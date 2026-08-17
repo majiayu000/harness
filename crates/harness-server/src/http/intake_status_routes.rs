@@ -205,7 +205,10 @@ fn legacy_task_recent_dispatch(task: &task_runner::TaskState) -> IntakeRecentDis
 }
 
 fn runtime_issue_recent_dispatch(workflow: &WorkflowInstance) -> Option<IntakeRecentDispatch> {
-    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(
+        &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
+        workflow,
+    );
     let task_id = projection.submission_handle?;
     let source = runtime_workflow_intake_source(workflow)?;
     Some(IntakeRecentDispatch {

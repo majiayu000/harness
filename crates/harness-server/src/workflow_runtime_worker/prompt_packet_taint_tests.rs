@@ -37,6 +37,7 @@ fn build_packet(workflow: &WorkflowInstance) -> anyhow::Result<Value> {
 fn build_packet_for_job(workflow: &WorkflowInstance, job: &RuntimeJob) -> anyhow::Result<Value> {
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
     build_runtime_prompt_packet(
+        &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
         job,
         Some(workflow),
         Path::new("/workspaces/issue-1771"),

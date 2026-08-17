@@ -337,7 +337,7 @@ impl WorkflowRuntimeStore {
             .await?;
         let policy_events = policy_events_for_usage_records(event_store, &usage_records).await?;
         let usage = aggregate_usage_records(&usage_records)?;
-        let terminal = workflow.is_terminal();
+        let terminal = workflow.is_terminal_with_registry(&self.definition_registry);
         Ok(Some(RuntimeAgentTelemetry {
             workflow_id: workflow.id,
             workflow_state: workflow.state.clone(),

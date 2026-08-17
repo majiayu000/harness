@@ -1,5 +1,5 @@
 use super::model::{WorkflowDecision, WorkflowInstance};
-use super::state_registry::{self, WorkflowProgressMode};
+use super::state_registry::{WorkflowProgressMode, WorkflowStateDefinition};
 use super::validator::{
     TransitionRule, ValidationContext, WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
 };
@@ -148,19 +148,19 @@ fn validated_evidence_trust(
 }
 
 pub(super) fn validate_target_progress_contract(
+    state: Option<&WorkflowStateDefinition>,
     instance: &WorkflowInstance,
     decision: &WorkflowDecision,
 ) -> Result<(), WorkflowDecisionRejection> {
-    validate_target_progress_contract_with_override(instance, decision, false)
+    validate_target_progress_contract_with_override(state, instance, decision, false)
 }
 
 pub(super) fn validate_target_progress_contract_with_override(
+    state: Option<&WorkflowStateDefinition>,
     instance: &WorkflowInstance,
     decision: &WorkflowDecision,
     allow_missing_pinned_cancel: bool,
 ) -> Result<(), WorkflowDecisionRejection> {
-    let state =
-        state_registry::workflow_state_definition_for_instance(instance, &decision.next_state);
     if state.is_none()
         && allow_missing_pinned_cancel
         && decision.decision == "cancel_declarative_submission"

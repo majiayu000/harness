@@ -6,16 +6,18 @@ use super::{
     ISSUE_STATE_ARTIFACT,
 };
 use crate::runtime::completion_evidence::{
-    github_pr_identity, pr_binding_verification_failure, transition_evidence_enforced,
-    verified_issue_state_artifact, verified_pr_binding_artifact,
-    ARTIFACT_MERGE_COMPLETION_VERIFICATION, EVIDENCE_GITHUB_TERMINAL, EVIDENCE_VERIFIED_PR_BINDING,
-    MERGE_COMPLETION_VERIFICATION_SCHEMA, REASON_PR_BINDING_VERIFICATION_FAILED,
+    github_pr_identity, pr_binding_verification_failure,
+    transition_evidence_enforced_with_registry, verified_issue_state_artifact,
+    verified_pr_binding_artifact, ARTIFACT_MERGE_COMPLETION_VERIFICATION, EVIDENCE_GITHUB_TERMINAL,
+    EVIDENCE_VERIFIED_PR_BINDING, MERGE_COMPLETION_VERIFICATION_SCHEMA,
+    REASON_PR_BINDING_VERIFICATION_FAILED,
 };
 use crate::runtime::model::{
     ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvent,
     WorkflowEvidence, WorkflowInstance,
 };
 use crate::runtime::reason_class::STOP_REASON_INVALID_AGENT_OUTPUT;
+use crate::runtime::WorkflowDefinitionRegistry;
 use serde_json::{json, Value};
 
 pub(super) fn issue_implementation_missing_result_decision(
@@ -169,6 +171,7 @@ fn github_issue_state_can_finish_closed(state: &str) -> bool {
 }
 
 pub(super) fn bind_pr_from_activity_result(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -185,14 +188,15 @@ pub(super) fn bind_pr_from_activity_result(
         return None;
     }
     let (pr_number, pr_url) = pull_request_artifact(result)?;
-    let binding = match verified_pr_binding_evidence(result, pr_number, &pr_url) {
-        Ok(binding) => binding,
-        Err(reason) => {
-            return Some(pr_binding_verification_blocked_decision(
-                instance, event, result, &reason,
-            ));
-        }
-    };
+    let binding =
+        match verified_pr_binding_evidence_with_registry(registry, result, pr_number, &pr_url) {
+            Ok(binding) => binding,
+            Err(reason) => {
+                return Some(pr_binding_verification_blocked_decision(
+                    instance, event, result, &reason,
+                ));
+            }
+        };
     let pr_url = binding.canonical_pr_url;
     Some(
         WorkflowDecision::new(
@@ -224,7 +228,8 @@ pub(crate) struct VerifiedPrBindingEvidence {
     pub(crate) canonical_pr_url: String,
 }
 
-pub(crate) fn verified_pr_binding_evidence(
+pub(crate) fn verified_pr_binding_evidence_with_registry(
+    registry: &WorkflowDefinitionRegistry,
     result: &ActivityResult,
     claimed_pr_number: u64,
     claimed_pr_url: &str,
@@ -275,7 +280,8 @@ pub(crate) fn verified_pr_binding_evidence(
             ),
         });
     }
-    if !transition_evidence_enforced(
+    if !transition_evidence_enforced_with_registry(
+        registry,
         GITHUB_ISSUE_PR_DEFINITION_ID,
         "implementing",
         "pr_open",

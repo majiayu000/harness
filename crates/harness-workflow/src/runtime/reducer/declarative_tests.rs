@@ -51,10 +51,11 @@ fn declarative_failure_without_route_uses_configured_generic_retry() -> anyhow::
         )]),
     )?;
     let version = definition.definition_version();
-    super::super::state_registry::register_declarative_workflow_definitions([definition])?;
-    let definition =
-        super::super::state_registry::workflow_declarative_definition(DEFINITION_ID, version)
-            .ok_or_else(|| anyhow::anyhow!("generic-retry definition should resolve"))?;
+    let mut registry = super::super::state_registry::WorkflowDefinitionRegistry::with_builtins();
+    registry.register_declarative_current(definition)?;
+    let definition = registry
+        .declarative_definition(DEFINITION_ID, version)
+        .ok_or_else(|| anyhow::anyhow!("generic-retry definition should resolve"))?;
     let instance = WorkflowInstance::new(
         DEFINITION_ID,
         definition.definition_version(),
@@ -75,7 +76,7 @@ fn declarative_failure_without_route_uses_configured_generic_retry() -> anyhow::
             "activity_result": result,
         }));
 
-    let decision = reduce_runtime_job_completed(&instance, &event)?
+    let decision = reduce_runtime_job_completed_with_registry(&registry, &instance, &event)?
         .ok_or_else(|| anyhow::anyhow!("generic retry should produce a decision"))?;
     assert_eq!(decision.decision, "retry_failed_runtime_activity");
     assert_eq!(decision.next_state, "working");
@@ -84,7 +85,8 @@ fn declarative_failure_without_route_uses_configured_generic_retry() -> anyhow::
         WorkflowCommandType::EnqueueActivity
     );
     assert_eq!(decision.commands[0].command["retry_attempt"], 1);
-    super::super::state_registry::decision_validator_for_instance(&instance)
+    registry
+        .decision_validator_for_instance(&instance)
         .map_err(|error| anyhow::anyhow!("declarative definition pin failed: {error:?}"))?
         .ok_or_else(|| anyhow::anyhow!("generic retry validator should resolve"))?
         .validate(

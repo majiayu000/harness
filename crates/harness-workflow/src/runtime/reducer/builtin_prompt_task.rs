@@ -9,6 +9,7 @@ use crate::runtime::prompt_task::{
     PromptContinuationState, PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 use crate::runtime::remote_facts::stable_remote_fact_hash;
+use crate::runtime::WorkflowDefinitionRegistry;
 use crate::runtime::RUNTIME_TRANSCRIPT_ARTIFACT;
 use chrono::Duration;
 use serde_json::{json, Value};
@@ -21,14 +22,29 @@ const SERVER_GENERATED_ARTIFACTS: [&str; 5] = [
     RUNTIME_TRANSCRIPT_ARTIFACT,
 ];
 
+#[cfg(test)]
 pub(super) fn prompt_task_success_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    prompt_task_success_decision_with_registry(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        instance,
+        event,
+        result,
+    )
+}
+
+pub(super) fn prompt_task_success_decision_with_registry(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
     let continuation = match prompt_continuation_state_from_data(&instance.data) {
         Ok(Some(continuation)) => continuation,
-        Ok(None) => return Some(single_shot_done_decision(instance, event, result)),
+        Ok(None) => return Some(single_shot_done_decision(registry, instance, event, result)),
         Err(reason) => {
             return Some(blocked_decision(
                 instance,
@@ -56,7 +72,7 @@ pub(super) fn prompt_task_success_decision(
     let observed = observed_state(&continuation, result, &signal);
     if !continuation.policy.active_states.contains(&signal.state) {
         return Some(settled_done_decision(
-            instance, event, result, &signal, &observed,
+            registry, instance, event, result, &signal, &observed,
         ));
     }
     if continuation.attempt >= continuation.policy.max_attempts {
@@ -143,11 +159,12 @@ fn missing_completion_evidence_decision(
 }
 
 fn single_shot_done_decision(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> WorkflowDecision {
-    let completion = match prompt_completion_evidence(result) {
+    let completion = match prompt_completion_evidence(registry, result) {
         Ok(completion) => completion,
         Err(detail) => {
             return missing_completion_evidence_decision(instance, event, result, &detail, None)
@@ -166,13 +183,14 @@ fn single_shot_done_decision(
 }
 
 fn settled_done_decision(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
     signal: &ExternalStateSignal,
     continuation: &PromptContinuationState,
 ) -> WorkflowDecision {
-    let completion = match prompt_completion_evidence(result) {
+    let completion = match prompt_completion_evidence(registry, result) {
         Ok(completion) => completion,
         Err(detail) => {
             return missing_completion_evidence_decision(

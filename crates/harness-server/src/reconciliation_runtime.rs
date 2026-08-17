@@ -17,7 +17,7 @@ pub(super) async fn collect_runtime_candidates(
     let mut skipped_terminal = 0usize;
     for (data, row_updated_at) in rows {
         let instance: WorkflowInstance = serde_json::from_str(&data)?;
-        if instance.is_terminal() {
+        if instance.is_terminal_with_registry(store.definition_registry()) {
             skipped_terminal += 1;
             continue;
         }

@@ -42,7 +42,7 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Vec<WorkflowInstance>> {
         let limit = limit.max(1);
         let (terminal_definition_ids, terminal_states, terminal_task_statuses) =
-            terminal_task_status_rows();
+            terminal_task_status_rows(&self.definition_registry);
         let rows: Vec<(String,)> = sqlx::query_as(
             "WITH terminal_states(definition_id, state, task_status) AS (
                  SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
@@ -175,7 +175,7 @@ impl WorkflowRuntimeStore {
         since: DateTime<Utc>,
     ) -> anyhow::Result<WorkflowSubmissionMetrics> {
         let (terminal_definition_ids, terminal_states, terminal_task_statuses) =
-            terminal_task_status_rows();
+            terminal_task_status_rows(&self.definition_registry);
         let stalled_reason = "round_budget_exhausted";
         let stalled_pattern = format!("%\"reason\":\"{stalled_reason}\"%");
         let rows = sqlx::query_as::<_, SubmissionMetricRow>(

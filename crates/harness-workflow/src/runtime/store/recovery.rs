@@ -14,19 +14,23 @@ use crate::runtime::model::{
 use crate::runtime::pr_feedback::{
     LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
-use crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID;
-use crate::runtime::quality_gate::QUALITY_GATE_DEFINITION_ID;
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::state_registry::{
-    DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, WorkflowProgressMode,
+    DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, WorkflowDefinitionRegistry,
+    WorkflowProgressMode,
 };
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::ValidationContext;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
 
+#[path = "recovery_definition.rs"]
+mod recovery_definition;
 #[path = "recovery_validation.rs"]
 mod recovery_validation;
+use recovery_definition::{
+    custom_declarative_definition, declarative_recovery_rejection, is_builtin_definition_id,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowRuntimeRecoveryAction {
@@ -103,8 +107,9 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(WorkflowRuntimeRecoveryOutcome::NotFound);
         };
-        let declarative = custom_declarative_definition(&snapshot).is_some();
-        if let Some(outcome) = recovery_rejection(&snapshot, &request)? {
+        let declarative =
+            custom_declarative_definition(&self.definition_registry, &snapshot).is_some();
+        if let Some(outcome) = recovery_rejection(&self.definition_registry, &snapshot, &request)? {
             if declarative {
                 audit_recovery_rejection_tx(&mut tx, &snapshot, &request, "eligibility_rejected")
                     .await?;
@@ -112,7 +117,14 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(outcome);
         }
-        let plan = match recovery_dispatch_plan_tx(&mut tx, &snapshot, &request).await? {
+        let plan = match recovery_dispatch_plan_tx(
+            &mut tx,
+            &self.definition_registry,
+            &snapshot,
+            &request,
+        )
+        .await?
+        {
             Ok(plan) => plan,
             Err(activity) => {
                 if declarative {
@@ -129,9 +141,14 @@ impl WorkflowRuntimeStore {
             }
         };
         if declarative {
-            if let Some(outcome) =
-                recovery_validation::validate_request_tx(&mut tx, &snapshot, &request, &plan)
-                    .await?
+            if let Some(outcome) = recovery_validation::validate_request_tx(
+                &mut tx,
+                &self.definition_registry,
+                &snapshot,
+                &request,
+                &plan,
+            )
+            .await?
             {
                 tx.commit().await?;
                 return Ok(outcome);
@@ -144,11 +161,14 @@ impl WorkflowRuntimeStore {
             return Ok(WorkflowRuntimeRecoveryOutcome::NotFound);
         };
 
-        if let Some(outcome) = recovery_rejection(&instance, &request)? {
+        if let Some(outcome) = recovery_rejection(&self.definition_registry, &instance, &request)? {
             tx.rollback().await?;
             return Ok(outcome);
         }
-        if recovery_dispatch_plan_tx(&mut tx, &instance, &request).await? != Ok(plan.clone()) {
+        if recovery_dispatch_plan_tx(&mut tx, &self.definition_registry, &instance, &request)
+            .await?
+            != Ok(plan.clone())
+        {
             tx.rollback().await?;
             return Ok(unsupported_stopped_activity(&instance, None));
         }
@@ -183,13 +203,13 @@ impl WorkflowRuntimeStore {
             &event.id,
             request.evidence,
         );
-        let Some(validator) = validator_for_instance(&instance)? else {
+        let Some(validator) = validator_for_instance(&self.definition_registry, &instance)? else {
             anyhow::bail!(
                 "workflow runtime recovery cannot validate definition {}",
                 instance.definition_id
             );
         };
-        let validation_context = if instance.is_terminal() {
+        let validation_context = if instance.is_terminal_with_registry(&self.definition_registry) {
             ValidationContext::new("workflow_runtime_operator_action", event.created_at)
                 .allow_terminal_reopen()
         } else {
@@ -257,10 +277,11 @@ async fn audit_recovery_rejection_tx(tx: &mut sqlx::Transaction<'_, sqlx::Postgr
 }
 
 fn recovery_rejection(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     request: &WorkflowRuntimeRecoveryRequest<'_>,
 ) -> anyhow::Result<Option<WorkflowRuntimeRecoveryOutcome>> {
-    match custom_declarative_definition(instance) {
+    match custom_declarative_definition(registry, instance) {
         Some(Ok(definition)) => {
             return Ok(declarative_recovery_rejection(
                 instance,
@@ -277,7 +298,7 @@ fn recovery_rejection(
         None => {}
     }
     if let DeclarativeDefinitionResolution::PinError(error) =
-        crate::runtime::state_registry::resolve_declarative_definition(instance)
+        registry.resolve_declarative_definition(instance)
     {
         if !is_builtin_definition_id(&instance.definition_id) {
             return Ok(Some(WorkflowRuntimeRecoveryOutcome::InvalidDefinitionPin {
@@ -317,48 +338,13 @@ fn recovery_rejection(
     Ok(None)
 }
 
-fn custom_declarative_definition(
-    instance: &WorkflowInstance,
-) -> Option<
-    Result<
-        std::sync::Arc<crate::runtime::declarative::DeclarativeWorkflowDefinition>,
-        DeclarativeDefinitionPinError,
-    >,
-> {
-    if is_builtin_definition_id(&instance.definition_id) {
-        return None;
-    }
-    match crate::runtime::state_registry::resolve_declarative_definition(instance) {
-        DeclarativeDefinitionResolution::PinError(error) => Some(Err(error)),
-        DeclarativeDefinitionResolution::Resolved(definition) => Some(Ok(definition)),
-        DeclarativeDefinitionResolution::NotDeclarative => None,
-    }
-}
-
-fn is_builtin_definition_id(definition_id: &str) -> bool {
-    matches!(
-        definition_id,
-        GITHUB_ISSUE_PR_DEFINITION_ID
-            | PROMPT_TASK_DEFINITION_ID
-            | QUALITY_GATE_DEFINITION_ID
-            | PR_FEEDBACK_DEFINITION_ID
-    )
-}
-
-#[rustfmt::skip]
-fn declarative_recovery_rejection(instance: &WorkflowInstance, request: &WorkflowRuntimeRecoveryRequest<'_>, definition: &crate::runtime::declarative::DeclarativeWorkflowDefinition) -> Option<WorkflowRuntimeRecoveryOutcome> {
-    if request.actor != "operator" { return Some(WorkflowRuntimeRecoveryOutcome::OperatorRequired { workflow: instance.clone() }); }
-    if request.action != WorkflowRuntimeRecoveryAction::Unblock || instance.state != "blocked" { return Some(WorkflowRuntimeRecoveryOutcome::WrongState { workflow: instance.clone() }); }
-    if request.target_state.is_none() && definition.policy().recovery_targets.len() != 1 { return Some(WorkflowRuntimeRecoveryOutcome::TargetRequired { workflow: instance.clone() }); }
-    request.target_state.filter(|target| !definition.policy().recovery_targets.iter().any(|allowed| allowed == target)).map(|target_state| WorkflowRuntimeRecoveryOutcome::TargetNotAllowed { workflow: instance.clone(), target_state: target_state.to_string() })
-}
-
 async fn recovery_dispatch_plan_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     request: &WorkflowRuntimeRecoveryRequest<'_>,
 ) -> anyhow::Result<Result<RecoveryDispatchPlan, Option<String>>> {
-    if let Some(Ok(definition)) = custom_declarative_definition(instance) {
+    if let Some(Ok(definition)) = custom_declarative_definition(registry, instance) {
         return declarative_recovery_dispatch_plan(request, &definition);
     }
     validate_stopped_metadata(&instance.data)?;

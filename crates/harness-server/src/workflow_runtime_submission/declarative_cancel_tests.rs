@@ -6,13 +6,11 @@ use harness_core::{
     db::resolve_database_url,
 };
 use harness_workflow::runtime::{
-    build_declarative_definition, persisted_declarative_definition,
-    register_declarative_workflow_definitions,
+    build_declarative_definition, persisted_declarative_definition, WorkflowDefinitionRegistry,
 };
-use std::{collections::BTreeMap, sync::Once};
+use std::collections::BTreeMap;
 
 const DEFINITION_ID: &str = "missing_pin_cancel_test_declarative";
-static REGISTER_CURRENT_DEFINITION: Once = Once::new();
 
 fn definition(with_stop_signal: bool) -> harness_workflow::runtime::DeclarativeWorkflowDefinition {
     let on_signal = if with_stop_signal {
@@ -67,14 +65,15 @@ async fn missing_registered_pin_can_use_persisted_definition_for_cancellation() 
         return Ok(());
     }
     let persisted_version = definition(false);
-    REGISTER_CURRENT_DEFINITION.call_once(|| {
-        register_declarative_workflow_definitions([definition(true)])
-            .expect("current cancellation fixture should register");
-    });
+    let mut registry = WorkflowDefinitionRegistry::with_builtins();
+    registry
+        .register_declarative_current(definition(true))
+        .expect("current cancellation fixture should register");
     let dir = tempfile::tempdir()?;
     let database_url = resolve_database_url(None)?;
-    let store =
-        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
+    let store = WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url))
+        .await?
+        .with_definition_registry(registry.into_shared());
     store
         .persist_definition_version(&persisted_declarative_definition(
             &persisted_version,
@@ -104,5 +103,13 @@ async fn missing_registered_pin_can_use_persisted_definition_for_cancellation() 
         cancelled.data["last_decision"],
         "cancel_declarative_submission"
     );
+
+    let repeated = cancel_submission_by_workflow_id(&store, &instance.id).await?;
+    let RuntimeSubmissionCancelOutcome::AlreadyTerminal(reloaded) = repeated else {
+        anyhow::bail!(
+            "repeated declarative cancellation did not report an already-terminal outcome"
+        );
+    };
+    assert_eq!(reloaded.state, "withdrawn");
     Ok(())
 }

@@ -375,7 +375,10 @@ async fn workflow_runtime_tree_summary(
         .map(|state| state.count)
         .sum();
     let (workflow_statuses, workflow_scheduler_states, workflow_active_buckets) =
-        workflow_projection_summary_counts(&aggregate_summary.workflow_states);
+        workflow_projection_summary_counts(
+            store.definition_registry(),
+            &aggregate_summary.workflow_states,
+        );
     Ok((
         WorkflowRuntimeTreeSummary {
             workflow_statuses,
@@ -395,6 +398,7 @@ async fn workflow_runtime_tree_summary(
 }
 
 fn workflow_projection_summary_counts(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     workflow_states: &[harness_workflow::runtime::store::WorkflowRuntimeStateCount],
 ) -> (
     BTreeMap<String, usize>,
@@ -408,14 +412,21 @@ fn workflow_projection_summary_counts(
     for state_count in workflow_states {
         let workflow = WorkflowInstance::new(
             &state_count.definition_id,
-            1,
+            state_count.definition_version,
             &state_count.state,
             WorkflowSubject::new(
                 "summary",
                 format!("{}:{}", state_count.definition_id, state_count.state),
             ),
         );
-        let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+        let workflow = match state_count.definition_hash.as_deref() {
+            Some(definition_hash) => {
+                workflow.with_server_data(json!({ "definition_hash": definition_hash }))
+            }
+            None => workflow,
+        };
+        let projection =
+            RuntimeWorkflowProjection::from_workflow_with_registry(registry, &workflow);
         add_summary_count(
             &mut workflow_statuses,
             projection.task_status.as_str(),
@@ -533,7 +544,8 @@ async fn build_full_workflow_runtime_nodes(
         by_id.insert(
             workflow_id,
             WorkflowRuntimeTreeNode {
-                projection: WorkflowRuntimeTreeProjection::from_workflow_with_stopped_eligibility(
+                projection: WorkflowRuntimeTreeProjection::from_workflow_with_registry_and_stopped_eligibility(
+                    store.definition_registry(),
                     &instance,
                     stopped_eligibility
                         .get(&instance.id)
@@ -639,7 +651,8 @@ async fn build_compact_workflow_runtime_nodes(
         by_id.insert(
             workflow_id,
             WorkflowRuntimeTreeNode {
-                projection: WorkflowRuntimeTreeProjection::from_workflow_with_stopped_eligibility(
+                projection: WorkflowRuntimeTreeProjection::from_workflow_with_registry_and_stopped_eligibility(
+                    store.definition_registry(),
                     &instance,
                     stopped_eligibility
                         .get(&instance.id)

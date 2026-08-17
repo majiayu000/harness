@@ -59,7 +59,9 @@ pub(super) async fn dashboard_active_counts(
     let allowed_project_roots = &state.core.server.config.server.allowed_project_roots;
 
     if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-        match crate::handlers::definition_ids::active_count_definition_ids() {
+        match crate::handlers::definition_ids::active_count_definition_ids(
+            store.definition_registry(),
+        ) {
             Ok(definition_ids) => {
                 for definition_id in &definition_ids {
                     match store
@@ -69,7 +71,10 @@ pub(super) async fn dashboard_active_counts(
                         Ok(workflows) => {
                             for workflow in workflows {
                                 let projection =
-                                    RuntimeWorkflowProjection::from_workflow(&workflow);
+                                    RuntimeWorkflowProjection::from_workflow_with_registry(
+                                        store.definition_registry(),
+                                        &workflow,
+                                    );
                                 add_active_runtime_workflow(
                                     &mut counts,
                                     &projection,

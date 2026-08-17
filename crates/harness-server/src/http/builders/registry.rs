@@ -52,6 +52,7 @@ pub(crate) async fn build_registry(
     // same policy at activity completion that the dispatcher enforces
     // pre-dispatch (GH-1770).
     let runtime_budget_policy = workflow_config.runtime_budget_policy.clone();
+    let mut workflow_definition_registry = server.configure_workflow_definition_registry()?;
     let workflow_ns = workflow_config.storage.schema_namespace;
     let mut startup_results = Vec::new();
     let plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>> = Arc::new(DashMap::new());
@@ -276,10 +277,11 @@ pub(crate) async fn build_registry(
                 .await?
                 .with_budget_policy(runtime_budget_policy.clone());
                 let historical_definitions = store.list_persisted_declarative_definitions().await?;
-                harness_workflow::runtime::register_historical_declarative_workflow_definitions(
-                    historical_definitions,
-                )?;
-                Ok::<_, anyhow::Error>(store)
+                workflow_definition_registry
+                    .register_declarative_historical_batch(historical_definitions)?;
+                Ok::<_, anyhow::Error>(
+                    store.with_definition_registry(workflow_definition_registry.into_shared()),
+                )
             }
             .await
             {

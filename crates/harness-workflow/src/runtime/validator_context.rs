@@ -1,6 +1,18 @@
-use super::ValidationContext;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
+
+#[derive(Debug, Clone)]
+pub struct ValidationContext {
+    pub actor: String,
+    pub now: DateTime<Utc>,
+    pub resource_budget_available: bool,
+    pub replan_available: bool,
+    pub wait_available: bool,
+    pub allow_terminal_reopen: bool,
+    pub allow_missing_pinned_cancel: bool,
+    pub allow_definition_pin_safety_decision: bool,
+    pub active_dedupe_keys: BTreeSet<String>,
+}
 
 impl ValidationContext {
     pub fn new(actor: impl Into<String>, now: DateTime<Utc>) -> Self {

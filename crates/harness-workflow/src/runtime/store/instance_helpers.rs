@@ -1,8 +1,4 @@
-use crate::runtime::state_registry::{
-    known_workflow_definition_ids, workflow_state_terminal_state,
-    workflow_terminal_state_names_for_definition,
-};
-use crate::runtime::{WorkflowOtelTraceContext, WorkflowTerminalState};
+use crate::runtime::{WorkflowDefinitionRegistry, WorkflowOtelTraceContext, WorkflowTerminalState};
 
 pub(super) fn otel_trace_context_from_data(
     data: &serde_json::Value,
@@ -13,31 +9,117 @@ pub(super) fn otel_trace_context_from_data(
     context.has_valid_trace_ids().then_some(context)
 }
 
-pub(super) fn terminal_state_pairs() -> (Vec<String>, Vec<String>) {
-    let mut definition_ids = Vec::new();
-    let mut states = Vec::new();
-    for definition_id in known_workflow_definition_ids() {
-        for state in workflow_terminal_state_names_for_definition(&definition_id) {
-            definition_ids.push(definition_id.clone());
-            states.push(state);
-        }
-    }
-    (definition_ids, states)
+pub(super) struct TerminalStateSelectorRows {
+    pub(super) definition_ids: Vec<String>,
+    pub(super) definition_versions: Vec<Option<i64>>,
+    pub(super) definition_hashes: Vec<Option<String>>,
+    pub(super) states: Vec<String>,
 }
 
-pub(super) fn terminal_task_status_rows() -> (Vec<String>, Vec<String>, Vec<String>) {
+pub(super) struct ProgressStateSelectorRows {
+    pub(super) definition_ids: Vec<String>,
+    pub(super) definition_versions: Vec<Option<i64>>,
+    pub(super) definition_hashes: Vec<Option<String>>,
+    pub(super) states: Vec<String>,
+}
+
+impl ProgressStateSelectorRows {
+    pub(super) fn insert(
+        &mut self,
+        definition_id: String,
+        definition_version: Option<i64>,
+        definition_hash: Option<String>,
+        state: String,
+    ) {
+        let duplicate = self
+            .definition_ids
+            .iter()
+            .zip(&self.definition_versions)
+            .zip(&self.definition_hashes)
+            .zip(&self.states)
+            .any(
+                |(((registered_id, registered_version), registered_hash), registered_state)| {
+                    registered_id == &definition_id
+                        && registered_version == &definition_version
+                        && registered_hash == &definition_hash
+                        && registered_state == &state
+                },
+            );
+        if duplicate {
+            return;
+        }
+        self.definition_ids.push(definition_id);
+        self.definition_versions.push(definition_version);
+        self.definition_hashes.push(definition_hash);
+        self.states.push(state);
+    }
+}
+
+pub(super) fn progress_state_selector_rows(
+    registry: &WorkflowDefinitionRegistry,
+    progress_mode: crate::runtime::WorkflowProgressMode,
+) -> ProgressStateSelectorRows {
+    let mut rows = ProgressStateSelectorRows {
+        definition_ids: Vec::new(),
+        definition_versions: Vec::new(),
+        definition_hashes: Vec::new(),
+        states: Vec::new(),
+    };
+    for definition_id in registry.known_definition_ids() {
+        for selector in registry.progress_state_selectors(&definition_id, progress_mode) {
+            rows.insert(
+                definition_id.clone(),
+                selector.definition_version.map(i64::from),
+                selector.definition_hash,
+                selector.state,
+            );
+        }
+    }
+    rows
+}
+
+pub(super) fn terminal_state_selector_rows(
+    registry: &WorkflowDefinitionRegistry,
+) -> TerminalStateSelectorRows {
+    let mut definition_ids = Vec::new();
+    let mut definition_versions = Vec::new();
+    let mut definition_hashes = Vec::new();
+    let mut states = Vec::new();
+    for definition_id in registry.known_definition_ids() {
+        for selector in registry.terminal_state_selectors(&definition_id) {
+            definition_ids.push(definition_id.clone());
+            definition_versions.push(selector.definition_version.map(i64::from));
+            definition_hashes.push(selector.definition_hash);
+            states.push(selector.state);
+        }
+    }
+    TerminalStateSelectorRows {
+        definition_ids,
+        definition_versions,
+        definition_hashes,
+        states,
+    }
+}
+
+pub(super) fn terminal_task_status_rows(
+    registry: &WorkflowDefinitionRegistry,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut definition_ids = Vec::new();
     let mut states = Vec::new();
     let mut task_statuses = Vec::new();
-    for definition_id in known_workflow_definition_ids() {
-        for state in workflow_terminal_state_names_for_definition(&definition_id) {
-            let Some(terminal_state) = workflow_state_terminal_state(&definition_id, &state) else {
+    for definition_id in registry.known_definition_ids() {
+        for selector in registry.terminal_state_selectors(&definition_id) {
+            // Declarative versions are joined through persisted definition
+            // metadata by the submission queries. Keeping them out of this
+            // unversioned CTE prevents current policy from overriding a
+            // historical pin that reused the same state name.
+            if selector.definition_version.is_some() || selector.definition_hash.is_some() {
                 continue;
-            };
+            }
             definition_ids.push(definition_id.clone());
-            states.push(state);
+            states.push(selector.state);
             task_statuses.push(
-                match terminal_state {
+                match selector.terminal_state {
                     WorkflowTerminalState::Succeeded => "done",
                     WorkflowTerminalState::Failed => "failed",
                     WorkflowTerminalState::Cancelled => "cancelled",
@@ -47,4 +129,76 @@ pub(super) fn terminal_task_status_rows() -> (Vec<String>, Vec<String>, Vec<Stri
         }
     }
     (definition_ids, states, task_statuses)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::build_declarative_definition;
+    use harness_core::config::workflow::{
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn declarative_terminal_rows_preserve_version_and_hash() -> anyhow::Result<()> {
+        let definition_id = "terminal_selector_pin_fixture";
+        let definition = build_declarative_definition(
+            &WorkflowDefinitionPolicy {
+                id: definition_id.to_string(),
+                initial: "work".to_string(),
+                states: BTreeMap::from([
+                    (
+                        "work".to_string(),
+                        DeclaredState {
+                            activity: Some("run".to_string()),
+                            on_success: Some("done".to_string()),
+                            on_failure: Some("failed".to_string()),
+                            ..DeclaredState::default()
+                        },
+                    ),
+                    (
+                        "blocked".to_string(),
+                        DeclaredState {
+                            progress: Some(DeclaredProgressMode::OperatorGate),
+                            ..DeclaredState::default()
+                        },
+                    ),
+                ]),
+                terminal: BTreeMap::from([
+                    ("cancelled".to_string(), "cancelled".to_string()),
+                    ("done".to_string(), "succeeded".to_string()),
+                    ("failed".to_string(), "failed".to_string()),
+                ]),
+                evidence_required: BTreeMap::new(),
+                recovery_targets: Vec::new(),
+                intake: None,
+            },
+            &BTreeMap::from([("run".to_string(), WorkflowActivityPolicy::default())]),
+        )?;
+        let expected_version = i64::from(definition.definition_version());
+        let expected_hash = definition.definition_hash().to_string();
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry.register_declarative_current(definition)?;
+
+        let rows = terminal_state_selector_rows(&registry);
+        let pinned_rows = rows
+            .definition_ids
+            .iter()
+            .zip(&rows.definition_versions)
+            .zip(&rows.definition_hashes)
+            .zip(&rows.states)
+            .filter(|(((id, _), _), _)| id.as_str() == definition_id)
+            .collect::<Vec<_>>();
+        assert_eq!(pinned_rows.len(), 3);
+        assert!(pinned_rows.iter().all(|(((id, version), hash), _)| {
+            id.as_str() == definition_id
+                && **version == Some(expected_version)
+                && hash.as_deref() == Some(expected_hash.as_str())
+        }));
+
+        let (unversioned_ids, _, _) = terminal_task_status_rows(&registry);
+        assert!(!unversioned_ids.iter().any(|id| id == definition_id));
+        Ok(())
+    }
 }

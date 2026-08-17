@@ -88,12 +88,23 @@ pub fn transition_evidence_enforced(
     to_state: &str,
     evidence_kind: &str,
 ) -> bool {
-    crate::runtime::state_registry::transition_requires_evidence(
+    transition_evidence_enforced_with_registry(
+        &crate::runtime::WorkflowDefinitionRegistry::with_builtins(),
         definition_id,
         from_state,
         to_state,
         evidence_kind,
     )
+}
+
+pub fn transition_evidence_enforced_with_registry(
+    registry: &crate::runtime::WorkflowDefinitionRegistry,
+    definition_id: &str,
+    from_state: &str,
+    to_state: &str,
+    evidence_kind: &str,
+) -> bool {
+    registry.transition_requires_evidence(definition_id, from_state, to_state, evidence_kind)
 }
 
 /// The server-attached verified-PR-binding payload, if present.

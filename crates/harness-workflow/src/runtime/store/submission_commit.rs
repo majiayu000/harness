@@ -91,7 +91,7 @@ impl WorkflowRuntimeStore {
         let mut tx = self.pool.begin().await?;
         lock_submission_tx(&mut tx, transition.workflow_id).await?;
         let Some((current, created_for_submission)) =
-            load_submission_instance_tx(&mut tx, &transition).await?
+            load_submission_instance_tx(&mut tx, &self.definition_registry, &transition).await?
         else {
             return Ok(None);
         };
@@ -132,7 +132,9 @@ impl WorkflowRuntimeStore {
                         "rejected workflow submission final instance is only allowed for a newly created submission"
                     );
                 }
-                if final_instance.terminal_state() != Some(WorkflowTerminalState::Failed) {
+                if final_instance.terminal_state_with_registry(&self.definition_registry)
+                    != Some(WorkflowTerminalState::Failed)
+                {
                     anyhow::bail!(
                         "rejected workflow submission final instance must use the definition-specific failed terminal state"
                     );
@@ -198,13 +200,18 @@ impl WorkflowRuntimeStore {
                 .existing_record
                 .is_none_or(|_| current.state == record.decision.observed_state);
         if validate_as_new_transition {
-            let validation_context = if current.is_terminal() {
+            let validation_context = if current.is_terminal_with_registry(&self.definition_registry)
+            {
                 ValidationContext::new("workflow-policy", Utc::now()).allow_terminal_reopen()
             } else {
                 ValidationContext::new("workflow-policy", Utc::now())
             };
-            match validate_transition_with_context(&current, &record.decision, &validation_context)
-            {
+            match validate_transition_with_context(
+                &self.definition_registry,
+                &current,
+                &record.decision,
+                &validation_context,
+            ) {
                 TransitionValidation::Accepted => {}
                 TransitionValidation::Rejected(reason) if transition.existing_record.is_none() => {
                     let rejected = WorkflowDecisionRecord::rejected(
@@ -275,6 +282,7 @@ impl WorkflowRuntimeStore {
             } else {
                 commit_rejected_initial_failure_instance_tx(
                     &mut tx,
+                    &self.definition_registry,
                     &current,
                     final_instance,
                     &record,
@@ -306,6 +314,7 @@ async fn lock_submission_tx(
 
 async fn load_submission_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    definition_registry: &crate::runtime::WorkflowDefinitionRegistry,
     transition: &WorkflowSubmissionDecisionTransition<'_>,
 ) -> anyhow::Result<Option<(WorkflowInstance, bool)>> {
     if let Some(current) = select_instance_for_update_tx(tx, transition.workflow_id).await? {
@@ -326,7 +335,7 @@ async fn load_submission_instance_tx(
     {
         return Ok(None);
     }
-    if insert_validated_observed_instance_tx(tx, initial).await? {
+    if insert_validated_observed_instance_tx(tx, definition_registry, initial).await? {
         return Ok(Some((initial.clone(), true)));
     }
     Ok(select_instance_for_update_tx(tx, transition.workflow_id)

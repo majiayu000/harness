@@ -41,7 +41,13 @@ impl WorkflowRuntimeStore {
         let Some(instance) = self.get_instance(&decision.workflow_id).await? else {
             return Ok(());
         };
-        let Some(record) = extract_terminal_repo_memory_record(&instance, event, decision)? else {
+        let Some(record) = extract_terminal_repo_memory_record_with_registry(
+            &self.definition_registry,
+            &instance,
+            event,
+            decision,
+        )?
+        else {
             return Ok(());
         };
         self.insert_repo_memory_record(&record).await?;
@@ -49,7 +55,8 @@ impl WorkflowRuntimeStore {
     }
 }
 
-fn extract_terminal_repo_memory_record(
+fn extract_terminal_repo_memory_record_with_registry(
+    registry: &super::state_registry::WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     decision: &WorkflowDecisionRecord,
@@ -57,7 +64,7 @@ fn extract_terminal_repo_memory_record(
     if !decision.accepted {
         return Ok(None);
     }
-    let Some(outcome) = repo_memory_outcome(instance) else {
+    let Some(outcome) = repo_memory_outcome(registry, instance) else {
         return Ok(None);
     };
     let result: ActivityResult =
@@ -97,6 +104,20 @@ fn extract_terminal_repo_memory_record(
     ))
 }
 
+#[cfg(test)]
+fn extract_terminal_repo_memory_record(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    decision: &WorkflowDecisionRecord,
+) -> anyhow::Result<Option<RepoMemoryRecord>> {
+    extract_terminal_repo_memory_record_with_registry(
+        &super::state_registry::WorkflowDefinitionRegistry::with_builtins(),
+        instance,
+        event,
+        decision,
+    )
+}
+
 fn repo_memory_enabled_for_result(result: &ActivityResult) -> bool {
     result
         .artifacts
@@ -108,11 +129,14 @@ fn repo_memory_enabled_for_result(result: &ActivityResult) -> bool {
         .unwrap_or(false)
 }
 
-fn repo_memory_outcome(instance: &WorkflowInstance) -> Option<RepoMemoryOutcome> {
-    match (instance.state.as_str(), instance.terminal_state()?) {
-        ("done", WorkflowTerminalState::Succeeded) => Some(RepoMemoryOutcome::Done),
-        ("failed", WorkflowTerminalState::Failed) => Some(RepoMemoryOutcome::Failed),
-        _ => None,
+fn repo_memory_outcome(
+    registry: &super::state_registry::WorkflowDefinitionRegistry,
+    instance: &WorkflowInstance,
+) -> Option<RepoMemoryOutcome> {
+    match instance.terminal_state_with_registry(registry)? {
+        WorkflowTerminalState::Succeeded => Some(RepoMemoryOutcome::Done),
+        WorkflowTerminalState::Failed => Some(RepoMemoryOutcome::Failed),
+        WorkflowTerminalState::Cancelled => None,
     }
 }
 
@@ -301,6 +325,10 @@ fn clean_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
+
+#[cfg(test)]
+#[path = "memory_extract_registry_tests.rs"]
+mod registry_tests;
 
 #[cfg(test)]
 mod tests {

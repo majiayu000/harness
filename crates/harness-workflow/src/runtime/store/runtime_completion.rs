@@ -12,11 +12,9 @@ use crate::runtime::prompt_task::{
     prompt_continuation_state_from_data, PromptContinuationState, PROMPT_TASK_DEFINITION_ID,
 };
 use crate::runtime::reducer::{
-    invalid_agent_output_blocked_decision, reduce_runtime_job_completed,
+    invalid_agent_output_blocked_decision, reduce_runtime_job_completed_with_registry,
 };
-use crate::runtime::state_registry::{
-    resolve_declarative_definition, DeclarativeDefinitionResolution,
-};
+use crate::runtime::state_registry::{DeclarativeDefinitionResolution, WorkflowDefinitionRegistry};
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::{
     ValidationContext, WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
@@ -25,15 +23,18 @@ use crate::runtime::{DataProvenance, WorkflowDataWrite};
 use serde_json::{json, Value};
 
 pub(super) fn validator_for_instance(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<Option<crate::runtime::validator::DecisionValidator>> {
-    crate::runtime::state_registry::decision_validator_for_instance(instance).map_err(|error| {
-        anyhow::anyhow!(
-            "invalid declarative definition pin for workflow '{}': {:?}",
-            instance.id,
-            error
-        )
-    })
+    registry
+        .decision_validator_for_instance(instance)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "invalid declarative definition pin for workflow '{}': {:?}",
+                instance.id,
+                error
+            )
+        })
 }
 
 impl WorkflowRuntimeStore {
@@ -61,6 +62,7 @@ impl WorkflowRuntimeStore {
         .await?;
         let decision = apply_runtime_completion_decision_for_instance_tx(
             &mut tx,
+            &self.definition_registry,
             instance,
             source,
             &event,
@@ -92,6 +94,7 @@ impl WorkflowRuntimeStore {
             insert_event_tx(&mut tx, workflow_id, "RuntimeJobCompleted", source, payload).await?;
         let record = persist_runtime_completion_decision_tx(
             &mut tx,
+            &self.definition_registry,
             instance,
             source,
             &event,
@@ -105,6 +108,7 @@ impl WorkflowRuntimeStore {
 
 pub(super) async fn apply_runtime_completion_decision_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registry: &WorkflowDefinitionRegistry,
     workflow_id: &str,
     source: &str,
     event: &WorkflowEvent,
@@ -113,30 +117,48 @@ pub(super) async fn apply_runtime_completion_decision_tx(
     let Some(instance) = select_instance_for_update_tx(tx, workflow_id).await? else {
         return Ok(None);
     };
-    apply_runtime_completion_decision_for_instance_tx(tx, instance, source, event, budget_policy)
-        .await
+    apply_runtime_completion_decision_for_instance_tx(
+        tx,
+        registry,
+        instance,
+        source,
+        event,
+        budget_policy,
+    )
+    .await
 }
 
 async fn apply_runtime_completion_decision_for_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registry: &WorkflowDefinitionRegistry,
     instance: WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
     budget_policy: &RuntimeBudgetPolicy,
 ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
-    let driverless_decision = driverless_structured_completion_decision(&instance, source, event)?;
-    let Some(decision) = reduce_runtime_job_completed(&instance, event)? else {
+    let driverless_decision =
+        driverless_structured_completion_decision(registry, &instance, source, event)?;
+    let Some(decision) = reduce_runtime_job_completed_with_registry(registry, &instance, event)?
+    else {
         return Ok(None);
     };
     // Hard workflow budget ceiling (GH-1770 §4.4). Checked before the policy
     // fallbacks below: those already stop the workflow, so a budget block on
     // top of them would only mask the real reason.
-    if let Some(budget_decision) =
-        budget_ceiling_blocked_decision(tx, budget_policy, &instance, source, event, &decision)
-            .await?
+    if let Some(budget_decision) = budget_ceiling_blocked_decision(
+        tx,
+        budget_policy,
+        registry,
+        &instance,
+        source,
+        event,
+        &decision,
+    )
+    .await?
     {
         return persist_runtime_completion_decision_tx(
             tx,
+            registry,
             instance,
             source,
             event,
@@ -153,6 +175,7 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         if let Some(driverless_decision) = driverless_decision {
             let rejected = persist_runtime_completion_decision_tx(
                 tx,
+                registry,
                 instance.clone(),
                 source,
                 event,
@@ -177,6 +200,7 @@ async fn apply_runtime_completion_decision_for_instance_tx(
             ));
             let policy = persist_runtime_completion_decision_tx(
                 tx,
+                registry,
                 instance,
                 source,
                 event,
@@ -196,10 +220,17 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         }
     }
 
-    if declarative_decision_requires_blocked_fallback(&instance, source, event, &decision) {
-        let rejected =
-            persist_runtime_completion_decision_tx(tx, instance.clone(), source, event, decision)
-                .await?;
+    if declarative_decision_requires_blocked_fallback(registry, &instance, source, event, &decision)
+    {
+        let rejected = persist_runtime_completion_decision_tx(
+            tx,
+            registry,
+            instance.clone(),
+            source,
+            event,
+            decision,
+        )
+        .await?;
         if rejected.accepted {
             anyhow::bail!("insufficient-evidence decision unexpectedly passed validation");
         }
@@ -226,9 +257,15 @@ async fn apply_runtime_completion_decision_for_instance_tx(
                 rejected.id
             ),
         ));
-        let policy =
-            persist_runtime_completion_decision_tx(tx, instance, source, event, policy_decision)
-                .await?;
+        let policy = persist_runtime_completion_decision_tx(
+            tx,
+            registry,
+            instance,
+            source,
+            event,
+            policy_decision,
+        )
+        .await?;
         if !policy.accepted {
             anyhow::bail!(
                 "blocked policy decision was rejected after insufficient trusted evidence: {}",
@@ -241,24 +278,25 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         return Ok(Some(policy));
     }
 
-    persist_runtime_completion_decision_tx(tx, instance, source, event, decision)
+    persist_runtime_completion_decision_tx(tx, registry, instance, source, event, decision)
         .await
         .map(Some)
 }
 
 fn declarative_decision_requires_blocked_fallback(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
     decision: &WorkflowDecision,
 ) -> bool {
     if !matches!(
-        resolve_declarative_definition(instance),
+        registry.resolve_declarative_definition(instance),
         DeclarativeDefinitionResolution::Resolved(_)
     ) {
         return false;
     }
-    let Ok(Some(validator)) = validator_for_instance(instance) else {
+    let Ok(Some(validator)) = validator_for_instance(registry, instance) else {
         return false;
     };
     matches!(
@@ -284,6 +322,7 @@ fn is_generic_invalid_structured_fallback(decision: &WorkflowDecision) -> bool {
 }
 
 fn driverless_structured_completion_decision(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
@@ -306,7 +345,7 @@ fn driverless_structured_completion_decision(
     else {
         return Ok(None);
     };
-    let Ok(Some(validator)) = validator_for_instance(instance) else {
+    let Ok(Some(validator)) = validator_for_instance(registry, instance) else {
         return Ok(None);
     };
     let rejection = validator.validate(
@@ -324,6 +363,7 @@ fn driverless_structured_completion_decision(
 
 async fn persist_runtime_completion_decision_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registry: &WorkflowDefinitionRegistry,
     instance: WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
@@ -332,6 +372,7 @@ async fn persist_runtime_completion_decision_tx(
     let validation_context = runtime_completion_validation_context(source, event);
     persist_runtime_completion_decision_with_context_tx(
         tx,
+        registry,
         instance,
         event,
         decision,
@@ -342,13 +383,14 @@ async fn persist_runtime_completion_decision_tx(
 
 async fn persist_runtime_completion_decision_with_context_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registry: &WorkflowDefinitionRegistry,
     mut instance: WorkflowInstance,
     event: &WorkflowEvent,
     decision: WorkflowDecision,
     validation_context: ValidationContext,
 ) -> anyhow::Result<WorkflowDecisionRecord> {
     let current = instance.clone();
-    let record = match validator_for_instance(&instance) {
+    let record = match validator_for_instance(registry, &instance) {
         Ok(Some(validator)) => {
             match validator.validate(&instance, &decision, &validation_context) {
                 Ok(()) => {

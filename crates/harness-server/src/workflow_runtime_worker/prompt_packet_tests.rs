@@ -461,6 +461,7 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
 
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         None,
         Path::new("/workspaces/job-1"),
@@ -564,6 +565,7 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
     );
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         Some(&workflow),
         Path::new("/workspaces/job-continue"),
@@ -636,6 +638,7 @@ fn runtime_prompt_packet_describes_deferred_candidate_submission_contract() {
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
 
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         None,
         Path::new("/workspaces/issue-1449-c1"),
@@ -690,6 +693,7 @@ fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
     }];
 
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         None,
         Path::new("/workspaces/job-1"),
@@ -752,6 +756,7 @@ fn model_facing_prompt_matches_frozen_v1_fixture_while_durable_packet_remains_v2
     };
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         None,
         Path::new("/workspaces/job-1"),
@@ -813,6 +818,7 @@ fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
 
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         None,
         Path::new("/workspaces/job-1"),

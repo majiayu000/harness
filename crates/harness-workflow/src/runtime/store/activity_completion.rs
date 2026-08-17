@@ -346,6 +346,7 @@ impl WorkflowRuntimeStore {
 
         let decision_record = runtime_completion::apply_runtime_completion_decision_tx(
             &mut tx,
+            &self.definition_registry,
             &command.workflow_id,
             owner,
             &event,

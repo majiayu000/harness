@@ -1,62 +1,48 @@
 pub use super::state_registry::WorkflowTerminalState;
 
-pub fn workflow_terminal_state(definition_id: &str, state: &str) -> Option<WorkflowTerminalState> {
-    super::state_registry::workflow_state_terminal_state(definition_id, state)
-}
-
-pub fn workflow_terminal_state_for_version(
-    definition_id: &str,
-    definition_version: u32,
-    state: &str,
-) -> Option<WorkflowTerminalState> {
-    super::state_registry::workflow_state_terminal_state_for_version(
-        definition_id,
-        definition_version,
-        state,
-    )
-}
-
-pub fn workflow_terminal_state_for_instance(
-    instance: &super::model::WorkflowInstance,
-) -> Option<WorkflowTerminalState> {
-    super::state_registry::workflow_state_definition_for_instance(instance, &instance.state)?
-        .terminal_state
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn terminal_state_treats_done_failed_and_cancelled_as_shared_terminal_states() {
+        let registry = super::super::state_registry::WorkflowDefinitionRegistry::with_builtins();
         assert_eq!(
-            workflow_terminal_state("github_issue_pr", "done"),
+            registry.state_terminal_state("github_issue_pr", "done"),
             Some(WorkflowTerminalState::Succeeded)
         );
         assert_eq!(
-            workflow_terminal_state("prompt_task", "failed"),
+            registry.state_terminal_state("prompt_task", "failed"),
             Some(WorkflowTerminalState::Failed)
         );
         assert_eq!(
-            workflow_terminal_state("pr_feedback", "cancelled"),
+            registry.state_terminal_state("pr_feedback", "cancelled"),
             Some(WorkflowTerminalState::Cancelled)
         );
     }
 
     #[test]
     fn terminal_state_scopes_success_states_to_workflow_definitions() {
+        let registry = super::super::state_registry::WorkflowDefinitionRegistry::with_builtins();
         assert_eq!(
-            workflow_terminal_state("quality_gate", "passed"),
+            registry.state_terminal_state("quality_gate", "passed"),
             Some(WorkflowTerminalState::Succeeded)
         );
-        assert_eq!(workflow_terminal_state("github_issue_pr", "passed"), None);
-        assert_eq!(workflow_terminal_state("quality_gate", "done"), None);
+        assert_eq!(
+            registry.state_terminal_state("github_issue_pr", "passed"),
+            None
+        );
+        assert_eq!(registry.state_terminal_state("quality_gate", "done"), None);
     }
 
     #[test]
     fn terminal_state_rejects_terminal_looking_states_for_unknown_definitions() {
+        let registry = super::super::state_registry::WorkflowDefinitionRegistry::with_builtins();
         for state in ["done", "passed", "failed", "cancelled"] {
-            assert_eq!(workflow_terminal_state("unknown_workflow", state), None);
+            assert_eq!(
+                registry.state_terminal_state("unknown_workflow", state),
+                None
+            );
         }
     }
 }

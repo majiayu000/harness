@@ -5,8 +5,7 @@ use super::{
 };
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
-    build_declarative_submission_decision, current_declarative_workflow_definition,
-    decision_validator_for_instance, persisted_declarative_definition,
+    build_declarative_submission_decision, persisted_declarative_definition,
     DeclarativeWorkflowDefinition, ValidationContext, WorkflowCommandStatus, WorkflowInstance,
     WorkflowRuntimeStore, WorkflowSubject, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload, DECLARATIVE_SUBMISSION_DECISION,
@@ -39,8 +38,11 @@ pub(crate) async fn record_declarative_submission(
             ctx.definition_id
         );
     }
-    let definition =
-        resolve_declarative_definition_for_project(ctx.project_root, ctx.definition_id)?;
+    let definition = resolve_declarative_definition_for_project(
+        store.definition_registry(),
+        ctx.project_root,
+        ctx.definition_id,
+    )?;
 
     let project_id = ctx.project_root.to_string_lossy().into_owned();
     let workflow_id = declarative_workflow_id(
@@ -58,15 +60,18 @@ pub(crate) async fn record_declarative_submission(
 }
 
 pub(crate) fn resolve_declarative_definition_for_project(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     project_root: &Path,
     definition_id: &str,
 ) -> anyhow::Result<Arc<DeclarativeWorkflowDefinition>> {
-    let registered = current_declarative_workflow_definition(definition_id).ok_or_else(|| {
-        anyhow::anyhow!(
-            "workflow definition '{}' is not a registered declarative definition",
-            definition_id
-        )
-    })?;
+    let registered = registry
+        .current_declarative_definition(definition_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "workflow definition '{}' is not a registered declarative definition",
+                definition_id
+            )
+        })?;
     let document = harness_core::config::workflow::load_workflow_document(project_root)?;
     let policy = document.config.definition.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -126,7 +131,9 @@ async fn persist_new_submission(
     );
     let instance = submission_instance(ctx, project_id, &workflow_id, &prompt_ref, definition);
     let decision = build_declarative_submission_decision(definition, &instance)?;
-    let validator = decision_validator_for_instance(&instance)
+    let validator = store
+        .definition_registry()
+        .decision_validator_for_instance(&instance)
         .map_err(|error| {
             anyhow::anyhow!(
                 "declarative workflow '{}@{}' has an invalid definition pin: {error:?}",

@@ -205,6 +205,7 @@ fn runtime_prompt_packet_omits_duplicated_additional_prompt() {
         .unwrap_or_else(|error| panic!("test runtime settings should resolve: {error}"));
 
     let packet = build_runtime_prompt_packet(
+        &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
         &job,
         Some(&workflow),
         Path::new("/workspaces/job-1"),

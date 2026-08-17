@@ -1,6 +1,6 @@
 use super::{RuntimeRecoveryTargetProjection, RuntimeStoppedActionEligibility};
 use harness_workflow::runtime::{
-    workflow_declarative_definition, ActivityErrorKind, WorkflowCommand, WorkflowCommandType,
+    ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowDefinitionRegistry,
     WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
@@ -18,7 +18,7 @@ pub(crate) async fn stopped_action_eligibility_for_workflows(
     let mut plans = Vec::new();
     let mut runtime_job_ids = Vec::new();
     for workflow in workflows {
-        let Some(plan) = stopped_action_plan(workflow) else {
+        let Some(plan) = stopped_action_plan(store.definition_registry(), workflow) else {
             continue;
         };
         if let Some(runtime_job_id) = plan.runtime_job_id.as_ref() {
@@ -61,13 +61,14 @@ pub(crate) async fn stopped_action_eligibility_for_workflows(
 }
 
 pub(super) fn pinned_recovery_targets(
+    registry: &WorkflowDefinitionRegistry,
     workflow: &WorkflowInstance,
 ) -> Vec<RuntimeRecoveryTargetProjection> {
     if workflow.state != "blocked" {
         return Vec::new();
     }
     let Some(definition) =
-        workflow_declarative_definition(&workflow.definition_id, workflow.definition_version)
+        registry.declarative_definition(&workflow.definition_id, workflow.definition_version)
     else {
         return Vec::new();
     };
@@ -122,9 +123,12 @@ struct RecoveryDispatchTarget {
     activity: &'static str,
 }
 
-fn stopped_action_plan(workflow: &WorkflowInstance) -> Option<StoppedActionPlan> {
+fn stopped_action_plan(
+    registry: &WorkflowDefinitionRegistry,
+    workflow: &WorkflowInstance,
+) -> Option<StoppedActionPlan> {
     if workflow.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
-        if workflow.state != "blocked" || pinned_recovery_targets(workflow).is_empty() {
+        if workflow.state != "blocked" || pinned_recovery_targets(registry, workflow).is_empty() {
             return None;
         }
         return Some(StoppedActionPlan {

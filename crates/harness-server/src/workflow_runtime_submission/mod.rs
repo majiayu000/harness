@@ -36,7 +36,7 @@ pub(crate) use cancel::cancel_issue_submission_by_task_id;
 pub(crate) use cancel::{
     cancel_submission_by_workflow_id, RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
 };
-use commit::{apply_decision, apply_prompt_decision};
+use commit::{apply_decision, apply_prompt_decision, decision_validator_for_instance};
 pub(crate) use declarative::{
     record_declarative_submission, resolve_declarative_definition_for_project,
     DeclarativeSubmissionRuntimeContext,
@@ -140,7 +140,7 @@ pub(crate) async fn runtime_issue_by_submission_id(
 }
 
 pub(crate) fn runtime_issue_task_handle(instance: &WorkflowInstance) -> Option<TaskId> {
-    crate::runtime_projection::RuntimeWorkflowProjection::from_workflow(instance).submission_handle
+    crate::runtime_projection::runtime_submission_handle(&instance.data)
 }
 
 async fn persist_issue_submission(
@@ -275,7 +275,7 @@ async fn commit_runtime_decision(
     event_payload: serde_json::Value,
     accepted_data: Option<serde_json::Value>,
 ) -> anyhow::Result<WorkflowInstance> {
-    let validator = decision_validator_for_instance(&instance)?;
+    let validator = decision_validator_for_instance(store, &instance)?;
     commit_runtime_decision_with_validator(
         store,
         instance,
@@ -301,7 +301,8 @@ async fn commit_runtime_decision_with_validator(
     validator: DecisionValidator,
     allow_missing_pinned_cancel: bool,
 ) -> anyhow::Result<WorkflowInstance> {
-    let mut validation_context = if instance.is_terminal() {
+    let mut validation_context = if instance.is_terminal_with_registry(store.definition_registry())
+    {
         ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
     } else {
         ValidationContext::new("workflow-policy", chrono::Utc::now())
@@ -350,24 +351,6 @@ async fn commit_runtime_decision_with_validator(
         );
     }
     Ok(final_instance)
-}
-
-fn decision_validator_for_instance(
-    instance: &WorkflowInstance,
-) -> anyhow::Result<DecisionValidator> {
-    match instance.definition_id.as_str() {
-        GITHUB_ISSUE_PR_DEFINITION_ID => Ok(DecisionValidator::github_issue_pr()),
-        PROMPT_TASK_DEFINITION_ID => Ok(DecisionValidator::prompt_task()),
-        other => harness_workflow::runtime::decision_validator_for_instance(instance)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "workflow definition `{other}` has an invalid definition pin: {error:?}"
-                )
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!("workflow definition `{other}` cannot be committed by submission")
-            }),
-    }
 }
 
 async fn upsert_github_issue_pr_definition(store: &WorkflowRuntimeStore) -> anyhow::Result<()> {
@@ -779,30 +762,22 @@ fn string_array_field(data: &serde_json::Value, field: &str) -> anyhow::Result<V
 
 #[cfg(test)]
 mod atomicity_tests;
-
 #[cfg(test)]
-mod identity_tests;
-
-#[cfg(test)]
-mod dependency_tests;
-
+mod continuation_tests;
 #[cfg(test)]
 mod declarative_cancel_tests;
 #[cfg(test)]
-mod declarative_tests;
-
-#[cfg(test)]
 mod declarative_project_tests;
-
 #[cfg(test)]
-mod continuation_tests;
-
+mod declarative_tests;
+#[cfg(test)]
+mod dependency_tests;
+#[cfg(test)]
+mod identity_tests;
 #[cfg(test)]
 mod replay_tests;
-
-#[cfg(test)]
-mod trust_tests;
-
 #[cfg(test)]
 #[path = "../workflow_runtime_submission_tests.rs"]
 mod tests;
+#[cfg(test)]
+mod trust_tests;

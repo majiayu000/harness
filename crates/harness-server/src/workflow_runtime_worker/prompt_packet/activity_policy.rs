@@ -1,20 +1,21 @@
 use super::pretty_json;
 use harness_core::config::workflow::WorkflowDocument;
 use harness_workflow::runtime::{
-    resolve_declarative_definition, DeclarativeDefinitionResolution, RuntimeJob, WorkflowInstance,
+    DeclarativeDefinitionResolution, RuntimeJob, WorkflowDefinitionRegistry, WorkflowInstance,
 };
 use serde_json::{json, Value};
 
 use crate::workflow_runtime_worker::data_helpers::activity_name;
 
 pub(super) fn apply_activity_policy(
+    registry: &WorkflowDefinitionRegistry,
     packet: &mut Value,
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
     workflow_document: &WorkflowDocument,
 ) -> anyhow::Result<()> {
     apply_activity_policy_with_resolver(packet, job, workflow, workflow_document, |workflow| {
-        resolve_declarative_definition(workflow)
+        registry.resolve_declarative_definition(workflow)
     })
 }
 

@@ -14,6 +14,7 @@ use crate::runtime::pr_feedback::{
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
+use crate::runtime::WorkflowDefinitionRegistry;
 use serde_json::Value;
 
 pub(super) fn pr_feedback_sweep_decision_from_activity_result(
@@ -159,6 +160,7 @@ pub(super) fn local_review_decision_from_activity_result(
 }
 
 pub(super) fn pr_feedback_child_decision_from_activity_result(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -208,7 +210,8 @@ pub(super) fn pr_feedback_child_decision_from_activity_result(
                 "server_pr_snapshot",
                 Some(event.id.clone()),
             ));
-        } else if !crate::runtime::completion_evidence::transition_evidence_enforced(
+        } else if !crate::runtime::completion_evidence::transition_evidence_enforced_with_registry(
+            registry,
             PR_FEEDBACK_DEFINITION_ID,
             "inspecting",
             "ready_to_merge",

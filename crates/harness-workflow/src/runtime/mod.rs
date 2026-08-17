@@ -48,6 +48,8 @@ pub mod validator;
 pub mod validator_binding;
 mod validator_progress;
 pub mod worker;
+#[path = "model_workflow_instance.rs"]
+mod workflow_instance_impl;
 
 #[cfg(test)]
 mod circuit_breaker_store_tests;
@@ -171,9 +173,9 @@ pub use reason_class::{
 };
 pub use reducer::{
     activity_result_has_closed_issue_evidence, activity_result_value_has_closed_issue_evidence,
-    reduce_runtime_job_completed, value_has_closed_issue_evidence, GITHUB_ISSUE_PR_DEFINITION_ID,
-    ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT,
-    RUNTIME_JOB_COMPLETED_EVENT,
+    reduce_runtime_job_completed, reduce_runtime_job_completed_with_registry,
+    value_has_closed_issue_evidence, GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL,
+    ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT, RUNTIME_JOB_COMPLETED_EVENT,
 };
 pub use remote_facts::{
     remote_fact_command_dedupe_key, stable_pr_snapshot_fact_hash_input, stable_remote_fact_hash,
@@ -184,19 +186,8 @@ pub use repo_memory::{
     REPO_MEMORY_DEGRADATION_ARTIFACT,
 };
 pub use state_registry::{
-    apply_builtin_evidence_enforcement, current_declarative_workflow_definition,
-    decision_validator_for_definition, decision_validator_for_instance,
-    declarative_workflow_definition_for_instance, freeze_workflow_definition_registry,
-    known_workflow_definition_ids, register_declarative_workflow_definitions,
-    register_historical_declarative_workflow_definitions, register_workflow_definition,
-    resolve_declarative_definition, workflow_declarative_definition, workflow_definition,
-    workflow_definition_for_version, workflow_instance_is_declarative, workflow_state_definition,
-    workflow_state_definition_for_instance, workflow_state_definition_for_version,
-    workflow_state_exists, workflow_state_progress_mode, workflow_state_progress_mode_for_version,
-    workflow_state_terminal_state_for_version, workflow_states_for_definition,
-    workflow_terminal_state_names_for_definition, DeclarativeDefinitionPinError,
-    DeclarativeDefinitionResolution, RegisteredWorkflowDefinition, WorkflowDefinitionRegistry,
-    WorkflowProgressMode, WorkflowStateDefinition, WorkflowStateKey,
+    DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, RegisteredWorkflowDefinition,
+    WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowStateDefinition, WorkflowStateKey,
 };
 pub use status::WorkflowCommandStatus;
 pub use store::PromptPayloadIntegrityError;
@@ -222,10 +213,7 @@ pub use submission::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, IssueSubmissionDecisionOutput,
     IssueSubmissionWorkflowAction, SubmissionMode,
 };
-pub use terminal_state::{
-    workflow_terminal_state, workflow_terminal_state_for_instance,
-    workflow_terminal_state_for_version, WorkflowTerminalState,
-};
+pub use terminal_state::WorkflowTerminalState;
 pub use tier_resolution::{resolve_isolation_tier, IsolationTaskMetadata, IsolationTierResolution};
 pub use transcript::{
     prepare_runtime_transcript, runtime_transcript_artifact_ref, runtime_transcript_checksum,

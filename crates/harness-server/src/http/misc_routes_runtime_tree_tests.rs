@@ -1,9 +1,14 @@
 use super::*;
+use harness_core::config::workflow::{
+    DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+};
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeEvent, RuntimeJob, RuntimeKind, WorkflowInstance,
-    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    build_declarative_definition, ActivityArtifact, ActivityResult, RuntimeEvent, RuntimeJob,
+    RuntimeKind, WorkflowDefinitionRegistry, WorkflowInstance, WorkflowSubject,
+    GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use serde_json::json;
+use std::collections::BTreeMap;
 
 fn runtime_job_with_artifacts(artifacts: Vec<ActivityArtifact>) -> RuntimeJob {
     let result = artifacts.into_iter().fold(
@@ -265,4 +270,101 @@ fn runtime_job_has_in_flight_model_turn_ends_after_result_for_latest_turn() {
     ];
 
     assert!(!runtime_job_has_in_flight_model_turn(&job, &events));
+}
+
+#[test]
+fn workflow_summary_projection_preserves_declarative_definition_pins() -> anyhow::Result<()> {
+    let definition_id = "runtime_tree_pinned_summary";
+    let activities = BTreeMap::from([("run".to_string(), WorkflowActivityPolicy::default())]);
+    let old = build_declarative_definition(
+        &WorkflowDefinitionPolicy {
+            id: definition_id.to_string(),
+            initial: "complete".to_string(),
+            states: BTreeMap::from([
+                (
+                    "complete".to_string(),
+                    DeclaredState {
+                        activity: Some("run".to_string()),
+                        on_success: Some("archived".to_string()),
+                        on_failure: Some("failed".to_string()),
+                        ..DeclaredState::default()
+                    },
+                ),
+                (
+                    "blocked".to_string(),
+                    DeclaredState {
+                        progress: Some(DeclaredProgressMode::OperatorGate),
+                        ..DeclaredState::default()
+                    },
+                ),
+            ]),
+            terminal: BTreeMap::from([
+                ("archived".to_string(), "succeeded".to_string()),
+                ("cancelled".to_string(), "cancelled".to_string()),
+                ("failed".to_string(), "failed".to_string()),
+            ]),
+            evidence_required: BTreeMap::new(),
+            recovery_targets: Vec::new(),
+            intake: None,
+        },
+        &activities,
+    )?;
+    let current = build_declarative_definition(
+        &WorkflowDefinitionPolicy {
+            id: definition_id.to_string(),
+            initial: "work".to_string(),
+            states: BTreeMap::from([
+                (
+                    "work".to_string(),
+                    DeclaredState {
+                        activity: Some("run".to_string()),
+                        on_success: Some("complete".to_string()),
+                        on_failure: Some("failed".to_string()),
+                        ..DeclaredState::default()
+                    },
+                ),
+                (
+                    "blocked".to_string(),
+                    DeclaredState {
+                        progress: Some(DeclaredProgressMode::OperatorGate),
+                        ..DeclaredState::default()
+                    },
+                ),
+            ]),
+            terminal: BTreeMap::from([
+                ("cancelled".to_string(), "cancelled".to_string()),
+                ("complete".to_string(), "succeeded".to_string()),
+                ("failed".to_string(), "failed".to_string()),
+            ]),
+            evidence_required: BTreeMap::new(),
+            recovery_targets: Vec::new(),
+            intake: None,
+        },
+        &activities,
+    )?;
+    let mut registry = WorkflowDefinitionRegistry::with_builtins();
+    registry.register_declarative_current(current.clone())?;
+    registry.register_declarative_historical(old.clone())?;
+    let counts = [
+        harness_workflow::runtime::store::WorkflowRuntimeStateCount {
+            definition_id: definition_id.to_string(),
+            definition_version: old.definition_version(),
+            definition_hash: Some(old.definition_hash().to_string()),
+            state: "complete".to_string(),
+            count: 1,
+        },
+        harness_workflow::runtime::store::WorkflowRuntimeStateCount {
+            definition_id: definition_id.to_string(),
+            definition_version: current.definition_version(),
+            definition_hash: Some(current.definition_hash().to_string()),
+            state: "complete".to_string(),
+            count: 1,
+        },
+    ];
+
+    let (statuses, _, _) = workflow_projection_summary_counts(&registry, &counts);
+
+    assert_eq!(statuses.get("done"), Some(&1));
+    assert_eq!(statuses.get("waiting"), Some(&1));
+    Ok(())
 }

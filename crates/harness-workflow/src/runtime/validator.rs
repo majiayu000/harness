@@ -1,11 +1,15 @@
 use super::model::{WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowInstance};
+use super::state_registry::{WorkflowDefinitionRegistry, WorkflowStateDefinition};
 use super::validator_binding::DecisionValidatorBinding;
 use super::validator_progress;
-use chrono::{DateTime, Utc};
+#[cfg(test)]
+use chrono::Utc;
 use harness_core::claim_trust::ClaimTrustLevel;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+#[path = "validator_command_rules.rs"]
+mod command_rules;
 #[path = "validator_evidence.rs"]
 mod evidence_contract;
 #[path = "validator_github_issue_pr.rs"]
@@ -16,6 +20,9 @@ mod hidden_transitions;
 mod prompt_task_validation;
 #[path = "validator_context.rs"]
 mod validation_context;
+
+use command_rules::{is_replan_command, required_command_for_transition};
+pub use validation_context::ValidationContext;
 
 #[cfg(test)]
 #[path = "validator_tests.rs"]
@@ -366,19 +373,6 @@ impl TransitionAllowlist {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ValidationContext {
-    pub actor: String,
-    pub now: DateTime<Utc>,
-    pub resource_budget_available: bool,
-    pub replan_available: bool,
-    pub wait_available: bool,
-    pub allow_terminal_reopen: bool,
-    pub allow_missing_pinned_cancel: bool,
-    pub allow_definition_pin_safety_decision: bool,
-    pub active_dedupe_keys: BTreeSet<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowDecisionRejectionKind {
     WorkflowIdMismatch,
@@ -430,6 +424,7 @@ impl std::error::Error for WorkflowDecisionRejection {}
 #[derive(Debug, Clone)]
 pub struct DecisionValidator {
     allowlist: TransitionAllowlist,
+    states: Vec<WorkflowStateDefinition>,
     kind: DecisionValidatorKind,
     binding: DecisionValidatorBinding,
 }
@@ -448,6 +443,7 @@ impl DecisionValidator {
     pub fn new(allowlist: TransitionAllowlist) -> Self {
         Self {
             allowlist,
+            states: Vec::new(),
             kind: DecisionValidatorKind::Generic,
             binding: DecisionValidatorBinding::unbound(),
         }
@@ -459,8 +455,9 @@ impl DecisionValidator {
         definition_version: u32,
         definition_hash: &str,
         allowlist: TransitionAllowlist,
+        states: Vec<WorkflowStateDefinition>,
     ) -> Self {
-        let mut validator = Self::for_definition(definition_id, allowlist);
+        let mut validator = Self::for_definition(definition_id, allowlist, states);
         validator.binding = DecisionValidatorBinding::for_declarative(
             definition_id,
             definition_version,
@@ -475,34 +472,34 @@ impl DecisionValidator {
     }
 
     pub fn github_issue_pr() -> Self {
-        super::state_registry::decision_validator_for_definition(
-            super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID,
-        )
-        .expect("built-in github_issue_pr workflow definition must be registered")
+        WorkflowDefinitionRegistry::with_builtins()
+            .decision_validator_for_definition(super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID)
+            .expect("built-in github_issue_pr workflow definition must be registered")
     }
 
     pub fn quality_gate() -> Self {
-        super::state_registry::decision_validator_for_definition(
-            super::quality_gate::QUALITY_GATE_DEFINITION_ID,
-        )
-        .expect("built-in quality_gate workflow definition must be registered")
+        WorkflowDefinitionRegistry::with_builtins()
+            .decision_validator_for_definition(super::quality_gate::QUALITY_GATE_DEFINITION_ID)
+            .expect("built-in quality_gate workflow definition must be registered")
     }
 
     pub fn pr_feedback() -> Self {
-        super::state_registry::decision_validator_for_definition(
-            super::pr_feedback::PR_FEEDBACK_DEFINITION_ID,
-        )
-        .expect("built-in pr_feedback workflow definition must be registered")
+        WorkflowDefinitionRegistry::with_builtins()
+            .decision_validator_for_definition(super::pr_feedback::PR_FEEDBACK_DEFINITION_ID)
+            .expect("built-in pr_feedback workflow definition must be registered")
     }
 
     pub fn prompt_task() -> Self {
-        super::state_registry::decision_validator_for_definition(
-            super::prompt_task::PROMPT_TASK_DEFINITION_ID,
-        )
-        .expect("built-in prompt_task workflow definition must be registered")
+        WorkflowDefinitionRegistry::with_builtins()
+            .decision_validator_for_definition(super::prompt_task::PROMPT_TASK_DEFINITION_ID)
+            .expect("built-in prompt_task workflow definition must be registered")
     }
 
-    pub(crate) fn for_definition(definition_id: &str, allowlist: TransitionAllowlist) -> Self {
+    pub(crate) fn for_definition(
+        definition_id: &str,
+        allowlist: TransitionAllowlist,
+        states: Vec<WorkflowStateDefinition>,
+    ) -> Self {
         let kind = match definition_id {
             super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidatorKind::GithubIssuePr,
             super::prompt_task::PROMPT_TASK_DEFINITION_ID => DecisionValidatorKind::PromptTask,
@@ -510,6 +507,7 @@ impl DecisionValidator {
         };
         Self {
             allowlist,
+            states,
             kind,
             binding: DecisionValidatorBinding::for_definition(definition_id),
         }
@@ -541,7 +539,9 @@ impl DecisionValidator {
             ));
         }
 
-        if instance.is_terminal()
+        if self
+            .state_definition(&instance.state)
+            .is_some_and(|state| state.terminal_state.is_some())
             && decision.next_state != instance.state
             && !context.allow_terminal_reopen
         {
@@ -603,6 +603,7 @@ impl DecisionValidator {
         self.validate_commands(rule, decision, context)?;
         validator_progress::validate_required_evidence(rule, decision)?;
         validator_progress::validate_target_progress_contract_with_override(
+            self.state_definition(&decision.next_state),
             instance,
             decision,
             context.allow_missing_pinned_cancel,
@@ -615,6 +616,12 @@ impl DecisionValidator {
         from_state: &'a str,
     ) -> impl Iterator<Item = &'a TransitionRule> + 'a {
         self.allowlist.rules_from(from_state)
+    }
+
+    pub(super) fn state_definition(&self, state: &str) -> Option<&WorkflowStateDefinition> {
+        self.states
+            .iter()
+            .find(|definition| definition.key.state.as_ref() == state)
     }
 
     fn validate_commands(
@@ -780,26 +787,5 @@ impl DecisionValidator {
         }
 
         Ok(())
-    }
-}
-
-fn is_replan_command(command: &WorkflowCommand) -> bool {
-    command.activity_name() == Some("replan_issue")
-}
-
-fn required_command_for_transition(
-    from_state: &str,
-    to_state: &str,
-) -> Option<WorkflowCommandType> {
-    match (from_state, to_state) {
-        (from_state, "pr_open") if from_state != "pr_open" => Some(WorkflowCommandType::BindPr),
-        ("idle", "scanning") => Some(WorkflowCommandType::EnqueueActivity),
-        ("scanning", "planning_batch") => Some(WorkflowCommandType::EnqueueActivity),
-        ("planning_batch", "dispatching") => Some(WorkflowCommandType::StartChildWorkflow),
-        (_, "done") => Some(WorkflowCommandType::MarkDone),
-        (_, "blocked") => Some(WorkflowCommandType::MarkBlocked),
-        (_, "failed") => Some(WorkflowCommandType::MarkFailed),
-        (_, "cancelled") => Some(WorkflowCommandType::MarkCancelled),
-        _ => None,
     }
 }

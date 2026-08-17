@@ -59,9 +59,12 @@ async fn declarative_recovery_is_atomic_and_persists_exact_driver_status() -> an
     }
 
     let definition = declarative_recovery_definition()?;
-    super::register_declarative_workflow_definitions([definition.clone()])?;
+    let mut registry = crate::runtime::WorkflowDefinitionRegistry::with_builtins();
+    registry.register_declarative_current(definition.clone())?;
     let dir = tempfile::tempdir()?;
-    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db"))
+        .await?
+        .with_definition_registry(registry.into_shared());
     let blocked = |id: &str| {
         WorkflowInstance::new(
             definition.policy().id.clone(),

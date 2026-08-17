@@ -85,7 +85,7 @@ pub(super) async fn emit_runtime_job_trajectory_completion(
         }
     }
 
-    if workflow.is_terminal() {
+    if workflow.is_terminal_with_registry(store.definition_registry()) {
         state
             .observability
             .events

@@ -9,15 +9,13 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::Arc;
 
 mod builtins;
 mod evidence_policy;
 mod versioning;
 
 use self::builtins::{builtin_definitions, builtin_registered_definitions};
-
-pub use evidence_policy::{apply_builtin_evidence_enforcement, transition_requires_evidence};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclarativeDefinitionPinError {
@@ -156,7 +154,7 @@ impl WorkflowDefinitionRegistry {
         }
     }
 
-    fn with_builtins() -> Self {
+    pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         if let Err(error) = registry.register_declarative_current_batch(builtin_definitions()) {
             panic!("built-in workflow definitions must be unique and valid: {error}");
@@ -241,6 +239,13 @@ impl WorkflowDefinitionRegistry {
         self.frozen
     }
 
+    /// Freeze this registry and return the immutable handle shared by a
+    /// workflow runtime. Runtime lookups never acquire a blocking lock.
+    pub fn into_shared(mut self) -> Arc<Self> {
+        self.freeze();
+        Arc::new(self)
+    }
+
     pub fn definition(&self, definition_id: &str) -> Option<Arc<RegisteredWorkflowDefinition>> {
         self.definitions.get(definition_id).cloned()
     }
@@ -250,7 +255,11 @@ impl WorkflowDefinitionRegistry {
         definition_id: &str,
     ) -> Option<DecisionValidator> {
         self.definition(definition_id).map(|definition| {
-            DecisionValidator::for_definition(definition_id, definition.allowlist.clone())
+            DecisionValidator::for_definition(
+                definition_id,
+                definition.allowlist.clone(),
+                definition.states.clone(),
+            )
         })
     }
 
@@ -271,6 +280,7 @@ impl WorkflowDefinitionRegistry {
                     definition.definition_version(),
                     definition.definition_hash(),
                     definition.registered().allowlist.clone(),
+                    definition.registered().states.clone(),
                 )))
             }
             DeclarativeDefinitionResolution::PinError(error) => Err(error),
@@ -284,7 +294,113 @@ impl WorkflowDefinitionRegistry {
         self.definition_ids.clone()
     }
 
-    fn terminal_state_selectors(&self, definition_id: &str) -> Vec<WorkflowTerminalStateSelector> {
+    pub fn declarative_definition_for_instance(
+        &self,
+        instance: &WorkflowInstance,
+    ) -> Option<Arc<DeclarativeWorkflowDefinition>> {
+        match self.resolve_declarative_definition(instance) {
+            DeclarativeDefinitionResolution::Resolved(definition) => Some(definition),
+            DeclarativeDefinitionResolution::NotDeclarative
+            | DeclarativeDefinitionResolution::PinError(_) => None,
+        }
+    }
+
+    pub fn instance_is_declarative(&self, instance: &WorkflowInstance) -> bool {
+        !matches!(
+            self.resolve_declarative_definition(instance),
+            DeclarativeDefinitionResolution::NotDeclarative
+        )
+    }
+
+    pub fn states_for_definition(&self, definition_id: &str) -> Vec<WorkflowStateDefinition> {
+        self.definition(definition_id)
+            .map(|definition| definition.states.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn terminal_state_names_for_definition(&self, definition_id: &str) -> Vec<String> {
+        self.definition(definition_id)
+            .map(|definition| {
+                definition
+                    .states
+                    .iter()
+                    .filter(|state| state.terminal_state.is_some())
+                    .map(|state| state.key.state.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn state_definition(
+        &self,
+        definition_id: &str,
+        state: &str,
+    ) -> Option<WorkflowStateDefinition> {
+        self.definition(definition_id).and_then(|definition| {
+            definition
+                .states
+                .iter()
+                .find(|definition| definition.key.state.as_ref() == state)
+                .cloned()
+        })
+    }
+
+    pub fn state_exists(&self, definition_id: &str, state: &str) -> bool {
+        self.state_definition(definition_id, state).is_some()
+    }
+
+    pub fn state_terminal_state(
+        &self,
+        definition_id: &str,
+        state: &str,
+    ) -> Option<WorkflowTerminalState> {
+        self.state_definition(definition_id, state)?.terminal_state
+    }
+
+    pub fn state_progress_mode(
+        &self,
+        definition_id: &str,
+        state: &str,
+    ) -> Option<WorkflowProgressMode> {
+        self.state_definition(definition_id, state)?.progress_mode
+    }
+
+    pub fn state_progress_mode_for_version(
+        &self,
+        definition_id: &str,
+        definition_version: u32,
+        state: &str,
+    ) -> Option<WorkflowProgressMode> {
+        self.state_definition_for_version(definition_id, definition_version, state)?
+            .progress_mode
+    }
+
+    pub fn state_terminal_state_for_version(
+        &self,
+        definition_id: &str,
+        definition_version: u32,
+        state: &str,
+    ) -> Option<WorkflowTerminalState> {
+        self.state_definition_for_version(definition_id, definition_version, state)?
+            .terminal_state
+    }
+
+    pub fn terminal_state_for_instance(
+        &self,
+        instance: &WorkflowInstance,
+    ) -> Option<WorkflowTerminalState> {
+        self.state_definition_for_instance(instance, &instance.state)?
+            .terminal_state
+    }
+
+    pub fn instance_is_terminal(&self, instance: &WorkflowInstance) -> bool {
+        self.terminal_state_for_instance(instance).is_some()
+    }
+
+    pub(super) fn terminal_state_selectors(
+        &self,
+        definition_id: &str,
+    ) -> Vec<WorkflowTerminalStateSelector> {
         if is_builtin_definition_id(definition_id) {
             if let Some(definition) = self.definition(definition_id) {
                 return definition
@@ -336,7 +452,7 @@ impl WorkflowDefinitionRegistry {
         selectors
     }
 
-    fn progress_state_selectors(
+    pub(super) fn progress_state_selectors(
         &self,
         definition_id: &str,
         progress_mode: WorkflowProgressMode,
@@ -400,237 +516,6 @@ impl Default for WorkflowDefinitionRegistry {
     fn default() -> Self {
         Self::new()
     }
-}
-
-static REGISTRY: OnceLock<RwLock<WorkflowDefinitionRegistry>> = OnceLock::new();
-
-fn registry() -> &'static RwLock<WorkflowDefinitionRegistry> {
-    REGISTRY.get_or_init(|| RwLock::new(WorkflowDefinitionRegistry::with_builtins()))
-}
-
-pub fn register_workflow_definition(
-    definition: RegisteredWorkflowDefinition,
-) -> anyhow::Result<()> {
-    registry()
-        .write()
-        .expect("workflow definition registry lock poisoned")
-        .register(definition)
-}
-
-pub fn register_declarative_workflow_definitions(
-    definitions: impl IntoIterator<Item = DeclarativeWorkflowDefinition>,
-) -> anyhow::Result<()> {
-    registry()
-        .write()
-        .expect("workflow definition registry lock poisoned")
-        .register_declarative_current_batch(definitions)
-}
-
-pub fn register_historical_declarative_workflow_definitions(
-    definitions: impl IntoIterator<Item = DeclarativeWorkflowDefinition>,
-) -> anyhow::Result<()> {
-    registry()
-        .write()
-        .expect("workflow definition registry lock poisoned")
-        .register_declarative_historical_batch(definitions)
-}
-
-pub fn freeze_workflow_definition_registry() {
-    registry()
-        .write()
-        .expect("workflow definition registry lock poisoned")
-        .freeze();
-}
-
-pub fn workflow_definition(definition_id: &str) -> Option<Arc<RegisteredWorkflowDefinition>> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .definition(definition_id)
-}
-
-pub fn workflow_declarative_definition(
-    definition_id: &str,
-    definition_version: u32,
-) -> Option<Arc<DeclarativeWorkflowDefinition>> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .declarative_definition(definition_id, definition_version)
-}
-
-pub fn current_declarative_workflow_definition(
-    definition_id: &str,
-) -> Option<Arc<DeclarativeWorkflowDefinition>> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .current_declarative_definition(definition_id)
-}
-
-pub fn declarative_workflow_definition_for_instance(
-    instance: &WorkflowInstance,
-) -> Option<Arc<DeclarativeWorkflowDefinition>> {
-    match resolve_declarative_definition(instance) {
-        DeclarativeDefinitionResolution::Resolved(definition) => Some(definition),
-        DeclarativeDefinitionResolution::NotDeclarative
-        | DeclarativeDefinitionResolution::PinError(_) => None,
-    }
-}
-
-pub fn workflow_instance_is_declarative(instance: &WorkflowInstance) -> bool {
-    !matches!(
-        resolve_declarative_definition(instance),
-        DeclarativeDefinitionResolution::NotDeclarative
-    )
-}
-
-pub fn workflow_definition_for_version(
-    definition_id: &str,
-    definition_version: u32,
-) -> Option<Arc<RegisteredWorkflowDefinition>> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .definition_for_version(definition_id, definition_version)
-}
-
-pub fn decision_validator_for_definition(definition_id: &str) -> Option<DecisionValidator> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .decision_validator_for_definition(definition_id)
-}
-
-pub fn resolve_declarative_definition(
-    instance: &WorkflowInstance,
-) -> DeclarativeDefinitionResolution {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .resolve_declarative_definition(instance)
-}
-
-pub fn decision_validator_for_instance(
-    instance: &WorkflowInstance,
-) -> Result<Option<DecisionValidator>, DeclarativeDefinitionPinError> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .decision_validator_for_instance(instance)
-}
-
-pub fn known_workflow_definition_ids() -> Vec<String> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .known_definition_ids()
-}
-
-pub fn workflow_states_for_definition(definition_id: &str) -> Vec<WorkflowStateDefinition> {
-    workflow_definition(definition_id)
-        .map(|definition| definition.states.clone())
-        .unwrap_or_default()
-}
-
-pub fn workflow_terminal_state_names_for_definition(definition_id: &str) -> Vec<String> {
-    workflow_definition(definition_id)
-        .map(|definition| {
-            definition
-                .states
-                .iter()
-                .filter(|state| state.terminal_state.is_some())
-                .map(|state| state.key.state.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-pub(super) fn workflow_terminal_state_selectors_for_definition(
-    definition_id: &str,
-) -> Vec<WorkflowTerminalStateSelector> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .terminal_state_selectors(definition_id)
-}
-
-pub(super) fn workflow_progress_state_selectors_for_definition(
-    definition_id: &str,
-    progress_mode: WorkflowProgressMode,
-) -> Vec<WorkflowProgressStateSelector> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .progress_state_selectors(definition_id, progress_mode)
-}
-
-pub fn workflow_state_definition(
-    definition_id: &str,
-    state: &str,
-) -> Option<WorkflowStateDefinition> {
-    workflow_definition(definition_id).and_then(|definition| {
-        definition
-            .states
-            .iter()
-            .find(|definition| definition.key.state.as_ref() == state)
-            .cloned()
-    })
-}
-
-pub fn workflow_state_definition_for_version(
-    definition_id: &str,
-    definition_version: u32,
-    state: &str,
-) -> Option<WorkflowStateDefinition> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .state_definition_for_version(definition_id, definition_version, state)
-}
-
-pub fn workflow_state_definition_for_instance(
-    instance: &WorkflowInstance,
-    state: &str,
-) -> Option<WorkflowStateDefinition> {
-    registry()
-        .read()
-        .expect("workflow definition registry lock poisoned")
-        .state_definition_for_instance(instance, state)
-}
-
-pub fn workflow_state_exists(definition_id: &str, state: &str) -> bool {
-    workflow_state_definition(definition_id, state).is_some()
-}
-
-pub fn workflow_state_terminal_state(
-    definition_id: &str,
-    state: &str,
-) -> Option<WorkflowTerminalState> {
-    workflow_state_definition(definition_id, state)?.terminal_state
-}
-
-pub fn workflow_state_progress_mode(
-    definition_id: &str,
-    state: &str,
-) -> Option<WorkflowProgressMode> {
-    workflow_state_definition(definition_id, state)?.progress_mode
-}
-
-pub fn workflow_state_progress_mode_for_version(
-    definition_id: &str,
-    definition_version: u32,
-    state: &str,
-) -> Option<WorkflowProgressMode> {
-    workflow_state_definition_for_version(definition_id, definition_version, state)?.progress_mode
-}
-
-pub fn workflow_state_terminal_state_for_version(
-    definition_id: &str,
-    definition_version: u32,
-    state: &str,
-) -> Option<WorkflowTerminalState> {
-    workflow_state_definition_for_version(definition_id, definition_version, state)?.terminal_state
 }
 
 fn is_builtin_definition_id(definition_id: &str) -> bool {

@@ -192,7 +192,10 @@ pub(super) async fn cleanup_terminal_runtime_workspace(
     state: &AppState,
     workflow: &WorkflowInstance,
 ) -> anyhow::Result<()> {
-    if !workflow.is_terminal() {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return Ok(());
+    };
+    if !workflow.is_terminal_with_registry(store.definition_registry()) {
         return Ok(());
     }
     let Some(workspace_mgr) = state.concurrency.workspace_mgr.as_ref() else {

@@ -10,6 +10,7 @@ use super::model::{
 use super::status::WorkflowCommandStatus;
 use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
 use super::transcript::PendingRuntimeTranscript;
+use super::WorkflowDefinitionRegistry;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
@@ -19,6 +20,7 @@ use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 #[path = "store/activity_completion.rs"]
 mod activity_completion;
@@ -52,6 +54,8 @@ mod evidence;
 mod instance_helpers;
 #[path = "store/instances.rs"]
 mod instances;
+#[path = "store/instances_retention.rs"]
+mod instances_retention;
 #[path = "store/lock_order.rs"]
 mod lock_order;
 #[path = "store/lock_order_tests.rs"]
@@ -89,12 +93,14 @@ mod transaction_helpers;
 mod transition_validation;
 pub use child_instance_start::{WorkflowChildStart, WorkflowChildStartOutcome};
 pub use command_facade::DispatchPoolSnapshot;
+pub(in crate::runtime) use command_store::terminal_command_status;
 pub use coverage_recovery::{
     WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
     WorkflowCoverageRecoveryTransition,
 };
 pub(in crate::runtime) use decision_provenance::insert_decision_record_once_tx;
 pub use decision_provenance::DecisionProvenanceConflict;
+pub(in crate::runtime) use definitions::terminal_state_for_instance_tx;
 pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProvenanceStatus};
 pub use evidence::{
     WorkflowRunEvidence, WorkflowRunEvidenceExport, WorkflowRunEvidenceInput,
@@ -132,6 +138,7 @@ pub(super) use transaction_helpers::{enum_str, insert_event_tx, to_jsonb_string}
 #[derive(Clone)]
 pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,
+    pub(super) definition_registry: Arc<WorkflowDefinitionRegistry>,
     /// Hard workflow budget ceiling policy (GH-1770 spec §4.4), applied when a
     /// completed activity commits its decision. Defaults to shadow enforcement
     /// so a store opened without explicit wiring only records decisions.
@@ -189,6 +196,8 @@ pub struct WorkflowSubmissionHourlyDone {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowRuntimeStateCount {
     pub definition_id: String,
+    pub definition_version: u32,
+    pub definition_hash: Option<String>,
     pub state: String,
     pub count: usize,
 }
@@ -330,6 +339,7 @@ impl WorkflowRuntimeStore {
             .await?;
         Ok(Self {
             pool,
+            definition_registry: WorkflowDefinitionRegistry::with_builtins().into_shared(),
             budget_policy: RuntimeBudgetPolicy::default(),
         })
     }
@@ -343,6 +353,7 @@ impl WorkflowRuntimeStore {
             .await?;
         Ok(Self {
             pool,
+            definition_registry: WorkflowDefinitionRegistry::with_builtins().into_shared(),
             budget_policy: RuntimeBudgetPolicy::default(),
         })
     }
@@ -355,6 +366,7 @@ impl WorkflowRuntimeStore {
             .await?;
         Ok(Self {
             pool,
+            definition_registry: WorkflowDefinitionRegistry::with_builtins().into_shared(),
             budget_policy: RuntimeBudgetPolicy::default(),
         })
     }
@@ -368,6 +380,7 @@ impl WorkflowRuntimeStore {
         .await?;
         Ok(Self {
             pool,
+            definition_registry: WorkflowDefinitionRegistry::with_builtins().into_shared(),
             budget_policy: RuntimeBudgetPolicy::default(),
         })
     }
@@ -376,6 +389,19 @@ impl WorkflowRuntimeStore {
     pub fn with_budget_policy(mut self, budget_policy: RuntimeBudgetPolicy) -> Self {
         self.budget_policy = budget_policy;
         self
+    }
+    /// Inject the immutable definition universe used by this runtime store.
+    /// The handle is built and frozen during startup, before the store is
+    /// shared with workers.
+    pub fn with_definition_registry(
+        mut self,
+        definition_registry: Arc<WorkflowDefinitionRegistry>,
+    ) -> Self {
+        self.definition_registry = definition_registry;
+        self
+    }
+    pub fn definition_registry(&self) -> &WorkflowDefinitionRegistry {
+        &self.definition_registry
     }
     /// The wired budget policy, so mid-turn enforcement (the GH-1770 §4.3
     /// turn-stream watchdog) applies the same ceiling as the dispatch gate and

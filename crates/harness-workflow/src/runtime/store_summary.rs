@@ -41,24 +41,37 @@ async fn workflow_states_for_instances(
     store: &WorkflowRuntimeStore,
     project_id: Option<&str>,
 ) -> anyhow::Result<Vec<WorkflowRuntimeStateCount>> {
-    let rows: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT definition_id, state, COUNT(*)
+    let rows: Vec<(String, i64, Option<String>, String, i64)> = sqlx::query_as(
+        "SELECT definition_id,
+                (data->>'definition_version')::bigint,
+                NULLIF(BTRIM(data->'data'->>'definition_hash'), ''),
+                state,
+                COUNT(*)
          FROM workflow_instances
          WHERE ($1::text IS NULL OR data->'data'->>'project_id' = $1)
-         GROUP BY definition_id, state
-         ORDER BY definition_id ASC, state ASC",
+         GROUP BY 1, 2, 3, 4
+         ORDER BY 1 ASC, 2 ASC, 3 ASC NULLS FIRST, 4 ASC",
     )
     .bind(project_id)
     .fetch_all(store.pool())
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(definition_id, state, count)| WorkflowRuntimeStateCount {
-            definition_id,
-            state,
-            count: count.max(0) as usize,
-        })
-        .collect())
+    rows.into_iter()
+        .map(
+            |(definition_id, definition_version, definition_hash, state, count)| {
+                Ok(WorkflowRuntimeStateCount {
+                    definition_id,
+                    definition_version: u32::try_from(definition_version).map_err(|_| {
+                        anyhow::anyhow!(
+                        "workflow summary contains invalid definition version {definition_version}"
+                    )
+                    })?,
+                    definition_hash,
+                    state,
+                    count: count.max(0) as usize,
+                })
+            },
+        )
+        .collect()
 }
 
 async fn command_statuses_for_instances(
@@ -251,6 +264,8 @@ mod tests {
             summary.workflow_states,
             vec![WorkflowRuntimeStateCount {
                 definition_id: "github_issue_pr".to_string(),
+                definition_version: 1,
+                definition_hash: None,
                 state: "implementing".to_string(),
                 count: 1,
             }]

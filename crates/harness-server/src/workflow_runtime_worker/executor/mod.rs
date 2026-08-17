@@ -2,7 +2,9 @@ use crate::http::AppState;
 use harness_core::agent::AGENT_OUTPUT_SCHEMA_PATH_ENV;
 use harness_core::config::workflow::WorkflowConfig;
 use harness_core::types::AgentId;
-use harness_workflow::runtime::{ActivityArtifact, ActivityResult, RuntimeJob, WorkflowInstance};
+use harness_workflow::runtime::{
+    ActivityArtifact, ActivityResult, RuntimeJob, WorkflowInstance, WorkflowTerminalState,
+};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::{
@@ -73,14 +75,29 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
     pub(super) async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
         let workflow = super::job_context::workflow_for_job(self.state, &job).await?;
         if let Some(workflow) = workflow.as_ref() {
-            if workflow.is_terminal() {
-                return Ok(ActivityResult::cancelled(
-                    activity_name(&job),
-                    format!(
-                        "Workflow {} was already terminal ({}) before runtime execution.",
-                        workflow.id, workflow.state
-                    ),
-                ));
+            let store = self
+                .state
+                .core
+                .workflow_runtime_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("workflow runtime store is unavailable"))?;
+            if let Some(terminal_state) = store.terminal_state_for_instance(workflow).await? {
+                let activity = activity_name(&job);
+                let summary = format!(
+                    "Workflow {} was already terminal ({}) before runtime execution.",
+                    workflow.id, workflow.state
+                );
+                return Ok(match terminal_state {
+                    WorkflowTerminalState::Cancelled => {
+                        ActivityResult::cancelled(activity, summary)
+                    }
+                    WorkflowTerminalState::Failed => {
+                        ActivityResult::failed(activity, summary, "workflow already failed")
+                    }
+                    WorkflowTerminalState::Succeeded => {
+                        ActivityResult::succeeded(activity, summary)
+                    }
+                });
             }
         }
         let _queue_permit = super::runtime_execution_queue::acquire_runtime_execution_queue_permit(
@@ -150,6 +167,12 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             )
             .await;
             let prompt_packet = build_runtime_prompt_packet(
+                self.state
+                    .core
+                    .workflow_runtime_store
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("workflow runtime store unavailable"))?
+                    .definition_registry(),
                 &job,
                 workflow.as_ref(),
                 &project_root,

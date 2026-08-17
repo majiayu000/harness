@@ -318,7 +318,7 @@ impl DefaultExecutionService {
         else {
             return Ok(None);
         };
-        if instance.is_terminal() {
+        if instance.is_terminal_with_registry(store.definition_registry()) {
             return Ok(None);
         }
         Ok(workflow_runtime_submission::runtime_issue_task_handle(
@@ -394,6 +394,10 @@ impl DefaultExecutionService {
 
         if let Some(definition_id) = req.definition_id.as_deref() {
             workflow_runtime_submission::resolve_declarative_definition_for_project(
+                self.workflow_runtime_store
+                    .as_ref()
+                    .expect("workflow runtime store checked above")
+                    .definition_registry(),
                 &canonical,
                 definition_id,
             )

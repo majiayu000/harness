@@ -3,7 +3,7 @@ use super::support::{
 };
 use crate::runtime::completion_evidence::{
     server_validation_digest_artifact, server_validation_digest_passed,
-    transition_evidence_enforced, EVIDENCE_SERVER_VALIDATION_DIGEST,
+    transition_evidence_enforced_with_registry, EVIDENCE_SERVER_VALIDATION_DIGEST,
 };
 use crate::runtime::model::{
     ActivityResult, WorkflowDecision, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
@@ -12,9 +12,11 @@ use crate::runtime::quality_gate::{
     QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
     QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
 };
+use crate::runtime::WorkflowDefinitionRegistry;
 use serde_json::Value;
 
 pub(super) fn quality_gate_success_decision(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -23,7 +25,7 @@ pub(super) fn quality_gate_success_decision(
         return None;
     }
 
-    if quality_gate_success_contract_error(result).is_none() {
+    if quality_gate_success_contract_error(registry, result).is_none() {
         return Some(
             WorkflowDecision::new(
                 &instance.id,
@@ -38,13 +40,14 @@ pub(super) fn quality_gate_success_decision(
         );
     }
 
-    let reason = quality_gate_success_contract_error(result)?;
+    let reason = quality_gate_success_contract_error(registry, result)?;
     Some(invalid_agent_output_blocked_decision(
         instance, event, result, reason,
     ))
 }
 
 pub(super) fn parent_quality_gate_pass_decision(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -61,7 +64,7 @@ pub(super) fn parent_quality_gate_pass_decision(
         return None;
     }
 
-    if let Some(reason) = quality_gate_success_contract_error(result) {
+    if let Some(reason) = quality_gate_success_contract_error(registry, result) {
         return Some(invalid_agent_output_blocked_decision(
             instance, event, result, reason,
         ));
@@ -95,7 +98,10 @@ pub(super) fn quality_gate_activity_matches(
     )
 }
 
-pub(super) fn quality_gate_success_contract_error(result: &ActivityResult) -> Option<&'static str> {
+pub(super) fn quality_gate_success_contract_error(
+    registry: &WorkflowDefinitionRegistry,
+    result: &ActivityResult,
+) -> Option<&'static str> {
     let passed = signal_count(result, QUALITY_PASSED_SIGNAL);
     let failed = signal_count(result, QUALITY_FAILED_SIGNAL);
     let blocked = signal_count(result, QUALITY_BLOCKED_SIGNAL);
@@ -108,12 +114,13 @@ pub(super) fn quality_gate_success_contract_error(result: &ActivityResult) -> Op
         Some("run_quality_gate succeeded with ambiguous quality status signals")
     } else if !quality_gate_has_validation_evidence(result) {
         Some("run_quality_gate succeeded without validation evidence")
-    } else if quality_gate_digest_enforced() && server_validation_digest_artifact(result).is_none()
+    } else if quality_gate_digest_enforced(registry)
+        && server_validation_digest_artifact(result).is_none()
     {
         // GH-1766 B-003: an agent QualityPassed claim without a server-side
         // validation re-run does not satisfy the gate.
         Some("run_quality_gate succeeded without a server validation digest; the server must re-execute the validation commands itself")
-    } else if quality_gate_digest_enforced() && !server_validation_digest_passed(result) {
+    } else if quality_gate_digest_enforced(registry) && !server_validation_digest_passed(result) {
         Some("run_quality_gate claimed QualityPassed but the server validation digest records failing or unstarted commands")
     } else {
         None
@@ -123,8 +130,9 @@ pub(super) fn quality_gate_success_contract_error(result: &ActivityResult) -> Op
 /// The transition table is the authority for whether `checking -> passed`
 /// still demands a server validation digest (GH-1815): the deployment-global
 /// kill switch strips the requirement, and this reducer gate lifts with it.
-fn quality_gate_digest_enforced() -> bool {
-    transition_evidence_enforced(
+fn quality_gate_digest_enforced(registry: &WorkflowDefinitionRegistry) -> bool {
+    transition_evidence_enforced_with_registry(
+        registry,
         QUALITY_GATE_DEFINITION_ID,
         "checking",
         "passed",

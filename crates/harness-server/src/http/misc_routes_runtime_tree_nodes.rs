@@ -216,14 +216,29 @@ impl WorkflowRuntimeTreeProjection {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn from_workflow_with_stopped_eligibility(
         workflow: &WorkflowInstance,
         stopped_eligibility: RuntimeStoppedActionEligibility,
     ) -> Self {
-        let projection = RuntimeWorkflowProjection::from_workflow_with_stopped_eligibility(
+        Self::from_workflow_with_registry_and_stopped_eligibility(
+            &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
             workflow,
             stopped_eligibility,
-        );
+        )
+    }
+
+    pub(super) fn from_workflow_with_registry_and_stopped_eligibility(
+        registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
+        workflow: &WorkflowInstance,
+        stopped_eligibility: RuntimeStoppedActionEligibility,
+    ) -> Self {
+        let projection =
+            RuntimeWorkflowProjection::from_workflow_with_registry_and_stopped_eligibility(
+                registry,
+                workflow,
+                stopped_eligibility,
+            );
         let active_bucket = projection.active_bucket().map(runtime_active_bucket_label);
         Self {
             status: projection.task_status,
