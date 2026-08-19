@@ -43,6 +43,66 @@ fn classify_issue_state_preserves_completion_reason() {
     );
 }
 
+#[tokio::test]
+async fn exact_subject_fetch_rejects_identity_or_kind_mismatches() {
+    let _env_guard = crate::workspace::test_support::async_env_lock()
+        .lock()
+        .await;
+
+    let api_base = crate::workspace::test_support::github_state_server(
+        "/repos/owner/repo/issues/7",
+        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo","state":"open"}"#,
+    )
+    .await;
+    let api_guard =
+        crate::workspace::test_support::ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+    assert_eq!(
+        fetch_exact_issue_state_with_token("owner/repo", 7, None).await,
+        GitHubState::Open
+    );
+    drop(api_guard);
+
+    let api_base = crate::workspace::test_support::github_state_server(
+        "/repos/owner/repo/issues/7",
+        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo","state":"open","pull_request":{"url":"https://api.github.test/pulls/7"}}"#,
+    )
+    .await;
+    let api_guard =
+        crate::workspace::test_support::ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+    assert_eq!(
+        fetch_exact_issue_state_with_token("owner/repo", 7, None).await,
+        GitHubState::Unknown,
+        "the GitHub issues endpoint also returns PRs, which are not exact issue matches"
+    );
+    drop(api_guard);
+
+    let api_base = crate::workspace::test_support::github_state_server(
+        "/repos/owner/repo/pulls/11",
+        r#"{"number":12,"state":"open","merged_at":null,"base":{"repo":{"full_name":"owner/repo"}}}"#,
+    )
+    .await;
+    let api_guard =
+        crate::workspace::test_support::ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+    assert_eq!(
+        fetch_exact_pr_state_with_token("owner/repo", 11, None).await,
+        GitHubState::Unknown
+    );
+    drop(api_guard);
+
+    let api_base = crate::workspace::test_support::github_state_server(
+        "/repos/owner/repo/issues/7",
+        r#"{"number":7,"repository_url":"https://api.github.test/repos/other/repo","state":"open"}"#,
+    )
+    .await;
+    let api_guard =
+        crate::workspace::test_support::ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+    assert_eq!(
+        fetch_exact_issue_state_with_token("owner/repo", 7, None).await,
+        GitHubState::Unknown
+    );
+    drop(api_guard);
+}
+
 #[test]
 fn transition_mapping_matches_external_states() {
     assert_eq!(

@@ -39,14 +39,19 @@ pub(super) fn decision_validator_for_instance(
     }
 }
 
-pub(super) async fn apply_decision(
+pub(super) async fn apply_decision<F, Fut>(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
     new_instance: bool,
     mut decision: WorkflowDecision,
     ctx: &IssueSubmissionRuntimeContext<'_>,
     accepted_data: serde_json::Value,
-) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
+    admission: F,
+) -> anyhow::Result<WorkflowSubmissionRuntimeRecord>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let validation_context = if instance.is_terminal_with_registry(store.definition_registry()) {
         ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
     } else {
@@ -88,6 +93,7 @@ pub(super) async fn apply_decision(
             } else {
                 None
             };
+            admission().await?;
             let outcome = store
                 .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
                     workflow_id: &instance.id,
@@ -128,6 +134,7 @@ pub(super) async fn apply_decision(
         accepted_data,
         preserves_applied_instance(&instance, existing_record.as_ref()),
     )?;
+    admission().await?;
     let outcome = store
         .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
             workflow_id: &instance.id,

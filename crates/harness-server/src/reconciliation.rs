@@ -31,6 +31,7 @@ use self::reconciliation_github::{
     classify_issue_state, classify_pr_state, GitHubIssueState, GitHubPullState,
 };
 pub(crate) use self::reconciliation_github::{
+    fetch_exact_issue_state_with_token, fetch_exact_pr_state_with_token,
     fetch_issue_state_with_token, fetch_pr_state_by_slug_with_token, github_api_base_url,
     GitHubState,
 };

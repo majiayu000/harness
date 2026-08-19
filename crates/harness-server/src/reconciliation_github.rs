@@ -20,10 +20,39 @@ pub(super) struct GitHubPullState {
 }
 
 #[derive(Debug, Deserialize)]
+struct ExactGitHubPullState {
+    number: u64,
+    state: String,
+    merged_at: Option<String>,
+    base: ExactGitHubPullBase,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExactGitHubPullBase {
+    repo: ExactGitHubRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExactGitHubRepository {
+    full_name: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub(super) struct GitHubIssueState {
     pub(super) state: String,
     #[serde(default)]
     pub(super) state_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExactGitHubIssueState {
+    number: u64,
+    repository_url: String,
+    state: String,
+    #[serde(default)]
+    state_reason: Option<String>,
+    #[serde(default)]
+    pull_request: Option<serde_json::Value>,
 }
 
 pub(crate) use crate::github_client::github_api_base_url;
@@ -117,4 +146,60 @@ pub(crate) async fn fetch_issue_state_with_token(
         return GitHubState::Unknown;
     };
     classify_issue_state(&state)
+}
+
+/// Fetch a PR state for admission, rejecting mismatched response identities.
+pub(crate) async fn fetch_exact_pr_state_with_token(
+    repo_slug: &str,
+    pr_num: u64,
+    github_token: Option<&str>,
+) -> GitHubState {
+    let Some(state) = github_get_json::<ExactGitHubPullState>(
+        &format!("/repos/{repo_slug}/pulls/{pr_num}"),
+        github_token,
+    )
+    .await
+    else {
+        return GitHubState::Unknown;
+    };
+    if state.number != pr_num || !state.base.repo.full_name.eq_ignore_ascii_case(repo_slug) {
+        return GitHubState::Unknown;
+    }
+    classify_pr_state(&GitHubPullState {
+        state: state.state,
+        merged_at: state.merged_at,
+    })
+}
+
+/// Fetch an issue state for admission, rejecting PRs returned by the issues API
+/// and mismatched response identities.
+pub(crate) async fn fetch_exact_issue_state_with_token(
+    repo_slug: &str,
+    issue_num: u64,
+    github_token: Option<&str>,
+) -> GitHubState {
+    let Some(state) = github_get_json::<ExactGitHubIssueState>(
+        &format!("/repos/{repo_slug}/issues/{issue_num}"),
+        github_token,
+    )
+    .await
+    else {
+        return GitHubState::Unknown;
+    };
+    if state.number != issue_num
+        || state.pull_request.is_some()
+        || !repository_url_matches_slug(&state.repository_url, repo_slug)
+    {
+        return GitHubState::Unknown;
+    }
+    classify_issue_state(&GitHubIssueState {
+        state: state.state,
+        state_reason: state.state_reason,
+    })
+}
+
+fn repository_url_matches_slug(repository_url: &str, repo_slug: &str) -> bool {
+    repository_url
+        .rsplit_once("/repos/")
+        .is_some_and(|(_, response_slug)| response_slug.eq_ignore_ascii_case(repo_slug))
 }

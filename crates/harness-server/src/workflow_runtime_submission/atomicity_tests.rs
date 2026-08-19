@@ -51,7 +51,16 @@ async fn rejected_new_issue_submission_does_not_persist_live_instance_or_command
         "invalid issue submission transition",
     );
 
-    let result = commit::apply_decision(&store, instance, true, decision, &ctx, json!({})).await?;
+    let result = commit::apply_decision(
+        &store,
+        instance,
+        true,
+        decision,
+        &ctx,
+        json!({}),
+        || async { Ok(()) },
+    )
+    .await?;
 
     assert!(!result.accepted);
     assert!(result.rejection_reason.is_some());

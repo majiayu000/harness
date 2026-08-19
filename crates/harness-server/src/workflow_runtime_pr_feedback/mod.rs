@@ -27,6 +27,7 @@ mod persistence;
 pub(crate) mod pr_detection;
 #[cfg(test)]
 mod pr_lifecycle_persist;
+mod submission_requests;
 mod targets;
 
 use command_state::*;
@@ -39,6 +40,7 @@ use pr_lifecycle_persist::{
 use pr_lifecycle_persist::{
     set_pr_lifecycle_persist_test_failures, PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS,
 };
+use submission_requests::*;
 use targets::*;
 
 #[cfg(test)]
@@ -142,7 +144,7 @@ pub(super) struct ObservedPrFact {
     pub activity_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-fn runtime_task_id_from_instance(instance: &WorkflowInstance) -> String {
+pub(crate) fn runtime_task_id_from_instance(instance: &WorkflowInstance) -> String {
     instance
         .data
         .get("task_id")
@@ -423,10 +425,23 @@ pub(crate) async fn record_pr_merged(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn request_pr_feedback_sweep_for_pr(
     store: &WorkflowRuntimeStore,
     ctx: PrFeedbackSweepRuntimeContext<'_>,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    request_pr_feedback_sweep_for_pr_with_admission(store, ctx, || async { Ok(()) }).await
+}
+
+pub(crate) async fn request_pr_feedback_sweep_for_pr_with_admission<F, Fut>(
+    store: &WorkflowRuntimeStore,
+    ctx: PrFeedbackSweepRuntimeContext<'_>,
+    admission: F,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let PrRuntimeTarget {
         instance,
         new_instance,
@@ -465,7 +480,7 @@ pub(crate) async fn request_pr_feedback_sweep_for_pr(
             task_id: runtime_task_id_from_instance(&instance),
         });
     }
-    persist_local_review_request(store, instance, new_instance).await
+    persist_local_review_request(store, instance, new_instance, admission).await
 }
 
 pub(crate) async fn request_pr_hygiene_repair(
@@ -519,6 +534,18 @@ pub(crate) async fn request_local_review(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    request_local_review_with_admission(store, workflow_id, || async { Ok(()) }).await
+}
+
+pub(crate) async fn request_local_review_with_admission<F, Fut>(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    admission: F,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let Some(instance) = store.get_instance(workflow_id).await? else {
         anyhow::bail!("workflow runtime instance `{workflow_id}` was not found");
     };
@@ -537,7 +564,7 @@ pub(crate) async fn request_local_review(
             task_id,
         });
     }
-    persist_local_review_request(store, instance, false).await
+    persist_local_review_request(store, instance, false, admission).await
 }
 
 pub(crate) async fn request_pr_feedback_sweep(
@@ -552,11 +579,43 @@ pub(crate) async fn request_pr_feedback_sweep(
     .await
 }
 
+pub(crate) async fn request_pr_feedback_sweep_with_admission<F, Fut>(
+    store: &WorkflowRuntimeStore,
+    workflow_id: &str,
+    admission: F,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let latest_pr_fact = latest_observed_pr_fact_for_workflow(store, workflow_id).await?;
+    request_pr_feedback_sweep_with_failed_child_suppression_secs_and_activity(
+        store,
+        workflow_id,
+        DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS,
+        latest_pr_fact,
+        admission,
+    )
+    .await
+}
+
 pub(crate) async fn pr_feedback_driver_command_is_active(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
 ) -> anyhow::Result<bool> {
     command_state::has_active_pr_feedback_driver_command(store, workflow_id).await
+}
+
+pub(crate) async fn pr_feedback_submission_is_active(
+    store: &WorkflowRuntimeStore,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<bool> {
+    if instance.state == "local_review_gate"
+        || has_active_local_review_command(store, &instance.id).await?
+    {
+        return Ok(true);
+    }
+    has_active_pr_feedback_driver_command(store, &instance.id).await
 }
 
 pub(crate) async fn request_pr_feedback_sweep_with_failed_child_suppression_secs(
@@ -570,163 +629,9 @@ pub(crate) async fn request_pr_feedback_sweep_with_failed_child_suppression_secs
         workflow_id,
         failed_child_suppression_secs,
         latest_pr_fact,
+        || async { Ok(()) },
     )
     .await
-}
-
-async fn latest_observed_pr_fact_for_workflow(
-    store: &WorkflowRuntimeStore,
-    workflow_id: &str,
-) -> anyhow::Result<Option<ObservedPrFact>> {
-    let Some(instance) = store.get_instance(workflow_id).await? else {
-        return Ok(None);
-    };
-    latest_observed_pr_fact_for_instance(store, &instance).await
-}
-
-async fn latest_observed_pr_fact_for_instance(
-    store: &WorkflowRuntimeStore,
-    instance: &WorkflowInstance,
-) -> anyhow::Result<Option<ObservedPrFact>> {
-    let Some(repo) = pr_repo_for_fact_lookup(&instance.data) else {
-        return Ok(None);
-    };
-    let Some(pr_number) = instance
-        .data
-        .get("pr_number")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| i64::try_from(value).ok())
-    else {
-        return Ok(None);
-    };
-    Ok(store
-        .get_remote_fact_snapshot("github", &repo, "pull_request", pr_number)
-        .await?
-        .map(|snapshot| ObservedPrFact {
-            fact_hash: snapshot.fact_hash.clone(),
-            activity_at: observed_pr_fact_activity_at(&snapshot),
-        }))
-}
-
-fn pr_repo_for_fact_lookup(data: &serde_json::Value) -> Option<String> {
-    optional_string_field(data, "repo").or_else(|| {
-        optional_string_field(data, "pr_url").and_then(|pr_url| {
-            harness_agents::output_parsing::parse_github_pr_url(pr_url.trim())
-                .map(|(owner, repo, _)| format!("{owner}/{repo}"))
-        })
-    })
-}
-
-fn observed_pr_fact_activity_at(
-    snapshot: &RemoteFactSnapshot,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    ["updated_at", "updatedAt"].into_iter().find_map(|field| {
-        snapshot
-            .facts
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&chrono::Utc))
-    })
-}
-
-async fn request_pr_feedback_sweep_with_failed_child_suppression_secs_and_activity(
-    store: &WorkflowRuntimeStore,
-    workflow_id: &str,
-    failed_child_suppression_secs: u64,
-    latest_pr_fact: Option<ObservedPrFact>,
-) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
-    let Some(instance) = store.get_instance(workflow_id).await? else {
-        anyhow::bail!("workflow runtime instance `{workflow_id}` was not found");
-    };
-    if instance.definition_id != "github_issue_pr" || instance.state != "awaiting_feedback" {
-        return Ok(PrFeedbackSweepRequestOutcome::NotCandidate {
-            workflow_id: instance.id,
-            state: instance.state,
-        });
-    }
-    if has_active_pr_feedback_command_with_activity(
-        store,
-        &instance.id,
-        failed_child_suppression_secs,
-        latest_pr_fact.as_ref().map(|fact| fact.fact_hash.as_str()),
-        latest_pr_fact.as_ref().and_then(|fact| fact.activity_at),
-    )
-    .await?
-    {
-        let task_id = runtime_task_id_from_instance(&instance);
-        return Ok(PrFeedbackSweepRequestOutcome::ActiveCommandExists {
-            workflow_id: instance.id,
-            task_id,
-        });
-    }
-    persist_pr_feedback_sweep_request(store, instance, latest_pr_fact.as_ref()).await
-}
-
-async fn persist_local_review_request(
-    store: &WorkflowRuntimeStore,
-    instance: WorkflowInstance,
-    new_instance: bool,
-) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
-    let workflow_id = instance.id.clone();
-    let task_id = runtime_task_id_from_instance(&instance);
-    let pr_number = required_u64_field(&instance.data, "pr_number")?;
-    let pr_url = optional_string_field(&instance.data, "pr_url");
-    let issue_number = instance
-        .data
-        .get("issue_number")
-        .and_then(|value| value.as_u64());
-    let repo = optional_string_field(&instance.data, "repo");
-    let accepted_data = instance.data.clone();
-    let review_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-    let output = build_local_review_request_decision(
-        &instance,
-        LocalReviewDecisionInput {
-            dedupe_key: &format!("local-review:{}:{review_nonce}", instance.id),
-            pr_number,
-            pr_url: pr_url.as_deref(),
-            issue_number,
-            repo: repo.as_deref(),
-            summary: "Runtime workflow requested local agent review before remote feedback.",
-        },
-    );
-    let event_payload = json!({
-        "issue_number": issue_number,
-        "repo": repo.as_deref(),
-        "pr_number": pr_number,
-        "pr_url": pr_url.as_deref(),
-    });
-    match commit_runtime_decision(
-        store,
-        instance,
-        new_instance,
-        output.decision,
-        "LocalReviewRequested",
-        "workflow_runtime_pr_feedback",
-        event_payload,
-        accepted_data,
-    )
-    .await?
-    {
-        RuntimeDecisionCommitOutcome::Accepted => Ok(PrFeedbackSweepRequestOutcome::Requested {
-            workflow_id,
-            task_id,
-        }),
-        RuntimeDecisionCommitOutcome::Rejected { reason } => {
-            Ok(PrFeedbackSweepRequestOutcome::Rejected {
-                workflow_id,
-                reason,
-            })
-        }
-        RuntimeDecisionCommitOutcome::Stale => {
-            let state = store
-                .get_instance(&workflow_id)
-                .await?
-                .map(|instance| instance.state)
-                .unwrap_or_else(|| "missing".to_string());
-            Ok(PrFeedbackSweepRequestOutcome::NotCandidate { workflow_id, state })
-        }
-    }
 }
 
 pub(crate) fn synthesized_pr_feedback_task_id(
