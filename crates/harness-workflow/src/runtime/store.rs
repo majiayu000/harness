@@ -125,6 +125,7 @@ pub use submission_commit::{
     WorkflowSubmissionPromptPayload,
 };
 pub use submission_instances::WorkflowSubmissionFilter;
+pub(in crate::runtime) use transaction_helpers::fence_terminal_transition_tx;
 #[cfg(test)]
 use transaction_helpers::force_upsert_lifecycle_state_for_test_tx;
 use transaction_helpers::{

@@ -50,14 +50,14 @@ async fn runtime_store_get_instance_by_pr_prefers_issue_bound_workflow() -> anyh
 }
 
 #[tokio::test]
-async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Result<()> {
+async fn runtime_worker_cancels_job_when_workflow_already_done() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = issue_instance("done");
+    let mut instance = issue_instance("implementing");
     store
         .force_upsert_lifecycle_state_for_test(&instance)
         .await?;
@@ -71,6 +71,10 @@ async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Re
         None,
     )
     .await?;
+    instance.state = "done".to_string();
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let worker = RuntimeWorker::new(&store, "runtime-1");
     let executor = CountingRuntimeExecutor {
@@ -78,17 +82,21 @@ async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Re
         calls: calls.clone(),
     };
 
-    let completed = worker
-        .run_once(&executor)
-        .await?
-        .expect("worker should complete stale terminal job");
+    assert!(worker.run_once(&executor).await?.is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(completed.id, job.id);
-    assert_eq!(completed.status, RuntimeJobStatus::Succeeded);
-    let output: ActivityResult =
-        serde_json::from_value(completed.output.expect("activity result output"))?;
-    assert_eq!(output.status, ActivityStatus::Succeeded);
-    assert!(output.summary.contains("already terminal (done)"));
+    let cancelled = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("stale terminal job should remain auditable");
+    assert_eq!(cancelled.status, RuntimeJobStatus::Cancelled);
+    assert_eq!(
+        store
+            .get_command(&job.command_id)
+            .await?
+            .expect("stale terminal command should remain auditable")
+            .status,
+        WorkflowCommandStatus::Cancelled
+    );
     Ok(())
 }
 

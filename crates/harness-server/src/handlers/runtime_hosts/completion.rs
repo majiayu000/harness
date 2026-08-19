@@ -125,45 +125,49 @@ pub async fn complete_runtime_job_for_runtime_host(
     // renewals for the same host. Deregistration can safely revoke the reserved
     // lease, and the fenced completion commit below will then fail closed.
     drop(host_operation);
-    let result = match tokio::time::timeout(
-        Duration::from_secs(COMPLETION_EVIDENCE_TIMEOUT_SECS),
-        crate::workflow_runtime_worker::remote_completion::apply_remote_completion_evidence(
-            &state, &job, result,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => {
-            tracing::error!(
-                host_id = %host_id,
-                runtime_job_id = %runtime_job_id,
-                %error,
-                "runtime host completion evidence verification failed"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                reserved_lease_error_response(
-                    format!("failed to verify runtime completion evidence: {error}"),
-                    completion_lease_expires_at,
-                    completion_lease_generation,
-                ),
-            );
-        }
-        Err(_) => {
-            tracing::error!(
-                host_id = %host_id,
-                runtime_job_id = %runtime_job_id,
-                "runtime host completion evidence verification timed out"
-            );
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                reserved_lease_error_response(
-                    "runtime completion evidence verification timed out",
-                    completion_lease_expires_at,
-                    completion_lease_generation,
-                ),
-            );
+    let result = if cancellation_ack {
+        result
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(COMPLETION_EVIDENCE_TIMEOUT_SECS),
+            crate::workflow_runtime_worker::remote_completion::apply_remote_completion_evidence(
+                &state, &job, result,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    host_id = %host_id,
+                    runtime_job_id = %runtime_job_id,
+                    %error,
+                    "runtime host completion evidence verification failed"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    reserved_lease_error_response(
+                        format!("failed to verify runtime completion evidence: {error}"),
+                        completion_lease_expires_at,
+                        completion_lease_generation,
+                    ),
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    host_id = %host_id,
+                    runtime_job_id = %runtime_job_id,
+                    "runtime host completion evidence verification timed out"
+                );
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    reserved_lease_error_response(
+                        "runtime completion evidence verification timed out",
+                        completion_lease_expires_at,
+                        completion_lease_generation,
+                    ),
+                );
+            }
         }
     };
     let result_payload = match serde_json::to_value(&result) {
@@ -180,17 +184,30 @@ pub async fn complete_runtime_job_for_runtime_host(
         }
     };
 
-    let completion = match store
-        .commit_runtime_activity_completion_with_transcript_if_owned_with_generation(
-            &runtime_job_id,
-            &host_id,
-            completion_lease_expires_at,
-            Some(completion_lease_generation),
-            &result,
-            transcript.as_ref(),
-        )
-        .await
-    {
+    let completion_result = if cancellation_ack {
+        store
+            .commit_cancelled_runtime_activity_completion_with_transcript_if_owned_with_generation(
+                &runtime_job_id,
+                &host_id,
+                completion_lease_expires_at,
+                completion_lease_generation,
+                &result,
+                transcript.as_ref(),
+            )
+            .await
+    } else {
+        store
+            .commit_runtime_activity_completion_with_transcript_if_owned_with_generation(
+                &runtime_job_id,
+                &host_id,
+                completion_lease_expires_at,
+                Some(completion_lease_generation),
+                &result,
+                transcript.as_ref(),
+            )
+            .await
+    };
+    let completion = match completion_result {
         Ok(Some(completion)) => completion,
         Ok(None) => {
             return (

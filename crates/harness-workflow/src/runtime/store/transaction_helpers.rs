@@ -388,6 +388,76 @@ pub(super) async fn commit_decision_instance_tx(
     upsert_instance_row_tx(tx, target).await
 }
 
+pub(in crate::runtime) async fn fence_terminal_transition_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    definition_registry: &WorkflowDefinitionRegistry,
+    target: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    if definitions::terminal_state_for_instance_tx(tx, definition_registry, target)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, status, data::text FROM workflow_commands
+         WHERE workflow_id = $1
+         ORDER BY id
+         FOR UPDATE",
+    )
+    .bind(&target.id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let summary = format!(
+        "Workflow entered terminal state `{}` before the command completed.",
+        target.state
+    );
+    let cancellations = rows
+        .iter()
+        .map(|(command_id, _, data)| {
+            let command: WorkflowCommand = serde_json::from_str(data)?;
+            Ok(runtime_job_state::RuntimeJobCancellation::new(
+                command_id,
+                command.activity_name().unwrap_or("workflow_command"),
+                &summary,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    runtime_job_state::cancel_unfinished_runtime_jobs_for_commands_tx(tx, &cancellations).await?;
+
+    let command_ids = rows
+        .into_iter()
+        .filter(|(_, status, _)| {
+            matches!(
+                status.as_str(),
+                "pending" | "dispatching" | "dispatched" | "deferred"
+            )
+        })
+        .map(|(command_id, _, _)| command_id)
+        .collect::<Vec<_>>();
+    if !command_ids.is_empty() {
+        sqlx::query(
+            "UPDATE workflow_commands
+             SET status = $2,
+                 dispatch_owner = NULL,
+                 dispatch_lease_expires_at = NULL,
+                 dispatch_not_before = NULL,
+                 dispatch_barrier = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ANY($1::text[])",
+        )
+        .bind(&command_ids)
+        .bind(WorkflowCommandStatus::Cancelled.as_str())
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn commit_rejected_initial_failure_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     registry: &crate::runtime::WorkflowDefinitionRegistry,

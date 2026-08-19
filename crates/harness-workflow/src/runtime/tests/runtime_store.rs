@@ -638,7 +638,7 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let terminal_parent = project_issue_instance("/project-a", 401, "done");
+    let mut terminal_parent = project_issue_instance("/project-a", 401, "implementing");
     let terminal_child = quality_gate_instance("passed")
         .with_id("terminal-family-child")
         .with_parent(&terminal_parent.id);
@@ -646,12 +646,7 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
     let active_child = quality_gate_instance("checking")
         .with_id("active-family-child")
         .with_parent(&active_parent.id);
-    for instance in [
-        &terminal_parent,
-        &terminal_child,
-        &active_parent,
-        &active_child,
-    ] {
+    for instance in [&terminal_parent, &active_parent, &active_child] {
         store
             .force_upsert_lifecycle_state_for_test(instance)
             .await?;
@@ -676,6 +671,13 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
         .await?;
     store
         .record_runtime_event(&runtime_job.id, "RuntimePromptPrepared", json!({}))
+        .await?;
+    terminal_parent.state = "done".to_string();
+    store
+        .force_upsert_lifecycle_state_for_test(&terminal_parent)
+        .await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&terminal_child)
         .await?;
     sqlx::query(
         "INSERT INTO workflow_artifacts (id, workflow_id, runtime_job_id, artifact_type, data)

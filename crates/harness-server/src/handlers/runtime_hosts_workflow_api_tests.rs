@@ -744,6 +744,88 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
 }
 
 #[tokio::test]
+async fn runtime_job_completion_preserves_cancelled_eval_feedback_cleanup_proof(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "cancelled-eval-feedback",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+            "command": {
+                "activity": harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+                "eval": {
+                    "eval_run_id": "run-cancelled-feedback",
+                    "case_id": "case-1",
+                    "timeout_secs": 45
+                }
+            }
+        }),
+    )
+    .await?;
+    let claimed = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+    store
+        .cancel_command_and_unfinished_runtime_jobs(
+            &job.command_id,
+            harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+            "operator cancelled eval",
+        )
+        .await?;
+
+    let completed = post_json(
+        &app,
+        format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
+        json!({
+            "lease_generation": claimed["lease_generation"],
+            "lease_expires_at": claimed["lease_expires_at"],
+            "result": ActivityResult::cancelled(
+                harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+                "host stopped and cleaned",
+            ),
+            "execution_evidence": {
+                "checked_out_commit": "",
+                "resource_limit_report": {},
+                "usage": {
+                    "model": "test-model",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "total_tokens": 0,
+                    "cost_usd_micros": 0
+                },
+                "isolation_cleanup_status": "cleaned",
+                "validation": []
+            }
+        }),
+    )
+    .await?;
+
+    assert_eq!(completed["completed"], true);
+    assert_eq!(completed["runtime_job"]["status"], "cancelled");
+    assert!(completed["runtime_job"]["output"]["artifacts"]
+        .as_array()
+        .is_some_and(|artifacts| artifacts.iter().any(|artifact| {
+            artifact["artifact_type"]
+                == harness_workflow::runtime::completion_evidence::ARTIFACT_EVAL_ISOLATION_CLEANUP
+                && artifact["artifact"]["status"] == "cleaned"
+                && artifact["artifact"]["evidence_source"] == "runtime_host_cancellation_ack"
+        })));
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_job_completion_endpoint_rejects_unbound_remote_quality_gate_validation(
 ) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

@@ -629,12 +629,13 @@ async fn store_stopped_failed_command(
     stopped_activity: &str,
     command: &WorkflowCommand,
 ) -> anyhow::Result<WorkflowInstance> {
-    let instance = project_issue_instance("/project-a", issue_number, "failed");
+    let mut instance = project_issue_instance("/project-a", issue_number, "implementing");
     store
         .force_upsert_lifecycle_state_for_test(&instance)
         .await?;
     let (_command_id, runtime_job_id) =
         enqueue_original_runtime_job(store, &instance.id, command).await?;
+    instance.state = "failed".to_string();
     let instance = instance.with_server_data(json!({
         "error_kind": "timeout",
         "last_stop": {

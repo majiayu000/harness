@@ -109,10 +109,10 @@ async fn failed_pr_feedback_child_suppresses_duplicate_feedback_sweep() -> anyho
         "task_id": "task-1",
     }));
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &parent).await?;
-    let child = WorkflowInstance::new(
+    let mut child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
         1,
-        "failed",
+        "pending",
         WorkflowSubject::new("pr", "pr:77"),
     )
     .with_id("pr-feedback-child-failed")
@@ -126,6 +126,8 @@ async fn failed_pr_feedback_child_suppresses_duplicate_feedback_sweep() -> anyho
     store
         .mark_command_status(&child_command_id, WorkflowCommandStatus::Failed)
         .await?;
+    child.state = "failed".to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &child).await?;
 
     assert!(
         has_active_pr_feedback_command(

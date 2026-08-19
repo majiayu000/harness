@@ -704,6 +704,21 @@ async fn authoritative_domain_completion_wins_over_driverless_artifact() -> anyh
     store
         .force_upsert_lifecycle_state_for_test(&instance)
         .await?;
+    let unfinished = WorkflowCommand::enqueue_activity(
+        "inspect_pr_feedback",
+        "issue-closed-domain-unfinished",
+    );
+    let unfinished_command_id = store
+        .enqueue_command(&instance.id, None, &unfinished)
+        .await?;
+    let unfinished_job = store
+        .enqueue_runtime_job(
+            &unfinished_command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "inspect_pr_feedback" }),
+        )
+        .await?;
     let driverless = WorkflowDecision::new(
         &instance.id,
         "implementing",
@@ -760,12 +775,28 @@ async fn authoritative_domain_completion_wins_over_driverless_artifact() -> anyh
     assert_eq!(decisions.len(), 1);
     assert!(decisions[0].accepted);
     let commands = store.commands_for(&instance.id).await?;
-    assert_eq!(commands.len(), 1);
+    assert_eq!(commands.len(), 2);
+    let terminal_marker = commands
+        .iter()
+        .find(|command| command.command.command_type == WorkflowCommandType::MarkDone)
+        .expect("terminal transition should persist its marker");
     assert_eq!(
-        commands[0].command.command_type,
-        WorkflowCommandType::MarkDone
+        terminal_marker.decision_id.as_deref(),
+        Some(record.id.as_str())
     );
-    assert_eq!(commands[0].decision_id.as_deref(), Some(record.id.as_str()));
+    let cancelled = store
+        .get_command(&unfinished_command_id)
+        .await?
+        .expect("unfinished command should remain auditable");
+    assert_eq!(cancelled.status, WorkflowCommandStatus::Cancelled);
+    assert_eq!(
+        store
+            .get_runtime_job(&unfinished_job.id)
+            .await?
+            .expect("unfinished job should remain auditable")
+            .status,
+        RuntimeJobStatus::Cancelled
+    );
     Ok(())
 }
 

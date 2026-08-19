@@ -191,7 +191,7 @@ async fn cancellation_cleanup_honors_marker_bound_to_current_decision() -> anyho
         WorkflowDecisionRecord::accepted(cancellation_decision(&instance.id, &marker), None);
     store.record_decision(&record).await?;
     store
-        .enqueue_command(&instance.id, Some(&record.id), &marker)
+        .enqueue_command_for_test_unchecked(&instance.id, Some(&record.id), &marker)
         .await?;
 
     let stored = store
@@ -223,9 +223,13 @@ async fn cancellation_cleanup_rejects_detached_marker() -> anyhow::Result<()> {
         .await?;
 
     let activity = WorkflowCommand::enqueue_activity("implement", "gh1865-detached-activity");
-    let activity_id = store.enqueue_command(&instance.id, None, &activity).await?;
+    let activity_id = store
+        .enqueue_command_for_test_unchecked(&instance.id, None, &activity)
+        .await?;
     let marker = cancellation_marker("gh1865-cancel-detached-marker");
-    store.enqueue_command(&instance.id, None, &marker).await?;
+    store
+        .enqueue_command_for_test_unchecked(&instance.id, None, &marker)
+        .await?;
 
     let stored = store
         .get_instance(&instance.id)
@@ -273,7 +277,7 @@ async fn cancellation_cleanup_rejects_marker_for_rejected_decision() -> anyhow::
     );
     store.record_decision(&record).await?;
     store
-        .enqueue_command(&instance.id, Some(&record.id), &marker)
+        .enqueue_command_for_test_unchecked(&instance.id, Some(&record.id), &marker)
         .await?;
 
     let stored = store
@@ -310,7 +314,7 @@ async fn cancellation_cleanup_rejects_marker_from_older_generation() -> anyhow::
         WorkflowDecisionRecord::accepted(cancellation_decision(&instance.id, &marker), None);
     store.record_decision(&cancelled_record).await?;
     store
-        .enqueue_command(&instance.id, Some(&cancelled_record.id), &marker)
+        .enqueue_command_for_test_unchecked(&instance.id, Some(&cancelled_record.id), &marker)
         .await?;
 
     // A newer accepted decision reopened the workflow; the instance row in
@@ -363,7 +367,7 @@ async fn cancellation_cleanup_rejects_superseded_marker() -> anyhow::Result<()> 
         WorkflowDecisionRecord::accepted(cancellation_decision(&instance.id, &marker), None);
     store.record_decision(&cancelled_record).await?;
     let marker_id = store
-        .enqueue_command(&instance.id, Some(&cancelled_record.id), &marker)
+        .enqueue_command_for_test_unchecked(&instance.id, Some(&cancelled_record.id), &marker)
         .await?;
 
     // A newer decision reuses the marker's dedupe key for different work,
@@ -384,7 +388,11 @@ async fn cancellation_cleanup_rejects_superseded_marker() -> anyhow::Result<()> 
     replacement_record.created_at = cancelled_record.created_at + chrono::Duration::seconds(1);
     store.record_decision(&replacement_record).await?;
     store
-        .enqueue_command(&instance.id, Some(&replacement_record.id), &replacement)
+        .enqueue_command_for_test_unchecked(
+            &instance.id,
+            Some(&replacement_record.id),
+            &replacement,
+        )
         .await?;
 
     let marker = store
