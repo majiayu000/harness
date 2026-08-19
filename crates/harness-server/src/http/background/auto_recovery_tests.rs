@@ -54,10 +54,11 @@ async fn seed_stopped_instance(
     state: &str,
     data: Value,
 ) -> anyhow::Result<WorkflowInstance> {
+    let target_state = state.to_string();
     let mut workflow = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
-        state,
+        "implementing",
         WorkflowSubject::new("issue", format!("issue:{id}")),
     )
     .with_id(id.to_string())
@@ -84,6 +85,7 @@ async fn seed_stopped_instance(
         last_stop,
         harness_workflow::runtime::DataProvenance::Server,
     )?;
+    workflow.state = target_state;
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     Ok(workflow)
 }
