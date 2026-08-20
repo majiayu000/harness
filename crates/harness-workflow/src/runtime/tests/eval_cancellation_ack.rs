@@ -1,6 +1,7 @@
 use super::*;
 use crate::runtime::store::runtime_job_leases::{
-    RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRejection, RuntimeJobLeaseRenewalRequest,
+    postgres_timestamp_floor, RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRejection,
+    RuntimeJobLeaseRenewalRequest,
 };
 use crate::runtime::RuntimeJobCompletionLease;
 use crate::runtime::{ActivityArtifact, RuntimeJobClaimDeferOutcome};
@@ -43,7 +44,8 @@ async fn running_remote_eval_waits_for_host_cleanup_acknowledgement() -> anyhow:
             json!({"activity": "implement_issue", "command": command.command}),
         )
         .await?;
-    let expires_at = Utc::now() - Duration::seconds(1);
+    let expires_at =
+        postgres_timestamp_floor(Utc::now() - Duration::seconds(1)) + Duration::nanoseconds(999);
     let claimed = store
         .claim_next_runtime_job_for_runtime_kind(RuntimeKind::RemoteHost, "host-1", expires_at)
         .await?

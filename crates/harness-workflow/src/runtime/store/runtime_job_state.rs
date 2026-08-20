@@ -81,6 +81,11 @@ impl WorkflowRuntimeStore {
             return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        let lease_expires_at = if job.runtime_kind == RuntimeKind::RemoteHost {
+            runtime_job_leases::postgres_timestamp_floor(lease_expires_at)
+        } else {
+            lease_expires_at
+        };
         let is_current_lease = job.status == RuntimeJobStatus::Running
             && job
                 .lease
