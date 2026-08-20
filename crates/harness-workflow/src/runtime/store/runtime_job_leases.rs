@@ -18,6 +18,7 @@ pub enum RuntimeJobLeaseRenewalRejection {
     StaleExpiry,
     WrongGeneration,
     WrongOwner,
+    WrongProof,
     WrongRuntimeKind,
     WrongState,
 }
@@ -35,6 +36,7 @@ impl RuntimeJobLeaseRenewalRejection {
             Self::StaleExpiry => "stale_expiry",
             Self::WrongGeneration => "wrong_generation",
             Self::WrongOwner => "wrong_owner",
+            Self::WrongProof => "wrong_proof",
             Self::WrongRuntimeKind => "wrong_runtime_kind",
             Self::WrongState => "wrong_state",
         }
@@ -59,6 +61,7 @@ pub struct RuntimeJobLeaseRenewalRequest<'a> {
     pub runtime_job_id: &'a str,
     pub owner: &'a str,
     pub lease_generation: u64,
+    pub lease_proof: Option<Uuid>,
     pub previous_expires_at: DateTime<Utc>,
     pub renewal_id: Uuid,
     pub lease_secs: i64,
@@ -67,7 +70,7 @@ pub struct RuntimeJobLeaseRenewalRequest<'a> {
     pub owner_active: bool,
 }
 
-type ReceiptRow = (String, DateTime<Utc>, DateTime<Utc>, i64);
+type ReceiptRow = (String, DateTime<Utc>, DateTime<Utc>, i64, bool);
 
 pub fn postgres_timestamp_floor(value: DateTime<Utc>) -> DateTime<Utc> {
     let microsecond_nanos = value.nanosecond() / 1_000 * 1_000;
@@ -84,7 +87,85 @@ pub fn postgres_timestamp_ceil(value: DateTime<Utc>) -> Option<DateTime<Utc>> {
         .map(postgres_timestamp_floor)
 }
 
+/// Mark the current transaction as proof-aware before it mutates a remote
+/// lease. Migration v28 installs a database barrier that rejects lease writes
+/// from older binaries, which cannot return or validate lease proofs.
+pub(crate) async fn mark_remote_lease_proof_v1_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<()> {
+    sqlx::query("SELECT set_config('harness.runtime_job_lease_proof_v1', '1', true)")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 impl WorkflowRuntimeStore {
+    pub async fn remote_runtime_job_lease_proof(
+        &self,
+        runtime_job_id: &str,
+        owner: &str,
+        lease_generation: u64,
+        lease_expires_at: DateTime<Utc>,
+    ) -> anyhow::Result<Option<Uuid>> {
+        let lease_expires_at = postgres_timestamp_floor(lease_expires_at);
+        let generation = i64::try_from(lease_generation)
+            .map_err(|_| anyhow::anyhow!("runtime job lease generation exceeds BIGINT"))?;
+        let row: Option<(Option<Uuid>,)> = sqlx::query_as(
+            "SELECT issuance.lease_proof
+             FROM runtime_job_lease_issuances AS issuance
+             JOIN runtime_jobs AS job ON job.id = issuance.runtime_job_id
+             WHERE issuance.runtime_job_id = $1
+               AND issuance.owner = $2
+               AND issuance.lease_generation = $3
+               AND issuance.lease_expires_at = $4
+               AND job.runtime_kind = 'remote_host'",
+        )
+        .bind(runtime_job_id)
+        .bind(owner)
+        .bind(generation)
+        .bind(lease_expires_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(proof,)| proof))
+    }
+
+    /// Resolve the generation of the one proofless lease that v28 migrated
+    /// from a running v27 host. A missing or ambiguous row fails closed.
+    pub async fn remote_legacy_runtime_job_lease_generation(
+        &self,
+        runtime_job_id: &str,
+        owner: &str,
+        lease_expires_at: DateTime<Utc>,
+    ) -> anyhow::Result<Option<u64>> {
+        let lease_expires_at = postgres_timestamp_floor(lease_expires_at);
+        let generations: Vec<(i64,)> = sqlx::query_as(
+            "SELECT issuance.lease_generation
+             FROM runtime_job_lease_issuances AS issuance
+             JOIN runtime_jobs AS job ON job.id = issuance.runtime_job_id
+             WHERE issuance.runtime_job_id = $1
+               AND issuance.owner = $2
+               AND issuance.lease_expires_at = $3
+               AND issuance.legacy_proofless
+               AND job.runtime_kind = 'remote_host'
+             ORDER BY issuance.lease_generation
+             LIMIT 2",
+        )
+        .bind(runtime_job_id)
+        .bind(owner)
+        .bind(lease_expires_at)
+        .fetch_all(&self.pool)
+        .await?;
+        match generations.as_slice() {
+            [] => Ok(None),
+            [(generation,)] => Ok(Some(u64::try_from(*generation).map_err(|_| {
+                anyhow::anyhow!("legacy runtime job lease generation is negative")
+            })?)),
+            _ => anyhow::bail!(
+                "multiple legacy runtime job lease generations match job {runtime_job_id}"
+            ),
+        }
+    }
+
     pub async fn renew_remote_host_runtime_job_lease(
         &self,
         request: RuntimeJobLeaseRenewalRequest<'_>,
@@ -133,7 +214,7 @@ impl WorkflowRuntimeStore {
             Some(RuntimeJobLeaseRenewalRejection::CancellationRequested)
         } else if cancellation_ack && !cancellation_requested {
             Some(RuntimeJobLeaseRenewalRejection::InvariantViolation)
-        } else if !request.owner_active {
+        } else if !request.owner_active && !cancellation_ack {
             Some(RuntimeJobLeaseRenewalRejection::HostDraining)
         } else if job.status != RuntimeJobStatus::Running {
             Some(RuntimeJobLeaseRenewalRejection::WrongState)
@@ -169,7 +250,8 @@ impl WorkflowRuntimeStore {
             }
         };
         let receipt: Option<ReceiptRow> = sqlx::query_as(
-            "SELECT owner, previous_expires_at, renewed_expires_at, lease_secs
+            "SELECT owner, previous_expires_at, renewed_expires_at, lease_secs,
+                    legacy_proofless
              FROM runtime_job_lease_renewal_receipts
              WHERE runtime_job_id = $1 AND lease_generation = $2 AND renewal_id = $3",
         )
@@ -178,7 +260,14 @@ impl WorkflowRuntimeStore {
         .bind(request.renewal_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((owner, previous_expires_at, renewed_expires_at, lease_secs)) = receipt {
+        if let Some((
+            owner,
+            previous_expires_at,
+            renewed_expires_at,
+            lease_secs,
+            legacy_proofless,
+        )) = receipt
+        {
             if owner != request.owner
                 || previous_expires_at != request_previous_expires_at
                 || lease_secs != request.lease_secs
@@ -190,6 +279,47 @@ impl WorkflowRuntimeStore {
                 )
                 .await;
             }
+            let proof_matches = legacy_proofless && request.lease_proof.is_none()
+                || remote_runtime_job_lease_proof_matches_tx(
+                    &mut tx,
+                    request.runtime_job_id,
+                    request.owner,
+                    request.lease_generation,
+                    request_previous_expires_at,
+                    request.lease_proof,
+                )
+                .await?;
+            if !proof_matches {
+                return reject_renewal_tx(
+                    tx,
+                    &request,
+                    RuntimeJobLeaseRenewalRejection::WrongProof,
+                )
+                .await;
+            }
+            if legacy_proofless {
+                // The receipt proves this is an exact replay of a v27 renewal
+                // whose response may have been lost during migration. Rotate
+                // the currently renewed issuance before returning it so the
+                // v28 response can carry a proof. The receipt remains the
+                // bounded authorization for repeated response-loss retries of
+                // this exact renewal_id; it cannot authorize a new renewal.
+                sqlx::query(
+                    "UPDATE runtime_job_lease_issuances
+                     SET lease_proof = gen_random_uuid()
+                     WHERE runtime_job_id = $1
+                       AND owner = $2
+                       AND lease_generation = $3
+                       AND lease_expires_at = $4
+                       AND lease_proof IS NULL",
+                )
+                .bind(request.runtime_job_id)
+                .bind(request.owner)
+                .bind(generation)
+                .bind(renewed_expires_at)
+                .execute(&mut *tx)
+                .await?;
+            }
             tx.commit().await?;
             return Ok(RuntimeJobLeaseRenewalOutcome::Renewed {
                 lease_generation: job.lease_generation,
@@ -197,6 +327,29 @@ impl WorkflowRuntimeStore {
                 replayed: true,
             });
         }
+
+        let proof_matches = remote_runtime_job_lease_proof_matches_tx(
+            &mut tx,
+            request.runtime_job_id,
+            request.owner,
+            request.lease_generation,
+            request_previous_expires_at,
+            request.lease_proof,
+        )
+        .await?;
+        if !proof_matches {
+            return reject_renewal_tx(tx, &request, RuntimeJobLeaseRenewalRejection::WrongProof)
+                .await;
+        }
+        let legacy_proofless = request.lease_proof.is_none()
+            && remote_runtime_job_lease_is_legacy_tx(
+                &mut tx,
+                request.runtime_job_id,
+                request.owner,
+                request.lease_generation,
+                request_previous_expires_at,
+            )
+            .await?;
 
         let Some(current_expires_at) = job.lease.as_ref().map(|lease| lease.expires_at) else {
             return reject_renewal_tx(tx, &request, RuntimeJobLeaseRenewalRejection::Revoked).await;
@@ -242,7 +395,7 @@ impl WorkflowRuntimeStore {
             )
             .await;
         };
-        if normalized_current_expires_at > max_expires_at {
+        if normalized_current_expires_at > max_expires_at && !legacy_proofless {
             return reject_renewal_tx(
                 tx,
                 &request,
@@ -275,6 +428,7 @@ impl WorkflowRuntimeStore {
         job.updated_at = request.now;
         let updated = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
+        mark_remote_lease_proof_v1_tx(&mut tx).await?;
         sqlx::query(
             "UPDATE runtime_jobs
              SET status = $1, not_before = $2, data = $3::jsonb, updated_at = $4
@@ -287,11 +441,29 @@ impl WorkflowRuntimeStore {
         .bind(request.runtime_job_id)
         .execute(&mut *tx)
         .await?;
+        if legacy_proofless {
+            sqlx::query(
+                "UPDATE runtime_job_lease_issuances
+                 SET lease_proof = gen_random_uuid()
+                 WHERE runtime_job_id = $1
+                   AND owner = $2
+                   AND lease_generation = $3
+                   AND lease_expires_at = $4
+                   AND lease_proof IS NULL",
+            )
+            .bind(request.runtime_job_id)
+            .bind(request.owner)
+            .bind(generation)
+            .bind(request_previous_expires_at)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "INSERT INTO runtime_job_lease_renewal_receipts
                 (runtime_job_id, renewal_id, owner, lease_generation,
-                 previous_expires_at, renewed_expires_at, lease_secs, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 previous_expires_at, renewed_expires_at, lease_secs, created_at,
+                 legacy_proofless)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(request.runtime_job_id)
         .bind(request.renewal_id)
@@ -301,6 +473,7 @@ impl WorkflowRuntimeStore {
         .bind(renewed_expires_at)
         .bind(request.lease_secs)
         .bind(request.now)
+        .bind(legacy_proofless)
         .execute(&mut *tx)
         .await?;
         append_runtime_event_tx(
@@ -344,6 +517,9 @@ impl WorkflowRuntimeStore {
         .fetch_all(&mut *tx)
         .await?;
         let mut revoked = 0;
+        if !rows.is_empty() {
+            mark_remote_lease_proof_v1_tx(&mut tx).await?;
+        }
         for (runtime_job_id, data) in &rows {
             let mut job: RuntimeJob = serde_json::from_str(data)?;
             if job.input.get("cancellation_requested").is_some() {
@@ -414,6 +590,69 @@ impl WorkflowRuntimeStore {
         .await?;
         Ok(rows.into_iter().collect())
     }
+}
+
+pub(crate) async fn remote_runtime_job_lease_proof_matches_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    runtime_job_id: &str,
+    owner: &str,
+    lease_generation: u64,
+    lease_expires_at: DateTime<Utc>,
+    lease_proof: Option<Uuid>,
+) -> anyhow::Result<bool> {
+    let lease_expires_at = postgres_timestamp_floor(lease_expires_at);
+    let generation = i64::try_from(lease_generation)
+        .map_err(|_| anyhow::anyhow!("runtime job lease generation exceeds BIGINT"))?;
+    let (matches,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+            SELECT 1 FROM runtime_job_lease_issuances
+            WHERE runtime_job_id = $1
+              AND owner = $2
+              AND lease_generation = $3
+              AND lease_expires_at = $4
+              AND (
+                lease_proof = $5
+                OR (lease_proof IS NULL AND $5::uuid IS NULL)
+              )
+         )",
+    )
+    .bind(runtime_job_id)
+    .bind(owner)
+    .bind(generation)
+    .bind(lease_expires_at)
+    .bind(lease_proof)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(matches)
+}
+
+async fn remote_runtime_job_lease_is_legacy_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    runtime_job_id: &str,
+    owner: &str,
+    lease_generation: u64,
+    lease_expires_at: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let lease_expires_at = postgres_timestamp_floor(lease_expires_at);
+    let generation = i64::try_from(lease_generation)
+        .map_err(|_| anyhow::anyhow!("runtime job lease generation exceeds BIGINT"))?;
+    let (legacy,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+            SELECT 1 FROM runtime_job_lease_issuances
+            WHERE runtime_job_id = $1
+              AND owner = $2
+              AND lease_generation = $3
+              AND lease_expires_at = $4
+              AND legacy_proofless
+         )",
+    )
+    .bind(runtime_job_id)
+    .bind(owner)
+    .bind(generation)
+    .bind(lease_expires_at)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(legacy)
 }
 
 async fn reject_renewal_tx(
@@ -523,11 +762,12 @@ mod tests {
             RuntimeJobLeaseRenewalRejection::StaleExpiry,
             RuntimeJobLeaseRenewalRejection::WrongGeneration,
             RuntimeJobLeaseRenewalRejection::WrongOwner,
+            RuntimeJobLeaseRenewalRejection::WrongProof,
             RuntimeJobLeaseRenewalRejection::WrongRuntimeKind,
             RuntimeJobLeaseRenewalRejection::WrongState,
         ];
         let codes: Vec<&str> = reasons.into_iter().map(|reason| reason.as_str()).collect();
-        assert_eq!(codes.len(), 12);
+        assert_eq!(codes.len(), 13);
         assert!(codes.iter().all(|code| !code.contains("host-")));
     }
 }

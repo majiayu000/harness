@@ -398,7 +398,7 @@ async fn ensure_no_active_work(
 mod tests {
     use super::*;
     use crate::runtime::{
-        ActivityArtifact, ActivityResult, RuntimeKind, WorkflowSubject,
+        ActivityArtifact, ActivityResult, RuntimeJobCompletionLease, RuntimeKind, WorkflowSubject,
         GITHUB_ISSUE_PR_DEFINITION_ID,
     };
 
@@ -508,7 +508,11 @@ mod tests {
             .await?;
         let expires_at = Utc::now() + chrono::TimeDelta::minutes(5);
         let claimed = store
-            .claim_next_runtime_job("test-owner", expires_at)
+            .claim_next_runtime_job_for_runtime_kind(
+                RuntimeKind::RemoteHost,
+                "test-owner",
+                expires_at,
+            )
             .await?
             .ok_or_else(|| anyhow::anyhow!("runtime job should be claimable"))?;
         let result = ActivityResult::succeeded("implement_issue", "done").with_artifact(
@@ -517,8 +521,26 @@ mod tests {
                 json!({"status": "cleaned"}),
             ),
         );
+        let lease_proof = store
+            .remote_runtime_job_lease_proof(
+                &claimed.id,
+                "test-owner",
+                claimed.lease_generation,
+                expires_at,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("remote lease proof should be issued"))?;
         store
-            .complete_runtime_job_if_owned(&claimed.id, "test-owner", expires_at, &result)
+            .commit_runtime_activity_completion_if_owned_with_generation(
+                &claimed.id,
+                RuntimeJobCompletionLease::remote(
+                    "test-owner",
+                    expires_at,
+                    claimed.lease_generation,
+                    Some(lease_proof),
+                ),
+                &result,
+            )
             .await?
             .ok_or_else(|| anyhow::anyhow!("runtime job should complete"))?;
         store

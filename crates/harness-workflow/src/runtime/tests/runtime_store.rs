@@ -870,6 +870,7 @@ async fn lease_expired_completion_is_recorded_to_dead_letter() -> anyhow::Result
         .record_lease_expired_completion(
             &first_claim.id,
             "worker-a",
+            first_claim.lease_generation,
             first_lease_expires_at,
             &result,
             None,
@@ -923,6 +924,7 @@ async fn lease_expired_completion_is_recorded_to_dead_letter() -> anyhow::Result
         .record_lease_expired_completion(
             &first_claim.id,
             "worker-a",
+            first_claim.lease_generation,
             first_lease_expires_at,
             &result,
             None,
@@ -988,6 +990,7 @@ async fn lease_expired_completion_persists_transcript_payload() -> anyhow::Resul
         .record_lease_expired_completion(
             &claimed.id,
             "worker-a",
+            claimed.lease_generation,
             lease_expires_at,
             &result,
             pending.as_ref(),

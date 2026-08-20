@@ -73,6 +73,7 @@ mod p1_followups;
 mod pr_repair_evidence;
 mod provenance_immutability;
 mod remote_host_lease;
+mod remote_host_lease_proof;
 mod replay_determinism;
 mod retry;
 mod runtime_store;

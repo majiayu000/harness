@@ -683,26 +683,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn post_reservation_errors_return_the_updated_lease_fence() {
-        let lease_expires_at = Utc::now() + chrono::TimeDelta::minutes(5);
-        let response = reserved_lease_error_response("verification failed", lease_expires_at, 7);
-        assert_eq!(response.0["error"], "verification failed");
-        assert_eq!(response.0["lease_expires_at"], json!(lease_expires_at));
-        assert_eq!(response.0["lease_generation"], 7);
-        assert_eq!(response.0["lease_reserved"], true);
-    }
-
-    #[test]
-    fn completion_reservation_id_is_stable_for_ambiguous_retries() {
-        let lease_expires_at = Utc::now() + chrono::TimeDelta::minutes(5);
-        let first = completion_reservation_id("job-1", "host-a", 3, lease_expires_at);
-        let retry = completion_reservation_id("job-1", "host-a", 3, lease_expires_at);
-        let different_owner = completion_reservation_id("job-1", "host-b", 3, lease_expires_at);
-        assert_eq!(first, retry);
-        assert_ne!(first, different_owner);
-    }
-
     #[tokio::test]
     async fn completion_reservation_reconciles_old_fence_and_deregister_revokes_final_commit(
     ) -> anyhow::Result<()> {
@@ -737,12 +717,14 @@ mod tests {
         let lease_generation = claimed["lease_generation"]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("claimed lease generation must be an integer"))?;
+        let lease_proof: Uuid = serde_json::from_value(claimed["lease_proof"].clone())?;
         let reserved = replay_completion_reservation(
             store.as_ref(),
             &job.id,
             "host-a",
             lease_generation,
             original_expires_at,
+            Some(lease_proof),
         )
         .await?;
         let RuntimeJobLeaseRenewalOutcome::Renewed {
@@ -761,6 +743,7 @@ mod tests {
             json!({
                 "lease_generation": lease_generation,
                 "lease_expires_at": original_expires_at,
+                "lease_proof": lease_proof,
                 "renewal_id": Uuid::new_v4(),
                 "lease_secs": 120,
             }),
@@ -778,9 +761,12 @@ mod tests {
         let stale_completion = store
             .commit_runtime_activity_completion_if_owned_with_generation(
                 &job.id,
-                "host-a",
-                reserved_expires_at,
-                Some(lease_generation),
+                RuntimeJobCompletionLease::remote(
+                    "host-a",
+                    reserved_expires_at,
+                    lease_generation,
+                    None,
+                ),
                 &ActivityResult::succeeded("remote_check", "done"),
             )
             .await?;

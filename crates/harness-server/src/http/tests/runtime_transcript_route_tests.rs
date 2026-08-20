@@ -186,7 +186,9 @@ async fn remote_completion_route_accepts_transcripts_above_axum_default_limit() 
         ),
     );
     let body = json!({
+        "lease_generation": claimed["lease_generation"],
         "lease_expires_at": claimed["lease_expires_at"],
+        "lease_proof": claimed["lease_proof"],
         "result": result,
     });
 
