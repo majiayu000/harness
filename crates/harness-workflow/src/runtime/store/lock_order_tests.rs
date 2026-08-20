@@ -192,6 +192,27 @@ fn lint_detects_runtime_job_lock_before_terminal_fence() {
     assert_eq!(found[0].after_table, "runtime_jobs");
 }
 
+#[test]
+fn lint_detects_runtime_job_lock_before_runtime_job_workflow_fence() {
+    let source = r#"
+        async fn inverted_runtime_job_mutation(&self) -> anyhow::Result<()> {
+            sqlx::query("SELECT id FROM runtime_jobs WHERE id = $1 FOR UPDATE");
+            runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(&mut tx).await?;
+            Ok(())
+        }
+    "#;
+    let sites = lock_sites(source);
+    let ranks: Vec<usize> = sites.iter().map(|site| site.rank).collect();
+    assert_eq!(ranks, vec![2, 0, 1, 2]);
+    let found = inversions(&sites);
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].late_table, "workflow_instances");
+    assert_eq!(found[1].late_table, "workflow_commands");
+    assert!(found
+        .iter()
+        .all(|violation| violation.after_table == "runtime_jobs"));
+}
+
 /// A lock taken at a shallower level than one already held, without that level
 /// having been held first.
 #[derive(Debug)]

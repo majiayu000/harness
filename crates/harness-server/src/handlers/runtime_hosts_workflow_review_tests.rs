@@ -289,19 +289,6 @@ async fn draining_host_can_acknowledge_eval_cancellation_then_finish_deregister(
     )
     .await?;
     assert_eq!(claimed["runtime_job_id"], job.id);
-    store
-        .cancel_command_and_unfinished_runtime_jobs(
-            &job.command_id,
-            "implement_issue",
-            "operator cancelled",
-        )
-        .await?;
-    let cancelling = store
-        .get_runtime_job(&job.id)
-        .await?
-        .expect("cancelling runtime job should remain readable");
-    assert_eq!(cancelling.status, RuntimeJobStatus::Running);
-    assert!(cancelling.input.get("cancellation_requested").is_some());
     assert_eq!(
         store.count_remote_host_runtime_job_leases("host-a").await?,
         1
@@ -318,6 +305,12 @@ async fn draining_host_can_acknowledge_eval_cancellation_then_finish_deregister(
         state.runtime_hosts.lifecycle("host-a"),
         Some(crate::runtime_hosts::RuntimeHostLifecycle::Draining)
     );
+    let cancelling = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("deregistering eval should remain readable until cleanup acknowledgement");
+    assert_eq!(cancelling.status, RuntimeJobStatus::Running);
+    assert!(cancelling.input.get("cancellation_requested").is_some());
 
     let (status, completed) = support::post_json_with_status(
         &app,

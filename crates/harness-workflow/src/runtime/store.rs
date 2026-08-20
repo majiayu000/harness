@@ -76,6 +76,8 @@ mod recovery;
 mod runtime_completion;
 #[path = "store/runtime_completion_budget.rs"]
 mod runtime_completion_budget;
+#[path = "store/runtime_job_lease_revocation.rs"]
+mod runtime_job_lease_revocation;
 #[path = "store/runtime_job_leases.rs"]
 pub mod runtime_job_leases;
 #[path = "store/runtime_job_queries.rs"]

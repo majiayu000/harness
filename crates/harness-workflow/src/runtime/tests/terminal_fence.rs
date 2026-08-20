@@ -362,3 +362,90 @@ async fn legacy_terminal_running_eval_cannot_renew_an_unexpired_lease() -> anyho
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn remote_eval_deregistration_serializes_with_terminal_transition() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = issue_instance("implementing").with_id("terminal-deregister-eval-race");
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+    let command = WorkflowCommand::enqueue_activity(
+        "implement_issue",
+        "terminal-deregister-eval-command",
+    );
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::RemoteHost,
+            "eval-host",
+            json!({
+                "activity": "implement_issue",
+                "eval": {"timeout_secs": 60}
+            }),
+        )
+        .await?;
+    let lease_expires_at = Utc::now() + Duration::minutes(5);
+    store
+        .claim_next_runtime_job_for_runtime_kind(
+            RuntimeKind::RemoteHost,
+            "terminal-deregister-host",
+            lease_expires_at,
+        )
+        .await?
+        .expect("remote eval should be claimed before the race");
+
+    let result = ActivityResult::succeeded(
+        "implement_issue",
+        "The issue closed while its runtime host was deregistering.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 123,
+            "state": "closed",
+            "issue_url": "https://github.com/owner/repo/issues/123"
+        }),
+    ))
+    .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(123));
+
+    let deregister =
+        store.revoke_remote_host_runtime_job_leases("terminal-deregister-host", Utc::now());
+    let terminal = store.commit_parent_runtime_completion(
+        &instance.id,
+        "terminal-deregister-runtime",
+        json!({
+            "command_id": "terminal-deregister-completed-command",
+            "runtime_job_id": "terminal-deregister-completed-job",
+            "activity_result": result,
+        }),
+    );
+    let (revoked, terminal) = tokio::join!(deregister, terminal);
+    assert_eq!(revoked?, 0, "remote eval cleanup ownership must be preserved");
+    let record = terminal?.expect("closed issue should produce a terminal decision");
+    assert!(record.accepted);
+    assert_eq!(record.decision.next_state, "done");
+
+    let cancelling = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("cancelling remote eval should remain auditable");
+    assert_eq!(cancelling.status, RuntimeJobStatus::Running);
+    assert!(cancelling.lease.is_some());
+    assert!(cancelling.input.get("cancellation_requested").is_some());
+    assert_eq!(
+        store
+            .get_command(&command_id)
+            .await?
+            .expect("terminal command should remain auditable")
+            .status,
+        WorkflowCommandStatus::Cancelled
+    );
+    Ok(())
+}

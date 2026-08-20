@@ -509,69 +509,6 @@ impl WorkflowRuntimeStore {
         })
     }
 
-    pub async fn revoke_remote_host_runtime_job_leases(
-        &self,
-        owner: &str,
-        now: DateTime<Utc>,
-    ) -> anyhow::Result<usize> {
-        let mut tx = self.pool.begin().await?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, data::text FROM runtime_jobs
-             WHERE status = 'running'
-               AND runtime_kind = 'remote_host'
-               AND data #>> '{lease,owner}' = $1
-             ORDER BY id
-             FOR UPDATE",
-        )
-        .bind(owner)
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut revoked = 0;
-        if !rows.is_empty() {
-            mark_remote_lease_proof_v1_tx(&mut tx).await?;
-        }
-        for (runtime_job_id, data) in &rows {
-            let mut job: RuntimeJob = serde_json::from_str(data)?;
-            if job.input.get("cancellation_requested").is_some() {
-                continue;
-            }
-            let previous_expires_at = job.lease.as_ref().map(|lease| lease.expires_at);
-            job.status = RuntimeJobStatus::Pending;
-            job.lease = None;
-            job.not_before = None;
-            job.updated_at = now;
-            let updated = to_jsonb_string(&job)?;
-            sqlx::query(
-                "UPDATE runtime_jobs
-                 SET status = 'pending', not_before = NULL, data = $1::jsonb, updated_at = $2
-                 WHERE id = $3",
-            )
-            .bind(&updated)
-            .bind(now)
-            .bind(runtime_job_id)
-            .execute(&mut *tx)
-            .await?;
-            delete_runtime_job_lease_receipts_tx(&mut tx, runtime_job_id, job.lease_generation)
-                .await?;
-            append_runtime_event_tx(
-                &mut tx,
-                runtime_job_id,
-                "RuntimeJobLeaseRevoked",
-                json!({
-                    "owner": owner,
-                    "lease_generation": job.lease_generation,
-                    "previous_expires_at": previous_expires_at,
-                    "reason": "host_deregistered",
-                    "source": "runtime_host_deregister",
-                }),
-            )
-            .await?;
-            revoked += 1;
-        }
-        tx.commit().await?;
-        Ok(revoked)
-    }
-
     pub async fn count_remote_host_runtime_job_leases(&self, owner: &str) -> anyhow::Result<i64> {
         let (count,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM runtime_jobs
