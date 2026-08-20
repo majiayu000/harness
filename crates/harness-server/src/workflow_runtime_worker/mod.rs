@@ -155,7 +155,7 @@ pub(crate) async fn exact_replay_preflight_for_test(
 pub(crate) async fn hydrate_exact_replay_for_test(
     state: &Arc<AppState>,
     job: &mut RuntimeJob,
-) -> Result<(), ActivityResult> {
+) -> Result<(), Box<ActivityResult>> {
     transcript_durability::hydrate_exact_replay_transcript(state, job).await
 }
 

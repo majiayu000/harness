@@ -462,7 +462,7 @@ pub async fn claim_runtime_job_for_runtime_host(
             &host_id,
             lease_expires_at,
             &job,
-            result,
+            *result,
         )
         .await;
     }
