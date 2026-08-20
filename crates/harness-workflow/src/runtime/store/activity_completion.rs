@@ -414,12 +414,16 @@ fn cancellation_ack_is_stale_for_workflow(
     let Some(marker) = job.input.get("cancellation_requested") else {
         return false;
     };
-    let workflow_version = marker.get("workflow_version").and_then(Value::as_u64);
-    let command_attempt_generation = marker
-        .get("command_attempt_generation")
-        .and_then(Value::as_u64);
-    workflow_version != Some(workflow.version)
-        || command_attempt_generation != Some(u64::from(command.attempt_generation))
+    let mismatches = |key, expected| {
+        marker
+            .get(key)
+            .is_some_and(|value| value.as_u64() != Some(expected))
+    };
+    mismatches("workflow_version", workflow.version)
+        || mismatches(
+            "command_attempt_generation",
+            u64::from(command.attempt_generation),
+        )
         || command.status != WorkflowCommandStatus::Dispatched
         || command.superseded_by_command_id.is_some()
 }
@@ -541,6 +545,9 @@ impl WorkflowRuntimeStore {
         result: &ActivityResult,
         transcript: Option<&PendingRuntimeTranscript>,
     ) -> anyhow::Result<bool> {
+        let lease_generation = lease
+            .generation
+            .ok_or_else(|| anyhow::anyhow!("remote stale completion requires a generation"))?;
         let result_json = serde_json::to_value(result)?;
         let transcript_json = transcript
             .map(|pending| serde_json::to_value(&pending.record))
@@ -567,9 +574,6 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(false);
         }
-        let lease_generation = lease
-            .generation
-            .expect("issued remote stale completion requires a generation");
         let insert_outcome = insert_lease_expired_completion_tx(
             &mut tx,
             runtime_job_id,
@@ -626,6 +630,10 @@ impl WorkflowRuntimeStore {
         Ok(issued)
     }
 }
+
+#[cfg(test)]
+#[path = "activity_completion_tests.rs"]
+mod tests;
 
 async fn remote_stale_completion_is_issued_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

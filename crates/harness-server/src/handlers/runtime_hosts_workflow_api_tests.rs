@@ -864,6 +864,115 @@ async fn runtime_job_completion_endpoint_accepts_terminal_activity_result() -> a
 }
 
 #[tokio::test]
+async fn runtime_job_completion_endpoint_allows_draining_host_to_finish() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state.clone());
+    register_host(&app, "host-a").await?;
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "completion-while-draining",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({ "activity": "remote_check" }),
+    )
+    .await?;
+    let claimed = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+    assert!(state.runtime_hosts.mark_draining("host-a").is_some());
+
+    let completed = post_json(
+        &app,
+        format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
+        json!({
+            "lease_generation": claimed["lease_generation"],
+            "lease_expires_at": claimed["lease_expires_at"],
+            "lease_proof": claimed["lease_proof"],
+            "result": ActivityResult::succeeded("remote_check", "finished while draining"),
+        }),
+    )
+    .await?;
+
+    assert_eq!(completed["completed"], true);
+    assert_eq!(completed["runtime_job"]["status"], "succeeded");
+    Ok(())
+}
+
+#[tokio::test]
+async fn draining_host_completion_revalidates_required_eval_capabilities() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state.clone());
+    register_host_with_capabilities(
+        &app,
+        "host-a",
+        vec!["eval_resource_limits", "trusted_eval_verifier_v1"],
+    )
+    .await?;
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "draining-capability-revalidation",
+        RuntimeKind::RemoteHost,
+        "eval-isolated-runtime-host",
+        json!({
+            "activity": "run_quality_gate",
+            "command": {
+                "eval": {
+                    "required_runtime_host_capabilities": [
+                        "eval_resource_limits",
+                        "trusted_eval_verifier_v1"
+                    ]
+                }
+            }
+        }),
+    )
+    .await?;
+    let claimed = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+    assert!(state.runtime_hosts.mark_draining("host-a").is_some());
+    state.runtime_hosts.register(
+        "host-a".to_string(),
+        None,
+        vec![RUNTIME_JOB_LEASE_PROOF_V1_CAPABILITY.to_string()],
+    );
+
+    let (status, body) = post_json_with_status(
+        &app,
+        format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
+        json!({
+            "lease_generation": claimed["lease_generation"],
+            "lease_expires_at": claimed["lease_expires_at"],
+            "lease_proof": claimed["lease_proof"],
+            "result": ActivityResult::succeeded("run_quality_gate", "untrusted result"),
+        }),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"],
+        "runtime host no longer advertises required eval capabilities"
+    );
+    assert_eq!(
+        body["missing_capabilities"],
+        json!(["eval_resource_limits", "trusted_eval_verifier_v1"])
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_job_completion_endpoint_dead_letters_expired_issued_lease() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {

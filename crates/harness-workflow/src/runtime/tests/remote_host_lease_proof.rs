@@ -188,6 +188,18 @@ async fn issued_stale_completion_is_dead_lettered_with_generation() -> anyhow::R
         Some(proof),
     );
     let result = ActivityResult::succeeded("remote_check", "finished on stale lease");
+    let missing_generation = store
+        .record_remote_stale_completion_if_issued(
+            &first.id,
+            RuntimeJobCompletionLease::local("host-a", expired_at),
+            &result,
+            None,
+        )
+        .await
+        .expect_err("remote stale completion without a generation must fail closed");
+    assert!(missing_generation
+        .to_string()
+        .contains("remote stale completion requires a generation"));
     let inserted = store
         .record_remote_stale_completion_if_issued(&first.id, lease, &result, None)
         .await?;

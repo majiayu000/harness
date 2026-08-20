@@ -29,7 +29,6 @@ pub async fn complete_runtime_job_for_runtime_host(
             ),
         );
     }
-    let owner_active = state.runtime_hosts.is_active(&host_id);
     let store = match workflow_runtime_store(&state) {
         Ok(store) => store,
         Err((status, body)) => return (status, completion_json(body.0)),
@@ -106,7 +105,7 @@ pub async fn complete_runtime_job_for_runtime_host(
     };
     let result = crate::workflow_runtime_worker::strip_caller_transcript_unavailable_signal(result);
     let cancellation_ack = is_eval_cancellation_ack(&job, &result);
-    if !cancellation_ack && owner_active {
+    if !cancellation_ack {
         if let Err(response) = validate_eval_host_capabilities(&state, &host_id, &job) {
             return (StatusCode::BAD_REQUEST, completion_json(response));
         }
@@ -143,7 +142,6 @@ pub async fn complete_runtime_job_for_runtime_host(
         Some(lease_generation),
         lease_proof,
         cancellation_ack,
-        owner_active,
     )
     .await
     {

@@ -89,7 +89,6 @@ pub(super) async fn reserve_completion_lease(
     lease_generation: Option<u64>,
     lease_proof: Option<Uuid>,
     cancellation_ack: bool,
-    owner_active: bool,
 ) -> Result<CompletionLeaseReservation, (StatusCode, CompletionJson)> {
     let lease_generation = lease_generation.unwrap_or(job.lease_generation);
     let renewal_id =
@@ -106,7 +105,11 @@ pub(super) async fn reserve_completion_lease(
             lease_secs: crate::runtime_hosts::MAX_LEASE_SECS,
             now,
             max_lease_secs: crate::runtime_hosts::MAX_LEASE_SECS,
-            owner_active,
+            // Draining prevents new work and ordinary lease renewals, but a
+            // host must still be able to reserve enough time to finish work
+            // it already owns. The existing lease fence below still rejects
+            // revoked, expired, or reclaimed ownership.
+            owner_active: true,
         };
         if cancellation_ack {
             store
