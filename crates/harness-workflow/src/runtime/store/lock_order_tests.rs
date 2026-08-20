@@ -384,7 +384,7 @@ fn multi_command_runtime_job_cancellation_uses_one_global_id_order() {
         .find("command_id = ANY($1::text[])")
         .expect("multi-command cancellation must select all command jobs together");
     let id_order = helper
-        .find("ORDER BY id")
+        .find("ORDER BY job.id")
         .expect("multi-command cancellation must define a global job ID order");
     let row_lock = helper
         .find("FOR UPDATE")

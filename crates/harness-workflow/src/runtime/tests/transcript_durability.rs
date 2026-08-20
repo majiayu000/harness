@@ -98,6 +98,14 @@ async fn transcript_completion_is_atomic_restart_safe_and_pinned_while_active() 
         store.read_runtime_transcript(&artifact_ref).await?,
         RuntimeTranscriptRead::Verified(_)
     ));
+    let result_events = store
+        .runtime_events_for(&job.id)
+        .await?
+        .into_iter()
+        .filter(|event| event.event_type == "ActivityResultReady")
+        .collect::<Vec<_>>();
+    assert_eq!(result_events.len(), 1);
+    assert_eq!(result_events[0].event, serde_json::to_value(&result)?);
 
     drop(store);
     let reopened = WorkflowRuntimeStore::open(&path).await?;

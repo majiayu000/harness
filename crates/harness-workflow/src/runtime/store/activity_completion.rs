@@ -1,3 +1,7 @@
+use super::activity_completion_terminal::{
+    cancellation_ack_matches, command_status_is_active,
+    lock_workflow_commands_for_terminal_fence_tx, lock_workflow_runtime_jobs_for_terminal_fence_tx,
+};
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -6,12 +10,10 @@ enum RuntimeCompletionKind {
     CancellationAck,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct RuntimeActivityCompletionRequest<'a> {
     runtime_job_id: &'a str,
-    owner: &'a str,
-    lease_expires_at: DateTime<Utc>,
-    lease_generation: Option<u64>,
+    lease: RuntimeJobCompletionLease<'a>,
     result: &'a ActivityResult,
     transcript: Option<&'a PendingRuntimeTranscript>,
     completion_kind: RuntimeCompletionKind,
@@ -63,6 +65,7 @@ impl WorkflowRuntimeStore {
         let is_current_lease = !workflow_is_terminal
             && job.input.get("cancellation_requested").is_none()
             && job.status == RuntimeJobStatus::Running
+            && job.runtime_kind != RuntimeKind::RemoteHost
             && job
                 .lease
                 .as_ref()
@@ -105,9 +108,7 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         self.commit_runtime_activity_completion_if_owned_with_generation(
             runtime_job_id,
-            owner,
-            lease_expires_at,
-            None,
+            RuntimeJobCompletionLease::local(owner, lease_expires_at),
             result,
         )
         .await
@@ -123,9 +124,7 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         self.commit_runtime_activity_completion_retrying(RuntimeActivityCompletionRequest {
             runtime_job_id,
-            owner,
-            lease_expires_at,
-            lease_generation: None,
+            lease: RuntimeJobCompletionLease::local(owner, lease_expires_at),
             result,
             transcript,
             completion_kind: RuntimeCompletionKind::Normal,
@@ -136,16 +135,12 @@ impl WorkflowRuntimeStore {
     pub async fn commit_runtime_activity_completion_if_owned_with_generation(
         &self,
         runtime_job_id: &str,
-        owner: &str,
-        lease_expires_at: DateTime<Utc>,
-        lease_generation: Option<u64>,
+        lease: RuntimeJobCompletionLease<'_>,
         result: &ActivityResult,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         self.commit_runtime_activity_completion_retrying(RuntimeActivityCompletionRequest {
             runtime_job_id,
-            owner,
-            lease_expires_at,
-            lease_generation,
+            lease,
             result,
             transcript: None,
             completion_kind: RuntimeCompletionKind::Normal,
@@ -156,17 +151,13 @@ impl WorkflowRuntimeStore {
     pub async fn commit_runtime_activity_completion_with_transcript_if_owned_with_generation(
         &self,
         runtime_job_id: &str,
-        owner: &str,
-        lease_expires_at: DateTime<Utc>,
-        lease_generation: Option<u64>,
+        lease: RuntimeJobCompletionLease<'_>,
         result: &ActivityResult,
         transcript: Option<&PendingRuntimeTranscript>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         self.commit_runtime_activity_completion_retrying(RuntimeActivityCompletionRequest {
             runtime_job_id,
-            owner,
-            lease_expires_at,
-            lease_generation,
+            lease,
             result,
             transcript,
             completion_kind: RuntimeCompletionKind::Normal,
@@ -176,23 +167,18 @@ impl WorkflowRuntimeStore {
 
     /// Commit the explicit cleanup acknowledgement for a cancelled remote eval.
     ///
-    /// This is intentionally separate from ordinary completion: once the
-    /// terminal fence requests cancellation, only a cancelled result carrying
-    /// the runtime-host cleanup proof may consume the preserved lease.
+    /// Once the terminal fence requests cancellation, only a cancelled result
+    /// carrying the runtime-host cleanup proof may consume the preserved lease.
     pub async fn commit_cancelled_runtime_activity_completion_with_transcript_if_owned_with_generation(
         &self,
         runtime_job_id: &str,
-        owner: &str,
-        lease_expires_at: DateTime<Utc>,
-        lease_generation: u64,
+        lease: RuntimeJobCompletionLease<'_>,
         result: &ActivityResult,
         transcript: Option<&PendingRuntimeTranscript>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         self.commit_runtime_activity_completion_retrying(RuntimeActivityCompletionRequest {
             runtime_job_id,
-            owner,
-            lease_expires_at,
-            lease_generation: Some(lease_generation),
+            lease,
             result,
             transcript,
             completion_kind: RuntimeCompletionKind::CancellationAck,
@@ -212,7 +198,7 @@ impl WorkflowRuntimeStore {
         request: RuntimeActivityCompletionRequest<'_>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         lock_order::retry_on_transaction_abort("commit_runtime_activity_completion", || {
-            self.commit_runtime_activity_completion_inner(request.clone())
+            self.commit_runtime_activity_completion_inner(request)
         })
         .await
     }
@@ -223,9 +209,7 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         let RuntimeActivityCompletionRequest {
             runtime_job_id,
-            owner,
-            lease_expires_at,
-            lease_generation,
+            lease,
             result,
             transcript,
             completion_kind,
@@ -308,14 +292,33 @@ impl WorkflowRuntimeStore {
             }
             RuntimeCompletionKind::CancellationAck => cancellation_ack_matches(&job, result),
         };
-        let is_current_lease = completion_kind_matches
+        let mut is_current_lease = completion_kind_matches
             && job.status == RuntimeJobStatus::Running
-            && lease_generation.is_none_or(|generation| generation == job.lease_generation)
-            && job.lease.as_ref().is_some_and(|lease| {
-                lease.owner == owner
-                    && lease.expires_at == lease_expires_at
-                    && lease.expires_at > Utc::now()
+            && lease
+                .generation
+                .is_none_or(|generation| generation == job.lease_generation)
+            && job.lease.as_ref().is_some_and(|current| {
+                current.owner == lease.owner
+                    && runtime_job_leases::postgres_timestamp_floor(current.expires_at)
+                        == runtime_job_leases::postgres_timestamp_floor(lease.expires_at)
+                    && current.expires_at > Utc::now()
             });
+        if is_current_lease && job.runtime_kind == RuntimeKind::RemoteHost {
+            is_current_lease = match lease.generation {
+                Some(generation) => {
+                    runtime_job_leases::remote_runtime_job_lease_proof_matches_tx(
+                        &mut tx,
+                        runtime_job_id,
+                        lease.owner,
+                        generation,
+                        lease.expires_at,
+                        lease.proof,
+                    )
+                    .await?
+                }
+                None => false,
+            };
+        }
         if !is_current_lease {
             tx.commit().await?;
             return Ok(None);
@@ -324,7 +327,13 @@ impl WorkflowRuntimeStore {
         let mut command = command_row
             .map(workflow_command_record_from_row)
             .transpose()?;
-        if let Some(transcript) = transcript {
+        let stale_cancellation_ack = match (command.as_ref(), locked_workflow.as_ref()) {
+            (Some(command), Some(workflow)) => {
+                cancellation_ack_is_stale_for_workflow(&job, command, workflow, result)
+            }
+            _ => false,
+        };
+        if let Some(transcript) = transcript.filter(|_| !stale_cancellation_ack) {
             let command = command.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("runtime transcript cannot be persisted without its command")
             })?;
@@ -340,6 +349,9 @@ impl WorkflowRuntimeStore {
         job.complete(result)?;
         let updated = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
+        if job.runtime_kind == RuntimeKind::RemoteHost {
+            runtime_job_leases::mark_remote_lease_proof_v1_tx(&mut tx).await?;
+        }
         sqlx::query(
             "UPDATE runtime_jobs
              SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
@@ -357,6 +369,34 @@ impl WorkflowRuntimeStore {
             job.lease_generation,
         )
         .await?;
+        runtime_job_leases::append_runtime_event_tx(
+            &mut tx,
+            runtime_job_id,
+            "ActivityResultReady",
+            serde_json::to_value(result)?,
+        )
+        .await?;
+        if stale_cancellation_ack {
+            runtime_job_leases::append_runtime_event_tx(
+                &mut tx,
+                runtime_job_id,
+                "StaleCancellationAcknowledgementRecorded",
+                json!({
+                    "owner": lease.owner,
+                    "command_id": command.as_ref().map(|command| &command.id),
+                    "workflow_id": command.as_ref().map(|command| &command.workflow_id),
+                    "applied_to_workflow": false,
+                }),
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(Some(RuntimeActivityCompletion {
+                runtime_job: job,
+                command,
+                workflow_event: None,
+                decision: None,
+            }));
+        }
         let Some(mut command) = command.take() else {
             tx.commit().await?;
             return Ok(Some(RuntimeActivityCompletion {
@@ -397,7 +437,6 @@ impl WorkflowRuntimeStore {
                 decision: None,
             }));
         };
-
         let active_start_child_workflow_commands =
             if command.command.command_type == WorkflowCommandType::StartChildWorkflow {
                 let command_type = enum_str(&WorkflowCommandType::StartChildWorkflow)?;
@@ -426,7 +465,7 @@ impl WorkflowRuntimeStore {
             &mut tx,
             &command.workflow_id,
             "RuntimeJobCompleted",
-            owner,
+            lease.owner,
             json!({
                 "command_id": command.id,
                 "command": command.command,
@@ -442,7 +481,7 @@ impl WorkflowRuntimeStore {
             &mut tx,
             &self.definition_registry,
             &command.workflow_id,
-            owner,
+            lease.owner,
             &event,
             &self.budget_policy,
         )
@@ -473,6 +512,32 @@ impl WorkflowRuntimeStore {
     }
 }
 
+fn cancellation_ack_is_stale_for_workflow(
+    job: &RuntimeJob,
+    command: &WorkflowCommandRecord,
+    workflow: &WorkflowInstance,
+    result: &ActivityResult,
+) -> bool {
+    if result.status != ActivityStatus::Cancelled {
+        return false;
+    }
+    let Some(marker) = job.input.get("cancellation_requested") else {
+        return false;
+    };
+    let mismatches = |key, expected| {
+        marker
+            .get(key)
+            .is_some_and(|value| value.as_u64() != Some(expected))
+    };
+    mismatches("workflow_version", workflow.version)
+        || mismatches(
+            "command_attempt_generation",
+            u64::from(command.attempt_generation),
+        )
+        || command.status != WorkflowCommandStatus::Dispatched
+        || command.superseded_by_command_id.is_some()
+}
+
 fn command_status_for_activity(status: ActivityStatus) -> WorkflowCommandStatus {
     match status {
         ActivityStatus::Succeeded => WorkflowCommandStatus::Completed,
@@ -484,119 +549,6 @@ fn command_status_for_activity(status: ActivityStatus) -> WorkflowCommandStatus 
     }
 }
 
-fn command_status_is_active(status: WorkflowCommandStatus) -> bool {
-    matches!(
-        status,
-        WorkflowCommandStatus::Pending
-            | WorkflowCommandStatus::Dispatching
-            | WorkflowCommandStatus::Deferred
-            | WorkflowCommandStatus::Dispatched
-    )
-}
-
-fn cancellation_ack_matches(job: &RuntimeJob, result: &ActivityResult) -> bool {
-    job.input.get("cancellation_requested").is_some()
-        && job.runtime_kind == RuntimeKind::RemoteHost
-        && (job.input.get("eval").is_some() || job.input.pointer("/command/eval").is_some())
-        && result.status == ActivityStatus::Cancelled
-        && result.artifacts.iter().any(|artifact| {
-            artifact.artifact_type
-                == crate::runtime::completion_evidence::ARTIFACT_EVAL_ISOLATION_CLEANUP
-                && artifact.artifact.get("status").and_then(Value::as_str) == Some("cleaned")
-                && artifact
-                    .artifact
-                    .get("evidence_source")
-                    .and_then(Value::as_str)
-                    == Some("runtime_host_cancellation_ack")
-        })
-}
-
-async fn lock_workflow_commands_for_terminal_fence_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workflow_id: &str,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        "SELECT id FROM workflow_commands
-         WHERE workflow_id = $1
-         ORDER BY id
-         FOR UPDATE",
-    )
-    .bind(workflow_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-async fn lock_workflow_runtime_jobs_for_terminal_fence_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workflow_id: &str,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        "SELECT job.id FROM runtime_jobs AS job
-         JOIN workflow_commands AS command ON command.id = job.command_id
-         WHERE command.workflow_id = $1
-         ORDER BY job.id
-         FOR UPDATE OF job",
-    )
-    .bind(workflow_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-impl WorkflowRuntimeStore {
-    /// Durably record a completed activity result that the worker can no
-    /// longer commit because its job lease expired or was reclaimed
-    /// (GH-1878). The payload — result plus optional transcript — lands in
-    /// `runtime_job_completions_dlq` instead of being dropped, so no finished
-    /// agent work vanishes silently; reconciliation can decide later whether
-    /// the result is still applicable or the job must re-run.
-    pub async fn record_lease_expired_completion(
-        &self,
-        runtime_job_id: &str,
-        owner: &str,
-        lease_expires_at: DateTime<Utc>,
-        result: &ActivityResult,
-        transcript: Option<&crate::runtime::transcript::PendingRuntimeTranscript>,
-    ) -> anyhow::Result<()> {
-        let transcript_json = transcript
-            .map(|pending| serde_json::to_value(&pending.record))
-            .transpose()?;
-        // The DLQ holds at most one record per job (id = runtime_job_id):
-        // a later re-expiry of the same job keeps the first record, which
-        // represents the same turn's final result, and reconciliation sees
-        // exactly one pending decision per job.
-        let mut tx = self.pool.begin().await?;
-        let inserted = sqlx::query(
-            "INSERT INTO runtime_job_completions_dlq
-                (id, runtime_job_id, owner, lease_expires_at, result, transcript)
-             VALUES ($1, $1, $2, $3, $4::jsonb, $5::jsonb)
-             ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(runtime_job_id)
-        .bind(owner)
-        .bind(lease_expires_at)
-        .bind(serde_json::to_value(result)?)
-        .bind(transcript_json)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if inserted == 0 {
-            tx.commit().await?;
-            return Ok(());
-        }
-        runtime_job_leases::append_runtime_event_tx(
-            &mut tx,
-            runtime_job_id,
-            "LeaseExpiredCompletionRecorded",
-            serde_json::json!({
-                "owner": owner,
-                "lease_expires_at": lease_expires_at,
-                "applied": false,
-            }),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-}
+#[cfg(test)]
+#[path = "activity_completion_tests.rs"]
+mod tests;
