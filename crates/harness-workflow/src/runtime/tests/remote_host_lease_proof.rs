@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::store::runtime_job_leases::{
-    postgres_timestamp_floor, RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRejection,
-    RuntimeJobLeaseRenewalRequest,
+    postgres_timestamp_ceil, postgres_timestamp_floor, RuntimeJobLeaseRenewalOutcome,
+    RuntimeJobLeaseRenewalRejection, RuntimeJobLeaseRenewalRequest,
 };
 use crate::runtime::RuntimeJobCompletionLease;
 use uuid::Uuid;
@@ -371,7 +371,8 @@ async fn v27_renewal_response_loss_replays_after_v28_migration() -> anyhow::Resu
         .await?
         .expect("legacy remote job should be claimed");
     let renewal_id = Uuid::new_v4();
-    let renewed_expires_at = now + Duration::minutes(10);
+    let renewed_expires_at = postgres_timestamp_ceil(now + Duration::minutes(10))
+        .ok_or_else(|| anyhow::anyhow!("legacy renewal expiry should normalize"))?;
 
     // Simulate the v27 renewal SQL committing before its response is lost.
     // v27 has no issuance table or proof fields to write.
@@ -397,7 +398,7 @@ async fn v27_renewal_response_loss_replays_after_v28_migration() -> anyhow::Resu
     .bind("legacy-host")
     .bind(i64::try_from(claimed.lease_generation)?)
     .bind(postgres_timestamp_floor(previous_expires_at))
-    .bind(postgres_timestamp_floor(renewed_expires_at))
+    .bind(renewed_expires_at)
     .bind(300_i64)
     .bind(now)
     .execute(store.pool())
