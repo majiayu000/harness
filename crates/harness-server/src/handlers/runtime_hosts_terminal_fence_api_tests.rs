@@ -11,7 +11,7 @@ async fn open_race_store(store: &WorkflowRuntimeStore) -> anyhow::Result<Workflo
     let schema: String = sqlx::query_scalar("SELECT current_schema()")
         .fetch_one(store.pool())
         .await?;
-    let database_url = std::env::var("HARNESS_DATABASE_URL")?;
+    let database_url = harness_core::config::process_env::var("HARNESS_DATABASE_URL")?;
     WorkflowRuntimeStore::open_with_database_url_and_schema(Some(&database_url), &schema).await
 }
 
