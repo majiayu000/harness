@@ -1,7 +1,9 @@
 mod completion;
 pub use completion::complete_runtime_job_for_runtime_host;
 #[cfg(test)]
-pub(crate) use completion::replay_completion_reservation;
+pub(crate) use completion::{
+    install_completion_reservation_test_gate, replay_completion_reservation,
+};
 mod claim;
 use claim::defer_runtime_host_resource_limit_claim;
 
@@ -460,7 +462,7 @@ pub async fn claim_runtime_job_for_runtime_host(
             &host_id,
             lease_expires_at,
             &job,
-            result,
+            *result,
         )
         .await;
     }

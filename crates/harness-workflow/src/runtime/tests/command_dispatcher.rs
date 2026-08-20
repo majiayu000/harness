@@ -348,7 +348,9 @@ async fn runtime_command_dispatcher_skips_terminal_workflow_before_enqueue() -> 
     store.force_upsert_lifecycle_state_for_test(&instance).await?;
     let command =
         WorkflowCommand::enqueue_activity("implement_issue", "issue-123-cancelled-implement");
-    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+    let command_id = store
+        .enqueue_command_for_test_unchecked(&instance.id, None, &command)
+        .await?;
     let dispatcher = RuntimeCommandDispatcher::new(
         &store,
         RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc),

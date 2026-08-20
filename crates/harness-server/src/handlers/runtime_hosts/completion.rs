@@ -1,7 +1,13 @@
 use super::*;
 use crate::http::rest_contract::ContractJson;
 use harness_protocol::rest::RuntimeHostCompletionResponse;
+use harness_workflow::runtime::store::RemoteStaleCompletionOutcome;
 use std::time::Duration;
+
+#[cfg(test)]
+mod test_gate;
+#[cfg(test)]
+pub(crate) use test_gate::install_completion_reservation_test_gate;
 
 const COMPLETION_EVIDENCE_TIMEOUT_SECS: u64 = crate::runtime_hosts::MAX_LEASE_SECS as u64 - 30;
 
@@ -154,45 +160,51 @@ pub async fn complete_runtime_job_for_runtime_host(
     // renewals for the same host. Deregistration can safely revoke the reserved
     // lease, and the fenced completion commit below will then fail closed.
     drop(host_operation);
-    let result = match tokio::time::timeout(
-        Duration::from_secs(COMPLETION_EVIDENCE_TIMEOUT_SECS),
-        crate::workflow_runtime_worker::remote_completion::apply_remote_completion_evidence(
-            &state, &job, result,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => {
-            tracing::error!(
-                host_id = %host_id,
-                runtime_job_id = %runtime_job_id,
-                %error,
-                "runtime host completion evidence verification failed"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                completion_reservation.error_response(format!(
-                    "failed to verify runtime completion evidence: {error}"
-                )),
-            );
-        }
-        Err(_) => {
-            tracing::error!(
-                host_id = %host_id,
-                runtime_job_id = %runtime_job_id,
-                "runtime host completion evidence verification timed out"
-            );
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                completion_reservation
-                    .error_response("runtime completion evidence verification timed out"),
-            );
+    #[cfg(test)]
+    test_gate::pause_after_completion_reservation(&runtime_job_id).await;
+    let result = if cancellation_ack {
+        result
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(COMPLETION_EVIDENCE_TIMEOUT_SECS),
+            crate::workflow_runtime_worker::remote_completion::apply_remote_completion_evidence(
+                &state, &job, result,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    host_id = %host_id,
+                    runtime_job_id = %runtime_job_id,
+                    %error,
+                    "runtime host completion evidence verification failed"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    completion_reservation.error_response(format!(
+                        "failed to verify runtime completion evidence: {error}"
+                    )),
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    host_id = %host_id,
+                    runtime_job_id = %runtime_job_id,
+                    "runtime host completion evidence verification timed out"
+                );
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    completion_reservation
+                        .error_response("runtime completion evidence verification timed out"),
+                );
+            }
         }
     };
     let completion_lease = completion_reservation.completion_lease(&host_id);
     if completion_reservation.is_issued_but_stale() {
-        let dead_lettered = match store
+        let stale_outcome = match store
             .record_remote_stale_completion_if_issued(
                 &runtime_job_id,
                 completion_lease,
@@ -201,7 +213,7 @@ pub async fn complete_runtime_job_for_runtime_host(
             )
             .await
         {
-            Ok(dead_lettered) => dead_lettered,
+            Ok(outcome) => outcome,
             Err(error) => {
                 tracing::error!(
                     host_id = %host_id,
@@ -209,31 +221,48 @@ pub async fn complete_runtime_job_for_runtime_host(
                     %error,
                     "runtime host failed to dead-letter stale completion"
                 );
-                false
+                RemoteStaleCompletionOutcome::Rejected
             }
         };
+        if stale_outcome == RemoteStaleCompletionOutcome::CancellationRequested {
+            return (
+                StatusCode::CONFLICT,
+                completion_json(lease::cancellation_requested_body()),
+            );
+        }
         return (
             StatusCode::CONFLICT,
             completion_json(json!({
                 "completed": false,
                 "error": "runtime job lease is not owned by this host",
-                "dead_lettered": dead_lettered,
+                "dead_lettered": stale_outcome == RemoteStaleCompletionOutcome::DeadLettered,
             })),
         );
     }
 
-    let completion = match store
-        .commit_runtime_activity_completion_with_transcript_if_owned_with_generation(
-            &runtime_job_id,
-            completion_lease,
-            &result,
-            transcript.as_ref(),
-        )
-        .await
-    {
+    let completion_result = if cancellation_ack {
+        store
+            .commit_cancelled_runtime_activity_completion_with_transcript_if_owned_with_generation(
+                &runtime_job_id,
+                completion_lease,
+                &result,
+                transcript.as_ref(),
+            )
+            .await
+    } else {
+        store
+            .commit_runtime_activity_completion_with_transcript_if_owned_with_generation(
+                &runtime_job_id,
+                completion_lease,
+                &result,
+                transcript.as_ref(),
+            )
+            .await
+    };
+    let completion = match completion_result {
         Ok(Some(completion)) => completion,
         Ok(None) => {
-            let dead_lettered = match store
+            let stale_outcome = match store
                 .record_remote_stale_completion_if_issued(
                     &runtime_job_id,
                     completion_lease,
@@ -242,7 +271,7 @@ pub async fn complete_runtime_job_for_runtime_host(
                 )
                 .await
             {
-                Ok(dead_lettered) => dead_lettered,
+                Ok(outcome) => outcome,
                 Err(error) => {
                     tracing::error!(
                         host_id = %host_id,
@@ -250,15 +279,21 @@ pub async fn complete_runtime_job_for_runtime_host(
                         %error,
                         "runtime host failed to dead-letter stale completion"
                     );
-                    false
+                    RemoteStaleCompletionOutcome::Rejected
                 }
             };
+            if stale_outcome == RemoteStaleCompletionOutcome::CancellationRequested {
+                return (
+                    StatusCode::CONFLICT,
+                    completion_json(lease::cancellation_requested_body()),
+                );
+            }
             return (
                 StatusCode::CONFLICT,
                 completion_json(json!({
                     "completed": false,
                     "error": "runtime job lease is not owned by this host",
-                    "dead_lettered": dead_lettered,
+                    "dead_lettered": stale_outcome == RemoteStaleCompletionOutcome::DeadLettered,
                 })),
             );
         }

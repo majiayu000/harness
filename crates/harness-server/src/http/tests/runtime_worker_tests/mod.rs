@@ -693,10 +693,10 @@ async fn runtime_job_worker_cancels_job_when_workflow_already_terminal() -> anyh
         .workflow_runtime_store
         .as_ref()
         .expect("workflow runtime store should be configured");
-    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+    let mut workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
         1,
-        "cancelled",
+        "implementing",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:125"),
     )
     .with_id("issue-125")
@@ -731,6 +731,8 @@ async fn runtime_job_worker_cancels_job_when_workflow_already_terminal() -> anyh
             }),
         )
         .await?;
+    workflow.state = "cancelled".to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,
@@ -741,8 +743,11 @@ async fn runtime_job_worker_cancels_job_when_workflow_already_terminal() -> anyh
 
     assert_eq!(tick.succeeded, 0);
     assert_eq!(tick.failed, 0);
-    assert_eq!(tick.cancelled, 1);
-    assert!(!tick.idle);
+    assert_eq!(tick.cancelled, 0);
+    assert!(
+        tick.idle,
+        "the claim-level terminal fence repairs the stale job before the worker receives it"
+    );
     assert!(agent.prompts.lock().await.is_empty());
     let completed = store
         .get_runtime_job(&runtime_job.id)
@@ -760,16 +765,17 @@ async fn runtime_job_worker_cancels_job_when_workflow_already_terminal() -> anyh
     assert_eq!(output.activity, "implement_issue");
     assert_eq!(
         output.summary,
-        "Workflow issue-125 was already terminal (cancelled) before runtime execution."
+        "Workflow entered terminal state `cancelled` before the command completed."
     );
     assert_eq!(
         store.commands_for(&workflow.id).await?[0].status,
         "cancelled"
     );
     let events = store.runtime_events_for(&runtime_job.id).await?;
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0].event_type, "RuntimeJobClaimed");
-    assert_eq!(events[1].event_type, "ActivityResultReady");
+    assert!(
+        events.is_empty(),
+        "the stale job is fenced before a runtime lease or execution event is created"
+    );
     Ok(())
 }
 

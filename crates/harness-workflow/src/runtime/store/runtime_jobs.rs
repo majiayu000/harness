@@ -244,19 +244,60 @@ impl WorkflowRuntimeStore {
         input: Value,
         not_before: Option<DateTime<Utc>>,
     ) -> anyhow::Result<RuntimeJob> {
+        let workflow_id: Option<(String,)> =
+            sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
+                .bind(command_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((workflow_id,)) = workflow_id else {
+            anyhow::bail!("workflow command not found: {command_id}");
+        };
+
         let mut job = RuntimeJob::pending(command_id, runtime_kind, runtime_profile, input);
         job.not_before = not_before;
         let data = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
         let runtime_kind = enum_str(&job.runtime_kind)?;
         let mut tx = self.pool.begin().await?;
-        let workflow_id: Option<(String,)> =
-            sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
-                .bind(command_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((workflow_id,)) = workflow_id else {
+        let workflow = select_instance_for_update_tx(&mut tx, &workflow_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("workflow instance not found: {workflow_id}"))?;
+        if definitions::terminal_state_for_instance_tx(
+            &mut tx,
+            &self.definition_registry,
+            &workflow,
+        )
+        .await?
+        .is_some()
+        {
+            anyhow::bail!(
+                "cannot enqueue runtime job for terminal workflow `{workflow_id}` in state `{}`",
+                workflow.state
+            );
+        }
+        let command_status: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM workflow_commands
+             WHERE id = $1 AND workflow_id = $2
+             FOR UPDATE",
+        )
+        .bind(command_id)
+        .bind(&workflow_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((command_status,)) = command_status else {
             anyhow::bail!("workflow command not found: {command_id}");
+        };
+        let command_status = WorkflowCommandStatus::try_from(command_status.as_str())?;
+        if !matches!(
+            command_status,
+            WorkflowCommandStatus::Pending
+                | WorkflowCommandStatus::Dispatching
+                | WorkflowCommandStatus::Dispatched
+                | WorkflowCommandStatus::Deferred
+        ) {
+            anyhow::bail!(
+                "cannot enqueue runtime job for command `{command_id}` in status `{command_status}`"
+            );
         };
         sqlx::query(
             "INSERT INTO runtime_jobs
@@ -326,62 +367,7 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
-        let mut tx = self.pool.begin().await?;
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT job.id, job.data::text
-             FROM runtime_jobs AS job
-             JOIN workflow_commands AS command ON command.id = job.command_id
-             JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
-             WHERE (
-                 (
-                     job.status = 'pending'
-                     AND (job.not_before IS NULL OR job.not_before <= CURRENT_TIMESTAMP)
-                 ) OR (
-                     job.status = 'running'
-                     AND job.data ? 'lease'
-                     AND (job.data->'lease' ? 'expires_at')
-                     AND (job.data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
-                 )
-             )
-             AND job.data #> '{input,cancellation_requested}' IS NULL
-             ORDER BY
-                 CASE
-                     WHEN COALESCE(job.data #>> '{input,activity}', '') IN (
-                         'implement_issue',
-                         'implement_prompt',
-                         'inspect_pr_feedback',
-                         'address_pr_feedback'
-                     ) THEN 0
-                     ELSE 1
-                 END ASC,
-                 job.created_at ASC
-             LIMIT 1
-             FOR UPDATE OF job SKIP LOCKED",
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some((id, data)) = row else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-
-        let mut job: RuntimeJob = serde_json::from_str(&data)?;
-        job.claim(owner, expires_at);
-        let updated = to_jsonb_string(&job)?;
-        let status = enum_str(&job.status)?;
-        sqlx::query(
-            "UPDATE runtime_jobs
-             SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $4",
-        )
-        .bind(&status)
-        .bind(job.not_before)
-        .bind(&updated)
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(Some(job))
+        self.claim_next_runtime_job_matching(None, None, owner, expires_at, true, true)
+            .await
     }
 }

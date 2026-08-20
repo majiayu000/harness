@@ -1,6 +1,6 @@
 use super::*;
 use harness_workflow::runtime::store::runtime_job_leases::{
-    RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRequest,
+    RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRejection, RuntimeJobLeaseRenewalRequest,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -161,6 +161,12 @@ pub(super) async fn reserve_completion_lease(
                 Err((status, completion_json(body.0)))
             }
         },
+        Ok(RuntimeJobLeaseRenewalOutcome::LeaseLost {
+            reason: RuntimeJobLeaseRenewalRejection::CancellationRequested,
+        }) => Err((
+            StatusCode::CONFLICT,
+            completion_json(lease::cancellation_requested_body()),
+        )),
         Ok(RuntimeJobLeaseRenewalOutcome::LeaseLost { .. }) => match store
             .remote_stale_completion_is_issued(
                 &job.id,

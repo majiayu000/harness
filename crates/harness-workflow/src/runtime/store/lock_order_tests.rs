@@ -61,9 +61,35 @@ fn rank_of(table: &str) -> Option<usize> {
     LOCK_HIERARCHY.iter().position(|known| *known == table)
 }
 
-/// Extracts the table a `FOR UPDATE` statement locks by walking back to the
-/// nearest `FROM <table>` in the same SQL literal.
+/// Extracts the table a `FOR UPDATE` statement locks. Explicit
+/// `FOR UPDATE OF <alias>` clauses resolve their alias against the preceding
+/// `FROM`/`JOIN`; otherwise the nearest `FROM <table>` remains the fallback.
 fn table_for_lock(lines: &[&str], lock_line: usize) -> Option<String> {
+    if let Some((_, after)) = lines[lock_line].split_once("FOR UPDATE OF ") {
+        let alias = after
+            .split_whitespace()
+            .next()?
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        for line in lines[..=lock_line].iter().rev() {
+            for keyword in ["FROM ", "JOIN "] {
+                let Some((_, relation)) = line.split_once(keyword) else {
+                    continue;
+                };
+                let mut parts = relation.split_whitespace();
+                let table = parts
+                    .next()?
+                    .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                let relation_alias = match parts.next() {
+                    Some("AS") => parts.next(),
+                    other => other,
+                }
+                .map(|part| part.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'));
+                if relation_alias == Some(alias) || table == alias {
+                    return Some(table.to_string());
+                }
+            }
+        }
+    }
     lines[..=lock_line].iter().rev().find_map(|line| {
         let (_, after) = line.split_once("FROM ")?;
         let table = after
@@ -72,6 +98,32 @@ fn table_for_lock(lines: &[&str], lock_line: usize) -> Option<String> {
             .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
         (!table.is_empty()).then(|| table.to_string())
     })
+}
+
+#[test]
+fn lint_resolves_explicit_for_update_aliases() {
+    let source = r#"
+        async fn claim(&self) -> anyhow::Result<()> {
+            sqlx::query(
+                "SELECT job.id
+                 FROM runtime_jobs AS job
+                 JOIN workflow_commands AS command ON command.id = job.command_id
+                 JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+                 FOR UPDATE OF workflow SKIP LOCKED",
+            );
+            sqlx::query("SELECT id FROM runtime_jobs WHERE id = $1 FOR UPDATE");
+            Ok(())
+        }
+    "#;
+    let sites = lock_sites(source);
+    assert_eq!(
+        sites
+            .iter()
+            .map(|site| site.table.as_str())
+            .collect::<Vec<_>>(),
+        vec!["workflow_instances", "runtime_jobs"]
+    );
+    assert!(inversions(&sites).is_empty());
 }
 
 /// Name of the nearest enclosing `fn`, used only for error messages.
@@ -88,33 +140,77 @@ fn enclosing_fn(lines: &[&str], line: usize) -> String {
 
 /// The table a line locks: either directly via `FOR UPDATE`, or indirectly by
 /// calling a helper listed in [`LOCK_TAKING_HELPERS`].
-fn locked_table(lines: &[&str], index: usize) -> Option<String> {
+fn locked_tables(lines: &[&str], index: usize) -> Vec<String> {
     if lines[index].contains("FOR UPDATE") {
-        return table_for_lock(lines, index);
+        return table_for_lock(lines, index).into_iter().collect();
     }
     LOCK_TAKING_HELPERS
         .iter()
-        .find(|(helper, _)| lines[index].contains(&format!("{helper}(")))
+        .filter(|(helper, _)| lines[index].contains(&format!("{helper}(")))
         // A helper's own definition is not a call site.
         .filter(|_| !lines[index].trim_start().starts_with("fn "))
         .filter(|_| !lines[index].contains("async fn "))
         .map(|(_, table)| table.to_string())
+        .collect()
 }
 
 fn lock_sites(source: &str) -> Vec<LockSite> {
     let lines: Vec<&str> = source.lines().collect();
     (0..lines.len())
-        .filter_map(|index| {
-            let table = locked_table(&lines, index)?;
-            let rank = rank_of(&table)?;
-            Some(LockSite {
-                table,
-                rank,
-                line: index + 1,
-                function: enclosing_fn(&lines, index),
-            })
+        .flat_map(|index| {
+            locked_tables(&lines, index)
+                .into_iter()
+                .filter_map(|table| {
+                    let rank = rank_of(&table)?;
+                    Some(LockSite {
+                        table,
+                        rank,
+                        line: index + 1,
+                        function: enclosing_fn(&lines, index),
+                    })
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
+}
+
+#[test]
+fn lint_detects_runtime_job_lock_before_terminal_fence() {
+    let source = r#"
+        async fn inverted_terminal_completion(&self) -> anyhow::Result<()> {
+            sqlx::query("SELECT id FROM runtime_jobs WHERE id = $1 FOR UPDATE");
+            transaction_helpers::fence_terminal_transition_tx(&mut tx).await?;
+            Ok(())
+        }
+    "#;
+    let sites = lock_sites(source);
+    let ranks: Vec<usize> = sites.iter().map(|site| site.rank).collect();
+    assert_eq!(ranks, vec![2, 1, 2]);
+    let found = inversions(&sites);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].late_table, "workflow_commands");
+    assert_eq!(found[0].after_table, "runtime_jobs");
+}
+
+#[test]
+fn lint_detects_runtime_job_lock_before_runtime_job_workflow_fence() {
+    let source = r#"
+        async fn inverted_runtime_job_mutation(&self) -> anyhow::Result<()> {
+            sqlx::query("SELECT id FROM runtime_jobs WHERE id = $1 FOR UPDATE");
+            runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(&mut tx).await?;
+            Ok(())
+        }
+    "#;
+    let sites = lock_sites(source);
+    let ranks: Vec<usize> = sites.iter().map(|site| site.rank).collect();
+    assert_eq!(ranks, vec![2, 0, 1, 2]);
+    let found = inversions(&sites);
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].late_table, "workflow_instances");
+    assert_eq!(found[1].late_table, "workflow_commands");
+    assert!(found
+        .iter()
+        .all(|violation| violation.after_table == "runtime_jobs"));
 }
 
 /// A lock taken at a shallower level than one already held, without that level
@@ -366,6 +462,28 @@ fn lint_accepts_the_documented_order() {
     let ranks: Vec<usize> = sites.iter().map(|site| site.rank).collect();
     assert_eq!(ranks, vec![0, 1, 2]);
     assert!(inversions(&sites).is_empty());
+}
+
+#[test]
+fn lint_models_terminal_fence_prelocks_before_completion_rows() {
+    let source = r#"
+        async fn ordered_terminal_completion(&self) -> anyhow::Result<()> {
+            transaction_helpers::select_instance_for_update_tx(&mut tx, workflow_id).await?;
+            lock_workflow_commands_for_terminal_fence_tx(&mut tx, workflow_id).await?;
+            lock_workflow_runtime_jobs_for_terminal_fence_tx(&mut tx, workflow_id).await?;
+            sqlx::query("SELECT id FROM workflow_commands WHERE id = $1 FOR UPDATE");
+            sqlx::query("SELECT id FROM runtime_jobs WHERE id = $1 FOR UPDATE");
+            transaction_helpers::fence_terminal_transition_tx(&mut tx).await?;
+            Ok(())
+        }
+    "#;
+    let sites = lock_sites(source);
+    let ranks: Vec<usize> = sites.iter().map(|site| site.rank).collect();
+    assert_eq!(ranks, vec![0, 1, 2, 1, 2, 1, 2]);
+    assert!(
+        inversions(&sites).is_empty(),
+        "terminal completion prelocks must make later row re-locks safe"
+    );
 }
 
 #[test]

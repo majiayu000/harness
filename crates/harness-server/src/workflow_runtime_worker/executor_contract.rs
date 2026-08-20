@@ -31,7 +31,7 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
 
     async fn execute(&self, mut job: RuntimeJob) -> ActivityResult {
         if let Err(result) = hydrate_exact_replay_transcript(self.state, &mut job).await {
-            return result;
+            return *result;
         }
         let activity = activity_name(&job);
         match self.execute_inner(job).await {

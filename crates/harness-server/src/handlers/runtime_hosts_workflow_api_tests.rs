@@ -1736,6 +1736,9 @@ async fn register_runtime_host_rejects_required_missing_runtime_state_store() ->
     Ok(())
 }
 
+#[path = "runtime_hosts_terminal_fence_cases.rs"]
+mod terminal_fence_cases;
+
 #[tokio::test]
 async fn deregister_runtime_host_rejects_required_missing_runtime_state_store_before_lookup(
 ) -> anyhow::Result<()> {

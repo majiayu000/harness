@@ -24,6 +24,11 @@ use std::sync::Arc;
 
 #[path = "store/activity_completion.rs"]
 mod activity_completion;
+#[path = "store/activity_completion_dead_letter.rs"]
+mod activity_completion_dead_letter;
+pub use activity_completion_dead_letter::RemoteStaleCompletionOutcome;
+#[path = "store/activity_completion_terminal.rs"]
+mod activity_completion_terminal;
 #[path = "store/artifacts.rs"]
 mod artifacts;
 #[path = "store/child_instance_start.rs"]
@@ -71,12 +76,16 @@ mod recovery;
 mod runtime_completion;
 #[path = "store/runtime_completion_budget.rs"]
 mod runtime_completion_budget;
+#[path = "store/runtime_job_lease_revocation.rs"]
+mod runtime_job_lease_revocation;
 #[path = "store/runtime_job_leases.rs"]
 pub mod runtime_job_leases;
 #[path = "store/runtime_job_queries.rs"]
 mod runtime_job_queries;
 #[path = "store/runtime_job_state.rs"]
 mod runtime_job_state;
+#[path = "store/runtime_job_terminal_fence.rs"]
+mod runtime_job_terminal_fence;
 #[path = "store/runtime_jobs.rs"]
 mod runtime_jobs;
 #[path = "store/runtime_usage.rs"]
@@ -125,6 +134,7 @@ pub use submission_commit::{
     WorkflowSubmissionPromptPayload,
 };
 pub use submission_instances::WorkflowSubmissionFilter;
+pub(in crate::runtime) use transaction_helpers::fence_terminal_transition_tx;
 #[cfg(test)]
 use transaction_helpers::force_upsert_lifecycle_state_for_test_tx;
 use transaction_helpers::{

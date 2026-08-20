@@ -1,4 +1,23 @@
+use super::activity_completion_terminal::{
+    cancellation_ack_matches, command_status_is_active,
+    lock_workflow_commands_for_terminal_fence_tx, lock_workflow_runtime_jobs_for_terminal_fence_tx,
+};
 use super::*;
+
+#[derive(Clone, Copy)]
+enum RuntimeCompletionKind {
+    Normal,
+    CancellationAck,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeActivityCompletionRequest<'a> {
+    runtime_job_id: &'a str,
+    lease: RuntimeJobCompletionLease<'a>,
+    result: &'a ActivityResult,
+    transcript: Option<&'a PendingRuntimeTranscript>,
+    completion_kind: RuntimeCompletionKind,
+}
 
 impl WorkflowRuntimeStore {
     pub async fn complete_runtime_job_if_owned(
@@ -8,7 +27,21 @@ impl WorkflowRuntimeStore {
         lease_expires_at: DateTime<Utc>,
         result: &ActivityResult,
     ) -> anyhow::Result<Option<RuntimeJob>> {
+        let workflow_id_row: Option<(String,)> = sqlx::query_as(
+            "SELECT command.workflow_id
+             FROM runtime_jobs AS job
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             WHERE job.id = $1",
+        )
+        .bind(runtime_job_id)
+        .fetch_optional(&self.pool)
+        .await?;
         let mut tx = self.pool.begin().await?;
+        let locked_workflow = if let Some((workflow_id,)) = workflow_id_row.as_ref() {
+            transaction_helpers::select_instance_for_update_tx(&mut tx, workflow_id).await?
+        } else {
+            None
+        };
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
                 .bind(runtime_job_id)
@@ -18,7 +51,20 @@ impl WorkflowRuntimeStore {
             return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
-        let is_current_lease = job.status == RuntimeJobStatus::Running
+        let workflow_is_terminal = if let Some(workflow) = locked_workflow.as_ref() {
+            definitions::terminal_state_for_instance_tx(
+                &mut tx,
+                &self.definition_registry,
+                workflow,
+            )
+            .await?
+            .is_some()
+        } else {
+            false
+        };
+        let is_current_lease = !workflow_is_terminal
+            && job.input.get("cancellation_requested").is_none()
+            && job.status == RuntimeJobStatus::Running
             && job.runtime_kind != RuntimeKind::RemoteHost
             && job
                 .lease
@@ -76,12 +122,13 @@ impl WorkflowRuntimeStore {
         result: &ActivityResult,
         transcript: Option<&PendingRuntimeTranscript>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
-        self.commit_runtime_activity_completion_retrying(
+        self.commit_runtime_activity_completion_retrying(RuntimeActivityCompletionRequest {
             runtime_job_id,
-            RuntimeJobCompletionLease::local(owner, lease_expires_at),
+            lease: RuntimeJobCompletionLease::local(owner, lease_expires_at),
             result,
             transcript,
-        )
+            completion_kind: RuntimeCompletionKind::Normal,
+        })
         .await
     }
 
@@ -91,8 +138,14 @@ impl WorkflowRuntimeStore {
         lease: RuntimeJobCompletionLease<'_>,
         result: &ActivityResult,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
-        self.commit_runtime_activity_completion_retrying(runtime_job_id, lease, result, None)
-            .await
+        self.commit_runtime_activity_completion_retrying(RuntimeActivityCompletionRequest {
+            runtime_job_id,
+            lease,
+            result,
+            transcript: None,
+            completion_kind: RuntimeCompletionKind::Normal,
+        })
+        .await
     }
 
     pub async fn commit_runtime_activity_completion_with_transcript_if_owned_with_generation(
@@ -102,8 +155,35 @@ impl WorkflowRuntimeStore {
         result: &ActivityResult,
         transcript: Option<&PendingRuntimeTranscript>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
-        self.commit_runtime_activity_completion_retrying(runtime_job_id, lease, result, transcript)
-            .await
+        self.commit_runtime_activity_completion_retrying(RuntimeActivityCompletionRequest {
+            runtime_job_id,
+            lease,
+            result,
+            transcript,
+            completion_kind: RuntimeCompletionKind::Normal,
+        })
+        .await
+    }
+
+    /// Commit the explicit cleanup acknowledgement for a cancelled remote eval.
+    ///
+    /// Once the terminal fence requests cancellation, only a cancelled result
+    /// carrying the runtime-host cleanup proof may consume the preserved lease.
+    pub async fn commit_cancelled_runtime_activity_completion_with_transcript_if_owned_with_generation(
+        &self,
+        runtime_job_id: &str,
+        lease: RuntimeJobCompletionLease<'_>,
+        result: &ActivityResult,
+        transcript: Option<&PendingRuntimeTranscript>,
+    ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
+        self.commit_runtime_activity_completion_retrying(RuntimeActivityCompletionRequest {
+            runtime_job_id,
+            lease,
+            result,
+            transcript,
+            completion_kind: RuntimeCompletionKind::CancellationAck,
+        })
+        .await
     }
 
     /// Runs the completion transaction, re-running it when PostgreSQL aborts
@@ -115,24 +195,25 @@ impl WorkflowRuntimeStore {
     /// runtime job.
     async fn commit_runtime_activity_completion_retrying(
         &self,
-        runtime_job_id: &str,
-        lease: RuntimeJobCompletionLease<'_>,
-        result: &ActivityResult,
-        transcript: Option<&PendingRuntimeTranscript>,
+        request: RuntimeActivityCompletionRequest<'_>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
         lock_order::retry_on_transaction_abort("commit_runtime_activity_completion", || {
-            self.commit_runtime_activity_completion_inner(runtime_job_id, lease, result, transcript)
+            self.commit_runtime_activity_completion_inner(request)
         })
         .await
     }
 
     async fn commit_runtime_activity_completion_inner(
         &self,
-        runtime_job_id: &str,
-        lease: RuntimeJobCompletionLease<'_>,
-        result: &ActivityResult,
-        transcript: Option<&PendingRuntimeTranscript>,
+        request: RuntimeActivityCompletionRequest<'_>,
     ) -> anyhow::Result<Option<RuntimeActivityCompletion>> {
+        let RuntimeActivityCompletionRequest {
+            runtime_job_id,
+            lease,
+            result,
+            transcript,
+            completion_kind,
+        } = request;
         // Resolve the keys of the rows this transaction will lock BEFORE it
         // opens, with plain reads that take no row locks. `command_id` and
         // `workflow_id` are immutable for the life of a job/command, so an
@@ -164,6 +245,12 @@ impl WorkflowRuntimeStore {
         } else {
             None
         };
+        if let (Some(_), Some((workflow_id,))) =
+            (locked_workflow.as_ref(), workflow_id_row.as_ref())
+        {
+            lock_workflow_commands_for_terminal_fence_tx(&mut tx, workflow_id).await?;
+            lock_workflow_runtime_jobs_for_terminal_fence_tx(&mut tx, workflow_id).await?;
+        }
         // Lock order 2/3: the command.
         let command_row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
@@ -188,7 +275,25 @@ impl WorkflowRuntimeStore {
             return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
-        let mut is_current_lease = job.status == RuntimeJobStatus::Running
+        let workflow_is_terminal = if let Some(workflow) = locked_workflow.as_ref() {
+            definitions::terminal_state_for_instance_tx(
+                &mut tx,
+                &self.definition_registry,
+                workflow,
+            )
+            .await?
+            .is_some()
+        } else {
+            false
+        };
+        let completion_kind_matches = match completion_kind {
+            RuntimeCompletionKind::Normal => {
+                !workflow_is_terminal && job.input.get("cancellation_requested").is_none()
+            }
+            RuntimeCompletionKind::CancellationAck => cancellation_ack_matches(&job, result),
+        };
+        let mut is_current_lease = completion_kind_matches
+            && job.status == RuntimeJobStatus::Running
             && lease
                 .generation
                 .is_none_or(|generation| generation == job.lease_generation)
@@ -302,21 +407,26 @@ impl WorkflowRuntimeStore {
             }));
         };
         let command_status = command_status_for_activity(result.status);
-        sqlx::query(
-            "UPDATE workflow_commands
-             SET status = $1,
-                 dispatch_owner = NULL,
-                 dispatch_lease_expires_at = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $2",
-        )
-        .bind(command_status.as_str())
-        .bind(&command.id)
-        .execute(&mut *tx)
-        .await?;
-        command.status = command_status;
-        command.dispatch_owner = None;
-        command.dispatch_lease_expires_at = None;
+        let preserve_inactive_command =
+            matches!(completion_kind, RuntimeCompletionKind::CancellationAck)
+                && !command_status_is_active(command.status);
+        if !preserve_inactive_command {
+            sqlx::query(
+                "UPDATE workflow_commands
+                 SET status = $1,
+                     dispatch_owner = NULL,
+                     dispatch_lease_expires_at = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $2",
+            )
+            .bind(command_status.as_str())
+            .bind(&command.id)
+            .execute(&mut *tx)
+            .await?;
+            command.status = command_status;
+            command.dispatch_owner = None;
+            command.dispatch_lease_expires_at = None;
+        }
 
         let Some(locked_workflow) = locked_workflow else {
             tx.commit().await?;
@@ -439,297 +549,6 @@ fn command_status_for_activity(status: ActivityStatus) -> WorkflowCommandStatus 
     }
 }
 
-impl WorkflowRuntimeStore {
-    /// Durably record a completed activity result that the worker can no
-    /// longer commit because its job lease expired or was reclaimed
-    /// (GH-1878). The payload — result plus optional transcript — lands in
-    /// `runtime_job_completions_dlq` instead of being dropped, so no finished
-    /// agent work vanishes silently; reconciliation can decide later whether
-    /// the result is still applicable or the job must re-run.
-    pub async fn record_lease_expired_completion(
-        &self,
-        runtime_job_id: &str,
-        owner: &str,
-        lease_generation: u64,
-        lease_expires_at: DateTime<Utc>,
-        result: &ActivityResult,
-        transcript: Option<&crate::runtime::transcript::PendingRuntimeTranscript>,
-    ) -> anyhow::Result<()> {
-        const MAX_ATTEMPTS: usize = 3;
-
-        let mut last_error = None;
-        for attempt in 1..=MAX_ATTEMPTS {
-            match self
-                .record_lease_expired_completion_once(
-                    runtime_job_id,
-                    owner,
-                    lease_generation,
-                    lease_expires_at,
-                    result,
-                    transcript,
-                )
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    last_error = Some(error);
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
-                            .await;
-                    }
-                }
-            }
-        }
-        match last_error {
-            Some(error) => Err(error).context(format!(
-                "failed to record lease-expired completion after {MAX_ATTEMPTS} attempts"
-            )),
-            None => anyhow::bail!("dead-letter retry loop did not execute"),
-        }
-    }
-
-    async fn record_lease_expired_completion_once(
-        &self,
-        runtime_job_id: &str,
-        owner: &str,
-        lease_generation: u64,
-        lease_expires_at: DateTime<Utc>,
-        result: &ActivityResult,
-        transcript: Option<&crate::runtime::transcript::PendingRuntimeTranscript>,
-    ) -> anyhow::Result<()> {
-        let result_json = serde_json::to_value(result)?;
-        let transcript_json = transcript
-            .map(|pending| serde_json::to_value(&pending.record))
-            .transpose()?;
-        let mut tx = self.pool.begin().await?;
-        match insert_lease_expired_completion_tx(
-            &mut tx,
-            runtime_job_id,
-            owner,
-            lease_generation,
-            lease_expires_at,
-            &result_json,
-            transcript_json.as_ref(),
-        )
-        .await?
-        {
-            LeaseExpiredCompletionInsertOutcome::Inserted => {
-                runtime_job_leases::append_runtime_event_tx(
-                    &mut tx,
-                    runtime_job_id,
-                    "LeaseExpiredCompletionRecorded",
-                    serde_json::json!({
-                        "owner": owner,
-                        "lease_generation": lease_generation,
-                        "lease_expires_at": lease_expires_at,
-                        "applied": false,
-                    }),
-                )
-                .await?;
-            }
-            LeaseExpiredCompletionInsertOutcome::Replayed => {}
-            LeaseExpiredCompletionInsertOutcome::Conflict => {
-                anyhow::bail!(
-                    "conflicting lease-expired completion already exists for runtime job {runtime_job_id}"
-                );
-            }
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn record_remote_stale_completion_if_issued(
-        &self,
-        runtime_job_id: &str,
-        lease: RuntimeJobCompletionLease<'_>,
-        result: &ActivityResult,
-        transcript: Option<&PendingRuntimeTranscript>,
-    ) -> anyhow::Result<bool> {
-        let lease_generation = lease
-            .generation
-            .ok_or_else(|| anyhow::anyhow!("remote stale completion requires a generation"))?;
-        let result_json = serde_json::to_value(result)?;
-        let transcript_json = transcript
-            .map(|pending| serde_json::to_value(&pending.record))
-            .transpose()?;
-        let mut tx = self.pool.begin().await?;
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
-                .bind(runtime_job_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((data,)) = row else {
-            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
-        };
-        let current: RuntimeJob = serde_json::from_str(&data)?;
-        if !remote_stale_completion_is_issued_tx(
-            &mut tx,
-            runtime_job_id,
-            &current,
-            lease,
-            Utc::now(),
-        )
-        .await?
-        {
-            tx.commit().await?;
-            return Ok(false);
-        }
-        let insert_outcome = insert_lease_expired_completion_tx(
-            &mut tx,
-            runtime_job_id,
-            lease.owner,
-            lease_generation,
-            lease.expires_at,
-            &result_json,
-            transcript_json.as_ref(),
-        )
-        .await?;
-        if insert_outcome == LeaseExpiredCompletionInsertOutcome::Inserted {
-            runtime_job_leases::append_runtime_event_tx(
-                &mut tx,
-                runtime_job_id,
-                "LeaseExpiredCompletionRecorded",
-                serde_json::json!({
-                    "owner": lease.owner,
-                    "lease_generation": lease_generation,
-                    "lease_expires_at": lease.expires_at,
-                    "applied": false,
-                    "source": "runtime_host",
-                }),
-            )
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(insert_outcome != LeaseExpiredCompletionInsertOutcome::Conflict)
-    }
-
-    pub async fn remote_stale_completion_is_issued(
-        &self,
-        runtime_job_id: &str,
-        lease: RuntimeJobCompletionLease<'_>,
-    ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
-                .bind(runtime_job_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((data,)) = row else {
-            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
-        };
-        let current: RuntimeJob = serde_json::from_str(&data)?;
-        let issued = remote_stale_completion_is_issued_tx(
-            &mut tx,
-            runtime_job_id,
-            &current,
-            lease,
-            Utc::now(),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(issued)
-    }
-}
-
 #[cfg(test)]
 #[path = "activity_completion_tests.rs"]
 mod tests;
-
-async fn remote_stale_completion_is_issued_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    runtime_job_id: &str,
-    current: &RuntimeJob,
-    lease: RuntimeJobCompletionLease<'_>,
-    now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
-    let Some(lease_generation) = lease.generation else {
-        return Ok(false);
-    };
-    let same_expired_generation = current.lease_generation == lease_generation
-        && current.status == RuntimeJobStatus::Running
-        && current
-            .lease
-            .as_ref()
-            .is_some_and(|current_lease| current_lease.expires_at <= now);
-    let revoked_generation = current.lease_generation == lease_generation
-        && current.status == RuntimeJobStatus::Pending
-        && current.lease.is_none();
-    let reclaimed_generation = current.lease_generation > lease_generation;
-    if current.runtime_kind != RuntimeKind::RemoteHost
-        || (!same_expired_generation && !revoked_generation && !reclaimed_generation)
-    {
-        return Ok(false);
-    }
-    runtime_job_leases::remote_runtime_job_lease_proof_matches_tx(
-        tx,
-        runtime_job_id,
-        lease.owner,
-        lease_generation,
-        lease.expires_at,
-        lease.proof,
-    )
-    .await
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LeaseExpiredCompletionInsertOutcome {
-    Inserted,
-    Replayed,
-    Conflict,
-}
-
-async fn insert_lease_expired_completion_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    runtime_job_id: &str,
-    owner: &str,
-    lease_generation: u64,
-    lease_expires_at: DateTime<Utc>,
-    result_json: &serde_json::Value,
-    transcript_json: Option<&serde_json::Value>,
-) -> anyhow::Result<LeaseExpiredCompletionInsertOutcome> {
-    let lease_generation = i64::try_from(lease_generation)
-        .map_err(|_| anyhow::anyhow!("runtime job lease generation exceeds BIGINT"))?;
-    let inserted = sqlx::query(
-        "INSERT INTO runtime_job_completions_dlq
-            (id, runtime_job_id, owner, lease_generation, lease_expires_at, result, transcript)
-         VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6::jsonb)
-         ON CONFLICT (id) DO NOTHING",
-    )
-    .bind(runtime_job_id)
-    .bind(owner)
-    .bind(lease_generation)
-    .bind(lease_expires_at)
-    .bind(result_json)
-    .bind(transcript_json)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected();
-    if inserted > 0 {
-        return Ok(LeaseExpiredCompletionInsertOutcome::Inserted);
-    }
-    let replayed: Option<(bool,)> = sqlx::query_as(
-        "SELECT owner = $2
-                AND lease_generation IS NOT DISTINCT FROM $3
-                AND lease_expires_at = $4
-                AND result = $5::jsonb
-                AND transcript IS NOT DISTINCT FROM $6::jsonb
-         FROM runtime_job_completions_dlq
-         WHERE id = $1
-         FOR UPDATE",
-    )
-    .bind(runtime_job_id)
-    .bind(owner)
-    .bind(lease_generation)
-    .bind(lease_expires_at)
-    .bind(result_json)
-    .bind(transcript_json)
-    .fetch_optional(&mut **tx)
-    .await?;
-    match replayed {
-        Some((true,)) => Ok(LeaseExpiredCompletionInsertOutcome::Replayed),
-        Some((false,)) => Ok(LeaseExpiredCompletionInsertOutcome::Conflict),
-        None => anyhow::bail!(
-            "runtime completion dead-letter conflict disappeared for runtime job {runtime_job_id}"
-        ),
-    }
-}

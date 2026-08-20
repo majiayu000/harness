@@ -6,7 +6,8 @@
 
 use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
-    insert_decision_record_once_tx, insert_event_tx, load_or_insert_initial_instance_tx,
+    fence_terminal_transition_tx, insert_decision_record_once_tx, insert_event_tx,
+    load_or_insert_initial_instance_tx,
     transition_validation::{validate_transition, TransitionValidation},
     validate_instance_for_persistence, WorkflowDecisionTransition,
     WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
@@ -214,6 +215,7 @@ impl WorkflowRuntimeStore {
             }
         }
 
+        fence_terminal_transition_tx(&mut tx, &self.definition_registry, &final_instance).await?;
         commit_decision_instance_tx(&mut tx, &current, &final_instance, &record, false).await?;
 
         tx.commit().await?;

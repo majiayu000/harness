@@ -425,7 +425,7 @@ mod tests {
             let mut workflow = WorkflowInstance::new(
                 GITHUB_ISSUE_PR_DEFINITION_ID,
                 1,
-                state,
+                "implementing",
                 WorkflowSubject::new("issue", format!("issue:{id}")),
             )
             .with_id(id.to_string())
@@ -456,6 +456,7 @@ mod tests {
                 last_stop,
                 harness_workflow::runtime::DataProvenance::Server,
             )?;
+            workflow.state = state.to_string();
             crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
                 .await?;
             workflows.push(workflow);

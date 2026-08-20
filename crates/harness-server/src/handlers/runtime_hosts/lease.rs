@@ -159,13 +159,17 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
 fn cancellation_requested_response() -> (StatusCode, LeaseJson) {
     (
         StatusCode::CONFLICT,
-        lease_json(json!({
-            "error": "runtime job cancellation was requested",
-            "error_code": "lease_lost",
-            "must_stop": true,
-            "cleanup_ack_required": true,
-        })),
+        lease_json(cancellation_requested_body()),
     )
+}
+
+pub(super) fn cancellation_requested_body() -> serde_json::Value {
+    json!({
+        "error": "runtime job cancellation was requested",
+        "error_code": "lease_lost",
+        "must_stop": true,
+        "cleanup_ack_required": true,
+    })
 }
 
 pub(super) fn runtime_host_lease_expires_at(

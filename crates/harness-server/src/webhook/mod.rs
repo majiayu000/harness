@@ -300,9 +300,9 @@ pub(crate) fn decode_hex(value: &str) -> Option<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(value.len() / 2);
     let bytes = value.as_bytes();
-    for pair in bytes.chunks_exact(2) {
-        let high = (pair[0] as char).to_digit(16)? as u8;
-        let low = (pair[1] as char).to_digit(16)? as u8;
+    for index in (0..bytes.len()).step_by(2) {
+        let high = (bytes[index] as char).to_digit(16)? as u8;
+        let low = (bytes[index + 1] as char).to_digit(16)? as u8;
         out.push((high << 4) | low);
     }
     Some(out)

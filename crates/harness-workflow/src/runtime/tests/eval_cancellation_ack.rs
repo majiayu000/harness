@@ -96,6 +96,43 @@ async fn running_remote_eval_waits_for_host_cleanup_acknowledgement() -> anyhow:
         .await?
         .is_none());
 
+    let stale_job_only_completion = store
+        .complete_runtime_job_if_owned(
+            &claimed.id,
+            "host-1",
+            expires_at,
+            &ActivityResult::succeeded("implement_issue", "stale job-only success"),
+        )
+        .await?;
+    assert!(
+        stale_job_only_completion.is_none(),
+        "legacy job-only completion must honor the cancellation fence"
+    );
+
+    let stale_completion = store
+        .commit_runtime_activity_completion_if_owned_with_generation(
+            &claimed.id,
+            RuntimeJobCompletionLease::remote(
+                "host-1",
+                expires_at,
+                claimed.lease_generation,
+                store
+                    .remote_runtime_job_lease_proof(
+                        &claimed.id,
+                        "host-1",
+                        claimed.lease_generation,
+                        expires_at,
+                    )
+                    .await?,
+            ),
+            &ActivityResult::succeeded("implement_issue", "stale success after cancellation"),
+        )
+        .await?;
+    assert!(
+        stale_completion.is_none(),
+        "ordinary completion must not cross a requested cancellation fence"
+    );
+
     let now = Utc::now();
     let lease_proof = store
         .remote_runtime_job_lease_proof(&claimed.id, "host-1", claimed.lease_generation, expires_at)
@@ -141,7 +178,7 @@ async fn running_remote_eval_waits_for_host_cleanup_acknowledgement() -> anyhow:
             json!({"status": "cleaned", "evidence_source": "runtime_host_cancellation_ack"}),
         ));
     let completion = store
-        .commit_runtime_activity_completion_if_owned_with_generation(
+        .commit_cancelled_runtime_activity_completion_with_transcript_if_owned_with_generation(
             &claimed.id,
             RuntimeJobCompletionLease::remote(
                 "host-1",
@@ -150,6 +187,7 @@ async fn running_remote_eval_waits_for_host_cleanup_acknowledgement() -> anyhow:
                 lease_proof,
             ),
             &result,
+            None,
         )
         .await?;
     let completion = completion.expect("cleanup acknowledgement should complete the runtime job");
@@ -263,7 +301,7 @@ async fn late_cancellation_ack_does_not_decide_reopened_workflow() -> anyhow::Re
             json!({"status": "cleaned", "evidence_source": "runtime_host_cancellation_ack"}),
         ));
     let completion = store
-        .commit_runtime_activity_completion_if_owned_with_generation(
+        .commit_cancelled_runtime_activity_completion_with_transcript_if_owned_with_generation(
             &job.id,
             RuntimeJobCompletionLease::remote(
                 "host-1",
@@ -272,6 +310,7 @@ async fn late_cancellation_ack_does_not_decide_reopened_workflow() -> anyhow::Re
                 Some(proof),
             ),
             &result,
+            None,
         )
         .await?
         .expect("cleanup acknowledgement should finalize the old runtime job");

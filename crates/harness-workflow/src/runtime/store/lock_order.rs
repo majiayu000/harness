@@ -71,7 +71,7 @@ pub(super) const LOCK_HIERARCHY: [&str; 3] =
 ///
 /// Add an entry whenever a `_tx` helper starts taking a hierarchy row lock.
 #[cfg(test)]
-pub(super) const LOCK_TAKING_HELPERS: [(&str, &str); 10] = [
+pub(super) const LOCK_TAKING_HELPERS: [(&str, &str); 17] = [
     ("select_instance_for_update_tx", "workflow_instances"),
     ("lock_instance_for_update_tx", "workflow_instances"),
     ("lock_instance_for_event_sequence_tx", "workflow_instances"),
@@ -84,6 +84,25 @@ pub(super) const LOCK_TAKING_HELPERS: [(&str, &str); 10] = [
         "cancel_unfinished_runtime_jobs_for_commands_tx",
         "runtime_jobs",
     ),
+    (
+        "lock_workflow_commands_for_terminal_fence_tx",
+        "workflow_commands",
+    ),
+    (
+        "lock_workflow_runtime_jobs_for_terminal_fence_tx",
+        "runtime_jobs",
+    ),
+    ("fence_terminal_transition_tx", "workflow_commands"),
+    ("fence_terminal_transition_tx", "runtime_jobs"),
+    (
+        "fence_terminal_runtime_job_workflow_tx",
+        "workflow_instances",
+    ),
+    (
+        "fence_terminal_runtime_job_workflow_tx",
+        "workflow_commands",
+    ),
+    ("fence_terminal_runtime_job_workflow_tx", "runtime_jobs"),
     ("append_runtime_event_tx", "runtime_jobs"),
 ];
 

@@ -3,6 +3,7 @@ use crate::runtime::store::runtime_job_leases::{
     postgres_timestamp_ceil, postgres_timestamp_floor, RuntimeJobLeaseRenewalOutcome,
     RuntimeJobLeaseRenewalRejection, RuntimeJobLeaseRenewalRequest,
 };
+use crate::runtime::store::RemoteStaleCompletionOutcome;
 use crate::runtime::RuntimeJobCompletionLease;
 use uuid::Uuid;
 
@@ -203,15 +204,16 @@ async fn issued_stale_completion_is_dead_lettered_with_generation() -> anyhow::R
     let inserted = store
         .record_remote_stale_completion_if_issued(&first.id, lease, &result, None)
         .await?;
-    assert!(inserted);
-    assert!(
+    assert_eq!(inserted, RemoteStaleCompletionOutcome::DeadLettered);
+    assert_eq!(
         store
             .record_remote_stale_completion_if_issued(&first.id, lease, &result, None)
             .await?,
+        RemoteStaleCompletionOutcome::DeadLettered,
         "an exact response-loss replay must report the durable dead letter"
     );
-    assert!(
-        !store
+    assert_eq!(
+        store
             .record_remote_stale_completion_if_issued(
                 &first.id,
                 lease,
@@ -219,6 +221,7 @@ async fn issued_stale_completion_is_dead_lettered_with_generation() -> anyhow::R
                 None,
             )
             .await?,
+        RemoteStaleCompletionOutcome::Rejected,
         "a different result for the same job must not overwrite the first dead letter"
     );
     let (generation,): (Option<i64>,) = sqlx::query_as(
@@ -260,7 +263,7 @@ async fn revoked_issued_completion_is_dead_lettered_without_restoring_ownership(
             .await?,
         1
     );
-    assert!(
+    assert_eq!(
         store
             .record_remote_stale_completion_if_issued(
                 &claimed.id,
@@ -273,7 +276,8 @@ async fn revoked_issued_completion_is_dead_lettered_without_restoring_ownership(
                 &ActivityResult::succeeded("remote_check", "finished before revocation"),
                 None,
             )
-            .await?
+            .await?,
+        RemoteStaleCompletionOutcome::DeadLettered
     );
     let persisted = store
         .get_runtime_job(&claimed.id)
