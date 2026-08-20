@@ -222,13 +222,13 @@ pub(super) async fn required_remote_runtime_job_lease_proof(
     owner: &str,
     lease_generation: u64,
     lease_expires_at: DateTime<Utc>,
-) -> Result<uuid::Uuid, (StatusCode, Json<serde_json::Value>)> {
+) -> Option<uuid::Uuid> {
     match store
         .remote_runtime_job_lease_proof(runtime_job_id, owner, lease_generation, lease_expires_at)
         .await
     {
-        Ok(Some(proof)) => Ok(proof),
-        Ok(None) => Err(workflow_store_unavailable_response()),
+        Ok(Some(proof)) => Some(proof),
+        Ok(None) => None,
         Err(error) => {
             tracing::error!(
                 runtime_job_id,
@@ -236,7 +236,7 @@ pub(super) async fn required_remote_runtime_job_lease_proof(
                 %error,
                 "runtime job lease proof lookup failed"
             );
-            Err(workflow_store_unavailable_response())
+            None
         }
     }
 }

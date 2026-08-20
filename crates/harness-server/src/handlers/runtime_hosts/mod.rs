@@ -329,8 +329,11 @@ pub async fn claim_runtime_job_for_runtime_host(
     )
     .await
     {
-        Ok(proof) => proof,
-        Err(response) => return (response.0, claim_json(response.1 .0)),
+        Some(proof) => proof,
+        None => {
+            let response = lease::workflow_store_unavailable_response();
+            return (response.0, claim_json(response.1 .0));
+        }
     };
 
     match state
@@ -563,8 +566,11 @@ async fn complete_runtime_host_preflight_failure(
     )
     .await
     {
-        Ok(proof) => proof,
-        Err(response) => return (response.0, claim_json(response.1 .0)),
+        Some(proof) => proof,
+        None => {
+            let response = lease::workflow_store_unavailable_response();
+            return (response.0, claim_json(response.1 .0));
+        }
     };
     let completion = match store
         .commit_runtime_activity_completion_if_owned_with_generation(
