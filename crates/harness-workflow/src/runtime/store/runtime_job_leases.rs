@@ -188,6 +188,16 @@ impl WorkflowRuntimeStore {
         cancellation_ack: bool,
     ) -> anyhow::Result<RuntimeJobLeaseRenewalOutcome> {
         let mut tx = self.pool.begin().await?;
+        if !super::runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(
+            &mut tx,
+            &self.definition_registry,
+            request.runtime_job_id,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(RuntimeJobLeaseRenewalOutcome::NotFound);
+        }
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
                 .bind(request.runtime_job_id)

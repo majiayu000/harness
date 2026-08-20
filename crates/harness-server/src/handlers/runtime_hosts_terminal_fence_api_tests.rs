@@ -345,34 +345,7 @@ async fn completion_commit_reports_cleanup_ack_when_post_reservation_fence_wins_
     let claimed_expires_at: chrono::DateTime<chrono::Utc> =
         serde_json::from_value(claimed["lease_expires_at"].clone())?;
 
-    let terminal_store = std::sync::Arc::new(open_race_store(&store).await?);
-    let gate_store = open_race_store(&store).await?;
-    let monitor_store = open_race_store(&store).await?;
-    let mut gate = gate_store.pool().begin().await?;
-    let gate_backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *gate)
-        .await?;
-    sqlx::query("SELECT id FROM workflow_instances WHERE id = $1 FOR UPDATE")
-        .bind(&workflow_id)
-        .execute(&mut *gate)
-        .await?;
-
-    let terminal_workflow_id = workflow_id.clone();
-    let terminal = tokio::spawn(async move {
-        terminal_store
-            .commit_parent_runtime_completion(
-                &terminal_workflow_id,
-                "post-reservation-terminal-fence",
-                json!({
-                    "command_id": "post-reservation-terminal-command",
-                    "runtime_job_id": "post-reservation-terminal-job",
-                    "activity_result": terminal_issue_result(),
-                }),
-            )
-            .await
-    });
-    wait_for_gate_blockers(&monitor_store, gate_backend_pid, 1).await?;
-
+    let reservation_gate = super::runtime_hosts::install_completion_reservation_test_gate(&job.id);
     let runtime_job_id = job.id.clone();
     let completion = tokio::spawn(async move {
         support::post_json_with_status(
@@ -382,14 +355,16 @@ async fn completion_commit_reports_cleanup_ack_when_post_reservation_fence_wins_
         )
         .await
     });
-    if let Err(error) = wait_for_gate_blockers(&monitor_store, gate_backend_pid, 2).await {
-        if completion.is_finished() {
-            let (status, body) = completion.await??;
-            anyhow::bail!("completion returned before commit race: {status} {body}");
-        }
-        return Err(error);
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reservation_gate.wait_until_reached(),
+    )
+    .await
+    .is_err()
+    {
+        anyhow::bail!("completion did not reach its post-reservation test gate");
     }
-    let reserved = monitor_store
+    let reserved = store
         .get_runtime_job(&job.id)
         .await?
         .expect("reserved runtime job should remain readable");
@@ -400,15 +375,26 @@ async fn completion_commit_reports_cleanup_ack_when_post_reservation_fence_wins_
             .is_some_and(|lease| lease.expires_at > claimed_expires_at),
         "completion lease must be reserved before the terminal fence commits"
     );
-    gate.rollback().await?;
 
-    let terminal = terminal
-        .await??
+    let terminal = store
+        .commit_parent_runtime_completion(
+            &workflow_id,
+            "post-reservation-terminal-fence",
+            json!({
+                "command_id": "post-reservation-terminal-command",
+                "runtime_job_id": "post-reservation-terminal-job",
+                "activity_result": terminal_issue_result(),
+            }),
+        )
+        .await?
         .expect("closed issue should produce a terminal decision");
     assert!(terminal.accepted);
     assert_eq!(terminal.decision.next_state, "done");
+
+    reservation_gate.release();
     let (status, body) = completion.await??;
     assert_cleanup_ack_required(status, &body);
+
     let cancelling = store
         .get_runtime_job(&job.id)
         .await?

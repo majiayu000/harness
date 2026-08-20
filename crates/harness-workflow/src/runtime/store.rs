@@ -82,6 +82,8 @@ pub mod runtime_job_leases;
 mod runtime_job_queries;
 #[path = "store/runtime_job_state.rs"]
 mod runtime_job_state;
+#[path = "store/runtime_job_terminal_fence.rs"]
+mod runtime_job_terminal_fence;
 #[path = "store/runtime_jobs.rs"]
 mod runtime_jobs;
 #[path = "store/runtime_usage.rs"]

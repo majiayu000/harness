@@ -24,6 +24,16 @@ impl WorkflowRuntimeStore {
         next_lease_expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
         let mut tx = self.pool.begin().await?;
+        if !super::runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(
+            &mut tx,
+            &self.definition_registry,
+            runtime_job_id,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+        }
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
                 .bind(runtime_job_id)
@@ -72,6 +82,16 @@ impl WorkflowRuntimeStore {
         not_before: DateTime<Utc>,
     ) -> anyhow::Result<RuntimeJobClaimDeferOutcome> {
         let mut tx = self.pool.begin().await?;
+        if !super::runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(
+            &mut tx,
+            &self.definition_registry,
+            runtime_job_id,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+        }
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
                 .bind(runtime_job_id)

@@ -4,6 +4,11 @@ use harness_protocol::rest::RuntimeHostCompletionResponse;
 use harness_workflow::runtime::store::RemoteStaleCompletionOutcome;
 use std::time::Duration;
 
+#[cfg(test)]
+mod test_gate;
+#[cfg(test)]
+pub(crate) use test_gate::install_completion_reservation_test_gate;
+
 const COMPLETION_EVIDENCE_TIMEOUT_SECS: u64 = crate::runtime_hosts::MAX_LEASE_SECS as u64 - 30;
 
 type CompletionJson = ContractJson<RuntimeHostCompletionResponse>;
@@ -155,6 +160,8 @@ pub async fn complete_runtime_job_for_runtime_host(
     // renewals for the same host. Deregistration can safely revoke the reserved
     // lease, and the fenced completion commit below will then fail closed.
     drop(host_operation);
+    #[cfg(test)]
+    test_gate::pause_after_completion_reservation(&runtime_job_id).await;
     let result = if cancellation_ack {
         result
     } else {

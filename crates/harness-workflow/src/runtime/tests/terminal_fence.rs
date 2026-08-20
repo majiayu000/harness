@@ -269,3 +269,96 @@ async fn legacy_unfinished_jobs_cannot_cross_a_persisted_terminal_fence() -> any
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn legacy_terminal_running_eval_cannot_renew_an_unexpired_lease() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let mut instance =
+        issue_instance("implementing").with_id("legacy-terminal-running-eval-renewal");
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+    let command = WorkflowCommand::enqueue_activity(
+        "implement_issue",
+        "legacy-terminal-running-eval-command",
+    );
+    let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+    store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::RemoteHost,
+            "remote-host",
+            json!({
+                "activity": "implement_issue",
+                "eval": {"timeout_secs": 60}
+            }),
+        )
+        .await?;
+    let lease_expires_at = Utc::now() + Duration::minutes(5);
+    let claimed = store
+        .claim_next_runtime_job_for_runtime_kind(
+            RuntimeKind::RemoteHost,
+            "legacy-terminal-renewal-host",
+            lease_expires_at,
+        )
+        .await?
+        .expect("legacy running eval should be claimed before terminalization");
+    let lease_proof = store
+        .remote_runtime_job_lease_proof(
+            &claimed.id,
+            "legacy-terminal-renewal-host",
+            claimed.lease_generation,
+            lease_expires_at,
+        )
+        .await?;
+
+    // Reproduce a terminal row written before terminal fencing existed. There
+    // is deliberately no second pending job to make the claim path repair it.
+    instance.state = "done".to_string();
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+
+    let outcome = store
+        .renew_remote_host_runtime_job_lease(
+            crate::runtime::store::runtime_job_leases::RuntimeJobLeaseRenewalRequest {
+                runtime_job_id: &claimed.id,
+                owner: "legacy-terminal-renewal-host",
+                lease_generation: claimed.lease_generation,
+                lease_proof,
+                previous_expires_at: lease_expires_at,
+                renewal_id: uuid::Uuid::new_v4(),
+                lease_secs: 60,
+                now: Utc::now(),
+                max_lease_secs: 3_600,
+                owner_active: true,
+            },
+        )
+        .await?;
+    assert_eq!(
+        outcome,
+        crate::runtime::store::runtime_job_leases::RuntimeJobLeaseRenewalOutcome::LeaseLost {
+            reason: crate::runtime::store::runtime_job_leases::RuntimeJobLeaseRenewalRejection::CancellationRequested,
+        }
+    );
+    let fenced = store
+        .get_runtime_job(&claimed.id)
+        .await?
+        .expect("legacy terminal eval should remain auditable");
+    assert_eq!(fenced.status, RuntimeJobStatus::Running);
+    assert!(fenced.input.get("cancellation_requested").is_some());
+    assert_eq!(
+        store
+            .get_command(&command_id)
+            .await?
+            .expect("legacy terminal command should remain auditable")
+            .status,
+        WorkflowCommandStatus::Cancelled
+    );
+    Ok(())
+}
