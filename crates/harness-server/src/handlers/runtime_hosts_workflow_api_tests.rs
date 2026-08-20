@@ -926,6 +926,7 @@ async fn draining_host_completion_revalidates_required_eval_capabilities() -> an
             "activity": "run_quality_gate",
             "command": {
                 "eval": {
+                    "timeout_secs": 45,
                     "required_runtime_host_capabilities": [
                         "eval_resource_limits",
                         "trusted_eval_verifier_v1"
@@ -941,6 +942,8 @@ async fn draining_host_completion_revalidates_required_eval_capabilities() -> an
         json!({ "lease_secs": 60 }),
     )
     .await?;
+    assert_eq!(claimed["claimed"], true);
+    assert_eq!(claimed["runtime_job_id"], job.id);
     assert!(state.runtime_hosts.mark_draining("host-a").is_some());
     state.runtime_hosts.register(
         "host-a".to_string(),
