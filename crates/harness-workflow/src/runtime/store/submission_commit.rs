@@ -1,8 +1,8 @@
 use super::{
     command_store, commit_decision_instance_tx, commit_rejected_initial_failure_instance_tx,
     decision_transitions::ensure_protected_instance_fields_match,
-    insert_decision_record_once_tx, insert_event_tx_with_id, insert_prompt_payload_tx,
-    insert_validated_observed_instance_tx, select_instance_for_update_tx,
+    fence_terminal_transition_tx, insert_decision_record_once_tx, insert_event_tx_with_id,
+    insert_prompt_payload_tx, insert_validated_observed_instance_tx, select_instance_for_update_tx,
     transition_validation::{validate_transition_with_context, TransitionValidation},
     WorkflowRuntimeStore,
 };
@@ -270,6 +270,8 @@ impl WorkflowRuntimeStore {
                     );
                 }
             }
+            fence_terminal_transition_tx(&mut tx, &self.definition_registry, final_instance)
+                .await?;
             if record.accepted {
                 commit_decision_instance_tx(
                     &mut tx,

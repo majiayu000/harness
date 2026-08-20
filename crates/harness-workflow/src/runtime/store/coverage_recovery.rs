@@ -4,7 +4,8 @@ use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
     commit_same_state_instance_tx,
     decision_transitions::ensure_protected_instance_fields_match,
-    insert_decision_record_once_tx, insert_event_tx_with_id, insert_validated_observed_instance_tx,
+    fence_terminal_transition_tx, insert_decision_record_once_tx, insert_event_tx_with_id,
+    insert_validated_observed_instance_tx,
     runtime_job_state::{cancel_unfinished_runtime_jobs_for_commands_tx, RuntimeJobCancellation},
     select_instance_for_update_tx,
     transition_validation::{validate_transition_with_context, TransitionValidation},
@@ -258,6 +259,7 @@ impl WorkflowRuntimeStore {
                 apply_inline_command_side_effect(&mut final_instance, command)?;
             }
         }
+        fence_terminal_transition_tx(&mut tx, &self.definition_registry, &final_instance).await?;
         commit_decision_instance_tx(
             &mut tx,
             &validation_current,

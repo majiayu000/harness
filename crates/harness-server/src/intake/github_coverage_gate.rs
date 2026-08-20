@@ -687,7 +687,7 @@ mod tests {
         let mut workflow = WorkflowInstance::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
             1,
-            stopped_state,
+            "replanning",
             WorkflowSubject::new("issue", format!("issue:{issue_number}")),
         )
         .with_id(workflow_id)
@@ -724,6 +724,7 @@ mod tests {
         let mut last_stop = workflow.data["last_stop"].clone();
         last_stop["runtime_job_id"] = json!(runtime_job.id);
         workflow.set_data_field("last_stop", last_stop, DataProvenance::Server)?;
+        workflow.state = stopped_state.to_string();
         crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
             .await?;
         Ok(workflow)

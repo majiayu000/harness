@@ -1,8 +1,8 @@
 use super::runtime_completion_budget::budget_ceiling_blocked_decision;
 use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
-    insert_decision_record_once_tx, insert_event_tx, select_instance_for_update_tx,
-    RuntimeBudgetPolicy, WorkflowRuntimeStore,
+    fence_terminal_transition_tx, insert_decision_record_once_tx, insert_event_tx,
+    select_instance_for_update_tx, RuntimeBudgetPolicy, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowDecision, WorkflowDecisionRecord,
@@ -450,6 +450,7 @@ async fn persist_runtime_completion_decision_with_context_tx(
         apply_runtime_completion_data_side_effect(&mut instance, &record.decision, event)?;
         instance.state = record.decision.next_state.clone();
         instance.version = instance.version.saturating_add(1);
+        fence_terminal_transition_tx(tx, registry, &instance).await?;
         commit_decision_instance_tx(tx, &current, &instance, &record, false).await?;
     }
 

@@ -98,6 +98,14 @@ async fn transcript_completion_is_atomic_restart_safe_and_pinned_while_active() 
         store.read_runtime_transcript(&artifact_ref).await?,
         RuntimeTranscriptRead::Verified(_)
     ));
+    let result_events = store
+        .runtime_events_for(&job.id)
+        .await?
+        .into_iter()
+        .filter(|event| event.event_type == "ActivityResultReady")
+        .collect::<Vec<_>>();
+    assert_eq!(result_events.len(), 1);
+    assert_eq!(result_events[0].event, serde_json::to_value(&result)?);
 
     drop(store);
     let reopened = WorkflowRuntimeStore::open(&path).await?;
@@ -530,7 +538,9 @@ async fn missing_transcript_dependency_keeps_producer_reconstructable() -> anyho
             "exact_replay": {"transcript_artifact_ref": artifact_ref},
         }),
     );
-    store.enqueue_command(&dependent.id, None, &replay).await?;
+    store
+        .enqueue_command_for_test_unchecked(&dependent.id, None, &replay)
+        .await?;
     sqlx::query("DELETE FROM workflow_artifacts WHERE id = $1")
         .bind(&artifact_ref)
         .execute(store.pool())
@@ -603,7 +613,9 @@ async fn lost_transcript_consumer_and_producer_remain_pinned_until_recovery() ->
             "exact_replay": {"transcript_artifact_ref": artifact_ref},
         }),
     );
-    store.enqueue_command(&consumer.id, None, &replay).await?;
+    store
+        .enqueue_command_for_test_unchecked(&consumer.id, None, &replay)
+        .await?;
     sqlx::query("DELETE FROM workflow_artifacts WHERE id = $1")
         .bind(&artifact_ref)
         .execute(store.pool())

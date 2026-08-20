@@ -47,6 +47,7 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 - `runtime_kind: RuntimeKind`
 - `runtime_profile: String`
 - `lease: Option<WorkflowLease>`
+- `lease_generation: u64`
 - `input: Value`
 - `output: Option<Value>`
 
@@ -62,13 +63,22 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 5. Expired leases are reclaimable by any host unless eval cancellation is awaiting the original owner's cleanup acknowledgement.
 6. Workflow runtime-job claims select only `runtime_kind = remote_host` jobs.
 7. In-process runtime workers do not claim `remote_host` jobs.
-8. Runtime-job completion requires the host id and exact lease expiration
-   timestamp from the claim response. Upgraded clients also send the additive
-   lease generation; legacy clients may omit it.
-9. Runtime-job claim and renewal lease durations default to 60 seconds and
+8. A host must advertise the `runtime_job_lease_proof_v1` capability before it
+   can claim new work. Claims issued to capable hosts include a lease-scoped
+   proof.
+9. Runtime-job renewal and completion require the host id, lease generation,
+   exact lease expiration timestamp, and lease proof from the most recent
+   successful claim or renewal response.
+10. Only a remote-host lease that was already running when schema v28 was
+    installed may omit the proof. That exact legacy lease may complete or make
+    one proofless renewal; a successful renewal rotates it to a proof-bearing
+    lease, and subsequent requests must echo the returned proof.
+11. Runtime-job claim and renewal lease durations default to 60 seconds and
    accept only `1..=3600` seconds.
-10. A draining host cannot claim or renew work. Heartbeat only updates host
+12. A draining host cannot claim or renew work. Heartbeat only updates host
     liveness and never extends a job lease.
+13. A draining host that owns a cancellation-requested eval lease may submit
+    the fenced cleanup acknowledgement required to finish deregistration.
 
 ## API Response Shape
 
@@ -78,21 +88,24 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 
 `POST /api/runtime-hosts/{id}/runtime-jobs/claim`
 - request: `{ lease_secs?: number }`
-- success: `{ claimed: true, runtime_job_id, lease_generation, lease_expires_at, runtime_job }`
+- registration prerequisite: the host advertises
+  `runtime_job_lease_proof_v1` in `capabilities`
+- success: `{ claimed: true, runtime_job_id, lease_generation, lease_expires_at, lease_proof, runtime_job }`
 - none available: `{ claimed: false }`
+- incompatible host: `{ claimed: false, upgrade_required: true, required_capability: "runtime_job_lease_proof_v1" }`; this response does not mutate a pending job or issue a lease
 - `runtime_job.input` carries the activity payload and runtime profile manifest needed by the external host.
 - `lease_secs` is a target TTL from server time, defaults to `60`, and must be an integer in `1..=3600`; `null`, zero, and larger values are rejected.
 
 `POST /api/runtime-hosts/{id}/runtime-jobs/{runtime_job_id}/lease/renew`
-- request: `{ lease_generation, lease_expires_at, renewal_id, lease_secs?: number }`
-- success: `{ renewed: true, runtime_job_id, lease_generation, lease_expires_at, replayed }`
+- request: `{ lease_generation, lease_expires_at, lease_proof, renewal_id, lease_secs?: number }`
+- success: `{ renewed: true, runtime_job_id, lease_generation, lease_expires_at, lease_proof, replayed }`
 - the server computes `max(current_expiry, server_now + lease_secs)`, so renewal never shortens a lease and never extends beyond the 3600-second server-time horizon.
 - retry an ambiguous transport result with the same `renewal_id` and identical inputs; a live replay returns the original expiry with `replayed: true` and creates no second renewal event.
 - stale, expired, revoked, reclaimed, wrong-host, wrong-generation, or draining ownership returns HTTP `409` with `{ error_code: "lease_lost", must_stop: true }`; the response never exposes another owner's identity or lease evidence.
 - unknown host or job returns `404`, invalid input returns `400`, and unavailable durable storage returns `503`.
 
 `POST /api/runtime-hosts/{id}/runtime-jobs/{runtime_job_id}/complete`
-- request: `{ lease_expires_at, lease_generation?, result, execution_evidence? }`
+- request: `{ lease_expires_at, lease_generation, lease_proof, result, execution_evidence? }`
 - `result` is the workflow `ActivityResult` payload and may report `succeeded`, `failed`, `blocked`, or `cancelled`.
 - Eval implementation and quality-gate jobs require host-level `execution_evidence` containing the full observed checkout SHA, the enforced `resource_limit_report`, token usage, and `isolation_cleanup_status: "cleaned"`. Quality-gate evidence also carries the exact validation argv, exit code, output SHA-256, and duration. Implementation must match the manifest base commit; quality-gate execution must exactly match the server-observed draft head. Every non-null effective resource limit must have its matching usage observation. The server validates these fields and attaches reserved evidence; agent-authored artifacts cannot substitute for them.
 - success: `{ completed: true, runtime_job, workflow_event, decision }`
@@ -102,13 +115,18 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 
 1. Schedule renewal at approximately one third of the confirmed TTL and keep at most one renewal request in flight per runtime job.
 2. Treat heartbeat and per-job renewal as independent protocols. Heartbeat proves host liveness only; renewal of one job does not renew any other job.
-3. On an ambiguous transport failure, retry only with the same `renewal_id`, generation, prior expiry, and duration.
+3. On an ambiguous transport failure, retry only with the same `renewal_id`,
+   generation, proof, prior expiry, and duration.
 4. On `404`, `409`, `must_stop: true`, or inability to confirm renewal before the last confirmed expiry, cancel local execution. When the response includes `cleanup_ack_required: true`, clean the ephemeral isolation and promptly submit a cancelled completion with `isolation_cleanup_status: "cleaned"`; the server reserves this cleanup acknowledgement against the same owner and lease generation even if the prior expiry elapsed. Otherwise suppress completion.
 5. Deregistration is draining cleanup: do not claim or renew after draining begins, and retry deregistration until it succeeds or returns an operational failure.
 
 ## Rollback
 
-Stop remote clients from calling renewal before disabling the renew route. The additive generation, lifecycle, and receipt data remain compatible with legacy claim and completion clients. Before removing draining/revocation behavior, verify that no host is draining and no runtime job depends on a renewed expiry.
+Stop remote clients from calling renewal before disabling the renew route. New
+claims are withheld from hosts that do not advertise
+`runtime_job_lease_proof_v1`; drain or upgrade those hosts before removing the
+capability gate. Before removing draining/revocation behavior, verify that no
+host is draining and no runtime job depends on a renewed expiry.
 
 ## Risks
 

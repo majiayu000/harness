@@ -58,10 +58,10 @@ pub(super) async fn exact_replay_preflight_result(
 pub(crate) async fn hydrate_exact_replay_transcript(
     state: &Arc<AppState>,
     job: &mut RuntimeJob,
-) -> Result<(), ActivityResult> {
+) -> Result<(), Box<ActivityResult>> {
     let record = match load_exact_replay_transcript(state, job).await {
         ExactReplayTranscript::Loaded(record) => record,
-        ExactReplayTranscript::Failure(result) => return Err(result),
+        ExactReplayTranscript::Failure(result) => return Err(Box::new(result)),
         ExactReplayTranscript::NotRequested => return Ok(()),
     };
     let exact_replay = job

@@ -485,10 +485,15 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
                     .expect("extra data should be an object")
                     .clone(),
             );
+        let initial_state = if matches!(id, "issue-blocked" | "issue-terminal") {
+            "implementing"
+        } else {
+            state
+        };
         let workflow = harness_workflow::runtime::WorkflowInstance::new(
             "github_issue_pr",
             1,
-            state,
+            initial_state,
             harness_workflow::runtime::WorkflowSubject::new(
                 "issue",
                 format!("issue:{issue_number}"),
@@ -506,6 +511,7 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
             "implement_issue",
             "issue-blocked-source",
         ),
+        "blocked",
     )
     .await?;
     let failed_runtime_job_id = set_recovery_source_job(
@@ -515,6 +521,7 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
             "implement_issue",
             "issue-terminal-source",
         ),
+        "failed",
     )
     .await?;
 
@@ -628,6 +635,7 @@ async fn set_recovery_source_job(
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
     workflow_id: &str,
     command: harness_workflow::runtime::WorkflowCommand,
+    final_state: &str,
 ) -> anyhow::Result<String> {
     let command_id = store.enqueue_command(workflow_id, None, &command).await?;
     let job = store
@@ -650,6 +658,7 @@ async fn set_recovery_source_job(
         last_stop,
         harness_workflow::runtime::DataProvenance::Server,
     )?;
+    workflow.state = final_state.to_string();
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     Ok(runtime_job_id)
 }

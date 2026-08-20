@@ -4,8 +4,6 @@ mod declarative_pinning {
         DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
     };
     use harness_core::db::resolve_database_url;
-    use chrono::Utc;
-    use crate::runtime::store::RuntimeJobEnqueueOutcome;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -305,7 +303,7 @@ mod declarative_pinning {
     }
 
     #[tokio::test]
-    async fn claimed_enqueue_recognizes_persisted_only_cancelled_pin() -> anyhow::Result<()> {
+    async fn command_enqueue_rejects_persisted_only_terminal_pin() -> anyhow::Result<()> {
         if resolve_database_url(None).is_err() {
             return Ok(());
         }
@@ -341,33 +339,15 @@ mod declarative_pinning {
         .with_server_data(json!({ "definition_hash": historical.definition_hash() }));
         store.force_upsert_lifecycle_state_for_test(&workflow).await?;
         let command = WorkflowCommand::enqueue_activity("review", "persisted-terminal-command");
-        let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
-        let claim = store
-            .claim_pending_commands("persisted-terminal-owner", Utc::now(), 10)
-            .await?
-            .into_iter()
-            .find(|record| record.id == command_id)
-            .expect("persisted-only terminal command should reach the transactional guard");
-
-        assert_eq!(
-            store
-                .enqueue_runtime_job_for_claimed_command(
-                    &command_id,
-                    DispatchClaim {
-                        owner: "persisted-terminal-owner",
-                        generation: claim.dispatch_claim_generation,
-                    },
-                    RuntimeKind::CodexJsonrpc,
-                    "codex-default",
-                    json!({ "activity": "review" }),
-                    None,
-                )
-                .await?,
-            RuntimeJobEnqueueOutcome::WorkflowTerminal {
-                status: WorkflowCommandStatus::Cancelled,
-            }
+        let error = store
+            .enqueue_command(&workflow.id, None, &command)
+            .await
+            .expect_err("persisted-only terminal workflow must reject new commands");
+        assert!(
+            error.to_string().contains("terminal workflow"),
+            "unexpected error: {error}"
         );
-        assert!(store.runtime_jobs_for_command(&command_id).await?.is_empty());
+        assert!(store.commands_for(&workflow.id).await?.is_empty());
         Ok(())
     }
 
