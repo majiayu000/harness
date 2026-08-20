@@ -1,4 +1,4 @@
-use super::runtime_hosts_workflow_api_tests as support;
+use super as support;
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityResult, ActivitySignal, RuntimeJobStatus, RuntimeKind,
     WorkflowRuntimeStore, WorkflowSubject,
@@ -148,7 +148,8 @@ async fn wait_for_gate_blockers(
              {activity:?}"
         );
     }
-    waited.expect("timeout handled")?;
+    let waited = waited.map_err(|_| anyhow::anyhow!("timeout was handled without diagnostics"))?;
+    waited?;
     Ok(())
 }
 
@@ -333,7 +334,7 @@ async fn completion_commit_reports_cleanup_ack_when_post_reservation_fence_wins_
     let mut workflow = store
         .get_instance(&workflow_id)
         .await?
-        .expect("race workflow should exist");
+        .ok_or_else(|| anyhow::anyhow!("race workflow should exist"))?;
     workflow.subject = WorkflowSubject::new("issue", "123");
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow).await?;
     let claimed = support::post_json(
@@ -345,7 +346,8 @@ async fn completion_commit_reports_cleanup_ack_when_post_reservation_fence_wins_
     let claimed_expires_at: chrono::DateTime<chrono::Utc> =
         serde_json::from_value(claimed["lease_expires_at"].clone())?;
 
-    let reservation_gate = super::runtime_hosts::install_completion_reservation_test_gate(&job.id);
+    let reservation_gate =
+        crate::handlers::runtime_hosts::install_completion_reservation_test_gate(&job.id);
     let runtime_job_id = job.id.clone();
     let completion = tokio::spawn(async move {
         support::post_json_with_status(
@@ -367,7 +369,7 @@ async fn completion_commit_reports_cleanup_ack_when_post_reservation_fence_wins_
     let reserved = store
         .get_runtime_job(&job.id)
         .await?
-        .expect("reserved runtime job should remain readable");
+        .ok_or_else(|| anyhow::anyhow!("reserved runtime job should remain readable"))?;
     assert!(
         reserved
             .lease
@@ -387,7 +389,7 @@ async fn completion_commit_reports_cleanup_ack_when_post_reservation_fence_wins_
             }),
         )
         .await?
-        .expect("closed issue should produce a terminal decision");
+        .ok_or_else(|| anyhow::anyhow!("closed issue should produce a terminal decision"))?;
     assert!(terminal.accepted);
     assert_eq!(terminal.decision.next_state, "done");
 
@@ -398,7 +400,7 @@ async fn completion_commit_reports_cleanup_ack_when_post_reservation_fence_wins_
     let cancelling = store
         .get_runtime_job(&job.id)
         .await?
-        .expect("terminal-fenced eval should remain readable");
+        .ok_or_else(|| anyhow::anyhow!("terminal-fenced eval should remain readable"))?;
     assert_eq!(cancelling.status, RuntimeJobStatus::Running);
     assert!(cancelling.input.get("cancellation_requested").is_some());
     Ok(())
@@ -427,18 +429,18 @@ async fn stale_dead_letter_reports_cleanup_ack_when_terminal_fence_wins_race() -
     let mut workflow = store
         .get_instance(&workflow_id)
         .await?
-        .expect("race workflow should exist");
+        .ok_or_else(|| anyhow::anyhow!("race workflow should exist"))?;
     workflow.subject = WorkflowSubject::new("issue", "123");
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow).await?;
     let expired_at = chrono::Utc::now() - chrono::TimeDelta::seconds(1);
     let claimed = store
         .claim_next_runtime_job_for_runtime_kind(RuntimeKind::RemoteHost, "host-a", expired_at)
         .await?
-        .expect("remote eval should be claimed with an expired lease");
+        .ok_or_else(|| anyhow::anyhow!("remote eval should be claimed with an expired lease"))?;
     let lease_proof = store
         .remote_runtime_job_lease_proof(&job.id, "host-a", claimed.lease_generation, expired_at)
         .await?
-        .expect("expired lease should retain its issuance proof");
+        .ok_or_else(|| anyhow::anyhow!("expired lease should retain its issuance proof"))?;
     let completion_request = ordinary_eval_completion_request(&json!({
         "lease_generation": claimed.lease_generation,
         "lease_expires_at": expired_at,
@@ -503,7 +505,7 @@ async fn stale_dead_letter_reports_cleanup_ack_when_terminal_fence_wins_race() -
 
     let terminal = terminal
         .await??
-        .expect("closed issue should produce a terminal decision");
+        .ok_or_else(|| anyhow::anyhow!("closed issue should produce a terminal decision"))?;
     assert!(terminal.accepted);
     assert_eq!(terminal.decision.next_state, "done");
     let (status, body) = completion.await??;

@@ -39,9 +39,6 @@ pub(crate) mod runtime_hosts_workflow_api_tests;
 #[cfg(test)]
 mod runtime_hosts_workflow_review_tests;
 
-#[cfg(test)]
-mod runtime_hosts_terminal_fence_api_tests;
-
 /// Validate a project root path, returning early with an `INTERNAL_ERROR`
 /// response on failure.
 ///
