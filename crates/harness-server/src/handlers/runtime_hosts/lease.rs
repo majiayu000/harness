@@ -67,6 +67,7 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
             runtime_job_id: &runtime_job_id,
             owner: &host_id,
             lease_generation: req.lease_generation,
+            lease_proof: req.lease_proof,
             previous_expires_at: req.lease_expires_at,
             renewal_id: req.renewal_id,
             lease_secs,
@@ -85,6 +86,7 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
                 &host_id,
                 req.lease_generation,
                 req.lease_expires_at,
+                req.lease_proof,
             )
             .await
         }
@@ -95,16 +97,41 @@ pub async fn renew_runtime_job_lease_for_runtime_host(
             lease_generation,
             lease_expires_at,
             replayed,
-        }) => (
-            StatusCode::OK,
-            lease_json(json!({
-                "renewed": true,
-                "runtime_job_id": runtime_job_id,
-                "lease_generation": lease_generation,
-                "lease_expires_at": lease_expires_at,
-                "replayed": replayed,
-            })),
-        ),
+        }) => match store
+            .remote_runtime_job_lease_proof(
+                &runtime_job_id,
+                &host_id,
+                lease_generation,
+                lease_expires_at,
+            )
+            .await
+        {
+            Ok(Some(lease_proof)) => (
+                StatusCode::OK,
+                lease_json(json!({
+                    "renewed": true,
+                    "runtime_job_id": runtime_job_id,
+                    "lease_generation": lease_generation,
+                    "lease_expires_at": lease_expires_at,
+                    "lease_proof": lease_proof,
+                    "replayed": replayed,
+                })),
+            ),
+            Ok(None) => {
+                let response = workflow_store_unavailable_response();
+                (response.0, lease_json(response.1 .0))
+            }
+            Err(error) => {
+                tracing::error!(
+                    host_id = %host_id,
+                    runtime_job_id = %runtime_job_id,
+                    %error,
+                    "renewed runtime job lease proof lookup failed"
+                );
+                let response = workflow_store_unavailable_response();
+                (response.0, lease_json(response.1 .0))
+            }
+        },
         Ok(RuntimeJobLeaseRenewalOutcome::LeaseLost {
             reason: RuntimeJobLeaseRenewalRejection::CancellationRequested,
         }) => cancellation_requested_response(),
@@ -187,6 +214,31 @@ pub(super) fn lease_lost_response() -> (StatusCode, Json<serde_json::Value>) {
 
 pub(super) fn workflow_store_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
     crate::http::api_error::ApiError::store_unavailable("workflow runtime store").into_status_json()
+}
+
+pub(super) async fn required_remote_runtime_job_lease_proof(
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    runtime_job_id: &str,
+    owner: &str,
+    lease_generation: u64,
+    lease_expires_at: DateTime<Utc>,
+) -> Result<uuid::Uuid, (StatusCode, Json<serde_json::Value>)> {
+    match store
+        .remote_runtime_job_lease_proof(runtime_job_id, owner, lease_generation, lease_expires_at)
+        .await
+    {
+        Ok(Some(proof)) => Ok(proof),
+        Ok(None) => Err(workflow_store_unavailable_response()),
+        Err(error) => {
+            tracing::error!(
+                runtime_job_id,
+                owner,
+                %error,
+                "runtime job lease proof lookup failed"
+            );
+            Err(workflow_store_unavailable_response())
+        }
+    }
 }
 
 #[cfg(test)]

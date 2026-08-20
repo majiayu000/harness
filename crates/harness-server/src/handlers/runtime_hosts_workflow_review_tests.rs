@@ -1,7 +1,7 @@
 use super::runtime_hosts_workflow_api_tests as support;
 use axum::{body::Body, http::Request};
 use chrono::Utc;
-use harness_workflow::runtime::{RuntimeJobStatus, RuntimeKind};
+use harness_workflow::runtime::{ActivityResult, RuntimeJobStatus, RuntimeKind};
 use serde_json::json;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
@@ -257,6 +257,106 @@ async fn runtime_host_partial_deregister_remains_draining_and_retryable() -> any
             Some(crate::runtime_hosts::RuntimeHostLifecycle::Draining)
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn draining_host_can_acknowledge_eval_cancellation_then_finish_deregister(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (state, store) = required_runtime_store_state(dir.path()).await?;
+    let app = support::runtime_hosts_workflow_app(state.clone());
+    support::register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+    let job = support::enqueue_runtime_host_test_job(
+        &store,
+        "draining-cancellation-ack",
+        RuntimeKind::RemoteHost,
+        "eval-host",
+        json!({
+            "activity": "implement_issue",
+            "eval": {
+                "eval_run_id": "run-draining",
+                "case_id": "case-1",
+                "timeout_secs": 60
+            },
+        }),
+    )
+    .await?;
+    let claimed = support::post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+    assert_eq!(claimed["runtime_job_id"], job.id);
+    store
+        .cancel_command_and_unfinished_runtime_jobs(
+            &job.command_id,
+            "implement_issue",
+            "operator cancelled",
+        )
+        .await?;
+    let cancelling = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("cancelling runtime job should remain readable");
+    assert_eq!(cancelling.status, RuntimeJobStatus::Running);
+    assert!(cancelling.input.get("cancellation_requested").is_some());
+    assert_eq!(
+        store.count_remote_host_runtime_job_leases("host-a").await?,
+        1
+    );
+
+    let (status, _) = support::post_json_with_status(
+        &app,
+        "/api/runtime-hosts/host-a/deregister".to_string(),
+        json!({}),
+    )
+    .await?;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        state.runtime_hosts.lifecycle("host-a"),
+        Some(crate::runtime_hosts::RuntimeHostLifecycle::Draining)
+    );
+
+    let (status, completed) = support::post_json_with_status(
+        &app,
+        format!("/api/runtime-hosts/host-a/runtime-jobs/{}/complete", job.id),
+        json!({
+            "lease_generation": claimed["lease_generation"],
+            "lease_expires_at": claimed["lease_expires_at"],
+            "lease_proof": claimed["lease_proof"],
+            "result": ActivityResult::cancelled("implement_issue", "host stopped and cleaned"),
+            "execution_evidence": {
+                "checked_out_commit": "",
+                "resource_limit_report": {},
+                "usage": {
+                    "model": "cancellation-cleanup",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                },
+                "isolation_cleanup_status": "cleaned"
+            }
+        }),
+    )
+    .await?;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(completed["completed"], true);
+    let acknowledged = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("acknowledged runtime job should remain readable");
+    assert_eq!(acknowledged.status, RuntimeJobStatus::Cancelled);
+
+    let (status, _) = support::post_json_with_status(
+        &app,
+        "/api/runtime-hosts/host-a/deregister".to_string(),
+        json!({}),
+    )
+    .await?;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(state.runtime_hosts.lifecycle("host-a"), None);
     Ok(())
 }
 

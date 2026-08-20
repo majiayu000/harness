@@ -184,6 +184,7 @@ impl<'a> RuntimeWorker<'a> {
                 .record_lease_expired_completion(
                     &job.id,
                     &self.owner,
+                    job.lease_generation,
                     lease_expires_at,
                     &result,
                     transcript.as_ref(),
@@ -204,13 +205,6 @@ impl<'a> RuntimeWorker<'a> {
             );
             return Ok(None);
         };
-        self.store
-            .record_runtime_event(
-                &job.id,
-                "ActivityResultReady",
-                serde_json::to_value(&result)?,
-            )
-            .await?;
         if let Some(event) = completion.workflow_event.as_ref() {
             self.propagate_pr_feedback_child_completion(&event.workflow_id, event)
                 .await?;

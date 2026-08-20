@@ -1,5 +1,7 @@
 use harness_core::db::Migration;
 
+mod remote_lease_proof;
+
 pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -703,5 +705,10 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_runtime_job_id
                 ON workflow_run_evidence (runtime_job_id)
                 WHERE runtime_job_id IS NOT NULL",
+    },
+    Migration {
+        version: 28,
+        description: "prove remote lease provenance for stale completion recovery",
+        sql: remote_lease_proof::SQL,
     },
 ];

@@ -7,6 +7,9 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 
+/// Runtime-host capability required before the server issues proof-bearing leases.
+pub const RUNTIME_JOB_LEASE_PROOF_V1_CAPABILITY: &str = "runtime_job_lease_proof_v1";
+
 /// Signed signal payload accepted by `POST /signals`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct IngestSignalRequest {
@@ -54,6 +57,8 @@ pub struct CompleteRuntimeJobRequest {
     pub lease_expires_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub lease_generation: Option<u64>,
+    #[serde(default)]
+    pub lease_proof: Option<uuid::Uuid>,
     pub result: serde_json::Value,
     #[serde(default)]
     pub execution_evidence: Option<RuntimeHostExecutionEvidence>,
@@ -82,6 +87,8 @@ impl<'de> serde::Deserialize<'de> for OptionalLeaseSeconds {
 pub struct RenewRuntimeJobLeaseRequest {
     pub lease_generation: u64,
     pub lease_expires_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub lease_proof: Option<uuid::Uuid>,
     pub renewal_id: uuid::Uuid,
     #[serde(default)]
     pub lease_secs: OptionalLeaseSeconds,

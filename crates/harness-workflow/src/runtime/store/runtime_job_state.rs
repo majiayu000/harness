@@ -101,6 +101,9 @@ impl WorkflowRuntimeStore {
         job.updated_at = Utc::now();
         let updated = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
+        if job.runtime_kind == RuntimeKind::RemoteHost {
+            runtime_job_leases::mark_remote_lease_proof_v1_tx(&mut tx).await?;
+        }
         sqlx::query(
             "UPDATE runtime_jobs
              SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
@@ -493,16 +496,21 @@ pub(super) async fn cancel_unfinished_runtime_jobs_for_commands_tx(
         .iter()
         .map(|cancellation| cancellation.command_id.clone())
         .collect::<Vec<_>>();
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT id, command_id, data::text FROM runtime_jobs
-         WHERE command_id = ANY($1::text[]) AND status IN ('pending', 'running')
-         ORDER BY id
-         FOR UPDATE",
+    let rows: Vec<(String, String, String, i64, i32)> = sqlx::query_as(
+        "SELECT job.id, job.command_id, job.data::text, workflow.version,
+                command.attempt_generation
+         FROM runtime_jobs AS job
+         JOIN workflow_commands AS command ON command.id = job.command_id
+         JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+         WHERE job.command_id = ANY($1::text[])
+           AND job.status IN ('pending', 'running')
+         ORDER BY job.id
+         FOR UPDATE OF job",
     )
     .bind(&command_ids)
     .fetch_all(&mut **tx)
     .await?;
-    for (id, command_id, data) in &rows {
+    for (id, command_id, data, workflow_version, command_attempt_generation) in &rows {
         let cancellation = cancellations
             .iter()
             .find(|cancellation| cancellation.command_id == *command_id)
@@ -521,6 +529,8 @@ pub(super) async fn cancel_unfinished_runtime_jobs_for_commands_tx(
                 "reason": cancellation.summary,
                 "activity": cancellation.activity,
                 "requested_at": Utc::now(),
+                "workflow_version": workflow_version,
+                "command_attempt_generation": command_attempt_generation,
             });
             job.updated_at = Utc::now();
             sqlx::query(
@@ -536,6 +546,9 @@ pub(super) async fn cancel_unfinished_runtime_jobs_for_commands_tx(
             &cancellation.activity,
             &cancellation.summary,
         ))?;
+        if job.runtime_kind == RuntimeKind::RemoteHost {
+            runtime_job_leases::mark_remote_lease_proof_v1_tx(tx).await?;
+        }
         sqlx::query(
             "UPDATE runtime_jobs SET status = $1, not_before = $2, data = $3::jsonb,
                 updated_at = CURRENT_TIMESTAMP WHERE id = $4",

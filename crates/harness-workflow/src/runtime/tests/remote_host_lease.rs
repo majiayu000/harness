@@ -1,8 +1,9 @@
 use super::*;
 use crate::runtime::store::runtime_job_leases::{
-    postgres_timestamp_ceil, RuntimeJobLeaseRenewalOutcome, RuntimeJobLeaseRenewalRejection,
-    RuntimeJobLeaseRenewalRequest,
+    mark_remote_lease_proof_v1_tx, postgres_timestamp_ceil, RuntimeJobLeaseRenewalOutcome,
+    RuntimeJobLeaseRenewalRejection, RuntimeJobLeaseRenewalRequest,
 };
+use crate::runtime::RuntimeJobCompletionLease;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
@@ -53,6 +54,10 @@ async fn persist_runtime_job(store: &WorkflowRuntimeStore, job: &RuntimeJob) -> 
         .as_str()
         .expect("runtime kind must serialize as a string")
         .to_string();
+    let mut tx = store.pool().begin().await?;
+    if job.runtime_kind == RuntimeKind::RemoteHost {
+        mark_remote_lease_proof_v1_tx(&mut tx).await?;
+    }
     sqlx::query(
         "UPDATE runtime_jobs
          SET status = $1, runtime_kind = $2, not_before = $3, data = $4::jsonb, updated_at = $5
@@ -64,30 +69,36 @@ async fn persist_runtime_job(store: &WorkflowRuntimeStore, job: &RuntimeJob) -> 
     .bind(serde_json::to_string(job)?)
     .bind(job.updated_at)
     .bind(&job.id)
-    .execute(store.pool())
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
-fn renewal<'a>(
+async fn renewal<'a>(
+    store: &WorkflowRuntimeStore,
     job: &'a RuntimeJob,
     owner: &'a str,
     previous_expires_at: DateTime<Utc>,
     renewal_id: Uuid,
     lease_secs: i64,
     now: DateTime<Utc>,
-) -> RuntimeJobLeaseRenewalRequest<'a> {
-    RuntimeJobLeaseRenewalRequest {
+) -> anyhow::Result<RuntimeJobLeaseRenewalRequest<'a>> {
+    let lease_proof = store
+        .remote_runtime_job_lease_proof(&job.id, owner, job.lease_generation, previous_expires_at)
+        .await?;
+    Ok(RuntimeJobLeaseRenewalRequest {
         runtime_job_id: &job.id,
         owner,
         lease_generation: job.lease_generation,
+        lease_proof,
         previous_expires_at,
         renewal_id,
         lease_secs,
         now,
         max_lease_secs: 3_600,
         owner_active: true,
-    }
+    })
 }
 
 fn renewed_expiry(outcome: RuntimeJobLeaseRenewalOutcome) -> (DateTime<Utc>, bool) {
@@ -146,7 +157,8 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
     let now = Utc::now()
         .with_nanosecond(123_456_789)
         .expect("fixed nanosecond component must be valid");
-    let original_expiry = now + Duration::seconds(60);
+    let original_expiry = postgres_timestamp_ceil(now + Duration::seconds(60))
+        .expect("ordinary test timestamp must normalize to PostgreSQL precision");
     let pending = enqueue_remote_lease_job(&store, "ttl-receipts").await?;
     let claimed = store
         .claim_next_runtime_job_for_runtime_kind(RuntimeKind::RemoteHost, "host-a", original_expiry)
@@ -166,14 +178,18 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
     let renewal_id = Uuid::new_v4();
     let (short_target_expiry, replayed) = renewed_expiry(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &claimed,
-                "host-a",
-                original_expiry,
-                renewal_id,
-                1,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(
+                    &store,
+                    &claimed,
+                    "host-a",
+                    original_expiry,
+                    renewal_id,
+                    1,
+                    now,
+                )
+                .await?,
+            )
             .await?,
     );
     assert!(short_target_expiry >= original_expiry);
@@ -182,14 +198,18 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
 
     let (replayed_expiry, replayed) = renewed_expiry(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &claimed,
-                "host-a",
-                original_expiry,
-                renewal_id,
-                1,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(
+                    &store,
+                    &claimed,
+                    "host-a",
+                    original_expiry,
+                    renewal_id,
+                    1,
+                    now,
+                )
+                .await?,
+            )
             .await?,
     );
     assert_eq!(replayed_expiry, short_target_expiry);
@@ -200,18 +220,22 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
     assert!(replayed);
 
     let same_microsecond_expiry = original_expiry
-        .with_nanosecond(original_expiry.nanosecond() / 1_000 * 1_000 + 1)
+        .with_nanosecond(original_expiry.nanosecond() / 1_000 * 1_000 + 999)
         .expect("same-microsecond timestamp must be valid");
     let (precision_replay_expiry, replayed) = renewed_expiry(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &claimed,
-                "host-a",
-                same_microsecond_expiry,
-                renewal_id,
-                1,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(
+                    &store,
+                    &claimed,
+                    "host-a",
+                    same_microsecond_expiry,
+                    renewal_id,
+                    1,
+                    now,
+                )
+                .await?,
+            )
             .await?,
     );
     assert_eq!(precision_replay_expiry, short_target_expiry);
@@ -219,14 +243,18 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
 
     assert_rejected(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &claimed,
-                "host-a",
-                original_expiry,
-                renewal_id,
-                2,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(
+                    &store,
+                    &claimed,
+                    "host-a",
+                    original_expiry,
+                    renewal_id,
+                    2,
+                    now,
+                )
+                .await?,
+            )
             .await?,
         RuntimeJobLeaseRenewalRejection::RenewalIdConflict,
     );
@@ -234,14 +262,18 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
     let extended_id = Uuid::new_v4();
     let (extended_expiry, _) = renewed_expiry(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &claimed,
-                "host-a",
-                short_target_expiry,
-                extended_id,
-                120,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(
+                    &store,
+                    &claimed,
+                    "host-a",
+                    short_target_expiry,
+                    extended_id,
+                    120,
+                    now,
+                )
+                .await?,
+            )
             .await?,
     );
     assert_eq!(
@@ -249,8 +281,16 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
         postgres_timestamp_ceil(now + Duration::seconds(120))
     );
 
-    let mut wrong_generation =
-        renewal(&claimed, "host-a", extended_expiry, Uuid::new_v4(), 60, now);
+    let mut wrong_generation = renewal(
+        &store,
+        &claimed,
+        "host-a",
+        extended_expiry,
+        Uuid::new_v4(),
+        60,
+        now,
+    )
+    .await?;
     wrong_generation.lease_generation += 1;
     assert_rejected(
         store
@@ -260,27 +300,35 @@ async fn runtime_store_remote_host_lease_ttl_receipts_and_fences() -> anyhow::Re
     );
     assert_rejected(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &claimed,
-                "host-b",
-                extended_expiry,
-                Uuid::new_v4(),
-                60,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(
+                    &store,
+                    &claimed,
+                    "host-b",
+                    extended_expiry,
+                    Uuid::new_v4(),
+                    60,
+                    now,
+                )
+                .await?,
+            )
             .await?,
         RuntimeJobLeaseRenewalRejection::WrongOwner,
     );
     assert_rejected(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &claimed,
-                "host-a",
-                original_expiry,
-                Uuid::new_v4(),
-                60,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(
+                    &store,
+                    &claimed,
+                    "host-a",
+                    original_expiry,
+                    Uuid::new_v4(),
+                    60,
+                    now,
+                )
+                .await?,
+            )
             .await?,
         RuntimeJobLeaseRenewalRejection::StaleExpiry,
     );
@@ -318,9 +366,9 @@ async fn runtime_store_remote_host_lease_reclaim_cleans_receipts_and_fences_gene
     let renewal_id = Uuid::new_v4();
     renewed_expiry(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &first, "host-a", expiry, renewal_id, 120, now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(&store, &first, "host-a", expiry, renewal_id, 120, now).await?,
+            )
             .await?,
     );
     assert_eq!(
@@ -358,23 +406,28 @@ async fn runtime_store_remote_host_lease_reclaim_cleans_receipts_and_fences_gene
 
     assert_rejected(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &first,
-                "host-a",
-                expiry,
-                Uuid::new_v4(),
-                60,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(&store, &first, "host-a", expiry, Uuid::new_v4(), 60, now).await?,
+            )
             .await?,
         RuntimeJobLeaseRenewalRejection::WrongGeneration,
     );
     let stale_completion = store
         .commit_runtime_activity_completion_if_owned_with_generation(
             &first.id,
-            "host-a",
-            expiry,
-            Some(first.lease_generation),
+            RuntimeJobCompletionLease::remote(
+                "host-a",
+                expiry,
+                first.lease_generation,
+                store
+                    .remote_runtime_job_lease_proof(
+                        &first.id,
+                        "host-a",
+                        first.lease_generation,
+                        expiry,
+                    )
+                    .await?,
+            ),
             &ActivityResult::succeeded("remote_check", "done"),
         )
         .await?;
@@ -412,15 +465,18 @@ async fn runtime_store_remote_host_lease_concurrent_renew_and_complete_have_one_
     let renew_job = claimed.clone();
     let renew = tokio::spawn(async move {
         renew_barrier.wait().await;
+        let request = renewal(
+            &renew_store,
+            &renew_job,
+            "host-a",
+            expiry,
+            Uuid::new_v4(),
+            120,
+            now,
+        )
+        .await?;
         renew_store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &renew_job,
-                "host-a",
-                expiry,
-                Uuid::new_v4(),
-                120,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(request)
             .await
     });
     let complete_store = store.clone();
@@ -428,12 +484,23 @@ async fn runtime_store_remote_host_lease_concurrent_renew_and_complete_have_one_
     let complete_job = claimed.clone();
     let complete = tokio::spawn(async move {
         complete_barrier.wait().await;
+        let lease_proof = complete_store
+            .remote_runtime_job_lease_proof(
+                &complete_job.id,
+                "host-a",
+                complete_job.lease_generation,
+                expiry,
+            )
+            .await?;
         complete_store
             .commit_runtime_activity_completion_if_owned_with_generation(
                 &complete_job.id,
-                "host-a",
-                expiry,
-                Some(complete_job.lease_generation),
+                RuntimeJobCompletionLease::remote(
+                    "host-a",
+                    expiry,
+                    complete_job.lease_generation,
+                    lease_proof,
+                ),
                 &ActivityResult::succeeded("remote_check", "done"),
             )
             .await
@@ -480,15 +547,18 @@ async fn runtime_store_remote_host_lease_concurrent_renew_and_reclaim_have_one_m
     let renew_job = claimed.clone();
     let renew = tokio::spawn(async move {
         renew_barrier.wait().await;
+        let request = renewal(
+            &renew_store,
+            &renew_job,
+            "host-a",
+            expired_at,
+            Uuid::new_v4(),
+            60,
+            now,
+        )
+        .await?;
         renew_store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &renew_job,
-                "host-a",
-                expired_at,
-                Uuid::new_v4(),
-                60,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(request)
             .await
     });
     let reclaim_store = store.clone();
@@ -551,7 +621,9 @@ async fn runtime_store_remote_host_lease_expired_receipt_is_cleaned_before_rejec
     let _db_guard = REMOTE_LEASE_DB_TEST_LOCK.lock().await;
     let store = remote_lease_store().await?;
     let now = Utc::now();
-    let expiry = now + Duration::seconds(1);
+    let expiry = (now + Duration::seconds(1))
+        .with_nanosecond(999_999_999)
+        .expect("test expiry nanoseconds are valid");
     enqueue_remote_lease_job(&store, "receipt-expiry").await?;
     let claimed = store
         .claim_next_runtime_job_for_runtime_kind(RuntimeKind::RemoteHost, "host-a", expiry)
@@ -560,9 +632,9 @@ async fn runtime_store_remote_host_lease_expired_receipt_is_cleaned_before_rejec
     let renewal_id = Uuid::new_v4();
     renewed_expiry(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &claimed, "host-a", expiry, renewal_id, 1, now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(&store, &claimed, "host-a", expiry, renewal_id, 1, now).await?,
+            )
             .await?,
     );
 
@@ -570,14 +642,18 @@ async fn runtime_store_remote_host_lease_expired_receipt_is_cleaned_before_rejec
         .expect("ordinary test timestamp must normalize to PostgreSQL precision");
     assert_rejected(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &claimed,
-                "host-a",
-                expiry,
-                renewal_id,
-                1,
-                normalized_expiry,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(
+                    &store,
+                    &claimed,
+                    "host-a",
+                    expiry,
+                    renewal_id,
+                    1,
+                    normalized_expiry,
+                )
+                .await?,
+            )
             .await?,
         RuntimeJobLeaseRenewalRejection::Expired,
     );
@@ -685,13 +761,15 @@ async fn runtime_store_remote_host_lease_full_state_and_horizon_fence_matrix() -
             _ => 60,
         };
         let mut request = renewal(
+            &store,
             &claimed,
             "host-a",
             initial_expiry,
             Uuid::new_v4(),
             lease_secs,
             now,
-        );
+        )
+        .await?;
         request.owner_active = !matches!(case, FenceCase::Draining);
         assert_rejected(
             store.renew_remote_host_runtime_job_lease(request).await?,
@@ -721,14 +799,18 @@ async fn runtime_store_remote_host_lease_full_state_and_horizon_fence_matrix() -
         .expect("maximum-TTL job should be claimed");
     let (maximum_expiry, _) = renewed_expiry(
         store
-            .renew_remote_host_runtime_job_lease(renewal(
-                &claimed,
-                "host-a",
-                expiry,
-                Uuid::new_v4(),
-                3_600,
-                now,
-            ))
+            .renew_remote_host_runtime_job_lease(
+                renewal(
+                    &store,
+                    &claimed,
+                    "host-a",
+                    expiry,
+                    Uuid::new_v4(),
+                    3_600,
+                    now,
+                )
+                .await?,
+            )
             .await?,
     );
     assert_eq!(

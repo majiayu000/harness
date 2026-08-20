@@ -144,6 +144,39 @@ pub struct WorkflowRuntimeStore {
     /// so a store opened without explicit wiring only records decisions.
     pub(super) budget_policy: RuntimeBudgetPolicy,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeJobCompletionLease<'a> {
+    pub owner: &'a str,
+    pub expires_at: DateTime<Utc>,
+    pub generation: Option<u64>,
+    pub proof: Option<uuid::Uuid>,
+}
+
+impl<'a> RuntimeJobCompletionLease<'a> {
+    pub fn local(owner: &'a str, expires_at: DateTime<Utc>) -> Self {
+        Self {
+            owner,
+            expires_at,
+            generation: None,
+            proof: None,
+        }
+    }
+
+    pub fn remote(
+        owner: &'a str,
+        expires_at: DateTime<Utc>,
+        generation: u64,
+        proof: Option<uuid::Uuid>,
+    ) -> Self {
+        Self {
+            owner,
+            expires_at,
+            generation: Some(generation),
+            proof,
+        }
+    }
+}
 const WORKFLOW_RUNTIME_SHARED_POOL_MIGRATIONS_TABLE: &str = "workflow_runtime_schema_migrations";
 pub struct WorkflowInstancePage {
     pub instances: Vec<WorkflowInstance>,
