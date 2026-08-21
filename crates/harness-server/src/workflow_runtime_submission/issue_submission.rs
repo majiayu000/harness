@@ -32,7 +32,12 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    persist_issue_submission(store, &ctx, admission).await
+    let canonical_repo = canonical_github_repo_identity(ctx.repo);
+    let canonical_ctx = IssueSubmissionRuntimeContext {
+        repo: canonical_repo.as_deref(),
+        ..ctx
+    };
+    persist_issue_submission(store, &canonical_ctx, admission).await
 }
 
 async fn persist_issue_submission<F, Fut>(

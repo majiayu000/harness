@@ -1,4 +1,4 @@
-use crate::workflow_runtime_submission::TaskId;
+use crate::workflow_runtime_submission::{canonical_github_repo_identity, TaskId};
 #[cfg(test)]
 use harness_workflow::runtime::{
     build_local_review_completed_decision, build_pr_detected_decision, build_pr_feedback_decision,
@@ -639,9 +639,10 @@ pub(crate) fn synthesized_pr_feedback_task_id(
     repo: Option<&str>,
     pr_number: u64,
 ) -> TaskId {
+    let repo = canonical_github_repo_identity(repo);
     TaskId::from_str(&format!(
         "github-pr-feedback::{project_id}::repo:{}::pr:{pr_number}:feedback",
-        repo.unwrap_or("<none>")
+        repo.as_deref().unwrap_or("<none>")
     ))
 }
 

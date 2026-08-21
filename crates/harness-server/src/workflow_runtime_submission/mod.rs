@@ -16,6 +16,10 @@ const EXECUTION_PATH_WORKFLOW_RUNTIME: &str = "workflow_runtime";
 const PROMPT_TASK_DESCRIPTION: &str = "prompt task";
 const GITHUB_TRACKER_SOURCE: &str = "github";
 
+pub(crate) fn canonical_github_repo_identity(repo: Option<&str>) -> Option<String> {
+    repo.map(str::to_ascii_lowercase)
+}
+
 mod cancel;
 mod commit;
 mod declarative;

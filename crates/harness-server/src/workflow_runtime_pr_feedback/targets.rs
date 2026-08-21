@@ -51,6 +51,8 @@ pub(super) async fn load_or_pr_runtime_target(
 ) -> anyhow::Result<PrRuntimeTarget> {
     upsert_github_issue_pr_definition(store).await?;
     let project_id = project_root.to_string_lossy().into_owned();
+    let repo = canonical_github_repo_identity(repo);
+    let repo = repo.as_deref();
     if let Some(issue_number) = issue_number {
         let workflow_id =
             harness_workflow::issue_lifecycle::workflow_id(&project_id, repo, issue_number);
@@ -157,9 +159,10 @@ pub(super) fn pr_scoped_instance(
 }
 
 pub(super) fn pr_workflow_id(project_id: &str, repo: Option<&str>, pr_number: u64) -> String {
+    let repo = canonical_github_repo_identity(repo);
     format!(
         "{project_id}::repo:{}::pr:{pr_number}:feedback",
-        repo.unwrap_or("<none>")
+        repo.as_deref().unwrap_or("<none>")
     )
 }
 

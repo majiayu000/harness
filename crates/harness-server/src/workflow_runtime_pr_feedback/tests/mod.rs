@@ -599,6 +599,98 @@ async fn pr_feedback_without_issue_uses_bound_workflow_for_local_review() -> any
 }
 
 #[tokio::test]
+async fn concurrent_mixed_case_pr_requests_share_one_canonical_workflow() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("mixed-case-concurrent-pr");
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let first_barrier = barrier.clone();
+    let second_barrier = barrier;
+
+    let (first, second) = tokio::join!(
+        request_pr_feedback_sweep_for_pr_with_admission(
+            &store,
+            PrFeedbackSweepRuntimeContext {
+                project_root: &project_root,
+                repo: Some("Owner/Repo"),
+                task_id: &task_id,
+                pr_number: 78,
+                pr_url: Some("https://github.com/Owner/Repo/pull/78"),
+            },
+            move || {
+                let barrier = first_barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    Ok(())
+                }
+            },
+        ),
+        request_pr_feedback_sweep_for_pr_with_admission(
+            &store,
+            PrFeedbackSweepRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                task_id: &task_id,
+                pr_number: 78,
+                pr_url: Some("https://github.com/owner/repo/pull/78"),
+            },
+            move || {
+                let barrier = second_barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    Ok(())
+                }
+            },
+        )
+    );
+    let outcomes = [first?, second?];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, PrFeedbackSweepRequestOutcome::Requested { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, PrFeedbackSweepRequestOutcome::NotCandidate { .. }))
+            .count(),
+        1
+    );
+
+    let project_id = project_root.to_string_lossy();
+    let canonical_id = pr_workflow_id(&project_id, Some("owner/repo"), 78);
+    let mixed_case_id = format!("{project_id}::repo:Owner/Repo::pr:78:feedback");
+    for outcome in &outcomes {
+        let workflow_id = match outcome {
+            PrFeedbackSweepRequestOutcome::Requested { workflow_id, .. }
+            | PrFeedbackSweepRequestOutcome::NotCandidate { workflow_id, .. }
+            | PrFeedbackSweepRequestOutcome::ActiveCommandExists { workflow_id, .. }
+            | PrFeedbackSweepRequestOutcome::Rejected { workflow_id, .. } => workflow_id,
+        };
+        assert_eq!(workflow_id, &canonical_id);
+    }
+    let instance = store
+        .get_instance(&canonical_id)
+        .await?
+        .expect("canonical PR workflow should be persisted");
+    assert_eq!(instance.data["repo"], "owner/repo");
+    assert!(store.get_instance(&mixed_case_id).await?.is_none());
+    assert_eq!(store.commands_for(&canonical_id).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn pr_merged_without_issue_creates_pr_scoped_done_workflow() -> anyhow::Result<()> {
     let Ok(database_url) = resolve_database_url(None) else {
         return Ok(());

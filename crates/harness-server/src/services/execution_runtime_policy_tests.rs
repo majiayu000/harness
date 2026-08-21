@@ -162,25 +162,35 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
         .is_empty());
 
     let existing_issue_task_id = TaskId::from_str("existing-mixed-case-issue-task");
-    crate::workflow_runtime_submission::record_issue_submission(
-        &store,
-        crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
-            project_root: &project_root,
-            repo: Some("Owner/Repo"),
-            issue_number: 10,
-            task_id: &existing_issue_task_id,
-            labels: &[],
-            force_execute: false,
-            additional_prompt: None,
-            depends_on: &[],
-            dependencies_blocked: false,
-            source: Some("github"),
-            external_id: Some("issue:10"),
-            remote_fact_hash: None,
-            author_trust_class: None,
-        },
+    store
+        .upsert_definition(&harness_workflow::runtime::WorkflowDefinition::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "GitHub issue PR workflow",
+        ))
+        .await?;
+    let legacy_issue_workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("Owner/Repo"),
+        10,
+    );
+    let legacy_issue = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "planning",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:10"),
     )
-    .await?;
+    .with_id(legacy_issue_workflow_id.clone())
+    .with_server_data(serde_json::json!({
+        "project_id": project_root.to_string_lossy(),
+        "repo": "Owner/Repo",
+        "issue_number": 10,
+        "submission_id": existing_issue_task_id.as_str(),
+        "task_id": existing_issue_task_id.as_str(),
+        "task_ids": [existing_issue_task_id.as_str()],
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &legacy_issue)
+        .await?;
     let api_base = crate::workspace::test_support::github_state_server(
         "/repos/owner/repo/issues/10",
         r#"{"number":10,"repository_url":"https://api.github.test/repos/owner/repo","state":"closed","state_reason":"completed"}"#,
@@ -202,11 +212,6 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
         "an active legacy mixed-case issue retry must return without rechecking GitHub"
     );
 
-    let legacy_issue_workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-        &project_root.to_string_lossy(),
-        Some("Owner/Repo"),
-        10,
-    );
     let Some(mut legacy_issue) = store.get_instance(&legacy_issue_workflow_id).await? else {
         anyhow::bail!("legacy mixed-case issue workflow should exist");
     };
