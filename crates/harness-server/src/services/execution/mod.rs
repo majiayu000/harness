@@ -594,6 +594,9 @@ fn valid_github_repo_slug(repo: &str) -> bool {
     else {
         return false;
     };
+    if owner.len() > 39 || name.len() > 100 {
+        return false;
+    }
     [owner, name].into_iter().all(|segment| {
         !segment.is_empty()
             && segment != "."

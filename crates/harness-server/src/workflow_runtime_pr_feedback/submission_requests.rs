@@ -35,12 +35,39 @@ async fn latest_observed_pr_fact_for_instance(
 }
 
 fn pr_repo_for_fact_lookup(data: &serde_json::Value) -> Option<String> {
-    optional_string_field(data, "repo").or_else(|| {
-        optional_string_field(data, "pr_url").and_then(|pr_url| {
-            harness_agents::output_parsing::parse_github_pr_url(pr_url.trim())
-                .map(|(owner, repo, _)| format!("{owner}/{repo}"))
+    if !data.is_object() {
+        return None;
+    }
+    optional_string_field(data, "repo")
+        .map(|repo| repo.to_ascii_lowercase())
+        .or_else(|| {
+            optional_string_field(data, "pr_url").and_then(|pr_url| {
+                harness_agents::output_parsing::parse_github_pr_url(pr_url.trim())
+                    .map(|(owner, repo, _)| format!("{owner}/{repo}").to_ascii_lowercase())
+            })
         })
-    })
+}
+
+#[cfg(test)]
+mod repository_lookup_tests {
+    use super::pr_repo_for_fact_lookup;
+    use serde_json::json;
+
+    #[test]
+    fn pr_fact_repository_lookup_requires_an_object_and_normalizes_case() {
+        assert_eq!(pr_repo_for_fact_lookup(&json!(["Owner/Repo"])), None);
+        assert_eq!(
+            pr_repo_for_fact_lookup(&json!({"repo": "Owner/Repo"})).as_deref(),
+            Some("owner/repo")
+        );
+        assert_eq!(
+            pr_repo_for_fact_lookup(&json!({
+                "pr_url": "https://github.com/Owner/Repo/pull/7"
+            }))
+            .as_deref(),
+            Some("owner/repo")
+        );
+    }
 }
 
 fn observed_pr_fact_activity_at(

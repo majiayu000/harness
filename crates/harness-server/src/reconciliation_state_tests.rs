@@ -51,7 +51,7 @@ async fn exact_subject_fetch_rejects_identity_or_kind_mismatches() {
 
     let api_base = crate::workspace::test_support::github_state_server(
         "/repos/owner/repo/issues/7",
-        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo","state":"open"}"#,
+        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo/","state":"open"}"#,
     )
     .await;
     let api_guard =

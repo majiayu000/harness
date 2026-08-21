@@ -86,6 +86,11 @@ fn remote_subject_gate_validates_repository_slugs() {
             "expected invalid slug: {invalid}"
         );
     }
+    assert!(!valid_github_repo_slug(&format!("{}/repo", "a".repeat(40))));
+    assert!(!valid_github_repo_slug(&format!(
+        "owner/{}",
+        "a".repeat(101)
+    )));
 }
 
 #[test]
@@ -113,6 +118,7 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
         dir.path().join("WORKFLOW.md"),
         "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
     )?;
+    let project_root = std::fs::canonicalize(dir.path())?;
     let store = Arc::new(
         WorkflowRuntimeStore::open_with_database_url(
             dir.path(),
@@ -138,7 +144,7 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
         .enqueue(CreateTaskRequest {
             issue: Some(9),
             repo: Some("owner/repo".to_string()),
-            project: Some(dir.path().to_path_buf()),
+            project: Some(project_root.clone()),
             ..CreateTaskRequest::default()
         })
         .await
@@ -159,7 +165,7 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
     let outcome = crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep_for_pr(
         &store,
         crate::workflow_runtime_pr_feedback::PrFeedbackSweepRuntimeContext {
-            project_root: dir.path(),
+            project_root: &project_root,
             repo: Some("owner/repo"),
             task_id: &existing_task_id,
             pr_number: 7,
@@ -183,7 +189,7 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
         .enqueue(CreateTaskRequest {
             pr: Some(7),
             repo: Some("owner/repo".to_string()),
-            project: Some(dir.path().to_path_buf()),
+            project: Some(project_root.clone()),
             ..CreateTaskRequest::default()
         })
         .await?;
@@ -208,6 +214,7 @@ async fn concurrent_remote_subject_admissions_return_one_issue_handle() -> anyho
         dir.path().join("WORKFLOW.md"),
         "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
     )?;
+    let project_root = std::fs::canonicalize(dir.path())?;
     let store = Arc::new(
         WorkflowRuntimeStore::open_with_database_url(
             dir.path(),
@@ -232,7 +239,7 @@ async fn concurrent_remote_subject_admissions_return_one_issue_handle() -> anyho
     let request = CreateTaskRequest {
         issue: Some(10),
         repo: Some("Owner/Repo".to_string()),
-        project: Some(dir.path().to_path_buf()),
+        project: Some(project_root.clone()),
         ..CreateTaskRequest::default()
     };
     let (first, second) = tokio::join!(service.enqueue(request.clone()), service.enqueue(request));
@@ -240,7 +247,7 @@ async fn concurrent_remote_subject_admissions_return_one_issue_handle() -> anyho
     assert_eq!(first?, second?);
 
     let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-        &dir.path().to_string_lossy(),
+        &project_root.to_string_lossy(),
         Some("owner/repo"),
         10,
     );
@@ -262,6 +269,7 @@ async fn concurrent_remote_subject_admissions_return_one_pr_handle() -> anyhow::
         dir.path().join("WORKFLOW.md"),
         "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
     )?;
+    let project_root = std::fs::canonicalize(dir.path())?;
     let store = Arc::new(
         WorkflowRuntimeStore::open_with_database_url(
             dir.path(),
@@ -286,7 +294,7 @@ async fn concurrent_remote_subject_admissions_return_one_pr_handle() -> anyhow::
     let request = CreateTaskRequest {
         pr: Some(11),
         repo: Some("Owner/Repo".to_string()),
-        project: Some(dir.path().to_path_buf()),
+        project: Some(project_root.clone()),
         ..CreateTaskRequest::default()
     };
     let (first, second) = tokio::join!(service.enqueue(request.clone()), service.enqueue(request));
@@ -296,7 +304,7 @@ async fn concurrent_remote_subject_admissions_return_one_pr_handle() -> anyhow::
     let instance = store
         .get_instance_by_pr(
             harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-            &dir.path().to_string_lossy(),
+            &project_root.to_string_lossy(),
             Some("owner/repo"),
             11,
         )

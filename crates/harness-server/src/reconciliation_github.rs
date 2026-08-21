@@ -200,6 +200,7 @@ pub(crate) async fn fetch_exact_issue_state_with_token(
 
 fn repository_url_matches_slug(repository_url: &str, repo_slug: &str) -> bool {
     repository_url
+        .trim_end_matches('/')
         .rsplit_once("/repos/")
         .is_some_and(|(_, response_slug)| response_slug.eq_ignore_ascii_case(repo_slug))
 }
