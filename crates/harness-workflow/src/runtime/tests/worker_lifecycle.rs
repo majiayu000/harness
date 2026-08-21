@@ -66,6 +66,19 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
         "issue_number": 77,
         "pr_number": 880,
     }));
+    let canonical_terminal = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "done",
+        WorkflowSubject::new("issue", "issue:77"),
+    )
+    .with_id("project-a::owner/repo::issue:77")
+    .with_server_data(json!({
+        "project_id": "project-a",
+        "repo": "owner/repo",
+        "issue_number": 77,
+        "pr_number": 880,
+    }));
     let wrong_repo = WorkflowInstance::new(
         "github_issue_pr",
         1,
@@ -93,18 +106,21 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
         "pr_number": 880,
     }));
     store.force_upsert_lifecycle_state_for_test(&matching).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&canonical_terminal)
+        .await?;
     store.force_upsert_lifecycle_state_for_test(&wrong_repo).await?;
     store.force_upsert_lifecycle_state_for_test(&wrong_project).await?;
 
     let found = store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 880)
         .await?
-        .expect("legacy mixed-case runtime issue workflow should be found");
+        .expect("active legacy workflow should win over an exact-case terminal collision");
     assert_eq!(found.id, matching.id);
     let found_by_issue = store
         .get_instance_by_issue("github_issue_pr", "project-a", Some("owner/repo"), 77)
         .await?
-        .expect("legacy mixed-case issue identity should be found");
+        .expect("active legacy issue should win over an exact-case terminal collision");
     assert_eq!(found_by_issue.id, matching.id);
     assert!(store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 881)

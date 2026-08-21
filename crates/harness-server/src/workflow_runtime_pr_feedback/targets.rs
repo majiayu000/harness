@@ -20,13 +20,23 @@ pub(super) async fn load_or_issue_instance(
     issue_number: u64,
     state: &str,
 ) -> anyhow::Result<(WorkflowInstance, bool)> {
-    Ok(match store.get_instance(&workflow_id).await? {
-        Some(instance) => (instance, false),
-        None => (
-            issue_instance(workflow_id, project_id, repo, issue_number, state),
-            true,
-        ),
-    })
+    Ok(
+        match store
+            .get_instance_by_issue(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                &project_id,
+                repo.as_deref(),
+                issue_number,
+            )
+            .await?
+        {
+            Some(instance) => (instance, false),
+            None => (
+                issue_instance(workflow_id, project_id, repo, issue_number, state),
+                true,
+            ),
+        },
+    )
 }
 
 pub(super) async fn load_or_pr_runtime_target(

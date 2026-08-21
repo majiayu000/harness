@@ -202,6 +202,45 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
         "an active legacy mixed-case issue retry must return without rechecking GitHub"
     );
 
+    let legacy_issue_workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("Owner/Repo"),
+        10,
+    );
+    let Some(mut legacy_issue) = store.get_instance(&legacy_issue_workflow_id).await? else {
+        anyhow::bail!("legacy mixed-case issue workflow should exist");
+    };
+    legacy_issue.state = "done".to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &legacy_issue)
+        .await?;
+    let api_base = crate::workspace::test_support::github_state_server(
+        "/repos/owner/repo/issues/10",
+        r#"{"number":10,"repository_url":"https://api.github.test/repos/owner/repo","state":"open"}"#,
+    )
+    .await;
+    let api_guard =
+        crate::workspace::test_support::ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+    let error = service
+        .enqueue(CreateTaskRequest {
+            issue: Some(10),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root.clone()),
+            ..CreateTaskRequest::default()
+        })
+        .await
+        .expect_err("a terminal legacy issue retry must not create a canonical duplicate");
+    drop(api_guard);
+    assert!(matches!(error, EnqueueTaskError::BadRequest(_)));
+    let canonical_issue_workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        10,
+    );
+    assert!(store
+        .get_instance(&canonical_issue_workflow_id)
+        .await?
+        .is_none());
+
     let existing_task_id = TaskId::from_str("existing-pr-feedback-task");
     let outcome = crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep_for_pr(
         &store,

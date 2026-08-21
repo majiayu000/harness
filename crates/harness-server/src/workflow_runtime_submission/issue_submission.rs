@@ -48,7 +48,15 @@ where
     let workflow_id =
         harness_workflow::issue_lifecycle::workflow_id(&project_id, ctx.repo, ctx.issue_number);
     upsert_github_issue_pr_definition(store).await?;
-    let (instance, new_instance) = match store.get_instance(&workflow_id).await? {
+    let (instance, new_instance) = match store
+        .get_instance_by_issue(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            &project_id,
+            ctx.repo,
+            ctx.issue_number,
+        )
+        .await?
+    {
         Some(instance) => (instance, false),
         None => (
             issue_instance(

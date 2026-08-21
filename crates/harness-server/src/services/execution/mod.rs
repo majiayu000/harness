@@ -329,27 +329,15 @@ impl DefaultExecutionService {
         let Some(store) = self.workflow_runtime_store.as_ref() else {
             return Ok(None);
         };
-        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            project_id,
-            req.repo.as_deref(),
-            issue_number,
-        );
         let instance = store
-            .get_instance(&workflow_id)
+            .get_instance_by_issue(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                project_id,
+                req.repo.as_deref(),
+                issue_number,
+            )
             .await
             .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;
-        let instance = match instance {
-            Some(instance) => Some(instance),
-            None => store
-                .get_instance_by_issue(
-                    GITHUB_ISSUE_PR_DEFINITION_ID,
-                    project_id,
-                    req.repo.as_deref(),
-                    issue_number,
-                )
-                .await
-                .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?,
-        };
         let Some(instance) = instance else {
             return Ok(None);
         };
