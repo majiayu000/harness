@@ -711,4 +711,26 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         description: "prove remote lease provenance for stale completion recovery",
         sql: remote_lease_proof::SQL,
     },
+    Migration {
+        version: 29,
+        description: "index case-insensitive runtime GitHub subject lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_project_repo_issue_ci
+              ON workflow_instances (
+                  definition_id,
+                  (data->'data'->>'project_id'),
+                  (LOWER(data->'data'->>'repo')),
+                  (data->'data'->>'issue_number'),
+                  updated_at DESC
+              )
+              WHERE data->'data'->>'issue_number' IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_instances_project_repo_pr_ci
+              ON workflow_instances (
+                  definition_id,
+                  (data->'data'->>'project_id'),
+                  (LOWER(data->'data'->>'repo')),
+                  (data->'data'->>'pr_number'),
+                  updated_at DESC
+              )
+              WHERE data->'data'->>'pr_number' IS NOT NULL",
+    },
 ];

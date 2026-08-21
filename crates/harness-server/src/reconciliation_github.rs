@@ -57,8 +57,27 @@ struct ExactGitHubIssueState {
 
 pub(crate) use crate::github_client::github_api_base_url;
 
+const GITHUB_STATE_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn github_get_json<T: DeserializeOwned>(path: &str, github_token: Option<&str>) -> Option<T> {
+    github_get_json_with_timeout(path, github_token, GITHUB_STATE_TIMEOUT).await
+}
+
+pub(super) async fn github_get_json_with_timeout<T: DeserializeOwned>(
+    path: &str,
+    github_token: Option<&str>,
+    timeout: Duration,
+) -> Option<T> {
     let client = reqwest::Client::new();
+    github_get_json_with_client_timeout(&client, path, github_token, timeout).await
+}
+
+pub(super) async fn github_get_json_with_client_timeout<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    path: &str,
+    github_token: Option<&str>,
+    timeout: Duration,
+) -> Option<T> {
     let mut request = client
         .get(format!("{}{}", github_api_base_url(), path))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -66,22 +85,35 @@ async fn github_get_json<T: DeserializeOwned>(path: &str, github_token: Option<&
     if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
         request = request.bearer_auth(token);
     }
-    let response = match tokio::time::timeout(Duration::from_secs(10), request.send()).await {
-        Ok(Ok(response)) if response.status().is_success() => response,
-        Ok(Ok(response)) => {
-            tracing::debug!(status = %response.status(), path, "GitHub state check failed");
-            return None;
+    let response = tokio::time::timeout(timeout, async {
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Ok((status, None));
+        }
+        let value = response.json::<T>().await?;
+        Ok::<_, reqwest::Error>((status, Some(value)))
+    })
+    .await;
+    match response {
+        Ok(Ok((_, Some(value)))) => Some(value),
+        Ok(Ok((status, None))) => {
+            tracing::debug!(%status, path, "GitHub state check failed");
+            None
         }
         Ok(Err(e)) => {
             tracing::debug!(error = %e, path, "GitHub state check invocation error");
-            return None;
+            None
         }
         Err(_) => {
-            tracing::debug!(path, "GitHub state check timed out after 10s");
-            return None;
+            tracing::debug!(
+                path,
+                timeout_ms = timeout.as_millis(),
+                "GitHub state check timed out"
+            );
+            None
         }
-    };
-    response.json::<T>().await.ok()
+    }
 }
 
 pub(super) fn classify_pr_state(state: &GitHubPullState) -> GitHubState {

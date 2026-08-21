@@ -1,5 +1,32 @@
 use super::*;
 
+async fn github_state_server_with_stalled_body(path: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled GitHub mock");
+    let addr = listener.local_addr().expect("stalled GitHub mock address");
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0_u8; 2048];
+        let Ok(n) = socket.read(&mut buf).await else {
+            return;
+        };
+        let request = String::from_utf8_lossy(&buf[..n]);
+        if !request.starts_with(&format!("GET {path} ")) {
+            return;
+        }
+        let headers = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 128\r\nconnection: close\r\n\r\n{";
+        if socket.write_all(headers.as_bytes()).await.is_ok() {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+    format!("http://{addr}")
+}
+
 #[test]
 fn classify_pr_state_handles_merged_and_closed() {
     assert_eq!(
@@ -101,6 +128,36 @@ async fn exact_subject_fetch_rejects_identity_or_kind_mismatches() {
         GitHubState::Unknown
     );
     drop(api_guard);
+}
+
+#[tokio::test]
+async fn github_state_fetch_bounds_response_body_read() {
+    let _env_guard = crate::workspace::test_support::async_env_lock()
+        .lock()
+        .await;
+    let path = "/repos/owner/repo/issues/7";
+    let api_base = github_state_server_with_stalled_body(path).await;
+    let _api_guard =
+        crate::workspace::test_support::ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build local GitHub mock client");
+
+    let started = Instant::now();
+    let result = github_get_json_with_client_timeout::<serde_json::Value>(
+        &client,
+        path,
+        None,
+        Duration::from_millis(50),
+    )
+    .await;
+
+    assert!(result.is_none());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "body streaming must remain inside the request deadline"
+    );
 }
 
 #[test]

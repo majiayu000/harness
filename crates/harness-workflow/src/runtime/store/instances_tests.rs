@@ -23,6 +23,33 @@ fn discovered_instance(id: &str) -> WorkflowInstance {
 }
 
 #[tokio::test]
+async fn runtime_migration_indexes_case_insensitive_github_subject_lookups() -> anyhow::Result<()> {
+    let Some(store) = test_store().await? else {
+        return Ok(());
+    };
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT indexname, indexdef
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND tablename = 'workflow_instances'
+           AND indexname = ANY($1::text[])
+         ORDER BY indexname",
+    )
+    .bind(vec![
+        "idx_workflow_instances_project_repo_issue_ci",
+        "idx_workflow_instances_project_repo_pr_ci",
+    ])
+    .fetch_all(store.pool())
+    .await?;
+
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|(_, definition)| { definition.to_ascii_lowercase().contains("lower(") }));
+    Ok(())
+}
+
+#[tokio::test]
 async fn public_upsert_rejects_unrecorded_state_change() -> anyhow::Result<()> {
     let Some(store) = test_store().await? else {
         return Ok(());
