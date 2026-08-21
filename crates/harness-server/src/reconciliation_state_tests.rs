@@ -104,6 +104,20 @@ async fn exact_subject_fetch_rejects_identity_or_kind_mismatches() {
     drop(api_guard);
 
     let api_base = crate::workspace::test_support::github_state_server(
+        "/repos/owner/repo/issues/7",
+        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo","state":"open","pull_request":null}"#,
+    )
+    .await;
+    let api_guard =
+        crate::workspace::test_support::ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+    assert_eq!(
+        fetch_exact_issue_state_with_token("owner/repo", 7, None).await,
+        GitHubState::Unknown,
+        "the pull_request key identifies a PR even when its value is null"
+    );
+    drop(api_guard);
+
+    let api_base = crate::workspace::test_support::github_state_server(
         "/repos/owner/repo/pulls/11",
         r#"{"number":12,"state":"open","merged_at":null,"base":{"repo":{"full_name":"owner/repo"}}}"#,
     )

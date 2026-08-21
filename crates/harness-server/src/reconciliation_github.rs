@@ -1,5 +1,5 @@
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::{Deserialize, Deserializer};
 use std::time::Duration;
 
 /// External GitHub state observed for one candidate.
@@ -51,8 +51,20 @@ struct ExactGitHubIssueState {
     state: String,
     #[serde(default)]
     state_reason: Option<String>,
-    #[serde(default)]
-    pull_request: Option<serde_json::Value>,
+    #[serde(
+        default,
+        rename = "pull_request",
+        deserialize_with = "deserialize_field_presence"
+    )]
+    has_pull_request_marker: bool,
+}
+
+fn deserialize_field_presence<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
 }
 
 pub(crate) use crate::github_client::github_api_base_url;
@@ -219,7 +231,7 @@ pub(crate) async fn fetch_exact_issue_state_with_token(
         return GitHubState::Unknown;
     };
     if state.number != issue_num
-        || state.pull_request.is_some()
+        || state.has_pull_request_marker
         || !repository_url_matches_slug(&state.repository_url, repo_slug)
     {
         return GitHubState::Unknown;
