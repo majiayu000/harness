@@ -145,11 +145,6 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "test git binary override",
     ),
     allowed(
-        "crates/harness-server/src/reconciliation_tests.rs",
-        1,
-        "serialized env fixture",
-    ),
-    allowed(
         "crates/harness-server/src/router/tests/exec_plan.rs",
         1,
         "test fixture home directory",
