@@ -59,10 +59,10 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
         "pr_open",
         WorkflowSubject::new("issue", "issue:77"),
     )
-    .with_id("project-a::owner/repo::issue:77")
+    .with_id("project-a::Owner/Repo::issue:77")
     .with_server_data(json!({
         "project_id": "project-a",
-        "repo": "owner/repo",
+        "repo": "Owner/Repo",
         "issue_number": 77,
         "pr_number": 880,
     }));
@@ -99,8 +99,13 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
     let found = store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 880)
         .await?
-        .expect("matching runtime issue workflow should be found");
+        .expect("legacy mixed-case runtime issue workflow should be found");
     assert_eq!(found.id, matching.id);
+    let found_by_issue = store
+        .get_instance_by_issue("github_issue_pr", "project-a", Some("owner/repo"), 77)
+        .await?
+        .expect("legacy mixed-case issue identity should be found");
+    assert_eq!(found_by_issue.id, matching.id);
     assert!(store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 881)
         .await?

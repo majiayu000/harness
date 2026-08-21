@@ -236,9 +236,11 @@ impl WorkflowRuntimeStore {
                 head_sha, state, fact_hash, facts::text, fetched_at
              FROM remote_fact_snapshots
              WHERE provider = $1
-               AND repo = $2
+               AND (repo = $2 OR ($1 = 'github' AND LOWER(repo) = LOWER($2)))
                AND subject_type = $3
-               AND subject_number = $4",
+               AND subject_number = $4
+             ORDER BY fetched_at DESC, updated_at DESC, (repo = $2) DESC
+             LIMIT 1",
         )
         .bind(provider)
         .bind(repo)
@@ -323,6 +325,35 @@ mod tests {
         assert_eq!(loaded.state, "closed");
         assert_eq!(loaded.fact_hash, second.fact_hash);
         assert_eq!(loaded, upserted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_store_resolves_legacy_github_repo_case() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let snapshot = RemoteFactSnapshot::new(
+            "github",
+            "Owner/Repo",
+            "pull_request",
+            11,
+            "open",
+            json!({ "number": 11, "state": "open" }),
+            Utc::now(),
+        );
+        store.upsert_remote_fact_snapshot(&snapshot).await?;
+
+        let Some(loaded) = store
+            .get_remote_fact_snapshot("github", "owner/repo", "pull_request", 11)
+            .await?
+        else {
+            anyhow::bail!("legacy mixed-case GitHub fact should be found");
+        };
+        assert_eq!(loaded.id, snapshot.id);
         Ok(())
     }
 

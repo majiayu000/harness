@@ -245,11 +245,15 @@ impl WorkflowRuntimeStore {
             "SELECT data::text FROM workflow_instances
              WHERE definition_id = $1
                AND data->'data'->>'project_id' = $2
-               AND ($3::text IS NULL OR data->'data'->>'repo' = $3)
+               AND ($3::text IS NULL OR LOWER(data->'data'->>'repo') = LOWER($3))
                AND data->'data'->>'pr_number' = $4
              ORDER BY
                CASE
                  WHEN subject_type = 'issue' OR data->'data' ? 'issue_number' THEN 0
+                 ELSE 1
+               END,
+               CASE
+                 WHEN $3::text IS NOT NULL AND data->'data'->>'repo' = $3 THEN 0
                  ELSE 1
                END,
                updated_at DESC
@@ -259,6 +263,38 @@ impl WorkflowRuntimeStore {
         .bind(project_id)
         .bind(repo)
         .bind(pr_number)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(data,)| workflow_instance_from_persisted_json(&data))
+            .transpose()
+    }
+
+    pub async fn get_instance_by_issue(
+        &self,
+        definition_id: &str,
+        project_id: &str,
+        repo: Option<&str>,
+        issue_number: u64,
+    ) -> anyhow::Result<Option<WorkflowInstance>> {
+        let issue_number = issue_number.to_string();
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE definition_id = $1
+               AND data->'data'->>'project_id' = $2
+               AND ($3::text IS NULL OR LOWER(data->'data'->>'repo') = LOWER($3))
+               AND data->'data'->>'issue_number' = $4
+             ORDER BY
+               CASE
+                 WHEN $3::text IS NOT NULL AND data->'data'->>'repo' = $3 THEN 0
+                 ELSE 1
+               END,
+               updated_at DESC
+             LIMIT 1",
+        )
+        .bind(definition_id)
+        .bind(project_id)
+        .bind(repo)
+        .bind(issue_number)
         .fetch_optional(&self.pool)
         .await?;
         row.map(|(data,)| workflow_instance_from_persisted_json(&data))

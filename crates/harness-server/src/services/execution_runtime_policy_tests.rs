@@ -161,12 +161,53 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
         .await?
         .is_empty());
 
+    let existing_issue_task_id = TaskId::from_str("existing-mixed-case-issue-task");
+    crate::workflow_runtime_submission::record_issue_submission(
+        &store,
+        crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("Owner/Repo"),
+            issue_number: 10,
+            task_id: &existing_issue_task_id,
+            labels: &[],
+            force_execute: false,
+            additional_prompt: None,
+            depends_on: &[],
+            dependencies_blocked: false,
+            source: Some("github"),
+            external_id: Some("issue:10"),
+            remote_fact_hash: None,
+            author_trust_class: None,
+        },
+    )
+    .await?;
+    let api_base = crate::workspace::test_support::github_state_server(
+        "/repos/owner/repo/issues/10",
+        r#"{"number":10,"repository_url":"https://api.github.test/repos/owner/repo","state":"closed","state_reason":"completed"}"#,
+    )
+    .await;
+    let api_guard =
+        crate::workspace::test_support::ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+    let returned_task_id = service
+        .enqueue(CreateTaskRequest {
+            issue: Some(10),
+            repo: Some("owner/repo".to_string()),
+            project: Some(project_root.clone()),
+            ..CreateTaskRequest::default()
+        })
+        .await?;
+    drop(api_guard);
+    assert_eq!(
+        returned_task_id, existing_issue_task_id,
+        "an active legacy mixed-case issue retry must return without rechecking GitHub"
+    );
+
     let existing_task_id = TaskId::from_str("existing-pr-feedback-task");
     let outcome = crate::workflow_runtime_pr_feedback::request_pr_feedback_sweep_for_pr(
         &store,
         crate::workflow_runtime_pr_feedback::PrFeedbackSweepRuntimeContext {
             project_root: &project_root,
-            repo: Some("owner/repo"),
+            repo: Some("Owner/Repo"),
             task_id: &existing_task_id,
             pr_number: 7,
             pr_url: None,
@@ -196,7 +237,7 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
     drop(api_guard);
     assert_eq!(
         returned_task_id, existing_task_id,
-        "an active PR-feedback retry must return idempotently without rechecking GitHub"
+        "an active legacy mixed-case PR retry must return without rechecking GitHub"
     );
     Ok(())
 }
