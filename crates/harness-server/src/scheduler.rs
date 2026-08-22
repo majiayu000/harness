@@ -118,15 +118,15 @@ impl Scheduler {
             .await
             .map_err(|err| anyhow::anyhow!("failed to query events: {err}"))?;
         let project_root = state.core.project_root.clone();
-        let violations = {
-            let rules = state.engines.rules.read().await;
-            rules.scan(&project_root).await.map_err(|err| {
-                anyhow::anyhow!(
-                    "failed to scan rules for '{}': {err}",
-                    project_root.display()
-                )
-            })?
-        };
+        // Snapshot under the read lock; the scan spawns one bash script per
+        // guard and must not pin the lock while it runs.
+        let snapshot = state.engines.rules.read().await.snapshot();
+        let violations = snapshot.scan(&project_root).await.map_err(|err| {
+            anyhow::anyhow!(
+                "failed to scan rules for '{}': {err}",
+                project_root.display()
+            )
+        })?;
         state
             .observability
             .events
