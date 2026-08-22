@@ -8,6 +8,9 @@ async fn open_test_store() -> anyhow::Result<Option<IssueWorkflowStore>> {
         Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    if configured.trim().is_empty() {
+        anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
+    }
     let database_url = harness_core::db::resolve_test_database_url(Some(&configured))?;
     let dir = tempfile::tempdir()?;
     Ok(Some(

@@ -2,9 +2,14 @@ use super::IssueWorkflowStore;
 use crate::issue_lifecycle::{workflow_id, IssueWorkflowInstance};
 
 fn isolated_database_url() -> anyhow::Result<Option<String>> {
-    let Ok(configured) = std::env::var("HARNESS_DATABASE_URL") else {
-        return Ok(None);
+    let configured = match std::env::var("HARNESS_DATABASE_URL") {
+        Ok(configured) => configured,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
+    if configured.trim().is_empty() {
+        anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
+    }
     Ok(Some(harness_core::db::resolve_test_database_url(Some(
         &configured,
     ))?))

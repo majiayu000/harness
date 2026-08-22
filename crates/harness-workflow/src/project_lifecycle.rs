@@ -632,6 +632,9 @@ mod tests {
             Err(std::env::VarError::NotPresent) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        if configured.trim().is_empty() {
+            anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
+        }
         let database_url = resolve_test_database_url(Some(&configured))?;
         let dir = tempfile::tempdir()?;
         Ok(Some(
