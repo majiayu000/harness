@@ -180,7 +180,7 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "test fixture home directory",
     ),
     allowed(
-        "crates/harness-server/src/websocket.rs",
+        "crates/harness-server/src/websocket/tests.rs",
         1,
         "websocket client home fallback",
     ),
