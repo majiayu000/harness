@@ -733,4 +733,17 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               )
               WHERE data->'data'->>'pr_number' IS NOT NULL",
     },
+    Migration {
+        version: 30,
+        description: "index case-insensitive GitHub remote fact lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_remote_fact_snapshots_provider_repo_subject_ci
+              ON remote_fact_snapshots (
+                  provider,
+                  (LOWER(repo)),
+                  subject_type,
+                  subject_number,
+                  fetched_at DESC,
+                  updated_at DESC
+              )",
+    },
 ];

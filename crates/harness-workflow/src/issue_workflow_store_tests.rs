@@ -114,6 +114,49 @@ async fn issue_workflow_store_scopes_identity_by_repo() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn issue_workflow_store_reuses_legacy_mixed_case_identity() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/legacy-mixed-case-issue";
+    let legacy = store
+        .record_issue_scheduled(
+            project_id,
+            Some("Owner/Repo"),
+            77,
+            "legacy-task",
+            &[],
+            false,
+        )
+        .await?;
+    let updated = store
+        .record_implement_started(project_id, Some("owner/repo"), 77, "legacy-task")
+        .await?;
+
+    assert_eq!(updated.id, legacy.id);
+    assert_eq!(updated.repo.as_deref(), Some("Owner/Repo"));
+    assert_eq!(updated.state, IssueLifecycleState::Implementing);
+    assert_eq!(store.row_count().await?, 1);
+    let loaded = store
+        .get_by_issue(project_id, Some("owner/repo"), 77)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("canonical lookup should find legacy workflow"))?;
+    assert_eq!(loaded.id, legacy.id);
+    let index: Option<(String,)> = sqlx::query_as(
+        "SELECT indexdef FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND tablename = 'issue_workflows'
+           AND indexname = 'idx_issue_workflows_repo_subject_ci'",
+    )
+    .fetch_optional(store.pool())
+    .await?;
+    assert!(index.is_some_and(|(definition,)| definition
+        .to_ascii_lowercase()
+        .contains("lower(((data)::jsonb ->> 'repo'")));
+    Ok(())
+}
+
+#[tokio::test]
 async fn issue_workflow_store_records_cancelled_pr_tasks_as_cancelled() -> anyhow::Result<()> {
     let Some(store) = open_test_store().await? else {
         return Ok(());

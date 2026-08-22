@@ -46,6 +46,22 @@ async fn runtime_migration_indexes_case_insensitive_github_subject_lookups() -> 
     assert!(rows
         .iter()
         .all(|(_, definition)| { definition.to_ascii_lowercase().contains("lower(") }));
+
+    let remote_fact_index: Option<(String,)> = sqlx::query_as(
+        "SELECT indexdef
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND tablename = 'remote_fact_snapshots'
+           AND indexname = 'idx_remote_fact_snapshots_provider_repo_subject_ci'",
+    )
+    .fetch_optional(store.pool())
+    .await?;
+    let Some((remote_fact_index,)) = remote_fact_index else {
+        anyhow::bail!("case-insensitive remote fact index should exist");
+    };
+    assert!(remote_fact_index
+        .to_ascii_lowercase()
+        .contains("lower(repo)"));
     Ok(())
 }
 

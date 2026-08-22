@@ -25,6 +25,16 @@ static PROJECT_WORKFLOW_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_project_workflows_project
               ON project_workflows ((data::jsonb->>'project_id'))",
     },
+    Migration {
+        version: 3,
+        description: "index case-insensitive GitHub project workflow lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_project_workflows_repo_ci
+              ON project_workflows (
+                  (data::jsonb->>'project_id'),
+                  (LOWER(data::jsonb->>'repo')),
+                  updated_at DESC
+              )",
+    },
 ];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,8 +274,8 @@ impl ProjectWorkflowStore {
             sqlx::query_as(
                 "SELECT data FROM project_workflows
                  WHERE data::jsonb->>'project_id' = $1
-                   AND data::jsonb->>'repo' = $2
-                 ORDER BY updated_at DESC
+                   AND LOWER(data::jsonb->>'repo') = LOWER($2)
+                 ORDER BY (data::jsonb->>'repo' = $2) DESC, updated_at DESC
                  LIMIT 1",
             )
             .bind(project_id)
@@ -451,10 +461,20 @@ impl ProjectWorkflowStore {
     where
         F: FnOnce(&mut ProjectWorkflowInstance),
     {
+        let mut tx = self.pool.begin().await?;
+        if let Some((row_id, mut workflow)) = self
+            .load_for_update_by_project(&mut tx, project_id, repo)
+            .await?
+        {
+            f(&mut workflow);
+            self.upsert_in_tx(&mut tx, &workflow).await?;
+            debug_assert_eq!(workflow.id, row_id);
+            tx.commit().await?;
+            return Ok(workflow);
+        }
         let workflow_id = workflow_id(project_id, repo);
         let placeholder =
             ProjectWorkflowInstance::new(project_id.to_string(), repo.map(str::to_string));
-        let mut tx = self.pool.begin().await?;
         self.insert_placeholder(&mut tx, &workflow_id, &placeholder)
             .await?;
         let mut workflow = self
@@ -503,6 +523,42 @@ impl ProjectWorkflowStore {
         row.map(|(data,)| serde_json::from_str(&data))
             .transpose()
             .map_err(Into::into)
+    }
+
+    async fn load_for_update_by_project(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        project_id: &str,
+        repo: Option<&str>,
+    ) -> anyhow::Result<Option<(String, ProjectWorkflowInstance)>> {
+        let row: Option<(String, String)> = if let Some(repo) = repo {
+            sqlx::query_as(
+                "SELECT id, data FROM project_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND LOWER(data::jsonb->>'repo') = LOWER($2)
+                 ORDER BY (data::jsonb->>'repo' = $2) DESC, updated_at DESC
+                 LIMIT 1
+                 FOR UPDATE",
+            )
+            .bind(project_id)
+            .bind(repo)
+            .fetch_optional(&mut **tx)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, data FROM project_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND data::jsonb->>'repo' IS NULL
+                 ORDER BY updated_at DESC
+                 LIMIT 1
+                 FOR UPDATE",
+            )
+            .bind(project_id)
+            .fetch_optional(&mut **tx)
+            .await?
+        };
+        row.map(|(id, data)| Ok((id, serde_json::from_str(&data)?)))
+            .transpose()
     }
 
     async fn upsert_in_tx(
@@ -597,6 +653,40 @@ mod tests {
             .expect("repo-b workflow");
 
         assert_ne!(a.id, b.id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_workflow_store_reuses_legacy_mixed_case_identity() -> anyhow::Result<()> {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project_id = "/tmp/legacy-mixed-case-project";
+        let legacy = store
+            .record_poll_started(project_id, Some("Owner/Repo"))
+            .await?;
+        let updated = store.record_idle(project_id, Some("owner/repo")).await?;
+
+        assert_eq!(updated.id, legacy.id);
+        assert_eq!(updated.repo.as_deref(), Some("Owner/Repo"));
+        assert_eq!(updated.state, ProjectWorkflowState::Idle);
+        assert_eq!(store.row_count().await?, 1);
+        let loaded = store
+            .get_by_project(project_id, Some("owner/repo"))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("canonical lookup should find legacy workflow"))?;
+        assert_eq!(loaded.id, legacy.id);
+        let index: Option<(String,)> = sqlx::query_as(
+            "SELECT indexdef FROM pg_indexes
+             WHERE schemaname = current_schema()
+               AND tablename = 'project_workflows'
+               AND indexname = 'idx_project_workflows_repo_ci'",
+        )
+        .fetch_optional(&store.pool)
+        .await?;
+        assert!(index.is_some_and(|(definition,)| definition
+            .to_ascii_lowercase()
+            .contains("lower(((data)::jsonb ->> 'repo'")));
         Ok(())
     }
 }

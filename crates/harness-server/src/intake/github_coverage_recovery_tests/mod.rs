@@ -5,6 +5,7 @@ mod support;
 use support::*;
 
 mod atomic;
+mod legacy_identity;
 
 #[tokio::test]
 async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> anyhow::Result<()> {
@@ -67,13 +68,17 @@ async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> a
         Some(&store),
         &project_root,
         &project_id,
-        REPO,
+        "Owner/Repo",
         issue_number,
         IsolationTrustClass::Trusted,
         None,
     )
     .await?;
     assert!(matches!(repeated, GitHubIssueCoverage::Covered { .. }));
+    let canonical_id = workflow_id(&project_id, Some(REPO), issue_number);
+    let mixed_case_id = workflow_id(&project_id, Some("Owner/Repo"), issue_number);
+    assert!(store.get_instance(&canonical_id).await?.is_some());
+    assert!(store.get_instance(&mixed_case_id).await?.is_none());
     assert_quality_gate_queued(&store, &project_id, issue_number, pr_number).await?;
 
     drop(store);
@@ -103,6 +108,80 @@ async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> a
     )
     .await?;
     assert_quality_gate_queued(&reopened, &project_id, issue_number, pr_number).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_reuses_legacy_mixed_case_workflow_identity() -> anyhow::Result<()> {
+    let Some((dir, store)) = open_runtime_store().await? else {
+        return Ok(());
+    };
+    let project_root = dir.path().join("legacy-mixed-case");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nbase:\n  branch: main\n---\n",
+    )?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let issue_number = 1711;
+    let pr_number = 1712;
+    let legacy_id = workflow_id(&project_id, Some("Owner/Repo"), issue_number);
+    let legacy = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "planning",
+        WorkflowSubject::new("issue", format!("issue:{issue_number}")),
+    )
+    .with_id(legacy_id.clone())
+    .with_server_data(json!({
+        "project_id": project_id,
+        "repo": "Owner/Repo",
+        "issue_number": issue_number,
+        "submission_id": format!("legacy-handle-{issue_number}"),
+        "task_id": format!("github-issue:Owner/Repo:issue:{issue_number}"),
+        "task_ids": [format!("legacy-handle-{issue_number}")],
+        "expected_base_ref": "release",
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &legacy).await?;
+    let mut snapshot = pr_snapshot(pr_number, issue_number, "OPEN", "SUCCESS", true);
+    snapshot["baseRefName"] = json!("release");
+    let graphql_url = spawn_json_server(
+        "200 OK",
+        vec![
+            issue_links_response("OPEN", &[pr_number]),
+            graphql_response(snapshot),
+        ],
+    )
+    .await;
+
+    let coverage = recover_with_urls(
+        &store,
+        &project_root,
+        &project_id,
+        issue_number,
+        "unused",
+        &graphql_url,
+    )
+    .await?;
+
+    assert!(matches!(coverage, GitHubIssueCoverage::Covered { .. }));
+    let recovered = store
+        .get_instance(&legacy_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("legacy workflow should be recovered in place"))?;
+    assert_eq!(recovered.state, "quality_gate_pending");
+    assert_eq!(recovered.data["pr_number"], pr_number);
+    assert_eq!(recovered.data["expected_base_ref"], "release");
+    let canonical_id = workflow_id(&project_id, Some(REPO), issue_number);
+    assert!(store.get_instance(&canonical_id).await?.is_none());
+    let commands = store.commands_for(&legacy_id).await?;
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.command.requires_runtime_job())
+            .count(),
+        1
+    );
     Ok(())
 }
 

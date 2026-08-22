@@ -50,6 +50,14 @@ pub(super) async fn recover_with_urls_and_trust(
     graphql_url: &str,
     author_trust_class: IsolationTrustClass,
 ) -> anyhow::Result<GitHubIssueCoverage> {
+    let existing_workflow = store
+        .get_instance_by_issue(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            project_id,
+            Some(REPO),
+            issue_number,
+        )
+        .await?;
     recover_github_pr_coverage_with_client(
         store,
         project_root,
@@ -58,6 +66,9 @@ pub(super) async fn recover_with_urls_and_trust(
         issue_number,
         author_trust_class,
         None,
+        existing_workflow
+            .as_ref()
+            .map(|workflow| workflow.id.as_str()),
         &reqwest::Client::new(),
         graphql_url,
     )
