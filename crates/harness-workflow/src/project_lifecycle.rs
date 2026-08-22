@@ -485,6 +485,7 @@ impl ProjectWorkflowStore {
         F: FnOnce(&mut ProjectWorkflowInstance),
     {
         let mut tx = self.pool.begin().await?;
+        lock_project_identity(&mut tx, project_id, repo).await?;
         if let Some((row_id, mut workflow)) = self
             .load_for_update_by_project(&mut tx, project_id, repo)
             .await?
@@ -601,6 +602,21 @@ impl ProjectWorkflowStore {
         .await?;
         Ok(())
     }
+}
+
+async fn lock_project_identity(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    project_id: &str,
+    repo: Option<&str>,
+) -> anyhow::Result<()> {
+    let canonical_repo = repo.map(str::to_ascii_lowercase);
+    let lock_key =
+        serde_json::to_string(&("project_workflow_identity", project_id, canonical_repo))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

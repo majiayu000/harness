@@ -569,6 +569,7 @@ impl IssueWorkflowStore {
         F: FnOnce(&mut IssueWorkflowInstance) -> anyhow::Result<()>,
     {
         let mut tx = self.pool.begin().await?;
+        lock_issue_identity(&mut tx, project_id, repo, issue_number).await?;
         if let Some((row_id, mut workflow)) = self
             .load_for_update_by_issue(&mut tx, project_id, repo, issue_number)
             .await?
@@ -627,6 +628,7 @@ impl IssueWorkflowStore {
         F: FnOnce(&mut IssueWorkflowInstance) -> anyhow::Result<()>,
     {
         let mut tx = self.pool.begin().await?;
+        lock_issue_identity(&mut tx, project_id, repo, issue_number).await?;
         let Some((row_id, mut workflow)) = self
             .load_for_update_by_issue(&mut tx, project_id, repo, issue_number)
             .await?
@@ -714,6 +716,26 @@ impl IssueWorkflowStore {
         .await?;
         Ok(())
     }
+}
+
+async fn lock_issue_identity(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    project_id: &str,
+    repo: Option<&str>,
+    issue_number: u64,
+) -> anyhow::Result<()> {
+    let canonical_repo = repo.map(str::to_ascii_lowercase);
+    let lock_key = serde_json::to_string(&(
+        "issue_workflow_identity",
+        project_id,
+        canonical_repo,
+        issue_number,
+    ))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
