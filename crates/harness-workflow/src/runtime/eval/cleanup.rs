@@ -1,13 +1,25 @@
 use super::{data::eval_cleanup_data, transition_outcome::accepted_transition_record};
 use crate::runtime::{
-    DataProvenance, RuntimeJobStatus, ValidationContext, WorkflowCommand, WorkflowCommandStatus,
-    WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition, WorkflowEvidence,
-    WorkflowInstance, WorkflowRuntimeStore,
+    DataProvenance, RuntimeJobStatus, ValidationContext, WorkflowCommand, WorkflowCommandRecord,
+    WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition,
+    WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore,
 };
 use chrono::Utc;
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
+
+/// Batch-fetch every runtime job belonging to `commands`, keyed by command id:
+/// one round trip instead of one per command (issue #1999). Callers iterate
+/// the returned map in their existing command order, so first-error bail
+/// semantics are unchanged.
+pub(super) async fn runtime_jobs_by_command_id(
+    store: &WorkflowRuntimeStore,
+    commands: &[WorkflowCommandRecord],
+) -> anyhow::Result<BTreeMap<String, Vec<crate::runtime::RuntimeJob>>> {
+    let command_ids: Vec<String> = commands.iter().map(|command| command.id.clone()).collect();
+    store.runtime_jobs_for_commands(&command_ids).await
+}
 
 const REMOTE_CLEANUP_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -242,8 +254,14 @@ async fn ensure_cancelled_workflow_family_clean(
         workflow_ids.push(workflow_id);
     }
 
-    let commands = store.commands_for_workflows(&workflow_ids).await?;
-    for command in commands.into_values().flatten() {
+    let commands: Vec<WorkflowCommandRecord> = store
+        .commands_for_workflows(&workflow_ids)
+        .await?
+        .into_values()
+        .flatten()
+        .collect();
+    let mut jobs_by_command = runtime_jobs_by_command_id(store, &commands).await?;
+    for command in commands {
         if matches!(
             command.status,
             WorkflowCommandStatus::Pending
@@ -257,7 +275,7 @@ async fn ensure_cancelled_workflow_family_clean(
                 command.status.as_str()
             );
         }
-        for job in store.runtime_jobs_for_command(&command.id).await? {
+        for job in jobs_by_command.remove(&command.id).unwrap_or_default() {
             if matches!(
                 job.status,
                 RuntimeJobStatus::Pending | RuntimeJobStatus::Running
@@ -291,10 +309,16 @@ async fn ensure_completed_workflow_family_clean(
         .collect::<Vec<_>>();
     ensure_no_active_work(store, &workflow_ids).await?;
 
-    let commands = store.commands_for_workflows(&workflow_ids).await?;
+    let commands: Vec<WorkflowCommandRecord> = store
+        .commands_for_workflows(&workflow_ids)
+        .await?
+        .into_values()
+        .flatten()
+        .collect();
+    let mut jobs_by_command = runtime_jobs_by_command_id(store, &commands).await?;
     let mut required_cleanup_proofs = 0_u64;
-    for command in commands.into_values().flatten() {
-        for job in store.runtime_jobs_for_command(&command.id).await? {
+    for command in commands {
+        for job in jobs_by_command.remove(&command.id).unwrap_or_default() {
             if eval_job_requires_cleanup_proof(&job) {
                 required_cleanup_proofs = required_cleanup_proofs.saturating_add(1);
                 if !runtime_job_has_cleanup_proof(&job) {
@@ -363,8 +387,14 @@ async fn ensure_no_active_work(
     store: &WorkflowRuntimeStore,
     workflow_ids: &[String],
 ) -> anyhow::Result<()> {
-    let commands = store.commands_for_workflows(workflow_ids).await?;
-    for command in commands.into_values().flatten() {
+    let commands: Vec<WorkflowCommandRecord> = store
+        .commands_for_workflows(workflow_ids)
+        .await?
+        .into_values()
+        .flatten()
+        .collect();
+    let mut jobs_by_command = runtime_jobs_by_command_id(store, &commands).await?;
+    for command in commands {
         if matches!(
             command.status,
             WorkflowCommandStatus::Pending
@@ -378,7 +408,7 @@ async fn ensure_no_active_work(
                 command.status.as_str()
             );
         }
-        for job in store.runtime_jobs_for_command(&command.id).await? {
+        for job in jobs_by_command.remove(&command.id).unwrap_or_default() {
             if matches!(
                 job.status,
                 RuntimeJobStatus::Pending | RuntimeJobStatus::Running
