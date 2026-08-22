@@ -150,8 +150,8 @@ pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,
     pub(super) definition_registry: Arc<WorkflowDefinitionRegistry>,
     /// Hard workflow budget ceiling policy (GH-1770 spec §4.4), applied when a
-    /// completed activity commits its decision. Defaults to shadow enforcement
-    /// so a store opened without explicit wiring only records decisions.
+    /// completed activity commits its decision. Defaults to enforcement unless
+    /// callers explicitly configure shadow mode.
     pub(super) budget_policy: RuntimeBudgetPolicy,
 }
 
