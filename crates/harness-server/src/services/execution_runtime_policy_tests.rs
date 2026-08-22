@@ -107,9 +107,9 @@ fn remote_subject_identity_normalizes_repository_case() {
 
 #[tokio::test]
 async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
         return Ok(());
-    }
+    };
     let _env_guard = crate::workspace::test_support::async_env_lock()
         .lock()
         .await;
@@ -120,11 +120,7 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
     )?;
     let project_root = std::fs::canonicalize(dir.path())?;
     let store = Arc::new(
-        WorkflowRuntimeStore::open_with_database_url(
-            dir.path(),
-            Some(&crate::test_helpers::test_database_url()?),
-        )
-        .await?,
+        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?,
     );
     let service = DefaultExecutionService::new(
         Arc::new(HarnessConfig::default()),
@@ -288,9 +284,9 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
 
 #[tokio::test]
 async fn concurrent_remote_subject_admissions_return_one_issue_handle() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
         return Ok(());
-    }
+    };
     let _env_guard = crate::workspace::test_support::async_env_lock()
         .lock()
         .await;
@@ -301,11 +297,7 @@ async fn concurrent_remote_subject_admissions_return_one_issue_handle() -> anyho
     )?;
     let project_root = std::fs::canonicalize(dir.path())?;
     let store = Arc::new(
-        WorkflowRuntimeStore::open_with_database_url(
-            dir.path(),
-            Some(&crate::test_helpers::test_database_url()?),
-        )
-        .await?,
+        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?,
     );
     let service = DefaultExecutionService::new(
         Arc::new(HarnessConfig::default()),
@@ -343,9 +335,9 @@ async fn concurrent_remote_subject_admissions_return_one_issue_handle() -> anyho
 
 #[tokio::test]
 async fn concurrent_remote_subject_admissions_return_one_pr_handle() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
         return Ok(());
-    }
+    };
     let _env_guard = crate::workspace::test_support::async_env_lock()
         .lock()
         .await;
@@ -356,11 +348,7 @@ async fn concurrent_remote_subject_admissions_return_one_pr_handle() -> anyhow::
     )?;
     let project_root = std::fs::canonicalize(dir.path())?;
     let store = Arc::new(
-        WorkflowRuntimeStore::open_with_database_url(
-            dir.path(),
-            Some(&crate::test_helpers::test_database_url()?),
-        )
-        .await?,
+        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?,
     );
     let service = DefaultExecutionService::new(
         Arc::new(HarnessConfig::default()),

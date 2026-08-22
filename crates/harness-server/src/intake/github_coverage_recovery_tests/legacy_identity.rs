@@ -5,11 +5,10 @@ use harness_workflow::project_lifecycle::ProjectWorkflowStore;
 
 #[tokio::test]
 async fn canonical_intake_reuses_legacy_issue_and_project_workflows() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
         return Ok(());
-    }
+    };
     let dir = crate::test_helpers::tempdir_in_home("harness-test-legacy-intake-")?;
-    let database_url = crate::test_helpers::test_database_url()?;
     let issue_store = IssueWorkflowStore::open_with_database_url(
         &dir.path().join("issue-workflows"),
         Some(&database_url),

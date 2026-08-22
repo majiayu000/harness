@@ -163,9 +163,9 @@ async fn accepted_issue_replay_repairs_pending_command_without_advancing_instanc
 #[tokio::test]
 async fn concurrent_mixed_case_issue_submissions_share_one_canonical_workflow() -> anyhow::Result<()>
 {
-    if !crate::test_helpers::db_tests_enabled().await {
+    let Some(_database_url) = crate::test_helpers::configured_test_database_url()? else {
         return Ok(());
-    }
+    };
 
     let dir = tempfile::tempdir()?;
     let store = open_runtime_store(dir.path()).await?;

@@ -600,10 +600,9 @@ async fn pr_feedback_without_issue_uses_bound_workflow_for_local_review() -> any
 
 #[tokio::test]
 async fn concurrent_mixed_case_pr_requests_share_one_canonical_workflow() -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
         return Ok(());
-    }
-    let database_url = crate::test_helpers::test_database_url()?;
+    };
     let dir = tempfile::tempdir()?;
     let store =
         WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;

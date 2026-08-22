@@ -170,9 +170,9 @@ async fn issue_submission_releases_dependency_by_github_issue_handle_when_canoni
 #[tokio::test]
 async fn github_issue_dependency_resolution_bridges_legacy_repo_case_in_both_directions(
 ) -> anyhow::Result<()> {
-    if !crate::test_helpers::db_tests_enabled().await {
+    let Some(_database_url) = crate::test_helpers::configured_test_database_url()? else {
         return Ok(());
-    }
+    };
 
     let dir = tempfile::tempdir()?;
     let store = open_runtime_store(dir.path()).await?;
