@@ -220,7 +220,7 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "Postgres integration test gate",
     ),
     allowed(
-        "crates/harness-workflow/src/project_lifecycle.rs",
+        "crates/harness-workflow/src/project_lifecycle_tests.rs",
         1,
         "Postgres integration test gate",
     ),
