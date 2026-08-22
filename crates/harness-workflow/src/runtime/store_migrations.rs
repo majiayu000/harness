@@ -755,7 +755,6 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                        ROW_NUMBER() OVER (
                            PARTITION BY provider, LOWER(repo), subject_type, subject_number
                            ORDER BY
-                               fetched_at DESC,
                                CASE LOWER(state)
                                    WHEN 'merged' THEN 4
                                    WHEN 'closed' THEN 3
@@ -763,6 +762,7 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                                    WHEN 'cancelled' THEN 2
                                    ELSE 1
                                END DESC,
+                               fetched_at DESC,
                                fact_hash DESC,
                                updated_at DESC,
                                id DESC

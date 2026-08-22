@@ -361,11 +361,15 @@ impl WorkflowRuntimeStore {
             return Ok(Vec::new());
         }
         let limit = limit.clamp(1, 500);
+        let canonical_repos = repos
+            .iter()
+            .map(|repo| repo.to_ascii_lowercase())
+            .collect::<Vec<_>>();
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT data::text FROM workflow_instances
              WHERE definition_id = $1
                AND state = $2
-               AND data->'data'->>'repo' = ANY($3::text[])
+               AND LOWER(data->'data'->>'repo') = ANY($3::text[])
                AND (data->'data'->>'reason_class' = 'transient'
                     OR data->'data'->'last_stop'->>'reason_class' = 'transient')
                AND NOT (
@@ -378,7 +382,7 @@ impl WorkflowRuntimeStore {
         )
         .bind(definition_id)
         .bind(state)
-        .bind(repos)
+        .bind(&canonical_repos)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

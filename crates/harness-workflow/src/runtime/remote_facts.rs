@@ -200,10 +200,9 @@ pub(in crate::runtime) async fn upsert_remote_fact_snapshot_tx(
                 facts = EXCLUDED.facts,
                 fetched_at = EXCLUDED.fetched_at,
                 updated_at = CURRENT_TIMESTAMP
-             WHERE remote_fact_snapshots.fetched_at < EXCLUDED.fetched_at
-                OR (
-                    remote_fact_snapshots.fetched_at = EXCLUDED.fetched_at
-                    AND (
+             WHERE CASE
+                WHEN LOWER(EXCLUDED.provider) = 'github' THEN
+                    (
                         CASE LOWER(remote_fact_snapshots.state)
                             WHEN 'merged' THEN 4
                             WHEN 'closed' THEN 3
@@ -211,8 +210,9 @@ pub(in crate::runtime) async fn upsert_remote_fact_snapshot_tx(
                             WHEN 'cancelled' THEN 2
                             ELSE 1
                         END,
+                        remote_fact_snapshots.fetched_at,
                         remote_fact_snapshots.fact_hash
-                    ) < (
+                    ) < ROW(
                         CASE LOWER(EXCLUDED.state)
                             WHEN 'merged' THEN 4
                             WHEN 'closed' THEN 3
@@ -220,9 +220,13 @@ pub(in crate::runtime) async fn upsert_remote_fact_snapshot_tx(
                             WHEN 'cancelled' THEN 2
                             ELSE 1
                         END,
+                        EXCLUDED.fetched_at,
                         EXCLUDED.fact_hash
                     )
-                )
+                ELSE
+                    (remote_fact_snapshots.fetched_at, remote_fact_snapshots.fact_hash)
+                        < (EXCLUDED.fetched_at, EXCLUDED.fact_hash)
+             END
              RETURNING id, provider, repo, subject_type, subject_number, subject_url,
                 head_sha, state, fact_hash, facts::text, fetched_at",
     )
@@ -532,6 +536,39 @@ mod tests {
         );
         let persisted = store.upsert_remote_fact_snapshot(&older).await?;
         assert_eq!(persisted.fact_hash, newer.fact_hash);
+        assert_eq!(persisted.state, "merged");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_store_does_not_regress_github_terminal_remote_fact() -> anyhow::Result<()> {
+        let Some(store) = remote_fact_test_store().await? else {
+            return Ok(());
+        };
+        let fetched_at = Utc::now();
+        let terminal = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            21,
+            "merged",
+            json!({"state": "merged"}),
+            fetched_at,
+        );
+        store.upsert_remote_fact_snapshot(&terminal).await?;
+        let stale_open = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            21,
+            "open",
+            json!({"state": "open"}),
+            fetched_at + chrono::Duration::seconds(1),
+        );
+        let persisted = store.upsert_remote_fact_snapshot(&stale_open).await?;
+
+        assert_eq!(persisted.id, terminal.id);
+        assert_eq!(persisted.fact_hash, terminal.fact_hash);
         assert_eq!(persisted.state, "merged");
         Ok(())
     }

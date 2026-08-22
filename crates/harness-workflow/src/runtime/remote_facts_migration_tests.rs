@@ -60,7 +60,7 @@ async fn migration_canonicalizes_remote_fact_collisions_and_preserves_winner() -
         902,
         "open",
         json!({"state": "open"}),
-        fetched_at,
+        fetched_at + chrono::Duration::seconds(1),
     );
     let merged = RemoteFactSnapshot::new(
         "github",
