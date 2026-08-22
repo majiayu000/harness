@@ -1,4 +1,4 @@
-use crate::{http::AppState, router};
+use crate::{http::AppState, websocket_dispatch::WS_REQUEST_BACKLOG};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
@@ -121,8 +121,11 @@ pub async fn ws_handler(
 
 /// Handle a single WebSocket connection.
 ///
-/// - Incoming text frames are decoded as JSON-RPC 2.0 requests, routed through
-///   the standard dispatcher, and the response is sent back as a text frame.
+/// - Incoming text frames are forwarded to the per-connection dispatch worker
+///   ([`crate::websocket_dispatch::dispatch_requests`]), which routes them
+///   through the standard dispatcher and sends each response back as a text
+///   frame. The connection loop itself never awaits a request handler, so
+///   heartbeats stay live during long calls (GH-1984).
 /// - Server-push notifications broadcast on `AppState::notification_tx` are
 ///   forwarded to the client as unsolicited text frames.
 /// - A Ping frame is sent every `ws_heartbeat_interval_secs` seconds. If the
@@ -184,10 +187,22 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     heartbeat.tick().await; // consume the first immediate tick
     let mut pong_pending = false;
 
+    // Task 3: serialized JSON-RPC dispatch worker (GH-1984). Request handlers
+    // run on their own task so a slow handler cannot stall the connection
+    // loop, which must service Pong frames and heartbeat ticks promptly or a
+    // healthy connection gets misjudged as stale and killed.
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<String>(WS_REQUEST_BACKLOG);
+    let dispatch_task = tokio::spawn(crate::websocket_dispatch::dispatch_requests(
+        req_rx,
+        out_tx.clone(),
+        state.clone(),
+    ));
+
     // Subscribe to the graceful-shutdown signal.
     let mut ws_shutdown_rx = state.notifications.ws_shutdown_tx.subscribe();
 
-    // Main loop: read incoming frames, dispatch as JSON-RPC, reply.
+    // Main loop: forward requests to the dispatch worker; service heartbeat
+    // and shutdown locally. Never awaits a request handler (GH-1984).
     loop {
         tokio::select! {
             msg = ws_stream.next() => {
@@ -205,24 +220,24 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
                     _ => continue,
                 };
 
-                let response = match codec::decode_request(&text) {
-                    Ok(req) => router::handle_request(&state, req).await,
-                    Err(e) => Some(RpcResponse::error(
-                        None,
-                        harness_protocol::methods::PARSE_ERROR,
-                        format!("parse error: {e}"),
-                    )),
-                };
-
-                if let Some(resp) = response {
-                    match codec::encode_response(&resp) {
-                        Ok(out) => {
+                match req_tx.try_send(text.to_string()) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        // Fail-closed backpressure: reject instead of growing
+                        // the queue without bound (GH-1984).
+                        tracing::warn!("WebSocket request backlog full; rejecting request");
+                        let resp = RpcResponse::error(
+                            None,
+                            harness_protocol::methods::INTERNAL_ERROR,
+                            "request backlog full".to_string(),
+                        );
+                        if let Ok(out) = codec::encode_response(&resp) {
                             if out_tx.send(Message::Text(out.into())).is_err() {
                                 break;
                             }
                         }
-                        Err(e) => tracing::warn!("failed to encode response: {e}"),
                     }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
 
@@ -244,6 +259,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
         }
     }
 
+    dispatch_task.abort();
     notif_task.abort();
     send_task.abort();
 }
@@ -251,181 +267,16 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
+    use crate::websocket_test_support::{
+        bind_ws_test_listener, connect_ws_test_client, make_test_state, make_test_state_with_config,
+    };
     use axum::http::HeaderValue;
-    use harness_agents::registry::AgentRegistry;
     use harness_core::config::HarnessConfig;
     use harness_protocol::{
         codec, methods::Method, methods::RpcRequest, notifications::Notification,
         notifications::RpcNotification,
     };
     use std::sync::Arc;
-    use tokio::sync::broadcast;
-    use tokio::sync::RwLock;
-    type TestWebSocket = tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >;
-
-    async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<AppState> {
-        make_test_state_with_config(dir, HarnessConfig::default()).await
-    }
-
-    async fn make_test_state_with_config(
-        dir: &std::path::Path,
-        mut config: HarnessConfig,
-    ) -> anyhow::Result<AppState> {
-        config.server.allow_unauthenticated = true;
-        let db_setup_guard = crate::test_helpers::acquire_db_state_guard().await;
-        let notification_broadcast_capacity = config.server.notification_broadcast_capacity.max(1);
-        let notification_lag_log_every = config.server.notification_lag_log_every;
-        let server = Arc::new(HarnessServer::new(
-            config,
-            ThreadManager::new(),
-            AgentRegistry::new("test"),
-        ));
-        let tasks = crate::task_runner::TaskStore::open(
-            &harness_core::config::dirs::default_db_path(dir, "tasks"),
-        )
-        .await?;
-        let events = Arc::new(harness_observe::event_store::EventStore::new(dir).await?);
-        let signal_detector = harness_gc::signal_detector::SignalDetector::new(
-            server.config.gc.signal_thresholds.clone(),
-            harness_core::types::ProjectId::new(),
-        );
-        let draft_store = harness_gc::draft_store::DraftStore::new(dir)?;
-        let gc_agent = Arc::new(harness_gc::gc_agent::GcAgent::new(
-            server.config.gc.clone(),
-            signal_detector,
-            draft_store,
-            dir.to_path_buf(),
-        ));
-        let (notification_tx, _) = broadcast::channel(notification_broadcast_capacity);
-        let (ws_shutdown_tx, _) = broadcast::channel(1);
-
-        let _project_svc_tmp = crate::project_registry::ProjectRegistry::open(
-            &harness_core::config::dirs::default_db_path(dir, "projects"),
-        )
-        .await?;
-        let project_svc = crate::services::project::DefaultProjectService::new(
-            _project_svc_tmp,
-            dir.to_path_buf(),
-        );
-        let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
-        let execution_svc = crate::services::execution::DefaultExecutionService::new(
-            Arc::new(server.config.clone()),
-            None,
-            None,
-            vec![],
-        );
-        drop(db_setup_guard);
-
-        Ok(AppState {
-            background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
-            core: crate::http::CoreServices {
-                server: server.clone(),
-                project_root: dir.to_path_buf(),
-                home_dir: std::env::var("HOME")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| dir.to_path_buf()),
-                tasks,
-                plan_db: None,
-                plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
-                issue_workflow_store: None,
-                project_workflow_store: None,
-                workflow_runtime_store: None,
-                project_registry: None,
-                runtime_state_store: None,
-                maintenance_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-            engines: crate::http::EngineServices {
-                skills: Arc::new(RwLock::new(harness_skills::store::SkillStore::new())),
-                rules: Arc::new(RwLock::new(harness_rules::engine::RuleEngine::new())),
-                gc_agent,
-            },
-            observability: crate::http::ObservabilityServices {
-                alerts: crate::alerting::AlertHandle::disabled(),
-                events,
-                signal_rate_limiter: std::sync::Arc::new(
-                    crate::http::rate_limit::SignalRateLimiter::new(100),
-                ),
-                password_reset_rate_limiter: std::sync::Arc::new(
-                    crate::http::rate_limit::PasswordResetRateLimiter::new(5),
-                ),
-            },
-            concurrency: crate::http::ConcurrencyServices {
-                task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-                review_task_queue: Arc::new(crate::task_queue::TaskQueue::new(&Default::default())),
-                workspace_mgr: None,
-            },
-            #[cfg(test)]
-            _db_state_guard: None,
-            runtime_hosts: Arc::new(crate::runtime_hosts::RuntimeHostManager::new()),
-            runtime_project_cache: Arc::new(
-                crate::runtime_project_cache::RuntimeProjectCacheManager::new(),
-            ),
-            postgres_catalog: crate::postgres_catalog::PostgresCatalogMonitor::unavailable(
-                crate::postgres_catalog::PostgresCatalogThresholds::from_server(
-                    &server.config.server,
-                ),
-                "postgres_pool_unavailable",
-            ),
-            isolation_availability: Default::default(),
-            runtime_state_persist_lock: tokio::sync::Mutex::new(()),
-            runtime_state_dirty: std::sync::atomic::AtomicBool::new(false),
-            runtime_circuit_breakers: std::sync::Arc::new(
-                crate::runtime_circuit_breaker::RuntimeCircuitBreakerRegistry::new(
-                    Default::default(),
-                ),
-            ),
-            notifications: crate::http::NotificationServices {
-                notification_tx,
-                notification_lagged_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                notification_lag_log_every,
-                notify_tx: None,
-                initializing: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                ws_shutdown_tx,
-            },
-            interceptors: vec![],
-            startup_statuses: vec![],
-            degraded_subsystems: vec![],
-            intake: crate::http::IntakeServices {
-                feishu_intake: None,
-                github_pollers: vec![],
-                github_poller_repos: vec![],
-                completion_callback: None,
-                token_dispatch_counters: crate::http::IntakeServices::new_token_dispatch_counters(),
-                intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
-            },
-            project_svc,
-            task_svc,
-            execution_svc,
-        })
-    }
-
-    async fn bind_ws_test_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
-        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-            Ok(listener) => Ok(Some(listener)),
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
-                Ok(None)
-            }
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    async fn connect_ws_test_client(url: &str) -> anyhow::Result<Option<TestWebSocket>> {
-        match tokio_tungstenite::connect_async(url).await {
-            Ok((ws, _)) => Ok(Some(ws)),
-            Err(tokio_tungstenite::tungstenite::Error::Io(err))
-                if err.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                tracing::warn!("skipping websocket test due to sandbox network restriction: {err}");
-                Ok(None)
-            }
-            Err(err) => Err(err.into()),
-        }
-    }
 
     #[test]
     fn is_local_origin_accepts_localhost_variants() {
@@ -776,6 +627,71 @@ mod tests {
             Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {}
             Some(Ok(other)) => anyhow::bail!("expected Close, got: {other:?}"),
             Some(Err(_)) => {} // connection reset is also acceptable
+        }
+
+        Ok(())
+    }
+
+    /// GH-1984 follow-up coverage: requests pipelined over the real socket get
+    /// exactly one response each, in arrival order, through the serialized
+    /// dispatch worker.
+    #[tokio::test]
+    async fn websocket_pipelined_requests_answered_in_order() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = HarnessConfig::default();
+        config.server.ws_heartbeat_interval_secs = 1;
+        let mut state = make_test_state_with_config(dir.path(), config).await?;
+        state.notifications.initialized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = Arc::new(state);
+
+        let listener = match bind_ws_test_listener().await? {
+            Some(listener) => listener,
+            None => return Ok(()),
+        };
+        let addr = listener.local_addr()?;
+
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(ws_handler))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/ws", port = addr.port());
+        let mut ws = match connect_ws_test_client(&url).await? {
+            Some(ws) => ws,
+            None => return Ok(()),
+        };
+
+        // Pipeline several `initialize` requests without waiting. Only the
+        // first can succeed (the initialized flag flips after the handshake);
+        // the rest are rejected — but every request must yield exactly one
+        // response, in arrival order.
+        const COUNT: u64 = 8;
+        for id in 0..COUNT {
+            let req = RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(serde_json::json!(id)),
+                method: Method::Initialize,
+            };
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&req)?.into(),
+            ))
+            .await?;
+        }
+
+        use futures::StreamExt;
+        for expected_id in 0..COUNT {
+            let msg = tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next())
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("connection closed mid-pipeline"))??;
+            let body = match msg {
+                tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+                other => anyhow::bail!("unexpected frame: {other:?}"),
+            };
+            let resp = codec::decode_response(&body)?;
+            assert_eq!(resp.id, Some(serde_json::json!(expected_id)));
         }
 
         Ok(())
