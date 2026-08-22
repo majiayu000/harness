@@ -36,6 +36,18 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
+    /// Serde representation (`rename_all = "snake_case"`) — matches the
+    /// `execution_policy.task_kind` string persisted on prompt-family rows.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::Pr => "pr",
+            Self::Prompt => "prompt",
+            Self::Review => "review",
+            Self::Planner => "planner",
+        }
+    }
+
     pub fn classify(source: Option<&str>, issue: Option<u64>, pr: Option<u64>) -> Self {
         match source {
             Some("periodic_review") => Self::Review,

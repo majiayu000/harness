@@ -514,6 +514,7 @@ mod declarative_pinning {
                     include_prompt: true,
                     active_only: true,
                     task_statuses: Vec::new(),
+                    prompt_task_kinds: Vec::new(),
                 },
                 10,
             )
@@ -533,11 +534,100 @@ mod declarative_pinning {
                     include_prompt: true,
                     active_only: false,
                     task_statuses: vec!["done".to_string()],
+                    prompt_task_kinds: Vec::new(),
                 },
                 10,
             )
             .await?;
         assert_eq!(done, vec![submission]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_filter_discriminates_prompt_family_kinds_in_sql() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("prompt-kinds.db")).await?;
+
+        let policy = |task_kind: &str| {
+            json!({
+                "submission_id": format!("kind-{task_kind}"),
+                "execution_policy": {
+                    "task_kind": task_kind,
+                    "queue_domain": "primary",
+                    "priority": 0
+                }
+            })
+        };
+        for (id, payload) in [
+            ("kind-planner", policy("planner")),
+            ("kind-review", policy("review")),
+            ("kind-prompt", json!({ "submission_id": "kind-prompt" })),
+        ] {
+            let instance = WorkflowInstance::new(
+                "prompt_task",
+                1,
+                "implementing",
+                WorkflowSubject::new("prompt", id),
+            )
+            .with_id(id)
+            .with_server_data(payload);
+            store.force_upsert_lifecycle_state_for_test(&instance).await?;
+        }
+
+        let planner_only = store
+            .list_submission_instances_page(
+                None,
+                None,
+                &WorkflowSubmissionFilter {
+                    project_id: None,
+                    source: None,
+                    repo: None,
+                    include_issue: false,
+                    include_pr: false,
+                    include_prompt: true,
+                    active_only: false,
+                    task_statuses: Vec::new(),
+                    prompt_task_kinds: vec!["planner".to_string()],
+                },
+                10,
+            )
+            .await?;
+        assert_eq!(
+            planner_only
+                .iter()
+                .map(|instance| instance.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kind-planner"],
+            "SQL must return only the planner row when prompt_task_kinds=[planner]"
+        );
+
+        let all_prompt_family = store
+            .list_submission_instances_page(
+                None,
+                None,
+                &WorkflowSubmissionFilter {
+                    project_id: None,
+                    source: None,
+                    repo: None,
+                    include_issue: false,
+                    include_pr: false,
+                    include_prompt: true,
+                    active_only: false,
+                    task_statuses: Vec::new(),
+                    prompt_task_kinds: Vec::new(),
+                },
+                10,
+            )
+            .await?;
+        assert_eq!(
+            all_prompt_family.len(),
+            3,
+            "empty prompt_task_kinds keeps the whole prompt family visible"
+        );
         Ok(())
     }
 }

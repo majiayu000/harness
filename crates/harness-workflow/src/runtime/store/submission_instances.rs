@@ -29,6 +29,11 @@ pub struct WorkflowSubmissionFilter {
     pub include_prompt: bool,
     pub active_only: bool,
     pub task_statuses: Vec<String>,
+    /// Fine-grained discrimination inside the prompt family (`include_prompt`
+    /// gate): serde snake_case `TaskKind` values read from
+    /// `data.execution_policy.task_kind` (missing policy means `prompt`).
+    /// Empty means unconstrained.
+    pub prompt_task_kinds: Vec<String>,
 }
 
 impl WorkflowRuntimeStore {
@@ -127,6 +132,14 @@ impl WorkflowRuntimeStore {
                AND (NOT $10 OR task_status NOT IN ('done', 'failed', 'cancelled'))
                AND (cardinality($11::text[]) = 0 OR task_status = ANY($11::text[]))
                AND (
+                   NOT $9
+                   OR cardinality($16::text[]) = 0
+                   OR COALESCE(
+                       data->'data'->'execution_policy'->>'task_kind',
+                       'prompt'
+                   ) = ANY($16::text[])
+               )
+               AND (
                    $5::timestamptz IS NULL
                    OR (data->>'created_at')::timestamptz < $5
                    OR (
@@ -161,6 +174,7 @@ impl WorkflowRuntimeStore {
         .bind(filter.repo.as_deref())
         .bind(limit)
         .bind(DECLARATIVE_DEFINITION_METADATA_KIND)
+        .bind(&filter.prompt_task_kinds)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
