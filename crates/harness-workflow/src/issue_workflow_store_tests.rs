@@ -157,9 +157,11 @@ async fn issue_workflow_store_reuses_legacy_mixed_case_identity() -> anyhow::Res
     )
     .fetch_optional(store.pool())
     .await?;
-    assert!(index.is_some_and(|(definition,)| definition
-        .to_ascii_lowercase()
-        .contains("lower(((data)::jsonb ->> 'repo'")));
+    assert!(index.is_some_and(|(definition,)| {
+        let definition = definition.to_ascii_lowercase();
+        definition.contains("create unique index")
+            && definition.contains("lower(((data)::jsonb ->> 'repo'")
+    }));
     Ok(())
 }
 

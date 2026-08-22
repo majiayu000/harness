@@ -579,10 +579,9 @@ fn repo_key(repo: Option<&str>) -> &str {
 }
 
 pub fn workflow_id(project_id: &str, repo: Option<&str>, issue_number: u64) -> String {
-    let repo = repo.map(str::to_ascii_lowercase);
     format!(
         "{project_id}::repo:{}::issue:{issue_number}",
-        repo_key(repo.as_deref())
+        repo_key(repo)
     )
 }
 
@@ -607,6 +606,11 @@ mod tests {
 
         assert_eq!(upper.id, lower.id);
         assert_eq!(upper.repo.as_deref(), Some("owner/repo"));
+        assert_ne!(
+            workflow_id("/tmp/p", Some("Owner/Repo"), 7),
+            workflow_id("/tmp/p", Some("owner/repo"), 7),
+            "the raw helper must remain able to address legacy identities"
+        );
     }
 
     #[test]

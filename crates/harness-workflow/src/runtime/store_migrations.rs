@@ -753,7 +753,18 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                 SELECT id,
                        ROW_NUMBER() OVER (
                            PARTITION BY provider, LOWER(repo), subject_type, subject_number
-                           ORDER BY fetched_at DESC, updated_at DESC, id DESC
+                           ORDER BY
+                               fetched_at DESC,
+                               CASE LOWER(state)
+                                   WHEN 'merged' THEN 4
+                                   WHEN 'closed' THEN 3
+                                   WHEN 'done' THEN 3
+                                   WHEN 'cancelled' THEN 2
+                                   ELSE 1
+                               END DESC,
+                               fact_hash DESC,
+                               updated_at DESC,
+                               id DESC
                        ) AS row_number
                 FROM remote_fact_snapshots
                 WHERE provider = 'github'

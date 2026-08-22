@@ -5,7 +5,7 @@ use sqlx::Postgres;
 use std::path::Path;
 
 use crate::issue_lifecycle::{
-    is_feedback_claim_placeholder, legacy_schema_for_path, workflow_id, IssueLifecycleEvent,
+    is_feedback_claim_placeholder, legacy_schema_for_path, IssueLifecycleEvent,
     IssueLifecycleEventKind, IssueLifecycleState, IssueWorkflowInstance,
     FEEDBACK_CLAIM_TASK_PREFIX,
 };
@@ -50,6 +50,33 @@ static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
                   ((data::jsonb->>'issue_number')::bigint),
                   updated_at DESC
               )",
+    },
+    Migration {
+        version: 6,
+        description: "deduplicate issue workflow repository identities",
+        sql: "WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY
+                               data::jsonb->>'project_id',
+                               LOWER(data::jsonb->>'repo'),
+                               ((data::jsonb->>'issue_number')::bigint)
+                           ORDER BY updated_at DESC, id DESC
+                       ) AS row_number
+                FROM issue_workflows
+                WHERE data::jsonb->>'repo' IS NOT NULL
+              )
+              DELETE FROM issue_workflows AS workflow
+              USING ranked
+              WHERE workflow.id = ranked.id AND ranked.row_number > 1;
+              DROP INDEX IF EXISTS idx_issue_workflows_repo_subject_ci;
+              CREATE UNIQUE INDEX idx_issue_workflows_repo_subject_ci
+              ON issue_workflows (
+                  (data::jsonb->>'project_id'),
+                  (LOWER(data::jsonb->>'repo')),
+                  ((data::jsonb->>'issue_number')::bigint)
+              )
+              WHERE data::jsonb->>'repo' IS NOT NULL",
     },
 ];
 const ISSUE_WORKFLOW_SHARED_POOL_MIGRATIONS_TABLE: &str = "issue_workflow_schema_migrations";
@@ -553,12 +580,12 @@ impl IssueWorkflowStore {
             tx.commit().await?;
             return Ok(workflow);
         }
-        let wf_id = workflow_id(project_id, repo, issue_number);
         let placeholder = IssueWorkflowInstance::new(
             project_id.to_string(),
             repo.map(str::to_string),
             issue_number,
         );
+        let wf_id = placeholder.id.clone();
         let workflow = self
             .update_issue_row_in_tx(&mut tx, &wf_id, &placeholder, repo, f)
             .await?;

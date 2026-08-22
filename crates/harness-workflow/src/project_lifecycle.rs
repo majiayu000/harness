@@ -35,6 +35,29 @@ static PROJECT_WORKFLOW_MIGRATIONS: &[Migration] = &[
                   updated_at DESC
               )",
     },
+    Migration {
+        version: 4,
+        description: "deduplicate project workflow repository identities",
+        sql: "WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY data::jsonb->>'project_id', LOWER(data::jsonb->>'repo')
+                           ORDER BY updated_at DESC, id DESC
+                       ) AS row_number
+                FROM project_workflows
+                WHERE data::jsonb->>'repo' IS NOT NULL
+              )
+              DELETE FROM project_workflows AS workflow
+              USING ranked
+              WHERE workflow.id = ranked.id AND ranked.row_number > 1;
+              DROP INDEX IF EXISTS idx_project_workflows_repo_ci;
+              CREATE UNIQUE INDEX idx_project_workflows_repo_ci
+              ON project_workflows (
+                  (data::jsonb->>'project_id'),
+                  (LOWER(data::jsonb->>'repo'))
+              )
+              WHERE data::jsonb->>'repo' IS NOT NULL",
+    },
 ];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,8 +204,7 @@ fn repo_key(repo: Option<&str>) -> &str {
 }
 
 pub fn workflow_id(project_id: &str, repo: Option<&str>) -> String {
-    let repo = repo.map(str::to_ascii_lowercase);
-    format!("{project_id}::repo:{}::project", repo_key(repo.as_deref()))
+    format!("{project_id}::repo:{}::project", repo_key(repo))
 }
 
 pub fn legacy_schema_for_path(path: &Path) -> anyhow::Result<String> {
@@ -474,9 +496,9 @@ impl ProjectWorkflowStore {
             tx.commit().await?;
             return Ok(workflow);
         }
-        let workflow_id = workflow_id(project_id, repo);
         let placeholder =
             ProjectWorkflowInstance::new(project_id.to_string(), repo.map(str::to_string));
+        let workflow_id = placeholder.id.clone();
         self.insert_placeholder(&mut tx, &workflow_id, &placeholder)
             .await?;
         let mut workflow = self
@@ -594,6 +616,11 @@ mod tests {
 
         assert_eq!(upper.id, lower.id);
         assert_eq!(upper.repo.as_deref(), Some("owner/repo"));
+        assert_ne!(
+            workflow_id("/tmp/p", Some("Owner/Repo")),
+            workflow_id("/tmp/p", Some("owner/repo")),
+            "the raw helper must remain able to address legacy identities"
+        );
     }
 
     async fn open_test_store() -> anyhow::Result<Option<ProjectWorkflowStore>> {
@@ -702,9 +729,11 @@ mod tests {
         )
         .fetch_optional(&store.pool)
         .await?;
-        assert!(index.is_some_and(|(definition,)| definition
-            .to_ascii_lowercase()
-            .contains("lower(((data)::jsonb ->> 'repo'")));
+        assert!(index.is_some_and(|(definition,)| {
+            let definition = definition.to_ascii_lowercase();
+            definition.contains("create unique index")
+                && definition.contains("lower(((data)::jsonb ->> 'repo'")
+        }));
         Ok(())
     }
 

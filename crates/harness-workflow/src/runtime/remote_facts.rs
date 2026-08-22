@@ -197,7 +197,29 @@ pub(in crate::runtime) async fn upsert_remote_fact_snapshot_tx(
                 facts = EXCLUDED.facts,
                 fetched_at = EXCLUDED.fetched_at,
                 updated_at = CURRENT_TIMESTAMP
-             WHERE remote_fact_snapshots.fetched_at <= EXCLUDED.fetched_at
+             WHERE remote_fact_snapshots.fetched_at < EXCLUDED.fetched_at
+                OR (
+                    remote_fact_snapshots.fetched_at = EXCLUDED.fetched_at
+                    AND (
+                        CASE LOWER(remote_fact_snapshots.state)
+                            WHEN 'merged' THEN 4
+                            WHEN 'closed' THEN 3
+                            WHEN 'done' THEN 3
+                            WHEN 'cancelled' THEN 2
+                            ELSE 1
+                        END,
+                        remote_fact_snapshots.fact_hash
+                    ) < (
+                        CASE LOWER(EXCLUDED.state)
+                            WHEN 'merged' THEN 4
+                            WHEN 'closed' THEN 3
+                            WHEN 'done' THEN 3
+                            WHEN 'cancelled' THEN 2
+                            ELSE 1
+                        END,
+                        EXCLUDED.fact_hash
+                    )
+                )
              RETURNING id, provider, repo, subject_type, subject_number, subject_url,
                 head_sha, state, fact_hash, facts::text, fetched_at",
     )
@@ -380,7 +402,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_store_canonicalizes_repo_before_timestamp_conflict() -> anyhow::Result<()> {
+    async fn runtime_store_canonicalizes_repo_before_competing_timestamp_conflict(
+    ) -> anyhow::Result<()> {
         if resolve_database_url(None).is_err() {
             return Ok(());
         }
@@ -404,7 +427,7 @@ mod tests {
             19,
             "open",
             json!({"state": "open"}),
-            fetched_at - chrono::Duration::seconds(1),
+            fetched_at,
         );
         let persisted = store.upsert_remote_fact_snapshot(&older).await?;
 
@@ -421,6 +444,29 @@ mod tests {
         .fetch_one(store.pool())
         .await?;
         assert_eq!(count, 1);
+
+        let open_first = RemoteFactSnapshot::new(
+            "github",
+            "Owner/Repo",
+            "pull_request",
+            20,
+            "open",
+            json!({"state": "open"}),
+            fetched_at,
+        );
+        store.upsert_remote_fact_snapshot(&open_first).await?;
+        let merged_second = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            20,
+            "merged",
+            json!({"state": "merged"}),
+            fetched_at,
+        );
+        let persisted = store.upsert_remote_fact_snapshot(&merged_second).await?;
+        assert_eq!(persisted.id, merged_second.id);
+        assert_eq!(persisted.state, "merged");
         Ok(())
     }
 
