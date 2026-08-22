@@ -67,6 +67,9 @@ pub mod trusted_proxy;
 pub(crate) mod validation_executor;
 pub mod webhook;
 pub mod websocket;
+pub(crate) mod websocket_dispatch;
+#[cfg(test)]
+pub(crate) mod websocket_test_support;
 #[cfg(test)]
 pub(crate) mod workflow_runtime_plan_issue;
 pub(crate) mod workflow_runtime_policy;
