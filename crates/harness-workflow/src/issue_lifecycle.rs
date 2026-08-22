@@ -200,6 +200,7 @@ pub struct IssueWorkflowInstance {
 impl IssueWorkflowInstance {
     pub fn new(project_id: impl Into<String>, repo: Option<String>, issue_number: u64) -> Self {
         let project_id = project_id.into();
+        let repo = repo.map(|repo| repo.to_ascii_lowercase());
         let id = workflow_id(&project_id, repo.as_deref(), issue_number);
         let now = Utc::now();
         Self {
@@ -578,9 +579,10 @@ fn repo_key(repo: Option<&str>) -> &str {
 }
 
 pub fn workflow_id(project_id: &str, repo: Option<&str>, issue_number: u64) -> String {
+    let repo = repo.map(str::to_ascii_lowercase);
     format!(
         "{project_id}::repo:{}::issue:{issue_number}",
-        repo_key(repo)
+        repo_key(repo.as_deref())
     )
 }
 
@@ -597,6 +599,15 @@ pub fn legacy_schema_for_path(path: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_identity_canonicalizes_repo_case() {
+        let upper = IssueWorkflowInstance::new("/tmp/p", Some("Owner/Repo".to_string()), 7);
+        let lower = IssueWorkflowInstance::new("/tmp/p", Some("owner/repo".to_string()), 7);
+
+        assert_eq!(upper.id, lower.id);
+        assert_eq!(upper.repo.as_deref(), Some("owner/repo"));
+    }
 
     #[test]
     fn human_merge_approved_transitions_ready_to_done() {

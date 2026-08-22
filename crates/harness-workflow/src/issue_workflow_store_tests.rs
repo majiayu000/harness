@@ -119,7 +119,7 @@ async fn issue_workflow_store_reuses_legacy_mixed_case_identity() -> anyhow::Res
         return Ok(());
     };
     let project_id = "/tmp/legacy-mixed-case-issue";
-    let legacy = store
+    let mut legacy = store
         .record_issue_scheduled(
             project_id,
             Some("Owner/Repo"),
@@ -129,6 +129,13 @@ async fn issue_workflow_store_reuses_legacy_mixed_case_identity() -> anyhow::Res
             false,
         )
         .await?;
+    sqlx::query("DELETE FROM issue_workflows WHERE id = $1")
+        .bind(&legacy.id)
+        .execute(store.pool())
+        .await?;
+    legacy.id = format!("{project_id}::repo:Owner/Repo::issue:77");
+    legacy.repo = Some("Owner/Repo".to_string());
+    store.upsert(&legacy).await?;
     let updated = store
         .record_implement_started(project_id, Some("owner/repo"), 77, "legacy-task")
         .await?;
@@ -153,6 +160,39 @@ async fn issue_workflow_store_reuses_legacy_mixed_case_identity() -> anyhow::Res
     assert!(index.is_some_and(|(definition,)| definition
         .to_ascii_lowercase()
         .contains("lower(((data)::jsonb ->> 'repo'")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_workflow_store_serializes_concurrent_repo_case_variants() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/concurrent-mixed-case-issue";
+    let upper = store.record_issue_scheduled(
+        project_id,
+        Some("Owner/Repo"),
+        78,
+        "shared-task",
+        &[],
+        false,
+    );
+    let lower = store.record_issue_scheduled(
+        project_id,
+        Some("owner/repo"),
+        78,
+        "shared-task",
+        &[],
+        false,
+    );
+    let (upper, lower) = tokio::join!(upper, lower);
+    let upper = upper?;
+    let lower = lower?;
+
+    assert_eq!(upper.id, lower.id);
+    assert_eq!(upper.repo.as_deref(), Some("owner/repo"));
+    assert_eq!(lower.repo.as_deref(), Some("owner/repo"));
+    assert_eq!(store.row_count().await?, 1);
     Ok(())
 }
 

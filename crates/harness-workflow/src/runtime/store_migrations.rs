@@ -746,4 +746,24 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
                   updated_at DESC
               )",
     },
+    Migration {
+        version: 31,
+        description: "canonicalize GitHub remote fact repository identity",
+        sql: "WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY provider, LOWER(repo), subject_type, subject_number
+                           ORDER BY fetched_at DESC, updated_at DESC, id DESC
+                       ) AS row_number
+                FROM remote_fact_snapshots
+                WHERE provider = 'github'
+              )
+              DELETE FROM remote_fact_snapshots AS snapshot
+              USING ranked
+              WHERE snapshot.id = ranked.id
+                AND ranked.row_number > 1;
+              UPDATE remote_fact_snapshots
+              SET repo = LOWER(repo), updated_at = CURRENT_TIMESTAMP
+              WHERE provider = 'github' AND repo <> LOWER(repo)",
+    },
 ];

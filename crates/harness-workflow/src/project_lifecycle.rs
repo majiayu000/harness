@@ -118,6 +118,7 @@ pub struct ProjectWorkflowInstance {
 impl ProjectWorkflowInstance {
     pub fn new(project_id: impl Into<String>, repo: Option<String>) -> Self {
         let project_id = project_id.into();
+        let repo = repo.map(|repo| repo.to_ascii_lowercase());
         let now = Utc::now();
         Self {
             id: workflow_id(&project_id, repo.as_deref()),
@@ -180,7 +181,8 @@ fn repo_key(repo: Option<&str>) -> &str {
 }
 
 pub fn workflow_id(project_id: &str, repo: Option<&str>) -> String {
-    format!("{project_id}::repo:{}::project", repo_key(repo))
+    let repo = repo.map(str::to_ascii_lowercase);
+    format!("{project_id}::repo:{}::project", repo_key(repo.as_deref()))
 }
 
 pub fn legacy_schema_for_path(path: &Path) -> anyhow::Result<String> {
@@ -585,6 +587,15 @@ mod tests {
     use super::*;
     use harness_core::db::resolve_database_url;
 
+    #[test]
+    fn workflow_identity_canonicalizes_repo_case() {
+        let upper = ProjectWorkflowInstance::new("/tmp/p", Some("Owner/Repo".to_string()));
+        let lower = ProjectWorkflowInstance::new("/tmp/p", Some("owner/repo".to_string()));
+
+        assert_eq!(upper.id, lower.id);
+        assert_eq!(upper.repo.as_deref(), Some("owner/repo"));
+    }
+
     async fn open_test_store() -> anyhow::Result<Option<ProjectWorkflowStore>> {
         if resolve_database_url(None).is_err() {
             return Ok(None);
@@ -662,9 +673,16 @@ mod tests {
             return Ok(());
         };
         let project_id = "/tmp/legacy-mixed-case-project";
-        let legacy = store
+        let mut legacy = store
             .record_poll_started(project_id, Some("Owner/Repo"))
             .await?;
+        sqlx::query("DELETE FROM project_workflows WHERE id = $1")
+            .bind(&legacy.id)
+            .execute(&store.pool)
+            .await?;
+        legacy.id = format!("{project_id}::repo:Owner/Repo::project");
+        legacy.repo = Some("Owner/Repo".to_string());
+        store.upsert(&legacy).await?;
         let updated = store.record_idle(project_id, Some("owner/repo")).await?;
 
         assert_eq!(updated.id, legacy.id);
@@ -687,6 +705,26 @@ mod tests {
         assert!(index.is_some_and(|(definition,)| definition
             .to_ascii_lowercase()
             .contains("lower(((data)::jsonb ->> 'repo'")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_workflow_store_serializes_concurrent_repo_case_variants() -> anyhow::Result<()>
+    {
+        let Some(store) = open_test_store().await? else {
+            return Ok(());
+        };
+        let project_id = "/tmp/concurrent-mixed-case-project";
+        let upper = store.record_poll_started(project_id, Some("Owner/Repo"));
+        let lower = store.record_poll_started(project_id, Some("owner/repo"));
+        let (upper, lower) = tokio::join!(upper, lower);
+        let upper = upper?;
+        let lower = lower?;
+
+        assert_eq!(upper.id, lower.id);
+        assert_eq!(upper.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(lower.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(store.row_count().await?, 1);
         Ok(())
     }
 }
