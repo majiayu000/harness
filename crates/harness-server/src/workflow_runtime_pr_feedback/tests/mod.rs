@@ -600,15 +600,13 @@ async fn pr_feedback_without_issue_uses_bound_workflow_for_local_review() -> any
 
 #[tokio::test]
 async fn concurrent_mixed_case_pr_requests_share_one_canonical_workflow() -> anyhow::Result<()> {
-    let Ok(database_url) = resolve_database_url(None) else {
+    if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
-    };
+    }
+    let database_url = crate::test_helpers::test_database_url()?;
     let dir = tempfile::tempdir()?;
     let store =
-        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
-            Ok(store) => store,
-            Err(_) => return Ok(()),
-        };
+        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
     let project_root = dir.path().join("project");
     std::fs::create_dir(&project_root)?;
     let task_id = TaskId::from_str("mixed-case-concurrent-pr");

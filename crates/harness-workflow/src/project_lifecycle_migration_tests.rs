@@ -10,7 +10,8 @@ fn isolated_database_url() -> anyhow::Result<Option<String>> {
 }
 
 #[tokio::test]
-async fn migration_deduplicates_project_repo_case_and_enforces_uniqueness() -> anyhow::Result<()> {
+async fn migration_rejects_project_repo_case_collision_and_enforces_uniqueness(
+) -> anyhow::Result<()> {
     let Some(database_url) = isolated_database_url()? else {
         return Ok(());
     };
@@ -29,20 +30,33 @@ async fn migration_deduplicates_project_repo_case_and_enforces_uniqueness() -> a
     legacy.id = workflow_id(project_id, Some("Owner/Repo"));
     legacy.repo = Some("Owner/Repo".to_string());
     store.upsert(&legacy).await?;
-    sqlx::query(
-        "UPDATE project_workflows
-         SET updated_at = CASE WHEN id = $1
-             THEN CURRENT_TIMESTAMP
-             ELSE CURRENT_TIMESTAMP - INTERVAL '1 minute'
-         END",
-    )
-    .bind(&legacy.id)
-    .execute(&store.pool)
-    .await?;
     sqlx::query("DELETE FROM schema_migrations WHERE version = 4")
         .execute(&store.pool)
         .await?;
     drop(store);
+
+    let error = match ProjectWorkflowStore::open_with_database_url(&store_path, Some(&database_url))
+        .await
+    {
+        Ok(_) => anyhow::bail!("migration must not discard a case-colliding workflow"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}")
+        .contains("project_workflows contains case-colliding repository identities"));
+    let context = harness_core::db::PgStoreContext::from_legacy_path_schema(
+        &store_path,
+        Some(&database_url),
+    )?;
+    let pool = context.open_pool().await?;
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM project_workflows")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 2, "failed migration must preserve both workflows");
+    sqlx::query("DELETE FROM project_workflows WHERE id = $1")
+        .bind(&canonical.id)
+        .execute(&pool)
+        .await?;
+    drop(pool);
 
     let store =
         ProjectWorkflowStore::open_with_database_url(&store_path, Some(&database_url)).await?;
@@ -50,7 +64,7 @@ async fn migration_deduplicates_project_repo_case_and_enforces_uniqueness() -> a
     let migrated = store
         .get_by_project(project_id, Some("owner/repo"))
         .await?
-        .expect("migration should retain one logical project workflow");
+        .expect("resolved migration should retain the selected project workflow");
     assert_eq!(migrated.id, legacy.id);
 
     let mut duplicate = canonical;

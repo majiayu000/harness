@@ -37,19 +37,18 @@ static PROJECT_WORKFLOW_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 4,
-        description: "deduplicate project workflow repository identities",
-        sql: "WITH ranked AS (
-                SELECT id,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY data::jsonb->>'project_id', LOWER(data::jsonb->>'repo')
-                           ORDER BY updated_at DESC, id DESC
-                       ) AS row_number
-                FROM project_workflows
-                WHERE data::jsonb->>'repo' IS NOT NULL
-              )
-              DELETE FROM project_workflows AS workflow
-              USING ranked
-              WHERE workflow.id = ranked.id AND ranked.row_number > 1;
+        description: "enforce unique project workflow repository identities",
+        sql: "DO $$
+              BEGIN
+                IF EXISTS (
+                  SELECT 1 FROM project_workflows
+                  WHERE data::jsonb->>'repo' IS NOT NULL
+                  GROUP BY data::jsonb->>'project_id', LOWER(data::jsonb->>'repo')
+                  HAVING COUNT(*) > 1
+                ) THEN
+                  RAISE EXCEPTION 'project_workflows contains case-colliding repository identities; resolve duplicates before migration';
+                END IF;
+              END $$;
               DROP INDEX IF EXISTS idx_project_workflows_repo_ci;
               CREATE UNIQUE INDEX idx_project_workflows_repo_ci
               ON project_workflows (

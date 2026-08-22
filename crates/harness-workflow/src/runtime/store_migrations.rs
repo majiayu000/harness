@@ -1,5 +1,6 @@
 use harness_core::db::Migration;
 
+mod github_identity;
 mod remote_lease_proof;
 
 pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
@@ -776,5 +777,10 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
               UPDATE remote_fact_snapshots
               SET repo = LOWER(repo), updated_at = CURRENT_TIMESTAMP
               WHERE provider = 'github' AND repo <> LOWER(repo)",
+    },
+    Migration {
+        version: 32,
+        description: "enforce unique runtime GitHub issue identities",
+        sql: github_identity::SQL,
     },
 ];

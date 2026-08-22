@@ -53,22 +53,21 @@ static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 6,
-        description: "deduplicate issue workflow repository identities",
-        sql: "WITH ranked AS (
-                SELECT id,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY
-                               data::jsonb->>'project_id',
-                               LOWER(data::jsonb->>'repo'),
-                               ((data::jsonb->>'issue_number')::bigint)
-                           ORDER BY updated_at DESC, id DESC
-                       ) AS row_number
-                FROM issue_workflows
-                WHERE data::jsonb->>'repo' IS NOT NULL
-              )
-              DELETE FROM issue_workflows AS workflow
-              USING ranked
-              WHERE workflow.id = ranked.id AND ranked.row_number > 1;
+        description: "enforce unique issue workflow repository identities",
+        sql: "DO $$
+              BEGIN
+                IF EXISTS (
+                  SELECT 1 FROM issue_workflows
+                  WHERE data::jsonb->>'repo' IS NOT NULL
+                  GROUP BY
+                    data::jsonb->>'project_id',
+                    LOWER(data::jsonb->>'repo'),
+                    ((data::jsonb->>'issue_number')::bigint)
+                  HAVING COUNT(*) > 1
+                ) THEN
+                  RAISE EXCEPTION 'issue_workflows contains case-colliding repository identities; resolve duplicates before migration';
+                END IF;
+              END $$;
               DROP INDEX IF EXISTS idx_issue_workflows_repo_subject_ci;
               CREATE UNIQUE INDEX idx_issue_workflows_repo_subject_ci
               ON issue_workflows (
