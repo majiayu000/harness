@@ -161,6 +161,7 @@ pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
 
     let weak_state = Arc::downgrade(state);
     let mut shutdown_rx = state.notifications.ws_shutdown_tx.subscribe();
+    let handle = state.background_loops.register_loop("runtime_job_workers");
     tokio::spawn(async move {
         let mut workers = tokio::task::JoinSet::new();
         let active_worker_state_clones = Arc::new(AtomicUsize::new(0));
@@ -175,7 +176,8 @@ pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                 "workflow runtime job workers",
             ) {
                 Ok(config) => config,
-                Err(_) => {
+                Err(error) => {
+                    handle.tick_failed(&format!("workflow config load failed: {error}"));
                     drop(state);
                     if runtime_worker_sleep_or_shutdown(
                         std::time::Duration::from_secs(RUNTIME_WORKFLOW_CONFIG_RETRY_SECS),
@@ -215,6 +217,8 @@ pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                 &mut next_worker_id,
             );
             drop(state);
+            handle.tick_ok();
+            handle.set_interval(interval.as_secs());
             if runtime_worker_sleep_or_shutdown(interval, &mut shutdown_rx, &mut workers).await {
                 break;
             }

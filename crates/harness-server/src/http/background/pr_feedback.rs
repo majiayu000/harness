@@ -353,6 +353,7 @@ pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) 
     }
 
     let weak_state = Arc::downgrade(state);
+    let handle = state.background_loops.register_loop("pr_feedback_sweeper");
     tokio::spawn(async move {
         let mut remote_refresh_cursor = 0;
         loop {
@@ -365,7 +366,8 @@ pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) 
                 "workflow runtime PR feedback sweeper",
             ) {
                 Ok(config) => config,
-                Err(_) => {
+                Err(error) => {
+                    handle.tick_failed(&format!("workflow config load failed: {error}"));
                     tokio::time::sleep(std::time::Duration::from_secs(
                         RUNTIME_WORKFLOW_CONFIG_RETRY_SECS,
                     ))
@@ -375,6 +377,7 @@ pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) 
             };
             let interval =
                 std::time::Duration::from_secs(workflow_cfg.pr_feedback.sweep_interval_secs.max(1));
+            handle.set_interval(interval.as_secs());
             match run_runtime_pr_feedback_sweep_tick_with_cursor(
                 &state,
                 128,
@@ -382,19 +385,22 @@ pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) 
             )
             .await
             {
-                Ok(tick) if tick.touched_anything() => {
-                    tracing::info!(
-                        requested = tick.requested,
-                        active_command_exists = tick.active_command_exists,
-                        remote_request_attempts = tick.remote_request_attempts,
-                        skipped = tick.skipped,
-                        rejected = tick.rejected,
-                        "workflow runtime PR feedback sweeper tick complete"
-                    );
+                Ok(tick) => {
+                    if tick.touched_anything() {
+                        tracing::info!(
+                            requested = tick.requested,
+                            active_command_exists = tick.active_command_exists,
+                            remote_request_attempts = tick.remote_request_attempts,
+                            skipped = tick.skipped,
+                            rejected = tick.rejected,
+                            "workflow runtime PR feedback sweeper tick complete"
+                        );
+                    }
+                    handle.tick_ok();
                 }
-                Ok(_) => {}
                 Err(error) => {
                     tracing::warn!("workflow runtime PR feedback sweeper tick failed: {error}");
+                    handle.tick_failed(&error.to_string());
                 }
             }
             tokio::time::sleep(interval).await;

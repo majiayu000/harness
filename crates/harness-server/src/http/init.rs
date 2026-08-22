@@ -178,9 +178,20 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     // completion callback.
     // Depends on: engines.gc_agent + engines.events (quality trigger),
     //             registry.project_registry (unused directly but ordering is stable).
-    let intake =
-        builders::intake::build_intake(&server, &storage, &engines, &registry, &project_root, &dir)
-            .await?;
+    // The loop-health registry is created here so the memory-pressure monitor
+    // can register itself during this phase and still land in AppState below
+    // (GH-1981).
+    let background_loops = Arc::new(crate::http::background::BackgroundLoopHealth::new());
+    let intake = builders::intake::build_intake(
+        &server,
+        &storage,
+        &engines,
+        &registry,
+        &project_root,
+        &dir,
+        &background_loops,
+    )
+    .await?;
     // Validate bindings against the sources that were actually registered for
     // poll_tick. Configured webhook-only sources and disabled pollers cannot
     // silently pass startup validation (GH-1656, B-002).
@@ -260,7 +271,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     };
 
     Ok(AppState {
-        background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
+        background_loops,
         core: CoreServices {
             server,
             project_root,

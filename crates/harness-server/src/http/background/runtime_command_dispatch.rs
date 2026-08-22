@@ -536,6 +536,9 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
     let mut starvation = crate::alerting::producers::PoolStarvationTracker::new(
         state.core.server.config.alerting.pool_starvation_ticks,
     );
+    let handle = state
+        .background_loops
+        .register_loop("runtime_command_dispatch");
     tokio::spawn(async move {
         loop {
             let state = match weak_state.upgrade() {
@@ -547,7 +550,8 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
                 "workflow runtime command dispatcher",
             ) {
                 Ok(config) => config,
-                Err(_) => {
+                Err(error) => {
+                    handle.tick_failed(&format!("workflow config load failed: {error}"));
                     tokio::time::sleep(std::time::Duration::from_secs(
                         RUNTIME_WORKFLOW_CONFIG_RETRY_SECS,
                     ))
@@ -557,6 +561,7 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
             };
             let policy = workflow_cfg.runtime_dispatch;
             let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
+            handle.set_interval(interval.as_secs());
             let inherited_profile = match runtime_default_profile_for_project(
                 &state,
                 &state.core.project_root,
@@ -569,6 +574,9 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
                     tracing::warn!(
                             "workflow runtime command dispatcher could not resolve default runtime profile: {error}"
                         );
+                    handle.tick_failed(&format!(
+                        "default runtime profile resolution failed: {error}"
+                    ));
                     tokio::time::sleep(interval).await;
                     continue;
                 }
@@ -583,6 +591,7 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
                     tracing::warn!(
                         "workflow runtime command dispatcher could not build runtime profile selector: {error}"
                     );
+                    handle.tick_failed(&format!("runtime profile selector build failed: {error}"));
                     tokio::time::sleep(interval).await;
                     continue;
                 }
@@ -607,9 +616,11 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
                     if let Some(empty_ticks) = starvation.observe_tick(dispatched_any) {
                         probe_pool_starvation(&state, empty_ticks).await;
                     }
+                    handle.tick_ok();
                 }
                 Err(e) => {
                     tracing::warn!("workflow runtime command dispatcher tick failed: {e}");
+                    handle.tick_failed(&e.to_string());
                 }
             }
             tokio::time::sleep(interval).await;
