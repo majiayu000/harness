@@ -289,8 +289,25 @@ impl WorkflowRuntimeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::db::resolve_database_url;
+    use harness_core::db::resolve_test_database_url;
     use serde_json::json;
+
+    async fn remote_fact_test_store() -> anyhow::Result<Option<WorkflowRuntimeStore>> {
+        let configured = match std::env::var("HARNESS_DATABASE_URL") {
+            Ok(configured) => configured,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let database_url = resolve_test_database_url(Some(&configured))?;
+        let dir = tempfile::tempdir()?;
+        Ok(Some(
+            WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime.db"),
+                Some(&database_url),
+            )
+            .await?,
+        ))
+    }
 
     #[test]
     fn stable_remote_fact_hash_sorts_object_keys() {
@@ -353,12 +370,9 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_store_upserts_remote_fact_snapshot_by_subject() -> anyhow::Result<()> {
-        if resolve_database_url(None).is_err() {
+        let Some(store) = remote_fact_test_store().await? else {
             return Ok(());
-        }
-
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        };
         let first = RemoteFactSnapshot::new(
             "github",
             "owner/repo",
@@ -396,12 +410,9 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_store_resolves_legacy_github_repo_case() -> anyhow::Result<()> {
-        if resolve_database_url(None).is_err() {
+        let Some(store) = remote_fact_test_store().await? else {
             return Ok(());
-        }
-
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        };
         let snapshot = RemoteFactSnapshot::new(
             "github",
             "Owner/Repo",
@@ -427,11 +438,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_store_canonicalizes_repo_before_competing_timestamp_conflict(
     ) -> anyhow::Result<()> {
-        if resolve_database_url(None).is_err() {
+        let Some(store) = remote_fact_test_store().await? else {
             return Ok(());
-        }
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        };
         let fetched_at = Utc::now();
         let newer = RemoteFactSnapshot::new(
             "github",
@@ -495,11 +504,9 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_store_does_not_overwrite_newer_remote_fact() -> anyhow::Result<()> {
-        if resolve_database_url(None).is_err() {
+        let Some(store) = remote_fact_test_store().await? else {
             return Ok(());
-        }
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        };
         let fetched_at = Utc::now();
         let newer = RemoteFactSnapshot::new(
             "github",

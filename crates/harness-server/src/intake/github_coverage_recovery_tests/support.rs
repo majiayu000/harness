@@ -11,13 +11,13 @@ pub(super) const REPO: &str = "owner/repo";
 
 pub(super) async fn open_runtime_store(
 ) -> anyhow::Result<Option<(tempfile::TempDir, WorkflowRuntimeStore)>> {
-    if !crate::test_helpers::db_tests_enabled().await {
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
         return Ok(None);
-    }
+    };
     let dir = crate::test_helpers::tempdir_in_home("harness-test-coverage-recovery-")?;
     let store = WorkflowRuntimeStore::open_with_database_url(
         &dir.path().join("runtime"),
-        Some(&crate::test_helpers::test_database_url()?),
+        Some(&database_url),
     )
     .await?;
     Ok(Some((dir, store)))

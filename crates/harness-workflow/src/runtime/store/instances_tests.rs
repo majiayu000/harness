@@ -1,14 +1,21 @@
 use super::*;
 use crate::runtime::model::WorkflowSubject;
-use harness_core::db::resolve_database_url;
+use harness_core::db::resolve_test_database_url;
 
 async fn test_store() -> anyhow::Result<Option<WorkflowRuntimeStore>> {
-    if resolve_database_url(None).is_err() {
-        return Ok(None);
-    }
+    let configured = match std::env::var("HARNESS_DATABASE_URL") {
+        Ok(configured) => configured,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let database_url = resolve_test_database_url(Some(&configured))?;
     let dir = tempfile::tempdir()?;
     Ok(Some(
-        WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?,
+        WorkflowRuntimeStore::open_with_database_url(
+            &dir.path().join("workflow_runtime.db"),
+            Some(&database_url),
+        )
+        .await?,
     ))
 }
 

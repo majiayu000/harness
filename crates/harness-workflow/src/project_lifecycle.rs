@@ -610,7 +610,7 @@ mod migration_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::db::resolve_database_url;
+    use harness_core::db::resolve_test_database_url;
 
     #[test]
     fn workflow_identity_canonicalizes_repo_case() {
@@ -627,17 +627,20 @@ mod tests {
     }
 
     async fn open_test_store() -> anyhow::Result<Option<ProjectWorkflowStore>> {
-        if resolve_database_url(None).is_err() {
-            return Ok(None);
-        }
+        let configured = match std::env::var("HARNESS_DATABASE_URL") {
+            Ok(configured) => configured,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let database_url = resolve_test_database_url(Some(&configured))?;
         let dir = tempfile::tempdir()?;
-        match ProjectWorkflowStore::open(&dir.path().join("project_workflows.db")).await {
-            Ok(store) => Ok(Some(store)),
-            Err(e) => {
-                tracing::warn!("project workflow store test skipped: {e}");
-                Ok(None)
-            }
-        }
+        Ok(Some(
+            ProjectWorkflowStore::open_with_database_url(
+                &dir.path().join("project_workflows.db"),
+                Some(&database_url),
+            )
+            .await?,
+        ))
     }
 
     #[tokio::test]
