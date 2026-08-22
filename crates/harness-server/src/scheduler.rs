@@ -46,6 +46,9 @@ impl Scheduler {
     }
 
     pub fn start(self, state: Arc<AppState>) {
+        let handle = state
+            .background_loops
+            .register_loop_with_interval("scheduler_gc", self.gc_interval.as_secs());
         let gc_state = state.clone();
         let gc_interval = self.gc_interval;
         tokio::spawn(async move {
@@ -53,21 +56,32 @@ impl Scheduler {
                 sleep(gc_interval).await;
                 tracing::info!("scheduler: triggering periodic GC run");
                 crate::handlers::gc::gc_run(&gc_state, None, None).await;
+                handle.tick_ok();
             }
         });
 
+        let health_handle = state
+            .background_loops
+            .register_loop_with_interval("scheduler_health", self.health_interval.as_secs());
         let health_state = state.clone();
         let health_interval = self.health_interval;
         tokio::spawn(async move {
             loop {
                 sleep(health_interval).await;
-                if let Err(err) = Self::run_health_tick(&health_state).await {
-                    tracing::error!("scheduler: periodic health tick failed: {err}");
+                match Self::run_health_tick(&health_state).await {
+                    Ok(()) => health_handle.tick_ok(),
+                    Err(err) => {
+                        tracing::error!("scheduler: periodic health tick failed: {err}");
+                        health_handle.tick_failed(&err.to_string());
+                    }
                 }
             }
         });
 
         // Periodic disk workspace GC: removes on-disk worktrees for closed issues/PRs.
+        let wgc_handle = state
+            .background_loops
+            .register_loop_with_interval("workspace_disk_gc", self.workspace_gc_interval.as_secs());
         let wgc_state = state.clone();
         let wgc_interval = self.workspace_gc_interval;
         tokio::spawn(async move {
@@ -97,6 +111,7 @@ impl Scheduler {
                         "scheduler: workspace disk GC complete"
                     );
                 }
+                wgc_handle.tick_ok();
                 sleep(wgc_interval).await;
             }
         });

@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::http::background::LoopHandle;
+
 /// Start a background task that sets the returned flag to `true` whenever
 /// available system memory falls below `threshold_mb` MB, and `false` when
 /// it recovers.  Sampling occurs every `poll_secs` seconds (clamped to ≥ 1).
@@ -16,9 +18,37 @@ pub fn start(threshold_mb: u64, poll_secs: u64) -> Arc<AtomicBool> {
     start_with_sampler(threshold_mb, poll_secs, sample_available_mb)
 }
 
+/// Like [`start`] but reports liveness into the loop-health registry so the
+/// operator monitor flags the monitor if it dies (GH-1981). The first sample
+/// is taken immediately, so the loop is never falsely stale at startup.
+pub(crate) fn start_registered(
+    handle: LoopHandle,
+    threshold_mb: u64,
+    poll_secs: u64,
+) -> Arc<AtomicBool> {
+    start_with_sampler_and_health(
+        threshold_mb,
+        poll_secs.max(1),
+        Some(handle),
+        sample_available_mb,
+    )
+}
+
 /// Like [`start`] but accepts a custom sampler that returns available memory
 /// in megabytes.  Intended for unit tests that must not call real system APIs.
 pub fn start_with_sampler<F>(threshold_mb: u64, poll_secs: u64, sampler: F) -> Arc<AtomicBool>
+where
+    F: Fn() -> u64 + Send + 'static,
+{
+    start_with_sampler_and_health(threshold_mb, poll_secs, None, sampler)
+}
+
+fn start_with_sampler_and_health<F>(
+    threshold_mb: u64,
+    poll_secs: u64,
+    health: Option<LoopHandle>,
+    sampler: F,
+) -> Arc<AtomicBool>
 where
     F: Fn() -> u64 + Send + 'static,
 {
@@ -37,6 +67,9 @@ where
                     threshold_mb,
                     "memory pressure: available memory below threshold; new tasks will be rejected"
                 );
+            }
+            if let Some(handle) = &health {
+                handle.tick_ok();
             }
             tokio::time::sleep(interval).await;
         }
