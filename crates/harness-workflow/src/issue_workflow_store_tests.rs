@@ -172,6 +172,38 @@ async fn issue_workflow_store_reuses_legacy_mixed_case_identity() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn issue_workflow_backfill_skips_case_equivalent_identity() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/backfill-mixed-case-issue";
+    let canonical = store
+        .record_issue_scheduled(
+            project_id,
+            Some("owner/repo"),
+            79,
+            "canonical-task",
+            &[],
+            false,
+        )
+        .await?;
+    let mut legacy = canonical.clone();
+    legacy.id = format!("{project_id}::repo:Owner/Repo::issue:79");
+    legacy.repo = Some("Owner/Repo".to_string());
+
+    assert!(!store.insert_if_absent(&legacy).await?);
+    assert_eq!(store.row_count().await?, 1);
+    assert_eq!(
+        store
+            .get_by_issue(project_id, Some("Owner/Repo"), 79)
+            .await?
+            .map(|workflow| workflow.id),
+        Some(canonical.id)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn issue_workflow_store_serializes_concurrent_repo_case_variants() -> anyhow::Result<()> {
     let Some(store) = open_test_store().await? else {
         return Ok(());

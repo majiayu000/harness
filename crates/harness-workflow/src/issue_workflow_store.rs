@@ -195,6 +195,27 @@ impl IssueWorkflowStore {
     }
 
     pub async fn insert_if_absent(&self, workflow: &IssueWorkflowInstance) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        lock_issue_identity(
+            &mut tx,
+            &workflow.project_id,
+            workflow.repo.as_deref(),
+            workflow.issue_number,
+        )
+        .await?;
+        if self
+            .load_for_update_by_issue(
+                &mut tx,
+                &workflow.project_id,
+                workflow.repo.as_deref(),
+                workflow.issue_number,
+            )
+            .await?
+            .is_some()
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
         let data = serde_json::to_string(workflow)?;
         let result = sqlx::query(
             "INSERT INTO issue_workflows (id, data) VALUES ($1, $2)
@@ -202,8 +223,9 @@ impl IssueWorkflowStore {
         )
         .bind(&workflow.id)
         .bind(&data)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
