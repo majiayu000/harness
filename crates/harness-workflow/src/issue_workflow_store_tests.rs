@@ -600,7 +600,7 @@ async fn issue_workflow_store_reports_illegal_transition() -> anyhow::Result<()>
         .record_pr_merged(project, Some("owner/repo"), 123, None)
         .await?;
     let error = store
-        .record_implement_started(project, Some("owner/repo"), 23, "late-task")
+        .record_implement_started(project, Some("owner/repo"), 23, "task-1")
         .await
         .expect_err("terminal transition must reach the caller");
     assert!(error.to_string().contains("transition_not_allowed"));

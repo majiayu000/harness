@@ -48,6 +48,7 @@ WHERE definition_id = 'github_issue_pr'
   AND data->'data'->>'repo' IS NOT NULL
   AND data->'data'->>'issue_number' IS NOT NULL;
 
+DROP INDEX IF EXISTS idx_workflow_instances_project_repo_pr_only_ci;
 CREATE UNIQUE INDEX idx_workflow_instances_project_repo_pr_only_ci
 ON workflow_instances (
   definition_id,
