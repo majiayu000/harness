@@ -5,7 +5,7 @@ use sqlx::Postgres;
 use std::path::Path;
 
 use crate::issue_lifecycle::{
-    is_feedback_claim_placeholder, legacy_schema_for_path, workflow_id, IssueLifecycleEvent,
+    is_feedback_claim_placeholder, legacy_schema_for_path, IssueLifecycleEvent,
     IssueLifecycleEventKind, IssueLifecycleState, IssueWorkflowInstance,
     FEEDBACK_CLAIM_TASK_PREFIX,
 };
@@ -40,6 +40,43 @@ static ISSUE_WORKFLOW_MIGRATIONS: &[Migration] = &[
               ON issue_workflows (((data::jsonb->>'state')), updated_at DESC)
               WHERE data::jsonb->>'pr_number' IS NOT NULL",
     },
+    Migration {
+        version: 5,
+        description: "index case-insensitive GitHub issue workflow lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_issue_workflows_repo_subject_ci
+              ON issue_workflows (
+                  (data::jsonb->>'project_id'),
+                  (LOWER(data::jsonb->>'repo')),
+                  ((data::jsonb->>'issue_number')::bigint),
+                  updated_at DESC
+              )",
+    },
+    Migration {
+        version: 6,
+        description: "enforce unique issue workflow repository identities",
+        sql: "DO $$
+              BEGIN
+                IF EXISTS (
+                  SELECT 1 FROM issue_workflows
+                  WHERE data::jsonb->>'repo' IS NOT NULL
+                  GROUP BY
+                    data::jsonb->>'project_id',
+                    LOWER(data::jsonb->>'repo'),
+                    ((data::jsonb->>'issue_number')::bigint)
+                  HAVING COUNT(*) > 1
+                ) THEN
+                  RAISE EXCEPTION 'issue_workflows contains case-colliding repository identities; resolve duplicates before migration';
+                END IF;
+              END $$;
+              DROP INDEX IF EXISTS idx_issue_workflows_repo_subject_ci;
+              CREATE UNIQUE INDEX idx_issue_workflows_repo_subject_ci
+              ON issue_workflows (
+                  (data::jsonb->>'project_id'),
+                  (LOWER(data::jsonb->>'repo')),
+                  ((data::jsonb->>'issue_number')::bigint)
+              )
+              WHERE data::jsonb->>'repo' IS NOT NULL",
+    },
 ];
 const ISSUE_WORKFLOW_SHARED_POOL_MIGRATIONS_TABLE: &str = "issue_workflow_schema_migrations";
 
@@ -65,6 +102,7 @@ where
 mod maintenance;
 mod merge_approval;
 mod remote_facts;
+mod subject_lookup;
 pub use merge_approval::IssueMergeApprovalOutcome;
 
 pub struct IssueWorkflowStore {
@@ -157,6 +195,27 @@ impl IssueWorkflowStore {
     }
 
     pub async fn insert_if_absent(&self, workflow: &IssueWorkflowInstance) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        lock_issue_identity(
+            &mut tx,
+            &workflow.project_id,
+            workflow.repo.as_deref(),
+            workflow.issue_number,
+        )
+        .await?;
+        if self
+            .load_for_update_by_issue(
+                &mut tx,
+                &workflow.project_id,
+                workflow.repo.as_deref(),
+                workflow.issue_number,
+            )
+            .await?
+            .is_some()
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
         let data = serde_json::to_string(workflow)?;
         let result = sqlx::query(
             "INSERT INTO issue_workflows (id, data) VALUES ($1, $2)
@@ -164,87 +223,10 @@ impl IssueWorkflowStore {
         )
         .bind(&workflow.id)
         .bind(&data)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
-    }
-
-    pub async fn get_by_issue(
-        &self,
-        project_id: &str,
-        repo: Option<&str>,
-        issue_number: u64,
-    ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
-        let row: Option<(String,)> = if let Some(repo) = repo {
-            sqlx::query_as(
-                "SELECT data FROM issue_workflows
-                 WHERE data::jsonb->>'project_id' = $1
-                   AND data::jsonb->>'repo' = $2
-                   AND (data::jsonb->>'issue_number')::bigint = $3
-                 ORDER BY updated_at DESC
-                 LIMIT 1",
-            )
-            .bind(project_id)
-            .bind(repo)
-            .bind(issue_number as i64)
-            .fetch_optional(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT data FROM issue_workflows
-                 WHERE data::jsonb->>'project_id' = $1
-                   AND data::jsonb->>'repo' IS NULL
-                   AND (data::jsonb->>'issue_number')::bigint = $2
-                 ORDER BY updated_at DESC
-                 LIMIT 1",
-            )
-            .bind(project_id)
-            .bind(issue_number as i64)
-            .fetch_optional(&self.pool)
-            .await?
-        };
-        row.map(|(data,)| serde_json::from_str(&data))
-            .transpose()
-            .map_err(Into::into)
-    }
-
-    pub async fn get_by_pr(
-        &self,
-        project_id: &str,
-        repo: Option<&str>,
-        pr_number: u64,
-    ) -> anyhow::Result<Option<IssueWorkflowInstance>> {
-        let row: Option<(String,)> = if let Some(repo) = repo {
-            sqlx::query_as(
-                "SELECT data FROM issue_workflows
-                 WHERE data::jsonb->>'project_id' = $1
-                   AND data::jsonb->>'repo' = $2
-                   AND (data::jsonb->>'pr_number')::bigint = $3
-                 ORDER BY updated_at DESC
-                 LIMIT 1",
-            )
-            .bind(project_id)
-            .bind(repo)
-            .bind(pr_number as i64)
-            .fetch_optional(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT data FROM issue_workflows
-                 WHERE data::jsonb->>'project_id' = $1
-                   AND data::jsonb->>'repo' IS NULL
-                   AND (data::jsonb->>'pr_number')::bigint = $2
-                 ORDER BY updated_at DESC
-                 LIMIT 1",
-            )
-            .bind(project_id)
-            .bind(pr_number as i64)
-            .fetch_optional(&self.pool)
-            .await?
-        };
-        row.map(|(data,)| serde_json::from_str(&data))
-            .transpose()
-            .map_err(Into::into)
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<IssueWorkflowInstance>> {
@@ -608,13 +590,24 @@ impl IssueWorkflowStore {
     where
         F: FnOnce(&mut IssueWorkflowInstance) -> anyhow::Result<()>,
     {
-        let wf_id = workflow_id(project_id, repo, issue_number);
+        let mut tx = self.pool.begin().await?;
+        lock_issue_identity(&mut tx, project_id, repo, issue_number).await?;
+        if let Some((row_id, mut workflow)) = self
+            .load_for_update_by_issue(&mut tx, project_id, repo, issue_number)
+            .await?
+        {
+            f(&mut workflow)?;
+            self.upsert_in_tx(&mut tx, &workflow).await?;
+            debug_assert_eq!(workflow.id, row_id);
+            tx.commit().await?;
+            return Ok(workflow);
+        }
         let placeholder = IssueWorkflowInstance::new(
             project_id.to_string(),
-            repo.map(|r| r.to_string()),
+            repo.map(str::to_string),
             issue_number,
         );
-        let mut tx = self.pool.begin().await?;
+        let wf_id = placeholder.id.clone();
         let workflow = self
             .update_issue_row_in_tx(&mut tx, &wf_id, &placeholder, repo, f)
             .await?;
@@ -657,12 +650,16 @@ impl IssueWorkflowStore {
         F: FnOnce(&mut IssueWorkflowInstance) -> anyhow::Result<()>,
     {
         let mut tx = self.pool.begin().await?;
-        let wf_id = workflow_id(project_id, repo, issue_number);
-        let Some(mut workflow) = self.load_for_update_by_id(&mut tx, &wf_id).await? else {
+        lock_issue_identity(&mut tx, project_id, repo, issue_number).await?;
+        let Some((row_id, mut workflow)) = self
+            .load_for_update_by_issue(&mut tx, project_id, repo, issue_number)
+            .await?
+        else {
             return Ok(None);
         };
         f(&mut workflow)?;
         self.upsert_in_tx(&mut tx, &workflow).await?;
+        debug_assert_eq!(workflow.id, row_id);
         tx.commit().await?;
         Ok(Some(workflow))
     }
@@ -724,52 +721,6 @@ impl IssueWorkflowStore {
             .map_err(Into::into)
     }
 
-    async fn load_for_update_by_pr(
-        &self,
-        tx: &mut sqlx::Transaction<'_, Postgres>,
-        project_id: &str,
-        repo: Option<&str>,
-        pr_number: u64,
-    ) -> anyhow::Result<Option<(String, IssueWorkflowInstance)>> {
-        let row: Option<(String, String)> = if let Some(repo) = repo {
-            sqlx::query_as(
-                "SELECT id, data FROM issue_workflows
-                 WHERE data::jsonb->>'project_id' = $1
-                   AND data::jsonb->>'repo' = $2
-                   AND (data::jsonb->>'pr_number')::bigint = $3
-                 ORDER BY updated_at DESC
-                 LIMIT 1
-                 FOR UPDATE",
-            )
-            .bind(project_id)
-            .bind(repo)
-            .bind(pr_number as i64)
-            .fetch_optional(&mut **tx)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT id, data FROM issue_workflows
-                 WHERE data::jsonb->>'project_id' = $1
-                   AND data::jsonb->>'repo' IS NULL
-                   AND (data::jsonb->>'pr_number')::bigint = $2
-                 ORDER BY updated_at DESC
-                 LIMIT 1
-                 FOR UPDATE",
-            )
-            .bind(project_id)
-            .bind(pr_number as i64)
-            .fetch_optional(&mut **tx)
-            .await?
-        };
-        match row {
-            Some((id, data)) => {
-                let workflow = serde_json::from_str(&data)?;
-                Ok(Some((id, workflow)))
-            }
-            None => Ok(None),
-        }
-    }
-
     async fn upsert_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -789,6 +740,30 @@ impl IssueWorkflowStore {
     }
 }
 
+async fn lock_issue_identity(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    project_id: &str,
+    repo: Option<&str>,
+    issue_number: u64,
+) -> anyhow::Result<()> {
+    let canonical_repo = repo.map(str::to_ascii_lowercase);
+    let lock_key = serde_json::to_string(&(
+        "issue_workflow_identity",
+        project_id,
+        canonical_repo,
+        issue_number,
+    ))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "issue_workflow_store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "issue_workflow_store_migration_tests.rs"]
+mod migration_tests;

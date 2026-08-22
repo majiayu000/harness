@@ -111,6 +111,7 @@ pub(super) async fn run_direct_issue_dispatch(
     project_root: std::path::PathBuf,
     project_id: String,
 ) {
+    let repo = repo.to_ascii_lowercase();
     let Some(runtime_store) = state.core.workflow_runtime_store.as_deref() else {
         tracing::error!(
             repo,
@@ -126,7 +127,7 @@ pub(super) async fn run_direct_issue_dispatch(
 
     if let Some(workflows) = state.core.project_workflow_store.as_ref() {
         if let Err(error) = workflows
-            .record_dispatch_started(&project_id, Some(repo))
+            .record_dispatch_started(&project_id, Some(&repo))
             .await
         {
             tracing::warn!(
@@ -154,12 +155,12 @@ pub(super) async fn run_direct_issue_dispatch(
         };
 
         let task_id = TaskId::from_str(&format!("github-issue:{repo}:issue:{issue_number}"));
-        let depends_on = dependency_task_ids(&issue, repo);
+        let depends_on = dependency_task_ids(&issue, &repo);
         match crate::workflow_runtime_submission::record_issue_submission(
             runtime_store,
             crate::workflow_runtime_submission::IssueSubmissionRuntimeContext {
                 project_root: &project_root,
-                repo: Some(repo),
+                repo: Some(&repo),
                 issue_number,
                 task_id: &task_id,
                 labels: &issue.labels,
@@ -197,7 +198,7 @@ pub(super) async fn run_direct_issue_dispatch(
     }
 
     if let Some(workflows) = state.core.project_workflow_store.as_ref() {
-        if let Err(error) = workflows.record_idle(&project_id, Some(repo)).await {
+        if let Err(error) = workflows.record_idle(&project_id, Some(&repo)).await {
             tracing::warn!(
                 repo,
                 dispatched,
