@@ -171,8 +171,8 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
     ),
     allowed(
         "crates/harness-server/src/test_helpers.rs",
-        3,
-        "test fixture home directory",
+        4,
+        "test fixture home directory and explicit Postgres test gate",
     ),
     allowed(
         "crates/harness-server/src/websocket.rs",
@@ -210,8 +210,43 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "legacy DATABASE_URL migration gate",
     ),
     allowed(
+        "crates/harness-workflow/src/issue_workflow_store_migration_tests.rs",
+        1,
+        "Postgres integration test gate",
+    ),
+    allowed(
         "crates/harness-workflow/src/issue_workflow_store_tests.rs",
         2,
+        "Postgres integration test gate",
+    ),
+    allowed(
+        "crates/harness-workflow/src/project_lifecycle.rs",
+        1,
+        "Postgres integration test gate",
+    ),
+    allowed(
+        "crates/harness-workflow/src/project_lifecycle_migration_tests.rs",
+        1,
+        "Postgres integration test gate",
+    ),
+    allowed(
+        "crates/harness-workflow/src/runtime/remote_facts.rs",
+        1,
+        "Postgres integration test gate",
+    ),
+    allowed(
+        "crates/harness-workflow/src/runtime/remote_facts_migration_tests.rs",
+        1,
+        "Postgres integration test gate",
+    ),
+    allowed(
+        "crates/harness-workflow/src/runtime/store/identity_migration_tests.rs",
+        1,
+        "Postgres integration test gate",
+    ),
+    allowed(
+        "crates/harness-workflow/src/runtime/store/instances_tests.rs",
+        1,
         "Postgres integration test gate",
     ),
     allowed(
