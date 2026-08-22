@@ -720,3 +720,7 @@ impl IssueWorkflowStore {
 #[cfg(test)]
 #[path = "issue_workflow_store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "issue_workflow_store_migration_tests.rs"]
+mod migration_tests;

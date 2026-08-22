@@ -1,4 +1,6 @@
 use super::*;
+use harness_workflow::issue_lifecycle::IssueWorkflowInstance;
+use harness_workflow::project_lifecycle::ProjectWorkflowInstance;
 use harness_workflow::project_lifecycle::ProjectWorkflowStore;
 
 #[tokio::test]
@@ -22,19 +24,20 @@ async fn canonical_intake_reuses_legacy_issue_and_project_workflows() -> anyhow:
     std::fs::create_dir(&project_root)?;
     let project_id = project_root.to_string_lossy().into_owned();
     let issue_number = 1708;
-    let legacy_issue = issue_store
-        .record_issue_scheduled(
-            &project_id,
-            Some("Owner/Repo"),
-            issue_number,
-            "legacy-issue-task",
-            &[],
-            false,
-        )
-        .await?;
-    let legacy_project = project_store
-        .record_poll_started(&project_id, Some("Owner/Repo"))
-        .await?;
+    let mut legacy_issue = IssueWorkflowInstance::new(
+        project_id.clone(),
+        Some("owner/repo".to_string()),
+        issue_number,
+    );
+    legacy_issue.id = workflow_id(&project_id, Some("Owner/Repo"), issue_number);
+    legacy_issue.repo = Some("Owner/Repo".to_string());
+    issue_store.upsert(&legacy_issue).await?;
+    let mut legacy_project =
+        ProjectWorkflowInstance::new(project_id.clone(), Some("owner/repo".to_string()));
+    legacy_project.id =
+        harness_workflow::project_lifecycle::workflow_id(&project_id, Some("Owner/Repo"));
+    legacy_project.repo = Some("Owner/Repo".to_string());
+    project_store.upsert(&legacy_project).await?;
 
     let coverage = check_github_issue_coverage(
         Some(&issue_store),

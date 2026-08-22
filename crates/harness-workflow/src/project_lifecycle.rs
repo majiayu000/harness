@@ -605,6 +605,10 @@ impl ProjectWorkflowStore {
 }
 
 #[cfg(test)]
+#[path = "project_lifecycle_migration_tests.rs"]
+mod migration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use harness_core::db::resolve_database_url;

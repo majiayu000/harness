@@ -71,6 +71,9 @@ pub fn stable_pr_snapshot_fact_hash_input(snapshot: &Value) -> Value {
     let mut stable = snapshot.clone();
     if let Some(object) = stable.as_object_mut() {
         object.remove("observed_at");
+        if let Some(repo) = object.get("repo").and_then(Value::as_str) {
+            object.insert("repo".to_string(), Value::String(repo.to_ascii_lowercase()));
+        }
         object.insert(
             "statusCheckRollup".to_string(),
             json!({
@@ -328,6 +331,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pr_snapshot_hash_input_canonicalizes_repo_case() {
+        let upper = stable_pr_snapshot_fact_hash_input(&json!({
+            "repo": "Owner/Repo",
+            "pr_number": 19,
+            "state": "OPEN"
+        }));
+        let lower = stable_pr_snapshot_fact_hash_input(&json!({
+            "repo": "owner/repo",
+            "pr_number": 19,
+            "state": "OPEN"
+        }));
+
+        assert_eq!(
+            stable_remote_fact_hash(&upper),
+            stable_remote_fact_hash(&lower)
+        );
+        assert_eq!(upper["repo"], "owner/repo");
+    }
+
     #[tokio::test]
     async fn runtime_store_upserts_remote_fact_snapshot_by_subject() -> anyhow::Result<()> {
         if resolve_database_url(None).is_err() {
@@ -503,3 +526,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "remote_facts_migration_tests.rs"]
+mod migration_tests;
