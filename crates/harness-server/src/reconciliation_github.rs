@@ -121,8 +121,12 @@ async fn try_github_get_json_with_client_timeout<T: DeserializeOwned>(
         request = request.bearer_auth(token);
     }
     let value = tokio::time::timeout(timeout, async {
-        let response = request.send().await?.error_for_status()?;
-        response.json::<T>().await
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("GitHub state check returned HTTP {status}");
+        }
+        Ok::<T, anyhow::Error>(response.json::<T>().await?)
     })
     .await
     .map_err(|_| {

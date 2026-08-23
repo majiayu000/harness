@@ -68,6 +68,14 @@ pub(crate) fn run_git(args: &[&str]) -> std::process::Output {
 }
 
 pub(crate) async fn github_state_server(path: &'static str, body: &'static str) -> String {
+    github_state_server_with_status(path, "200 OK", body).await
+}
+
+pub(crate) async fn github_state_server_with_status(
+    path: &'static str,
+    success_status: &'static str,
+    body: &'static str,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -84,7 +92,7 @@ pub(crate) async fn github_state_server(path: &'static str, body: &'static str) 
         };
         let request = String::from_utf8_lossy(&buf[..n]);
         let (status, response_body) = if request.starts_with(&format!("GET {path} ")) {
-            ("200 OK", body)
+            (success_status, body)
         } else {
             ("404 Not Found", "{}")
         };
