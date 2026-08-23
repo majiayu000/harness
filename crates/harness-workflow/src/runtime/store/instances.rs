@@ -241,28 +241,79 @@ impl WorkflowRuntimeStore {
         pr_number: u64,
     ) -> anyhow::Result<Option<WorkflowInstance>> {
         let pr_number = pr_number.to_string();
-        let row: Option<(String,)> = sqlx::query_as(
+        let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT data::text FROM workflow_instances
              WHERE definition_id = $1
                AND data->'data'->>'project_id' = $2
-               AND ($3::text IS NULL OR data->'data'->>'repo' = $3)
+               AND ($3::text IS NULL OR LOWER(data->'data'->>'repo') = LOWER($3))
                AND data->'data'->>'pr_number' = $4
              ORDER BY
                CASE
                  WHEN subject_type = 'issue' OR data->'data' ? 'issue_number' THEN 0
                  ELSE 1
                END,
-               updated_at DESC
-             LIMIT 1",
+               CASE
+                 WHEN $3::text IS NOT NULL AND data->'data'->>'repo' = $3 THEN 0
+                 ELSE 1
+               END,
+               updated_at DESC",
         )
         .bind(definition_id)
         .bind(project_id)
         .bind(repo)
         .bind(pr_number)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        row.map(|(data,)| workflow_instance_from_persisted_json(&data))
-            .transpose()
+        let mut terminal = None;
+        for (data,) in rows {
+            let instance = workflow_instance_from_persisted_json(&data)?;
+            if !instance.is_terminal_with_registry(&self.definition_registry) {
+                return Ok(Some(instance));
+            }
+            terminal.get_or_insert(instance);
+        }
+        Ok(terminal)
+    }
+
+    pub async fn get_instance_by_issue(
+        &self,
+        definition_id: &str,
+        project_id: &str,
+        repo: Option<&str>,
+        issue_number: u64,
+    ) -> anyhow::Result<Option<WorkflowInstance>> {
+        let issue_number = issue_number.to_string();
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data::text FROM workflow_instances
+             WHERE definition_id = $1
+               AND data->'data'->>'project_id' = $2
+               AND (
+                 ($3::text IS NULL AND data->'data'->>'repo' IS NULL)
+                 OR ($3::text IS NOT NULL AND LOWER(data->'data'->>'repo') = LOWER($3))
+               )
+               AND data->'data'->>'issue_number' = $4
+             ORDER BY
+               CASE
+                 WHEN $3::text IS NOT NULL AND data->'data'->>'repo' = $3 THEN 0
+                 ELSE 1
+               END,
+               updated_at DESC",
+        )
+        .bind(definition_id)
+        .bind(project_id)
+        .bind(repo)
+        .bind(issue_number)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut terminal = None;
+        for (data,) in rows {
+            let instance = workflow_instance_from_persisted_json(&data)?;
+            if !instance.is_terminal_with_registry(&self.definition_registry) {
+                return Ok(Some(instance));
+            }
+            terminal.get_or_insert(instance);
+        }
+        Ok(terminal)
     }
 
     pub async fn list_instances_by_state(
@@ -310,11 +361,15 @@ impl WorkflowRuntimeStore {
             return Ok(Vec::new());
         }
         let limit = limit.clamp(1, 500);
+        let canonical_repos = repos
+            .iter()
+            .map(|repo| repo.to_ascii_lowercase())
+            .collect::<Vec<_>>();
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT data::text FROM workflow_instances
              WHERE definition_id = $1
                AND state = $2
-               AND data->'data'->>'repo' = ANY($3::text[])
+               AND LOWER(data->'data'->>'repo') = ANY($3::text[])
                AND (data->'data'->>'reason_class' = 'transient'
                     OR data->'data'->'last_stop'->>'reason_class' = 'transient')
                AND NOT (
@@ -327,7 +382,7 @@ impl WorkflowRuntimeStore {
         )
         .bind(definition_id)
         .bind(state)
-        .bind(repos)
+        .bind(&canonical_repos)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

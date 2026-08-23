@@ -1,5 +1,6 @@
 use harness_core::db::Migration;
 
+mod github_identity;
 mod remote_lease_proof;
 
 pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
@@ -710,5 +711,76 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         version: 28,
         description: "prove remote lease provenance for stale completion recovery",
         sql: remote_lease_proof::SQL,
+    },
+    Migration {
+        version: 29,
+        description: "index case-insensitive runtime GitHub subject lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_project_repo_issue_ci
+              ON workflow_instances (
+                  definition_id,
+                  (data->'data'->>'project_id'),
+                  (LOWER(data->'data'->>'repo')),
+                  (data->'data'->>'issue_number'),
+                  updated_at DESC
+              )
+              WHERE data->'data'->>'issue_number' IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_instances_project_repo_pr_ci
+              ON workflow_instances (
+                  definition_id,
+                  (data->'data'->>'project_id'),
+                  (LOWER(data->'data'->>'repo')),
+                  (data->'data'->>'pr_number'),
+                  updated_at DESC
+              )
+              WHERE data->'data'->>'pr_number' IS NOT NULL",
+    },
+    Migration {
+        version: 30,
+        description: "index case-insensitive GitHub remote fact lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_remote_fact_snapshots_provider_repo_subject_ci
+              ON remote_fact_snapshots (
+                  provider,
+                  (LOWER(repo)),
+                  subject_type,
+                  subject_number,
+                  fetched_at DESC,
+                  updated_at DESC
+              )",
+    },
+    Migration {
+        version: 31,
+        description: "canonicalize GitHub remote fact repository identity",
+        sql: "WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY provider, LOWER(repo), subject_type, subject_number
+                           ORDER BY
+                               CASE LOWER(state)
+                                   WHEN 'merged' THEN 4
+                                   WHEN 'closed' THEN 3
+                                   WHEN 'done' THEN 3
+                                   WHEN 'cancelled' THEN 2
+                                   ELSE 1
+                               END DESC,
+                               fetched_at DESC,
+                               fact_hash DESC,
+                               updated_at DESC,
+                               id DESC
+                       ) AS row_number
+                FROM remote_fact_snapshots
+                WHERE provider = 'github'
+              )
+              DELETE FROM remote_fact_snapshots AS snapshot
+              USING ranked
+              WHERE snapshot.id = ranked.id
+                AND ranked.row_number > 1;
+              UPDATE remote_fact_snapshots
+              SET repo = LOWER(repo), updated_at = CURRENT_TIMESTAMP
+              WHERE provider = 'github' AND repo <> LOWER(repo)",
+    },
+    Migration {
+        version: 32,
+        description: "enforce unique runtime GitHub issue identities",
+        sql: github_identity::SQL,
     },
 ];
