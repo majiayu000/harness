@@ -62,7 +62,12 @@ pub(super) async fn execute_start_child_workflow(
         .and_then(|workflow| workflow.data.get("repo"))
         .and_then(Value::as_str)
         .or_else(|| command.get("repo").and_then(Value::as_str));
-    let child_id = harness_workflow::issue_lifecycle::workflow_id(project_id, repo, issue_number);
+    let canonical_repo = repo.map(str::to_ascii_lowercase);
+    let child_id = harness_workflow::issue_lifecycle::workflow_id(
+        project_id,
+        canonical_repo.as_deref(),
+        issue_number,
+    );
     store
         .upsert_definition(&WorkflowDefinition::new(
             "github_issue_pr",
@@ -70,7 +75,9 @@ pub(super) async fn execute_start_child_workflow(
             "GitHub issue PR workflow",
         ))
         .await?;
-    let existing_child = store.get_instance(&child_id).await?;
+    let existing_child = store
+        .get_instance_by_issue("github_issue_pr", project_id, repo, issue_number)
+        .await?;
     let child_was_persisted = existing_child.is_some();
     let mut child = match existing_child {
         Some(instance) => instance,

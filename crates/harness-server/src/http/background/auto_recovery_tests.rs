@@ -195,13 +195,10 @@ async fn auto_recovery_selects_transient_and_skips_terminal_and_legacy() -> anyh
     let (_dir, store) = open_test_store("harness-test-ar-select-").await?;
     let github = test_github_config(3);
 
-    let transient = seed_stopped_instance(
-        &store,
-        "ar-select-transient",
-        "blocked",
-        transient_blocked_data("episode-1"),
-    )
-    .await?;
+    let mut transient_data = transient_blocked_data("episode-1");
+    transient_data["repo"] = json!("Owner/Auto");
+    let transient =
+        seed_stopped_instance(&store, "ar-select-transient", "blocked", transient_data).await?;
     let terminal = seed_stopped_instance(
         &store,
         "ar-select-terminal",
