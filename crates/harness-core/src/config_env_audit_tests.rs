@@ -175,7 +175,7 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "test fixture home directory and explicit Postgres test gate",
     ),
     allowed(
-        "crates/harness-server/src/websocket/mod.rs",
+        "crates/harness-server/src/websocket_test_support.rs",
         1,
         "websocket client home fallback",
     ),
