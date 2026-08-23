@@ -3,17 +3,23 @@ use crate::issue_lifecycle::{IssueLifecycleEventKind, IssueLifecycleState};
 use chrono::Utc;
 
 async fn open_test_store() -> anyhow::Result<Option<IssueWorkflowStore>> {
-    if std::env::var("DATABASE_URL").is_err() {
-        return Ok(None);
+    let configured = match std::env::var("HARNESS_DATABASE_URL") {
+        Ok(configured) => configured,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if configured.trim().is_empty() {
+        anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
     }
+    let database_url = harness_core::db::resolve_test_database_url(Some(&configured))?;
     let dir = tempfile::tempdir()?;
-    match IssueWorkflowStore::open(&dir.path().join("issue_workflows.db")).await {
-        Ok(store) => Ok(Some(store)),
-        Err(e) => {
-            tracing::warn!("issue workflow store test skipped: {e}");
-            Ok(None)
-        }
-    }
+    Ok(Some(
+        IssueWorkflowStore::open_with_database_url(
+            &dir.path().join("issue_workflows.db"),
+            Some(&database_url),
+        )
+        .await?,
+    ))
 }
 
 #[tokio::test]
@@ -110,6 +116,123 @@ async fn issue_workflow_store_scopes_identity_by_repo() -> anyhow::Result<()> {
         .expect("repo-b workflow");
 
     assert_ne!(a.id, b.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_workflow_store_reuses_legacy_mixed_case_identity() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/legacy-mixed-case-issue";
+    let mut legacy = store
+        .record_issue_scheduled(
+            project_id,
+            Some("Owner/Repo"),
+            77,
+            "legacy-task",
+            &[],
+            false,
+        )
+        .await?;
+    sqlx::query("DELETE FROM issue_workflows WHERE id = $1")
+        .bind(&legacy.id)
+        .execute(store.pool())
+        .await?;
+    legacy.id = format!("{project_id}::repo:Owner/Repo::issue:77");
+    legacy.repo = Some("Owner/Repo".to_string());
+    store.upsert(&legacy).await?;
+    let updated = store
+        .record_implement_started(project_id, Some("owner/repo"), 77, "legacy-task")
+        .await?;
+
+    assert_eq!(updated.id, legacy.id);
+    assert_eq!(updated.repo.as_deref(), Some("Owner/Repo"));
+    assert_eq!(updated.state, IssueLifecycleState::Implementing);
+    assert_eq!(store.row_count().await?, 1);
+    let loaded = store
+        .get_by_issue(project_id, Some("owner/repo"), 77)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("canonical lookup should find legacy workflow"))?;
+    assert_eq!(loaded.id, legacy.id);
+    let index: Option<(String,)> = sqlx::query_as(
+        "SELECT indexdef FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND tablename = 'issue_workflows'
+           AND indexname = 'idx_issue_workflows_repo_subject_ci'",
+    )
+    .fetch_optional(store.pool())
+    .await?;
+    assert!(index.is_some_and(|(definition,)| {
+        let definition = definition.to_ascii_lowercase();
+        definition.contains("create unique index")
+            && definition.contains("lower(((data)::jsonb ->> 'repo'")
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_workflow_backfill_skips_case_equivalent_identity() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/backfill-mixed-case-issue";
+    let canonical = store
+        .record_issue_scheduled(
+            project_id,
+            Some("owner/repo"),
+            79,
+            "canonical-task",
+            &[],
+            false,
+        )
+        .await?;
+    let mut legacy = canonical.clone();
+    legacy.id = format!("{project_id}::repo:Owner/Repo::issue:79");
+    legacy.repo = Some("Owner/Repo".to_string());
+
+    assert!(!store.insert_if_absent(&legacy).await?);
+    assert_eq!(store.row_count().await?, 1);
+    assert_eq!(
+        store
+            .get_by_issue(project_id, Some("Owner/Repo"), 79)
+            .await?
+            .map(|workflow| workflow.id),
+        Some(canonical.id)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue_workflow_store_serializes_concurrent_repo_case_variants() -> anyhow::Result<()> {
+    let Some(store) = open_test_store().await? else {
+        return Ok(());
+    };
+    let project_id = "/tmp/concurrent-mixed-case-issue";
+    let upper = store.record_issue_scheduled(
+        project_id,
+        Some("Owner/Repo"),
+        78,
+        "shared-task",
+        &[],
+        false,
+    );
+    let lower = store.record_issue_scheduled(
+        project_id,
+        Some("owner/repo"),
+        78,
+        "shared-task",
+        &[],
+        false,
+    );
+    let (upper, lower) = tokio::join!(upper, lower);
+    let upper = upper?;
+    let lower = lower?;
+
+    assert_eq!(upper.id, lower.id);
+    assert_eq!(upper.repo.as_deref(), Some("owner/repo"));
+    assert_eq!(lower.repo.as_deref(), Some("owner/repo"));
+    assert_eq!(store.row_count().await?, 1);
     Ok(())
 }
 
@@ -509,7 +632,7 @@ async fn issue_workflow_store_reports_illegal_transition() -> anyhow::Result<()>
         .record_pr_merged(project, Some("owner/repo"), 123, None)
         .await?;
     let error = store
-        .record_implement_started(project, Some("owner/repo"), 23, "late-task")
+        .record_implement_started(project, Some("owner/repo"), 23, "task-1")
         .await
         .expect_err("terminal transition must reach the caller");
     assert!(error.to_string().contains("transition_not_allowed"));

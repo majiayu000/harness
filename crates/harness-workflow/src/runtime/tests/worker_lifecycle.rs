@@ -47,22 +47,32 @@ async fn runtime_worker_claims_one_job_once_and_records_events() -> anyhow::Resu
 
 #[tokio::test]
 async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> anyhow::Result<()> {
-    if resolve_database_url(None).is_err() {
-        return Ok(());
+    let configured = match harness_core::config::process_env::var("HARNESS_DATABASE_URL") {
+        Ok(configured) => configured,
+        Err(std::env::VarError::NotPresent) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if configured.trim().is_empty() {
+        anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
     }
+    let database_url = harness_core::db::resolve_test_database_url(Some(&configured))?;
 
     let dir = tempfile::tempdir()?;
-    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let store = WorkflowRuntimeStore::open_with_database_url(
+        &dir.path().join("workflow_runtime.db"),
+        Some(&database_url),
+    )
+    .await?;
     let matching = WorkflowInstance::new(
         "github_issue_pr",
         1,
         "pr_open",
         WorkflowSubject::new("issue", "issue:77"),
     )
-    .with_id("project-a::owner/repo::issue:77")
+    .with_id("project-a::Owner/Repo::issue:77")
     .with_server_data(json!({
         "project_id": "project-a",
-        "repo": "owner/repo",
+        "repo": "Owner/Repo",
         "issue_number": 77,
         "pr_number": 880,
     }));
@@ -99,8 +109,13 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
     let found = store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 880)
         .await?
-        .expect("matching runtime issue workflow should be found");
+        .expect("mixed-case legacy workflow should match a canonical repository lookup");
     assert_eq!(found.id, matching.id);
+    let found_by_issue = store
+        .get_instance_by_issue("github_issue_pr", "project-a", Some("owner/repo"), 77)
+        .await?
+        .expect("mixed-case legacy issue should match a canonical repository lookup");
+    assert_eq!(found_by_issue.id, matching.id);
     assert!(store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 881)
         .await?

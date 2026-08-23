@@ -56,8 +56,12 @@ async fn persist_plan_issue_decision(
     ctx: &PlanIssueRuntimeContext<'_>,
 ) -> anyhow::Result<PlanIssueRuntimeAction> {
     let project_id = ctx.project_root.to_string_lossy().into_owned();
-    let workflow_id =
-        harness_workflow::issue_lifecycle::workflow_id(&project_id, ctx.repo, ctx.issue_number);
+    let canonical_repo = ctx.repo.map(str::to_ascii_lowercase);
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_id,
+        canonical_repo.as_deref(),
+        ctx.issue_number,
+    );
     store
         .upsert_definition(&WorkflowDefinition::new(
             "github_issue_pr",
@@ -65,13 +69,16 @@ async fn persist_plan_issue_decision(
             "GitHub issue PR workflow",
         ))
         .await?;
-    let (instance, new_instance) = match store.get_instance(&workflow_id).await? {
+    let (instance, new_instance) = match store
+        .get_instance_by_issue("github_issue_pr", &project_id, ctx.repo, ctx.issue_number)
+        .await?
+    {
         Some(instance) => (instance, false),
         None => (
             issue_instance(
                 workflow_id,
                 project_id.clone(),
-                ctx.repo.map(ToOwned::to_owned),
+                canonical_repo,
                 ctx.issue_number,
                 "implementing",
             ),
