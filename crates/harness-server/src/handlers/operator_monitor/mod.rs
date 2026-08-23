@@ -8,6 +8,7 @@
 mod activity;
 mod driverless_progress;
 mod failure_classification;
+mod health;
 mod response;
 mod sampling;
 
@@ -34,6 +35,7 @@ use failure_classification::{
     classify_failure_family, earlier_timestamp, failure_next_action, failure_retryable,
     failure_severity, later_timestamp, normalize_failure_message,
 };
+use health::{append_background_loop_degradations, operator_health_status};
 pub(crate) use response::{operator_monitor, OperatorMonitorResponse};
 
 /// A background loop whose last tick is older than this is reported stale and
@@ -284,49 +286,6 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
     })
 }
 
-fn append_background_loop_degradations(
-    subsystems: &mut Vec<&'static str>,
-    loop_snapshots: &[crate::http::background::loop_health::LoopSnapshot],
-    has_config_parse_failure: bool,
-) {
-    for loop_snapshot in loop_snapshots {
-        if loop_snapshot.stale {
-            subsystems.push(match loop_snapshot.name {
-                "orphan_schema_reaper" => "orphan_schema_reaper_stale",
-                "workflow_watchdog" => "workflow_watchdog_stale",
-                "runtime_retention" => "runtime_retention_stale",
-                "task_retention" => "task_retention_stale",
-                _ => {
-                    // Guards against future loop names missing a mapping
-                    // without leaking a string per snapshot; the precise name
-                    // is in `background_loops`.
-                    "background_loop_stale"
-                }
-            });
-        }
-    }
-    if has_config_parse_failure {
-        subsystems.push("workflow_config_parse_failure");
-    }
-}
-
-fn operator_health_status(
-    degraded_subsystems: &[&'static str],
-    runtime_log_state: &str,
-    runtime_state_dirty: bool,
-    isolation_degraded: bool,
-) -> &'static str {
-    if degraded_subsystems.is_empty()
-        && runtime_log_state != "degraded"
-        && !runtime_state_dirty
-        && !isolation_degraded
-    {
-        "ok"
-    } else {
-        "degraded"
-    }
-}
-
 async fn list_stuck_workflows(
     state: &AppState,
     generated_at: DateTime<Utc>,
@@ -335,7 +294,22 @@ async fn list_stuck_workflows(
         return Ok(Vec::new());
     };
     let workflow_cfg =
-        harness_core::config::workflow::load_workflow_config(&state.core.project_root)?;
+        match harness_core::config::workflow::load_workflow_config(&state.core.project_root) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(
+                    project_root = %state.core.project_root.display(),
+                    error = %error,
+                    "operator monitor cannot calculate stuck workflows from malformed WORKFLOW.md"
+                );
+                state
+                    .background_loops
+                    .record_config_failure("workflow_watchdog", &error.to_string());
+                // The health payload carries the error below, so the unavailable
+                // projection is explicit instead of making monitoring return 500.
+                return Ok(Vec::new());
+            }
+        };
     if !workflow_cfg.storage.workflow_watchdog_enabled {
         return Ok(Vec::new());
     }

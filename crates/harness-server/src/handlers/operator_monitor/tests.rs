@@ -1087,6 +1087,46 @@ async fn endpoint_includes_config_enabled_stuck_workflows() -> anyhow::Result<()
     Ok(())
 }
 
+#[tokio::test]
+async fn endpoint_surfaces_malformed_workflow_config_as_degraded_health() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-bad-config-")?;
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    state.core.workflow_runtime_store = Some(Arc::new(
+        WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+            Some(&test_helpers::test_database_url()?),
+        )
+        .await?,
+    ));
+    std::fs::write(dir.path().join("WORKFLOW.md"), "---\nstorage: [\n---\n")?;
+
+    let app = Router::new()
+        .route("/api/operator-monitor", get(operator_monitor))
+        .with_state(Arc::new(state));
+    let req = axum::http::Request::builder()
+        .uri("/api/operator-monitor")
+        .body(axum::body::Body::empty())?;
+    let resp = tower::ServiceExt::oneshot(app, req).await?;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["health"]["status"], "degraded");
+    assert_eq!(
+        body["health"]["config_parse_failure"]["affected_loops"],
+        json!(["workflow_watchdog"])
+    );
+    assert!(body["stuck_workflows"]
+        .as_array()
+        .expect("stuck workflows array")
+        .is_empty());
+    Ok(())
+}
+
 const DECLARATIVE_VISIBILITY_DEFINITION_ID: &str = "operator_monitor_visibility_flow";
 
 /// Register a uniquely-named declarative definition into the process-global
