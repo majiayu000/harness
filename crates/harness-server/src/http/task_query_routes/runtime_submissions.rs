@@ -56,6 +56,39 @@ async fn append_runtime_definition_summaries(
     let mut cursor_created_at = cursor.map(|cursor| cursor.created_at);
     let mut cursor_id = cursor.map(|cursor| cursor.id.clone());
     let include_all_kinds = filter.kinds.is_empty();
+    // Push fine prompt-family kind discrimination into SQL: the store query
+    // can only split Issue/Pr/prompt-family coarsely, so without this the
+    // handler pages through the whole prompt family to find Review/Planner
+    // rows (issue #1994). `TaskKind` serializes snake_case, matching the
+    // `execution_policy.task_kind` stored on prompt-family instances.
+    let prompt_task_kinds: Vec<String> = if include_all_kinds {
+        Vec::new()
+    } else {
+        filter
+            .kinds
+            .iter()
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    TaskKind::Prompt | TaskKind::Review | TaskKind::Planner
+                )
+            })
+            .map(|kind| kind.as_ref().to_string())
+            .collect()
+    };
+    // Mirror `AsRef<str> for TaskKind`: exactly the serde values a persisted
+    // execution_policy may carry. Anything else is corrupt and must still be
+    // fetched so `runtime_submission_task_kind` can reject it (fail closed)
+    // instead of the SQL filter silently hiding it.
+    let recognized_task_kinds = [
+        TaskKind::Issue,
+        TaskKind::Pr,
+        TaskKind::Prompt,
+        TaskKind::Review,
+        TaskKind::Planner,
+    ]
+    .map(|kind| kind.as_ref().to_string())
+    .to_vec();
     let store_filter = harness_workflow::runtime::WorkflowSubmissionFilter {
         project_id: filter.project.clone(),
         source: filter.source.clone(),
@@ -72,6 +105,8 @@ async fn append_runtime_definition_summaries(
             .iter()
             .map(|status| status.as_str().to_string())
             .collect(),
+        prompt_task_kinds,
+        recognized_task_kinds,
     };
     let mut listed_ids: HashSet<String> = summaries
         .iter()
@@ -87,21 +122,32 @@ async fn append_runtime_definition_summaries(
                 page_limit,
             )
             .await?;
-        let fetched = workflows.len();
-        let next_cursor = workflows.last().and_then(|workflow| {
-            RuntimeWorkflowProjection::from_workflow_with_registry(
-                store.definition_registry(),
-                workflow,
-            )
-            .submission_handle
-            .map(|task_id| (workflow.created_at, task_id.as_str().to_string()))
+        // Project each row exactly once; the same projection feeds the kind
+        // check, the dedupe key, the page cursor, and the summary (issue
+        // #1994). Previously every row was projected twice and the last row
+        // of each page three times.
+        let projected_page: Vec<(
+            harness_workflow::runtime::WorkflowInstance,
+            RuntimeWorkflowProjection,
+        )> = workflows
+            .into_iter()
+            .map(|workflow| {
+                let projection = RuntimeWorkflowProjection::from_workflow_with_registry(
+                    store.definition_registry(),
+                    &workflow,
+                );
+                (workflow, projection)
+            })
+            .collect();
+        let fetched = projected_page.len();
+        let next_cursor = projected_page.last().and_then(|(workflow, projection)| {
+            projection
+                .submission_handle
+                .clone()
+                .map(|task_id| (workflow.created_at, task_id.as_str().to_string()))
         });
 
-        for workflow in workflows {
-            let projection = RuntimeWorkflowProjection::from_workflow_with_registry(
-                store.definition_registry(),
-                &workflow,
-            );
+        for (workflow, projection) in projected_page {
             let Some(task_id) = projection.submission_handle.clone() else {
                 continue;
             };
@@ -112,12 +158,7 @@ async fn append_runtime_definition_summaries(
             if !listed_ids.insert(task_id.as_str().to_string()) {
                 continue;
             }
-            let summary = runtime_workflow_task_summary(
-                store.definition_registry(),
-                workflow,
-                task_id,
-                task_kind,
-            );
+            let summary = runtime_workflow_task_summary(projection, &workflow, task_id, task_kind);
             if filter.matches_summary(&summary) {
                 summaries.push(summary);
             }
@@ -161,19 +202,18 @@ pub(crate) fn runtime_submission_task_kind(
 }
 
 fn runtime_workflow_task_summary(
-    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
-    workflow: harness_workflow::runtime::WorkflowInstance,
+    projection: RuntimeWorkflowProjection,
+    workflow: &harness_workflow::runtime::WorkflowInstance,
     task_id: harness_core::types::TaskId,
     task_kind: TaskKind,
 ) -> TaskSummary {
-    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(registry, &workflow);
     let status = projection.task_status.clone();
     let issue = workflow
         .data
         .get("issue_number")
         .and_then(|value| value.as_u64());
     let external_id = runtime_external_id(task_kind, &workflow.data, issue);
-    let description = Some(runtime_submission_description(&workflow, task_kind, issue));
+    let description = Some(runtime_submission_description(workflow, task_kind, issue));
     TaskSummary {
         id: task_id,
         task_kind,
@@ -195,7 +235,7 @@ fn runtime_workflow_task_summary(
         workspace_path: None,
         workspace_owner: None,
         run_generation: 0,
-        workflow: Some(TaskWorkflowSummary::from_runtime_workflow(&workflow)),
+        workflow: Some(TaskWorkflowSummary::from_runtime_workflow(workflow)),
         scheduler: projection.scheduler,
     }
 }
