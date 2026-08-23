@@ -29,6 +29,18 @@ pub struct WorkflowSubmissionFilter {
     pub include_prompt: bool,
     pub active_only: bool,
     pub task_statuses: Vec<String>,
+    /// Fine-grained discrimination inside the prompt family (`include_prompt`
+    /// gate): serde snake_case `TaskKind` values read from
+    /// `data.execution_policy.task_kind` (missing policy means `prompt`).
+    /// Empty means unconstrained.
+    pub prompt_task_kinds: Vec<String>,
+    /// Every `TaskKind` serde value the caller recognizes. Rows whose
+    /// persisted `execution_policy.task_kind` falls outside this set are
+    /// always fetched so the handler's policy validation can reject them
+    /// (fail closed) instead of corrupted submissions silently vanishing
+    /// from filtered listings. Empty disables this mechanism entirely
+    /// (callers that have not opted in keep the pre-existing semantics).
+    pub recognized_task_kinds: Vec<String>,
 }
 
 impl WorkflowRuntimeStore {
@@ -127,6 +139,28 @@ impl WorkflowRuntimeStore {
                AND (NOT $10 OR task_status NOT IN ('done', 'failed', 'cancelled'))
                AND (cardinality($11::text[]) = 0 OR task_status = ANY($11::text[]))
                AND (
+                   definition_id = 'github_issue_pr'
+                   OR NOT $9
+                   OR cardinality($16::text[]) = 0
+                   OR COALESCE(
+                       data->'data'->'execution_policy'->>'task_kind',
+                       'prompt'
+                   ) = ANY($16::text[])
+                   -- Corrupted policies must still reach the handler's
+                   -- fail-closed validation instead of silently vanishing
+                   -- from filtered listings. Only applies when the caller
+                   -- supplied the recognized universe: an empty set means
+                   -- the caller opted out, and `<> ALL('{}')` is vacuously
+                   -- true in PostgreSQL, which would leak every row.
+                   OR (
+                       cardinality($17::text[]) > 0
+                       AND COALESCE(
+                           data->'data'->'execution_policy'->>'task_kind',
+                           'prompt'
+                       ) <> ALL($17::text[])
+                   )
+               )
+               AND (
                    $5::timestamptz IS NULL
                    OR (data->>'created_at')::timestamptz < $5
                    OR (
@@ -161,6 +195,8 @@ impl WorkflowRuntimeStore {
         .bind(filter.repo.as_deref())
         .bind(limit)
         .bind(DECLARATIVE_DEFINITION_METADATA_KIND)
+        .bind(&filter.prompt_task_kinds)
+        .bind(&filter.recognized_task_kinds)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
