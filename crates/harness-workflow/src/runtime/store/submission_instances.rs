@@ -38,7 +38,8 @@ pub struct WorkflowSubmissionFilter {
     /// persisted `execution_policy.task_kind` falls outside this set are
     /// always fetched so the handler's policy validation can reject them
     /// (fail closed) instead of corrupted submissions silently vanishing
-    /// from filtered listings.
+    /// from filtered listings. Empty disables this mechanism entirely
+    /// (callers that have not opted in keep the pre-existing semantics).
     pub recognized_task_kinds: Vec<String>,
 }
 
@@ -147,11 +148,17 @@ impl WorkflowRuntimeStore {
                    ) = ANY($16::text[])
                    -- Corrupted policies must still reach the handler's
                    -- fail-closed validation instead of silently vanishing
-                   -- from filtered listings.
-                   OR COALESCE(
-                       data->'data'->'execution_policy'->>'task_kind',
-                       'prompt'
-                   ) <> ALL($17::text[])
+                   -- from filtered listings. Only applies when the caller
+                   -- supplied the recognized universe: an empty set means
+                   -- the caller opted out, and `<> ALL('{}')` is vacuously
+                   -- true in PostgreSQL, which would leak every row.
+                   OR (
+                       cardinality($17::text[]) > 0
+                       AND COALESCE(
+                           data->'data'->'execution_policy'->>'task_kind',
+                           'prompt'
+                       ) <> ALL($17::text[])
+                   )
                )
                AND (
                    $5::timestamptz IS NULL
