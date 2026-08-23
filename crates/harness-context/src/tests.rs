@@ -334,7 +334,7 @@ fn providers_include_active_exec_plans_for_matching_project() {
     let mut plan = harness_exec::plan::ExecPlan::from_spec("# Ship context composer", dir.path())
         .expect("plan");
     plan.activate();
-    let provider = ExecPlanProvider::new(vec![plan.clone()]);
+    let provider = ExecPlanProvider::new(vec![std::sync::Arc::new(plan.clone())]);
     let mut request = req();
     request.project = ProjectId::from_path(dir.path());
 

@@ -73,8 +73,10 @@ pub(super) async fn run_review_tick(
     // repo with those guards produces false positives.
     let guard_scan_output: Option<String> = if project_root.join(".harness").join("guards").is_dir()
     {
-        let rules = state.engines.rules.read().await;
-        match rules.scan(project_root).await {
+        // Snapshot under the read lock; the scan spawns one bash script per
+        // guard and must not pin the lock while it runs.
+        let snapshot = state.engines.rules.read().await.snapshot();
+        match snapshot.scan(project_root).await {
             Ok(violations) => {
                 let text = format_violations_for_prompt(&violations);
                 Some(text)

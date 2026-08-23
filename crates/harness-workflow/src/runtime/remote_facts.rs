@@ -200,29 +200,28 @@ pub(in crate::runtime) async fn upsert_remote_fact_snapshot_tx(
                 facts = EXCLUDED.facts,
                 fetched_at = EXCLUDED.fetched_at,
                 updated_at = CURRENT_TIMESTAMP
+             -- GitHub merge is the only irreversible transition, so it is the
+             -- only monotone state: once stored, only a fresher `merged`
+             -- observation may replace it. Everything else (open, closed,
+             -- done, cancelled) is ordered purely by freshness — ranking
+             -- closed above open froze reopened subjects forever because a
+             -- stored closed snapshot rejected every newer open observation.
              WHERE CASE
                 WHEN LOWER(EXCLUDED.provider) = 'github' THEN
-                    (
-                        CASE LOWER(remote_fact_snapshots.state)
-                            WHEN 'merged' THEN 4
-                            WHEN 'closed' THEN 3
-                            WHEN 'done' THEN 3
-                            WHEN 'cancelled' THEN 2
-                            ELSE 1
-                        END,
-                        remote_fact_snapshots.fetched_at,
-                        remote_fact_snapshots.fact_hash
-                    ) < ROW(
-                        CASE LOWER(EXCLUDED.state)
-                            WHEN 'merged' THEN 4
-                            WHEN 'closed' THEN 3
-                            WHEN 'done' THEN 3
-                            WHEN 'cancelled' THEN 2
-                            ELSE 1
-                        END,
-                        EXCLUDED.fetched_at,
-                        EXCLUDED.fact_hash
-                    )
+                    CASE
+                        WHEN LOWER(remote_fact_snapshots.state) = 'merged' THEN
+                            LOWER(EXCLUDED.state) = 'merged'
+                            AND (
+                                remote_fact_snapshots.fetched_at,
+                                remote_fact_snapshots.fact_hash
+                            ) < (EXCLUDED.fetched_at, EXCLUDED.fact_hash)
+                        ELSE
+                            LOWER(EXCLUDED.state) = 'merged'
+                            OR (
+                                remote_fact_snapshots.fetched_at,
+                                remote_fact_snapshots.fact_hash
+                            ) < (EXCLUDED.fetched_at, EXCLUDED.fact_hash)
+                    END
                 ELSE
                     (remote_fact_snapshots.fetched_at, remote_fact_snapshots.fact_hash)
                         < (EXCLUDED.fetched_at, EXCLUDED.fact_hash)
@@ -569,6 +568,53 @@ mod tests {
 
         assert_eq!(persisted.id, terminal.id);
         assert_eq!(persisted.fact_hash, terminal.fact_hash);
+        assert_eq!(persisted.state, "merged");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_store_accepts_reopened_github_remote_fact_after_closed() -> anyhow::Result<()>
+    {
+        // A closed snapshot must not outrank a newer open observation:
+        // GitHub subjects reopen, so only merged is monotone.
+        let Some(store) = remote_fact_test_store().await? else {
+            return Ok(());
+        };
+        let fetched_at = Utc::now();
+        let closed = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            22,
+            "closed",
+            json!({"state": "closed"}),
+            fetched_at,
+        );
+        store.upsert_remote_fact_snapshot(&closed).await?;
+        let reopened = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            22,
+            "open",
+            json!({"state": "open"}),
+            fetched_at + chrono::Duration::seconds(1),
+        );
+        let persisted = store.upsert_remote_fact_snapshot(&reopened).await?;
+        assert_eq!(persisted.id, reopened.id);
+        assert_eq!(persisted.state, "open");
+
+        // A later merge still supersedes the reopened snapshot.
+        let merged = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            22,
+            "merged",
+            json!({"state": "merged"}),
+            fetched_at + chrono::Duration::seconds(2),
+        );
+        let persisted = store.upsert_remote_fact_snapshot(&merged).await?;
         assert_eq!(persisted.state, "merged");
         Ok(())
     }
