@@ -84,10 +84,11 @@ pub(crate) fn issue_remote_fact_snapshot(
     issue_number: u64,
     issue: &IncomingIssue,
 ) -> anyhow::Result<RemoteFactSnapshot> {
+    let repo = repo.to_ascii_lowercase();
     let subject_number = i64::try_from(issue_number)?;
     let facts = json!({
         "provider": "github",
-        "repo": repo,
+        "repo": &repo,
         "subject_type": "issue",
         "number": issue_number,
         "title": issue.title,
@@ -98,7 +99,7 @@ pub(crate) fn issue_remote_fact_snapshot(
     });
     let mut snapshot = RemoteFactSnapshot::new(
         "github",
-        repo,
+        &repo,
         "issue",
         subject_number,
         "open",
@@ -136,11 +137,18 @@ pub(crate) async fn check_github_issue_coverage(
     author_trust_class: IsolationTrustClass,
     github_token: Option<&str>,
 ) -> anyhow::Result<GitHubIssueCoverage> {
+    let requested_repo = repo;
+    let repo = repo.to_ascii_lowercase();
     if let Some(issue_store) = issue_store {
-        if let Some(workflow) = issue_store
-            .get_by_issue(project_id, Some(repo), issue_number)
-            .await?
-        {
+        let mut workflow = issue_store
+            .get_by_issue(project_id, Some(&repo), issue_number)
+            .await?;
+        if workflow.is_none() && requested_repo != repo {
+            workflow = issue_store
+                .get_by_issue(project_id, Some(requested_repo), issue_number)
+                .await?;
+        }
+        if let Some(workflow) = workflow {
             if issue_lifecycle_state_is_covered(workflow.state) {
                 return Ok(GitHubIssueCoverage::Covered {
                     source: "issue_workflow",
@@ -153,19 +161,29 @@ pub(crate) async fn check_github_issue_coverage(
         }
     }
 
-    if let Some(runtime_store) = runtime_store {
-        let id = workflow_id(project_id, Some(repo), issue_number);
-        if let Some(workflow) = runtime_store.get_instance(&id).await? {
+    let existing_runtime_workflow_id = if let Some(runtime_store) = runtime_store {
+        let workflow = runtime_store
+            .get_instance_by_issue(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                project_id,
+                Some(&repo),
+                issue_number,
+            )
+            .await?;
+        if let Some(workflow) = workflow.as_ref() {
             if runtime_issue_state_is_covered(&workflow.state)
-                && !recovered_closed_pr_requires_lookup(&workflow)
+                && !recovered_closed_pr_requires_lookup(workflow)
             {
                 return Ok(GitHubIssueCoverage::Covered {
                     source: "workflow_runtime",
-                    state: workflow.state,
+                    state: workflow.state.clone(),
                 });
             }
         }
-    }
+        workflow.map(|workflow| workflow.id)
+    } else {
+        None
+    };
 
     let Some(runtime_store) = runtime_store else {
         return Ok(GitHubIssueCoverage::Uncovered);
@@ -174,10 +192,11 @@ pub(crate) async fn check_github_issue_coverage(
         runtime_store,
         project_root,
         project_id,
-        repo,
+        &repo,
         issue_number,
         author_trust_class,
         github_token,
+        existing_runtime_workflow_id.as_deref(),
     )
     .await
 }
@@ -200,6 +219,7 @@ async fn recover_github_pr_coverage(
     issue_number: u64,
     author_trust_class: IsolationTrustClass,
     github_token: Option<&str>,
+    existing_workflow_id: Option<&str>,
 ) -> anyhow::Result<GitHubIssueCoverage> {
     let client = reqwest::Client::new();
     recover_github_pr_coverage_with_client(
@@ -210,6 +230,7 @@ async fn recover_github_pr_coverage(
         issue_number,
         author_trust_class,
         github_token,
+        existing_workflow_id,
         &client,
         &github_graphql_url(),
     )
@@ -225,6 +246,7 @@ async fn recover_github_pr_coverage_with_client(
     issue_number: u64,
     author_trust_class: IsolationTrustClass,
     github_token: Option<&str>,
+    existing_workflow_id: Option<&str>,
     client: &reqwest::Client,
     graphql_url: &str,
 ) -> anyhow::Result<GitHubIssueCoverage> {
@@ -236,9 +258,15 @@ async fn recover_github_pr_coverage_with_client(
         graphql_url,
     )
     .await?;
-    let expected_base_ref =
-        recovery_expected_base_ref(runtime_store, project_root, project_id, repo, issue_number)
-            .await?;
+    let expected_base_ref = recovery_expected_base_ref(
+        runtime_store,
+        project_root,
+        project_id,
+        repo,
+        issue_number,
+        existing_workflow_id,
+    )
+    .await?;
     let mut snapshots = Vec::new();
 
     for candidate in issue_links.candidates {
@@ -294,6 +322,7 @@ async fn recover_github_pr_coverage_with_client(
         remote_fact,
         state,
         author_trust_class,
+        existing_workflow_id,
     )
     .await?;
     for (_, _, fact, _) in &snapshots {
@@ -336,8 +365,10 @@ async fn persist_recovered_workflow(
     remote_fact: &RemoteFactSnapshot,
     state: &str,
     author_trust_class: IsolationTrustClass,
+    existing_workflow_id: Option<&str>,
 ) -> anyhow::Result<RecoveredWorkflowPersistence> {
-    let id = workflow_id(project_id, Some(repo), issue_number);
+    let canonical_id = workflow_id(project_id, Some(repo), issue_number);
+    let id = existing_workflow_id.unwrap_or(&canonical_id).to_string();
     let mut data = recovered_workflow_data(
         project_root,
         project_id,
@@ -671,9 +702,11 @@ mod tests {
         };
 
         let left = issue_remote_fact_snapshot("owner/repo", 7, &issue).expect("snapshot");
-        let right = issue_remote_fact_snapshot("owner/repo", 7, &issue).expect("snapshot");
+        let right = issue_remote_fact_snapshot("Owner/Repo", 7, &issue).expect("snapshot");
 
         assert_eq!(left.fact_hash, right.fact_hash);
+        assert_eq!(right.repo, "owner/repo");
+        assert_eq!(right.facts["repo"], "owner/repo");
     }
 
     async fn store_stopped_replan_workflow(

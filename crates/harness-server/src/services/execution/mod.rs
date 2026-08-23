@@ -64,6 +64,7 @@ pub struct DefaultExecutionService {
     workflow_runtime_store: Option<Arc<WorkflowRuntimeStore>>,
     project_registry: Option<Arc<ProjectRegistry>>,
     allowed_project_roots: Vec<PathBuf>,
+    verify_remote_subject_state: bool,
 }
 
 struct PreparedRuntimeIssueSubmission {
@@ -144,6 +145,23 @@ impl DefaultExecutionService {
             workflow_runtime_store,
             project_registry,
             allowed_project_roots,
+            verify_remote_subject_state: true,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(
+        server_config: Arc<HarnessConfig>,
+        workflow_runtime_store: Option<Arc<WorkflowRuntimeStore>>,
+        project_registry: Option<Arc<ProjectRegistry>>,
+        allowed_project_roots: Vec<PathBuf>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            server_config,
+            workflow_runtime_store,
+            project_registry,
+            allowed_project_roots,
+            verify_remote_subject_state: false,
         })
     }
 
@@ -164,6 +182,11 @@ impl DefaultExecutionService {
         {
             return Err(EnqueueTaskError::BadRequest(
                 "at least one of definition_id, prompt, issue, or pr must be provided".to_string(),
+            ));
+        }
+        if req.issue.is_some() && req.pr.is_some() {
+            return Err(EnqueueTaskError::BadRequest(
+                "issue and pr are mutually exclusive".to_string(),
             ));
         }
         if let Some(definition_id) = req.definition_id.as_deref() {
@@ -306,16 +329,16 @@ impl DefaultExecutionService {
         let Some(store) = self.workflow_runtime_store.as_ref() else {
             return Ok(None);
         };
-        let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
-            project_id,
-            req.repo.as_deref(),
-            issue_number,
-        );
-        let Some(instance) = store
-            .get_instance(&workflow_id)
+        let instance = store
+            .get_instance_by_issue(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                project_id,
+                req.repo.as_deref(),
+                issue_number,
+            )
             .await
-            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
-        else {
+            .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;
+        let Some(instance) = instance else {
             return Ok(None);
         };
         if instance.is_terminal_with_registry(store.definition_registry()) {
@@ -381,6 +404,7 @@ impl DefaultExecutionService {
         let project_id = canonical.to_string_lossy().into_owned();
         req.project = Some(canonical.clone());
         workflow_runtime_submission::fill_missing_repo_from_project(&mut req).await;
+        Self::normalize_remote_subject_identity(&mut req)?;
         Self::populate_external_id(&mut req);
 
         if !self.runtime_submission_enabled(&canonical)? {
@@ -420,6 +444,12 @@ impl DefaultExecutionService {
         }
 
         if req.pr.is_some() {
+            if let Some(existing_id) = self
+                .check_runtime_pr_feedback_duplicate(&project_id, &req)
+                .await?
+            {
+                return Ok(PreparedEnqueueResult::Existing(existing_id));
+            }
             return Ok(PreparedEnqueueResult::RuntimePrFeedbackSubmission(
                 Box::new(PreparedRuntimePrFeedbackSubmission { req, project_id }),
             ));
@@ -457,6 +487,139 @@ impl DefaultExecutionService {
                 self.submit_pr_feedback_to_workflow_runtime(*prepared).await
             }
         }
+    }
+
+    async fn ensure_remote_subject_open(
+        &self,
+        req: &CreateTaskRequest,
+    ) -> Result<(), EnqueueTaskError> {
+        if !self.verify_remote_subject_state || (req.issue.is_none() && req.pr.is_none()) {
+            return Ok(());
+        }
+        let repo = req
+            .repo
+            .as_deref()
+            .filter(|repo| !repo.is_empty())
+            .ok_or_else(|| {
+                EnqueueTaskError::BadRequest(
+                    "GitHub issue/PR submissions require a repository slug".to_string(),
+                )
+            })?;
+        if !valid_github_repo_slug(repo) {
+            return Err(EnqueueTaskError::BadRequest(format!(
+                "invalid GitHub repository slug: {repo}"
+            )));
+        }
+
+        let token = self.server_config.server.github_token.as_deref();
+        let (subject, state) = match (req.issue, req.pr) {
+            (Some(issue_number), None) => (
+                format!("issue #{issue_number}"),
+                crate::reconciliation::fetch_exact_issue_state_with_token(
+                    repo,
+                    issue_number,
+                    token,
+                )
+                .await,
+            ),
+            (None, Some(pr_number)) => (
+                format!("PR #{pr_number}"),
+                crate::reconciliation::fetch_exact_pr_state_with_token(repo, pr_number, token)
+                    .await,
+            ),
+            (None, None) => return Ok(()),
+            (Some(_), Some(_)) => {
+                return Err(EnqueueTaskError::BadRequest(
+                    "issue and pr are mutually exclusive".to_string(),
+                ));
+            }
+        };
+        validate_remote_subject_open(&subject, repo, state)
+    }
+
+    fn normalize_remote_subject_identity(
+        req: &mut CreateTaskRequest,
+    ) -> Result<(), EnqueueTaskError> {
+        if req.issue.is_none() && req.pr.is_none() {
+            return Ok(());
+        }
+        let repo = req
+            .repo
+            .as_deref()
+            .filter(|repo| !repo.is_empty())
+            .ok_or_else(|| {
+                EnqueueTaskError::BadRequest(
+                    "GitHub issue/PR submissions require a repository slug".to_string(),
+                )
+            })?;
+        if repo != repo.trim() || !valid_github_repo_slug(repo) {
+            return Err(EnqueueTaskError::BadRequest(format!(
+                "invalid GitHub repository slug: {repo}"
+            )));
+        }
+        req.repo = Some(repo.to_ascii_lowercase());
+        Ok(())
+    }
+
+    async fn check_runtime_pr_feedback_duplicate(
+        &self,
+        project_id: &str,
+        req: &CreateTaskRequest,
+    ) -> Result<Option<TaskId>, EnqueueTaskError> {
+        let (Some(pr_number), Some(store)) = (req.pr, self.workflow_runtime_store.as_deref())
+        else {
+            return Ok(None);
+        };
+        let Some(instance) = self
+            .find_runtime_issue_workflow_by_pr(store, project_id, req.repo.as_deref(), pr_number)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let active =
+            crate::workflow_runtime_pr_feedback::pr_feedback_submission_is_active(store, &instance)
+                .await
+                .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?;
+        Ok(active.then(|| {
+            TaskId::from_str(
+                &crate::workflow_runtime_pr_feedback::runtime_task_id_from_instance(&instance),
+            )
+        }))
+    }
+}
+
+fn valid_github_repo_slug(repo: &str) -> bool {
+    let mut segments = repo.split('/');
+    let (Some(owner), Some(name), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    if owner.len() > 39 || name.len() > 100 {
+        return false;
+    }
+    [owner, name].into_iter().all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    })
+}
+
+fn validate_remote_subject_open(
+    subject: &str,
+    repo: &str,
+    state: crate::reconciliation::GitHubState,
+) -> Result<(), EnqueueTaskError> {
+    match state {
+        crate::reconciliation::GitHubState::Open => Ok(()),
+        crate::reconciliation::GitHubState::Unknown => Err(EnqueueTaskError::Internal(format!(
+            "could not verify that GitHub {subject} in {repo} is open"
+        ))),
+        state => Err(EnqueueTaskError::BadRequest(format!(
+            "GitHub {subject} in {repo} is not open ({state:?})"
+        ))),
     }
 }
 
