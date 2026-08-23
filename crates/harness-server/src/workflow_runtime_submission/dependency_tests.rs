@@ -168,6 +168,83 @@ async fn issue_submission_releases_dependency_by_github_issue_handle_when_canoni
 }
 
 #[tokio::test]
+async fn github_issue_dependency_resolution_bridges_legacy_repo_case_in_both_directions(
+) -> anyhow::Result<()> {
+    let Some(_database_url) = crate::test_helpers::configured_test_database_url()? else {
+        return Ok(());
+    };
+
+    let dir = tempfile::tempdir()?;
+    let store = open_runtime_store(dir.path()).await?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+
+    for (offset, stored_repo, dependency_handle_repo) in [
+        (0_u64, "Owner/Repo", "owner/repo"),
+        (10_u64, "owner/repo", "Owner/Repo"),
+    ] {
+        let dependency_issue = 180 + offset;
+        let waiting_issue = dependency_issue + 1;
+        let dependency_id = harness_workflow::issue_lifecycle::workflow_id(
+            &project_id,
+            Some(stored_repo),
+            dependency_issue,
+        );
+        let dependency = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "done",
+            WorkflowSubject::new("issue", format!("issue:{dependency_issue}")),
+        )
+        .with_id(dependency_id)
+        .with_server_data(json!({
+            "project_id": project_id,
+            "repo": stored_repo,
+            "issue_number": dependency_issue,
+            "submission_id": format!("legacy-dependency-{dependency_issue}"),
+            "task_id": format!("legacy-dependency-{dependency_issue}"),
+            "task_ids": [format!("legacy-dependency-{dependency_issue}")],
+        }));
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &dependency)
+            .await?;
+
+        let dependency_handle = TaskId::from_str(&format!(
+            "github-issue:{dependency_handle_repo}:issue:{dependency_issue}"
+        ));
+        let waiting_task = TaskId::from_str(&format!("waiting-{waiting_issue}"));
+        let waiting = record_issue_submission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: waiting_issue,
+                task_id: &waiting_task,
+                labels: &[],
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: std::slice::from_ref(&dependency_handle),
+                dependencies_blocked: true,
+                source: None,
+                external_id: None,
+                remote_fact_hash: None,
+                author_trust_class: None,
+            },
+        )
+        .await?;
+
+        let released = release_ready_issue_dependencies(&store, 10).await?;
+        assert_eq!(released.released, 1);
+        let workflow = store
+            .get_instance(&waiting.workflow_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("dependent workflow should remain persisted"))?;
+        assert_eq!(workflow.state, "planning");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn issue_submission_keeps_blocked_runtime_dependency_without_closed_evidence_waiting(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {

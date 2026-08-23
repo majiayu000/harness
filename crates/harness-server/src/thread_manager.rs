@@ -24,6 +24,11 @@ use tracing;
 /// workflow-runtime store.
 pub struct ThreadManager {
     threads: DashMap<String, Thread>,
+    /// turn_id -> thread_id. Turn ids are unique across threads (fork rebinds
+    /// every inherited id, see `fork_thread`), so this is a 1:1 index that
+    /// keeps `find_thread_and_turn` / `find_thread_for_turn` off the
+    /// O(threads × turns) scan.
+    turn_index: DashMap<String, String>,
     running_turn_tasks: DashMap<String, JoinHandle<()>>,
     running_adapters: DashMap<String, Arc<dyn AgentAdapter>>,
     runtime_turn_aliases: DashMap<String, Vec<TurnId>>,
@@ -33,6 +38,7 @@ impl ThreadManager {
     pub fn new() -> Self {
         Self {
             threads: DashMap::new(),
+            turn_index: DashMap::new(),
             running_turn_tasks: DashMap::new(),
             running_adapters: DashMap::new(),
             runtime_turn_aliases: DashMap::new(),
@@ -57,6 +63,14 @@ impl ThreadManager {
         self.threads.get(id.as_str()).map(|t| t.clone())
     }
 
+    /// Read just the thread's project root without cloning the transcript.
+    pub fn thread_project_root(&self, id: &ThreadId) -> Option<std::path::PathBuf> {
+        record_usage(UsageProbeSurface::ThreadManager);
+        self.threads
+            .get(id.as_str())
+            .map(|t| t.value().project_root.clone())
+    }
+
     pub fn list_threads(&self) -> Vec<Thread> {
         record_usage(UsageProbeSurface::ThreadManager);
         self.threads.iter().map(|e| e.value().clone()).collect()
@@ -64,7 +78,15 @@ impl ThreadManager {
 
     pub fn delete_thread(&self, id: &ThreadId) -> bool {
         record_usage(UsageProbeSurface::ThreadManager);
-        self.threads.remove(id.as_str()).is_some()
+        match self.threads.remove(id.as_str()) {
+            Some((_, thread)) => {
+                for turn in &thread.turns {
+                    self.turn_index.remove(turn.id.as_str());
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn register_turn_task(&self, turn_id: &TurnId, handle: JoinHandle<()>) {
@@ -109,6 +131,9 @@ impl ThreadManager {
         let turn_id = turn.id.clone();
         thread.turns.push(turn);
         thread.updated_at = chrono::Utc::now();
+        drop(thread);
+        self.turn_index
+            .insert(turn_id.as_str().to_string(), thread_id.as_str().to_string());
 
         Ok(turn_id)
     }
@@ -263,6 +288,26 @@ impl ThreadManager {
 
     pub fn find_thread_and_turn(&self, turn_id: &TurnId) -> Option<(ThreadId, Turn)> {
         record_usage(UsageProbeSurface::ThreadManager);
+        // Fast path: resolve via the turn index. The indexed result only wins
+        // when the thread and turn still exist, so a stale index entry falls
+        // through to the scan instead of hiding a live turn.
+        let indexed = self
+            .turn_index
+            .get(turn_id.as_str())
+            .map(|entry| entry.value().clone())
+            .and_then(|thread_id| {
+                self.threads.get(thread_id.as_str()).and_then(|thread| {
+                    thread
+                        .turns
+                        .iter()
+                        .find(|turn| turn.id == *turn_id)
+                        .cloned()
+                        .map(|turn| (ThreadId::from_str(&thread_id), turn))
+                })
+            });
+        if indexed.is_some() {
+            return indexed;
+        }
         for entry in self.threads.iter() {
             if let Some(turn) = entry.value().turns.iter().find(|turn| turn.id == *turn_id) {
                 return Some((entry.value().id.clone(), turn.clone()));
@@ -274,6 +319,15 @@ impl ThreadManager {
     /// Find which thread contains a given turn.
     pub fn find_thread_for_turn(&self, turn_id: &TurnId) -> Option<ThreadId> {
         record_usage(UsageProbeSurface::ThreadManager);
+        let indexed = self
+            .turn_index
+            .get(turn_id.as_str())
+            .map(|entry| entry.value().clone())
+            .filter(|thread_id| self.threads.contains_key(thread_id.as_str()))
+            .map(|thread_id| ThreadId::from_str(&thread_id));
+        if indexed.is_some() {
+            return indexed;
+        }
         for entry in self.threads.iter() {
             if entry.value().turns.iter().any(|t| t.id == *turn_id) {
                 return Some(entry.value().id.clone());
@@ -353,6 +407,10 @@ impl ThreadManager {
             turn.thread_id = fork_id.clone();
         }
 
+        for turn in &new_thread.turns {
+            self.turn_index
+                .insert(turn.id.as_str().to_string(), fork_id.as_str().to_string());
+        }
         self.threads
             .insert(fork_id.as_str().to_string(), new_thread);
         Ok(fork_id)

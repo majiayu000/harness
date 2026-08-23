@@ -437,11 +437,13 @@ async fn collect_remaining_eval_resources(
         summary.orphan_pull_requests += 1;
     }
 
-    for command in store.commands_for(workflow_id).await? {
+    let commands = store.commands_for(workflow_id).await?;
+    let mut jobs_by_command = super::cleanup::runtime_jobs_by_command_id(store, &commands).await?;
+    for command in commands {
         if active_command_status(command.status) {
             summary.active_commands += 1;
         }
-        for job in store.runtime_jobs_for_command(&command.id).await? {
+        for job in jobs_by_command.remove(&command.id).unwrap_or_default() {
             if active_runtime_job_status(job.status) {
                 summary.active_runtime_jobs += 1;
             }

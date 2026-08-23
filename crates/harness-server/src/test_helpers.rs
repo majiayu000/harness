@@ -224,6 +224,19 @@ pub fn test_database_url() -> anyhow::Result<String> {
     Ok(url)
 }
 
+pub fn configured_test_database_url() -> anyhow::Result<Option<String>> {
+    configure_test_pg_pool_defaults();
+    let configured = match std::env::var("HARNESS_DATABASE_URL") {
+        Ok(configured) => configured,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if configured.trim().is_empty() {
+        anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
+    }
+    Ok(Some(resolve_test_database_url(Some(&configured))?))
+}
+
 pub fn is_pool_timeout(err: &anyhow::Error) -> bool {
     err.to_string()
         .contains("pool timed out while waiting for an open connection")
@@ -325,7 +338,7 @@ async fn make_state_inner(
         )
         .await?,
     );
-    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+    let execution_svc = crate::services::execution::DefaultExecutionService::new_for_tests(
         Arc::new(server.config.clone()),
         Some(workflow_runtime_store.clone()),
         None,
