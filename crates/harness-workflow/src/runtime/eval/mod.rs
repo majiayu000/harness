@@ -1,8 +1,8 @@
 //! Runtime-owned eval primitives.
 //!
-//! This module is additive groundwork for GH-1447. Eval execution will dispatch
-//! through the normal workflow runtime; this module only owns manifest parsing
-//! deterministic scoring primitives, and standard-path eval dispatch helpers.
+//! This module is additive groundwork for GH-1447. Eval execution dispatches
+//! through the normal workflow runtime; this module owns manifest parsing,
+//! evidence collection, and standard-path eval dispatch helpers.
 
 pub mod attestation;
 mod cleanup;
@@ -19,7 +19,6 @@ pub mod run;
 #[cfg(test)]
 #[path = "run_concurrency_tests.rs"]
 mod run_concurrency_tests;
-pub mod scoring;
 mod transition_outcome;
 mod trusted_verifier;
 mod verification_evidence;
@@ -70,7 +69,6 @@ pub use run::{
     EvalCaseEnqueueOutcome, EvalCaseWorkflowInput, EvalCaseWorkflowPlan, EvalRunCleanupInput,
     EvalRunCleanupSummary, EVAL_BRANCH_PREFIX, EVAL_PR_DRAFT_MODE,
 };
-pub use scoring::{score_pr_repair_eval, ScoringError};
 pub use trusted_verifier::{
     execute_trusted_eval_verifier, EvalTrustedVerifier, GH1454_CI_CONTRACT_V1_SHA256,
     TRUSTED_EVAL_VERIFIER_V1_CAPABILITY,
