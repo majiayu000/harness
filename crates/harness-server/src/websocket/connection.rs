@@ -1,123 +1,13 @@
+//! Per-connection WebSocket pump: bounded outbound queue, notification
+//! forwarding, heartbeat, and graceful shutdown.
+
 use crate::{http::AppState, router};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
-use axum::{
-    extract::{State, WebSocketUpgrade},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-};
 use futures::{SinkExt, StreamExt};
 use harness_protocol::{codec, methods::RpcResponse};
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
 use tokio::sync::broadcast::error::RecvError;
-
-/// Returns true if the origin is a localhost origin (safe for local dev tools).
-///
-/// Parses the host from the origin to prevent bypass via domains like
-/// `http://localhost.evil.com`.
-///
-/// `"null"` is intentionally NOT treated as local: browsers send `Origin: null`
-/// for `file:` URLs and sandboxed iframes, which are untrusted contexts.
-fn is_local_origin(origin: &str) -> bool {
-    // Origin format: scheme://host or scheme://host:port
-    // Extract the host by stripping scheme and optional port.
-    let host = origin
-        .split_once("://")
-        .map(|(_, rest)| {
-            rest.split(':')
-                .next()
-                .unwrap_or("")
-                .split('/')
-                .next()
-                .unwrap_or("")
-        })
-        .unwrap_or("");
-    host == "localhost" || host == "127.0.0.1"
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum OriginValidationError {
-    InvalidUtf8,
-    NonLocal(String),
-}
-
-fn validate_origin_header(headers: &HeaderMap) -> Result<(), OriginValidationError> {
-    let Some(origin) = headers.get("Origin") else {
-        return Ok(());
-    };
-
-    let origin_str = origin
-        .to_str()
-        .map_err(|_| OriginValidationError::InvalidUtf8)?;
-
-    if is_local_origin(origin_str) {
-        Ok(())
-    } else {
-        Err(OriginValidationError::NonLocal(origin_str.to_owned()))
-    }
-}
-
-/// Axum handler that upgrades the HTTP connection to WebSocket.
-///
-/// Two-layer access control:
-/// 1. Origin check (CSWH prevention): when an Origin header is present it must
-///    identify a localhost origin.  This blocks Cross-Site WebSocket Hijacking
-///    from remote websites.
-/// 2. Bearer token auth: when an API token is configured, **every** client must
-///    present a valid `Authorization: Bearer <token>` header, regardless of
-///    whether an Origin header is present.  Checking Origin alone is insufficient
-///    because non-browser clients can forge `Origin: http://localhost` while
-///    omitting the secret token.  Browsers that need to connect to this endpoint
-///    should obtain and forward the token via an alternative mechanism (e.g. a
-///    pre-flight REST call that returns a short-lived credential).
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
-    // Layer 1: CSWH prevention via Origin check.
-    if let Err(err) = validate_origin_header(&headers) {
-        match err {
-            OriginValidationError::InvalidUtf8 => {
-                tracing::warn!("WebSocket connection rejected: Origin header is not valid UTF-8");
-            }
-            OriginValidationError::NonLocal(origin) => {
-                tracing::warn!(
-                    "WebSocket connection rejected: non-local Origin {:?}",
-                    origin
-                );
-            }
-        }
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
-    // Layer 2: Bearer token auth for all clients when a token is configured.
-    // Origin headers can be forged by non-browser tools, so they do not exempt
-    // a client from token authentication.
-    let auth_mode = match crate::http::auth::resolve_api_auth_mode(&state.core.server.config.server)
-    {
-        Ok(mode) => mode,
-        Err(error) => {
-            tracing::error!("WebSocket auth misconfigured after startup: {error}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    if let Some(expected) = auth_mode.expected_token() {
-        let authorized = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .map(|tok| tok.as_bytes().ct_eq(expected.as_bytes()).into())
-            .unwrap_or(false);
-        if !authorized {
-            tracing::warn!("WebSocket connection rejected: missing or invalid Bearer token");
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-    }
-
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
-}
 
 /// Outbound per-connection queue capacity. A client that falls this far
 /// behind is closed instead of being buffered indefinitely (issue #1996),
@@ -138,7 +28,7 @@ const WS_OUTBOUND_BACKLOG: usize = 256;
 ///   connection is closed instead of buffering without limit.
 /// - When the server signals graceful shutdown via `ws_shutdown_tx`, a Close
 ///   frame is sent and the handler exits.
-async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
+pub(super) async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     let (mut ws_sink, mut ws_stream) = ws.split();
 
     // Internal bounded channel: both the request handler and the notification
@@ -278,6 +168,3 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     notif_task.abort();
     send_task.abort();
 }
-
-#[cfg(test)]
-mod tests;
