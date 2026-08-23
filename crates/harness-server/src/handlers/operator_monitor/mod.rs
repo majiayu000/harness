@@ -183,22 +183,12 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
     let runtime_host_leases =
         super::runtime_hosts::active_runtime_job_lease_count_total(state).await?;
     let runtime_log_state = state.core.server.runtime_logs.state.as_str();
-    let degraded_subsystems = state.degraded_subsystems.clone();
+    let mut degraded_subsystems = state.degraded_subsystems.clone();
     let runtime_state_dirty = state.is_runtime_state_dirty();
     let isolation_degraded = !state
         .isolation_availability
         .unavailable_required_tiers(&state.core.server.config.isolation)
         .is_empty();
-    let health_status = if degraded_subsystems.is_empty()
-        && runtime_log_state != "degraded"
-        && !runtime_state_dirty
-        && !isolation_degraded
-    {
-        "ok"
-    } else {
-        "degraded"
-    };
-
     let fallback_registry = WorkflowDefinitionRegistry::with_builtins();
     let registry = state
         .core
@@ -238,35 +228,24 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         .map(|manager| manager.live_count());
     let loop_snapshots = state.background_loops.snapshot(BACKGROUND_LOOP_STALE_SECS);
     let config_parse_failure = state.background_loops.config_failure_snapshot();
+    append_background_loop_degradations(
+        &mut degraded_subsystems,
+        &loop_snapshots,
+        config_parse_failure.is_some(),
+    );
+    let health_status = operator_health_status(
+        &degraded_subsystems,
+        runtime_log_state,
+        runtime_state_dirty,
+        isolation_degraded,
+    );
 
     Ok(OperatorMonitorPayload {
         generated_at: generated_at.to_rfc3339(),
         sample_limit: WORKFLOW_SAMPLE_LIMIT,
         health: OperatorHealth {
             status: health_status,
-            degraded_subsystems: {
-                let mut subsystems = degraded_subsystems;
-                for loop_snapshot in &loop_snapshots {
-                    if loop_snapshot.stale {
-                        subsystems.push(match loop_snapshot.name {
-                            "orphan_schema_reaper" => "orphan_schema_reaper_stale",
-                            "workflow_watchdog" => "workflow_watchdog_stale",
-                            "runtime_retention" => "runtime_retention_stale",
-                            "task_retention" => "task_retention_stale",
-                            _ => {
-                                // Guards against future loop names missing a
-                                // mapping without leaking a string per snapshot;
-                                // the precise name is in `background_loops`.
-                                "background_loop_stale"
-                            }
-                        });
-                    }
-                }
-                if config_parse_failure.is_some() {
-                    subsystems.push("workflow_config_parse_failure");
-                }
-                subsystems
-            },
+            degraded_subsystems,
             runtime_log_state,
             runtime_log_path: state
                 .core
@@ -303,6 +282,49 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
             cards: worktree_cards,
         },
     })
+}
+
+fn append_background_loop_degradations(
+    subsystems: &mut Vec<&'static str>,
+    loop_snapshots: &[crate::http::background::loop_health::LoopSnapshot],
+    has_config_parse_failure: bool,
+) {
+    for loop_snapshot in loop_snapshots {
+        if loop_snapshot.stale {
+            subsystems.push(match loop_snapshot.name {
+                "orphan_schema_reaper" => "orphan_schema_reaper_stale",
+                "workflow_watchdog" => "workflow_watchdog_stale",
+                "runtime_retention" => "runtime_retention_stale",
+                "task_retention" => "task_retention_stale",
+                _ => {
+                    // Guards against future loop names missing a mapping
+                    // without leaking a string per snapshot; the precise name
+                    // is in `background_loops`.
+                    "background_loop_stale"
+                }
+            });
+        }
+    }
+    if has_config_parse_failure {
+        subsystems.push("workflow_config_parse_failure");
+    }
+}
+
+fn operator_health_status(
+    degraded_subsystems: &[&'static str],
+    runtime_log_state: &str,
+    runtime_state_dirty: bool,
+    isolation_degraded: bool,
+) -> &'static str {
+    if degraded_subsystems.is_empty()
+        && runtime_log_state != "degraded"
+        && !runtime_state_dirty
+        && !isolation_degraded
+    {
+        "ok"
+    } else {
+        "degraded"
+    }
 }
 
 async fn list_stuck_workflows(

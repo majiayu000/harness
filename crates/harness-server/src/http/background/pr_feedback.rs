@@ -361,10 +361,7 @@ pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) 
                 Some(state) => state,
                 None => break,
             };
-            let workflow_cfg = match load_runtime_workflow_config(
-                &state.core.project_root,
-                "workflow runtime PR feedback sweeper",
-            ) {
+            let workflow_cfg = match load_workflow_config_for_loop(&state, &handle).await {
                 Ok(config) => config,
                 Err(error) => {
                     handle.tick_failed(&format!("workflow config load failed: {error}"));

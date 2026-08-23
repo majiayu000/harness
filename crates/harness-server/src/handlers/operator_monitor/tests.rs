@@ -7,6 +7,41 @@ use harness_workflow::runtime::{
     WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
 };
 
+#[test]
+fn stale_background_loop_degrades_the_aggregate_health_status() {
+    let mut degraded_subsystems = Vec::new();
+    let snapshots = vec![crate::http::background::loop_health::LoopSnapshot {
+        name: "scheduler_gc",
+        tick_count: 0,
+        failure_count: 0,
+        last_tick_secs_ago: None,
+        last_success_secs_ago: None,
+        last_error: None,
+        stale: true,
+    }];
+
+    append_background_loop_degradations(&mut degraded_subsystems, &snapshots, false);
+
+    assert_eq!(degraded_subsystems, vec!["background_loop_stale"]);
+    assert_eq!(
+        operator_health_status(&degraded_subsystems, "ok", false, false),
+        "degraded"
+    );
+}
+
+#[test]
+fn workflow_config_failure_degrades_the_aggregate_health_status() {
+    let mut degraded_subsystems = Vec::new();
+
+    append_background_loop_degradations(&mut degraded_subsystems, &[], true);
+
+    assert_eq!(degraded_subsystems, vec!["workflow_config_parse_failure"]);
+    assert_eq!(
+        operator_health_status(&degraded_subsystems, "ok", false, false),
+        "degraded"
+    );
+}
+
 fn workflow(state: &str, data: Value) -> WorkflowInstance {
     WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,

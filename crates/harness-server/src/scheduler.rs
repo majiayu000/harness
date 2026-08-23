@@ -5,6 +5,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+fn record_gc_tick(
+    handle: &crate::http::background::LoopHandle,
+    response: &harness_protocol::methods::RpcResponse,
+) {
+    if let Some(error) = &response.error {
+        tracing::error!(error = %error.message, "scheduler: periodic GC run failed");
+        handle.tick_failed(&error.message);
+    } else {
+        handle.tick_ok();
+    }
+}
+
 pub struct Scheduler {
     pub gc_interval: Duration,
     pub health_interval: Duration,
@@ -51,12 +63,13 @@ impl Scheduler {
             .register_loop_with_interval("scheduler_gc", self.gc_interval.as_secs());
         let gc_state = state.clone();
         let gc_interval = self.gc_interval;
+        handle.started();
         tokio::spawn(async move {
             loop {
                 sleep(gc_interval).await;
                 tracing::info!("scheduler: triggering periodic GC run");
-                crate::handlers::gc::gc_run(&gc_state, None, None).await;
-                handle.tick_ok();
+                let response = crate::handlers::gc::gc_run(&gc_state, None, None).await;
+                record_gc_tick(&handle, &response);
             }
         });
 
@@ -65,6 +78,7 @@ impl Scheduler {
             .register_loop_with_interval("scheduler_health", self.health_interval.as_secs());
         let health_state = state.clone();
         let health_interval = self.health_interval;
+        health_handle.started();
         tokio::spawn(async move {
             loop {
                 sleep(health_interval).await;
@@ -84,6 +98,7 @@ impl Scheduler {
             .register_loop_with_interval("workspace_disk_gc", self.workspace_gc_interval.as_secs());
         let wgc_state = state.clone();
         let wgc_interval = self.workspace_gc_interval;
+        wgc_handle.started();
         tokio::spawn(async move {
             // Brief init delay so the server is fully up before the first scan.
             sleep(Duration::from_secs(30)).await;
@@ -181,6 +196,24 @@ mod tests {
             language: Language::Common,
             rules: vec![],
         });
+    }
+
+    #[test]
+    fn gc_rpc_error_records_a_failed_health_tick() {
+        let health = Arc::new(crate::http::background::BackgroundLoopHealth::new());
+        let handle = health.register_loop("scheduler_gc");
+        let response = harness_protocol::methods::RpcResponse::error(
+            None,
+            harness_protocol::methods::INTERNAL_ERROR,
+            "gc failed",
+        );
+
+        record_gc_tick(&handle, &response);
+
+        let snapshot = health.snapshot(60);
+        assert_eq!(snapshot[0].tick_count, 0);
+        assert_eq!(snapshot[0].failure_count, 1);
+        assert_eq!(snapshot[0].last_error.as_deref(), Some("gc failed"));
     }
 
     #[test]

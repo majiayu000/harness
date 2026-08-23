@@ -107,7 +107,21 @@ impl BackgroundLoopHealth {
     /// loop's own cadence with 50% slack. A healthy slow loop never crosses
     /// it; a dead one does after at most one-and-a-half missed intervals.
     fn stale_threshold_secs(max_stale_secs: u64, expected_interval_secs: u64) -> u64 {
-        max_stale_secs.max(expected_interval_secs + expected_interval_secs / 2)
+        max_stale_secs.max(expected_interval_secs.saturating_add(expected_interval_secs / 2))
+    }
+
+    /// Record that a registered loop has started before its first scheduled
+    /// unit of work. Slow loops use this to avoid looking dead during their
+    /// intentional initial sleep without claiming a successful tick.
+    pub(crate) fn record_started(&self, name: &'static str) {
+        if let Some(status) = self
+            .loops
+            .lock()
+            .expect("loop health mutex poisoned")
+            .get_mut(name)
+        {
+            status.last_tick_at = Some(Instant::now());
+        }
     }
 
     /// Record that `name` completed a tick successfully.
@@ -186,15 +200,17 @@ impl BackgroundLoopHealth {
                 name,
                 tick_count: status.tick_count,
                 failure_count: status.failure_count,
-                last_tick_secs_ago: status.last_tick_at.map(|t| now.duration_since(t).as_secs()),
+                last_tick_secs_ago: status
+                    .last_tick_at
+                    .map(|t| now.saturating_duration_since(t).as_secs()),
                 last_success_secs_ago: status
                     .last_success_at
-                    .map(|t| now.duration_since(t).as_secs()),
+                    .map(|t| now.saturating_duration_since(t).as_secs()),
                 last_error: status.last_error.clone(),
                 stale: status
                     .last_tick_at
                     .map(|t| {
-                        now.duration_since(t).as_secs()
+                        now.saturating_duration_since(t).as_secs()
                             > Self::stale_threshold_secs(
                                 max_stale_secs,
                                 status.expected_interval_secs,
@@ -228,6 +244,10 @@ pub(crate) struct LoopHandle {
 }
 
 impl LoopHandle {
+    pub(crate) fn started(&self) {
+        self.health.record_started(self.name);
+    }
+
     pub(crate) fn tick_ok(&self) {
         self.health.record_tick(self.name);
     }
@@ -340,6 +360,45 @@ mod tests {
         health.set_loop_interval("rescheduled-loop", 100);
         let snapshot = health.snapshot(60);
         assert_eq!(snapshot.len(), 1, "interval update must not duplicate");
+        assert!(!snapshot[0].stale);
+    }
+
+    #[test]
+    fn started_loop_is_live_without_claiming_a_successful_tick() {
+        let health = Arc::new(BackgroundLoopHealth::new());
+        let handle = health.register_loop_with_interval("slow-loop", 86_400);
+
+        handle.started();
+
+        let snapshot = health.snapshot(60);
+        assert!(!snapshot[0].stale);
+        assert_eq!(snapshot[0].tick_count, 0);
+        assert_eq!(snapshot[0].last_success_secs_ago, None);
+    }
+
+    #[test]
+    fn staleness_arithmetic_saturates_for_unbounded_intervals() {
+        assert_eq!(
+            BackgroundLoopHealth::stale_threshold_secs(60, u64::MAX),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn future_tick_instants_do_not_panic_snapshotting() {
+        let health = Arc::new(BackgroundLoopHealth::new());
+        let handle = health.register_loop("future-loop");
+        handle.started();
+        health
+            .loops
+            .lock()
+            .expect("loop health mutex poisoned")
+            .get_mut("future-loop")
+            .expect("registered loop")
+            .last_tick_at = Some(Instant::now() + Duration::from_secs(1));
+
+        let snapshot = health.snapshot(60);
+        assert_eq!(snapshot[0].last_tick_secs_ago, Some(0));
         assert!(!snapshot[0].stale);
     }
 }
