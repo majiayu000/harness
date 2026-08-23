@@ -70,6 +70,31 @@ fn configured_github_repo_without_override_falls_back_to_default_project_root() 
 }
 
 #[test]
+fn configured_github_webhook_repo_identity_is_case_insensitive() {
+    let default_root = PathBuf::from("/srv/default");
+    let github = GitHubIntakeConfig {
+        enabled: true,
+        repos: vec![GitHubRepoConfig {
+            repo: "Owner/Repo".to_string(),
+            label: "harness".to_string(),
+            project_root: Some("/srv/mixed-case".to_string()),
+            auto_merge: None,
+            auto_recovery: None,
+            merge_method: None,
+            delete_branch: None,
+            require_review_threads_resolved: None,
+            require_clean_merge_state: None,
+        }],
+        ..Default::default()
+    };
+
+    let resolved =
+        configured_github_webhook_project_root(Some(&github), &default_root, "owner/repo");
+
+    assert_eq!(resolved, Some(PathBuf::from("/srv/mixed-case")));
+}
+
+#[test]
 fn unconfigured_github_repo_has_no_configured_project_root() {
     let default_root = PathBuf::from("/srv/repo-a");
     let github = GitHubIntakeConfig {

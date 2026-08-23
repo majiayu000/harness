@@ -147,12 +147,17 @@ async fn canonical_github_issue_dependency_instance(
         .data
         .get("repo")
         .and_then(serde_json::Value::as_str);
-    if dependency_repo != repo.unwrap_or("<none>") {
+    if !repo.is_some_and(|repo| dependency_repo.eq_ignore_ascii_case(repo)) {
         return Ok(None);
     }
-    let workflow_id =
-        harness_workflow::issue_lifecycle::workflow_id(project_id, repo, issue_number);
-    store.get_instance(&workflow_id).await
+    store
+        .get_instance_by_issue(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            project_id,
+            Some(dependency_repo),
+            issue_number,
+        )
+        .await
 }
 
 fn parse_github_issue_dependency(task_id: &str) -> Option<(&str, u64)> {

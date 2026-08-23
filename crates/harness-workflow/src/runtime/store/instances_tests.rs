@@ -1,14 +1,24 @@
 use super::*;
 use crate::runtime::model::WorkflowSubject;
-use harness_core::db::resolve_database_url;
+use harness_core::db::resolve_test_database_url;
 
 async fn test_store() -> anyhow::Result<Option<WorkflowRuntimeStore>> {
-    if resolve_database_url(None).is_err() {
-        return Ok(None);
+    let configured = match std::env::var("HARNESS_DATABASE_URL") {
+        Ok(configured) => configured,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if configured.trim().is_empty() {
+        anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
     }
+    let database_url = resolve_test_database_url(Some(&configured))?;
     let dir = tempfile::tempdir()?;
     Ok(Some(
-        WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?,
+        WorkflowRuntimeStore::open_with_database_url(
+            &dir.path().join("workflow_runtime.db"),
+            Some(&database_url),
+        )
+        .await?,
     ))
 }
 
@@ -20,6 +30,49 @@ fn discovered_instance(id: &str) -> WorkflowInstance {
         WorkflowSubject::new("issue", "issue:1784"),
     )
     .with_id(id)
+}
+
+#[tokio::test]
+async fn runtime_migration_indexes_case_insensitive_github_subject_lookups() -> anyhow::Result<()> {
+    let Some(store) = test_store().await? else {
+        return Ok(());
+    };
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT indexname, indexdef
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND tablename = 'workflow_instances'
+           AND indexname = ANY($1::text[])
+         ORDER BY indexname",
+    )
+    .bind(vec![
+        "idx_workflow_instances_project_repo_issue_ci",
+        "idx_workflow_instances_project_repo_pr_ci",
+    ])
+    .fetch_all(store.pool())
+    .await?;
+
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|(_, definition)| { definition.to_ascii_lowercase().contains("lower(") }));
+
+    let remote_fact_index: Option<(String,)> = sqlx::query_as(
+        "SELECT indexdef
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND tablename = 'remote_fact_snapshots'
+           AND indexname = 'idx_remote_fact_snapshots_provider_repo_subject_ci'",
+    )
+    .fetch_optional(store.pool())
+    .await?;
+    let Some((remote_fact_index,)) = remote_fact_index else {
+        anyhow::bail!("case-insensitive remote fact index should exist");
+    };
+    assert!(remote_fact_index
+        .to_ascii_lowercase()
+        .contains("lower(repo)"));
+    Ok(())
 }
 
 #[tokio::test]

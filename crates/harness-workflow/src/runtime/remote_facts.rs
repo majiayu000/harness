@@ -71,6 +71,9 @@ pub fn stable_pr_snapshot_fact_hash_input(snapshot: &Value) -> Value {
     let mut stable = snapshot.clone();
     if let Some(object) = stable.as_object_mut() {
         object.remove("observed_at");
+        if let Some(repo) = object.get("repo").and_then(Value::as_str) {
+            object.insert("repo".to_string(), Value::String(repo.to_ascii_lowercase()));
+        }
         object.insert(
             "statusCheckRollup".to_string(),
             json!({
@@ -155,6 +158,14 @@ fn snapshot_from_row(row: RemoteFactSnapshotRow) -> anyhow::Result<RemoteFactSna
     })
 }
 
+fn canonical_remote_fact_repo(provider: &str, repo: &str) -> String {
+    if provider.eq_ignore_ascii_case("github") {
+        repo.to_ascii_lowercase()
+    } else {
+        repo.to_string()
+    }
+}
+
 impl WorkflowRuntimeStore {
     pub async fn upsert_remote_fact_snapshot(
         &self,
@@ -172,6 +183,7 @@ pub(in crate::runtime) async fn upsert_remote_fact_snapshot_tx(
     snapshot: &RemoteFactSnapshot,
 ) -> anyhow::Result<RemoteFactSnapshot> {
     let facts = serde_json::to_string(&snapshot.facts)?;
+    let canonical_repo = canonical_remote_fact_repo(&snapshot.provider, &snapshot.repo);
     let row = sqlx::query_as::<_, RemoteFactSnapshotRow>(
         "INSERT INTO remote_fact_snapshots (
                 id, provider, repo, subject_type, subject_number, subject_url,
@@ -188,13 +200,39 @@ pub(in crate::runtime) async fn upsert_remote_fact_snapshot_tx(
                 facts = EXCLUDED.facts,
                 fetched_at = EXCLUDED.fetched_at,
                 updated_at = CURRENT_TIMESTAMP
-             WHERE remote_fact_snapshots.fetched_at <= EXCLUDED.fetched_at
+             WHERE CASE
+                WHEN LOWER(EXCLUDED.provider) = 'github' THEN
+                    (
+                        CASE LOWER(remote_fact_snapshots.state)
+                            WHEN 'merged' THEN 4
+                            WHEN 'closed' THEN 3
+                            WHEN 'done' THEN 3
+                            WHEN 'cancelled' THEN 2
+                            ELSE 1
+                        END,
+                        remote_fact_snapshots.fetched_at,
+                        remote_fact_snapshots.fact_hash
+                    ) < ROW(
+                        CASE LOWER(EXCLUDED.state)
+                            WHEN 'merged' THEN 4
+                            WHEN 'closed' THEN 3
+                            WHEN 'done' THEN 3
+                            WHEN 'cancelled' THEN 2
+                            ELSE 1
+                        END,
+                        EXCLUDED.fetched_at,
+                        EXCLUDED.fact_hash
+                    )
+                ELSE
+                    (remote_fact_snapshots.fetched_at, remote_fact_snapshots.fact_hash)
+                        < (EXCLUDED.fetched_at, EXCLUDED.fact_hash)
+             END
              RETURNING id, provider, repo, subject_type, subject_number, subject_url,
                 head_sha, state, fact_hash, facts::text, fetched_at",
     )
     .bind(snapshot.id)
     .bind(&snapshot.provider)
-    .bind(&snapshot.repo)
+    .bind(&canonical_repo)
     .bind(&snapshot.subject_type)
     .bind(snapshot.subject_number)
     .bind(&snapshot.subject_url)
@@ -215,7 +253,7 @@ pub(in crate::runtime) async fn upsert_remote_fact_snapshot_tx(
              WHERE provider = $1 AND repo = $2 AND subject_type = $3 AND subject_number = $4",
     )
     .bind(&snapshot.provider)
-    .bind(&snapshot.repo)
+    .bind(&canonical_repo)
     .bind(&snapshot.subject_type)
     .bind(snapshot.subject_number)
     .fetch_one(&mut **tx)
@@ -236,9 +274,11 @@ impl WorkflowRuntimeStore {
                 head_sha, state, fact_hash, facts::text, fetched_at
              FROM remote_fact_snapshots
              WHERE provider = $1
-               AND repo = $2
+               AND (repo = $2 OR ($1 = 'github' AND LOWER(repo) = LOWER($2)))
                AND subject_type = $3
-               AND subject_number = $4",
+               AND subject_number = $4
+             ORDER BY fetched_at DESC, updated_at DESC, (repo = $2) DESC
+             LIMIT 1",
         )
         .bind(provider)
         .bind(repo)
@@ -253,8 +293,28 @@ impl WorkflowRuntimeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::db::resolve_database_url;
+    use harness_core::db::resolve_test_database_url;
     use serde_json::json;
+
+    async fn remote_fact_test_store() -> anyhow::Result<Option<WorkflowRuntimeStore>> {
+        let configured = match std::env::var("HARNESS_DATABASE_URL") {
+            Ok(configured) => configured,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if configured.trim().is_empty() {
+            anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
+        }
+        let database_url = resolve_test_database_url(Some(&configured))?;
+        let dir = tempfile::tempdir()?;
+        Ok(Some(
+            WorkflowRuntimeStore::open_with_database_url(
+                &dir.path().join("workflow_runtime.db"),
+                Some(&database_url),
+            )
+            .await?,
+        ))
+    }
 
     #[test]
     fn stable_remote_fact_hash_sorts_object_keys() {
@@ -283,14 +343,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn github_remote_fact_repo_identity_is_case_insensitive() {
+        assert_eq!(
+            canonical_remote_fact_repo("github", "Owner/Repo"),
+            "owner/repo"
+        );
+        assert_eq!(
+            canonical_remote_fact_repo("custom", "Owner/Repo"),
+            "Owner/Repo"
+        );
+    }
+
+    #[test]
+    fn pr_snapshot_hash_input_canonicalizes_repo_case() {
+        let upper = stable_pr_snapshot_fact_hash_input(&json!({
+            "repo": "Owner/Repo",
+            "pr_number": 19,
+            "state": "OPEN"
+        }));
+        let lower = stable_pr_snapshot_fact_hash_input(&json!({
+            "repo": "owner/repo",
+            "pr_number": 19,
+            "state": "OPEN"
+        }));
+
+        assert_eq!(
+            stable_remote_fact_hash(&upper),
+            stable_remote_fact_hash(&lower)
+        );
+        assert_eq!(upper["repo"], "owner/repo");
+    }
+
     #[tokio::test]
     async fn runtime_store_upserts_remote_fact_snapshot_by_subject() -> anyhow::Result<()> {
-        if resolve_database_url(None).is_err() {
+        let Some(store) = remote_fact_test_store().await? else {
             return Ok(());
-        }
-
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        };
         let first = RemoteFactSnapshot::new(
             "github",
             "owner/repo",
@@ -327,12 +416,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_store_does_not_overwrite_newer_remote_fact() -> anyhow::Result<()> {
-        if resolve_database_url(None).is_err() {
+    async fn runtime_store_resolves_legacy_github_repo_case() -> anyhow::Result<()> {
+        let Some(store) = remote_fact_test_store().await? else {
             return Ok(());
-        }
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        };
+        let snapshot = RemoteFactSnapshot::new(
+            "github",
+            "Owner/Repo",
+            "pull_request",
+            11,
+            "open",
+            json!({ "number": 11, "state": "open" }),
+            Utc::now(),
+        );
+        store.upsert_remote_fact_snapshot(&snapshot).await?;
+
+        let Some(loaded) = store
+            .get_remote_fact_snapshot("github", "owner/repo", "pull_request", 11)
+            .await?
+        else {
+            anyhow::bail!("legacy mixed-case GitHub fact should be found");
+        };
+        assert_eq!(loaded.id, snapshot.id);
+        assert_eq!(loaded.repo, "owner/repo");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_store_canonicalizes_repo_before_competing_timestamp_conflict(
+    ) -> anyhow::Result<()> {
+        let Some(store) = remote_fact_test_store().await? else {
+            return Ok(());
+        };
+        let fetched_at = Utc::now();
+        let newer = RemoteFactSnapshot::new(
+            "github",
+            "Owner/Repo",
+            "pull_request",
+            19,
+            "merged",
+            json!({"state": "merged"}),
+            fetched_at,
+        );
+        store.upsert_remote_fact_snapshot(&newer).await?;
+        let older = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            19,
+            "open",
+            json!({"state": "open"}),
+            fetched_at,
+        );
+        let persisted = store.upsert_remote_fact_snapshot(&older).await?;
+
+        assert_eq!(persisted.id, newer.id);
+        assert_eq!(persisted.repo, "owner/repo");
+        assert_eq!(persisted.state, "merged");
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM remote_fact_snapshots
+             WHERE provider = 'github'
+               AND LOWER(repo) = 'owner/repo'
+               AND subject_type = 'pull_request'
+               AND subject_number = 19",
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(count, 1);
+
+        let open_first = RemoteFactSnapshot::new(
+            "github",
+            "Owner/Repo",
+            "pull_request",
+            20,
+            "open",
+            json!({"state": "open"}),
+            fetched_at,
+        );
+        store.upsert_remote_fact_snapshot(&open_first).await?;
+        let merged_second = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            20,
+            "merged",
+            json!({"state": "merged"}),
+            fetched_at,
+        );
+        let persisted = store.upsert_remote_fact_snapshot(&merged_second).await?;
+        assert_eq!(persisted.id, merged_second.id);
+        assert_eq!(persisted.state, "merged");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_store_does_not_overwrite_newer_remote_fact() -> anyhow::Result<()> {
+        let Some(store) = remote_fact_test_store().await? else {
+            return Ok(());
+        };
         let fetched_at = Utc::now();
         let newer = RemoteFactSnapshot::new(
             "github",
@@ -358,4 +539,41 @@ mod tests {
         assert_eq!(persisted.state, "merged");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn runtime_store_does_not_regress_github_terminal_remote_fact() -> anyhow::Result<()> {
+        let Some(store) = remote_fact_test_store().await? else {
+            return Ok(());
+        };
+        let fetched_at = Utc::now();
+        let terminal = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            21,
+            "merged",
+            json!({"state": "merged"}),
+            fetched_at,
+        );
+        store.upsert_remote_fact_snapshot(&terminal).await?;
+        let stale_open = RemoteFactSnapshot::new(
+            "github",
+            "owner/repo",
+            "pull_request",
+            21,
+            "open",
+            json!({"state": "open"}),
+            fetched_at + chrono::Duration::seconds(1),
+        );
+        let persisted = store.upsert_remote_fact_snapshot(&stale_open).await?;
+
+        assert_eq!(persisted.id, terminal.id);
+        assert_eq!(persisted.fact_hash, terminal.fact_hash);
+        assert_eq!(persisted.state, "merged");
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+#[path = "remote_facts_migration_tests.rs"]
+mod migration_tests;

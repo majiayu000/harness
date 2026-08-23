@@ -236,6 +236,8 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
         (
             "detail-active-workflow",
             "detail-active-task",
+            70,
+            170,
             "implementing",
             "implementing",
             "implement",
@@ -245,6 +247,8 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
         (
             "detail-review-wait-workflow",
             "detail-review-wait-task",
+            71,
+            171,
             "awaiting_feedback",
             "waiting",
             "review",
@@ -254,6 +258,8 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
         (
             "detail-terminal-workflow",
             "detail-terminal-task",
+            72,
+            172,
             "failed",
             "failed",
             "terminal",
@@ -262,7 +268,7 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
         ),
     ];
 
-    for &(workflow_id, task_id, workflow_state, _, _, _, _) in &cases {
+    for &(workflow_id, task_id, issue_number, pr_number, workflow_state, _, _, _, _) in &cases {
         let workflow = harness_workflow::runtime::WorkflowInstance::new(
             harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
             1,
@@ -273,8 +279,8 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
         .with_server_data(serde_json::json!({
             "project_id": project_root.to_string_lossy(),
             "repo": "owner/repo",
-            "issue_number": 70,
-            "pr_url": "https://github.com/owner/repo/pull/170",
+            "issue_number": issue_number,
+            "pr_url": format!("https://github.com/owner/repo/pull/{pr_number}"),
             "submission_id": task_id,
             "task_id": format!("{task_id}-legacy"),
         }));
@@ -289,7 +295,18 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
         )
         .with_state(state);
 
-    for &(_, task_id, workflow_state, status, phase, scheduler_state, failure_kind) in &cases {
+    for &(
+        _,
+        task_id,
+        issue_number,
+        pr_number,
+        workflow_state,
+        status,
+        phase,
+        scheduler_state,
+        failure_kind,
+    ) in &cases
+    {
         let response = app
             .clone()
             .oneshot(
@@ -308,8 +325,11 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
         assert_eq!(body["workflow"]["state"], workflow_state);
         assert_eq!(body["status"], status);
         assert_eq!(body["phase"], phase);
-        assert_eq!(body["pr_url"], "https://github.com/owner/repo/pull/170");
-        assert_eq!(body["description"], "issue #70");
+        assert_eq!(
+            body["pr_url"],
+            format!("https://github.com/owner/repo/pull/{pr_number}")
+        );
+        assert_eq!(body["description"], format!("issue #{issue_number}"));
         assert!(body["created_at"].as_str().is_some());
         assert!(body["updated_at"].as_str().is_some());
         assert_eq!(body["scheduler"]["authority_state"], scheduler_state);
