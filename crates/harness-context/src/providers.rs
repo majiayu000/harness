@@ -173,12 +173,14 @@ impl ContextProvider for ContractProvider {
     }
 }
 
+/// Holds shared handles to cached plans so that proposing never deep-clones
+/// plan contents (the server's plan cache stores `Arc<ExecPlan>`).
 pub struct ExecPlanProvider {
-    plans: Vec<harness_exec::plan::ExecPlan>,
+    plans: Vec<std::sync::Arc<harness_exec::plan::ExecPlan>>,
 }
 
 impl ExecPlanProvider {
-    pub fn new(plans: Vec<harness_exec::plan::ExecPlan>) -> Self {
+    pub fn new(plans: Vec<std::sync::Arc<harness_exec::plan::ExecPlan>>) -> Self {
         Self { plans }
     }
 }
@@ -194,7 +196,6 @@ impl ContextProvider for ExecPlanProvider {
             .iter()
             .filter(|plan| ProjectId::from_path(&plan.project_root) == req.project)
             .filter(|plan| matches!(plan.status, ExecPlanStatus::Draft | ExecPlanStatus::Active))
-            .cloned()
             .collect::<Vec<_>>();
         plans.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
 

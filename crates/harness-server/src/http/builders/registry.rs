@@ -15,7 +15,7 @@ use crate::server::HarnessServer;
 /// Outputs of the registry initialization phase.
 pub(crate) struct RegistryBundle {
     pub plan_db: Option<PlanDb>,
-    pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    pub plan_cache: Arc<DashMap<String, std::sync::Arc<harness_exec::plan::ExecPlan>>>,
     pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     pub project_workflow_store:
         Option<Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>>,
@@ -55,7 +55,8 @@ pub(crate) async fn build_registry(
     let mut workflow_definition_registry = server.configure_workflow_definition_registry()?;
     let workflow_ns = workflow_config.storage.schema_namespace;
     let mut startup_results = Vec::new();
-    let plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>> = Arc::new(DashMap::new());
+    let plan_cache: Arc<DashMap<String, std::sync::Arc<harness_exec::plan::ExecPlan>>> =
+        Arc::new(DashMap::new());
 
     let database_url = match harness_core::db::resolve_database_url(configured_database_url) {
         Ok(database_url) => database_url,
@@ -123,7 +124,7 @@ pub(crate) async fn build_registry(
             Ok(plans) => {
                 let count = plans.len();
                 for plan in plans {
-                    plan_cache.insert(plan.id.as_str().to_string(), plan);
+                    plan_cache.insert(plan.id.as_str().to_string(), std::sync::Arc::new(plan));
                 }
                 if count > 0 {
                     tracing::debug!(count, "plan cache: loaded {} plan(s) from db", count);
