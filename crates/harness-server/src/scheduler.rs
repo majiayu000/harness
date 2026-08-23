@@ -63,7 +63,6 @@ impl Scheduler {
             .register_loop_with_interval("scheduler_gc", self.gc_interval.as_secs());
         let gc_state = state.clone();
         let gc_interval = self.gc_interval;
-        handle.started();
         tokio::spawn(async move {
             loop {
                 sleep(gc_interval).await;
@@ -78,7 +77,6 @@ impl Scheduler {
             .register_loop_with_interval("scheduler_health", self.health_interval.as_secs());
         let health_state = state.clone();
         let health_interval = self.health_interval;
-        health_handle.started();
         tokio::spawn(async move {
             loop {
                 sleep(health_interval).await;
@@ -98,7 +96,6 @@ impl Scheduler {
             .register_loop_with_interval("workspace_disk_gc", self.workspace_gc_interval.as_secs());
         let wgc_state = state.clone();
         let wgc_interval = self.workspace_gc_interval;
-        wgc_handle.started();
         tokio::spawn(async move {
             // Brief init delay so the server is fully up before the first scan.
             sleep(Duration::from_secs(30)).await;
