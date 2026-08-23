@@ -71,8 +71,22 @@ pub(crate) use crate::github_client::github_api_base_url;
 
 const GITHUB_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn github_state_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
 async fn github_get_json<T: DeserializeOwned>(path: &str, github_token: Option<&str>) -> Option<T> {
     github_get_json_with_timeout(path, github_token, GITHUB_STATE_TIMEOUT).await
+}
+
+async fn try_github_get_json<T: DeserializeOwned>(
+    path: &str,
+    github_token: Option<&str>,
+) -> anyhow::Result<T> {
+    let client = github_state_client()?;
+    try_github_get_json_with_client_timeout(&client, path, github_token, GITHUB_STATE_TIMEOUT).await
 }
 
 pub(super) async fn github_get_json_with_timeout<T: DeserializeOwned>(
@@ -80,7 +94,13 @@ pub(super) async fn github_get_json_with_timeout<T: DeserializeOwned>(
     github_token: Option<&str>,
     timeout: Duration,
 ) -> Option<T> {
-    let client = reqwest::Client::new();
+    let client = match github_state_client() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::debug!(%error, path, "failed to build GitHub state client");
+            return None;
+        }
+    };
     github_get_json_with_client_timeout(&client, path, github_token, timeout).await
 }
 
@@ -90,6 +110,21 @@ pub(super) async fn github_get_json_with_client_timeout<T: DeserializeOwned>(
     github_token: Option<&str>,
     timeout: Duration,
 ) -> Option<T> {
+    match try_github_get_json_with_client_timeout(client, path, github_token, timeout).await {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::debug!(%error, path, "GitHub state check failed");
+            None
+        }
+    }
+}
+
+async fn try_github_get_json_with_client_timeout<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    path: &str,
+    github_token: Option<&str>,
+    timeout: Duration,
+) -> anyhow::Result<T> {
     let mut request = client
         .get(format!("{}{}", github_api_base_url(), path))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -97,35 +132,22 @@ pub(super) async fn github_get_json_with_client_timeout<T: DeserializeOwned>(
     if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
         request = request.bearer_auth(token);
     }
-    let response = tokio::time::timeout(timeout, async {
+    let value = tokio::time::timeout(timeout, async {
         let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
-            return Ok((status, None));
+            anyhow::bail!("GitHub state check returned HTTP {status}");
         }
-        let value = response.json::<T>().await?;
-        Ok::<_, reqwest::Error>((status, Some(value)))
+        Ok::<T, anyhow::Error>(response.json::<T>().await?)
     })
-    .await;
-    match response {
-        Ok(Ok((_, Some(value)))) => Some(value),
-        Ok(Ok((status, None))) => {
-            tracing::debug!(%status, path, "GitHub state check failed");
-            None
-        }
-        Ok(Err(e)) => {
-            tracing::debug!(error = %e, path, "GitHub state check invocation error");
-            None
-        }
-        Err(_) => {
-            tracing::debug!(
-                path,
-                timeout_ms = timeout.as_millis(),
-                "GitHub state check timed out"
-            );
-            None
-        }
-    }
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "GitHub state check timed out after {}ms",
+            timeout.as_millis()
+        )
+    })??;
+    Ok(value)
 }
 
 pub(super) fn classify_pr_state(state: &GitHubPullState) -> GitHubState {
@@ -168,15 +190,26 @@ pub(crate) async fn fetch_pr_state_by_slug_with_token(
     pr_num: u64,
     github_token: Option<&str>,
 ) -> GitHubState {
-    let Some(state) = github_get_json::<GitHubPullState>(
+    try_fetch_pr_state_by_slug_with_token(repo_slug, pr_num, github_token)
+        .await
+        .unwrap_or(GitHubState::Unknown)
+}
+
+pub(crate) async fn try_fetch_pr_state_by_slug_with_token(
+    repo_slug: &str,
+    pr_num: u64,
+    github_token: Option<&str>,
+) -> anyhow::Result<GitHubState> {
+    let state = try_github_get_json::<GitHubPullState>(
         &format!("/repos/{repo_slug}/pulls/{pr_num}"),
         github_token,
     )
-    .await
-    else {
-        return GitHubState::Unknown;
-    };
-    classify_pr_state(&state)
+    .await?;
+    let state = classify_pr_state(&state);
+    if state == GitHubState::Unknown {
+        anyhow::bail!("GitHub PR state response contained an unknown state");
+    }
+    Ok(state)
 }
 
 pub(crate) async fn fetch_issue_state_with_token(
@@ -184,15 +217,26 @@ pub(crate) async fn fetch_issue_state_with_token(
     issue_num: u64,
     github_token: Option<&str>,
 ) -> GitHubState {
-    let Some(state) = github_get_json::<GitHubIssueState>(
+    try_fetch_issue_state_with_token(repo_slug, issue_num, github_token)
+        .await
+        .unwrap_or(GitHubState::Unknown)
+}
+
+pub(crate) async fn try_fetch_issue_state_with_token(
+    repo_slug: &str,
+    issue_num: u64,
+    github_token: Option<&str>,
+) -> anyhow::Result<GitHubState> {
+    let state = try_github_get_json::<GitHubIssueState>(
         &format!("/repos/{repo_slug}/issues/{issue_num}"),
         github_token,
     )
-    .await
-    else {
-        return GitHubState::Unknown;
-    };
-    classify_issue_state(&state)
+    .await?;
+    let state = classify_issue_state(&state);
+    if state == GitHubState::Unknown {
+        anyhow::bail!("GitHub issue state response contained an unknown state");
+    }
+    Ok(state)
 }
 
 /// Fetch a PR state for admission, rejecting mismatched response identities.

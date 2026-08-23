@@ -271,7 +271,18 @@ impl WorkspaceManager {
 
         let mut rate = DiskRateLimiter::new(max_rate);
 
-        for entry in read_dir.flatten() {
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(
+                        root = ?self.config.root,
+                        "reconcile_disk_workspaces: failed to read directory entry: {error}"
+                    );
+                    summary.errors = summary.errors.saturating_add(1);
+                    continue;
+                }
+            };
             let path = entry.path();
             if !path.is_dir() {
                 continue;
@@ -338,18 +349,31 @@ impl WorkspaceManager {
 
             let gh_state = if let Some(n) = issue_num {
                 rate.acquire().await;
-                crate::reconciliation::fetch_issue_state_with_token(&repo_slug, n, github_token)
+                crate::reconciliation::try_fetch_issue_state_with_token(&repo_slug, n, github_token)
                     .await
             } else if let Some(n) = pr_num {
                 rate.acquire().await;
-                crate::reconciliation::fetch_pr_state_by_slug_with_token(
+                crate::reconciliation::try_fetch_pr_state_by_slug_with_token(
                     &repo_slug,
                     n,
                     github_token,
                 )
                 .await
             } else {
-                crate::reconciliation::GitHubState::Unknown
+                unreachable!("external id was validated above")
+            };
+            let gh_state = match gh_state {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(
+                        workspace_path = ?path,
+                        repo = %repo_slug,
+                        "reconcile_disk_workspaces: GitHub state lookup failed: {error}"
+                    );
+                    summary.skipped_open += 1;
+                    summary.errors = summary.errors.saturating_add(1);
+                    continue;
+                }
             };
 
             let should_remove = matches!(

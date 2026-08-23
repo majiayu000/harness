@@ -462,5 +462,82 @@ async fn reconcile_disk_skips_open_issue_workspace() {
 
     assert_eq!(summary.removed, 0);
     assert_eq!(summary.skipped_open, 1);
+    assert_eq!(summary.errors, 0);
     assert!(issue_dir.exists(), "open issue workspace preserved");
+}
+
+#[tokio::test]
+async fn reconcile_disk_reports_a_malformed_github_response() {
+    let _env_guard = async_env_lock().lock().await;
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let mgr = WorkspaceManager::new(WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    })
+    .expect("mgr");
+    let issue_dir = workspaces.path().join("myorg_my-repo__issue_8");
+    std::fs::create_dir_all(issue_dir.join(".git")).expect("mkdir");
+    std::fs::write(
+        issue_dir.join(".git").join(OWNER_RECORD_FILE),
+        serde_json::to_vec(&WorkspaceOwnerRecord {
+            task_id: "issue:8".to_string(),
+            run_generation: 1,
+            owner_session: "s".to_string(),
+            workspace_key: Some("myorg_my-repo__issue_8".to_string()),
+        })
+        .expect("serialize"),
+    )
+    .expect("write record");
+    let api_base = github_state_server("/repos/myorg/my-repo/issues/8", "not-json").await;
+    let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+
+    let summary = mgr
+        .reconcile_disk_workspaces(source.path(), "gh", 20, None)
+        .await;
+
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.skipped_open, 1);
+    assert!(issue_dir.exists(), "unknown issue state must fail closed");
+}
+
+#[tokio::test]
+async fn reconcile_disk_rejects_redirected_terminal_state() {
+    let _env_guard = async_env_lock().lock().await;
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let mgr = WorkspaceManager::new(WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    })
+    .expect("mgr");
+    let issue_dir = workspaces.path().join("myorg_my-repo__issue_9");
+    std::fs::create_dir_all(issue_dir.join(".git")).expect("mkdir");
+    std::fs::write(
+        issue_dir.join(".git").join(OWNER_RECORD_FILE),
+        serde_json::to_vec(&WorkspaceOwnerRecord {
+            task_id: "issue:9".to_string(),
+            run_generation: 1,
+            owner_session: "s".to_string(),
+            workspace_key: Some("myorg_my-repo__issue_9".to_string()),
+        })
+        .expect("serialize"),
+    )
+    .expect("write record");
+    let api_base =
+        github_redirect_state_server("/repos/myorg/my-repo/issues/9", r#"{"state":"closed"}"#)
+            .await;
+    let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+
+    let summary = mgr
+        .reconcile_disk_workspaces(source.path(), "gh", 20, None)
+        .await;
+
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.skipped_open, 1);
+    assert!(issue_dir.exists(), "redirect response must fail closed");
 }
