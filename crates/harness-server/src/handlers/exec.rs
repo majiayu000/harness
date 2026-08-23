@@ -27,7 +27,7 @@ pub async fn exec_plan_init(
             state
                 .core
                 .plan_cache
-                .insert(plan_id.as_str().to_string(), plan);
+                .insert(plan_id.as_str().to_string(), std::sync::Arc::new(plan));
             RpcResponse::success(id, serde_json::json!({ "plan_id": plan_id }))
         }
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -47,10 +47,10 @@ pub async fn exec_plan_status(
         match db.get(&plan_id).await {
             Ok(Some(plan)) => {
                 // Keep cache warm for the write path.
-                state
-                    .core
-                    .plan_cache
-                    .insert(plan_id.as_str().to_string(), plan.clone());
+                state.core.plan_cache.insert(
+                    plan_id.as_str().to_string(),
+                    std::sync::Arc::new(plan.clone()),
+                );
                 match serde_json::to_value(&plan) {
                     Ok(v) => RpcResponse::success(id, v),
                     Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -123,10 +123,10 @@ pub async fn exec_plan_update(
     match result {
         Ok(Some(plan)) => {
             // Keep in-memory cache in sync with the persisted state.
-            state
-                .core
-                .plan_cache
-                .insert(plan_id.as_str().to_string(), plan.clone());
+            state.core.plan_cache.insert(
+                plan_id.as_str().to_string(),
+                std::sync::Arc::new(plan.clone()),
+            );
             match serde_json::to_value(&plan) {
                 Ok(v) => RpcResponse::success(id, v),
                 Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
