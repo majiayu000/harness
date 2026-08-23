@@ -51,11 +51,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     agent_name: String,
     mut options: TurnLifecycleOptions,
 ) {
-    let Some(project_root) = server
-        .thread_manager
-        .get_thread(&thread_id)
-        .map(|thread| thread.project_root)
-    else {
+    let Some(project_root) = server.thread_manager.thread_project_root(&thread_id) else {
         tracing::warn!(
             "run_turn_lifecycle skipped because thread {} no longer exists",
             thread_id
