@@ -117,10 +117,15 @@ impl TurnInterceptor for HookEnforcer {
             return PostToolUseResult::clean();
         }
 
-        let engine = self.rules.read().await;
-        if engine.guards().is_empty() {
-            return PostToolUseResult::clean();
-        }
+        // Snapshot under the read lock; the scan spawns one bash script per
+        // guard and must not pin the lock while it runs.
+        let snapshot = {
+            let engine = self.rules.read().await;
+            if engine.guards().is_empty() {
+                return PostToolUseResult::clean();
+            }
+            engine.snapshot()
+        };
 
         // Circuit breaker: auto-pass when the consecutive-block limit has been
         // reached (stop_hook_active equivalent — prevents infinite loops).
@@ -133,7 +138,10 @@ impl TurnInterceptor for HookEnforcer {
             return PostToolUseResult::clean();
         }
 
-        let violations = match engine.scan_files(project_root, &event.affected_files).await {
+        let violations = match snapshot
+            .scan_files(project_root, &event.affected_files)
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(

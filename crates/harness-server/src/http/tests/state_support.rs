@@ -335,7 +335,7 @@ pub(super) async fn make_test_state_with_project_root(
     let mut review_queue_config = server.config.concurrency.clone();
     review_queue_config.max_concurrent_tasks = server.config.review.max_concurrent_tasks.max(1);
     let review_task_queue = Arc::new(crate::task_queue::TaskQueue::new(&review_queue_config));
-    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+    let execution_svc = crate::services::execution::DefaultExecutionService::new_for_tests(
         Arc::new(server.config.clone()),
         None,
         None,
@@ -472,7 +472,7 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         )
         .await?,
     );
-    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+    let execution_svc = crate::services::execution::DefaultExecutionService::new_for_tests(
         Arc::new(state.core.server.config.clone()),
         Some(workflow_runtime_store.clone()),
         None,

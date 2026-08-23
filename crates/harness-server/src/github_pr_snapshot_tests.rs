@@ -222,6 +222,26 @@ fn pr_remote_fact_hash_ignores_observed_at() -> anyhow::Result<()> {
 }
 
 #[test]
+fn pr_remote_fact_hash_ignores_repo_case() -> anyhow::Result<()> {
+    let upper_target = GitHubPrSnapshotTarget::new("Owner/Repo", 77)?;
+    let lower_target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+    let upper = GitHubPrSnapshotArtifacts {
+        raw_pr: ready_pr(),
+        normalized_snapshot: normalize_github_pr_snapshot(&upper_target, &ready_pr())?,
+    }
+    .remote_fact_snapshot()?;
+    let lower = GitHubPrSnapshotArtifacts {
+        raw_pr: ready_pr(),
+        normalized_snapshot: normalize_github_pr_snapshot(&lower_target, &ready_pr())?,
+    }
+    .remote_fact_snapshot()?;
+
+    assert_eq!(upper.fact_hash, lower.fact_hash);
+    assert_ne!(upper.facts["repo"], lower.facts["repo"]);
+    Ok(())
+}
+
+#[test]
 fn pr_remote_fact_hash_tracks_check_run_identity() -> anyhow::Result<()> {
     let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
     let mut first_pr = ready_pr();

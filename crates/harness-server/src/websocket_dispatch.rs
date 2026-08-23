@@ -22,13 +22,14 @@ pub(crate) const WS_REQUEST_BACKLOG: usize = 16;
 /// sink. Bounds teardown without cancelling handlers mid-turn.
 pub(crate) const WS_DISPATCH_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
-/// Handle queued request texts one at a time, writing each encoded response to
+/// Handle queued request texts one at a time (bounded outbound queue)., writing each encoded response to
 /// `out_tx`. Processing strictly in arrival order preserves the FIFO response
 /// ordering the previous inline dispatch provided. Exits when the queue closes
 /// or the outgoing channel drops.
 pub(crate) async fn dispatch_requests(
     mut req_rx: tokio::sync::mpsc::Receiver<String>,
-    out_tx: tokio::sync::mpsc::UnboundedSender<Message>,
+    out_tx: tokio::sync::mpsc::Sender<Message>,
+    backlog_close_tx: tokio::sync::watch::Sender<bool>,
     state: Arc<AppState>,
 ) {
     while let Some(text) = req_rx.recv().await {
@@ -43,11 +44,15 @@ pub(crate) async fn dispatch_requests(
 
         if let Some(resp) = response {
             match codec::encode_response(&resp) {
-                Ok(out) => {
-                    if out_tx.send(Message::Text(out.into())).is_err() {
+                Ok(out) => match out_tx.try_send(Message::Text(out.into())) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!("WebSocket outbound backlog full; closing slow connection");
+                        let _ = backlog_close_tx.send(true);
                         break;
                     }
-                }
+                    Err(_) => break,
+                },
                 Err(e) => tracing::warn!("failed to encode response: {e}"),
             }
         }
@@ -74,8 +79,10 @@ mod tests {
         let state = fresh_state_for_initialize(dir.path()).await?;
 
         let (req_tx, req_rx) = tokio::sync::mpsc::channel::<String>(WS_REQUEST_BACKLOG);
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-        tokio::spawn(dispatch_requests(req_rx, out_tx, state));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
+        let (backlog_close_tx, mut backlog_close_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(dispatch_requests(req_rx, out_tx, backlog_close_tx, state));
+        backlog_close_rx.borrow_and_update();
 
         // Pipeline several requests without waiting; responses must come back
         // in arrival order.
@@ -111,8 +118,10 @@ mod tests {
         let state = fresh_state_for_initialize(dir.path()).await?;
 
         let (req_tx, req_rx) = tokio::sync::mpsc::channel::<String>(WS_REQUEST_BACKLOG);
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-        tokio::spawn(dispatch_requests(req_rx, out_tx, state));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
+        let (backlog_close_tx, mut backlog_close_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(dispatch_requests(req_rx, out_tx, backlog_close_tx, state));
+        backlog_close_rx.borrow_and_update();
 
         req_tx.send("not json".to_string()).await?;
         let req = RpcRequest {

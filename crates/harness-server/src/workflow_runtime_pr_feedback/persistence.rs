@@ -90,11 +90,16 @@ pub(super) async fn persist_pr_detected(
     .into_result()
 }
 
-pub(super) async fn persist_pr_feedback_sweep_request(
+pub(super) async fn persist_pr_feedback_sweep_request<F, Fut>(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
     latest_pr_fact: Option<&ObservedPrFact>,
-) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    admission: F,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let workflow_id = instance.id.clone();
     let task_id = runtime_task_id_from_instance(&instance);
     let pr_number = required_u64_field(&instance.data, "pr_number")?;
@@ -131,6 +136,7 @@ pub(super) async fn persist_pr_feedback_sweep_request(
         "pr_number": pr_number,
         "pr_url": pr_url.as_deref(),
     });
+    admission().await?;
     match commit_runtime_decision(
         store,
         instance,
