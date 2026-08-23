@@ -1,4 +1,28 @@
 use crate::http::background::loop_health::LoopSnapshot;
+use crate::http::AppState;
+
+pub(super) fn load_workflow_config(
+    state: &AppState,
+) -> Option<harness_core::config::workflow::WorkflowConfig> {
+    state.core.workflow_runtime_store.as_ref()?;
+    match harness_core::config::workflow::load_workflow_config(&state.core.project_root) {
+        Ok(config) => {
+            state.background_loops.clear_config_failure();
+            Some(config)
+        }
+        Err(error) => {
+            tracing::error!(
+                project_root = %state.core.project_root.display(),
+                error = %error,
+                "operator monitor cannot calculate config-dependent projections from malformed WORKFLOW.md"
+            );
+            state
+                .background_loops
+                .record_config_failure("workflow_watchdog", &error.to_string());
+            None
+        }
+    }
+}
 
 pub(super) fn append_background_loop_degradations(
     subsystems: &mut Vec<&'static str>,

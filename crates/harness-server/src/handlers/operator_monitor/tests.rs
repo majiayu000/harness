@@ -1112,9 +1112,10 @@ async fn endpoint_surfaces_malformed_workflow_config_as_degraded_health() -> any
         .body(axum::body::Body::empty())?;
     let resp = tower::ServiceExt::oneshot(app, req).await?;
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    let status = resp.status();
     let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
     let body: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(status, StatusCode::OK, "unexpected response: {body}");
     assert_eq!(body["health"]["status"], "degraded");
     assert_eq!(
         body["health"]["config_parse_failure"]["affected_loops"],
@@ -1123,6 +1124,10 @@ async fn endpoint_surfaces_malformed_workflow_config_as_degraded_health() -> any
     assert!(body["stuck_workflows"]
         .as_array()
         .expect("stuck workflows array")
+        .is_empty());
+    assert!(body["driverless_progress"]
+        .as_array()
+        .expect("driverless progress array")
         .is_empty());
     Ok(())
 }

@@ -35,7 +35,7 @@ use failure_classification::{
     classify_failure_family, earlier_timestamp, failure_next_action, failure_retryable,
     failure_severity, later_timestamp, normalize_failure_message,
 };
-use health::{append_background_loop_degradations, operator_health_status};
+use health::{append_background_loop_degradations, load_workflow_config, operator_health_status};
 pub(crate) use response::{operator_monitor, OperatorMonitorResponse};
 
 /// A background loop whose last tick is older than this is reported stale and
@@ -219,8 +219,9 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
     let by_source = source_activity(registry, &workflows, &active_tasks);
     let operator_actions =
         operator_actions(registry, &workflows, generated_at, &stopped_eligibility);
-    let stuck_workflows = list_stuck_workflows(state, generated_at).await?;
-    let driverless_progress = list_driverless_progress(state).await?;
+    let workflow_cfg = load_workflow_config(state);
+    let stuck_workflows = list_stuck_workflows(state, workflow_cfg.as_ref(), generated_at).await?;
+    let driverless_progress = list_driverless_progress(state, workflow_cfg.as_ref()).await?;
     let failures = grouped_failures(registry, &recent_failures, &workflows);
     let capacity = state.concurrency.task_queue.global_limit() as u64;
     let local_live_worktrees = state
@@ -288,28 +289,17 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
 
 async fn list_stuck_workflows(
     state: &AppState,
+    workflow_cfg: Option<&harness_core::config::workflow::WorkflowConfig>,
     generated_at: DateTime<Utc>,
 ) -> anyhow::Result<Vec<StuckWorkflow>> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(Vec::new());
     };
-    let workflow_cfg =
-        match harness_core::config::workflow::load_workflow_config(&state.core.project_root) {
-            Ok(config) => config,
-            Err(error) => {
-                tracing::error!(
-                    project_root = %state.core.project_root.display(),
-                    error = %error,
-                    "operator monitor cannot calculate stuck workflows from malformed WORKFLOW.md"
-                );
-                state
-                    .background_loops
-                    .record_config_failure("workflow_watchdog", &error.to_string());
-                // The health payload carries the error below, so the unavailable
-                // projection is explicit instead of making monitoring return 500.
-                return Ok(Vec::new());
-            }
-        };
+    let Some(workflow_cfg) = workflow_cfg else {
+        // A parse failure is explicit in health.config_parse_failure; both
+        // config-dependent projections remain unavailable together.
+        return Ok(Vec::new());
+    };
     if !workflow_cfg.storage.workflow_watchdog_enabled {
         return Ok(Vec::new());
     }
