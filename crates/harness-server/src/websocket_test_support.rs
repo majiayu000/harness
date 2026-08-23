@@ -22,6 +22,10 @@ pub(crate) async fn make_test_state(dir: &std::path::Path) -> anyhow::Result<App
     make_test_state_with_config(dir, HarnessConfig::default()).await
 }
 
+/// Explicitly test-gated so storage-opener guards classify these tempdir
+/// store opens as test usage (lib.rs already compiles this module only for
+/// tests; the attribute keeps this file self-describing).
+#[cfg(test)]
 pub(crate) async fn make_test_state_with_config(
     dir: &std::path::Path,
     mut config: HarnessConfig,

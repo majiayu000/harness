@@ -141,7 +141,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
 
     // Task 1: drain the internal channel → WebSocket sink.
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if ws_sink.send(msg).await.is_err() {
                 break;
@@ -192,7 +192,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     // loop, which must service Pong frames and heartbeat ticks promptly or a
     // healthy connection gets misjudged as stale and killed.
     let (req_tx, req_rx) = tokio::sync::mpsc::channel::<String>(WS_REQUEST_BACKLOG);
-    let dispatch_task = tokio::spawn(crate::websocket_dispatch::dispatch_requests(
+    let mut dispatch_task = tokio::spawn(crate::websocket_dispatch::dispatch_requests(
         req_rx,
         out_tx.clone(),
         state.clone(),
@@ -224,14 +224,19 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         // Fail-closed backpressure: reject instead of growing
-                        // the queue without bound (GH-1984).
+                        // the queue without bound (GH-1984). Echo the request
+                        // id when the frame parses so the client can correlate
+                        // the rejection; unparseable frames keep id null.
                         tracing::warn!("WebSocket request backlog full; rejecting request");
+                        let id = codec::decode_request(&text).ok().and_then(|req| req.id);
                         let resp = RpcResponse::error(
-                            None,
+                            id,
                             harness_protocol::methods::INTERNAL_ERROR,
                             "request backlog full".to_string(),
                         );
                         if let Ok(out) = codec::encode_response(&resp) {
+                            // Unbounded sends are non-blocking by contract;
+                            // an error means the outbound half closed.
                             if out_tx.send(Message::Text(out.into())).is_err() {
                                 break;
                             }
@@ -259,9 +264,33 @@ async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    dispatch_task.abort();
+    // Graceful teardown (GH-1985 review): close the request queue and give
+    // the dispatch worker a bounded window to finish its in-flight handler
+    // and drain queued requests instead of aborting mid-turn. Then stop
+    // notification forwarding, drop the loop-side outbound handle, and give
+    // the sender task a bounded window to flush pending frames to the socket.
+    drop(req_tx);
+    if tokio::time::timeout(
+        crate::websocket_dispatch::WS_DISPATCH_DRAIN_GRACE,
+        &mut dispatch_task,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("WebSocket dispatch worker did not drain in time; cancelling");
+        dispatch_task.abort();
+    }
     notif_task.abort();
-    send_task.abort();
+    drop(out_tx);
+    if tokio::time::timeout(
+        crate::websocket_dispatch::WS_DISPATCH_DRAIN_GRACE,
+        &mut send_task,
+    )
+    .await
+    .is_err()
+    {
+        send_task.abort();
+    }
 }
 
 #[cfg(test)]

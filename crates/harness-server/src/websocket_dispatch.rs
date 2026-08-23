@@ -9,11 +9,18 @@ use crate::{http::AppState, router};
 use axum::extract::ws::Message;
 use harness_protocol::{codec, methods::RpcResponse};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Maximum number of JSON-RPC requests queued for dispatch per connection.
 /// When the backlog is full the server rejects the request with an error
 /// instead of growing memory without bound.
 pub(crate) const WS_REQUEST_BACKLOG: usize = 16;
+
+/// How long connection teardown waits for the dispatch worker to finish its
+/// in-flight request (and drain the queued backlog) before cancelling it, and
+/// for the sender task to flush pending outbound frames before dropping the
+/// sink. Bounds teardown without cancelling handlers mid-turn.
+pub(crate) const WS_DISPATCH_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// Handle queued request texts one at a time, writing each encoded response to
 /// `out_tx`. Processing strictly in arrival order preserves the FIFO response
