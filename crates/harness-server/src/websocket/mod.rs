@@ -1,62 +1,17 @@
-use crate::{http::AppState, router};
-use axum::body::Bytes;
-use axum::extract::ws::{Message, WebSocket};
+use crate::http::AppState;
 use axum::{
     extract::{State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures::{SinkExt, StreamExt};
-use harness_protocol::{codec, methods::RpcResponse};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use tokio::sync::broadcast::error::RecvError;
 
-/// Returns true if the origin is a localhost origin (safe for local dev tools).
-///
-/// Parses the host from the origin to prevent bypass via domains like
-/// `http://localhost.evil.com`.
-///
-/// `"null"` is intentionally NOT treated as local: browsers send `Origin: null`
-/// for `file:` URLs and sandboxed iframes, which are untrusted contexts.
-fn is_local_origin(origin: &str) -> bool {
-    // Origin format: scheme://host or scheme://host:port
-    // Extract the host by stripping scheme and optional port.
-    let host = origin
-        .split_once("://")
-        .map(|(_, rest)| {
-            rest.split(':')
-                .next()
-                .unwrap_or("")
-                .split('/')
-                .next()
-                .unwrap_or("")
-        })
-        .unwrap_or("");
-    host == "localhost" || host == "127.0.0.1"
-}
+mod connection;
+mod origin;
 
-#[derive(Debug, PartialEq, Eq)]
-enum OriginValidationError {
-    InvalidUtf8,
-    NonLocal(String),
-}
-
-fn validate_origin_header(headers: &HeaderMap) -> Result<(), OriginValidationError> {
-    let Some(origin) = headers.get("Origin") else {
-        return Ok(());
-    };
-
-    let origin_str = origin
-        .to_str()
-        .map_err(|_| OriginValidationError::InvalidUtf8)?;
-
-    if is_local_origin(origin_str) {
-        Ok(())
-    } else {
-        Err(OriginValidationError::NonLocal(origin_str.to_owned()))
-    }
-}
+use connection::handle_socket;
+use origin::{validate_origin_header, OriginValidationError};
 
 /// Axum handler that upgrades the HTTP connection to WebSocket.
 ///
@@ -119,140 +74,11 @@ pub async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-/// Handle a single WebSocket connection.
-///
-/// - Incoming text frames are decoded as JSON-RPC 2.0 requests, routed through
-///   the standard dispatcher, and the response is sent back as a text frame.
-/// - Server-push notifications broadcast on `AppState::notification_tx` are
-///   forwarded to the client as unsolicited text frames.
-/// - A Ping frame is sent every `ws_heartbeat_interval_secs` seconds. If the
-///   client does not respond with a Pong before the next Ping, the connection
-///   is treated as stale and closed.
-/// - When the server signals graceful shutdown via `ws_shutdown_tx`, a Close
-///   frame is sent and the handler exits.
-async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
-    let (mut ws_sink, mut ws_stream) = ws.split();
-
-    // Internal channel: both the request handler and the notification forwarder
-    // write messages here; the sender task drains them to the WebSocket.
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
-
-    // Task 1: drain the internal channel → WebSocket sink.
-    let send_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if ws_sink.send(msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Task 2: subscribe to the notification broadcast and forward to client.
-    let notif_out_tx = out_tx.clone();
-    let mut notif_rx = state.notifications.notification_tx.subscribe();
-    let notif_state = state.clone();
-    let notif_task = tokio::spawn(async move {
-        loop {
-            match notif_rx.recv().await {
-                Ok(notif) => match codec::encode_notification(&notif) {
-                    Ok(text) => {
-                        if notif_out_tx.send(Message::Text(text.into())).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => tracing::warn!("failed to encode notification: {e}"),
-                },
-                Err(RecvError::Lagged(skipped)) => {
-                    notif_state.observe_notification_lag(skipped as u64);
-                    continue;
-                }
-                Err(RecvError::Closed) => break,
-            }
-        }
-    });
-
-    // Heartbeat: send a Ping every heartbeat_interval. If no Pong arrives before
-    // the next tick, treat the connection as stale and close it.
-    let heartbeat_interval_secs = state
-        .core
-        .server
-        .config
-        .server
-        .ws_heartbeat_interval_secs
-        .max(1);
-    let heartbeat_interval = tokio::time::Duration::from_secs(heartbeat_interval_secs);
-    let mut heartbeat = tokio::time::interval(heartbeat_interval);
-    heartbeat.tick().await; // consume the first immediate tick
-    let mut pong_pending = false;
-
-    // Subscribe to the graceful-shutdown signal.
-    let mut ws_shutdown_rx = state.notifications.ws_shutdown_tx.subscribe();
-
-    // Main loop: read incoming frames, dispatch as JSON-RPC, reply.
-    loop {
-        tokio::select! {
-            msg = ws_stream.next() => {
-                let result = match msg {
-                    Some(r) => r,
-                    None => break,
-                };
-                let text = match result {
-                    Ok(Message::Text(t)) => t,
-                    Ok(Message::Pong(_)) => {
-                        pong_pending = false;
-                        continue;
-                    }
-                    Ok(Message::Close(_)) | Err(_) => break,
-                    _ => continue,
-                };
-
-                let response = match codec::decode_request(&text) {
-                    Ok(req) => router::handle_request(&state, req).await,
-                    Err(e) => Some(RpcResponse::error(
-                        None,
-                        harness_protocol::methods::PARSE_ERROR,
-                        format!("parse error: {e}"),
-                    )),
-                };
-
-                if let Some(resp) = response {
-                    match codec::encode_response(&resp) {
-                        Ok(out) => {
-                            if out_tx.send(Message::Text(out.into())).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => tracing::warn!("failed to encode response: {e}"),
-                    }
-                }
-            }
-
-            _ = heartbeat.tick() => {
-                if pong_pending {
-                    tracing::debug!("WebSocket heartbeat timeout: closing stale connection");
-                    break;
-                }
-                pong_pending = true;
-                if out_tx.send(Message::Ping(Bytes::new())).is_err() {
-                    break;
-                }
-            }
-
-            _ = ws_shutdown_rx.recv() => {
-                out_tx.send(Message::Close(None)).ok();
-                break;
-            }
-        }
-    }
-
-    notif_task.abort();
-    send_task.abort();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager};
-    use axum::http::HeaderValue;
+    use futures::SinkExt;
     use harness_agents::registry::AgentRegistry;
     use harness_core::config::HarnessConfig;
     use harness_protocol::{
@@ -261,6 +87,7 @@ mod tests {
     };
     use std::sync::Arc;
     use tokio::sync::broadcast;
+    use tokio::sync::broadcast::error::RecvError;
     use tokio::sync::RwLock;
     type TestWebSocket = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -425,63 +252,6 @@ mod tests {
             }
             Err(err) => Err(err.into()),
         }
-    }
-
-    #[test]
-    fn is_local_origin_accepts_localhost_variants() {
-        assert!(is_local_origin("http://localhost"));
-        assert!(is_local_origin("http://localhost:3000"));
-        assert!(is_local_origin("https://localhost:9800"));
-        assert!(is_local_origin("http://127.0.0.1"));
-        assert!(is_local_origin("http://127.0.0.1:8080"));
-    }
-
-    #[test]
-    fn is_local_origin_rejects_non_local() {
-        assert!(!is_local_origin("http://example.com"));
-        assert!(!is_local_origin("http://localhost.evil.com"));
-        assert!(!is_local_origin("http://192.168.1.1"));
-        assert!(!is_local_origin("http://0.0.0.0"));
-        // "null" is sent by browsers for file: URLs and sandboxed iframes —
-        // these are untrusted contexts and must NOT be treated as local.
-        assert!(!is_local_origin("null"));
-    }
-
-    #[test]
-    fn validate_origin_header_allows_missing_origin() {
-        let headers = HeaderMap::new();
-        assert!(validate_origin_header(&headers).is_ok());
-    }
-
-    #[test]
-    fn validate_origin_header_allows_local_origin() {
-        let mut headers = HeaderMap::new();
-        headers.insert("Origin", HeaderValue::from_static("http://localhost:9800"));
-        assert!(validate_origin_header(&headers).is_ok());
-    }
-
-    #[test]
-    fn validate_origin_header_rejects_remote_origin() {
-        let mut headers = HeaderMap::new();
-        headers.insert("Origin", HeaderValue::from_static("http://evil.com"));
-        assert!(matches!(
-            validate_origin_header(&headers),
-            Err(OriginValidationError::NonLocal(_))
-        ));
-    }
-
-    #[test]
-    fn validate_origin_header_rejects_non_utf8_origin() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Origin",
-            HeaderValue::from_bytes(b"http://localhost\xff").expect("valid raw header value"),
-        );
-
-        assert!(matches!(
-            validate_origin_header(&headers),
-            Err(OriginValidationError::InvalidUtf8)
-        ));
     }
 
     /// Integration test: spin up the HTTP server on a random port and connect
@@ -778,6 +548,111 @@ mod tests {
             Some(Err(_)) => {} // connection reset is also acceptable
         }
 
+        Ok(())
+    }
+
+    /// A client that stops reading must not grow server memory without
+    /// limit: once the bounded outbound backlog fills, the server closes
+    /// the connection instead of buffering indefinitely (issue #1996).
+    #[tokio::test]
+    async fn websocket_closes_connection_when_outbound_backlog_overflows() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = HarnessConfig::default();
+        // Keep the heartbeat out of the picture: this test must pass or fail
+        // on backlog overflow alone, not stale-pong detection.
+        config.server.ws_heartbeat_interval_secs = 600;
+        let state = Arc::new(make_test_state_with_config(dir.path(), config).await?);
+
+        let listener = match bind_ws_test_listener().await? {
+            Some(listener) => listener,
+            None => return Ok(()),
+        };
+        let addr = listener.local_addr()?;
+
+        let flood_state = state.clone();
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(ws_handler))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let url = format!("ws://127.0.0.1:{}/ws", addr.port());
+        let mut ws = match connect_ws_test_client(&url).await? {
+            Some(ws) => ws,
+            None => return Ok(()),
+        };
+
+        // Complete an initialize round-trip so the handler loop is live and
+        // its notification forwarder is subscribed before the flood begins.
+        let init_req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(0)),
+            method: Method::Initialize,
+        };
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&init_req)?.into(),
+        ))
+        .await?;
+        {
+            use futures::StreamExt;
+            ws.next()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("no init response"))??;
+        }
+
+        // Sustained flood from a separate task while the client refuses to
+        // read. A one-shot burst would merely trip the notification ring's
+        // lag accounting (capacity 256): the burst finishes before the
+        // forwarder drains anything, so almost nothing reaches the outbound
+        // queue. Pacing the flood keeps steady pressure on so the forwarder
+        // keeps pushing frames past the auto-tuned loopback socket buffers
+        // (~MBs) into the outbound queue until `try_send` hits the cap.
+        const FLOOD: usize = 600_000;
+        let flood_task = tokio::spawn(async move {
+            for i in 0..FLOOD {
+                let _ = flood_state
+                    .notifications
+                    .notification_tx
+                    .send(RpcNotification::new(Notification::TurnStarted {
+                        thread_id: harness_core::types::ThreadId::new(),
+                        turn_id: harness_core::types::TurnId::new(),
+                    }));
+                if i % 2_000 == 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                }
+            }
+        });
+        tokio::time::timeout(tokio::time::Duration::from_secs(60), flood_task)
+            .await
+            .expect("flood task did not finish")?;
+
+        // Give the notifier time to hit the cap and signal the close before
+        // the client starts draining.
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // The stream must terminate early: either a Close frame, an abrupt
+        // reset, or EOF — anything but delivery of every flooded message.
+        use futures::StreamExt;
+        let mut delivered = 0usize;
+        loop {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(5), ws.next()).await {
+                Err(_) => {
+                    anyhow::bail!("connection stayed open; slow-client backlog grew without bound");
+                }
+                Ok(None) => break,
+                Ok(Some(Err(_))) => break, // abrupt close without handshake is fine
+                Ok(Some(Ok(msg))) => match msg {
+                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                    tokio_tungstenite::tungstenite::Message::Text(_) => delivered += 1,
+                    _ => {}
+                },
+            }
+        }
+        assert!(
+            delivered < FLOOD,
+            "client received all {FLOOD} notifications; server buffered instead of closing"
+        );
         Ok(())
     }
 }
