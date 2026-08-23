@@ -59,6 +59,7 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
             let interval = std::time::Duration::from_secs(
                 workflow_cfg.storage.orphan_reaper_interval_secs.max(1),
             );
+            handle.set_interval(interval.as_secs());
 
             // Disabled is a pause, not a stop: config is reloaded each iteration,
             // so re-enabling takes effect on the next tick without a restart.

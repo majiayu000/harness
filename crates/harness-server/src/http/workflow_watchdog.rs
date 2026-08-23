@@ -43,6 +43,7 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
             let interval = std::time::Duration::from_secs(
                 workflow_cfg.storage.workflow_watchdog_interval_secs.max(1),
             );
+            handle.set_interval(interval.as_secs());
             if workflow_cfg.storage.workflow_watchdog_enabled {
                 let mut tick_error: Option<String> = None;
                 if let Some(store) = state.core.workflow_runtime_store.as_ref() {
