@@ -130,8 +130,11 @@ pub(super) async fn github_get_json_with_client_timeout<T: DeserializeOwned>(
 
 pub(super) fn classify_pr_state(state: &GitHubPullState) -> GitHubState {
     let merged_at_empty = state.merged_at.as_deref().unwrap_or("").trim().is_empty();
+    // A payload claiming `state=open` while carrying a merge timestamp is
+    // self-contradictory; classify it Unknown (fail closed) instead of Open so
+    // admission and reconciliation never trust the optimistic half.
     match (state.state.as_str(), merged_at_empty) {
-        ("open", _) | ("OPEN", _) => GitHubState::Open,
+        ("open", true) | ("OPEN", true) => GitHubState::Open,
         ("merged", _) | ("MERGED", _) | ("closed", false) | ("CLOSED", false) => {
             GitHubState::PrMerged
         }

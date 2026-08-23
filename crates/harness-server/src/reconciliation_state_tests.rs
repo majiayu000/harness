@@ -46,6 +46,19 @@ fn classify_pr_state_handles_merged_and_closed() {
 }
 
 #[test]
+fn classify_pr_state_fails_closed_on_contradictory_open_payload() {
+    // state=open with a merge timestamp is self-contradictory; it must not
+    // be trusted as Open (fail closed to Unknown).
+    assert_eq!(
+        classify_pr_state(&GitHubPullState {
+            state: "open".to_string(),
+            merged_at: Some("2024-01-01T00:00:00Z".to_string()),
+        }),
+        GitHubState::Unknown
+    );
+}
+
+#[test]
 fn classify_issue_state_preserves_completion_reason() {
     assert_eq!(
         classify_issue_state(&GitHubIssueState {
