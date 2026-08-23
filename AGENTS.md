@@ -20,9 +20,12 @@ Use the user's language for conversation. Keep repository artifacts in English, 
 Validation workflow:
 
 1. During implementation, run the smallest command from the table that covers the changed surface. Do not run the CI-equivalent workspace check after every edit.
-2. Before committing, run `cargo fmt --all` and `cargo fmt --all -- --check`. For behavior-changing code, run the relevant package tests; run full workspace tests when the change affects shared behavior, persistence, workflow runtime, or agent adapters.
+2. Before committing, run `cargo fmt --all` and `cargo fmt --all -- --check`. For behavior-changing code, run only the relevant package or filtered tests. Do not run `cargo test --workspace` locally; CI owns the full workspace test matrix, including changes to shared behavior, persistence, workflow runtime, and agent adapters.
 3. Before pushing a PR, run `cargo clippy --workspace --all-targets -- -D warnings` to catch CI-equivalent warnings and lints.
 
+- NEVER run `cargo test --workspace` on a developer machine unless the user explicitly requests it for that run.
+- NEVER run broad or unfiltered PostgreSQL test suites against a persistent or shared database. Local PostgreSQL validation must use the narrowest affected package/test filter and an isolated disposable database; leave full database suites to CI.
+- Keep `HARNESS_DATABASE_URL` and `DATABASE_URL` unset when pushing unless the user explicitly requests local database pre-push suites. The DB-less pre-push path and CI are the default.
 - When adding a new enum variant, grep ALL match sites for that enum and update them — CI uses exhaustive match checks
 - Dead code in `#[cfg(test)]` modules still triggers `-D warnings` in CI; delete unused test helpers instead of suppressing with `#[allow(dead_code)]`
 - Pre-commit hook (`.githooks/pre-commit`) runs fmt + staged-scope clippy as a fast commit gate. After cloning, activate with: `git config core.hooksPath .githooks`

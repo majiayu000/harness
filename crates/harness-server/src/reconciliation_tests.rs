@@ -1,7 +1,6 @@
 use super::*;
+use crate::workspace::test_support::{async_env_lock, ScopedEnvVar};
 use std::collections::HashMap;
-use std::sync::OnceLock;
-use tokio::sync::Mutex;
 
 #[path = "reconciliation_blocked_done_tests.rs"]
 mod blocked_done_tests;
@@ -9,37 +8,6 @@ mod blocked_done_tests;
 mod local_review_gate_tests;
 #[path = "reconciliation_ready_to_merge_tests.rs"]
 mod ready_to_merge_tests;
-
-fn async_env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-struct ScopedEnvVar {
-    key: String,
-    original: Option<String>,
-}
-
-impl ScopedEnvVar {
-    fn set(key: &str, value: &str) -> Self {
-        let original = std::env::var(key).ok();
-        unsafe { std::env::set_var(key, value) };
-        Self {
-            key: key.to_string(),
-            original,
-        }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        if let Some(value) = &self.original {
-            unsafe { std::env::set_var(&self.key, value) };
-        } else {
-            unsafe { std::env::remove_var(&self.key) };
-        }
-    }
-}
 
 async fn github_state_server(routes: Vec<(&'static str, &'static str)>) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -137,9 +137,11 @@ pub(super) async fn recovery_expected_base_ref(
     project_id: &str,
     repo: &str,
     issue_number: u64,
+    existing_workflow_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    let id = workflow_id(project_id, Some(repo), issue_number);
-    if let Some(expected) = runtime_store.get_instance(&id).await?.and_then(|workflow| {
+    let canonical_id = workflow_id(project_id, Some(repo), issue_number);
+    let id = existing_workflow_id.unwrap_or(&canonical_id);
+    if let Some(expected) = runtime_store.get_instance(id).await?.and_then(|workflow| {
         crate::http::auto_merge::expected_base_ref_from_workflow_data(&workflow.data)
     }) {
         return Ok(expected);
