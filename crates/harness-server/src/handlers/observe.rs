@@ -45,18 +45,18 @@ pub async fn metrics_collect(
     let project_root = validate_root!(&project_root, id, &state.core.home_dir);
 
     // scan -> persist -> query -> grade
-    let violations = {
-        let rules = state.engines.rules.read().await;
-        match rules.scan(&project_root).await {
-            Ok(violations) => violations,
-            Err(err) => {
-                tracing::error!(
+    // Snapshot under the read lock; the scan spawns one bash script per guard
+    // and must not pin the lock while it runs.
+    let snapshot = state.engines.rules.read().await.snapshot();
+    let violations = match snapshot.scan(&project_root).await {
+        Ok(violations) => violations,
+        Err(err) => {
+            tracing::error!(
                     project_root = %project_root.display(),
-                    error = %err,
-                    "metrics/collect: rules scan failed"
-                );
-                return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
-            }
+                error = %err,
+                "metrics/collect: rules scan failed"
+            );
+            return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
         }
     };
     state
