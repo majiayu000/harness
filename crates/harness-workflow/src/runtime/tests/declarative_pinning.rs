@@ -515,6 +515,7 @@ mod declarative_pinning {
                     active_only: true,
                     task_statuses: Vec::new(),
                     prompt_task_kinds: Vec::new(),
+                    recognized_task_kinds: Vec::new(),
                 },
                 10,
             )
@@ -535,6 +536,7 @@ mod declarative_pinning {
                     active_only: false,
                     task_statuses: vec!["done".to_string()],
                     prompt_task_kinds: Vec::new(),
+                    recognized_task_kinds: Vec::new(),
                 },
                 10,
             )
@@ -592,6 +594,7 @@ mod declarative_pinning {
                     active_only: false,
                     task_statuses: Vec::new(),
                     prompt_task_kinds: vec!["planner".to_string()],
+                    recognized_task_kinds: Vec::new(),
                 },
                 10,
             )
@@ -619,6 +622,7 @@ mod declarative_pinning {
                     active_only: false,
                     task_statuses: Vec::new(),
                     prompt_task_kinds: Vec::new(),
+                    recognized_task_kinds: Vec::new(),
                 },
                 10,
             )
@@ -629,5 +633,128 @@ mod declarative_pinning {
             "empty prompt_task_kinds keeps the whole prompt family visible"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_listing_keeps_github_rows_and_corrupt_policies_visible(
+    ) -> anyhow::Result<()> {
+        // Regression guards for the SQL kind predicate:
+        // 1. GitHub rows carry no execution_policy; a mixed query that also
+        //    requests prompt-family kinds must not coalesce them to `prompt`
+        //    and drop them.
+        // 2. A persisted policy with an unrecognized task_kind must stay
+        //    fetchable so the handler's Rust validation rejects it (fail
+        //    closed) instead of the listing silently hiding it.
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store =
+            WorkflowRuntimeStore::open(&dir.path().join("submission-kind-escapes.db")).await?;
+        let recognized_task_kinds = ["issue", "pr", "prompt", "review", "planner"]
+            .iter()
+            .map(|kind| (*kind).to_string())
+            .collect::<Vec<_>>();
+
+        for (id, payload) in [
+            (
+                "kind-github-issue",
+                json!({
+                    "submission_id": "kind-github-issue",
+                    "issue_number": 7,
+                }),
+            ),
+            ("kind-review", policy_payload("review")),
+            ("kind-prompt", json!({ "submission_id": "kind-prompt" })),
+            ("kind-corrupt", policy_payload("bogus")),
+        ] {
+            let instance = WorkflowInstance::new(
+                if id == "kind-github-issue" {
+                    GITHUB_ISSUE_PR_DEFINITION_ID
+                } else {
+                    "prompt_task"
+                },
+                1,
+                "implementing",
+                WorkflowSubject::new("prompt", id),
+            )
+            .with_id(id)
+            .with_server_data(payload);
+            store.force_upsert_lifecycle_state_for_test(&instance).await?;
+        }
+
+        let mixed_issue_review = store
+            .list_submission_instances_page(
+                None,
+                None,
+                &WorkflowSubmissionFilter {
+                    project_id: None,
+                    source: None,
+                    repo: None,
+                    include_issue: true,
+                    include_pr: false,
+                    include_prompt: true,
+                    active_only: false,
+                    task_statuses: Vec::new(),
+                    prompt_task_kinds: vec!["review".to_string()],
+                    recognized_task_kinds: recognized_task_kinds.clone(),
+                },
+                10,
+            )
+            .await?;
+        let mut mixed_ids: Vec<_> = mixed_issue_review
+            .iter()
+            .map(|instance| instance.id.as_str())
+            .collect();
+        mixed_ids.sort_unstable();
+        assert_eq!(
+            mixed_ids,
+            vec!["kind-corrupt", "kind-github-issue", "kind-review"],
+            "mixed Issue+Review query must keep GitHub rows and still surface \
+             corrupt policies for fail-closed validation"
+        );
+
+        let prompt_only = store
+            .list_submission_instances_page(
+                None,
+                None,
+                &WorkflowSubmissionFilter {
+                    project_id: None,
+                    source: None,
+                    repo: None,
+                    include_issue: false,
+                    include_pr: false,
+                    include_prompt: true,
+                    active_only: false,
+                    task_statuses: Vec::new(),
+                    prompt_task_kinds: vec!["prompt".to_string()],
+                    recognized_task_kinds,
+                },
+                10,
+            )
+            .await?;
+        let mut prompt_ids: Vec<_> = prompt_only
+            .iter()
+            .map(|instance| instance.id.as_str())
+            .collect();
+        prompt_ids.sort_unstable();
+        assert_eq!(
+            prompt_ids,
+            vec!["kind-corrupt", "kind-prompt"],
+            "corrupt policies stay visible even under a strict prompt filter; \
+             plain GitHub and review/planner rows do not match kind=prompt"
+        );
+        Ok(())
+    }
+
+    fn policy_payload(task_kind: &str) -> serde_json::Value {
+        json!({
+            "submission_id": format!("kind-{task_kind}"),
+            "execution_policy": {
+                "task_kind": task_kind,
+                "queue_domain": "primary",
+                "priority": 0
+            }
+        })
     }
 }

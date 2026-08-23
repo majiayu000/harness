@@ -73,9 +73,22 @@ async fn append_runtime_definition_summaries(
                     TaskKind::Prompt | TaskKind::Review | TaskKind::Planner
                 )
             })
-            .map(|kind| kind.as_str().to_string())
+            .map(|kind| kind.as_ref().to_string())
             .collect()
     };
+    // Mirror `AsRef<str> for TaskKind`: exactly the serde values a persisted
+    // execution_policy may carry. Anything else is corrupt and must still be
+    // fetched so `runtime_submission_task_kind` can reject it (fail closed)
+    // instead of the SQL filter silently hiding it.
+    let recognized_task_kinds = [
+        TaskKind::Issue,
+        TaskKind::Pr,
+        TaskKind::Prompt,
+        TaskKind::Review,
+        TaskKind::Planner,
+    ]
+    .map(|kind| kind.as_ref().to_string())
+    .to_vec();
     let store_filter = harness_workflow::runtime::WorkflowSubmissionFilter {
         project_id: filter.project.clone(),
         source: filter.source.clone(),
@@ -93,6 +106,7 @@ async fn append_runtime_definition_summaries(
             .map(|status| status.as_str().to_string())
             .collect(),
         prompt_task_kinds,
+        recognized_task_kinds,
     };
     let mut listed_ids: HashSet<String> = summaries
         .iter()

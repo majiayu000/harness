@@ -34,6 +34,12 @@ pub struct WorkflowSubmissionFilter {
     /// `data.execution_policy.task_kind` (missing policy means `prompt`).
     /// Empty means unconstrained.
     pub prompt_task_kinds: Vec<String>,
+    /// Every `TaskKind` serde value the caller recognizes. Rows whose
+    /// persisted `execution_policy.task_kind` falls outside this set are
+    /// always fetched so the handler's policy validation can reject them
+    /// (fail closed) instead of corrupted submissions silently vanishing
+    /// from filtered listings.
+    pub recognized_task_kinds: Vec<String>,
 }
 
 impl WorkflowRuntimeStore {
@@ -132,12 +138,20 @@ impl WorkflowRuntimeStore {
                AND (NOT $10 OR task_status NOT IN ('done', 'failed', 'cancelled'))
                AND (cardinality($11::text[]) = 0 OR task_status = ANY($11::text[]))
                AND (
-                   NOT $9
+                   definition_id = 'github_issue_pr'
+                   OR NOT $9
                    OR cardinality($16::text[]) = 0
                    OR COALESCE(
                        data->'data'->'execution_policy'->>'task_kind',
                        'prompt'
                    ) = ANY($16::text[])
+                   -- Corrupted policies must still reach the handler's
+                   -- fail-closed validation instead of silently vanishing
+                   -- from filtered listings.
+                   OR COALESCE(
+                       data->'data'->'execution_policy'->>'task_kind',
+                       'prompt'
+                   ) <> ALL($17::text[])
                )
                AND (
                    $5::timestamptz IS NULL
@@ -175,6 +189,7 @@ impl WorkflowRuntimeStore {
         .bind(limit)
         .bind(DECLARATIVE_DEFINITION_METADATA_KIND)
         .bind(&filter.prompt_task_kinds)
+        .bind(&filter.recognized_task_kinds)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
