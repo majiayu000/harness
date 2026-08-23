@@ -266,6 +266,7 @@ async fn runtime_pr_feedback_sweep_continues_after_refresh_failure() -> anyhow::
 
     assert_eq!(tick.requested, 1);
     assert_eq!(tick.rejected, 1);
+    assert_eq!(tick.operational_errors, 1);
     assert_eq!(tick.active_command_exists, 0);
     assert_eq!(tick.skipped, 0);
     assert_eq!(received.lock().await.len(), 2);
@@ -449,6 +450,7 @@ async fn runtime_pr_feedback_sweep_caps_remote_refresh_failures() -> anyhow::Res
 
     assert_eq!(tick.requested, 0);
     assert_eq!(tick.rejected, 1);
+    assert_eq!(tick.operational_errors, 1);
     assert_eq!(tick.remote_request_attempts, 1);
     assert_eq!(received.lock().await.len(), 1);
 
@@ -456,6 +458,7 @@ async fn runtime_pr_feedback_sweep_caps_remote_refresh_failures() -> anyhow::Res
         super::background::run_runtime_pr_feedback_sweep_tick_with_cursor(&state, 1, &mut cursor)
             .await?;
     assert_eq!(next_tick.rejected, 1);
+    assert_eq!(next_tick.operational_errors, 1);
     assert_eq!(next_tick.remote_request_attempts, 1);
     assert_eq!(
         received.lock().await.len(),

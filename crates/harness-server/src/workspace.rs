@@ -214,6 +214,7 @@ pub(crate) struct DiskReconciliationSummary {
     pub(crate) skipped_open: u32,
     pub(crate) skipped_live: Vec<SkippedLiveWorkspace>,
     pub(crate) released_leases: u32,
+    pub(crate) errors: u32,
 }
 
 pub struct WorkspaceManager {

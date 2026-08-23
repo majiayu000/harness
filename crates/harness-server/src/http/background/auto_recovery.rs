@@ -94,6 +94,17 @@ impl AutoRecoveryTick {
     }
 }
 
+fn record_auto_recovery_tick(handle: &super::LoopHandle, tick: &AutoRecoveryTick) {
+    if tick.errored == 0 {
+        handle.tick_ok();
+    } else {
+        handle.tick_failed(&format!(
+            "{} auto-recovery instance(s) failed",
+            tick.errored
+        ));
+    }
+}
+
 /// Spawn the recheck scheduler. With the global policy disabled (the
 /// default) the background task is not spawned at all (B-003).
 pub(in crate::http) fn spawn_auto_recovery(state: &Arc<AppState>) {
@@ -126,7 +137,7 @@ pub(in crate::http) fn spawn_auto_recovery(state: &Arc<AppState>) {
                     if tick.touched_anything() {
                         tracing::info!(?tick, "workflow runtime auto-recovery tick");
                     }
-                    handle.tick_ok();
+                    record_auto_recovery_tick(&handle, &tick);
                 }
                 Err(error) => {
                     // Store unavailable or scan failure: nothing was consumed;

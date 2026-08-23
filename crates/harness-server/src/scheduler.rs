@@ -17,6 +17,20 @@ fn record_gc_tick(
     }
 }
 
+fn record_workspace_gc_tick(
+    handle: &crate::http::background::LoopHandle,
+    summary: &crate::workspace::DiskReconciliationSummary,
+) {
+    if summary.errors == 0 {
+        handle.tick_ok();
+    } else {
+        handle.tick_failed(&format!(
+            "workspace disk GC completed with {} error(s)",
+            summary.errors
+        ));
+    }
+}
+
 pub struct Scheduler {
     pub gc_interval: Duration,
     pub health_interval: Duration,
@@ -120,10 +134,13 @@ impl Scheduler {
                         removed = summary.removed,
                         skipped_uuid = summary.skipped_uuid,
                         skipped_open = summary.skipped_open,
+                        errors = summary.errors,
                         "scheduler: workspace disk GC complete"
                     );
+                    record_workspace_gc_tick(&wgc_handle, &summary);
+                } else {
+                    wgc_handle.tick_ok();
                 }
-                wgc_handle.tick_ok();
                 sleep(wgc_interval).await;
             }
         });
@@ -211,6 +228,26 @@ mod tests {
         assert_eq!(snapshot[0].tick_count, 0);
         assert_eq!(snapshot[0].failure_count, 1);
         assert_eq!(snapshot[0].last_error.as_deref(), Some("gc failed"));
+    }
+
+    #[test]
+    fn workspace_gc_summary_errors_record_a_failed_health_tick() {
+        let health = Arc::new(crate::http::background::BackgroundLoopHealth::new());
+        let handle = health.register_loop("workspace_disk_gc");
+        let summary = crate::workspace::DiskReconciliationSummary {
+            errors: 2,
+            ..crate::workspace::DiskReconciliationSummary::default()
+        };
+
+        record_workspace_gc_tick(&handle, &summary);
+
+        let snapshot = health.snapshot(60);
+        assert_eq!(snapshot[0].tick_count, 0);
+        assert_eq!(snapshot[0].failure_count, 1);
+        assert_eq!(
+            snapshot[0].last_error.as_deref(),
+            Some("workspace disk GC completed with 2 error(s)")
+        );
     }
 
     #[test]

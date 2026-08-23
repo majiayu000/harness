@@ -253,6 +253,7 @@ impl WorkspaceManager {
                 }
                 Err(error) => {
                     tracing::warn!("workspace disk lease reconciliation failed: {error}");
+                    summary.errors = summary.errors.saturating_add(1);
                 }
             }
         }
@@ -263,6 +264,7 @@ impl WorkspaceManager {
                     "reconcile_disk_workspaces: failed to read {:?}: {e}",
                     self.config.root
                 );
+                summary.errors = summary.errors.saturating_add(1);
                 return summary;
             }
         };
@@ -305,6 +307,7 @@ impl WorkspaceManager {
                             "reconcile_disk_workspaces: failed to inspect persisted workspace lease: {error}"
                         );
                         summary.skipped_open += 1;
+                        summary.errors = summary.errors.saturating_add(1);
                         continue;
                     }
                 }
@@ -388,6 +391,7 @@ impl WorkspaceManager {
                             "reconcile_disk_workspaces: reclaim gate failed closed after lease lookup error: {error}"
                         );
                         summary.skipped_open += 1;
+                        summary.errors = summary.errors.saturating_add(1);
                     }
                     Ok(WorkspaceReclaimOutcome::SkippedMissingTask {
                         task_id,
@@ -401,9 +405,12 @@ impl WorkspaceManager {
                         );
                         summary.skipped_open += 1;
                     }
-                    Err(e) => tracing::warn!(
-                        "reconcile_disk_workspaces: cleanup failed for {path:?}: {e}"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            "reconcile_disk_workspaces: cleanup failed for {path:?}: {e}"
+                        );
+                        summary.errors = summary.errors.saturating_add(1);
+                    }
                 }
             } else {
                 summary.skipped_open += 1;
@@ -418,6 +425,7 @@ impl WorkspaceManager {
             skipped_live = summary.skipped_live.len(),
             skipped_live_workspaces = ?summary.skipped_live,
             released_leases = summary.released_leases,
+            errors = summary.errors,
             "reconcile_disk_workspaces: scan complete"
         );
         summary

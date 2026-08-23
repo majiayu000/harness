@@ -8,6 +8,7 @@ pub(in crate::http) struct RuntimePrFeedbackSweepTick {
     pub remote_request_attempts: usize,
     pub skipped: usize,
     pub rejected: usize,
+    pub operational_errors: usize,
 }
 
 impl RuntimePrFeedbackSweepTick {
@@ -17,6 +18,18 @@ impl RuntimePrFeedbackSweepTick {
             || self.active_command_exists > 0
             || self.skipped > 0
             || self.rejected > 0
+            || self.operational_errors > 0
+    }
+}
+
+fn record_pr_feedback_tick(handle: &LoopHandle, tick: &RuntimePrFeedbackSweepTick) {
+    if tick.operational_errors == 0 {
+        handle.tick_ok();
+    } else {
+        handle.tick_failed(&format!(
+            "{} PR feedback operation(s) failed",
+            tick.operational_errors
+        ));
     }
 }
 
@@ -154,6 +167,7 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick_with_cursor(
                         "workflow runtime PR feedback sweep skipped workflow after PR fact refresh failure"
                     );
                     tick.rejected += 1;
+                    tick.operational_errors += 1;
                     continue;
                 }
             };
@@ -390,10 +404,11 @@ pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) 
                             remote_request_attempts = tick.remote_request_attempts,
                             skipped = tick.skipped,
                             rejected = tick.rejected,
+                            operational_errors = tick.operational_errors,
                             "workflow runtime PR feedback sweeper tick complete"
                         );
                     }
-                    handle.tick_ok();
+                    record_pr_feedback_tick(&handle, &tick);
                 }
                 Err(error) => {
                     tracing::warn!("workflow runtime PR feedback sweeper tick failed: {error}");
@@ -403,4 +418,30 @@ pub(in crate::http) fn spawn_runtime_pr_feedback_sweeper(state: &Arc<AppState>) 
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operational_error_records_failed_pr_feedback_loop_health() {
+        let health = Arc::new(crate::http::background::BackgroundLoopHealth::new());
+        let handle = health.register_loop("pr_feedback_sweeper");
+        let tick = RuntimePrFeedbackSweepTick {
+            rejected: 1,
+            operational_errors: 1,
+            ..RuntimePrFeedbackSweepTick::default()
+        };
+
+        record_pr_feedback_tick(&handle, &tick);
+
+        let snapshot = health.snapshot(60);
+        assert_eq!(snapshot[0].tick_count, 0);
+        assert_eq!(snapshot[0].failure_count, 1);
+        assert_eq!(
+            snapshot[0].last_error.as_deref(),
+            Some("1 PR feedback operation(s) failed")
+        );
+    }
 }
