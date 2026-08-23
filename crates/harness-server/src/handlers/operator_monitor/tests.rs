@@ -7,6 +7,41 @@ use harness_workflow::runtime::{
     WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
 };
 
+#[test]
+fn stale_background_loop_degrades_the_aggregate_health_status() {
+    let mut degraded_subsystems = Vec::new();
+    let snapshots = vec![crate::http::background::loop_health::LoopSnapshot {
+        name: "scheduler_gc",
+        tick_count: 0,
+        failure_count: 0,
+        last_tick_secs_ago: None,
+        last_success_secs_ago: None,
+        last_error: None,
+        stale: true,
+    }];
+
+    append_background_loop_degradations(&mut degraded_subsystems, &snapshots, false);
+
+    assert_eq!(degraded_subsystems, vec!["background_loop_stale"]);
+    assert_eq!(
+        operator_health_status(&degraded_subsystems, "ok", false, false),
+        "degraded"
+    );
+}
+
+#[test]
+fn workflow_config_failure_degrades_the_aggregate_health_status() {
+    let mut degraded_subsystems = Vec::new();
+
+    append_background_loop_degradations(&mut degraded_subsystems, &[], true);
+
+    assert_eq!(degraded_subsystems, vec!["workflow_config_parse_failure"]);
+    assert_eq!(
+        operator_health_status(&degraded_subsystems, "ok", false, false),
+        "degraded"
+    );
+}
+
 fn workflow(state: &str, data: Value) -> WorkflowInstance {
     WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
@@ -1049,6 +1084,51 @@ async fn endpoint_includes_config_enabled_stuck_workflows() -> anyhow::Result<()
     assert_eq!(stuck[0]["repo"], "owner/repo");
     assert_eq!(stuck[0]["issue"], 44);
     assert_eq!(stuck[0]["pr"], 45);
+    Ok(())
+}
+
+#[tokio::test]
+async fn endpoint_surfaces_malformed_workflow_config_as_degraded_health() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-bad-config-")?;
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    state.core.workflow_runtime_store = Some(Arc::new(
+        WorkflowRuntimeStore::open_with_database_url(
+            &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
+            Some(&test_helpers::test_database_url()?),
+        )
+        .await?,
+    ));
+    std::fs::write(dir.path().join("WORKFLOW.md"), "---\nstorage: [\n---\n")?;
+
+    let app = Router::new()
+        .route("/api/operator-monitor", get(operator_monitor))
+        .with_state(Arc::new(state));
+    let req = axum::http::Request::builder()
+        .uri("/api/operator-monitor")
+        .body(axum::body::Body::empty())?;
+    let resp = tower::ServiceExt::oneshot(app, req).await?;
+
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(status, StatusCode::OK, "unexpected response: {body}");
+    assert_eq!(body["health"]["status"], "degraded");
+    assert_eq!(
+        body["health"]["config_parse_failure"]["affected_loops"],
+        json!(["workflow_watchdog"])
+    );
+    assert!(body["stuck_workflows"]
+        .as_array()
+        .expect("stuck workflows array")
+        .is_empty());
+    assert!(body["driverless_progress"]
+        .as_array()
+        .expect("driverless progress array")
+        .is_empty());
     Ok(())
 }
 

@@ -8,6 +8,7 @@
 mod activity;
 mod driverless_progress;
 mod failure_classification;
+mod health;
 mod response;
 mod sampling;
 
@@ -34,6 +35,7 @@ use failure_classification::{
     classify_failure_family, earlier_timestamp, failure_next_action, failure_retryable,
     failure_severity, later_timestamp, normalize_failure_message,
 };
+use health::{append_background_loop_degradations, load_workflow_config, operator_health_status};
 pub(crate) use response::{operator_monitor, OperatorMonitorResponse};
 
 /// A background loop whose last tick is older than this is reported stale and
@@ -183,22 +185,12 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
     let runtime_host_leases =
         super::runtime_hosts::active_runtime_job_lease_count_total(state).await?;
     let runtime_log_state = state.core.server.runtime_logs.state.as_str();
-    let degraded_subsystems = state.degraded_subsystems.clone();
+    let mut degraded_subsystems = state.degraded_subsystems.clone();
     let runtime_state_dirty = state.is_runtime_state_dirty();
     let isolation_degraded = !state
         .isolation_availability
         .unavailable_required_tiers(&state.core.server.config.isolation)
         .is_empty();
-    let health_status = if degraded_subsystems.is_empty()
-        && runtime_log_state != "degraded"
-        && !runtime_state_dirty
-        && !isolation_degraded
-    {
-        "ok"
-    } else {
-        "degraded"
-    };
-
     let fallback_registry = WorkflowDefinitionRegistry::with_builtins();
     let registry = state
         .core
@@ -227,8 +219,9 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
     let by_source = source_activity(registry, &workflows, &active_tasks);
     let operator_actions =
         operator_actions(registry, &workflows, generated_at, &stopped_eligibility);
-    let stuck_workflows = list_stuck_workflows(state, generated_at).await?;
-    let driverless_progress = list_driverless_progress(state).await?;
+    let workflow_cfg = load_workflow_config(state);
+    let stuck_workflows = list_stuck_workflows(state, workflow_cfg.as_ref(), generated_at).await?;
+    let driverless_progress = list_driverless_progress(state, workflow_cfg.as_ref()).await?;
     let failures = grouped_failures(registry, &recent_failures, &workflows);
     let capacity = state.concurrency.task_queue.global_limit() as u64;
     let local_live_worktrees = state
@@ -238,35 +231,24 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
         .map(|manager| manager.live_count());
     let loop_snapshots = state.background_loops.snapshot(BACKGROUND_LOOP_STALE_SECS);
     let config_parse_failure = state.background_loops.config_failure_snapshot();
+    append_background_loop_degradations(
+        &mut degraded_subsystems,
+        &loop_snapshots,
+        config_parse_failure.is_some(),
+    );
+    let health_status = operator_health_status(
+        &degraded_subsystems,
+        runtime_log_state,
+        runtime_state_dirty,
+        isolation_degraded,
+    );
 
     Ok(OperatorMonitorPayload {
         generated_at: generated_at.to_rfc3339(),
         sample_limit: WORKFLOW_SAMPLE_LIMIT,
         health: OperatorHealth {
             status: health_status,
-            degraded_subsystems: {
-                let mut subsystems = degraded_subsystems;
-                for loop_snapshot in &loop_snapshots {
-                    if loop_snapshot.stale {
-                        subsystems.push(match loop_snapshot.name {
-                            "orphan_schema_reaper" => "orphan_schema_reaper_stale",
-                            "workflow_watchdog" => "workflow_watchdog_stale",
-                            "runtime_retention" => "runtime_retention_stale",
-                            "task_retention" => "task_retention_stale",
-                            _ => {
-                                // Guards against future loop names missing a
-                                // mapping without leaking a string per snapshot;
-                                // the precise name is in `background_loops`.
-                                "background_loop_stale"
-                            }
-                        });
-                    }
-                }
-                if config_parse_failure.is_some() {
-                    subsystems.push("workflow_config_parse_failure");
-                }
-                subsystems
-            },
+            degraded_subsystems,
             runtime_log_state,
             runtime_log_path: state
                 .core
@@ -307,13 +289,17 @@ async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMoni
 
 async fn list_stuck_workflows(
     state: &AppState,
+    workflow_cfg: Option<&harness_core::config::workflow::WorkflowConfig>,
     generated_at: DateTime<Utc>,
 ) -> anyhow::Result<Vec<StuckWorkflow>> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(Vec::new());
     };
-    let workflow_cfg =
-        harness_core::config::workflow::load_workflow_config(&state.core.project_root)?;
+    let Some(workflow_cfg) = workflow_cfg else {
+        // A parse failure is explicit in health.config_parse_failure; both
+        // config-dependent projections remain unavailable together.
+        return Ok(Vec::new());
+    };
     if !workflow_cfg.storage.workflow_watchdog_enabled {
         return Ok(Vec::new());
     }

@@ -40,6 +40,7 @@ pub(super) fn spawn_runtime_retention(state: &Arc<AppState>) {
             let interval = std::time::Duration::from_secs(
                 workflow_cfg.storage.runtime_retention_interval_secs.max(1),
             );
+            handle.set_interval(interval.as_secs());
             if workflow_cfg.storage.runtime_retention_enabled {
                 warn_if_retention_undercuts_log_lookback(
                     workflow_cfg.storage.runtime_retention_days,

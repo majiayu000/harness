@@ -2,6 +2,26 @@ use super::test_support::*;
 use super::*;
 
 #[tokio::test]
+async fn reconcile_disk_reports_an_unreadable_workspace_root() {
+    let source = tempfile::tempdir().expect("tempdir");
+    let parent = tempfile::tempdir().expect("tempdir");
+    let missing_root = parent.path().join("missing-workspaces");
+    let mgr = WorkspaceManager::new(WorkspaceConfig {
+        root: missing_root.clone(),
+        ..Default::default()
+    })
+    .expect("mgr");
+    std::fs::remove_dir(&missing_root).expect("remove workspace root");
+
+    let summary = mgr
+        .reconcile_disk_workspaces(source.path(), "gh", 20, None)
+        .await;
+
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.scanned, 0);
+}
+
+#[tokio::test]
 async fn reconcile_disk_skips_uuid_keyed_workspace() {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());

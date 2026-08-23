@@ -29,12 +29,14 @@ impl From<DriverlessProgressInstance> for DriverlessProgressEvidence {
 
 pub(super) async fn list_driverless_progress(
     state: &AppState,
+    workflow_cfg: Option<&harness_core::config::workflow::WorkflowConfig>,
 ) -> anyhow::Result<Vec<DriverlessProgressEvidence>> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(Vec::new());
     };
-    let workflow_cfg =
-        harness_core::config::workflow::load_workflow_config(&state.core.project_root)?;
+    let Some(workflow_cfg) = workflow_cfg else {
+        return Ok(Vec::new());
+    };
     let limit = i64::from(workflow_cfg.storage.workflow_watchdog_batch_size)
         .clamp(1, WORKFLOW_SAMPLE_LIMIT);
     Ok(store

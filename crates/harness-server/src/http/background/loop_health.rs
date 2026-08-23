@@ -17,13 +17,20 @@ pub(crate) struct BackgroundLoopHealth {
     config_failure: Mutex<Option<ConfigFailure>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LoopStatus {
     tick_count: u64,
     failure_count: u64,
     last_tick_at: Option<Instant>,
     last_success_at: Option<Instant>,
     last_error: Option<String>,
+    /// Configured cadence of the loop in seconds (0 when unknown). Slow loops
+    /// declare this so staleness is judged against their own interval instead
+    /// of the global floor; a 24h scheduler tick is healthy at hour 12.
+    expected_interval_secs: u64,
+    /// When the loop registered. A loop that has not produced its first tick
+    /// yet is judged from this instant instead of being treated as stale.
+    registered_at: Instant,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -62,15 +69,61 @@ impl BackgroundLoopHealth {
 
     /// Register (or re-register) a loop and return its handle.
     pub(crate) fn register_loop(self: &Arc<Self>, name: &'static str) -> LoopHandle {
-        self.loops
-            .lock()
-            .expect("loop health mutex poisoned")
-            .entry(name)
-            .or_default();
+        self.register_loop_with_interval(name, 0)
+    }
+
+    /// Register (or re-register) a loop with its configured tick cadence, in
+    /// seconds. Loops slower than the global staleness floor must declare
+    /// their interval or the operator monitor would report them stale between
+    /// every normal tick (GH-1981).
+    pub(crate) fn register_loop_with_interval(
+        self: &Arc<Self>,
+        name: &'static str,
+        expected_interval_secs: u64,
+    ) -> LoopHandle {
+        let mut loops = self.loops.lock().expect("loop health mutex poisoned");
+        match loops.entry(name) {
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                // Re-registration refreshes only the cadence hint; liveness
+                // history belongs to the running server, not the spawn site.
+                occupied.get_mut().expected_interval_secs = expected_interval_secs;
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(LoopStatus {
+                    tick_count: 0,
+                    failure_count: 0,
+                    last_tick_at: None,
+                    last_success_at: None,
+                    last_error: None,
+                    expected_interval_secs,
+                    registered_at: Instant::now(),
+                });
+            }
+        }
         LoopHandle {
             health: Arc::clone(self),
             name,
         }
+    }
+
+    /// Update the expected tick cadence of an already-registered loop. Called
+    /// by loops whose interval is reloaded from config on every iteration.
+    pub(crate) fn set_loop_interval(&self, name: &'static str, expected_interval_secs: u64) {
+        if let Some(status) = self
+            .loops
+            .lock()
+            .expect("loop health mutex poisoned")
+            .get_mut(name)
+        {
+            status.expected_interval_secs = expected_interval_secs;
+        }
+    }
+
+    /// Staleness threshold for one loop: the global floor, raised to cover the
+    /// loop's own cadence with 50% slack. A healthy slow loop never crosses
+    /// it; a dead one does after at most one-and-a-half missed intervals.
+    fn stale_threshold_secs(max_stale_secs: u64, expected_interval_secs: u64) -> u64 {
+        max_stale_secs.max(expected_interval_secs.saturating_add(expected_interval_secs / 2))
     }
 
     /// Record that `name` completed a tick successfully.
@@ -149,15 +202,23 @@ impl BackgroundLoopHealth {
                 name,
                 tick_count: status.tick_count,
                 failure_count: status.failure_count,
-                last_tick_secs_ago: status.last_tick_at.map(|t| now.duration_since(t).as_secs()),
+                last_tick_secs_ago: status
+                    .last_tick_at
+                    .map(|t| now.saturating_duration_since(t).as_secs()),
                 last_success_secs_ago: status
                     .last_success_at
-                    .map(|t| now.duration_since(t).as_secs()),
+                    .map(|t| now.saturating_duration_since(t).as_secs()),
                 last_error: status.last_error.clone(),
-                stale: status
-                    .last_tick_at
-                    .map(|t| now.duration_since(t).as_secs() > max_stale_secs)
-                    .unwrap_or(true),
+                stale: {
+                    let threshold =
+                        Self::stale_threshold_secs(max_stale_secs, status.expected_interval_secs);
+                    // A loop that has not ticked yet is judged from when it
+                    // registered, not treated as instantly stale: sleep-first
+                    // loops (daily schedulers, delayed initial scans) are
+                    // healthy between spawn and their first real tick.
+                    let since = status.last_tick_at.unwrap_or(status.registered_at);
+                    now.saturating_duration_since(since).as_secs() > threshold
+                },
             })
             .collect()
     }
@@ -189,6 +250,13 @@ impl LoopHandle {
         self.health.record_tick(self.name);
     }
 
+    /// Update the expected tick cadence of this loop (config-driven loops
+    /// call this after each config reload).
+    pub(crate) fn set_interval(&self, expected_interval_secs: u64) {
+        self.health
+            .set_loop_interval(self.name, expected_interval_secs);
+    }
+
     pub(crate) fn tick_failed(&self, error: &str) {
         self.health.record_tick_failure(self.name, error);
     }
@@ -212,8 +280,8 @@ mod tests {
         let health = Arc::new(BackgroundLoopHealth::new());
         let handle = health.register_loop("test-loop");
         assert!(
-            health.snapshot(60)[0].stale,
-            "unregistered loop starts stale"
+            !health.snapshot(60)[0].stale,
+            "a loop that has not ticked yet is fresh until its threshold passes"
         );
         handle.tick_ok();
         handle.tick_ok();
@@ -253,13 +321,121 @@ mod tests {
     fn stale_detection_uses_last_tick() {
         let health = Arc::new(BackgroundLoopHealth::new());
         let handle = health.register_loop("stale-loop");
-        // A loop that never ticked is stale at any threshold.
-        assert!(health.snapshot(60)[0].stale);
+        // A loop that has not ticked yet is judged from its registration
+        // time, so a fresh registration is healthy at the global floor.
+        assert!(!health.snapshot(60)[0].stale);
         handle.tick_ok();
         assert!(!health.snapshot(60)[0].stale);
         std::thread::sleep(Duration::from_millis(5));
         // Second granularity truncation: a 5ms-old tick is not stale at any
         // whole-second threshold >= 1.
         assert!(!health.snapshot(1)[0].stale);
+    }
+
+    #[test]
+    fn never_ticked_loop_expires_after_registration_window() {
+        let health = Arc::new(BackgroundLoopHealth::new());
+        health
+            .loops
+            .lock()
+            .expect("loop health mutex poisoned")
+            .insert(
+                "ghost-loop",
+                LoopStatus {
+                    tick_count: 0,
+                    failure_count: 0,
+                    last_tick_at: None,
+                    last_success_at: None,
+                    last_error: None,
+                    expected_interval_secs: 0,
+                    registered_at: Instant::now()
+                        .checked_sub(Duration::from_secs(120))
+                        .expect("clock moved backwards"),
+                },
+            );
+        // Registered 120s ago with no tick and no interval hint: past the
+        // 60s floor, the loop is genuinely stale.
+        assert!(health.snapshot(60)[0].stale);
+    }
+
+    #[test]
+    fn slow_never_ticked_loop_is_judged_by_its_own_interval() {
+        let health = Arc::new(BackgroundLoopHealth::new());
+        health
+            .loops
+            .lock()
+            .expect("loop health mutex poisoned")
+            .insert(
+                "slow-ghost-loop",
+                LoopStatus {
+                    tick_count: 0,
+                    failure_count: 0,
+                    last_tick_at: None,
+                    last_success_at: None,
+                    last_error: None,
+                    expected_interval_secs: 3600,
+                    registered_at: Instant::now()
+                        .checked_sub(Duration::from_secs(120))
+                        .expect("clock moved backwards"),
+                },
+            );
+        // Registered 120s ago with a 1h cadence (threshold 5400s): still
+        // inside its own window, so it must not report stale.
+        assert!(!health.snapshot(60)[0].stale);
+    }
+
+    #[test]
+    fn staleness_threshold_saturates_on_absurd_intervals() {
+        assert_eq!(
+            BackgroundLoopHealth::stale_threshold_secs(60, u64::MAX),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn interval_hint_raises_staleness_threshold_for_slow_loops() {
+        let health = Arc::new(BackgroundLoopHealth::new());
+        let fast = health.register_loop_with_interval("fast-loop", 2);
+        let slow = health.register_loop_with_interval("slow-loop", 3600);
+        fast.tick_ok();
+        slow.tick_ok();
+        let snapshot = health.snapshot(60);
+        let fast_status = snapshot.iter().find(|s| s.name == "fast-loop").unwrap();
+        let slow_status = snapshot.iter().find(|s| s.name == "slow-loop").unwrap();
+        // The fast loop is judged by the global floor (60s here).
+        assert!(!fast_status.stale);
+        // The slow loop just ticked, so it is healthy even though its own
+        // cadence (3600s → 5400s threshold) dwarfs the floor.
+        assert!(!slow_status.stale);
+    }
+
+    #[test]
+    fn set_loop_interval_updates_threshold_in_place() {
+        let health = Arc::new(BackgroundLoopHealth::new());
+        let handle = health.register_loop("rescheduled-loop");
+        handle.tick_ok();
+        // Without a hint the global floor governs; raising it to 100s makes
+        // the loop's threshold max(60, 150) = 150s without re-registering.
+        health.set_loop_interval("rescheduled-loop", 100);
+        let snapshot = health.snapshot(60);
+        assert_eq!(snapshot.len(), 1, "interval update must not duplicate");
+        assert!(!snapshot[0].stale);
+    }
+
+    #[test]
+    fn future_tick_instants_do_not_panic_snapshotting() {
+        let health = Arc::new(BackgroundLoopHealth::new());
+        health.register_loop("future-loop");
+        health
+            .loops
+            .lock()
+            .expect("loop health mutex poisoned")
+            .get_mut("future-loop")
+            .expect("registered loop")
+            .last_tick_at = Some(Instant::now() + Duration::from_secs(1));
+
+        let snapshot = health.snapshot(60);
+        assert_eq!(snapshot[0].last_tick_secs_ago, Some(0));
+        assert!(!snapshot[0].stale);
     }
 }

@@ -38,6 +38,7 @@ pub(super) fn spawn_task_retention(state: &Arc<AppState>) {
             let interval = std::time::Duration::from_secs(
                 workflow_cfg.storage.task_retention_interval_secs.max(1),
             );
+            handle.set_interval(interval.as_secs());
             if workflow_cfg.storage.task_retention_enabled {
                 let dry_run_remaining = dry_run_passes_remaining
                     .get_or_insert(workflow_cfg.storage.task_retention_dry_run_passes);

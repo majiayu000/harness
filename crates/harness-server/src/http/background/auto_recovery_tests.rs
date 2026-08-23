@@ -46,6 +46,26 @@ async fn open_test_store(
     Ok((dir, store))
 }
 
+#[test]
+fn errored_auto_recovery_tick_records_failed_loop_health() {
+    let health = Arc::new(crate::http::background::BackgroundLoopHealth::new());
+    let handle = health.register_loop("auto_recovery");
+    let tick = AutoRecoveryTick {
+        errored: 2,
+        ..AutoRecoveryTick::default()
+    };
+
+    record_auto_recovery_tick(&handle, &tick);
+
+    let snapshot = health.snapshot(60);
+    assert_eq!(snapshot[0].tick_count, 0);
+    assert_eq!(snapshot[0].failure_count, 1);
+    assert_eq!(
+        snapshot[0].last_error.as_deref(),
+        Some("2 auto-recovery instance(s) failed")
+    );
+}
+
 /// Seed a stopped instance whose structured stop metadata points at a real
 /// runtime job + command, so `recover_stopped_instance` can replay it.
 async fn seed_stopped_instance(

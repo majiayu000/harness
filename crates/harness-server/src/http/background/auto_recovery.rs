@@ -94,6 +94,17 @@ impl AutoRecoveryTick {
     }
 }
 
+fn record_auto_recovery_tick(handle: &super::LoopHandle, tick: &AutoRecoveryTick) {
+    if tick.errored == 0 {
+        handle.tick_ok();
+    } else {
+        handle.tick_failed(&format!(
+            "{} auto-recovery instance(s) failed",
+            tick.errored
+        ));
+    }
+}
+
 /// Spawn the recheck scheduler. With the global policy disabled (the
 /// default) the background task is not spawned at all (B-003).
 pub(in crate::http) fn spawn_auto_recovery(state: &Arc<AppState>) {
@@ -107,6 +118,9 @@ pub(in crate::http) fn spawn_auto_recovery(state: &Arc<AppState>) {
         return;
     }
     let tick_interval = std::time::Duration::from_secs(github.auto_recovery.tick_interval_secs);
+    let handle = state
+        .background_loops
+        .register_loop_with_interval("auto_recovery", github.auto_recovery.tick_interval_secs);
     let state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tick_interval);
@@ -114,18 +128,22 @@ pub(in crate::http) fn spawn_auto_recovery(state: &Arc<AppState>) {
         loop {
             interval.tick().await;
             let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+                handle.tick_failed("workflow runtime store unavailable");
                 continue;
             };
             let alerts = &state.observability.alerts;
             match run_auto_recovery_tick(store, &github, alerts, Utc::now()).await {
-                Ok(tick) if tick.touched_anything() => {
-                    tracing::info!(?tick, "workflow runtime auto-recovery tick");
+                Ok(tick) => {
+                    if tick.touched_anything() {
+                        tracing::info!(?tick, "workflow runtime auto-recovery tick");
+                    }
+                    record_auto_recovery_tick(&handle, &tick);
                 }
-                Ok(_) => {}
                 Err(error) => {
                     // Store unavailable or scan failure: nothing was consumed;
                     // the next tick retries the scan.
                     tracing::error!("workflow runtime auto-recovery tick failed: {error}");
+                    handle.tick_failed(&error.to_string());
                 }
             }
         }
