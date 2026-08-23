@@ -1,7 +1,7 @@
-//! Per-connection WebSocket pump: bounded outbound queue, notification
-//! forwarding, heartbeat, and graceful shutdown.
+//! Per-connection WebSocket pump: serialized dispatch worker, bounded outbound
+//! queue, notification forwarding, heartbeat, and graceful shutdown.
 
-use crate::{http::AppState, router};
+use crate::{http::AppState, websocket_dispatch::WS_REQUEST_BACKLOG};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -17,8 +17,11 @@ const WS_OUTBOUND_BACKLOG: usize = 256;
 
 /// Handle a single WebSocket connection.
 ///
-/// - Incoming text frames are decoded as JSON-RPC 2.0 requests, routed through
-///   the standard dispatcher, and the response is sent back as a text frame.
+/// - Incoming text frames are forwarded to the per-connection dispatch worker
+///   ([`crate::websocket_dispatch::dispatch_requests`]), which routes them
+///   through the standard dispatcher and sends each response back as a text
+///   frame. The connection loop itself never awaits a request handler, so
+///   heartbeats stay live during long calls (GH-1984).
 /// - Server-push notifications broadcast on `AppState::notification_tx` are
 ///   forwarded to the client as unsolicited text frames.
 /// - A Ping frame is sent every `ws_heartbeat_interval_secs` seconds. If the
@@ -39,7 +42,7 @@ pub(super) async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     let (backlog_close_tx, mut backlog_close_rx) = tokio::sync::watch::channel(false);
 
     // Task 1: drain the internal channel → WebSocket sink.
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if ws_sink.send(msg).await.is_err() {
                 break;
@@ -49,6 +52,7 @@ pub(super) async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
 
     // Task 2: subscribe to the notification broadcast and forward to client.
     let notif_out_tx = out_tx.clone();
+    let notif_close_tx = backlog_close_tx.clone();
     let mut notif_rx = state.notifications.notification_tx.subscribe();
     let notif_state = state.clone();
     let notif_task = tokio::spawn(async move {
@@ -61,7 +65,7 @@ pub(super) async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
                             tracing::warn!(
                                 "WebSocket outbound backlog full; closing slow connection"
                             );
-                            let _ = backlog_close_tx.send(true);
+                            let _ = notif_close_tx.send(true);
                             break;
                         }
                         Err(_) => break,
@@ -91,10 +95,24 @@ pub(super) async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
     heartbeat.tick().await; // consume the first immediate tick
     let mut pong_pending = false;
 
+    // Task 3: serialized JSON-RPC dispatch worker (GH-1984). Request handlers
+    // run on their own task so a slow handler cannot stall the connection
+    // loop, which must service Pong frames and heartbeat ticks promptly or a
+    // healthy connection gets misjudged as stale and killed.
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<String>(WS_REQUEST_BACKLOG);
+    let dispatch_close_tx = backlog_close_tx.clone();
+    let mut dispatch_task = tokio::spawn(crate::websocket_dispatch::dispatch_requests(
+        req_rx,
+        out_tx.clone(),
+        dispatch_close_tx,
+        state.clone(),
+    ));
+
     // Subscribe to the graceful-shutdown signal.
     let mut ws_shutdown_rx = state.notifications.ws_shutdown_tx.subscribe();
 
-    // Main loop: read incoming frames, dispatch as JSON-RPC, reply.
+    // Main loop: forward requests to the dispatch worker; service heartbeat
+    // and shutdown locally. Never awaits a request handler (GH-1984).
     loop {
         tokio::select! {
             msg = ws_stream.next() => {
@@ -112,29 +130,28 @@ pub(super) async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
                     _ => continue,
                 };
 
-                let response = match codec::decode_request(&text) {
-                    Ok(req) => router::handle_request(&state, req).await,
-                    Err(e) => Some(RpcResponse::error(
-                        None,
-                        harness_protocol::methods::PARSE_ERROR,
-                        format!("parse error: {e}"),
-                    )),
-                };
-
-                if let Some(resp) = response {
-                    match codec::encode_response(&resp) {
-                        Ok(out) => match out_tx.try_send(Message::Text(out.into())) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                tracing::warn!(
-                                    "WebSocket outbound backlog full; closing slow connection"
-                                );
-                                break;
+                // Fail-closed backpressure on the request queue: reject instead
+                // of growing the queue without bound (GH-1984). Echo the request
+                // id when the frame parses so the client can correlate the
+                // rejection; unparseable frames keep id null.
+                match req_tx.try_send(text.to_string()) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!("WebSocket request backlog full; rejecting request");
+                        let id = codec::decode_request(&text).ok().and_then(|req| req.id);
+                        let resp = RpcResponse::error(
+                            id,
+                            harness_protocol::methods::INTERNAL_ERROR,
+                            "request backlog full".to_string(),
+                        );
+                        if let Ok(out) = codec::encode_response(&resp) {
+                            match out_tx.try_send(Message::Text(out.into())) {
+                                Ok(()) => {}
+                                Err(_) => break,
                             }
-                            Err(_) => break,
-                        },
-                        Err(e) => tracing::warn!("failed to encode response: {e}"),
+                        }
                     }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
 
@@ -165,6 +182,31 @@ pub(super) async fn handle_socket(ws: WebSocket, state: Arc<AppState>) {
         }
     }
 
+    // Graceful teardown (GH-1985 review): close the request queue and give
+    // the dispatch worker a bounded window to finish its in-flight handler
+    // and drain queued requests instead of aborting mid-turn. Then stop
+    // notification forwarding, drop the loop-side outbound handle, and give
+    // the sender task a bounded window to flush pending frames to the socket.
+    drop(req_tx);
+    if tokio::time::timeout(
+        crate::websocket_dispatch::WS_DISPATCH_DRAIN_GRACE,
+        &mut dispatch_task,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("WebSocket dispatch worker did not drain in time; cancelling");
+        dispatch_task.abort();
+    }
     notif_task.abort();
-    send_task.abort();
+    drop(out_tx);
+    if tokio::time::timeout(
+        crate::websocket_dispatch::WS_DISPATCH_DRAIN_GRACE,
+        &mut send_task,
+    )
+    .await
+    .is_err()
+    {
+        send_task.abort();
+    }
 }
