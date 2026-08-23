@@ -55,8 +55,18 @@ impl Scheduler {
             loop {
                 sleep(gc_interval).await;
                 tracing::info!("scheduler: triggering periodic GC run");
-                crate::handlers::gc::gc_run(&gc_state, None, None).await;
-                handle.tick_ok();
+                let response = crate::handlers::gc::gc_run(&gc_state, None, None).await;
+                match response.error {
+                    Some(err) => {
+                        tracing::error!(
+                            code = err.code,
+                            "scheduler: periodic GC run failed: {}",
+                            err.message
+                        );
+                        handle.tick_failed(&err.message);
+                    }
+                    None => handle.tick_ok(),
+                }
             }
         });
 
