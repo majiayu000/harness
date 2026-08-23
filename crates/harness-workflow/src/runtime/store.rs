@@ -458,6 +458,10 @@ impl WorkflowRuntimeStore {
 }
 
 #[cfg(test)]
+#[path = "store/identity_migration_tests.rs"]
+mod identity_migration_tests;
+
+#[cfg(test)]
 mod persistence_provenance_tests {
     use super::*;
     use crate::runtime::{DataProvenance, WorkflowSubject};

@@ -173,7 +173,7 @@ impl IntakeOrchestrator {
                 }
             };
             for issue in issues {
-                let repo_key = issue.repo.clone().unwrap_or_else(|| "default".to_string());
+                let repo_key = intake_repo_key(source.name(), issue.repo.as_deref());
                 by_repo
                     .entry(repo_key)
                     .or_default()
@@ -321,6 +321,15 @@ impl IntakeOrchestrator {
                 tracing::error!("intake: repo dispatch task panicked: {e}");
             }
         }
+    }
+}
+
+fn intake_repo_key(source_name: &str, repo: Option<&str>) -> String {
+    let repo = repo.unwrap_or("default");
+    if source_name == "github" {
+        repo.to_ascii_lowercase()
+    } else {
+        repo.to_string()
     }
 }
 
@@ -530,5 +539,17 @@ mod tests {
         assert_eq!(req.labels, vec!["inbox"]);
         assert_eq!(req.priority, 2);
         assert_eq!(req.issue, None);
+    }
+
+    #[test]
+    fn github_intake_repo_key_is_canonical_for_the_entire_poll_tick() {
+        assert_eq!(
+            intake_repo_key("github", Some("Owner/Repo")),
+            intake_repo_key("github", Some("owner/repo"))
+        );
+        assert_eq!(
+            intake_repo_key("feishu", Some("Team/Channel")),
+            "Team/Channel"
+        );
     }
 }

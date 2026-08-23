@@ -15,16 +15,12 @@ fn configured_github_webhook_project_root(
     default_root: &StdPath,
     repo: &str,
 ) -> Option<PathBuf> {
-    github?
-        .effective_repos()
-        .into_iter()
-        .find(|repo_cfg| repo_cfg.repo == repo)
-        .map(|repo_cfg| {
-            repo_cfg
-                .project_root
-                .map(PathBuf::from)
-                .unwrap_or_else(|| default_root.to_path_buf())
-        })
+    github?.find_repo_config(repo).map(|repo_cfg| {
+        repo_cfg
+            .project_root
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_root.to_path_buf())
+    })
 }
 
 enum GitHubWebhookProjectRootError {
