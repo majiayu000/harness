@@ -504,7 +504,7 @@ async fn reconcile_disk_reports_a_malformed_github_response() {
 }
 
 #[tokio::test]
-async fn reconcile_disk_rejects_redirect_terminal_state() {
+async fn reconcile_disk_rejects_redirected_terminal_state() {
     let _env_guard = async_env_lock().lock().await;
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());
@@ -528,12 +528,9 @@ async fn reconcile_disk_rejects_redirect_terminal_state() {
         .expect("serialize"),
     )
     .expect("write record");
-    let api_base = github_state_server_with_status(
-        "/repos/myorg/my-repo/issues/9",
-        "302 Found",
-        r#"{"state":"closed"}"#,
-    )
-    .await;
+    let api_base =
+        github_redirect_state_server("/repos/myorg/my-repo/issues/9", r#"{"state":"closed"}"#)
+            .await;
     let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
 
     let summary = mgr

@@ -71,6 +71,12 @@ pub(crate) use crate::github_client::github_api_base_url;
 
 const GITHUB_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn github_state_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
 async fn github_get_json<T: DeserializeOwned>(path: &str, github_token: Option<&str>) -> Option<T> {
     github_get_json_with_timeout(path, github_token, GITHUB_STATE_TIMEOUT).await
 }
@@ -79,7 +85,7 @@ async fn try_github_get_json<T: DeserializeOwned>(
     path: &str,
     github_token: Option<&str>,
 ) -> anyhow::Result<T> {
-    let client = reqwest::Client::new();
+    let client = github_state_client()?;
     try_github_get_json_with_client_timeout(&client, path, github_token, GITHUB_STATE_TIMEOUT).await
 }
 
@@ -88,7 +94,13 @@ pub(super) async fn github_get_json_with_timeout<T: DeserializeOwned>(
     github_token: Option<&str>,
     timeout: Duration,
 ) -> Option<T> {
-    let client = reqwest::Client::new();
+    let client = match github_state_client() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::debug!(%error, path, "failed to build GitHub state client");
+            return None;
+        }
+    };
     github_get_json_with_client_timeout(&client, path, github_token, timeout).await
 }
 
