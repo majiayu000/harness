@@ -64,7 +64,8 @@ pub struct CoreServices {
     pub plan_db: Option<crate::plan_db::PlanDb>,
     /// In-memory plan cache hydrated from `plan_db` on startup.
     /// Write-through: every mutation must also persist via `plan_db`.
-    pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    /// Values are shared handles so read paths never deep-clone plan contents.
+    pub plan_cache: Arc<DashMap<String, std::sync::Arc<harness_exec::plan::ExecPlan>>>,
     pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     pub project_workflow_store:
         Option<Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>>,

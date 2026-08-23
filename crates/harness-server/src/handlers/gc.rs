@@ -61,7 +61,9 @@ pub async fn gc_run(
         }
     }
 
-    let (violations, guard_count) = {
+    // Validate and snapshot under the read lock; the scan itself spawns one
+    // bash script per guard and must not pin the lock while it runs.
+    let snapshot = {
         let rules = state.engines.rules.read().await;
         if let Err(err) = rules.validate_scan_request(None) {
             tracing::warn!(
@@ -72,20 +74,20 @@ pub async fn gc_run(
             );
             return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
         }
-        let guard_count = rules.guards().len();
-        let violations = match rules.scan(&project_root).await {
-            Ok(violations) => violations,
-            Err(err) => {
-                tracing::warn!(
-                    project_root = %project_root.display(),
-                    guard_count,
-                    error = %err,
-                    "gc/run scan failed"
-                );
-                return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
-            }
-        };
-        (violations, guard_count)
+        rules.snapshot()
+    };
+    let guard_count = snapshot.guard_count();
+    let violations = match snapshot.scan(&project_root).await {
+        Ok(violations) => violations,
+        Err(err) => {
+            tracing::warn!(
+                project_root = %project_root.display(),
+                guard_count,
+                error = %err,
+                "gc/run scan failed"
+            );
+            return RpcResponse::error(id, INTERNAL_ERROR, err.to_string());
+        }
     };
     tracing::info!(
         project_root = %project_root.display(),
