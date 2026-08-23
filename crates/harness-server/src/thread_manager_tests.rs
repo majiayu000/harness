@@ -708,3 +708,56 @@ async fn steer_active_turn_after_deregister_is_noop() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ── Turn index (issue #1992) ─────────────────────────────────────────────────
+
+#[test]
+fn find_after_delete_thread_does_not_leak_turn_lookup() -> anyhow::Result<()> {
+    let tm = ThreadManager::new();
+    let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+    let turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+
+    assert!(tm.delete_thread(&thread_id));
+
+    // The turn must not resolve through a stale index entry after deletion.
+    // The scan fallback would also return None here, but the assertion keeps
+    // the index-maintenance contract explicit.
+    assert!(tm.find_thread_and_turn(&turn_id).is_none());
+    assert!(tm.find_thread_for_turn(&turn_id).is_none());
+    Ok(())
+}
+
+#[test]
+fn fork_rebinds_turn_index_to_fork_for_inherited_turns() -> anyhow::Result<()> {
+    let tm = ThreadManager::new();
+    let thread_id = tm.start_thread(PathBuf::from("/tmp"));
+    tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+
+    let fork_id = tm.fork_thread(&thread_id, None)?;
+    let fork = tm
+        .get_thread(&fork_id)
+        .ok_or_else(|| anyhow::anyhow!("fork missing"))?;
+    assert!(!fork.turns.is_empty());
+    for turn in &fork.turns {
+        assert_eq!(
+            tm.find_thread_for_turn(&turn.id),
+            Some(fork_id.clone()),
+            "rebound fork turn must resolve to the fork via the index"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn thread_project_root_reads_root_without_cloning_transcript() -> anyhow::Result<()> {
+    let tm = ThreadManager::new();
+    let thread_id = tm.start_thread(PathBuf::from("/tmp/proj"));
+    let _turn_id = tm.start_turn(&thread_id, "task".to_string(), AgentId::new())?;
+
+    assert_eq!(
+        tm.thread_project_root(&thread_id),
+        Some(PathBuf::from("/tmp/proj"))
+    );
+    assert_eq!(tm.thread_project_root(&ThreadId::from_str("missing")), None);
+    Ok(())
+}
