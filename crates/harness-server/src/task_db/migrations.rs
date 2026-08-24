@@ -270,6 +270,11 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
                   PRIMARY KEY (store_key, legacy_schema)
               )",
     },
+    Migration {
+        version: 27,
+        description: "create durable runtime workspace cleanup targets",
+        sql: crate::workspace_lease_store::WORKSPACE_CLEANUP_TARGETS_TABLE_SQL,
+    },
 ];
 
 #[cfg(test)]
@@ -345,6 +350,23 @@ mod tests {
                 .sql
                 .contains("ON task_artifacts(store_key, task_id, turn, id)"),
             "artifact index should match the store_key + task_id query predicate"
+        );
+    }
+
+    #[test]
+    fn workspace_cleanup_targets_migration_backfills_runtime_leases() {
+        let migration = TASK_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 27)
+            .expect("v27 migration should exist");
+
+        assert!(migration.sql.contains("workspace_cleanup_targets"));
+        assert!(migration.sql.contains("FROM workspace_leases"));
+        assert!(
+            migration
+                .sql
+                .contains("WHERE runtime_workflow_id IS NOT NULL"),
+            "v27 should preserve every visible runtime workspace cleanup obligation"
         );
     }
 }

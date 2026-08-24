@@ -44,9 +44,18 @@ impl WorkspaceManager {
         repo: Option<&str>,
         options: WorkspaceCreateOptions,
     ) -> Result<WorkspaceLease, WorkspaceLifecycleError> {
-        if let Some(active) = self.active.get(task_id) {
+        let (mut repository_write_lease, resolve_repository_write_lease) =
+            match options.repository_write_lease {
+                RepositoryWriteLeaseInput::Held(lease) => (Some(lease), false),
+                RepositoryWriteLeaseInput::NotRequired => (None, false),
+                RepositoryWriteLeaseInput::ResolveFromStartupConfig => (None, true),
+            };
+        if let Some(mut active) = self.active.get_mut(task_id) {
             if active.run_generation == run_generation && active.owner_session == self.owner_session
             {
+                if active._repository_write_lease.is_none() {
+                    active._repository_write_lease = repository_write_lease.take();
+                }
                 return Ok(WorkspaceLease {
                     workspace_path: active.workspace_path.clone(),
                     #[cfg(test)]
@@ -69,7 +78,29 @@ impl WorkspaceManager {
             });
         }
 
-        let pool_permit = match self.pool.acquire(source_repo, repo).await {
+        let project_key = crate::workspace_pool::project_limit_key(source_repo);
+        let mut resolved_workspace_capacity = options.workspace_capacity_override;
+        if resolve_repository_write_lease {
+            let (lease, capacity) = self
+                .acquire_repository_lease_from_current_config(source_repo)
+                .await
+                .map_err(|err| WorkspaceLifecycleError::CreateFailed {
+                    message: format!(
+                        "failed to acquire PostgreSQL repository lease for {project_key}: {err}"
+                    ),
+                })?;
+            repository_write_lease = lease;
+            resolved_workspace_capacity = Some(capacity);
+        }
+        let pool_permit = match self
+            .pool
+            .acquire_with_capacity(
+                source_repo,
+                repo,
+                resolved_workspace_capacity.unwrap_or_else(|| self.pool.capacity_for(source_repo)),
+            )
+            .await
+        {
             Ok(permit) => permit,
             Err(err) => {
                 return Err(WorkspaceLifecycleError::CreateFailed {
@@ -80,23 +111,18 @@ impl WorkspaceManager {
                 });
             }
         };
-        let project_key = pool_permit.project_key.clone();
+        debug_assert_eq!(project_key, pool_permit.project_key);
         let workspace_project_key = pool_permit.workspace_project_key.clone();
         let capacity = pool_permit.capacity;
         let mut pool_permit = Some(pool_permit.permit);
-        let repository_write_lease = self
-            .acquire_repository_write_lease_if_single_writer(source_repo)
-            .await
-            .map_err(|err| WorkspaceLifecycleError::CreateFailed {
-                message: format!(
-                    "failed to acquire PostgreSQL repository write lease for {project_key}: {err}"
-                ),
-            })?;
         let slot_lock = self.pool.selection_lock(&project_key);
         let slot_guard = slot_lock.lock().await;
-        if let Some(active) = self.active.get(task_id) {
+        if let Some(mut active) = self.active.get_mut(task_id) {
             if active.run_generation == run_generation && active.owner_session == self.owner_session
             {
+                if active._repository_write_lease.is_none() {
+                    active._repository_write_lease = repository_write_lease.take();
+                }
                 return Ok(WorkspaceLease {
                     workspace_path: active.workspace_path.clone(),
                     #[cfg(test)]
@@ -292,6 +318,7 @@ impl WorkspaceManager {
             }
         };
 
+        let git_ops_guard = self.git_ops.lock().await;
         let path_tracking_error = {
             use dashmap::mapref::entry::Entry;
             match self.active_paths.entry(workspace_path.clone()) {
@@ -387,7 +414,19 @@ impl WorkspaceManager {
         }
         drop(slot_guard);
 
-        let git_ops_guard = self.git_ops.lock().await;
+        let creation_still_active = self.active.get(task_id).is_some_and(|active| {
+            active.owner_session == owner_session
+                && active.run_generation == run_generation
+                && active.workspace_path == workspace_path
+        });
+        if !creation_still_active {
+            return Err(WorkspaceLifecycleError::CreateFailed {
+                message: format!(
+                    "workspace creation was cancelled before git setup for task {}",
+                    task_id.0
+                ),
+            });
+        }
         let mut _decision = WorkspaceAcquireDecision::CreatedFresh;
         let workspace_path_exists = workspace_path.exists();
         let missing_path_registered_worktree = if workspace_path_exists {

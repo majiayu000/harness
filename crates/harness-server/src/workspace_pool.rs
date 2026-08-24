@@ -58,7 +58,7 @@ impl WorkspacePoolConfig {
 
 pub(crate) struct WorkspacePool {
     config: WorkspacePoolConfig,
-    semaphores: DashMap<String, Arc<Semaphore>>,
+    semaphores: DashMap<(String, usize), Arc<Semaphore>>,
     slot_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
@@ -75,21 +75,31 @@ impl WorkspacePool {
         self.config.capacity_for(source_repo)
     }
 
-    pub(crate) fn requires_repository_write_lease(&self, source_repo: &Path) -> bool {
-        self.config.require_global_single_writer_lease && self.capacity_for(source_repo) == 1
+    pub(crate) fn repository_lease_mode_for_capacity(
+        &self,
+        capacity: usize,
+    ) -> Option<crate::workspace_lease_store::RepositoryLeaseMode> {
+        self.config
+            .require_global_single_writer_lease
+            .then_some(if capacity == 1 {
+                crate::workspace_lease_store::RepositoryLeaseMode::Exclusive
+            } else {
+                crate::workspace_lease_store::RepositoryLeaseMode::Shared
+            })
     }
 
-    pub(crate) async fn acquire(
+    pub(crate) async fn acquire_with_capacity(
         &self,
         source_repo: &Path,
         repo: Option<&str>,
+        capacity: usize,
     ) -> anyhow::Result<WorkspacePoolPermit> {
         let project_key = project_limit_key(source_repo);
-        let capacity = self.config.capacity_for(source_repo);
+        let capacity = capacity.max(1);
         let workspace_project_key = derive_workspace_pool_key(source_repo, repo);
         let semaphore = self
             .semaphores
-            .entry(project_key.clone())
+            .entry((project_key.clone(), capacity))
             .or_insert_with(|| Arc::new(Semaphore::new(capacity)))
             .clone();
         let permit = semaphore.acquire_owned().await.map_err(|_| {

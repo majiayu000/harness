@@ -164,6 +164,41 @@ async fn single_writer_workspace_fails_closed_without_postgres_lease_store() -> 
 }
 
 #[tokio::test]
+async fn multi_writer_workspace_fails_closed_without_postgres_lease_store() -> anyhow::Result<()> {
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+    let workspaces = tempfile::tempdir()?;
+    let manager = WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        },
+        WorkspacePoolConfig::new(2, std::collections::HashMap::new()),
+        None,
+    )?;
+    let error = manager
+        .create_workspace(
+            &TaskId("multi-writer-without-store".to_string()),
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            None,
+            None,
+        )
+        .await
+        .expect_err("multi-writer creation must fail closed without shared repository locking");
+    assert!(
+        error
+            .to_string()
+            .contains("PostgreSQL workspace lease store"),
+        "unexpected missing shared-lease error: {error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn remove_workspace_keeps_in_memory_slot_until_cleanup_finishes() -> anyhow::Result<()> {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());

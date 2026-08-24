@@ -32,6 +32,10 @@ pub(crate) use circuit_breaker_events::emit_circuit_breaker_events;
 pub(crate) use transcript_durability::{
     hydrate_exact_replay_transcript, strip_caller_transcript_unavailable_signal,
 };
+#[cfg(test)]
+pub(crate) use workspace::{
+    revalidate_runtime_workspace_admission, source_project_is_configured_single_writer,
+};
 
 use crate::http::AppState;
 use crate::runtime_circuit_breaker::{classify_agent_failure, FailureClass};

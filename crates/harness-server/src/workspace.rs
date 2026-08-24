@@ -1,6 +1,6 @@
 use crate::task_runner::{TaskId, TaskSummary};
 use crate::workspace_lease_store::{
-    RepositoryWriteLease, WorkspaceLeaseRecord, WorkspaceLeaseStore,
+    RepositoryLeaseMode, RepositoryWriteLease, WorkspaceLeaseRecord, WorkspaceLeaseStore,
 };
 use crate::workspace_pool::{
     select_available_slot, workspace_slot_key, WorkspacePool, WorkspacePoolConfig,
@@ -47,6 +47,8 @@ mod workspace_create;
 pub(crate) mod workspace_helpers;
 #[path = "workspace_reconcile.rs"]
 mod workspace_reconcile;
+#[path = "workspace_repository.rs"]
+mod workspace_repository;
 #[path = "workspace_worktree_add.rs"]
 mod workspace_worktree_add;
 
@@ -117,7 +119,6 @@ pub struct WorkspaceEntry {
     pub created_at: SystemTime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspaceCreateOptions {
     pub(crate) require_remote_head: bool,
     pub(crate) reuse_existing_workspace: bool,
@@ -125,6 +126,14 @@ pub(crate) struct WorkspaceCreateOptions {
     pub(crate) hook_timeout_secs: Option<u64>,
     pub(crate) branch_prefix: String,
     pub(crate) runtime_workflow_id: Option<String>,
+    pub(crate) workspace_capacity_override: Option<usize>,
+    pub(crate) repository_write_lease: RepositoryWriteLeaseInput,
+}
+
+pub(crate) enum RepositoryWriteLeaseInput {
+    ResolveFromStartupConfig,
+    NotRequired,
+    Held(RepositoryWriteLease),
 }
 
 impl Default for WorkspaceCreateOptions {
@@ -136,6 +145,8 @@ impl Default for WorkspaceCreateOptions {
             hook_timeout_secs: None,
             branch_prefix: "harness/".to_string(),
             runtime_workflow_id: None,
+            workspace_capacity_override: None,
+            repository_write_lease: RepositoryWriteLeaseInput::ResolveFromStartupConfig,
         }
     }
 }
@@ -230,17 +241,55 @@ pub struct WorkspaceManager {
     git_ops: tokio::sync::Mutex<()>,
     pool: WorkspacePool,
     lease_store: Option<Arc<WorkspaceLeaseStore>>,
+    capacity_source: Option<WorkspaceCapacitySource>,
+}
+
+struct WorkspaceCapacitySource {
+    server: Arc<crate::server::HarnessServer>,
+    project_registry: Option<Arc<crate::project_registry::ProjectRegistry>>,
 }
 
 impl WorkspaceManager {
     pub fn new(config: WorkspaceConfig) -> anyhow::Result<Self> {
-        Self::new_with_pool(config, WorkspacePoolConfig::default(), None)
+        #[cfg(not(test))]
+        let pool_config = WorkspacePoolConfig::default();
+        #[cfg(test)]
+        let pool_config =
+            WorkspacePoolConfig::new_for_local_pool_tests(4, std::collections::HashMap::new());
+        Self::new_with_pool(config, pool_config, None)
     }
 
     pub(crate) fn new_with_pool(
+        config: WorkspaceConfig,
+        pool_config: WorkspacePoolConfig,
+        lease_store: Option<Arc<WorkspaceLeaseStore>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_inner(config, pool_config, lease_store, None)
+    }
+
+    pub(crate) fn new_with_pool_and_capacity_source(
+        config: WorkspaceConfig,
+        pool_config: WorkspacePoolConfig,
+        lease_store: Option<Arc<WorkspaceLeaseStore>>,
+        server: Arc<crate::server::HarnessServer>,
+        project_registry: Option<Arc<crate::project_registry::ProjectRegistry>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_inner(
+            config,
+            pool_config,
+            lease_store,
+            Some(WorkspaceCapacitySource {
+                server,
+                project_registry,
+            }),
+        )
+    }
+
+    fn new_with_pool_inner(
         mut config: WorkspaceConfig,
         pool_config: WorkspacePoolConfig,
         lease_store: Option<Arc<WorkspaceLeaseStore>>,
+        capacity_source: Option<WorkspaceCapacitySource>,
     ) -> anyhow::Result<Self> {
         if !config.root.is_absolute() {
             config.root = std::env::current_dir()?.join(&config.root);
@@ -256,37 +305,8 @@ impl WorkspaceManager {
             git_ops: tokio::sync::Mutex::new(()),
             pool: WorkspacePool::new(pool_config),
             lease_store,
+            capacity_source,
         })
-    }
-
-    pub(crate) async fn acquire_repository_write_lease_if_single_writer(
-        &self,
-        source_repo: &Path,
-    ) -> anyhow::Result<Option<RepositoryWriteLease>> {
-        if !self.pool.requires_repository_write_lease(source_repo) {
-            return Ok(None);
-        }
-        let store = self.lease_store.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "single-writer repository execution requires the PostgreSQL workspace lease store"
-            )
-        })?;
-        let project_key = crate::workspace_pool::project_limit_key(source_repo);
-        let mut delay = Duration::from_millis(250);
-        loop {
-            if let Some(lease) = store
-                .try_acquire_repository_write_lease(&project_key)
-                .await?
-            {
-                return Ok(Some(lease));
-            }
-            tracing::debug!(
-                project_key = %project_key,
-                "workspace pool waiting for the PostgreSQL repository write lease"
-            );
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay * 2, Duration::from_secs(5));
-        }
     }
 
     fn release_active_path(&self, task_id: &TaskId, workspace_path: &Path) {
@@ -339,27 +359,6 @@ impl WorkspaceManager {
     ) -> anyhow::Result<()> {
         let _git_ops = self.git_ops.lock().await;
         cleanup_workspace_path(source_repo, workspace_path).await
-    }
-
-    pub async fn force_reclaim_workspace(
-        &self,
-        task_store: &crate::task_runner::TaskStore,
-        source_repo: &Path,
-        workspace_path: &Path,
-    ) -> anyhow::Result<bool> {
-        let _git_ops = self.git_ops.lock().await;
-        let outcome = try_reclaim_workspace(
-            source_repo,
-            workspace_path,
-            self.lease_store.as_deref(),
-            None,
-            WorkspaceReclaimMode::Force { task_store },
-        )
-        .await?;
-        Ok(matches!(
-            outcome,
-            WorkspaceReclaimOutcome::Deleted | WorkspaceReclaimOutcome::ForcedDeleted { .. }
-        ))
     }
 
     /// Remove the workspace for the given task. Runs `before_remove_hook` first (non-fatal).
@@ -461,6 +460,23 @@ impl WorkspaceManager {
         source_repo: &Path,
         workspace_path: Option<&Path>,
     ) -> anyhow::Result<()> {
+        let git_ops_guard = self.git_ops.lock().await;
+        self.cleanup_workspace_for_retry_locked(
+            &git_ops_guard,
+            task_id,
+            source_repo,
+            workspace_path,
+        )
+        .await
+    }
+
+    async fn cleanup_workspace_for_retry_locked(
+        &self,
+        _git_ops_guard: &tokio::sync::MutexGuard<'_, ()>,
+        task_id: &TaskId,
+        source_repo: &Path,
+        workspace_path: Option<&Path>,
+    ) -> anyhow::Result<()> {
         // Resolve target before removing from active so deterministic-key workspaces
         // (whose directory name differs from sanitize_task_id(task_id)) are found.
         let target = workspace_path
@@ -478,7 +494,17 @@ impl WorkspaceManager {
                 return Ok(());
             }
         }
-        let active_entry = self.remove_active_workspace(task_id);
+        let active_entry = self
+            .active
+            .remove_if(task_id, |_, active| {
+                active.workspace_path == target
+                    && crate::workspace_pool::project_limit_key(&active.source_repo)
+                        == crate::workspace_pool::project_limit_key(source_repo)
+            })
+            .map(|(_, active)| active);
+        if let Some(entry) = active_entry.as_ref() {
+            self.release_active_path(task_id, &entry.workspace_path);
+        }
         self.released_paths.remove(task_id);
         if let Some(entry) = active_entry.as_ref() {
             self.released_workspace_paths.remove(&entry.workspace_key);
@@ -495,9 +521,7 @@ impl WorkspaceManager {
             }
             return Ok(());
         }
-        let cleanup_result = self
-            .cleanup_workspace_path_locked(source_repo, &target)
-            .await;
+        let cleanup_result = cleanup_workspace_path(source_repo, &target).await;
         if let Some(entry) = active_entry.as_ref() {
             self.release_persisted_lease(task_id, entry).await;
         }

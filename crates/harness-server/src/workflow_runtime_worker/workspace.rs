@@ -40,20 +40,19 @@ pub(super) async fn prepare_runtime_workspace(
     match workflow_document.config.workspace.strategy.as_str() {
         "worktree" => {}
         "source" => {
-            let repository_write_lease = if let Some(workspace_mgr) =
-                state.concurrency.workspace_mgr.as_ref()
-            {
-                workspace_mgr
-                    .acquire_repository_write_lease_if_single_writer(source_project_root)
-                    .await?
-            } else {
-                if source_project_is_configured_single_writer(state, source_project_root).await? {
-                    anyhow::bail!(
-                        "single-writer source workspace requires the PostgreSQL workspace lease store"
-                    );
+            let repository_write_lease = match state.concurrency.workspace_mgr.as_ref() {
+                Some(workspace_mgr) => {
+                    acquire_runtime_repository_lease(state, workspace_mgr, source_project_root)
+                        .await?
+                        .0
                 }
-                None
+                None => anyhow::bail!(
+                    "source workspace repository execution requires the PostgreSQL workspace lease store"
+                ),
             };
+            if repository_write_lease.is_some() {
+                revalidate_runtime_workspace_admission(state, job, workflow).await?;
+            }
             if let Some(hook) = workflow_document.config.hooks.before_run.as_deref() {
                 run_workflow_hook(
                     "before_run",
@@ -79,6 +78,11 @@ pub(super) async fn prepare_runtime_workspace(
     let Some(workspace_mgr) = state.concurrency.workspace_mgr.as_ref() else {
         anyhow::bail!("workflow runtime workspace manager is unavailable");
     };
+    let (repository_write_lease, workspace_capacity) =
+        acquire_runtime_repository_lease(state, workspace_mgr, source_project_root).await?;
+    if repository_write_lease.is_some() {
+        revalidate_runtime_workspace_admission(state, job, workflow).await?;
+    }
     let task_id = stable_runtime_workspace_task_id(job, workflow);
     let external_id = workflow.map(|workflow| workflow.subject.subject_key.as_str());
     let repo = workflow
@@ -94,6 +98,11 @@ pub(super) async fn prepare_runtime_workspace(
         hook_timeout_secs: Some(workflow_document.config.hooks.timeout_secs),
         branch_prefix: workflow_document.config.workspace.branch_prefix.clone(),
         runtime_workflow_id: workflow.map(|workflow| workflow.id.clone()),
+        workspace_capacity_override: Some(workspace_capacity),
+        repository_write_lease: repository_write_lease.map_or(
+            crate::workspace::RepositoryWriteLeaseInput::NotRequired,
+            crate::workspace::RepositoryWriteLeaseInput::Held,
+        ),
     };
     let lease = workspace_mgr
         .create_workspace_with_options(
@@ -241,38 +250,89 @@ pub(super) async fn cleanup_terminal_runtime_workspace(
         .get("repo")
         .and_then(serde_json::Value::as_str)
         .or(workflow_document.config.source.repo.as_deref());
-    let workspace_path = workspace_mgr
-        .workspace_path_for_cleanup(
-            &task_id,
-            &source_project_root,
-            Some(workflow.subject.subject_key.as_str()),
-            repo,
+    let _repository_write_lease = workspace_mgr
+        .acquire_repository_write_lease_for_cleanup(&source_project_root)
+        .await?;
+    let current_workflow = store.get_instance(&workflow.id).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "workflow {} disappeared before workspace cleanup",
+            workflow.id
         )
-        .await;
-    if workspace_path.exists() {
+    })?;
+    if store
+        .terminal_state_for_instance(&current_workflow)
+        .await?
+        .is_none()
+    {
+        tracing::info!(
+            workflow_id = %workflow.id,
+            "skipping terminal workspace cleanup because the workflow reopened while waiting for the repository lease"
+        );
+        return Ok(());
+    }
+    let mut cleanup_targets = workspace_mgr
+        .workspace_targets_for_runtime_workflow(&workflow.id)
+        .await?;
+    if cleanup_targets.is_empty() {
+        let workspace_path = workspace_mgr
+            .workspace_path_for_cleanup(
+                &task_id,
+                &source_project_root,
+                Some(workflow.subject.subject_key.as_str()),
+                repo,
+            )
+            .await;
+        if workspace_path.exists() {
+            workspace_mgr
+                .cleanup_workspace_for_retry(&task_id, &source_project_root, Some(&workspace_path))
+                .await?;
+        }
+        return Ok(());
+    }
+    for target in cleanup_targets.drain(..) {
+        if workspace_mgr
+            .runtime_workspace_cleanup_target_is_superseded(&target)
+            .await?
+        {
+            workspace_mgr
+                .release_runtime_workspace_cleanup_target(&target)
+                .await?;
+            continue;
+        }
+        if !target.workspace_path.exists() {
+            workspace_mgr
+                .release_runtime_workspace_cleanup_target(&target)
+                .await?;
+            continue;
+        }
         if let Some(hook) = workflow_document.config.hooks.before_remove.as_deref() {
             if let Err(error) = run_workflow_hook(
                 "before_remove",
                 hook,
-                &workspace_path,
+                &target.workspace_path,
                 workflow_document.config.hooks.timeout_secs,
             )
             .await
             {
                 tracing::warn!(
                     workflow_id = %workflow.id,
-                    workspace_path = %workspace_path.display(),
+                    workspace_path = %target.workspace_path.display(),
                     "before_remove hook failed during terminal runtime workspace cleanup: {error}"
                 );
             }
         }
         workspace_mgr
-            .cleanup_workspace_for_retry(&task_id, &source_project_root, Some(&workspace_path))
-            .await
-    } else {
-        workspace_mgr.release_workspace(&task_id).await;
-        Ok(())
+            .cleanup_workspace_for_retry(
+                &target.task_id,
+                &source_project_root,
+                Some(&target.workspace_path),
+            )
+            .await?;
+        workspace_mgr
+            .release_runtime_workspace_cleanup_target(&target)
+            .await?;
     }
+    Ok(())
 }
 
 fn validate_workspace_cleanup_policy(cleanup: &str) -> anyhow::Result<()> {
@@ -282,19 +342,95 @@ fn validate_workspace_cleanup_policy(cleanup: &str) -> anyhow::Result<()> {
     }
 }
 
-async fn source_project_is_configured_single_writer(
+#[cfg(test)]
+pub(crate) async fn source_project_is_configured_single_writer(
     state: &AppState,
     source_project_root: &Path,
 ) -> anyhow::Result<bool> {
+    Ok(source_project_workspace_capacity(state, source_project_root).await? == 1)
+}
+
+async fn source_project_workspace_capacity(
+    state: &AppState,
+    source_project_root: &Path,
+) -> anyhow::Result<usize> {
     Ok(
         crate::http::builders::workspace_pool_config::build_workspace_pool_config(
             state.core.server.as_ref(),
             state.core.project_registry.as_ref(),
         )
         .await?
-        .capacity_for(source_project_root)
-            == 1,
+        .capacity_for(source_project_root),
     )
+}
+
+async fn acquire_runtime_repository_lease(
+    state: &AppState,
+    workspace_mgr: &crate::workspace::WorkspaceManager,
+    source_project_root: &Path,
+) -> anyhow::Result<(Option<RepositoryWriteLease>, usize)> {
+    loop {
+        let capacity = source_project_workspace_capacity(state, source_project_root).await?;
+        let single_writer = capacity == 1;
+        let lease = workspace_mgr
+            .acquire_repository_lease_for_runtime(source_project_root, single_writer)
+            .await?;
+        let current_capacity =
+            source_project_workspace_capacity(state, source_project_root).await?;
+        if single_writer || current_capacity > 1 {
+            return Ok((lease, current_capacity));
+        }
+        drop(lease);
+        tracing::debug!(
+            source_project_root = %source_project_root.display(),
+            "retrying repository admission after capacity changed to single-writer"
+        );
+    }
+}
+
+pub(crate) async fn revalidate_runtime_workspace_admission(
+    state: &AppState,
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+) -> anyhow::Result<()> {
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("workflow runtime store is unavailable"))?;
+    let workflow = workflow.ok_or_else(|| {
+        anyhow::anyhow!("repository workspace admission requires a persisted workflow")
+    })?;
+    if !store.runtime_job_matches_running_lease(job).await? {
+        anyhow::bail!(
+            "runtime job {} lost its running lease while waiting for the repository lease",
+            job.id
+        );
+    }
+    let sources = store
+        .command_sources_for_runtime_jobs(std::slice::from_ref(&job.id))
+        .await?;
+    if sources
+        .get(&job.id)
+        .is_none_or(|source| source.workflow_id != workflow.id)
+    {
+        anyhow::bail!(
+            "runtime job {} no longer belongs to workflow {}",
+            job.id,
+            workflow.id
+        );
+    }
+    let current = store
+        .get_instance(&workflow.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workflow {} no longer exists", workflow.id))?;
+    if store.terminal_state_for_instance(&current).await?.is_some() {
+        anyhow::bail!(
+            "workflow {} became terminal while waiting for the repository lease",
+            workflow.id
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn runtime_workspace_finish_action(

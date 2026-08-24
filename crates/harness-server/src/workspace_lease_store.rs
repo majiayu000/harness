@@ -6,7 +6,15 @@ use sqlx::postgres::PgPool;
 use sqlx::Postgres;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+#[path = "workspace_cleanup_store.rs"]
+mod workspace_cleanup_store;
+pub(crate) use workspace_cleanup_store::{
+    WorkspaceCleanupTargetRecord, WORKSPACE_CLEANUP_TARGETS_TABLE_SQL,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceLeaseRecord {
@@ -28,11 +36,19 @@ pub(crate) struct WorkspaceLeaseRecord {
 pub(crate) struct WorkspaceLeaseStore {
     pool: PgPool,
     repository_lock_pool: PgPool,
+    repository_lock_slots: Arc<Semaphore>,
     store_key: String,
 }
 
 pub(crate) struct RepositoryWriteLease {
     _connection: tokio::sync::Mutex<PoolConnection<Postgres>>,
+    _slot_permit: OwnedSemaphorePermit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepositoryLeaseMode {
+    Shared,
+    Exclusive,
 }
 
 impl WorkspaceLeaseStore {
@@ -45,65 +61,86 @@ impl WorkspaceLeaseStore {
         &self,
         project_key: &str,
     ) -> anyhow::Result<Option<RepositoryWriteLease>> {
-        self.try_acquire_repository_write_lease_with_timeout(
+        self.try_acquire_repository_lease_with_timeout(
             project_key,
+            RepositoryLeaseMode::Exclusive,
             std::time::Duration::from_secs(10),
         )
         .await
     }
 
-    async fn try_acquire_repository_write_lease_with_timeout(
+    pub(crate) async fn try_acquire_repository_shared_lease(
         &self,
         project_key: &str,
+    ) -> anyhow::Result<Option<RepositoryWriteLease>> {
+        self.try_acquire_repository_lease_with_timeout(
+            project_key,
+            RepositoryLeaseMode::Shared,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+    }
+
+    async fn try_acquire_repository_lease_with_timeout(
+        &self,
+        project_key: &str,
+        mode: RepositoryLeaseMode,
         acquire_timeout: std::time::Duration,
     ) -> anyhow::Result<Option<RepositoryWriteLease>> {
-        let mut connection = loop {
-            match tokio::time::timeout(acquire_timeout, self.repository_lock_pool.acquire()).await {
-                Ok(Ok(connection)) => break connection,
-                Err(_) | Ok(Err(sqlx::Error::PoolTimedOut))
-                    if self.repository_lock_pool_is_saturated() =>
-                {
-                    tracing::debug!(
-                        project_key,
-                        "repository advisory-lock pool is full; waiting for an active lease"
-                    );
-                }
-                Err(_) | Ok(Err(sqlx::Error::PoolTimedOut)) => {
-                    anyhow::bail!(
-                        "timed out acquiring a PostgreSQL repository advisory-lock connection"
-                    );
-                }
-                Ok(Err(error)) => return Err(error.into()),
+        let slot_permit = self
+            .repository_lock_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("repository advisory-lock slot semaphore closed"))?;
+        let mut connection = match tokio::time::timeout(
+            acquire_timeout,
+            self.repository_lock_pool.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(connection)) => connection,
+            Err(_) | Ok(Err(sqlx::Error::PoolTimedOut)) => {
+                anyhow::bail!(
+                    "timed out acquiring a PostgreSQL repository advisory-lock connection"
+                );
             }
+            Ok(Err(error)) => return Err(error.into()),
         };
         // If this future is cancelled after PostgreSQL acquires the session lock
         // but before the response is decoded, dropping must close the session
         // instead of returning a possibly locked connection to the pool.
         connection.close_on_drop();
-        let (acquired,): (bool,) =
-            sqlx::query_as("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
-                .bind(project_key)
-                .fetch_one(&mut *connection)
-                .await?;
+        let query = match mode {
+            RepositoryLeaseMode::Shared => {
+                "SELECT pg_try_advisory_lock_shared(hashtextextended($1, 0))"
+            }
+            RepositoryLeaseMode::Exclusive => {
+                "SELECT pg_try_advisory_lock(hashtextextended($1, 0))"
+            }
+        };
+        let (acquired,): (bool,) = sqlx::query_as(query)
+            .bind(project_key)
+            .fetch_one(&mut *connection)
+            .await?;
         if !acquired {
             return Ok(None);
         }
         Ok(Some(RepositoryWriteLease {
             _connection: tokio::sync::Mutex::new(connection),
+            _slot_permit: slot_permit,
         }))
-    }
-
-    fn repository_lock_pool_is_saturated(&self) -> bool {
-        self.repository_lock_pool.size()
-            >= self.repository_lock_pool.options().get_max_connections()
-            && self.repository_lock_pool.num_idle() == 0
     }
 
     #[cfg(test)]
     pub(crate) fn for_repository_lock_pool_test(repository_lock_pool: PgPool) -> Self {
+        let repository_lock_slots = Arc::new(Semaphore::new(
+            repository_lock_pool.options().get_max_connections() as usize,
+        ));
         Self {
             pool: repository_lock_pool.clone(),
             repository_lock_pool,
+            repository_lock_slots,
             store_key: "repository-lock-pool-test".to_string(),
         }
     }
@@ -114,8 +151,12 @@ impl WorkspaceLeaseStore {
         project_key: &str,
         acquire_timeout: std::time::Duration,
     ) -> anyhow::Result<Option<RepositoryWriteLease>> {
-        self.try_acquire_repository_write_lease_with_timeout(project_key, acquire_timeout)
-            .await
+        self.try_acquire_repository_lease_with_timeout(
+            project_key,
+            RepositoryLeaseMode::Exclusive,
+            acquire_timeout,
+        )
+        .await
     }
 
     pub(crate) async fn open_shared_with_data_dir(
@@ -136,9 +177,13 @@ impl WorkspaceLeaseStore {
         // Session-level advisory locks retain their connection for the full
         // workspace lifetime. Keep them out of the ordinary lease-query pool.
         let repository_lock_pool = context.open_runtime_pool().await?;
+        let repository_lock_slots = Arc::new(Semaphore::new(
+            repository_lock_pool.options().get_max_connections() as usize,
+        ));
         Ok(Self {
             pool,
             repository_lock_pool,
+            repository_lock_slots,
             store_key,
         })
     }
@@ -150,9 +195,13 @@ impl WorkspaceLeaseStore {
         let pool = context.open_pool().await?;
         ensure_workspace_leases_table(&pool).await?;
         let repository_lock_pool = context.open_runtime_pool().await?;
+        let repository_lock_slots = Arc::new(Semaphore::new(
+            repository_lock_pool.options().get_max_connections() as usize,
+        ));
         Ok(Self {
             pool,
             repository_lock_pool,
+            repository_lock_slots,
             store_key,
         })
     }
@@ -161,6 +210,7 @@ impl WorkspaceLeaseStore {
         &self,
         record: &WorkspaceLeaseRecord,
     ) -> anyhow::Result<bool> {
+        let mut transaction = self.pool.begin().await?;
         let result = sqlx::query(
             "INSERT INTO workspace_leases (
                 store_key, project_key, slot_index, task_id, workspace_key, workspace_path,
@@ -202,9 +252,51 @@ impl WorkspaceLeaseStore {
         .bind(record.run_generation as i64)
         .bind(record.process_id as i64)
         .bind(i64::try_from(record.process_started_at)?)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() == 0 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        if let Some(runtime_workflow_id) = record.runtime_workflow_id.as_deref() {
+            sqlx::query(
+                "INSERT INTO workspace_cleanup_targets (
+                    store_key, runtime_workflow_id, workspace_path, task_id, project_key,
+                    slot_index, workspace_key, source_repo, repo, owner_session, run_generation,
+                    process_id, process_started_at, created_at, last_used_at
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                           CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                 ON CONFLICT(store_key, runtime_workflow_id, workspace_path) DO UPDATE SET
+                    task_id = EXCLUDED.task_id,
+                    project_key = EXCLUDED.project_key,
+                    slot_index = EXCLUDED.slot_index,
+                    workspace_key = EXCLUDED.workspace_key,
+                    source_repo = EXCLUDED.source_repo,
+                    repo = EXCLUDED.repo,
+                    owner_session = EXCLUDED.owner_session,
+                    run_generation = EXCLUDED.run_generation,
+                    process_id = EXCLUDED.process_id,
+                    process_started_at = EXCLUDED.process_started_at,
+                    last_used_at = CURRENT_TIMESTAMP",
+            )
+            .bind(&self.store_key)
+            .bind(runtime_workflow_id)
+            .bind(record.workspace_path.to_string_lossy().as_ref())
+            .bind(record.task_id.as_str())
+            .bind(&record.project_key)
+            .bind(record.slot_index as i64)
+            .bind(&record.workspace_key)
+            .bind(record.source_repo.to_string_lossy().as_ref())
+            .bind(record.repo.as_deref())
+            .bind(&record.owner_session)
+            .bind(record.run_generation as i64)
+            .bind(record.process_id as i64)
+            .bind(i64::try_from(record.process_started_at)?)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(true)
     }
 
     pub(crate) async fn leased_slots_for_project(
@@ -304,7 +396,10 @@ impl WorkspaceLeaseStore {
         Ok(released)
     }
 
-    async fn release_exact_lease(&self, record: &WorkspaceLeaseRecord) -> anyhow::Result<bool> {
+    pub(crate) async fn release_exact_lease(
+        &self,
+        record: &WorkspaceLeaseRecord,
+    ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE workspace_leases
              SET state = 'released',
@@ -478,12 +573,17 @@ impl TryFrom<WorkspaceLeaseRow> for WorkspaceLeaseRecord {
 
 #[cfg(test)]
 async fn ensure_workspace_leases_table(pool: &PgPool) -> anyhow::Result<()> {
-    for statement in WORKSPACE_LEASES_TABLE_SQL
-        .split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-    {
-        sqlx::query(statement).execute(pool).await?;
+    for table_sql in [
+        WORKSPACE_LEASES_TABLE_SQL,
+        WORKSPACE_CLEANUP_TARGETS_TABLE_SQL,
+    ] {
+        for statement in table_sql
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+        {
+            sqlx::query(statement).execute(pool).await?;
+        }
     }
     Ok(())
 }

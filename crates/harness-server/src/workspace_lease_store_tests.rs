@@ -47,6 +47,262 @@ async fn workspace_lease_store_persists_and_releases_active_slots() -> anyhow::R
 }
 
 #[tokio::test]
+async fn runtime_cleanup_releases_only_the_exact_candidate_lease() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&dir.path().join("exact-candidate-release")).await?,
+    );
+    let manager = WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: dir.path().join("workspaces"),
+            ..Default::default()
+        },
+        WorkspacePoolConfig::new(2, std::collections::HashMap::new()),
+        Some(store.clone()),
+    )?;
+    let process_started_at = WorkspaceLeaseStore::current_process_started_at()?;
+    let shared_task_id = harness_core::types::TaskId("issue-1300-c1".to_string());
+    let record_a = WorkspaceLeaseRecord {
+        project_key: "/repo/a".to_string(),
+        slot_index: 0,
+        task_id: shared_task_id.clone(),
+        workspace_key: "repo-a-issue-1300".to_string(),
+        workspace_path: dir.path().join("workspaces/repo-a-slot-0"),
+        source_repo: dir.path().join("repo-a"),
+        repo: Some("owner/repo-a".to_string()),
+        runtime_workflow_id: Some("workflow-a".to_string()),
+        owner_session: "session-a".to_string(),
+        run_generation: 1,
+        process_id: std::process::id(),
+        process_started_at,
+    };
+    let record_b = WorkspaceLeaseRecord {
+        project_key: "/repo/b".to_string(),
+        workspace_key: "repo-b-issue-1300".to_string(),
+        workspace_path: dir.path().join("workspaces/repo-b-slot-0"),
+        source_repo: dir.path().join("repo-b"),
+        repo: Some("owner/repo-b".to_string()),
+        runtime_workflow_id: Some("workflow-b".to_string()),
+        owner_session: "session-b".to_string(),
+        ..record_a.clone()
+    };
+    assert!(store.try_acquire_lease(&record_a).await?);
+    assert!(store.try_acquire_lease(&record_b).await?);
+
+    let targets = manager
+        .workspace_targets_for_runtime_workflow("workflow-a")
+        .await?;
+    assert_eq!(targets.len(), 1);
+    manager
+        .release_runtime_workspace_cleanup_target(&targets[0])
+        .await?;
+
+    let leased = store.list_leased().await?;
+    assert_eq!(leased.len(), 1);
+    assert_eq!(leased[0].project_key, record_b.project_key);
+    assert_eq!(leased[0].task_id, shared_task_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_cleanup_does_not_remove_same_task_id_from_another_repository() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let repo_a = tempfile::tempdir()?;
+    let repo_b = tempfile::tempdir()?;
+    init_git_repo(repo_a.path());
+    init_git_repo(repo_b.path());
+    let branch_a = current_branch(repo_a.path());
+    let branch_b = current_branch(repo_b.path());
+    let workspaces = tempfile::tempdir()?;
+    let lease_db = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("cross-repository-task-id")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let pool_config = WorkspacePoolConfig::new(2, std::collections::HashMap::new());
+    let manager_a =
+        WorkspaceManager::new_with_pool(config.clone(), pool_config.clone(), Some(store.clone()))?;
+    let manager_b = WorkspaceManager::new_with_pool(config, pool_config, Some(store.clone()))?;
+    let task_id = harness_core::types::TaskId("issue-1300-c1".to_string());
+    let workspace_a = manager_a
+        .create_workspace_with_options(
+            &task_id,
+            repo_a.path(),
+            "origin",
+            &branch_a,
+            1,
+            Some("issue:1300"),
+            Some("owner/repo-a"),
+            WorkspaceCreateOptions {
+                require_remote_head: false,
+                runtime_workflow_id: Some("workflow-a".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    manager_a.release_workspace(&task_id).await;
+    let workspace_b = manager_b
+        .create_workspace_with_options(
+            &task_id,
+            repo_b.path(),
+            "origin",
+            &branch_b,
+            1,
+            Some("issue:1300"),
+            Some("owner/repo-b"),
+            WorkspaceCreateOptions {
+                require_remote_head: false,
+                runtime_workflow_id: Some("workflow-b".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    let _repository_lease = manager_b
+        .acquire_repository_write_lease_for_cleanup(repo_a.path())
+        .await?;
+    manager_b
+        .cleanup_workspace_for_retry(&task_id, repo_a.path(), Some(&workspace_a.workspace_path))
+        .await?;
+    let targets = manager_b
+        .workspace_targets_for_runtime_workflow("workflow-a")
+        .await?;
+    assert_eq!(targets.len(), 1);
+    manager_b
+        .release_runtime_workspace_cleanup_target(&targets[0])
+        .await?;
+
+    assert!(!workspace_a.workspace_path.exists());
+    assert!(workspace_b.workspace_path.exists());
+    assert!(manager_b.active.contains_key(&task_id));
+    let leased = store.list_leased().await?;
+    assert_eq!(leased.len(), 1);
+    assert_eq!(leased[0].runtime_workflow_id.as_deref(), Some("workflow-b"));
+    manager_b.remove_workspace(&task_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_cleanup_target_survives_slot_reuse_with_a_different_repo_slug(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source_repo = tempfile::tempdir()?;
+    init_git_repo(source_repo.path());
+    let branch = current_branch(source_repo.path());
+    let workspaces = tempfile::tempdir()?;
+    let lease_db = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("slot-reuse-cleanup-history")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let pool_config = WorkspacePoolConfig::new(1, std::collections::HashMap::new());
+    let manager_a =
+        WorkspaceManager::new_with_pool(config.clone(), pool_config.clone(), Some(store.clone()))?;
+    let manager_b = WorkspaceManager::new_with_pool(config, pool_config, Some(store.clone()))?;
+    let task_a = harness_core::types::TaskId("issue-1300-a".to_string());
+    let task_b = harness_core::types::TaskId("issue-1300-b".to_string());
+
+    let workspace_a = manager_a
+        .create_workspace_with_options(
+            &task_a,
+            source_repo.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:1300"),
+            Some("owner/repo-a"),
+            WorkspaceCreateOptions {
+                require_remote_head: false,
+                runtime_workflow_id: Some("workflow-a".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    manager_a.release_workspace(&task_a).await;
+
+    let workspace_b = manager_b
+        .create_workspace_with_options(
+            &task_b,
+            source_repo.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:1300"),
+            Some("owner/repo-b"),
+            WorkspaceCreateOptions {
+                require_remote_head: false,
+                runtime_workflow_id: Some("workflow-b".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    manager_b.release_workspace(&task_b).await;
+
+    assert_ne!(workspace_a.workspace_path, workspace_b.workspace_path);
+    let _repository_lease = manager_b
+        .acquire_repository_write_lease_for_cleanup(source_repo.path())
+        .await?;
+    let targets_a = manager_b
+        .workspace_targets_for_runtime_workflow("workflow-a")
+        .await?;
+    assert_eq!(targets_a.len(), 1);
+    assert_eq!(targets_a[0].workspace_path, workspace_a.workspace_path);
+    assert!(
+        !manager_b
+            .runtime_workspace_cleanup_target_is_superseded(&targets_a[0])
+            .await?
+    );
+    manager_b
+        .cleanup_workspace_for_retry(
+            &targets_a[0].task_id,
+            source_repo.path(),
+            Some(&targets_a[0].workspace_path),
+        )
+        .await?;
+    manager_b
+        .release_runtime_workspace_cleanup_target(&targets_a[0])
+        .await?;
+
+    assert!(!workspace_a.workspace_path.exists());
+    assert!(workspace_b.workspace_path.exists());
+    assert!(manager_b
+        .workspace_targets_for_runtime_workflow("workflow-a")
+        .await?
+        .is_empty());
+    assert_eq!(
+        manager_b
+            .workspace_targets_for_runtime_workflow("workflow-b")
+            .await?
+            .len(),
+        1
+    );
+    let current = store
+        .current_workspace_lease_for_slot(
+            &crate::workspace_pool::project_limit_key(source_repo.path()),
+            0,
+        )
+        .await?
+        .expect("workflow B should retain the current slot record");
+    assert_eq!(current.runtime_workflow_id.as_deref(), Some("workflow-b"));
+    assert_eq!(current.workspace_path, workspace_b.workspace_path);
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_lease_store_shared_schema_keeps_data_dirs_isolated() -> anyhow::Result<()> {
     let database_url = match harness_core::db::resolve_test_database_url(None) {
         Ok(url) => url,
@@ -116,7 +372,71 @@ async fn workspace_lease_store_shared_schema_keeps_data_dirs_isolated() -> anyho
 }
 
 #[tokio::test]
-async fn repository_write_lease_is_global_across_postgres_schemas() -> anyhow::Result<()> {
+async fn legacy_backfill_copies_runtime_workspace_cleanup_targets() -> anyhow::Result<()> {
+    let database_url = match harness_core::db::resolve_test_database_url(None) {
+        Ok(url) => url,
+        Err(_) => return Ok(()),
+    };
+    let dir = tempfile::tempdir()?;
+    let legacy_path = dir.path().join("legacy-task-db");
+    let _legacy_db =
+        crate::task_db::TaskDb::open_with_database_url(&legacy_path, Some(database_url.as_str()))
+            .await?;
+    let legacy_store = WorkspaceLeaseStore::open(&legacy_path).await?;
+    let record = WorkspaceLeaseRecord {
+        project_key: "/repo/legacy".to_string(),
+        slot_index: 0,
+        task_id: harness_core::types::TaskId("legacy-runtime-task".to_string()),
+        workspace_key: "legacy-runtime-workspace".to_string(),
+        workspace_path: dir.path().join("workspaces/legacy-runtime-slot-0"),
+        source_repo: dir.path().join("repo"),
+        repo: Some("owner/legacy-repo".to_string()),
+        runtime_workflow_id: Some("legacy-runtime-workflow".to_string()),
+        owner_session: "legacy-session".to_string(),
+        run_generation: 1,
+        process_id: std::process::id(),
+        process_started_at: WorkspaceLeaseStore::current_process_started_at()?,
+    };
+    assert!(legacy_store.try_acquire_lease(&record).await?);
+
+    let setup_pool = harness_core::db::pg_open_pool(&database_url).await?;
+    let mut shared_schema = TestSchemaGuard::new(&database_url, "cleanup_target_backfill_test")?;
+    let shared_context =
+        harness_core::db::PgStoreContext::from_schema(shared_schema.schema(), Some(&database_url))?;
+    let shared_data_dir = dir.path().join("shared-data");
+    std::fs::create_dir_all(&shared_data_dir)?;
+    let shared_db = crate::task_db::TaskDb::open_shared_with_data_dir(
+        &shared_context,
+        &setup_pool,
+        &shared_data_dir,
+    )
+    .await?;
+    crate::task_db::migrate_legacy_task_db_if_needed(
+        &legacy_path,
+        Some(database_url.as_str()),
+        &shared_db,
+    )
+    .await?;
+    let shared_store = WorkspaceLeaseStore::open_shared_with_data_dir(
+        &shared_context,
+        &setup_pool,
+        &shared_data_dir,
+    )
+    .await?;
+
+    let targets = shared_store
+        .workspace_cleanup_targets_for_runtime_workflow("legacy-runtime-workflow")
+        .await?;
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].workspace_path, record.workspace_path);
+
+    shared_schema.cleanup_with_pool(&setup_pool).await?;
+    setup_pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn repository_lease_modes_are_global_across_postgres_schemas() -> anyhow::Result<()> {
     let database_url = match harness_core::db::resolve_test_database_url(None) {
         Ok(url) => url,
         Err(_) => return Ok(()),
@@ -157,6 +477,48 @@ async fn repository_write_lease_is_global_across_postgres_schemas() -> anyhow::R
         .await?
         .expect("lease should be released when the owning connection is dropped");
     drop(lease_b);
+
+    let shared_a = store_a
+        .try_acquire_repository_shared_lease("/repo/owner/project")
+        .await?
+        .expect("the first multi-writer should acquire a shared repository lease");
+    let shared_b = store_b
+        .try_acquire_repository_shared_lease("/repo/owner/project")
+        .await?
+        .expect("a second multi-writer should share the repository lease");
+    assert!(
+        store_b
+            .try_acquire_repository_write_lease("/repo/owner/project")
+            .await?
+            .is_none(),
+        "an N-to-1 transition must wait for every shared writer"
+    );
+    drop(shared_a);
+    assert!(
+        store_a
+            .try_acquire_repository_write_lease("/repo/owner/project")
+            .await?
+            .is_none(),
+        "an exclusive writer must keep waiting while one shared writer remains"
+    );
+    drop(shared_b);
+    let exclusive = store_a
+        .try_acquire_repository_write_lease("/repo/owner/project")
+        .await?
+        .expect("the single-writer transition should acquire after shared writers drain");
+    assert!(
+        store_b
+            .try_acquire_repository_shared_lease("/repo/owner/project")
+            .await?
+            .is_none(),
+        "a 1-to-N transition must wait for the exclusive writer"
+    );
+    drop(exclusive);
+    let shared_after_transition = store_b
+        .try_acquire_repository_shared_lease("/repo/owner/project")
+        .await?
+        .expect("shared writers should resume after the exclusive writer drains");
+    drop(shared_after_transition);
 
     schema_a.cleanup_with_pool(&setup_pool).await?;
     schema_b.cleanup_with_pool(&setup_pool).await?;
@@ -199,6 +561,175 @@ async fn repository_write_lease_waits_when_dedicated_pool_is_full() -> anyhow::R
         .ok_or_else(|| anyhow::anyhow!("unrelated repository lease should acquire"))?;
     drop(second);
     drop(held_leases);
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_creation_accepts_preacquired_repository_write_lease() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+    let workspaces = tempfile::tempdir()?;
+    let lease_db = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("workspace-leases")).await?,
+    );
+    let mgr = WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        },
+        WorkspacePoolConfig::new(2, std::collections::HashMap::new()),
+        Some(store.clone()),
+    )?;
+    let task_id = harness_core::types::TaskId("preacquired-repository-lease".to_string());
+    let repository_write_lease = mgr.acquire_repository_write_lease(source.path()).await?;
+
+    let workspace = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        mgr.create_workspace_with_options(
+            &task_id,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:1302"),
+            Some("owner/repo"),
+            WorkspaceCreateOptions {
+                require_remote_head: false,
+                repository_write_lease: RepositoryWriteLeaseInput::Held(repository_write_lease),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("workspace creation tried to acquire the repository lease twice")
+    })??;
+    assert!(workspace.workspace_path.exists());
+    mgr.remove_workspace(&task_id).await?;
+
+    let reused_task_id = harness_core::types::TaskId("attach-preacquired-lease".to_string());
+    mgr.create_workspace_with_options(
+        &reused_task_id,
+        source.path(),
+        "origin",
+        &branch,
+        1,
+        Some("issue:1303"),
+        Some("owner/repo"),
+        WorkspaceCreateOptions {
+            require_remote_head: false,
+            repository_write_lease: RepositoryWriteLeaseInput::NotRequired,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(
+        mgr.active
+            .get(&reused_task_id)
+            .is_some_and(|active| active._repository_write_lease.is_none()),
+        "the multi-writer workspace should start without a repository lease"
+    );
+    let repository_write_lease = mgr.acquire_repository_write_lease(source.path()).await?;
+    mgr.create_workspace_with_options(
+        &reused_task_id,
+        source.path(),
+        "origin",
+        &branch,
+        1,
+        Some("issue:1303"),
+        Some("owner/repo"),
+        WorkspaceCreateOptions {
+            require_remote_head: false,
+            repository_write_lease: RepositoryWriteLeaseInput::Held(repository_write_lease),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(
+        mgr.active
+            .get(&reused_task_id)
+            .is_some_and(|active| active._repository_write_lease.is_some()),
+        "a live capacity change to single-writer must attach the preacquired lease to a reused workspace"
+    );
+    let project_key = crate::workspace_pool::project_limit_key(source.path());
+    assert!(
+        store
+            .try_acquire_repository_write_lease(&project_key)
+            .await?
+            .is_none(),
+        "the reused workspace must retain the attached repository lease"
+    );
+    mgr.remove_workspace(&reused_task_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cross_manager_reconciliation_waits_for_repository_writer() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+    let workspaces = tempfile::tempdir()?;
+    let lease_db = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("reconcile-race")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let pool_config = WorkspacePoolConfig::new(2, std::collections::HashMap::new());
+    let manager_a = std::sync::Arc::new(WorkspaceManager::new_with_pool(
+        config.clone(),
+        pool_config.clone(),
+        Some(store.clone()),
+    )?);
+    let manager_b = std::sync::Arc::new(WorkspaceManager::new_with_pool(
+        config,
+        pool_config,
+        Some(store),
+    )?);
+    let task_id = harness_core::types::TaskId("reconcile-race-writer".to_string());
+    let workspace = manager_a
+        .create_workspace(
+            &task_id,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:1304"),
+            Some("owner/repo"),
+        )
+        .await?;
+
+    let manager_b_for_cleanup = manager_b.clone();
+    let source_path = source.path().to_path_buf();
+    let workspace_path = workspace.workspace_path.clone();
+    let cleanup = tokio::spawn(async move {
+        manager_b_for_cleanup
+            .cleanup_reconciliation_workspace_path(&source_path, &workspace_path)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !cleanup.is_finished(),
+        "reconciliation must wait while another manager holds a shared writer lease"
+    );
+    assert!(workspace.workspace_path.exists());
+
+    manager_a.release_workspace(&task_id).await;
+    let removed = tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+        .await
+        .map_err(|_| anyhow::anyhow!("reconciliation did not resume after writer release"))???;
+    assert!(removed);
+    assert!(!workspace.workspace_path.exists());
     Ok(())
 }
 

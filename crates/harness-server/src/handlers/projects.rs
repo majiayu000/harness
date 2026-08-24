@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_project_updates_live_issue_queue_limit() -> anyhow::Result<()> {
+    async fn register_project_updates_live_queue_and_workspace_lease_limit() -> anyhow::Result<()> {
         let _lock = crate::test_helpers::HOME_LOCK.lock().await;
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
@@ -317,6 +317,56 @@ mod tests {
                 .task_queue
                 .effective_project_limit(&queue_key),
             4
+        );
+        assert_eq!(
+            state
+                .concurrency
+                .workspace_mgr
+                .as_ref()
+                .expect("workspace manager should be configured")
+                .resolve_workspace_capacity(&canonical_root)
+                .await?,
+            4,
+            "legacy workspace callers must observe the live capacity"
+        );
+
+        let (status, _) = register_project(
+            State(state.clone()),
+            Json(RegisterProjectRequest {
+                id: "live-limit".to_string(),
+                root: canonical_root.clone(),
+                max_concurrent: Some(1),
+                default_agent: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            state
+                .concurrency
+                .task_queue
+                .effective_project_limit(&queue_key),
+            1
+        );
+        assert_eq!(
+            state
+                .concurrency
+                .workspace_mgr
+                .as_ref()
+                .expect("workspace manager should be configured")
+                .resolve_workspace_capacity(&canonical_root)
+                .await?,
+            1,
+            "legacy workspace callers must switch to the live single-writer capacity"
+        );
+        assert!(
+            crate::workflow_runtime_worker::source_project_is_configured_single_writer(
+                &state,
+                &canonical_root,
+            )
+            .await?,
+            "workflow lease decisions must observe the updated project registry"
         );
         Ok(())
     }

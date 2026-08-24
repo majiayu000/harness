@@ -455,29 +455,33 @@ pub(crate) async fn build_registry(
     )
     .await
     {
-        Ok(workspace_pool_config) => match crate::workspace::WorkspaceManager::new_with_pool(
-            server.config.workspace.clone(),
-            workspace_pool_config,
-            workspace_lease_store,
-        ) {
-            Ok(mgr) => {
-                startup_results.push(StoreStartupResult::optional("workspace_manager"));
-                tracing::debug!(
-                    root = %server.config.workspace.root.display(),
-                    "workspace manager initialized"
-                );
-                Some(Arc::new(mgr))
-            }
-            Err(error) => {
-                startup_results.push(
-                    StoreStartupResult::optional("workspace_manager").failed(error.to_string()),
-                );
-                tracing::warn!(
+        Ok(workspace_pool_config) => {
+            match crate::workspace::WorkspaceManager::new_with_pool_and_capacity_source(
+                server.config.workspace.clone(),
+                workspace_pool_config,
+                workspace_lease_store,
+                server.clone(),
+                project_registry.clone(),
+            ) {
+                Ok(mgr) => {
+                    startup_results.push(StoreStartupResult::optional("workspace_manager"));
+                    tracing::debug!(
+                        root = %server.config.workspace.root.display(),
+                        "workspace manager initialized"
+                    );
+                    Some(Arc::new(mgr))
+                }
+                Err(error) => {
+                    startup_results.push(
+                        StoreStartupResult::optional("workspace_manager").failed(error.to_string()),
+                    );
+                    tracing::warn!(
                     "failed to initialize workspace manager: {error}; running without workspace isolation"
                 );
-                None
+                    None
+                }
             }
-        },
+        }
         Err(error) => {
             startup_results
                 .push(StoreStartupResult::optional("workspace_manager").failed(error.to_string()));
