@@ -69,6 +69,29 @@ impl WorkspaceLeaseStore {
         .await
     }
 
+    pub(crate) async fn try_acquire_repository_write_lease_now(
+        &self,
+        project_key: &str,
+    ) -> anyhow::Result<Option<RepositoryWriteLease>> {
+        let Ok(slot_permit) = self.repository_lock_slots.clone().try_acquire_owned() else {
+            return Ok(None);
+        };
+        let mut connection = self.repository_lock_pool.acquire().await?;
+        connection.close_on_drop();
+        let (acquired,): (bool,) =
+            sqlx::query_as("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+                .bind(project_key)
+                .fetch_one(&mut *connection)
+                .await?;
+        if !acquired {
+            return Ok(None);
+        }
+        Ok(Some(RepositoryWriteLease {
+            _connection: tokio::sync::Mutex::new(connection),
+            _slot_permit: slot_permit,
+        }))
+    }
+
     pub(crate) async fn try_acquire_repository_shared_lease(
         &self,
         project_key: &str,

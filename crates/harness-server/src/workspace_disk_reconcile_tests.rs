@@ -386,9 +386,14 @@ async fn cleanup_orphan_worktrees_reclaim_gate_skips_live_persisted_lease() -> a
         .create_workspace(&task_id, source.path(), "origin", &branch, 1, None, None)
         .await?;
 
-    mgr_b
-        .cleanup_orphan_worktrees(source.path(), std::slice::from_ref(&task_id))
-        .await;
+    let summary = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        mgr_b.cleanup_orphan_worktrees(source.path(), std::slice::from_ref(&task_id)),
+    )
+    .await
+    .expect("orphan cleanup should defer instead of waiting for a live repository writer");
+    assert_eq!(summary.deferred, 1);
+    assert!(summary.prune_deferred);
 
     assert!(
         lease.workspace_path.exists(),

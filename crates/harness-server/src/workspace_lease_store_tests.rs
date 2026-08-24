@@ -400,7 +400,7 @@ async fn legacy_backfill_copies_runtime_workspace_cleanup_targets() -> anyhow::R
     assert!(legacy_store.try_acquire_lease(&record).await?);
 
     let setup_pool = harness_core::db::pg_open_pool(&database_url).await?;
-    let mut shared_schema = TestSchemaGuard::new(&database_url, "cleanup_target_backfill_test")?;
+    let mut shared_schema = TestSchemaGuard::new(&database_url, "workspace_lease_scope_test")?;
     let shared_context =
         harness_core::db::PgStoreContext::from_schema(shared_schema.schema(), Some(&database_url))?;
     let shared_data_dir = dir.path().join("shared-data");
@@ -523,6 +523,24 @@ async fn repository_lease_modes_are_global_across_postgres_schemas() -> anyhow::
     schema_a.cleanup_with_pool(&setup_pool).await?;
     schema_b.cleanup_with_pool(&setup_pool).await?;
     setup_pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn immediate_repository_lease_reopens_connections_after_drop() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkspaceLeaseStore::open(&dir.path().join("immediate-repository-lease")).await?;
+
+    for _ in 0..3 {
+        let lease = store
+            .try_acquire_repository_write_lease_now("/repo/repeated-immediate")
+            .await?
+            .expect("an idle repository should acquire immediately");
+        drop(lease);
+    }
     Ok(())
 }
 

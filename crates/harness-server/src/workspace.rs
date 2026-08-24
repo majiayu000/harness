@@ -231,6 +231,15 @@ pub(crate) struct DiskReconciliationSummary {
     pub(crate) errors: u32,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanWorkspaceCleanupSummary {
+    pub removed: u32,
+    pub skipped_live: u32,
+    pub deferred: u32,
+    pub errors: u32,
+    pub prune_deferred: bool,
+}
+
 pub struct WorkspaceManager {
     pub(crate) config: WorkspaceConfig,
     pub(crate) active: DashMap<TaskId, ActiveWorkspace>,

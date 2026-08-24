@@ -6,6 +6,12 @@ pub(crate) struct RuntimeWorkspaceCleanupTarget {
     persisted_target: Option<crate::workspace_lease_store::WorkspaceCleanupTargetRecord>,
 }
 
+pub(crate) enum RepositoryWriteLeaseAttempt {
+    NotRequired,
+    Acquired(RepositoryWriteLease),
+    Contended,
+}
+
 impl WorkspaceManager {
     pub(crate) async fn acquire_repository_lease_from_current_config(
         &self,
@@ -112,6 +118,30 @@ impl WorkspaceManager {
         self.acquire_repository_write_lease(source_repo)
             .await
             .map(Some)
+    }
+
+    pub(crate) async fn try_acquire_repository_write_lease_for_reconciliation(
+        &self,
+        source_repo: &Path,
+    ) -> anyhow::Result<RepositoryWriteLeaseAttempt> {
+        if self.pool.repository_lease_mode_for_capacity(1).is_none() {
+            return Ok(RepositoryWriteLeaseAttempt::NotRequired);
+        }
+        let store = self.lease_store.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository reconciliation requires the PostgreSQL workspace lease store"
+            )
+        })?;
+        let project_key = crate::workspace_pool::project_limit_key(source_repo);
+        Ok(
+            match store
+                .try_acquire_repository_write_lease_now(&project_key)
+                .await?
+            {
+                Some(lease) => RepositoryWriteLeaseAttempt::Acquired(lease),
+                None => RepositoryWriteLeaseAttempt::Contended,
+            },
+        )
     }
 
     pub(crate) async fn workspace_targets_for_runtime_workflow(
