@@ -116,6 +116,145 @@ async fn workspace_lease_store_shared_schema_keeps_data_dirs_isolated() -> anyho
 }
 
 #[tokio::test]
+async fn repository_write_lease_is_global_across_postgres_schemas() -> anyhow::Result<()> {
+    let database_url = match harness_core::db::resolve_test_database_url(None) {
+        Ok(url) => url,
+        Err(_) => return Ok(()),
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let setup_pool = harness_core::db::pg_open_pool(&database_url).await?;
+    let mut schema_a = TestSchemaGuard::new(&database_url, "workspace_lease_scope_test")?;
+    let mut schema_b = TestSchemaGuard::new(&database_url, "workspace_lease_scope_test")?;
+    let context_a =
+        harness_core::db::PgStoreContext::from_schema(schema_a.schema(), Some(&database_url))?;
+    let context_b =
+        harness_core::db::PgStoreContext::from_schema(schema_b.schema(), Some(&database_url))?;
+    let data_a = dir.path().join("instance-a");
+    let data_b = dir.path().join("instance-b");
+    std::fs::create_dir_all(&data_a)?;
+    std::fs::create_dir_all(&data_b)?;
+    crate::task_db::TaskDb::open_shared_with_data_dir(&context_a, &setup_pool, &data_a).await?;
+    crate::task_db::TaskDb::open_shared_with_data_dir(&context_b, &setup_pool, &data_b).await?;
+    let store_a =
+        WorkspaceLeaseStore::open_shared_with_data_dir(&context_a, &setup_pool, &data_a).await?;
+    let store_b =
+        WorkspaceLeaseStore::open_shared_with_data_dir(&context_b, &setup_pool, &data_b).await?;
+
+    let lease_a = store_a
+        .try_acquire_repository_write_lease("/repo/owner/project")
+        .await?
+        .expect("first Harness instance should acquire the repository write lease");
+    assert!(
+        store_b
+            .try_acquire_repository_write_lease("/repo/owner/project")
+            .await?
+            .is_none(),
+        "a second Harness instance in another schema must not acquire the same repository"
+    );
+    drop(lease_a);
+    let lease_b = store_b
+        .try_acquire_repository_write_lease("/repo/owner/project")
+        .await?
+        .expect("lease should be released when the owning connection is dropped");
+    drop(lease_b);
+
+    schema_a.cleanup_with_pool(&setup_pool).await?;
+    schema_b.cleanup_with_pool(&setup_pool).await?;
+    setup_pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn repository_write_lease_waits_when_dedicated_pool_is_full() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkspaceLeaseStore::open(&dir.path().join("repository-lock-pool")).await?;
+    let pool_capacity = store.repository_lock_pool_capacity();
+    let mut held_leases = Vec::with_capacity(pool_capacity as usize);
+    for index in 0..pool_capacity {
+        let lease = store
+            .try_acquire_repository_write_lease(&format!("/repo/owner/held-{index}"))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("repository lease {index} should acquire"))?;
+        held_leases.push(lease);
+    }
+    let second = store.try_acquire_repository_write_lease_for_test(
+        "/repo/owner/second",
+        std::time::Duration::from_millis(100),
+    );
+    tokio::pin!(second);
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut second)
+            .await
+            .is_err(),
+        "pool exhaustion must keep waiting instead of returning a timeout error"
+    );
+    held_leases.pop();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), &mut second)
+        .await
+        .map_err(|_| anyhow::anyhow!("waiting repository lease did not resume"))??
+        .ok_or_else(|| anyhow::anyhow!("unrelated repository lease should acquire"))?;
+    drop(second);
+    drop(held_leases);
+    Ok(())
+}
+
+#[tokio::test]
+async fn repository_write_lease_propagates_sqlx_pool_timeout() -> anyhow::Result<()> {
+    let unavailable_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_millis(50))
+        .connect_lazy("postgres://postgres@127.0.0.1:1/harness_test")?;
+    let store = WorkspaceLeaseStore::for_repository_lock_pool_test(unavailable_pool);
+
+    let result = store
+        .try_acquire_repository_write_lease_for_test(
+            "/repo/owner/unavailable",
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => {
+            anyhow::bail!("database connectivity timeout must not be retried as pool saturation")
+        }
+    };
+    assert!(
+        error.to_string().contains("timed out acquiring"),
+        "unexpected database timeout error: {error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn repository_write_lease_propagates_outer_acquire_timeout() -> anyhow::Result<()> {
+    let unavailable_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(1))
+        .connect_lazy("postgres://postgres@127.0.0.1:1/harness_test")?;
+    let store = WorkspaceLeaseStore::for_repository_lock_pool_test(unavailable_pool);
+
+    let result = store
+        .try_acquire_repository_write_lease_for_test(
+            "/repo/owner/unavailable",
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => anyhow::bail!("outer connectivity timeout must not be retried as pool saturation"),
+    };
+    assert!(
+        error.to_string().contains("timed out acquiring"),
+        "unexpected outer database timeout error: {error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_lease_store_does_not_steal_live_foreign_slot() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

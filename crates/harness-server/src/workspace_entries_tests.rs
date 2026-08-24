@@ -31,6 +31,7 @@ fn workspace_entries_return_active_workspace_metadata_sorted_by_task_id() {
                 owner_session: mgr.owner_session.clone(),
                 run_generation: 1,
                 _pool_permit: None,
+                _repository_write_lease: None,
             },
         );
         mgr.active_paths.insert(workspace_path, task_id);

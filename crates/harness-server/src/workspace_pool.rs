@@ -11,6 +11,7 @@ const DEFAULT_WORKSPACE_POOL_CAPACITY: usize = 4;
 pub(crate) struct WorkspacePoolConfig {
     default_capacity: usize,
     per_project: HashMap<String, usize>,
+    require_global_single_writer_lease: bool,
 }
 
 impl Default for WorkspacePoolConfig {
@@ -18,6 +19,7 @@ impl Default for WorkspacePoolConfig {
         Self {
             default_capacity: DEFAULT_WORKSPACE_POOL_CAPACITY,
             per_project: HashMap::new(),
+            require_global_single_writer_lease: true,
         }
     }
 }
@@ -30,10 +32,21 @@ impl WorkspacePoolConfig {
                 .into_iter()
                 .map(|(key, value)| (key, value.max(1)))
                 .collect(),
+            require_global_single_writer_lease: true,
         }
     }
 
-    fn capacity_for(&self, source_repo: &Path) -> usize {
+    #[cfg(test)]
+    pub(crate) fn new_for_local_pool_tests(
+        default_capacity: usize,
+        per_project: HashMap<String, usize>,
+    ) -> Self {
+        let mut config = Self::new(default_capacity, per_project);
+        config.require_global_single_writer_lease = false;
+        config
+    }
+
+    pub(crate) fn capacity_for(&self, source_repo: &Path) -> usize {
         let project_key = project_limit_key(source_repo);
         self.per_project
             .get(&project_key)
@@ -56,6 +69,14 @@ impl WorkspacePool {
             semaphores: DashMap::new(),
             slot_locks: DashMap::new(),
         }
+    }
+
+    pub(crate) fn capacity_for(&self, source_repo: &Path) -> usize {
+        self.config.capacity_for(source_repo)
+    }
+
+    pub(crate) fn requires_repository_write_lease(&self, source_repo: &Path) -> bool {
+        self.config.require_global_single_writer_lease && self.capacity_for(source_repo) == 1
     }
 
     pub(crate) async fn acquire(

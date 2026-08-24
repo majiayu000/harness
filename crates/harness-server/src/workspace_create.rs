@@ -84,6 +84,14 @@ impl WorkspaceManager {
         let workspace_project_key = pool_permit.workspace_project_key.clone();
         let capacity = pool_permit.capacity;
         let mut pool_permit = Some(pool_permit.permit);
+        let repository_write_lease = self
+            .acquire_repository_write_lease_if_single_writer(source_repo)
+            .await
+            .map_err(|err| WorkspaceLifecycleError::CreateFailed {
+                message: format!(
+                    "failed to acquire PostgreSQL repository write lease for {project_key}: {err}"
+                ),
+            })?;
         let slot_lock = self.pool.selection_lock(&project_key);
         let slot_guard = slot_lock.lock().await;
         if let Some(active) = self.active.get(task_id) {
@@ -356,6 +364,7 @@ impl WorkspaceManager {
                         owner_session: owner_session.clone(),
                         run_generation,
                         _pool_permit: pool_permit.take(),
+                        _repository_write_lease: repository_write_lease,
                     });
                     None
                 }

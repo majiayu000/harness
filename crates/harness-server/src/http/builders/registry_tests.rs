@@ -93,6 +93,32 @@ async fn build_registry_opens_project_registry_from_shared_schema() {
 }
 
 #[tokio::test]
+async fn workspace_pool_config_fails_closed_when_project_registry_read_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
+        return;
+    };
+    let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
+        .await
+        .expect("build_registry should succeed");
+    let project_registry = bundle
+        .project_registry
+        .as_ref()
+        .expect("project registry should be ready");
+    project_registry.pool().close().await;
+
+    let result = crate::http::builders::workspace_pool_config::build_workspace_pool_config(
+        &server,
+        Some(project_registry),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "project limit resolution must fail closed when the registry cannot be read"
+    );
+}
+
+#[tokio::test]
 async fn runtime_state_failure_is_recorded_as_optional() {
     let dir = tempfile::tempdir().expect("tempdir");
     let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {

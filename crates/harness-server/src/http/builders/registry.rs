@@ -449,29 +449,40 @@ pub(crate) async fn build_registry(
         },
     };
 
-    let workspace_pool_config = super::workspace_pool_config::build_workspace_pool_config(
+    let workspace_mgr = match super::workspace_pool_config::build_workspace_pool_config(
         server,
         project_registry.as_ref(),
     )
-    .await;
-    let workspace_mgr = match crate::workspace::WorkspaceManager::new_with_pool(
-        server.config.workspace.clone(),
-        workspace_pool_config,
-        workspace_lease_store,
-    ) {
-        Ok(mgr) => {
-            startup_results.push(StoreStartupResult::optional("workspace_manager"));
-            tracing::debug!(
-                root = %server.config.workspace.root.display(),
-                "workspace manager initialized"
-            );
-            Some(Arc::new(mgr))
-        }
-        Err(e) => {
+    .await
+    {
+        Ok(workspace_pool_config) => match crate::workspace::WorkspaceManager::new_with_pool(
+            server.config.workspace.clone(),
+            workspace_pool_config,
+            workspace_lease_store,
+        ) {
+            Ok(mgr) => {
+                startup_results.push(StoreStartupResult::optional("workspace_manager"));
+                tracing::debug!(
+                    root = %server.config.workspace.root.display(),
+                    "workspace manager initialized"
+                );
+                Some(Arc::new(mgr))
+            }
+            Err(error) => {
+                startup_results.push(
+                    StoreStartupResult::optional("workspace_manager").failed(error.to_string()),
+                );
+                tracing::warn!(
+                    "failed to initialize workspace manager: {error}; running without workspace isolation"
+                );
+                None
+            }
+        },
+        Err(error) => {
             startup_results
-                .push(StoreStartupResult::optional("workspace_manager").failed(e.to_string()));
-            tracing::warn!(
-                "failed to initialize workspace manager: {e}; running without workspace isolation"
+                .push(StoreStartupResult::optional("workspace_manager").failed(error.to_string()));
+            tracing::error!(
+                "failed to resolve workspace concurrency limits: {error}; running without workspace isolation"
             );
             None
         }
