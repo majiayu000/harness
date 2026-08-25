@@ -389,10 +389,19 @@ impl WorkspaceManager {
 
             if should_remove {
                 let repository_lease = match self
-                    .acquire_repository_write_lease_for_cleanup(source_repo)
+                    .try_acquire_repository_write_lease_for_reconciliation(source_repo)
                     .await
                 {
-                    Ok(lease) => lease,
+                    Ok(RepositoryWriteLeaseAttempt::NotRequired) => None,
+                    Ok(RepositoryWriteLeaseAttempt::Acquired(lease)) => Some(lease),
+                    Ok(RepositoryWriteLeaseAttempt::Contended) => {
+                        tracing::debug!(
+                            workspace_path = ?path,
+                            "reconcile_disk_workspaces: repository is busy; deferring cleanup until remote state can be refreshed"
+                        );
+                        summary.skipped_open += 1;
+                        continue;
+                    }
                     Err(error) => {
                         tracing::warn!(
                             workspace_path = ?path,

@@ -97,6 +97,89 @@ async fn reconcile_disk_removes_closed_issue_workspace() {
 }
 
 #[tokio::test]
+async fn reconcile_disk_defers_closed_workspace_while_repository_is_busy() -> anyhow::Result<()> {
+    let _env_guard = async_env_lock().lock().await;
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+    let workspaces = tempfile::tempdir()?;
+    let lease_db = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("disk-reconcile-contention")).await?,
+    );
+    let config = WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        ..Default::default()
+    };
+    let active_manager = WorkspaceManager::new_with_pool(
+        config.clone(),
+        WorkspacePoolConfig::default(),
+        Some(store.clone()),
+    )?;
+    let reconcile_manager =
+        WorkspaceManager::new_with_pool(config, WorkspacePoolConfig::default(), Some(store))?;
+    let active_task = harness_core::types::TaskId("active-repository-writer".to_string());
+    active_manager
+        .create_workspace(
+            &active_task,
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            None,
+            None,
+        )
+        .await?;
+    assert!(active_manager
+        .active
+        .get(&active_task)
+        .is_some_and(|active| active._repository_write_lease.is_some()));
+    let lease_attempt = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        reconcile_manager.try_acquire_repository_write_lease_for_reconciliation(source.path()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("nonblocking reconciliation lease acquisition blocked"))??;
+    assert!(matches!(
+        lease_attempt,
+        crate::workspace::RepositoryWriteLeaseAttempt::Contended
+    ));
+
+    let issue_dir = workspaces.path().join("myorg_my-repo__issue_43");
+    std::fs::create_dir_all(issue_dir.join(".git"))?;
+    std::fs::write(
+        issue_dir.join(".git").join(OWNER_RECORD_FILE),
+        serde_json::to_vec(&WorkspaceOwnerRecord {
+            task_id: "issue:43".to_string(),
+            run_generation: 1,
+            owner_session: "stale-owner".to_string(),
+            acquisition_id: None,
+            workspace_key: Some("myorg_my-repo__issue_43".to_string()),
+        })?,
+    )?;
+    let api_base =
+        github_state_server("/repos/myorg/my-repo/issues/43", r#"{"state":"closed"}"#).await;
+    let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+
+    let summary = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        reconcile_manager.reconcile_disk_workspaces(source.path(), "gh", 20, None),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("disk reconciliation waited on a busy repository"))?;
+    assert_eq!(summary.removed, 0);
+    assert_eq!(summary.errors, 0);
+    assert!(issue_dir.exists());
+
+    active_manager.remove_workspace(&active_task).await?;
+    cleanup_workspace_path(source.path(), &issue_dir).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconcile_disk_removes_closed_issue_pool_slot_workspace() {
     let _env_guard = async_env_lock().lock().await;
     let source = tempfile::tempdir().expect("tempdir");
