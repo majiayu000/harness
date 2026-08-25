@@ -1,4 +1,8 @@
-use crate::workspace::WorkspaceManager;
+use crate::workspace::{
+    run_until_repository_lease_loss, WorkspaceExecutionGuard, WorkspaceLease, WorkspaceManager,
+};
+use crate::workspace_lease_store::RepositoryLeaseState;
+use futures::FutureExt;
 use harness_core::{
     agent::AgentRequest,
     agent::AgentResponse,
@@ -11,17 +15,159 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::Duration;
 
-/// RAII guard that aborts a spawned Tokio task when dropped.
-///
-/// This ensures that if the parent future is cancelled (e.g. via the external
-/// cancel endpoint), the child task is also aborted rather than running to
-/// completion detached.
-struct AbortOnDrop(tokio::task::AbortHandle);
+struct CancelSubtasksOnDrop {
+    sender: Option<tokio::sync::watch::Sender<bool>>,
+}
 
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
+impl CancelSubtasksOnDrop {
+    fn disarm(&mut self) {
+        self.sender = None;
     }
+}
+
+impl Drop for CancelSubtasksOnDrop {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            sender.send_replace(true);
+        }
+    }
+}
+
+async fn await_agent_execution<F>(
+    execution: F,
+    turn_timeout: Duration,
+    repository_lease_lost: Option<tokio::sync::watch::Receiver<RepositoryLeaseState>>,
+) -> Result<AgentResponse, String>
+where
+    F: std::future::Future<Output = harness_core::error::Result<AgentResponse>>,
+{
+    let outcome = run_until_repository_lease_loss(
+        repository_lease_lost,
+        tokio::time::timeout(
+            turn_timeout,
+            std::panic::AssertUnwindSafe(execution).catch_unwind(),
+        ),
+    )
+    .await;
+    let Some(outcome) = outcome else {
+        return Err("repository lease was lost during agent execution".to_string());
+    };
+    match outcome {
+        Ok(Ok(Ok(response))) => Ok(response),
+        Ok(Ok(Err(error))) => Err(format!("agent error: {error}")),
+        Ok(Err(panic)) => Err(format!("subtask panicked: {}", panic_message(panic))),
+        Err(_) => Err(format!(
+            "subtask timed out after {}s",
+            turn_timeout.as_secs()
+        )),
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send + 'static>) -> String {
+    panic
+        .downcast_ref::<&'static str>()
+        .copied()
+        .map(str::to_string)
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_string())
+}
+
+async fn await_spawned_agent_execution(
+    mut handle: tokio::task::JoinHandle<harness_core::error::Result<AgentResponse>>,
+    turn_timeout: Duration,
+    repository_lease_lost: Option<tokio::sync::watch::Receiver<RepositoryLeaseState>>,
+    mut dispatch_cancelled: tokio::sync::watch::Receiver<bool>,
+    label: &str,
+) -> Result<AgentResponse, String> {
+    enum AwaitOutcome<T> {
+        DispatchCancelled,
+        Execution(Option<T>),
+    }
+
+    let outcome = tokio::select! {
+        biased;
+        () = wait_for_dispatch_cancellation(&mut dispatch_cancelled) => {
+            AwaitOutcome::DispatchCancelled
+        }
+        outcome = run_until_repository_lease_loss(
+            repository_lease_lost,
+            tokio::time::timeout(turn_timeout, &mut handle),
+        ) => AwaitOutcome::Execution(outcome),
+    };
+    match outcome {
+        AwaitOutcome::DispatchCancelled => {
+            abort_and_await_agent(handle, label, "dispatch cancellation").await;
+            Err("parallel dispatch was cancelled during agent execution".to_string())
+        }
+        AwaitOutcome::Execution(None) => {
+            abort_and_await_agent(handle, label, "repository lease loss").await;
+            Err("repository lease was lost during agent execution".to_string())
+        }
+        AwaitOutcome::Execution(Some(Ok(Ok(Ok(response))))) => Ok(response),
+        AwaitOutcome::Execution(Some(Ok(Ok(Err(error))))) => Err(format!("agent error: {error}")),
+        AwaitOutcome::Execution(Some(Ok(Err(error)))) => Err(format!("subtask panicked: {error}")),
+        AwaitOutcome::Execution(Some(Err(_))) => {
+            abort_and_await_agent(handle, label, "timeout").await;
+            Err(format!(
+                "subtask timed out after {}s",
+                turn_timeout.as_secs()
+            ))
+        }
+    }
+}
+
+async fn wait_for_dispatch_cancellation(receiver: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *receiver.borrow() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn abort_and_await_agent(
+    handle: tokio::task::JoinHandle<harness_core::error::Result<AgentResponse>>,
+    label: &str,
+    reason: &str,
+) {
+    handle.abort();
+    if let Err(error) = handle.await {
+        if !error.is_cancelled() {
+            tracing::warn!("{label} did not exit cleanly after {reason}: {error}");
+        }
+    }
+}
+
+async fn cleanup_parallel_workspace(
+    workspace_mgr: &WorkspaceManager,
+    task_id: &TaskId,
+    lease: &WorkspaceLease,
+    execution_guard: &WorkspaceExecutionGuard,
+) -> anyhow::Result<()> {
+    workspace_mgr.begin_workspace_finalization(
+        task_id,
+        &lease.acquisition_id,
+        execution_guard.execution_id(),
+    )?;
+    let removal = run_until_repository_lease_loss(
+        lease.repository_lease_lost.clone(),
+        workspace_mgr.remove_workspace_acquisition(task_id, &lease.acquisition_id),
+    )
+    .await;
+    let result = if let Some(result) = removal {
+        result
+    } else {
+        workspace_mgr.mark_workspace_cleanup_required(task_id, &lease.acquisition_id);
+        workspace_mgr
+            .cleanup_required_workspace_for_retry(task_id, None, 0)
+            .await
+    };
+    if result.is_ok() {
+        execution_guard.complete();
+    }
+    result
 }
 
 /// Maximum number of parallel subtasks — caps both chunk count in `decompose`
@@ -338,11 +484,11 @@ async fn run_sequential_subtasks(
     // One shared workspace for all sequential steps — step N sees step N-1 outputs.
     let seq_id = sequential_subtask_id(task_id);
     // Sub-tasks use synthetic IDs and intentionally keep UUID-based workspace keys.
-    let workspace = match workspace_mgr
+    let workspace_lease = match workspace_mgr
         .create_workspace(&seq_id, source_repo, remote, base_branch, 1, None, None)
         .await
     {
-        Ok(lease) => lease.workspace_path,
+        Ok(lease) => lease,
         Err(e) => {
             tracing::warn!("parallel_dispatch: workspace creation failed for sequential run: {e}");
             return ParallelRunResult {
@@ -355,6 +501,29 @@ async fn run_sequential_subtasks(
             };
         }
     };
+    let workspace = workspace_lease.workspace_path.clone();
+    let execution_guard =
+        match workspace_mgr.claim_workspace_execution(&seq_id, &workspace_lease.acquisition_id) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let cleanup_error = workspace_mgr
+                    .remove_workspace_acquisition(&seq_id, &workspace_lease.acquisition_id)
+                    .await
+                    .err()
+                    .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                    .unwrap_or_default();
+                return ParallelRunResult {
+                    results: vec![SubtaskResult {
+                        index: 0,
+                        response: None,
+                        error: Some(format!(
+                            "workspace execution claim failed: {error}{cleanup_error}"
+                        )),
+                    }],
+                    is_sequential: true,
+                };
+            }
+        };
 
     // Single token covers the full sequential run — all steps share one workspace.
     // TTL must span every step: each step can run for up to `turn_timeout`, so
@@ -377,41 +546,13 @@ async fn run_sequential_subtasks(
             ..Default::default()
         };
         req.apply_configured_policy(config);
-        // Spawn into a task so a panic in agent.execute surfaces as JoinError
-        // instead of unwinding through this function and skipping cleanup.
-        //
-        // The AbortOnDrop guard ensures the child task is aborted whenever
-        // `handle` is dropped — including when the *parent* future is cancelled
-        // by an external abort (task_runner cancel endpoint).  Without it,
-        // dropping a JoinHandle merely detaches the child; the agent would keep
-        // running and writing to the shared workspace after cancellation.
         let agent_clone = agent.clone();
-        let mut handle = tokio::spawn(async move { agent_clone.execute(req).await });
-        let _abort_guard = AbortOnDrop(handle.abort_handle());
-        let outcome = match tokio::time::timeout(turn_timeout, &mut handle).await {
-            Ok(Ok(Ok(resp))) => Ok(resp),
-            Ok(Ok(Err(e))) => Err(format!("agent error: {e}")),
-            Ok(Err(join_err)) => Err(format!("subtask panicked: {join_err}")),
-            Err(_) => {
-                // Abort and await the task so it is fully stopped before
-                // workspace cleanup begins.  Tokio abort() is asynchronous —
-                // the task can still run until its next yield point — so
-                // awaiting guarantees no background mutations occur after
-                // remove_workspace is called.
-                handle.abort();
-                if let Err(e) = handle.await {
-                    if !e.is_cancelled() {
-                        tracing::warn!(
-                            "sequential subtask {i} did not exit cleanly after abort: {e}"
-                        );
-                    }
-                }
-                Err(format!(
-                    "subtask timed out after {}s",
-                    turn_timeout.as_secs()
-                ))
-            }
-        };
+        let outcome = await_agent_execution(
+            async move { agent_clone.execute(req).await },
+            turn_timeout,
+            workspace_lease.repository_lease_lost.clone(),
+        )
+        .await;
 
         let (response, error) = match outcome {
             Ok(resp) if resp.output.trim().is_empty() => {
@@ -444,7 +585,10 @@ async fn run_sequential_subtasks(
     }
 
     // Workspace is cleaned up once after all steps complete (or on early abort).
-    if let Err(e) = workspace_mgr.remove_workspace(&seq_id).await {
+    if let Err(e) =
+        cleanup_parallel_workspace(&workspace_mgr, &seq_id, &workspace_lease, &execution_guard)
+            .await
+    {
         tracing::warn!("parallel_dispatch: workspace cleanup failed for {seq_id:?}: {e}");
     }
 
@@ -470,12 +614,10 @@ async fn run_concurrent_subtasks(
     let count = subtasks.len();
     let mut handles: Vec<tokio::task::JoinHandle<(usize, Result<AgentResponse, String>)>> =
         Vec::with_capacity(count);
-    // RAII abort guards: when this Vec is dropped (including when the parent
-    // future is cancelled via the cancel endpoint), every spawned task is
-    // aborted.  Without these guards, dropping a JoinHandle merely detaches
-    // the child; agent processes would keep running and mutating worktrees
-    // even after the parent task is cancelled.
-    let mut abort_guards: Vec<AbortOnDrop> = Vec::with_capacity(count);
+    let (dispatch_cancelled, _) = tokio::sync::watch::channel(false);
+    let mut cancellation_owner = CancelSubtasksOnDrop {
+        sender: Some(dispatch_cancelled.clone()),
+    };
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL));
 
     for (i, spec) in subtasks.into_iter().enumerate() {
@@ -488,6 +630,7 @@ async fn run_concurrent_subtasks(
         let base_branch = base_branch.to_string();
         let sem = Arc::clone(&sem);
         let config = config.clone();
+        let dispatch_cancelled = dispatch_cancelled.subscribe();
         let handle = tokio::spawn(async move {
             // Acquire semaphore first (unbounded wait), then apply timeout only to
             // the actual agent execution. Workspace acquisition is part of the
@@ -498,16 +641,36 @@ async fn run_concurrent_subtasks(
                 Err(_) => return (i, Err("semaphore closed unexpectedly".to_string())),
             };
             // Sub-tasks use synthetic IDs and intentionally keep UUID-based workspace keys.
-            let workspace = match workspace_mgr
+            let workspace_lease = match workspace_mgr
                 .create_workspace(&sub_id, &source_repo, &remote, &base_branch, 1, None, None)
                 .await
             {
-                Ok(lease) => lease.workspace_path,
+                Ok(lease) => lease,
                 Err(e) => {
                     tracing::warn!(
                         "parallel_dispatch: workspace creation failed for subtask {i}: {e}"
                     );
                     return (i, Err(format!("workspace creation failed: {e}")));
+                }
+            };
+            let workspace = workspace_lease.workspace_path.clone();
+            let execution_guard = match workspace_mgr
+                .claim_workspace_execution(&sub_id, &workspace_lease.acquisition_id)
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let cleanup_error = workspace_mgr
+                        .remove_workspace_acquisition(&sub_id, &workspace_lease.acquisition_id)
+                        .await
+                        .err()
+                        .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                        .unwrap_or_default();
+                    return (
+                        i,
+                        Err(format!(
+                            "workspace execution claim failed: {error}{cleanup_error}"
+                        )),
+                    );
                 }
             };
             let token = CapabilityToken::new(
@@ -524,33 +687,27 @@ async fn run_concurrent_subtasks(
             };
             req.apply_configured_policy(&config);
             let agent_clone = agent.clone();
-            let mut agent_handle = tokio::spawn(async move { agent_clone.execute(req).await });
-            let _agent_abort_guard = AbortOnDrop(agent_handle.abort_handle());
-            let result = match tokio::time::timeout(turn_timeout, &mut agent_handle).await {
-                Ok(Ok(Ok(resp))) => Ok(resp),
-                Ok(Ok(Err(e))) => Err(format!("agent error: {e}")),
-                Ok(Err(join_err)) => Err(format!("subtask panicked: {join_err}")),
-                Err(_) => {
-                    agent_handle.abort();
-                    if let Err(e) = agent_handle.await {
-                        if !e.is_cancelled() {
-                            tracing::warn!(
-                                "parallel subtask {i} did not exit cleanly after abort: {e}"
-                            );
-                        }
-                    }
-                    Err(format!(
-                        "subtask timed out after {}s",
-                        turn_timeout.as_secs()
-                    ))
-                }
-            };
-            if let Err(e) = workspace_mgr.remove_workspace(&sub_id).await {
+            let agent_handle = tokio::spawn(async move { agent_clone.execute(req).await });
+            let result = await_spawned_agent_execution(
+                agent_handle,
+                turn_timeout,
+                workspace_lease.repository_lease_lost.clone(),
+                dispatch_cancelled,
+                &format!("parallel subtask {i}"),
+            )
+            .await;
+            if let Err(e) = cleanup_parallel_workspace(
+                &workspace_mgr,
+                &sub_id,
+                &workspace_lease,
+                &execution_guard,
+            )
+            .await
+            {
                 tracing::warn!("parallel_dispatch: workspace cleanup failed for {sub_id:?}: {e}");
             }
             (i, result)
         });
-        abort_guards.push(AbortOnDrop(handle.abort_handle()));
         handles.push(handle);
     }
 
@@ -570,21 +727,17 @@ async fn run_concurrent_subtasks(
                     error: Some(err),
                 });
             }
-            Err(join_err) => {
-                tracing::warn!("parallel subtask {i} join error: {join_err}");
+            Err(join_error) => {
+                tracing::warn!("parallel subtask {i} join error: {join_error}");
                 results.push(SubtaskResult {
                     index: i,
                     response: None,
-                    error: Some(format!("subtask panicked: {join_err}")),
+                    error: Some(format!("subtask panicked: {join_error}")),
                 });
             }
         }
     }
-
-    // All tasks have completed — dropping abort_guards here is a no-op.
-    // On parent-future cancellation they would have been dropped earlier,
-    // aborting every task before this point is reached.
-    drop(abort_guards);
+    cancellation_owner.disarm();
 
     ParallelRunResult {
         results,

@@ -275,6 +275,23 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         description: "create durable runtime workspace cleanup targets",
         sql: crate::workspace_lease_store::WORKSPACE_CLEANUP_TARGETS_TABLE_SQL,
     },
+    Migration {
+        version: 28,
+        description: "add workspace acquisition fencing tokens",
+        sql: "ALTER TABLE workspace_leases ADD COLUMN IF NOT EXISTS acquisition_id TEXT;
+              ALTER TABLE workspace_cleanup_targets ADD COLUMN IF NOT EXISTS acquisition_id TEXT;
+              ALTER TABLE workspace_cleanup_targets ADD COLUMN IF NOT EXISTS cleanup_in_progress BOOLEAN NOT NULL DEFAULT FALSE;
+              ALTER TABLE workspace_cleanup_targets ADD COLUMN IF NOT EXISTS cleanup_claim_id TEXT;
+              ALTER TABLE workspace_cleanup_targets ADD COLUMN IF NOT EXISTS cleanup_owner_session TEXT;
+              ALTER TABLE workspace_cleanup_targets ADD COLUMN IF NOT EXISTS cleanup_process_id BIGINT;
+              ALTER TABLE workspace_cleanup_targets ADD COLUMN IF NOT EXISTS cleanup_process_started_at BIGINT",
+    },
+    Migration {
+        version: 29,
+        description: "add expiring runtime workspace cleanup claims",
+        sql: "ALTER TABLE workspace_cleanup_targets
+              ADD COLUMN IF NOT EXISTS cleanup_claim_expires_at TIMESTAMPTZ",
+    },
 ];
 
 #[cfg(test)]
@@ -368,5 +385,16 @@ mod tests {
                 .contains("WHERE runtime_workflow_id IS NOT NULL"),
             "v27 should preserve every visible runtime workspace cleanup obligation"
         );
+    }
+
+    #[test]
+    fn workspace_cleanup_claims_have_durable_expiry() {
+        let migration = TASK_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 29)
+            .expect("v29 migration should exist");
+
+        assert!(migration.sql.contains("cleanup_claim_expires_at"));
+        assert!(migration.sql.contains("TIMESTAMPTZ"));
     }
 }

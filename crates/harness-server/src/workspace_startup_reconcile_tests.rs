@@ -619,6 +619,7 @@ async fn reconcile_startup_migration_counts_new_key_terminal_as_migrated() {
             task_id: "issue:42".to_string(),
             run_generation: 1,
             owner_session: "test-session".to_string(),
+            acquisition_id: None,
             workspace_key: None,
         })
         .expect("serialize"),

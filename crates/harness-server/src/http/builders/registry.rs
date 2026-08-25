@@ -425,10 +425,15 @@ pub(crate) async fn build_registry(
                 .push(StoreStartupResult::optional("workspace_lease_store").failed(error));
             None
         }
-        None => match crate::workspace_lease_store::WorkspaceLeaseStore::open_shared_with_data_dir(
+        None => match crate::workspace_lease_store::WorkspaceLeaseStore::open_shared_with_data_dir_and_repository_lock_capacity(
             &task_context,
             &setup_pool,
             data_dir,
+            server
+                .config
+                .concurrency
+                .max_concurrent_tasks
+                .saturating_add(1),
         )
         .await
         {

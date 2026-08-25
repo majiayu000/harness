@@ -11,15 +11,27 @@ use std::sync::Arc;
 use tokio::time::{timeout, Duration as TokioDuration};
 
 use super::data_helpers::activity_name;
+use crate::workspace_lease_store::RepositoryLeaseState;
 use crate::workspace_lease_store::RepositoryWriteLease;
+
+#[path = "workspace_terminal_cleanup.rs"]
+mod terminal_cleanup;
+pub(crate) use terminal_cleanup::cleanup_terminal_runtime_workspace_if_uncontended;
+pub(super) use terminal_cleanup::{
+    cleanup_terminal_runtime_workspace, repository_lease_loss_error, run_preparation_phase,
+    run_while_repository_lease_healthy,
+};
 
 pub(super) struct PreparedRuntimeWorkspace {
     pub run_project: PathBuf,
     pub task_id: Option<TaskId>,
+    pub acquisition_id: Option<String>,
+    pub execution_guard: Option<crate::workspace::WorkspaceExecutionGuard>,
     pub after_run_hook: Option<String>,
     pub before_remove_hook: Option<String>,
     pub hook_timeout_secs: u64,
     pub finish_action: RuntimeWorkspaceFinishAction,
+    pub repository_lease_lost: Option<tokio::sync::watch::Receiver<RepositoryLeaseState>>,
     pub _repository_write_lease: Option<RepositoryWriteLease>,
 }
 
@@ -35,6 +47,7 @@ pub(super) async fn prepare_runtime_workspace(
     workflow: Option<&WorkflowInstance>,
     source_project_root: &Path,
     workflow_document: &WorkflowDocument,
+    execution_cancelled: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<PreparedRuntimeWorkspace> {
     validate_workspace_cleanup_policy(&workflow_document.config.workspace.cleanup)?;
     match workflow_document.config.workspace.strategy.as_str() {
@@ -54,21 +67,33 @@ pub(super) async fn prepare_runtime_workspace(
                 revalidate_runtime_workspace_admission(state, job, workflow).await?;
             }
             if let Some(hook) = workflow_document.config.hooks.before_run.as_deref() {
-                run_workflow_hook(
-                    "before_run",
-                    hook,
-                    source_project_root,
-                    workflow_document.config.hooks.timeout_secs,
+                run_preparation_phase(
+                    repository_write_lease
+                        .as_ref()
+                        .map(RepositoryWriteLease::loss_receiver),
+                    execution_cancelled.clone(),
+                    run_workflow_hook(
+                        "before_run",
+                        hook,
+                        source_project_root,
+                        workflow_document.config.hooks.timeout_secs,
+                    ),
+                    "source workspace before_run hook",
                 )
                 .await?;
             }
             return Ok(PreparedRuntimeWorkspace {
                 run_project: source_project_root.to_path_buf(),
                 task_id: None,
+                acquisition_id: None,
+                execution_guard: None,
                 after_run_hook: workflow_document.config.hooks.after_run.clone(),
                 before_remove_hook: None,
                 hook_timeout_secs: workflow_document.config.hooks.timeout_secs,
                 finish_action: RuntimeWorkspaceFinishAction::Release,
+                repository_lease_lost: repository_write_lease
+                    .as_ref()
+                    .map(RepositoryWriteLease::loss_receiver),
                 _repository_write_lease: repository_write_lease,
             });
         }
@@ -78,12 +103,23 @@ pub(super) async fn prepare_runtime_workspace(
     let Some(workspace_mgr) = state.concurrency.workspace_mgr.as_ref() else {
         anyhow::bail!("workflow runtime workspace manager is unavailable");
     };
+    let task_id = stable_runtime_workspace_task_id(job, workflow);
+    workspace_mgr
+        .cleanup_required_workspace_for_retry(
+            &task_id,
+            workflow_document.config.hooks.before_remove.as_deref(),
+            workflow_document.config.hooks.timeout_secs,
+        )
+        .await?;
+    workspace_mgr.discard_unhealthy_repository_lease(&task_id);
     let (repository_write_lease, workspace_capacity) =
         acquire_runtime_repository_lease(state, workspace_mgr, source_project_root).await?;
     if repository_write_lease.is_some() {
         revalidate_runtime_workspace_admission(state, job, workflow).await?;
     }
-    let task_id = stable_runtime_workspace_task_id(job, workflow);
+    let repository_lease_lost = repository_write_lease
+        .as_ref()
+        .map(RepositoryWriteLease::loss_receiver);
     let external_id = workflow.map(|workflow| workflow.subject.subject_key.as_str());
     let repo = workflow
         .and_then(|workflow| workflow.data.get("repo"))
@@ -98,52 +134,73 @@ pub(super) async fn prepare_runtime_workspace(
         hook_timeout_secs: Some(workflow_document.config.hooks.timeout_secs),
         branch_prefix: workflow_document.config.workspace.branch_prefix.clone(),
         runtime_workflow_id: workflow.map(|workflow| workflow.id.clone()),
+        persist_runtime_cleanup_target: workflow_document.config.workspace.cleanup == "on_terminal",
         workspace_capacity_override: Some(workspace_capacity),
         repository_write_lease: repository_write_lease.map_or(
             crate::workspace::RepositoryWriteLeaseInput::NotRequired,
             crate::workspace::RepositoryWriteLeaseInput::Held,
         ),
     };
-    let lease = workspace_mgr
-        .create_workspace_with_options(
-            &task_id,
-            source_project_root,
-            &workflow_document.config.base.remote,
-            &workflow_document.config.base.branch,
-            1,
-            external_id,
-            repo,
-            options,
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let lease = run_preparation_phase(
+        repository_lease_lost,
+        execution_cancelled.clone(),
+        async {
+            workspace_mgr
+                .create_workspace_with_options(
+                    &task_id,
+                    source_project_root,
+                    &workflow_document.config.base.remote,
+                    &workflow_document.config.base.branch,
+                    1,
+                    external_id,
+                    repo,
+                    options,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))
+        },
+        "runtime workspace preparation",
+    )
+    .await?;
 
     if let Some(hook) = workflow_document.config.hooks.before_run.as_deref() {
-        if let Err(error) = run_workflow_hook(
-            "before_run",
-            hook,
-            &lease.workspace_path,
-            workflow_document.config.hooks.timeout_secs,
+        let preparation_guard =
+            workspace_mgr.begin_workspace_preparation(&task_id, &lease.acquisition_id)?;
+        if let Err(error) = run_preparation_phase(
+            lease.repository_lease_lost.clone(),
+            execution_cancelled.clone(),
+            run_workflow_hook(
+                "before_run",
+                hook,
+                &lease.workspace_path,
+                workflow_document.config.hooks.timeout_secs,
+            ),
+            "worktree before_run hook",
         )
         .await
         {
-            if let Some(hook) = workflow_document.config.hooks.before_remove.as_deref() {
-                if let Err(remove_hook_error) = run_workflow_hook(
-                    "before_remove",
-                    hook,
-                    &lease.workspace_path,
+            drop(preparation_guard);
+            if lease
+                .repository_lease_lost
+                .as_ref()
+                .is_some_and(|receiver| {
+                    matches!(
+                        *receiver.borrow(),
+                        RepositoryLeaseState::Revoking | RepositoryLeaseState::Lost
+                    )
+                })
+                || *execution_cancelled.borrow()
+            {
+                return Err(error);
+            }
+            if let Err(cleanup_error) = workspace_mgr
+                .cleanup_required_workspace_for_retry(
+                    &task_id,
+                    workflow_document.config.hooks.before_remove.as_deref(),
                     workflow_document.config.hooks.timeout_secs,
                 )
                 .await
-                {
-                    tracing::warn!(
-                        runtime_job_id = %job.id,
-                        workspace_path = %lease.workspace_path.display(),
-                        "before_remove hook failed during before_run cleanup: {remove_hook_error}"
-                    );
-                }
-            }
-            if let Err(cleanup_error) = workspace_mgr.remove_workspace(&task_id).await {
+            {
                 tracing::warn!(
                     runtime_job_id = %job.id,
                     workspace_path = %lease.workspace_path.display(),
@@ -152,11 +209,20 @@ pub(super) async fn prepare_runtime_workspace(
             }
             return Err(error);
         }
+        preparation_guard.complete()?;
+    }
+
+    let execution_guard =
+        workspace_mgr.claim_workspace_execution(&task_id, &lease.acquisition_id)?;
+    if *execution_cancelled.borrow() {
+        anyhow::bail!("runtime execution was cancelled after workspace preparation");
     }
 
     Ok(PreparedRuntimeWorkspace {
         run_project: lease.workspace_path,
         task_id: Some(task_id),
+        acquisition_id: Some(lease.acquisition_id),
+        execution_guard: Some(execution_guard),
         after_run_hook: workflow_document.config.hooks.after_run.clone(),
         before_remove_hook: workflow_document.config.hooks.before_remove.clone(),
         hook_timeout_secs: workflow_document.config.hooks.timeout_secs,
@@ -166,11 +232,42 @@ pub(super) async fn prepare_runtime_workspace(
             job,
             workflow,
         ),
+        repository_lease_lost: lease.repository_lease_lost,
         _repository_write_lease: None,
     })
 }
 
 pub(super) async fn finish_runtime_workspace(
+    state: &Arc<AppState>,
+    workspace: &PreparedRuntimeWorkspace,
+) -> anyhow::Result<()> {
+    if let (Some(workspace_mgr), Some(task_id), Some(acquisition_id), Some(execution_guard)) = (
+        state.concurrency.workspace_mgr.as_ref(),
+        workspace.task_id.as_ref(),
+        workspace.acquisition_id.as_deref(),
+        workspace.execution_guard.as_ref(),
+    ) {
+        workspace_mgr.begin_workspace_finalization(
+            task_id,
+            acquisition_id,
+            execution_guard.execution_id(),
+        )?;
+    }
+    let result = run_while_repository_lease_healthy(
+        workspace.repository_lease_lost.clone(),
+        finish_runtime_workspace_inner(state, workspace),
+        "runtime workspace finalization",
+    )
+    .await;
+    if result.is_ok() {
+        if let Some(execution_guard) = workspace.execution_guard.as_ref() {
+            execution_guard.complete();
+        }
+    }
+    result
+}
+
+async fn finish_runtime_workspace_inner(
     state: &Arc<AppState>,
     workspace: &PreparedRuntimeWorkspace,
 ) -> anyhow::Result<()> {
@@ -208,131 +305,23 @@ pub(super) async fn finish_runtime_workspace(
                 );
             }
         }
-        workspace_mgr.remove_workspace(task_id).await?;
+        let acquisition_id = workspace
+            .acquisition_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("runtime workspace acquisition ID is missing"))?;
+        workspace_mgr
+            .remove_workspace_acquisition(task_id, acquisition_id)
+            .await?;
     } else {
-        workspace_mgr.release_workspace(task_id).await;
+        let acquisition_id = workspace
+            .acquisition_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("runtime workspace acquisition ID is missing"))?;
+        workspace_mgr
+            .release_workspace_acquisition(task_id, acquisition_id)
+            .await?;
     }
     hook_result
-}
-
-pub(super) async fn cleanup_terminal_runtime_workspace(
-    state: &AppState,
-    workflow: &WorkflowInstance,
-) -> anyhow::Result<()> {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return Ok(());
-    };
-    if !workflow.is_terminal_with_registry(store.definition_registry()) {
-        return Ok(());
-    }
-    let Some(workspace_mgr) = state.concurrency.workspace_mgr.as_ref() else {
-        return Ok(());
-    };
-    let Some(project_id) = workflow
-        .data
-        .get("project_id")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return Ok(());
-    };
-    let source_project_root = PathBuf::from(project_id);
-    let workflow_document =
-        harness_core::config::workflow::load_workflow_document(&source_project_root)?;
-    if workflow_document.config.workspace.strategy != "worktree"
-        || workflow_document.config.workspace.cleanup != "on_terminal"
-    {
-        return Ok(());
-    }
-
-    let task_id = stable_runtime_workspace_task_id_for_workflow(workflow);
-    let repo = workflow
-        .data
-        .get("repo")
-        .and_then(serde_json::Value::as_str)
-        .or(workflow_document.config.source.repo.as_deref());
-    let _repository_write_lease = workspace_mgr
-        .acquire_repository_write_lease_for_cleanup(&source_project_root)
-        .await?;
-    let current_workflow = store.get_instance(&workflow.id).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "workflow {} disappeared before workspace cleanup",
-            workflow.id
-        )
-    })?;
-    if store
-        .terminal_state_for_instance(&current_workflow)
-        .await?
-        .is_none()
-    {
-        tracing::info!(
-            workflow_id = %workflow.id,
-            "skipping terminal workspace cleanup because the workflow reopened while waiting for the repository lease"
-        );
-        return Ok(());
-    }
-    let mut cleanup_targets = workspace_mgr
-        .workspace_targets_for_runtime_workflow(&workflow.id)
-        .await?;
-    if cleanup_targets.is_empty() {
-        let workspace_path = workspace_mgr
-            .workspace_path_for_cleanup(
-                &task_id,
-                &source_project_root,
-                Some(workflow.subject.subject_key.as_str()),
-                repo,
-            )
-            .await;
-        if workspace_path.exists() {
-            workspace_mgr
-                .cleanup_workspace_for_retry(&task_id, &source_project_root, Some(&workspace_path))
-                .await?;
-        }
-        return Ok(());
-    }
-    for target in cleanup_targets.drain(..) {
-        if workspace_mgr
-            .runtime_workspace_cleanup_target_is_superseded(&target)
-            .await?
-        {
-            workspace_mgr
-                .release_runtime_workspace_cleanup_target(&target)
-                .await?;
-            continue;
-        }
-        if !target.workspace_path.exists() {
-            workspace_mgr
-                .release_runtime_workspace_cleanup_target(&target)
-                .await?;
-            continue;
-        }
-        if let Some(hook) = workflow_document.config.hooks.before_remove.as_deref() {
-            if let Err(error) = run_workflow_hook(
-                "before_remove",
-                hook,
-                &target.workspace_path,
-                workflow_document.config.hooks.timeout_secs,
-            )
-            .await
-            {
-                tracing::warn!(
-                    workflow_id = %workflow.id,
-                    workspace_path = %target.workspace_path.display(),
-                    "before_remove hook failed during terminal runtime workspace cleanup: {error}"
-                );
-            }
-        }
-        workspace_mgr
-            .cleanup_workspace_for_retry(
-                &target.task_id,
-                &source_project_root,
-                Some(&target.workspace_path),
-            )
-            .await?;
-        workspace_mgr
-            .release_runtime_workspace_cleanup_target(&target)
-            .await?;
-    }
-    Ok(())
 }
 
 fn validate_workspace_cleanup_policy(cleanup: &str) -> anyhow::Result<()> {
@@ -558,6 +547,42 @@ mod tests {
     use super::*;
     use harness_workflow::runtime::{RuntimeKind, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn repository_lease_loss_is_a_runtime_error() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(RepositoryLeaseState::Healthy);
+        assert!(sender.send(RepositoryLeaseState::Lost).is_ok());
+
+        let error = repository_lease_loss_error(&mut receiver).await;
+
+        assert!(error.to_string().contains("session was lost"));
+    }
+
+    #[tokio::test]
+    async fn released_repository_lease_is_not_reported_as_loss() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(RepositoryLeaseState::Healthy);
+        assert!(sender.send(RepositoryLeaseState::Released).is_ok());
+
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            repository_lease_loss_error(&mut receiver),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn prefired_repository_loss_beats_immediate_completion() {
+        let (sender, receiver) = tokio::sync::watch::channel(RepositoryLeaseState::Healthy);
+        assert!(sender.send(RepositoryLeaseState::Lost).is_ok());
+
+        let error =
+            run_while_repository_lease_healthy(Some(receiver), async { Ok(()) }, "test phase")
+                .await
+                .expect_err("prefired loss must win over ready work");
+
+        assert!(error.to_string().contains("not healthy"));
+    }
 
     #[test]
     fn stable_runtime_workspace_task_id_reuses_workflow_identity_across_jobs() {

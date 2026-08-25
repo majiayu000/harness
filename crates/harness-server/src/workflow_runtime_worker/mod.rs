@@ -28,6 +28,8 @@ mod transcript_durability;
 pub(crate) mod turn_engine;
 mod workspace;
 
+pub(crate) use workspace::cleanup_terminal_runtime_workspace_if_uncontended;
+
 pub(crate) use circuit_breaker_events::emit_circuit_breaker_events;
 pub(crate) use transcript_durability::{
     hydrate_exact_replay_transcript, strip_caller_transcript_unavailable_signal,

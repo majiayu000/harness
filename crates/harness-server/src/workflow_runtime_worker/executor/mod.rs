@@ -38,7 +38,9 @@ use super::runtime_turn_control::{force_code_agent_for_runtime_turn, RuntimeTurn
 use super::runtime_usage::runtime_usage_context;
 use super::server_merge::{execute_server_merge, server_merge_execution_enabled};
 use super::turn_engine::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
-use super::workspace::{finish_runtime_workspace, prepare_runtime_workspace};
+use super::workspace::{
+    finish_runtime_workspace, prepare_runtime_workspace, repository_lease_loss_error,
+};
 mod runtime_timeout;
 use runtime_timeout::runtime_profile_with_timeout_fallback;
 mod egress_evidence;
@@ -52,24 +54,27 @@ use structured_output::{
     codex_output_schema_file, reserve_structured_output_correction_turn,
     structured_output_correction_artifact, structured_output_correction_prompt,
 };
+
 pub(super) struct ServerRuntimeJobExecutor<'a> {
     pub(super) state: &'a Arc<AppState>,
     /// Stateful lease-lost signal: `watch` keeps the latest value, so a
     /// cancellation that fires before the turn loop starts polling is not
     /// lost (GH-1877).
     lease_lost: Arc<tokio::sync::watch::Sender<bool>>,
+    lease_lost_receiver: tokio::sync::watch::Receiver<bool>,
 }
 impl<'a> ServerRuntimeJobExecutor<'a> {
     pub(super) fn new(state: &'a Arc<AppState>) -> Self {
-        let (lease_lost, _) = tokio::sync::watch::channel(false);
+        let (lease_lost, lease_lost_receiver) = tokio::sync::watch::channel(false);
         Self {
             state,
             lease_lost: Arc::new(lease_lost),
+            lease_lost_receiver,
         }
     }
 
     pub(super) fn cancel_lease_lost(&self) {
-        let _ = self.lease_lost.send(true);
+        self.lease_lost.send_replace(true);
     }
 
     pub(super) async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
@@ -153,9 +158,22 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             workflow.as_ref(),
             &source_project_root,
             &workflow_document,
+            self.lease_lost_receiver.clone(),
         )
         .await?;
-        let activity_result: anyhow::Result<ActivityResult> = async {
+        let repository_lease_forwarder =
+            runtime_workspace
+                .repository_lease_lost
+                .clone()
+                .map(|mut receiver| {
+                    let lease_lost = self.lease_lost.clone();
+                    tokio::spawn(async move {
+                        let error = repository_lease_loss_error(&mut receiver).await;
+                        tracing::error!("runtime repository lease failed: {error}");
+                        lease_lost.send_replace(true);
+                    })
+                });
+        let activity = async {
             let project_root = runtime_workspace.run_project.clone();
             let memory_enabled = workflow_document.config.memory.enabled;
             let repo_memory = repo_memory_for_prompt_packet(
@@ -291,7 +309,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         },
                         timeout_secs: Some(resolved_settings.timeout_secs),
                         stall_timeout_secs: Some(resolved_settings.stall_timeout_secs),
-                        lease_lost: Some(self.lease_lost.subscribe()),
+                        lease_lost: Some(self.lease_lost_receiver.clone()),
                         env_vars,
                         permission_mode: permission_profile.permission_mode,
                         allowed_tools: permission_profile.allowed_tools.clone(),
@@ -304,9 +322,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                             agent_name,
                             &source_project_root,
                         ),
-                        egress_verified_at_dispatch: Some(Arc::clone(
-                            &egress_verified_at_dispatch,
-                        )),
+                        egress_verified_at_dispatch: Some(Arc::clone(&egress_verified_at_dispatch)),
                     },
                 )
                 .await;
@@ -318,10 +334,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     .get_turn(&thread_id, &turn_id)
                     .ok_or_else(|| anyhow::anyhow!("runtime turn disappeared before completion"))?;
                 let attempt_number = attempt + 1;
-                attempt_enforcement_artifacts.push(permission_profile.artifact(
-                    resolved_settings.capability_profile,
-                    attempt_number,
-                ));
+                attempt_enforcement_artifacts.push(
+                    permission_profile
+                        .artifact(resolved_settings.capability_profile, attempt_number),
+                );
                 attempt_enforcement_artifacts.push(egress_evidence.artifact(
                     &turn.items,
                     egress_verified_at_dispatch.load(Ordering::Acquire),
@@ -383,12 +399,11 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(
                         result,
                     );
-                let result =
-                    super::transcript_durability::attach_runtime_transcript_source(
-                        result,
-                        transcript_turn.as_ref().unwrap_or(&turn),
-                    )?
-                    .with_artifact(repo_memory_config_artifact(memory_enabled));
+                let result = super::transcript_durability::attach_runtime_transcript_source(
+                    result,
+                    transcript_turn.as_ref().unwrap_or(&turn),
+                )?
+                .with_artifact(repo_memory_config_artifact(memory_enabled));
                 let result = attempt_enforcement_artifacts
                     .into_iter()
                     .fold(result, |result, artifact| result.with_artifact(artifact));
@@ -413,8 +428,11 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 );
             }
             unreachable!("bounded structured-output retry loop always returns")
+        };
+        let activity_result: anyhow::Result<ActivityResult> = activity.await;
+        if let Some(forwarder) = repository_lease_forwarder {
+            forwarder.abort();
         }
-        .await;
         let finish_result = finish_runtime_workspace(self.state, &runtime_workspace).await;
         let activity_completed = activity_result.is_ok();
         if let Err(error) = &finish_result {

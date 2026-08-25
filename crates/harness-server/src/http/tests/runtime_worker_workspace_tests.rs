@@ -311,6 +311,8 @@ async fn terminal_runtime_cleanup_releases_missing_workspace_without_git_cleanup
             created_at: std::time::SystemTime::now(),
             owner_session: workspace_mgr.owner_session.clone(),
             run_generation: 1,
+            acquisition_id: "test-acquisition".to_string(),
+            state: crate::workspace::ActiveWorkspaceState::Ready,
             _pool_permit: None,
             _repository_write_lease: None,
         },
@@ -348,6 +350,44 @@ async fn terminal_runtime_cleanup_releases_missing_workspace_without_git_cleanup
         workspace_mgr.active_paths.get(&workspace_path).is_none(),
         "missing workspace release should clear the active path reservation"
     );
+
+    let outside = tempfile::tempdir()?;
+    let outside_path = outside.path().join("must-remain");
+    std::fs::create_dir_all(&outside_path)?;
+    let outside_task = crate::task_runner::TaskId::from_str("terminal-outside-root");
+    workspace_mgr.active.insert(
+        outside_task.clone(),
+        crate::workspace::ActiveWorkspace {
+            workspace_path: outside_path.clone(),
+            source_repo: project_root.clone(),
+            repo: Some("owner/repo".to_string()),
+            runtime_workflow_id: Some(workflow.id.clone()),
+            workspace_key: "terminal-outside-root".to_string(),
+            project_key: "test-project".to_string(),
+            slot_index: 0,
+            branch: "harness/terminal-outside-root".to_string(),
+            created_at: std::time::SystemTime::now(),
+            owner_session: workspace_mgr.owner_session.clone(),
+            run_generation: 1,
+            acquisition_id: "outside-acquisition".to_string(),
+            state: crate::workspace::ActiveWorkspaceState::Ready,
+            _pool_permit: None,
+            _repository_write_lease: None,
+        },
+    );
+    workspace_mgr
+        .active_paths
+        .insert(outside_path.clone(), outside_task.clone());
+
+    crate::workflow_runtime_worker::notify_runtime_submission_terminal_workflow(
+        &state,
+        &workflow.id,
+        None,
+    )
+    .await?;
+    assert!(outside_path.exists());
+    assert!(workspace_mgr.active.contains_key(&outside_task));
+    assert!(workspace_mgr.active_paths.contains_key(&outside_path));
     Ok(())
 }
 

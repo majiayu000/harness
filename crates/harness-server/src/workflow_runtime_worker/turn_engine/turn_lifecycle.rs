@@ -133,6 +133,10 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             .get_adapter(&agent_name)
             .or_else(|| execution_adapter.clone())
     };
+    let control_is_execution_adapter = match (&adapter_opt, &execution_adapter) {
+        (Some(control), Some(execution)) => Arc::ptr_eq(control, execution),
+        _ => false,
+    };
 
     // Register as live adapter (RAII guard for cleanup on turn exit).
     // Adapters may be control-only (interrupt/steer/approval side channel
@@ -181,6 +185,8 @@ pub(crate) async fn run_turn_lifecycle_with_options(
 
     // Use a turn backend only when the registry supplies one for the agent.
     // Otherwise the default backend remains the streaming executor.
+    let execution_terminator = execution_adapter.clone();
+    let executes_via_adapter = execution_adapter.is_some();
     let mut execution: std::pin::Pin<
         Box<dyn std::future::Future<Output = harness_core::error::Result<()>> + Send>,
     > = if let Some(adapter_arc) = execution_adapter {
@@ -224,6 +230,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let mut stream_error: Option<String> = None;
     let mut completion_state = StreamCompletionState::default();
     let mut stream_cancelled: Option<String> = None;
+    let mut terminate_execution_after_drop = false;
     let mut last_activity = Instant::now();
     let execution_deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
     let execution_timeout = async {
@@ -323,10 +330,10 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         Some(receiver) => {
                             let mut receiver = receiver.clone();
                             loop {
-                                if receiver.changed().await.is_err() {
+                                if *receiver.borrow() {
                                     return;
                                 }
-                                if *receiver.borrow() {
+                                if receiver.changed().await.is_err() {
                                     return;
                                 }
                             }
@@ -339,14 +346,28 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     turn_id = %turn_id,
                     "runtime job lease lost mid-turn; interrupting agent"
                 );
-                if let Some(adapter) = adapter_opt.as_ref() {
-                    if let Err(error) = adapter.interrupt().await {
-                        tracing::warn!(
-                            thread_id = %thread_id,
-                            turn_id = %turn_id,
-                            "failed to interrupt agent after lease loss: {error}"
-                        );
+                // A process-backed execution adapter may hold its state lock
+                // inside start_turn while it initializes the child. Calling
+                // interrupt on that same adapter before cancelling the future
+                // would wait on the lock forever. A distinct control backend
+                // remains safe to notify before the execution is cancelled.
+                if !control_is_execution_adapter {
+                    if let Some(adapter) = adapter_opt.as_ref() {
+                        if let Err(error) = adapter.interrupt().await {
+                            tracing::warn!(
+                                thread_id = %thread_id,
+                                turn_id = %turn_id,
+                                "failed to interrupt agent after lease loss: {error}"
+                            );
+                        }
                     }
+                }
+                if executes_via_adapter {
+                    terminate_execution_after_drop = true;
+                }
+                if !executes_via_adapter {
+                    // The streaming future is dropped immediately after this loop;
+                    // ManagedChild drains its process group synchronously on that drop.
                 }
                 execution_result = Some(Err(HarnessError::AgentExecution(
                     "Runtime job lease was lost before the agent completed; turn interrupted.".to_string(),
@@ -365,6 +386,22 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     "Agent turn timed out after {timeout_secs}s"
                 ))));
                 break 'outer;
+            }
+        }
+    }
+
+    // Do not update terminal turn state while an abandoned execution can still
+    // mutate its workspace. Completed futures are harmless to drop here; cancelled
+    // streaming executions synchronously drain their managed process group.
+    drop(execution);
+    if terminate_execution_after_drop {
+        if let Some(adapter) = execution_terminator.as_ref() {
+            if let Err(error) = adapter.terminate_and_drain().await {
+                tracing::error!(
+                    thread_id = %thread_id,
+                    turn_id = %turn_id,
+                    "failed to force-stop and drain agent after lease loss: {error}"
+                );
             }
         }
     }

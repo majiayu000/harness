@@ -1,19 +1,23 @@
 use crate::task_runner::TaskId;
 use harness_core::db::PgStoreContext;
 use serde::{Deserialize, Serialize};
-use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPool;
-use sqlx::Postgres;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 #[path = "workspace_cleanup_store.rs"]
 mod workspace_cleanup_store;
 pub(crate) use workspace_cleanup_store::{
-    WorkspaceCleanupTargetRecord, WORKSPACE_CLEANUP_TARGETS_TABLE_SQL,
+    PersistedWorkspaceCleanupClaim, WorkspaceCleanupTargetRecord,
+    WORKSPACE_CLEANUP_TARGETS_TABLE_SQL,
+};
+#[path = "workspace_repository_lock.rs"]
+mod workspace_repository_lock;
+pub(crate) use workspace_repository_lock::{
+    RepositoryLeaseMode, RepositoryLeaseState, RepositoryWriteLease,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +32,7 @@ pub(crate) struct WorkspaceLeaseRecord {
     pub(crate) runtime_workflow_id: Option<String>,
     pub(crate) owner_session: String,
     pub(crate) run_generation: u32,
+    pub(crate) acquisition_id: Option<String>,
     pub(crate) process_id: u32,
     pub(crate) process_started_at: u64,
 }
@@ -40,148 +45,8 @@ pub(crate) struct WorkspaceLeaseStore {
     store_key: String,
 }
 
-pub(crate) struct RepositoryWriteLease {
-    _connection: tokio::sync::Mutex<PoolConnection<Postgres>>,
-    _slot_permit: OwnedSemaphorePermit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RepositoryLeaseMode {
-    Shared,
-    Exclusive,
-}
-
 impl WorkspaceLeaseStore {
     #[cfg(test)]
-    pub(crate) fn repository_lock_pool_capacity(&self) -> u32 {
-        self.repository_lock_pool.options().get_max_connections()
-    }
-
-    pub(crate) async fn try_acquire_repository_write_lease(
-        &self,
-        project_key: &str,
-    ) -> anyhow::Result<Option<RepositoryWriteLease>> {
-        self.try_acquire_repository_lease_with_timeout(
-            project_key,
-            RepositoryLeaseMode::Exclusive,
-            std::time::Duration::from_secs(10),
-        )
-        .await
-    }
-
-    pub(crate) async fn try_acquire_repository_write_lease_now(
-        &self,
-        project_key: &str,
-    ) -> anyhow::Result<Option<RepositoryWriteLease>> {
-        let Ok(slot_permit) = self.repository_lock_slots.clone().try_acquire_owned() else {
-            return Ok(None);
-        };
-        let mut connection = self.repository_lock_pool.acquire().await?;
-        connection.close_on_drop();
-        let (acquired,): (bool,) =
-            sqlx::query_as("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
-                .bind(project_key)
-                .fetch_one(&mut *connection)
-                .await?;
-        if !acquired {
-            return Ok(None);
-        }
-        Ok(Some(RepositoryWriteLease {
-            _connection: tokio::sync::Mutex::new(connection),
-            _slot_permit: slot_permit,
-        }))
-    }
-
-    pub(crate) async fn try_acquire_repository_shared_lease(
-        &self,
-        project_key: &str,
-    ) -> anyhow::Result<Option<RepositoryWriteLease>> {
-        self.try_acquire_repository_lease_with_timeout(
-            project_key,
-            RepositoryLeaseMode::Shared,
-            std::time::Duration::from_secs(10),
-        )
-        .await
-    }
-
-    async fn try_acquire_repository_lease_with_timeout(
-        &self,
-        project_key: &str,
-        mode: RepositoryLeaseMode,
-        acquire_timeout: std::time::Duration,
-    ) -> anyhow::Result<Option<RepositoryWriteLease>> {
-        let slot_permit = self
-            .repository_lock_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow::anyhow!("repository advisory-lock slot semaphore closed"))?;
-        let mut connection = match tokio::time::timeout(
-            acquire_timeout,
-            self.repository_lock_pool.acquire(),
-        )
-        .await
-        {
-            Ok(Ok(connection)) => connection,
-            Err(_) | Ok(Err(sqlx::Error::PoolTimedOut)) => {
-                anyhow::bail!(
-                    "timed out acquiring a PostgreSQL repository advisory-lock connection"
-                );
-            }
-            Ok(Err(error)) => return Err(error.into()),
-        };
-        // If this future is cancelled after PostgreSQL acquires the session lock
-        // but before the response is decoded, dropping must close the session
-        // instead of returning a possibly locked connection to the pool.
-        connection.close_on_drop();
-        let query = match mode {
-            RepositoryLeaseMode::Shared => {
-                "SELECT pg_try_advisory_lock_shared(hashtextextended($1, 0))"
-            }
-            RepositoryLeaseMode::Exclusive => {
-                "SELECT pg_try_advisory_lock(hashtextextended($1, 0))"
-            }
-        };
-        let (acquired,): (bool,) = sqlx::query_as(query)
-            .bind(project_key)
-            .fetch_one(&mut *connection)
-            .await?;
-        if !acquired {
-            return Ok(None);
-        }
-        Ok(Some(RepositoryWriteLease {
-            _connection: tokio::sync::Mutex::new(connection),
-            _slot_permit: slot_permit,
-        }))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_repository_lock_pool_test(repository_lock_pool: PgPool) -> Self {
-        let repository_lock_slots = Arc::new(Semaphore::new(
-            repository_lock_pool.options().get_max_connections() as usize,
-        ));
-        Self {
-            pool: repository_lock_pool.clone(),
-            repository_lock_pool,
-            repository_lock_slots,
-            store_key: "repository-lock-pool-test".to_string(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn try_acquire_repository_write_lease_for_test(
-        &self,
-        project_key: &str,
-        acquire_timeout: std::time::Duration,
-    ) -> anyhow::Result<Option<RepositoryWriteLease>> {
-        self.try_acquire_repository_lease_with_timeout(
-            project_key,
-            RepositoryLeaseMode::Exclusive,
-            acquire_timeout,
-        )
-        .await
-    }
-
     pub(crate) async fn open_shared_with_data_dir(
         context: &PgStoreContext,
         setup_pool: &PgPool,
@@ -191,6 +56,25 @@ impl WorkspaceLeaseStore {
         Self::open_with_context_and_store_key(context, setup_pool, store_key).await
     }
 
+    pub(crate) async fn open_shared_with_data_dir_and_repository_lock_capacity(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        data_dir: &std::path::Path,
+        repository_lock_capacity: usize,
+    ) -> anyhow::Result<Self> {
+        let store_key = crate::task_db::TaskDb::store_key_for_data_dir(data_dir)?;
+        let repository_lock_capacity = u32::try_from(repository_lock_capacity)
+            .map_err(|_| anyhow::anyhow!("repository lock capacity exceeds PostgreSQL limits"))?;
+        Self::open_with_context_store_key_and_repository_lock_capacity(
+            context,
+            setup_pool,
+            store_key,
+            repository_lock_capacity,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn open_with_context_and_store_key(
         context: &PgStoreContext,
         setup_pool: &PgPool,
@@ -203,6 +87,25 @@ impl WorkspaceLeaseStore {
         let repository_lock_slots = Arc::new(Semaphore::new(
             repository_lock_pool.options().get_max_connections() as usize,
         ));
+        Ok(Self {
+            pool,
+            repository_lock_pool,
+            repository_lock_slots,
+            store_key,
+        })
+    }
+
+    async fn open_with_context_store_key_and_repository_lock_capacity(
+        context: &PgStoreContext,
+        setup_pool: &PgPool,
+        store_key: String,
+        repository_lock_capacity: u32,
+    ) -> anyhow::Result<Self> {
+        let pool = context.open_pool_with_setup_pool(setup_pool).await?;
+        let repository_lock_pool = context
+            .open_runtime_pool_with_max_connections(repository_lock_capacity)
+            .await?;
+        let repository_lock_slots = Arc::new(Semaphore::new(repository_lock_capacity as usize));
         Ok(Self {
             pool,
             repository_lock_pool,
@@ -229,17 +132,44 @@ impl WorkspaceLeaseStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn try_acquire_lease(
         &self,
         record: &WorkspaceLeaseRecord,
     ) -> anyhow::Result<bool> {
+        self.try_acquire_lease_with_cleanup_target(record, record.runtime_workflow_id.is_some())
+            .await
+    }
+
+    pub(crate) async fn try_acquire_lease_with_cleanup_target(
+        &self,
+        record: &WorkspaceLeaseRecord,
+        persist_cleanup_target: bool,
+    ) -> anyhow::Result<bool> {
         let mut transaction = self.pool.begin().await?;
+        let cleanup_claims: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT cleanup_claim_id
+             FROM workspace_cleanup_targets
+             WHERE store_key = $1 AND workspace_path = $2
+             FOR UPDATE",
+        )
+        .bind(&self.store_key)
+        .bind(record.workspace_path.to_string_lossy().as_ref())
+        .fetch_all(&mut *transaction)
+        .await?;
+        if cleanup_claims
+            .into_iter()
+            .any(|claim_id| claim_id.is_some())
+        {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
         let result = sqlx::query(
             "INSERT INTO workspace_leases (
                 store_key, project_key, slot_index, task_id, workspace_key, workspace_path,
                 source_repo, repo, runtime_workflow_id, owner_session, run_generation,
-                process_id, process_started_at, state, acquired_at, released_at, last_used_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'leased',
+                acquisition_id, process_id, process_started_at, state, acquired_at, released_at, last_used_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'leased',
                        CURRENT_TIMESTAMP, NULL, CURRENT_TIMESTAMP)
              ON CONFLICT(store_key, project_key, slot_index) DO UPDATE SET
                 task_id = EXCLUDED.task_id,
@@ -250,14 +180,17 @@ impl WorkspaceLeaseStore {
                 runtime_workflow_id = EXCLUDED.runtime_workflow_id,
                 owner_session = EXCLUDED.owner_session,
                 run_generation = EXCLUDED.run_generation,
+                acquisition_id = EXCLUDED.acquisition_id,
                 process_id = EXCLUDED.process_id,
                 process_started_at = EXCLUDED.process_started_at,
                 state = 'leased',
                 acquired_at = CURRENT_TIMESTAMP,
                 released_at = NULL,
                 last_used_at = CURRENT_TIMESTAMP
-             WHERE workspace_leases.state <> 'leased'
+             WHERE workspace_leases.state = 'released'
                 OR (
+                    workspace_leases.state = 'leased'
+                    AND
                     workspace_leases.task_id = EXCLUDED.task_id
                     AND workspace_leases.owner_session = EXCLUDED.owner_session
                 )",
@@ -273,6 +206,7 @@ impl WorkspaceLeaseStore {
         .bind(record.runtime_workflow_id.as_deref())
         .bind(&record.owner_session)
         .bind(record.run_generation as i64)
+        .bind(record.acquisition_id.as_deref())
         .bind(record.process_id as i64)
         .bind(i64::try_from(record.process_started_at)?)
         .execute(&mut *transaction)
@@ -281,13 +215,14 @@ impl WorkspaceLeaseStore {
             transaction.rollback().await?;
             return Ok(false);
         }
-        if let Some(runtime_workflow_id) = record.runtime_workflow_id.as_deref() {
-            sqlx::query(
-                "INSERT INTO workspace_cleanup_targets (
+        if persist_cleanup_target {
+            if let Some(runtime_workflow_id) = record.runtime_workflow_id.as_deref() {
+                sqlx::query(
+                    "INSERT INTO workspace_cleanup_targets (
                     store_key, runtime_workflow_id, workspace_path, task_id, project_key,
                     slot_index, workspace_key, source_repo, repo, owner_session, run_generation,
-                    process_id, process_started_at, created_at, last_used_at
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    acquisition_id, process_id, process_started_at, created_at, last_used_at
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                  ON CONFLICT(store_key, runtime_workflow_id, workspace_path) DO UPDATE SET
                     task_id = EXCLUDED.task_id,
@@ -298,12 +233,55 @@ impl WorkspaceLeaseStore {
                     repo = EXCLUDED.repo,
                     owner_session = EXCLUDED.owner_session,
                     run_generation = EXCLUDED.run_generation,
+                    acquisition_id = EXCLUDED.acquisition_id,
                     process_id = EXCLUDED.process_id,
                     process_started_at = EXCLUDED.process_started_at,
+                    cleanup_in_progress = FALSE,
+                    cleanup_claim_id = NULL,
+                    cleanup_owner_session = NULL,
+                    cleanup_process_id = NULL,
+                    cleanup_process_started_at = NULL,
+                    cleanup_claim_expires_at = NULL,
                     last_used_at = CURRENT_TIMESTAMP",
+                )
+                .bind(&self.store_key)
+                .bind(runtime_workflow_id)
+                .bind(record.workspace_path.to_string_lossy().as_ref())
+                .bind(record.task_id.as_str())
+                .bind(&record.project_key)
+                .bind(record.slot_index as i64)
+                .bind(&record.workspace_key)
+                .bind(record.source_repo.to_string_lossy().as_ref())
+                .bind(record.repo.as_deref())
+                .bind(&record.owner_session)
+                .bind(record.run_generation as i64)
+                .bind(record.acquisition_id.as_deref())
+                .bind(record.process_id as i64)
+                .bind(i64::try_from(record.process_started_at)?)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        } else {
+            sqlx::query(
+                "DELETE FROM workspace_cleanup_targets
+                 WHERE store_key = $1
+                   AND runtime_workflow_id IS NOT DISTINCT FROM $2
+                   AND workspace_path = $3
+                   AND task_id = $4
+                   AND project_key = $5
+                   AND slot_index = $6
+                   AND workspace_key = $7
+                   AND source_repo = $8
+                   AND repo IS NOT DISTINCT FROM $9
+                   AND owner_session = $10
+                   AND run_generation = $11
+                   AND acquisition_id IS NOT DISTINCT FROM $12
+                   AND process_id = $13
+                   AND process_started_at = $14
+                   AND cleanup_claim_id IS NULL",
             )
             .bind(&self.store_key)
-            .bind(runtime_workflow_id)
+            .bind(record.runtime_workflow_id.as_deref())
             .bind(record.workspace_path.to_string_lossy().as_ref())
             .bind(record.task_id.as_str())
             .bind(&record.project_key)
@@ -313,6 +291,7 @@ impl WorkspaceLeaseStore {
             .bind(record.repo.as_deref())
             .bind(&record.owner_session)
             .bind(record.run_generation as i64)
+            .bind(record.acquisition_id.as_deref())
             .bind(record.process_id as i64)
             .bind(i64::try_from(record.process_started_at)?)
             .execute(&mut *transaction)
@@ -342,11 +321,14 @@ impl WorkspaceLeaseStore {
             .collect()
     }
 
-    pub(crate) async fn release_slot(
+    pub(crate) async fn release_owned_slot(
         &self,
         project_key: &str,
         slot_index: u32,
         task_id: &TaskId,
+        owner_session: &str,
+        run_generation: u32,
+        acquisition_id: &str,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
             "UPDATE workspace_leases
@@ -357,32 +339,21 @@ impl WorkspaceLeaseStore {
                AND project_key = $2
                AND slot_index = $3
                AND task_id = $4
+               AND owner_session = $5
+               AND run_generation = $6
+               AND acquisition_id = $7
                AND state = 'leased'",
         )
         .bind(&self.store_key)
         .bind(project_key)
         .bind(slot_index as i64)
         .bind(task_id.as_str())
+        .bind(owner_session)
+        .bind(run_generation as i64)
+        .bind(acquisition_id)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
-    }
-
-    pub(crate) async fn release_task(&self, task_id: &TaskId) -> anyhow::Result<u64> {
-        let result = sqlx::query(
-            "UPDATE workspace_leases
-             SET state = 'released',
-                 released_at = CURRENT_TIMESTAMP,
-                 last_used_at = CURRENT_TIMESTAMP
-             WHERE store_key = $1
-               AND task_id = $2
-               AND state = 'leased'",
-        )
-        .bind(&self.store_key)
-        .bind(task_id.as_str())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
     }
 
     pub(crate) async fn release_foreign_orphaned_leases(
@@ -391,7 +362,7 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<u64> {
         let rows = sqlx::query_as::<_, WorkspaceLeaseRow>(
             "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
-                    runtime_workflow_id, owner_session, run_generation, process_id,
+                    runtime_workflow_id, owner_session, run_generation, acquisition_id, process_id,
                     process_started_at
              FROM workspace_leases
              WHERE store_key = $1
@@ -433,8 +404,9 @@ impl WorkspaceLeaseStore {
                AND slot_index = $3
                AND task_id = $4
                AND owner_session = $5
-               AND process_id = $6
-               AND process_started_at = $7
+               AND acquisition_id IS NOT DISTINCT FROM $6
+               AND process_id = $7
+               AND process_started_at = $8
                AND state = 'leased'",
         )
         .bind(&self.store_key)
@@ -442,6 +414,7 @@ impl WorkspaceLeaseStore {
         .bind(record.slot_index as i64)
         .bind(record.task_id.as_str())
         .bind(&record.owner_session)
+        .bind(record.acquisition_id.as_deref())
         .bind(record.process_id as i64)
         .bind(i64::try_from(record.process_started_at)?)
         .execute(&self.pool)
@@ -475,7 +448,7 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<Option<WorkspaceLeaseRecord>> {
         let row = sqlx::query_as::<_, WorkspaceLeaseRow>(
             "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
-                    runtime_workflow_id, owner_session, run_generation, process_id,
+                    runtime_workflow_id, owner_session, run_generation, acquisition_id, process_id,
                     process_started_at
              FROM workspace_leases
              WHERE store_key = $1
@@ -499,7 +472,7 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<Option<WorkspaceLeaseRecord>> {
         let row = sqlx::query_as::<_, WorkspaceLeaseRow>(
             "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
-                    runtime_workflow_id, owner_session, run_generation, process_id,
+                    runtime_workflow_id, owner_session, run_generation, acquisition_id, process_id,
                     process_started_at
              FROM workspace_leases
              WHERE store_key = $1
@@ -519,7 +492,7 @@ impl WorkspaceLeaseStore {
     pub(crate) async fn list_leased(&self) -> anyhow::Result<Vec<WorkspaceLeaseRecord>> {
         let rows = sqlx::query_as::<_, WorkspaceLeaseRow>(
             "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo, repo,
-                    runtime_workflow_id, owner_session, run_generation, process_id,
+                    runtime_workflow_id, owner_session, run_generation, acquisition_id, process_id,
                     process_started_at
              FROM workspace_leases
              WHERE store_key = $1
@@ -569,6 +542,7 @@ struct WorkspaceLeaseRow {
     runtime_workflow_id: Option<String>,
     owner_session: String,
     run_generation: i64,
+    acquisition_id: Option<String>,
     process_id: i64,
     process_started_at: i64,
 }
@@ -588,6 +562,7 @@ impl TryFrom<WorkspaceLeaseRow> for WorkspaceLeaseRecord {
             runtime_workflow_id: row.runtime_workflow_id,
             owner_session: row.owner_session,
             run_generation: u32::try_from(row.run_generation)?,
+            acquisition_id: row.acquisition_id,
             process_id: u32::try_from(row.process_id)?,
             process_started_at: u64::try_from(row.process_started_at)?,
         })
@@ -624,6 +599,7 @@ pub(crate) const WORKSPACE_LEASES_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS 
     runtime_workflow_id TEXT,
     owner_session       TEXT NOT NULL,
     run_generation      BIGINT NOT NULL,
+    acquisition_id      TEXT,
     process_id          BIGINT NOT NULL,
     process_started_at  BIGINT NOT NULL DEFAULT 0,
     state               TEXT NOT NULL DEFAULT 'leased',

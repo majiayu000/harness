@@ -77,6 +77,7 @@ async fn reconcile_disk_removes_closed_issue_workspace() {
             task_id: "issue:42".to_string(),
             run_generation: 1,
             owner_session: "s".to_string(),
+            acquisition_id: None,
             workspace_key: Some("myorg_my-repo__issue_42".to_string()),
         })
         .expect("serialize"),
@@ -264,6 +265,7 @@ async fn reconcile_disk_releases_dead_persisted_lease_before_cleanup() -> anyhow
         runtime_workflow_id: Some("workflow-dead".to_string()),
         owner_session: "dead-foreign-session".to_string(),
         run_generation: 1,
+        acquisition_id: Some("stale-acquisition".to_string()),
         process_id: u32::MAX,
         process_started_at: 1,
     };
@@ -451,6 +453,7 @@ async fn reconcile_disk_skips_open_issue_workspace() {
             task_id: "issue:7".to_string(),
             run_generation: 1,
             owner_session: "s".to_string(),
+            acquisition_id: None,
             workspace_key: Some("myorg_my-repo__issue_7".to_string()),
         })
         .expect("serialize"),
@@ -491,6 +494,7 @@ async fn reconcile_disk_reports_a_malformed_github_response() {
             task_id: "issue:8".to_string(),
             run_generation: 1,
             owner_session: "s".to_string(),
+            acquisition_id: None,
             workspace_key: Some("myorg_my-repo__issue_8".to_string()),
         })
         .expect("serialize"),
@@ -528,6 +532,7 @@ async fn reconcile_disk_rejects_redirected_terminal_state() {
             task_id: "issue:9".to_string(),
             run_generation: 1,
             owner_session: "s".to_string(),
+            acquisition_id: None,
             workspace_key: Some("myorg_my-repo__issue_9".to_string()),
         })
         .expect("serialize"),

@@ -599,6 +599,11 @@ impl AgentAdapter for OpenCodeAcpAdapter {
         Ok(())
     }
 
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        self.state.lock().await.reset_child().await;
+        Ok(())
+    }
+
     async fn respond_approval(
         &self,
         id: String,

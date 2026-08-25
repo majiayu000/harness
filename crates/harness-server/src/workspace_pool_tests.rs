@@ -565,3 +565,92 @@ async fn create_workspace_enforces_project_capacity_across_repo_slugs() {
         .await
         .expect("remove second");
 }
+
+#[tokio::test]
+async fn reduced_capacity_waits_for_out_of_range_slots_to_exit() {
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let mgr = std::sync::Arc::new(
+        WorkspaceManager::new_with_pool(
+            WorkspaceConfig {
+                root: workspaces.path().to_path_buf(),
+                ..Default::default()
+            },
+            WorkspacePoolConfig::new_for_local_pool_tests(4, std::collections::HashMap::new()),
+            None,
+        )
+        .expect("manager"),
+    );
+    let mut tasks = Vec::new();
+    for index in 0..3 {
+        let task_id = TaskId(format!("capacity-old-{index}"));
+        let lease = mgr
+            .create_workspace_with_options(
+                &task_id,
+                source.path(),
+                "origin",
+                &branch,
+                1,
+                Some(&format!("issue:{index}")),
+                Some("owner/repo"),
+                WorkspaceCreateOptions {
+                    workspace_capacity_override: Some(4),
+                    repository_write_lease: RepositoryWriteLeaseInput::NotRequired,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("old-capacity workspace");
+        assert_eq!(lease.slot_index, index);
+        tasks.push(task_id);
+    }
+
+    let retry_task = TaskId("capacity-new".to_string());
+    let manager = mgr.clone();
+    let source_path = source.path().to_path_buf();
+    let retry_branch = branch.clone();
+    let retry_task_for_spawn = retry_task.clone();
+    let retry = tokio::spawn(async move {
+        manager
+            .create_workspace_with_options(
+                &retry_task_for_spawn,
+                &source_path,
+                "origin",
+                &retry_branch,
+                1,
+                Some("issue:new"),
+                Some("owner/repo"),
+                WorkspaceCreateOptions {
+                    workspace_capacity_override: Some(2),
+                    repository_write_lease: RepositoryWriteLeaseInput::NotRequired,
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!retry.is_finished(), "slot 2 must block reduced admission");
+
+    mgr.release_workspace(&tasks[2]).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !retry.is_finished(),
+        "slots 0 and 1 still fill the new capacity"
+    );
+    mgr.release_workspace(&tasks[1]).await;
+    let lease = tokio::time::timeout(Duration::from_secs(5), retry)
+        .await
+        .expect("reduced admission should resume")
+        .expect("retry join")
+        .expect("retry workspace");
+    assert_eq!(lease.slot_index, 1);
+
+    mgr.remove_workspace(&tasks[0])
+        .await
+        .expect("remove old slot");
+    mgr.remove_workspace(&retry_task)
+        .await
+        .expect("remove retry");
+}
