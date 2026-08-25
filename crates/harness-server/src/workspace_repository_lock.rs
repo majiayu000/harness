@@ -7,8 +7,12 @@ const REPOSITORY_LEASE_HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Durat
 const REPOSITORY_LEASE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const REPOSITORY_LEASE_HEARTBEAT_FAILURE_LIMIT: u32 = 3;
 
-fn repository_heartbeat_failure_is_terminal(consecutive_failures: u32) -> bool {
-    consecutive_failures >= REPOSITORY_LEASE_HEARTBEAT_FAILURE_LIMIT
+fn repository_heartbeat_failure_is_terminal(
+    consecutive_failures: u32,
+    requires_immediate_revocation: bool,
+) -> bool {
+    requires_immediate_revocation
+        || consecutive_failures >= REPOSITORY_LEASE_HEARTBEAT_FAILURE_LIMIT
 }
 
 fn repository_heartbeat_error_is_definitive(error: &sqlx::Error) -> bool {
@@ -110,18 +114,19 @@ impl RepositoryWriteLease {
                         error.to_string(),
                     )),
                     Err(_) => Some((
-                        false,
+                        true,
                         format!(
                             "heartbeat timed out after {}s",
                             REPOSITORY_LEASE_HEARTBEAT_TIMEOUT.as_secs()
                         ),
                     )),
                 };
-                if let Some((definitive, error)) = failure {
+                if let Some((requires_immediate_revocation, error)) = failure {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    if !definitive
-                        && !repository_heartbeat_failure_is_terminal(consecutive_failures)
-                    {
+                    if !repository_heartbeat_failure_is_terminal(
+                        consecutive_failures,
+                        requires_immediate_revocation,
+                    ) {
                         tracing::warn!(
                             consecutive_failures,
                             failure_limit = REPOSITORY_LEASE_HEARTBEAT_FAILURE_LIMIT,
@@ -129,10 +134,10 @@ impl RepositoryWriteLease {
                         );
                         continue;
                     }
-                    if definitive {
+                    if requires_immediate_revocation {
                         tracing::error!(
                             consecutive_failures,
-                            "PostgreSQL repository advisory-lock session was definitively lost: {error}"
+                            "PostgreSQL repository advisory-lock session may no longer be safely held: {error}"
                         );
                     } else {
                         tracing::error!(
@@ -272,9 +277,14 @@ mod tests {
 
     #[test]
     fn repository_heartbeat_requires_repeated_failures_before_revocation() {
-        assert!(!repository_heartbeat_failure_is_terminal(1));
-        assert!(!repository_heartbeat_failure_is_terminal(2));
-        assert!(repository_heartbeat_failure_is_terminal(3));
+        assert!(!repository_heartbeat_failure_is_terminal(1, false));
+        assert!(!repository_heartbeat_failure_is_terminal(2, false));
+        assert!(repository_heartbeat_failure_is_terminal(3, false));
+    }
+
+    #[test]
+    fn repository_heartbeat_timeout_revokes_immediately() {
+        assert!(repository_heartbeat_failure_is_terminal(1, true));
     }
 
     #[test]
