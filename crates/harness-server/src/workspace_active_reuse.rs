@@ -24,12 +24,32 @@ struct CancelledWorkspaceSetupCleanup {
     released_paths: Arc<DashMap<TaskId, PathBuf>>,
     released_workspace_paths: Arc<DashMap<String, PathBuf>>,
     git_ops: Arc<tokio::sync::Mutex<()>>,
-    cleanup_ops: Arc<tokio::sync::Mutex<()>>,
+    cleanup_ops: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     lease_store: Option<Arc<WorkspaceLeaseStore>>,
     workflow_before_remove_hook: Option<String>,
     workflow_hook_timeout_secs: u64,
     manager_before_remove_hook: Option<String>,
     manager_hook_timeout_secs: u64,
+}
+
+pub(super) fn workspace_cleanup_operation(
+    cleanup_ops: &DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    acquisition_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    cleanup_ops
+        .entry(acquisition_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn remove_workspace_cleanup_operation(
+    cleanup_ops: &DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    acquisition_id: &str,
+    cleanup_operation: &Arc<tokio::sync::Mutex<()>>,
+) {
+    cleanup_ops.remove_if(acquisition_id, |_, current| {
+        Arc::ptr_eq(current, cleanup_operation)
+    });
 }
 
 pub(super) fn cancelled_cleanup_retry_delay(attempt: u64) -> std::time::Duration {
@@ -83,6 +103,8 @@ impl CancelledWorkspaceSetupCleanup {
     }
 
     async fn converge(self, task_id: TaskId, snapshot: ActiveWorkspaceSnapshot) {
+        let cleanup_operation =
+            workspace_cleanup_operation(&self.cleanup_ops, &snapshot.acquisition_id);
         let mut attempt = 1_u64;
         loop {
             let still_current = self.active.get(&task_id).is_some_and(|active| {
@@ -90,6 +112,26 @@ impl CancelledWorkspaceSetupCleanup {
                     && active.state == ActiveWorkspaceState::CleanupRequired
             });
             if !still_current {
+                remove_workspace_cleanup_operation(
+                    &self.cleanup_ops,
+                    &snapshot.acquisition_id,
+                    &cleanup_operation,
+                );
+                return;
+            }
+
+            let cleanup_guard = cleanup_operation.lock().await;
+            let still_current = self.active.get(&task_id).is_some_and(|active| {
+                active.acquisition_id == snapshot.acquisition_id
+                    && active.state == ActiveWorkspaceState::CleanupRequired
+            });
+            if !still_current {
+                drop(cleanup_guard);
+                remove_workspace_cleanup_operation(
+                    &self.cleanup_ops,
+                    &snapshot.acquisition_id,
+                    &cleanup_operation,
+                );
                 return;
             }
 
@@ -106,6 +148,7 @@ impl CancelledWorkspaceSetupCleanup {
                             attempt,
                             "failed to reacquire the repository lease for cancelled workspace setup cleanup; retrying: {error}"
                         );
+                        drop(cleanup_guard);
                         let retry_delay = cancelled_cleanup_retry_delay(attempt);
                         attempt = attempt.saturating_add(1);
                         tokio::time::sleep(retry_delay).await;
@@ -117,7 +160,6 @@ impl CancelledWorkspaceSetupCleanup {
             let repository_lease_lost = repository_lease
                 .as_ref()
                 .map(RepositoryWriteLease::loss_receiver);
-            let _cleanup_ops = self.cleanup_ops.lock().await;
             let cleanup = async {
                 let still_current = self.active.get(&task_id).is_some_and(|active| {
                     active.acquisition_id == snapshot.acquisition_id
@@ -182,9 +224,23 @@ impl CancelledWorkspaceSetupCleanup {
                         self.released_paths.remove(&task_id);
                         self.released_workspace_paths.remove(&entry.workspace_key);
                     }
+                    drop(cleanup_guard);
+                    remove_workspace_cleanup_operation(
+                        &self.cleanup_ops,
+                        &snapshot.acquisition_id,
+                        &cleanup_operation,
+                    );
                     return;
                 }
-                Some(Ok(false)) => return,
+                Some(Ok(false)) => {
+                    drop(cleanup_guard);
+                    remove_workspace_cleanup_operation(
+                        &self.cleanup_ops,
+                        &snapshot.acquisition_id,
+                        &cleanup_operation,
+                    );
+                    return;
+                }
                 Some(Err(error)) => tracing::error!(
                     task_id = %task_id.0,
                     acquisition_id = %snapshot.acquisition_id,
@@ -198,6 +254,7 @@ impl CancelledWorkspaceSetupCleanup {
                     "repository lease was lost during cancelled workspace setup cleanup; retrying"
                 ),
             }
+            drop(cleanup_guard);
             let retry_delay = cancelled_cleanup_retry_delay(attempt);
             attempt = attempt.saturating_add(1);
             tokio::time::sleep(retry_delay).await;
@@ -238,6 +295,39 @@ impl WorkspaceManager {
             active._repository_write_lease = None;
             ActiveWorkspaceSnapshot::from(active.value())
         };
+        let cleanup_operation =
+            workspace_cleanup_operation(&self.cleanup_ops, &snapshot.acquisition_id);
+        let cleanup_guard = cleanup_operation.lock().await;
+        let target_is_current = {
+            let active = self.active.get(task_id);
+            retry_cleanup_target_is_current(
+                active
+                    .as_ref()
+                    .map(|active| (active.acquisition_id.as_str(), &active.state)),
+                &snapshot.acquisition_id,
+            )
+        };
+        match target_is_current {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(cleanup_guard);
+                remove_workspace_cleanup_operation(
+                    &self.cleanup_ops,
+                    &snapshot.acquisition_id,
+                    &cleanup_operation,
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                drop(cleanup_guard);
+                remove_workspace_cleanup_operation(
+                    &self.cleanup_ops,
+                    &snapshot.acquisition_id,
+                    &cleanup_operation,
+                );
+                return Err(error);
+            }
+        }
         let repository_lease = self
             .acquire_repository_write_lease_for_cleanup(&snapshot.source_repo)
             .await?;
@@ -245,7 +335,6 @@ impl WorkspaceManager {
             .as_ref()
             .map(RepositoryWriteLease::loss_receiver);
         let cleanup = async {
-            let _cleanup_ops = self.cleanup_ops.lock().await;
             let active = self.active.get(task_id);
             if !retry_cleanup_target_is_current(
                 active
@@ -278,18 +367,27 @@ impl WorkspaceManager {
                 .await
         };
         tokio::pin!(cleanup);
-        if let Some(receiver) = loss.as_mut() {
+        let result = if let Some(receiver) = loss.as_mut() {
             tokio::select! {
                 biased;
                 _ = wait_for_repository_revocation(receiver) => {
-                    anyhow::bail!("repository lease was lost during retry cleanup")
+                    Err(anyhow::anyhow!("repository lease was lost during retry cleanup"))
                 }
-                result = &mut cleanup => result?,
+                result = &mut cleanup => result,
             }
         } else {
-            cleanup.await?;
+            cleanup.await
+        };
+        drop(repository_lease);
+        drop(cleanup_guard);
+        if result.is_ok() {
+            remove_workspace_cleanup_operation(
+                &self.cleanup_ops,
+                &snapshot.acquisition_id,
+                &cleanup_operation,
+            );
         }
-        Ok(())
+        result
     }
 
     pub(crate) fn begin_workspace_preparation<'a>(

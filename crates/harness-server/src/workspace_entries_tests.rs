@@ -240,6 +240,22 @@ fn retry_cleanup_treats_disappeared_acquisition_as_converged() {
     .is_err());
 }
 
+#[tokio::test]
+async fn cleanup_serialization_is_scoped_to_acquisition() {
+    let cleanup_operations = DashMap::new();
+    let first =
+        workspace_active_reuse::workspace_cleanup_operation(&cleanup_operations, "acquisition-a");
+    let same =
+        workspace_active_reuse::workspace_cleanup_operation(&cleanup_operations, "acquisition-a");
+    let independent =
+        workspace_active_reuse::workspace_cleanup_operation(&cleanup_operations, "acquisition-b");
+
+    assert!(Arc::ptr_eq(&first, &same));
+    let _first_guard = first.lock().await;
+    assert!(same.try_lock().is_err());
+    assert!(independent.try_lock().is_ok());
+}
+
 #[test]
 fn cancelled_cleanup_retry_delay_is_bounded() {
     assert_eq!(
