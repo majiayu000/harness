@@ -355,7 +355,26 @@ impl WorkspaceLeaseStore {
         .execute(&mut *transaction)
         .await?;
         if released.rows_affected() == 0 {
-            anyhow::bail!("workspace acquisition changed before durable completion");
+            let already_released = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(
+                    SELECT 1 FROM workspace_leases
+                    WHERE store_key = $1 AND project_key = $2 AND slot_index = $3
+                      AND task_id = $4 AND owner_session = $5 AND run_generation = $6
+                      AND acquisition_id = $7 AND state = 'released'
+                )",
+            )
+            .bind(&self.store_key)
+            .bind(project_key)
+            .bind(slot_index as i64)
+            .bind(task_id.as_str())
+            .bind(owner_session)
+            .bind(run_generation as i64)
+            .bind(acquisition_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !already_released {
+                anyhow::bail!("workspace acquisition changed before durable completion");
+            }
         }
         transaction.commit().await?;
         Ok(())

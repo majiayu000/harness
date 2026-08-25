@@ -55,6 +55,66 @@ async fn workspace_lease_store_persists_and_releases_active_slots() -> anyhow::R
 }
 
 #[tokio::test]
+async fn durable_workspace_completion_is_idempotent_for_exact_acquisition() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkspaceLeaseStore::open(&dir.path().join("idempotent-completion")).await?;
+    let record = WorkspaceLeaseRecord {
+        project_key: "idempotent-project".to_string(),
+        slot_index: 0,
+        task_id: TaskId::from_str("idempotent-task"),
+        workspace_key: "idempotent-workspace".to_string(),
+        workspace_path: dir.path().join("workspaces/idempotent"),
+        source_repo: dir.path().join("repo"),
+        repo: Some("owner/repo".to_string()),
+        runtime_workflow_id: Some("idempotent-workflow".to_string()),
+        owner_session: "idempotent-session".to_string(),
+        run_generation: 1,
+        acquisition_id: Some("idempotent-acquisition-a".to_string()),
+        process_id: std::process::id(),
+        process_started_at: WorkspaceLeaseStore::current_process_started_at()?,
+    };
+    assert!(store.try_acquire_lease(&record).await?);
+    let acquisition_id = record.acquisition_id.as_deref().expect("acquisition ID");
+
+    for _ in 0..2 {
+        store
+            .complete_owned_workspace(
+                &record.project_key,
+                record.slot_index,
+                &record.task_id,
+                &record.owner_session,
+                record.run_generation,
+                acquisition_id,
+            )
+            .await?;
+    }
+
+    let replacement = WorkspaceLeaseRecord {
+        acquisition_id: Some("idempotent-acquisition-b".to_string()),
+        ..record.clone()
+    };
+    assert!(store.try_acquire_lease(&replacement).await?);
+    let stale_error = store
+        .complete_owned_workspace(
+            &record.project_key,
+            record.slot_index,
+            &record.task_id,
+            &record.owner_session,
+            record.run_generation,
+            acquisition_id,
+        )
+        .await
+        .expect_err("a replaced acquisition must remain fenced");
+    assert!(stale_error
+        .to_string()
+        .contains("workspace acquisition changed"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn acquisition_token_fences_stale_release_and_cleanup() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

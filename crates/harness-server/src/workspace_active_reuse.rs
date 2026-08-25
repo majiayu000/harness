@@ -24,6 +24,7 @@ struct CancelledWorkspaceSetupCleanup {
     released_paths: Arc<DashMap<TaskId, PathBuf>>,
     released_workspace_paths: Arc<DashMap<String, PathBuf>>,
     git_ops: Arc<tokio::sync::Mutex<()>>,
+    cleanup_ops: Arc<tokio::sync::Mutex<()>>,
     lease_store: Option<Arc<WorkspaceLeaseStore>>,
     workflow_before_remove_hook: Option<String>,
     workflow_hook_timeout_secs: u64,
@@ -116,6 +117,7 @@ impl CancelledWorkspaceSetupCleanup {
             let repository_lease_lost = repository_lease
                 .as_ref()
                 .map(RepositoryWriteLease::loss_receiver);
+            let _cleanup_ops = self.cleanup_ops.lock().await;
             let cleanup = async {
                 let still_current = self.active.get(&task_id).is_some_and(|active| {
                     active.acquisition_id == snapshot.acquisition_id
@@ -243,6 +245,7 @@ impl WorkspaceManager {
             .as_ref()
             .map(RepositoryWriteLease::loss_receiver);
         let cleanup = async {
+            let _cleanup_ops = self.cleanup_ops.lock().await;
             let active = self.active.get(task_id);
             if !retry_cleanup_target_is_current(
                 active
@@ -586,6 +589,7 @@ impl Drop for WorkspaceStateGuard<'_> {
             released_paths: Arc::clone(&self.manager.released_paths),
             released_workspace_paths: Arc::clone(&self.manager.released_workspace_paths),
             git_ops: Arc::clone(&self.manager.git_ops),
+            cleanup_ops: Arc::clone(&self.manager.cleanup_ops),
             lease_store: self.manager.lease_store.clone(),
             workflow_before_remove_hook: self.before_remove_hook.take(),
             workflow_hook_timeout_secs: self.hook_timeout_secs,

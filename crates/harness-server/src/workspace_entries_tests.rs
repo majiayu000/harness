@@ -123,6 +123,105 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
     assert!(manager_hook_marker.exists());
 }
 
+#[tokio::test]
+async fn cancellation_and_retry_serialize_before_remove_hook_without_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source_repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&source_repo).expect("source repo dir");
+    super::test_support::init_git_repo(&source_repo);
+    let workspace_path = tmp.path().join("workspaces/task-serialized-hook");
+    std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+    let hook_log = tmp.path().join("hook-log");
+    let hook_release = tmp.path().join("hook-release");
+    std::fs::write(
+        workspace_path.join("cancellation-hook.sh"),
+        format!(
+            "printf 'start\\n' >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+            hook_log.display(),
+            hook_release.display()
+        ),
+    )
+    .expect("hook script");
+    let mgr = Arc::new(
+        WorkspaceManager::new(WorkspaceConfig {
+            root: tmp.path().join("workspaces"),
+            ..Default::default()
+        })
+        .expect("manager"),
+    );
+    let task_id = TaskId("task-serialized-hook".to_string());
+    mgr.active.insert(
+        task_id.clone(),
+        ActiveWorkspace {
+            workspace_path,
+            source_repo,
+            repo: None,
+            runtime_workflow_id: None,
+            workspace_key: "workspace-key".to_string(),
+            project_key: "project-key".to_string(),
+            slot_index: 0,
+            branch: "harness/task-serialized-hook".to_string(),
+            created_at: std::time::SystemTime::now(),
+            owner_session: mgr.owner_session.clone(),
+            run_generation: 1,
+            acquisition_id: "acquisition-a".to_string(),
+            state: ActiveWorkspaceState::Ready,
+            _pool_permit: None,
+            _repository_write_lease: None,
+        },
+    );
+
+    let guard = mgr
+        .begin_workspace_preparation(
+            &task_id,
+            "acquisition-a",
+            Some("sh cancellation-hook.sh".to_string()),
+            5,
+        )
+        .expect("begin preparation");
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !hook_log.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancellation hook should start");
+
+    let retry_manager = Arc::clone(&mgr);
+    let retry_task_id = task_id.clone();
+    let retry = tokio::spawn(async move {
+        retry_manager
+            .cleanup_required_workspace_for_retry(
+                &retry_task_id,
+                Some("sh cancellation-hook.sh"),
+                5,
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!retry.is_finished());
+    assert_eq!(
+        std::fs::read_to_string(&hook_log)
+            .expect("hook log")
+            .lines()
+            .count(),
+        1
+    );
+
+    std::fs::write(&hook_release, "release").expect("release hook");
+    retry.await.expect("retry join").expect("retry cleanup");
+    assert_eq!(
+        std::fs::read_to_string(&hook_log)
+            .expect("hook log")
+            .lines()
+            .count(),
+        1,
+        "the same acquisition hook must not run twice"
+    );
+    assert!(!mgr.active.contains_key(&task_id));
+}
+
 #[test]
 fn retry_cleanup_treats_disappeared_acquisition_as_converged() {
     assert!(
