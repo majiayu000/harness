@@ -342,6 +342,81 @@ async fn concurrent_subtasks_release_pool_slots_before_creating_all_workspaces(
 }
 
 #[tokio::test]
+async fn cancelled_concurrent_dispatch_stops_waiting_workspace_acquisitions() -> anyhow::Result<()>
+{
+    let source = tempfile::tempdir()?;
+    let base_branch = init_git_repo(source.path());
+    let workspaces = tempfile::tempdir()?;
+    let workspace_mgr = Arc::new(WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            auto_cleanup: true,
+            ..Default::default()
+        },
+        crate::workspace_pool::WorkspacePoolConfig::new_for_local_pool_tests(
+            1,
+            std::collections::HashMap::new(),
+        ),
+        None,
+    )?);
+    let blocker_id = TaskId::from_str("parallel-acquisition-blocker");
+    let blocker = workspace_mgr
+        .create_workspace(
+            &blocker_id,
+            source.path(),
+            "origin",
+            &base_branch,
+            1,
+            None,
+            None,
+        )
+        .await?;
+    let agent = Arc::new(SequencedAgent::new(["unexpected", "unexpected"]));
+    let run_manager = Arc::clone(&workspace_mgr);
+    let run_agent = agent.clone();
+    let run_source = source.path().to_path_buf();
+    let run_branch = base_branch.clone();
+    let run = tokio::spawn(async move {
+        run_parallel_subtasks(
+            &TaskId::from_str("cancelled-workspace-acquisition"),
+            run_agent,
+            vec![
+                SubtaskSpec {
+                    prompt: "parallel step one".to_string(),
+                    depends_on_indices: Vec::new(),
+                },
+                SubtaskSpec {
+                    prompt: "parallel step two".to_string(),
+                    depends_on_indices: Vec::new(),
+                },
+            ],
+            run_manager,
+            &run_source,
+            "origin",
+            &run_branch,
+            Vec::new(),
+            Duration::from_secs(30),
+            &HarnessConfig::default(),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    run.abort();
+    match run.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => anyhow::bail!("dispatch should be cancelled"),
+    }
+    workspace_mgr
+        .remove_workspace_acquisition(&blocker_id, &blocker.acquisition_id)
+        .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(agent.prompt_count(), 0);
+    assert_eq!(workspace_mgr.live_count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelled_parallel_dispatch_requires_cleanup_before_workspace_reuse() -> anyhow::Result<()>
 {
     let source = tempfile::tempdir()?;

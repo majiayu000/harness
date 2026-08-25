@@ -3,6 +3,14 @@ use sqlx::pool::PoolConnection;
 use sqlx::Postgres;
 use tokio::sync::{watch, OwnedSemaphorePermit};
 
+const REPOSITORY_LEASE_HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const REPOSITORY_LEASE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const REPOSITORY_LEASE_HEARTBEAT_FAILURE_LIMIT: u32 = 3;
+
+fn repository_heartbeat_failure_is_terminal(consecutive_failures: u32) -> bool {
+    consecutive_failures >= REPOSITORY_LEASE_HEARTBEAT_FAILURE_LIMIT
+}
+
 pub(crate) struct RepositoryWriteLease {
     _connection: Arc<tokio::sync::Mutex<Option<PoolConnection<Postgres>>>>,
     _slot_permit: Arc<tokio::sync::Mutex<Option<OwnedSemaphorePermit>>>,
@@ -54,8 +62,9 @@ impl RepositoryWriteLease {
         let (state_tx, state) = watch::channel(RepositoryLeaseState::Healthy);
         let monitor_state_tx = state_tx.clone();
         let liveness_task = tokio::spawn(async move {
+            let mut consecutive_failures = 0_u32;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(REPOSITORY_LEASE_HEARTBEAT_INTERVAL).await;
                 let Some(connection_owner) = monitor_connection.upgrade() else {
                     break;
                 };
@@ -65,19 +74,35 @@ impl RepositoryWriteLease {
                         break;
                     };
                     tokio::time::timeout(
-                        std::time::Duration::from_secs(1),
+                        REPOSITORY_LEASE_HEARTBEAT_TIMEOUT,
                         sqlx::query("SELECT 1").execute(&mut **connection),
                     )
                     .await
                 };
                 let loss = match result {
-                    Ok(Ok(_)) => None,
+                    Ok(Ok(_)) => {
+                        consecutive_failures = 0;
+                        None
+                    }
                     Ok(Err(error)) => Some(error.to_string()),
-                    Err(_) => Some("heartbeat timed out after 1s".to_string()),
+                    Err(_) => Some(format!(
+                        "heartbeat timed out after {}s",
+                        REPOSITORY_LEASE_HEARTBEAT_TIMEOUT.as_secs()
+                    )),
                 };
                 if let Some(error) = loss {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if !repository_heartbeat_failure_is_terminal(consecutive_failures) {
+                        tracing::warn!(
+                            consecutive_failures,
+                            failure_limit = REPOSITORY_LEASE_HEARTBEAT_FAILURE_LIMIT,
+                            "PostgreSQL repository advisory-lock heartbeat failed; retaining the session pending confirmation: {error}"
+                        );
+                        continue;
+                    }
                     tracing::error!(
-                        "PostgreSQL repository advisory-lock session was lost: {error}"
+                        consecutive_failures,
+                        "PostgreSQL repository advisory-lock session was lost after repeated heartbeat failures: {error}"
                     );
                     let started_revoking = transition_repository_lease_state(
                         &monitor_state_tx,
@@ -90,7 +115,7 @@ impl RepositoryWriteLease {
                     if let Some(connection_owner) = monitor_connection.upgrade() {
                         if let Some(connection) = connection_owner.lock().await.take() {
                             match tokio::time::timeout(
-                                std::time::Duration::from_secs(1),
+                                REPOSITORY_LEASE_HEARTBEAT_TIMEOUT,
                                 connection.close(),
                             )
                             .await
@@ -207,6 +232,13 @@ mod tests {
             RepositoryLeaseState::Revoking,
         ));
         assert_eq!(*receiver.borrow(), RepositoryLeaseState::Released);
+    }
+
+    #[test]
+    fn repository_heartbeat_requires_repeated_failures_before_revocation() {
+        assert!(!repository_heartbeat_failure_is_terminal(1));
+        assert!(!repository_heartbeat_failure_is_terminal(2));
+        assert!(repository_heartbeat_failure_is_terminal(3));
     }
 }
 

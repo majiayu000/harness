@@ -62,6 +62,9 @@ fn workspace_entries_return_active_workspace_metadata_sorted_by_task_id() {
 #[tokio::test]
 async fn cancelled_preparation_marks_workspace_cleanup_required() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let source_repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&source_repo).expect("source repo dir");
+    super::test_support::init_git_repo(&source_repo);
     let workspace_path = tmp.path().join("workspaces/task-a");
     std::fs::create_dir_all(&workspace_path).expect("workspace dir");
     let mgr = WorkspaceManager::new(WorkspaceConfig {
@@ -74,7 +77,7 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
         task_id.clone(),
         ActiveWorkspace {
             workspace_path,
-            source_repo: tmp.path().join("repo"),
+            source_repo,
             repo: None,
             runtime_workflow_id: None,
             workspace_key: "workspace-key".to_string(),
@@ -99,15 +102,14 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
         ActiveWorkspaceState::Preparing
     );
     drop(guard);
-    assert_eq!(
-        mgr.active.get(&task_id).expect("active").state,
-        ActiveWorkspaceState::CleanupRequired
-    );
-    let error = mgr
-        .try_reuse_active_workspace(&task_id, 1, 1, &mut None)
-        .await
-        .expect_err("cleanup-required workspace must not be reused");
-    assert!(error.to_string().contains("requires cleanup"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while mgr.active.contains_key(&task_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled preparation cleanup should converge");
+    assert!(!tmp.path().join("workspaces/task-a").exists());
 }
 
 #[test]

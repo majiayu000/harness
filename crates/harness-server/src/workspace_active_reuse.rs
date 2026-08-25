@@ -16,6 +16,113 @@ pub(crate) struct WorkspaceExecutionGuard {
     armed: std::sync::atomic::AtomicBool,
 }
 
+struct CancelledWorkspaceSetupCleanup {
+    active: Arc<DashMap<TaskId, ActiveWorkspace>>,
+    active_paths: Arc<DashMap<PathBuf, TaskId>>,
+    released_paths: Arc<DashMap<TaskId, PathBuf>>,
+    released_workspace_paths: Arc<DashMap<String, PathBuf>>,
+    git_ops: Arc<tokio::sync::Mutex<()>>,
+    lease_store: Option<Arc<WorkspaceLeaseStore>>,
+}
+
+impl CancelledWorkspaceSetupCleanup {
+    async fn converge(self, task_id: TaskId, snapshot: ActiveWorkspaceSnapshot) {
+        let mut attempt = 1_u64;
+        loop {
+            let still_current = self.active.get(&task_id).is_some_and(|active| {
+                active.acquisition_id == snapshot.acquisition_id
+                    && active.state == ActiveWorkspaceState::CleanupRequired
+            });
+            if !still_current {
+                return;
+            }
+
+            let repository_lease = match self.lease_store.as_ref() {
+                Some(store) => match store
+                    .acquire_queued_repository_write_lease(&snapshot.project_key)
+                    .await
+                {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        tracing::error!(
+                            task_id = %task_id.0,
+                            acquisition_id = %snapshot.acquisition_id,
+                            attempt,
+                            "failed to reacquire the repository lease for cancelled workspace setup cleanup; retrying: {error}"
+                        );
+                        attempt = attempt.saturating_add(1);
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let repository_lease_lost = repository_lease
+                .as_ref()
+                .map(RepositoryWriteLease::loss_receiver);
+            let cleanup = async {
+                let _git_ops = self.git_ops.lock().await;
+                let still_current = self.active.get(&task_id).is_some_and(|active| {
+                    active.acquisition_id == snapshot.acquisition_id
+                        && active.state == ActiveWorkspaceState::CleanupRequired
+                });
+                if !still_current {
+                    return Ok(false);
+                }
+                cleanup_workspace_path(&snapshot.source_repo, &snapshot.workspace_path).await?;
+                if let Some(store) = self.lease_store.as_ref() {
+                    store
+                        .complete_owned_workspace(
+                            &snapshot.project_key,
+                            snapshot.slot_index,
+                            &task_id,
+                            &snapshot.owner_session,
+                            snapshot.run_generation,
+                            &snapshot.acquisition_id,
+                        )
+                        .await?;
+                }
+                Ok::<bool, anyhow::Error>(true)
+            };
+            let result = run_until_repository_lease_loss(repository_lease_lost, cleanup).await;
+            drop(repository_lease);
+            match result {
+                Some(Ok(true)) => {
+                    let removed = self
+                        .active
+                        .remove_if(&task_id, |_, active| {
+                            active.acquisition_id == snapshot.acquisition_id
+                                && active.state == ActiveWorkspaceState::CleanupRequired
+                        })
+                        .map(|(_, active)| active);
+                    if let Some(entry) = removed {
+                        self.active_paths
+                            .remove_if(&entry.workspace_path, |_, owner| owner == &task_id);
+                        self.released_paths.remove(&task_id);
+                        self.released_workspace_paths.remove(&entry.workspace_key);
+                    }
+                    return;
+                }
+                Some(Ok(false)) => return,
+                Some(Err(error)) => tracing::error!(
+                    task_id = %task_id.0,
+                    acquisition_id = %snapshot.acquisition_id,
+                    attempt,
+                    "failed to converge cancelled workspace setup cleanup; retrying: {error}"
+                ),
+                None => tracing::error!(
+                    task_id = %task_id.0,
+                    acquisition_id = %snapshot.acquisition_id,
+                    attempt,
+                    "repository lease was lost during cancelled workspace setup cleanup; retrying"
+                ),
+            }
+            attempt = attempt.saturating_add(1);
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+}
+
 impl WorkspaceManager {
     pub(crate) fn guard_workspace_creation<'a>(
         &'a self,
@@ -360,13 +467,38 @@ impl Drop for WorkspaceStateGuard<'_> {
         if !self.armed {
             return;
         }
-        if let Some(mut active) = self.manager.active.get_mut(&self.task_id) {
+        let snapshot = if let Some(mut active) = self.manager.active.get_mut(&self.task_id) {
             if active.acquisition_id == self.acquisition_id
                 && active.state == self.in_progress_state
             {
                 active.state = ActiveWorkspaceState::CleanupRequired;
                 active._repository_write_lease = None;
+                Some(ActiveWorkspaceSnapshot::from(active.value()))
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let cleanup = CancelledWorkspaceSetupCleanup {
+            active: Arc::clone(&self.manager.active),
+            active_paths: Arc::clone(&self.manager.active_paths),
+            released_paths: Arc::clone(&self.manager.released_paths),
+            released_workspace_paths: Arc::clone(&self.manager.released_workspace_paths),
+            git_ops: Arc::clone(&self.manager.git_ops),
+            lease_store: self.manager.lease_store.clone(),
+        };
+        let task_id = self.task_id.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(cleanup.converge(task_id, snapshot));
+        } else {
+            tracing::error!(
+                task_id = %self.task_id.0,
+                "cancelled workspace setup requires cleanup but no Tokio runtime is available"
+            );
         }
     }
 }
