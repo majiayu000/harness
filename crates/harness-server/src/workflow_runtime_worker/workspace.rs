@@ -144,7 +144,7 @@ pub(super) async fn prepare_runtime_workspace(
     let lease = run_preparation_phase(
         repository_lease_lost,
         execution_cancelled.clone(),
-        async {
+        Box::pin(async {
             workspace_mgr
                 .create_workspace_with_options(
                     &task_id,
@@ -158,7 +158,7 @@ pub(super) async fn prepare_runtime_workspace(
                 )
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))
-        },
+        }),
         "runtime workspace preparation",
     )
     .await?;

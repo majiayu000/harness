@@ -478,6 +478,25 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         None,
         vec![],
     );
+    let mut workspace_config = state.core.server.config.workspace.clone();
+    workspace_config.use_data_dir_default_root(dir);
+    let workspace_lease_store = Arc::new(
+        crate::workspace_lease_store::WorkspaceLeaseStore::open(
+            &harness_core::config::dirs::default_db_path(dir, "workspace_leases"),
+        )
+        .await?,
+    );
+    let workspace_pool_config =
+        crate::http::builders::workspace_pool_config::build_workspace_pool_config(
+            state.core.server.as_ref(),
+            None,
+        )
+        .await?;
+    let workspace_mgr = Arc::new(crate::workspace::WorkspaceManager::new_with_pool(
+        workspace_config,
+        workspace_pool_config,
+        Some(workspace_lease_store),
+    )?);
     Ok(Arc::new(AppState {
         background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         core: crate::http::CoreServices {
@@ -508,7 +527,7 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         concurrency: crate::http::ConcurrencyServices {
             task_queue: state.concurrency.task_queue.clone(),
             review_task_queue: state.concurrency.review_task_queue.clone(),
-            workspace_mgr: None,
+            workspace_mgr: Some(workspace_mgr),
         },
         #[cfg(test)]
         _db_state_guard: None,
