@@ -242,13 +242,21 @@ fn retry_cleanup_treats_disappeared_acquisition_as_converged() {
 
 #[tokio::test]
 async fn cleanup_serialization_is_scoped_to_acquisition() {
-    let cleanup_operations = DashMap::new();
-    let first =
-        workspace_active_reuse::workspace_cleanup_operation(&cleanup_operations, "acquisition-a");
-    let same =
-        workspace_active_reuse::workspace_cleanup_operation(&cleanup_operations, "acquisition-a");
-    let independent =
-        workspace_active_reuse::workspace_cleanup_operation(&cleanup_operations, "acquisition-b");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager = WorkspaceManager::new(WorkspaceConfig {
+        root: tmp.path().join("workspaces"),
+        ..Default::default()
+    })
+    .expect("manager");
+    let first = manager
+        .local_workspace_cleanup_operation("acquisition-a")
+        .expect("local cleanup operation");
+    let same = manager
+        .local_workspace_cleanup_operation("acquisition-a")
+        .expect("shared local cleanup operation");
+    let independent = manager
+        .local_workspace_cleanup_operation("acquisition-b")
+        .expect("independent local cleanup operation");
 
     assert!(Arc::ptr_eq(&first, &same));
     let _first_guard = first.lock().await;

@@ -220,6 +220,42 @@ async fn cleanup_terminal_runtime_workspace_with_admission(
                     &workspace_mgr.config.root,
                     &target.workspace_path,
                 )?;
+                let active_acquisition_id = if target.is_persisted() {
+                    None
+                } else {
+                    workspace_mgr
+                        .active_workspace_acquisition_id(&target.task_id, &target.workspace_path)
+                };
+                let acquisition_id = target
+                    .acquisition_id()
+                    .map(str::to_owned)
+                    .or(active_acquisition_id);
+                let cleanup_operation = acquisition_id.as_deref().and_then(|acquisition_id| {
+                    workspace_mgr.local_workspace_cleanup_operation(acquisition_id)
+                });
+                let cleanup_guard = match cleanup_operation.as_ref() {
+                    Some(cleanup_operation) => {
+                        Some(Arc::clone(cleanup_operation).lock_owned().await)
+                    }
+                    None => None,
+                };
+                if cleanup_operation.is_some()
+                    && workspace_mgr
+                        .active_workspace_acquisition_id(&target.task_id, &target.workspace_path)
+                        .as_deref()
+                        != acquisition_id.as_deref()
+                {
+                    drop(cleanup_guard);
+                    if let (Some(acquisition_id), Some(cleanup_operation)) =
+                        (acquisition_id.as_deref(), cleanup_operation.as_ref())
+                    {
+                        workspace_mgr.forget_local_workspace_cleanup_operation(
+                            acquisition_id,
+                            cleanup_operation,
+                        );
+                    }
+                    continue;
+                }
                 let Some(cleanup_claim) = workspace_mgr
                     .claim_runtime_workspace_cleanup_target(&target)
                     .await?
@@ -242,16 +278,6 @@ async fn cleanup_terminal_runtime_workspace_with_admission(
                         );
                     }
                 }
-                let active_acquisition_id = if target.is_persisted() {
-                    None
-                } else {
-                    workspace_mgr
-                        .active_workspace_acquisition_id(&target.task_id, &target.workspace_path)
-                };
-                let acquisition_id = target
-                    .acquisition_id()
-                    .map(str::to_owned)
-                    .or(active_acquisition_id);
                 let outcome = if let Some(acquisition_id) = acquisition_id.as_deref() {
                     if !target.is_persisted() && !target.workspace_path.exists() {
                         workspace_mgr
@@ -286,6 +312,15 @@ async fn cleanup_terminal_runtime_workspace_with_admission(
                     continue;
                 }
                 cleanup_claim.complete(workspace_mgr, &target).await?;
+                drop(cleanup_guard);
+                if let (Some(acquisition_id), Some(cleanup_operation)) =
+                    (acquisition_id.as_deref(), cleanup_operation.as_ref())
+                {
+                    workspace_mgr.forget_local_workspace_cleanup_operation(
+                        acquisition_id,
+                        cleanup_operation,
+                    );
+                }
             }
             Ok(())
         },

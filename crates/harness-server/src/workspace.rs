@@ -364,6 +364,25 @@ impl WorkspaceManager {
         }
     }
 
+    pub(crate) fn local_workspace_cleanup_operation(
+        &self,
+        acquisition_id: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        self.lease_store.is_none().then(|| {
+            workspace_active_reuse::workspace_cleanup_operation(&self.cleanup_ops, acquisition_id)
+        })
+    }
+
+    pub(crate) fn forget_local_workspace_cleanup_operation(
+        &self,
+        acquisition_id: &str,
+        cleanup_operation: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        self.cleanup_ops.remove_if(acquisition_id, |_, current| {
+            Arc::ptr_eq(current, cleanup_operation)
+        });
+    }
+
     fn occupied_slots_for_project(&self, project_key: &str) -> HashSet<u32> {
         self.active
             .iter()
