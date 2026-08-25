@@ -690,9 +690,16 @@ async fn runtime_cleanup_target_survives_slot_reuse_with_a_different_repo_slug(
         )
         .await?;
     assert_ne!(workspace_a.workspace_path, workspace_b.workspace_path);
-    let _repository_lease = manager_b
-        .acquire_repository_write_lease_for_cleanup(source_repo.path())
-        .await?;
+    assert_eq!(
+        manager_b.active.get(&task_b).and_then(|active| {
+            active
+                ._repository_write_lease
+                .as_ref()
+                .map(RepositoryWriteLease::mode)
+        }),
+        Some(RepositoryLeaseMode::Exclusive),
+        "the active replacement workspace must protect cleanup with its exclusive repository lease"
+    );
     let targets_a = manager_b
         .workspace_targets_for_runtime_workflow("workflow-a")
         .await?;

@@ -31,18 +31,29 @@ async fn force_reclaim_fixture(name: &str) -> anyhow::Result<ForceReclaimFixture
     .await?;
     let lease_store =
         Arc::new(WorkspaceLeaseStore::open(&root.path().join("workspace-leases")).await?);
-    let manager = WorkspaceManager::new_with_pool(
-        WorkspaceConfig {
-            root: root.path().join("workspaces"),
-            ..Default::default()
-        },
+    let manager_config = WorkspaceConfig {
+        root: root.path().join("workspaces"),
+        ..Default::default()
+    };
+    let creator = WorkspaceManager::new_with_pool(
+        manager_config.clone(),
         WorkspacePoolConfig::default(),
         Some(lease_store.clone()),
     )?;
     let task_id = harness_core::types::TaskId(format!("{name}-task"));
-    let lease = manager
+    let lease = creator
         .create_workspace(&task_id, &source_repo, "origin", &branch, 1, None, None)
         .await?;
+
+    // Reclamation runs after the original runtime owner is gone. Dropping its
+    // manager releases the repository session while preserving the durable
+    // workspace lease that the fresh manager must reclaim.
+    drop(creator);
+    let manager = WorkspaceManager::new_with_pool(
+        manager_config,
+        WorkspacePoolConfig::default(),
+        Some(lease_store.clone()),
+    )?;
 
     let mut state = TaskState::new(task_id.clone());
     state.status = TaskStatus::Implementing;

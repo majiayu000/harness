@@ -458,15 +458,21 @@ pub(super) async fn infer_workspace_source_repo(workspace_path: &Path) -> Option
         .args([
             "-C",
             &workspace_path.to_string_lossy(),
-            "rev-parse",
-            "--show-toplevel",
+            "worktree",
+            "list",
+            "--porcelain",
         ])
         .output()
         .await
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|stdout| PathBuf::from(stdout.trim()))
+        .and_then(|stdout| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("worktree "))
+                .map(PathBuf::from)
+        })
 }
 
 pub(super) async fn is_registered_worktree(source_repo: &Path, workspace_path: &Path) -> bool {
@@ -627,6 +633,40 @@ pub(crate) fn ensure_workspace_cleanup_path_within_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn infer_workspace_source_repo_returns_primary_worktree() -> anyhow::Result<()> {
+        let source_repo = tempfile::tempdir()?;
+        super::super::test_support::init_git_repo(source_repo.path());
+        let workspace_parent = tempfile::tempdir()?;
+        let workspace_path = workspace_parent.path().join("linked-worktree");
+        let output = git_command()
+            .args([
+                "-C",
+                &source_repo.path().to_string_lossy(),
+                "worktree",
+                "add",
+                "--detach",
+                &workspace_path.to_string_lossy(),
+                "HEAD",
+            ])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to create linked worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+
+        let inferred = infer_workspace_source_repo(&workspace_path)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("source repository should be inferred"))?;
+        assert_eq!(
+            std::fs::canonicalize(inferred)?,
+            std::fs::canonicalize(source_repo.path())?
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn cleanup_recovers_quarantine_after_original_path_disappears() -> anyhow::Result<()> {
