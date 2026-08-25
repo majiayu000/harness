@@ -630,7 +630,7 @@ async fn run_concurrent_subtasks(
         let base_branch = base_branch.to_string();
         let sem = Arc::clone(&sem);
         let config = config.clone();
-        let dispatch_cancelled = dispatch_cancelled.subscribe();
+        let mut dispatch_cancelled = dispatch_cancelled.subscribe();
         let handle = tokio::spawn(async move {
             // Acquire semaphore first (unbounded wait), then apply timeout only to
             // the actual agent execution. Workspace acquisition is part of the
@@ -641,10 +641,27 @@ async fn run_concurrent_subtasks(
                 Err(_) => return (i, Err("semaphore closed unexpectedly".to_string())),
             };
             // Sub-tasks use synthetic IDs and intentionally keep UUID-based workspace keys.
-            let workspace_lease = match workspace_mgr
-                .create_workspace(&sub_id, &source_repo, &remote, &base_branch, 1, None, None)
-                .await
-            {
+            let workspace_acquisition = workspace_mgr.create_workspace(
+                &sub_id,
+                &source_repo,
+                &remote,
+                &base_branch,
+                1,
+                None,
+                None,
+            );
+            tokio::pin!(workspace_acquisition);
+            let workspace_result = tokio::select! {
+                biased;
+                () = wait_for_dispatch_cancellation(&mut dispatch_cancelled) => {
+                    return (
+                        i,
+                        Err("parallel dispatch was cancelled during workspace acquisition".to_string()),
+                    );
+                }
+                result = &mut workspace_acquisition => result,
+            };
+            let workspace_lease = match workspace_result {
                 Ok(lease) => lease,
                 Err(e) => {
                     tracing::warn!(

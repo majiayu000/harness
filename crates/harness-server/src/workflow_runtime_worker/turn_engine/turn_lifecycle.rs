@@ -288,14 +288,17 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                                 "workflow budget ceiling reached mid-turn; interrupting agent"
                             );
                             if let Some(adapter) = adapter_opt.as_ref() {
-                                if let Err(error) = adapter.interrupt().await {
-                                    tracing::warn!(
-                                        thread_id = %thread_id,
-                                        turn_id = %turn_id,
-                                        "failed to interrupt agent after the budget ceiling: {error}"
-                                    );
+                                if !control_is_execution_adapter {
+                                    if let Err(error) = adapter.interrupt().await {
+                                        tracing::warn!(
+                                            thread_id = %thread_id,
+                                            turn_id = %turn_id,
+                                            "failed to interrupt agent after the budget ceiling: {error}"
+                                        );
+                                    }
                                 }
                             }
+                            terminate_execution_after_drop = executes_via_adapter;
                             execution_result = Some(Err(HarnessError::AgentExecution(format!(
                                 "Workflow {} spent {:.2} USD, reaching its {:.2} USD budget; turn interrupted.",
                                 stop.workflow_id, stop.spent_usd, stop.budget_usd
@@ -323,6 +326,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     "Agent stream stalled: no output for {}s",
                     stall_timeout.as_secs()
                 ))));
+                terminate_execution_after_drop = executes_via_adapter;
                 break 'outer;
             }
             _ = async {
@@ -385,6 +389,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 execution_result = Some(Err(HarnessError::AgentExecution(format!(
                     "Agent turn timed out after {timeout_secs}s"
                 ))));
+                terminate_execution_after_drop = executes_via_adapter;
                 break 'outer;
             }
         }
@@ -400,7 +405,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 tracing::error!(
                     thread_id = %thread_id,
                     turn_id = %turn_id,
-                    "failed to force-stop and drain agent after lease loss: {error}"
+                    "failed to force-stop and drain agent after an early turn exit: {error}"
                 );
             }
         }

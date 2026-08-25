@@ -2,13 +2,40 @@ use super::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOption
 use crate::{server::HarnessServer, thread_manager::ThreadManager};
 use async_trait::async_trait;
 use harness_agents::registry::AgentRegistry;
-use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
+use harness_core::agent::{AgentAdapter, AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::HarnessConfig;
 use harness_core::error::HarnessError;
 use harness_core::types::{AgentId, Capability, Item, TokenUsage, TurnStatus};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 struct SilentLifecycleAgent;
+
+struct PendingDrainAdapter {
+    terminate_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl AgentAdapter for PendingDrainAdapter {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    async fn start_turn(
+        &self,
+        _req: AgentRequest,
+        _tx: tokio::sync::mpsc::Sender<harness_core::agent::AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        std::future::pending().await
+    }
+
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        self.terminate_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl CodeAgent for SilentLifecycleAgent {
@@ -140,5 +167,56 @@ async fn lifecycle_wall_clock_timeout_wins_when_stall_cannot_be_shorter() -> any
         item,
         Item::Error { message, .. } if message.contains("Agent stream stalled")
     )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_drains_pending_adapter_after_stall_and_wall_clock_timeout() -> anyhow::Result<()>
+{
+    for (timeout_secs, stall_timeout_secs) in [(2, 1), (1, 600)] {
+        let root = tempfile::tempdir()?;
+        let mut config = HarnessConfig::default();
+        config.server.project_root = root.path().to_path_buf();
+        config.agents.default_agent = "codex".to_string();
+        let terminate_calls = Arc::new(AtomicUsize::new(0));
+        let terminate_calls_for_factory = terminate_calls.clone();
+        let mut registry = AgentRegistry::new("codex");
+        registry.register("codex", Arc::new(SilentLifecycleAgent));
+        registry
+            .register_turn_backend_factory("codex", move || {
+                Arc::new(PendingDrainAdapter {
+                    terminate_calls: terminate_calls_for_factory.clone(),
+                })
+            })
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+        let thread_id = server
+            .thread_manager
+            .start_thread(root.path().to_path_buf());
+        let turn_id = server.thread_manager.start_turn(
+            &thread_id,
+            "prompt".to_string(),
+            AgentId::from_str("codex"),
+        )?;
+        let (notification_tx, _) = tokio::sync::broadcast::channel(16);
+
+        run_turn_lifecycle_with_options(
+            server,
+            None,
+            notification_tx,
+            thread_id,
+            turn_id,
+            "prompt".to_string(),
+            "codex".to_string(),
+            TurnLifecycleOptions {
+                timeout_secs: Some(timeout_secs),
+                stall_timeout_secs: Some(stall_timeout_secs),
+                ..TurnLifecycleOptions::default()
+            },
+        )
+        .await;
+
+        assert_eq!(terminate_calls.load(Ordering::Acquire), 1);
+    }
     Ok(())
 }
