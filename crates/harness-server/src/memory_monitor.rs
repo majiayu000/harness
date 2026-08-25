@@ -4,21 +4,7 @@ use std::time::Duration;
 
 use crate::http::background::LoopHandle;
 
-/// Start a background task that sets the returned flag to `true` whenever
-/// available system memory falls below `threshold_mb` MB, and `false` when
-/// it recovers.  Sampling occurs every `poll_secs` seconds (clamped to ≥ 1).
-///
-/// The monitor runs for the caller's lifetime; dropping the returned
-/// `Arc<AtomicBool>` does **not** stop the task — the task stops when the
-/// tokio runtime shuts down.
-///
-/// This function is a no-op until a tokio runtime is active (it calls
-/// `tokio::spawn` internally).
-pub fn start(threshold_mb: u64, poll_secs: u64) -> Arc<AtomicBool> {
-    start_with_sampler(threshold_mb, poll_secs, sample_available_mb)
-}
-
-/// Like [`start`] but reports liveness into the loop-health registry so the
+/// Starts the monitor and reports liveness into the loop-health registry so the
 /// operator monitor flags the monitor if it dies (GH-1981). The first sample
 /// is taken immediately, so the loop is never falsely stale at startup.
 pub(crate) fn start_registered(
@@ -34,8 +20,9 @@ pub(crate) fn start_registered(
     )
 }
 
-/// Like [`start`] but accepts a custom sampler that returns available memory
+/// Accepts a custom sampler that returns available memory
 /// in megabytes.  Intended for unit tests that must not call real system APIs.
+#[cfg(test)]
 pub fn start_with_sampler<F>(threshold_mb: u64, poll_secs: u64, sampler: F) -> Arc<AtomicBool>
 where
     F: Fn() -> u64 + Send + 'static,

@@ -61,12 +61,6 @@ impl DefaultTaskService {
     pub fn new(store: Arc<TaskStore>) -> Arc<Self> {
         Arc::new(Self { store })
     }
-
-    /// Expose the underlying store for callers that need direct access
-    /// (e.g. `spawn_task` and mutation helpers).
-    pub fn store(&self) -> Arc<TaskStore> {
-        self.store.clone()
-    }
 }
 
 #[async_trait]

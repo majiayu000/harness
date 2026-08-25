@@ -7,6 +7,23 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Narrow compatibility surface for integration tests that exercise server internals.
+///
+/// These exports are not a stable application API. Keeping them here avoids exposing
+/// the implementation modules themselves while the tests are migrated incrementally.
+#[doc(hidden)]
+pub mod test_support {
+    pub use crate::event_replay::{TaskEvent, TaskEventLog};
+    pub use crate::handlers::gc::{gc_adopt, gc_run};
+    pub use crate::hook_enforcer::HookEnforcer;
+    pub use crate::http::{build_app_state, AppState};
+    pub use crate::task_db::{migrate_legacy_task_db_if_needed, TaskDb, TASK_DB_SCHEMA};
+    pub use crate::task_runner::{
+        SchedulerAuthorityState, TaskKind, TaskPhase, TaskSchedulerState, TaskState, TaskStatus,
+        TaskStore,
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeLogState {
     Disabled,

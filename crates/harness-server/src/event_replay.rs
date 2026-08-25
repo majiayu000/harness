@@ -198,10 +198,14 @@ impl TaskEventLog {
 #[derive(Debug, Default)]
 pub struct ReplayStats {
     /// Number of non-empty lines processed.
+    // Retained as replay diagnostics even though current recovery callers only consume states.
+    #[allow(dead_code)]
     pub total_lines: usize,
     /// Number of lines that could not be parsed (corrupt or I/O error).
+    #[allow(dead_code)]
     pub corrupt_lines: usize,
     /// Number of distinct task IDs encountered.
+    #[allow(dead_code)]
     pub tasks_seen: usize,
 }
 
@@ -211,6 +215,8 @@ pub struct ReplayResult {
     /// Per-task reconstructed state.
     pub states: HashMap<String, ReplayedState>,
     /// Parsing statistics from this replay pass.
+    // Kept with the replay result so diagnostics can be consumed without replaying the log.
+    #[allow(dead_code)]
     pub stats: ReplayStats,
 }
 

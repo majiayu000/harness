@@ -3,9 +3,9 @@
 //! Three independent enums describe different views of the same task and are
 //! persisted independently:
 //!
-//! * [`TaskStatus`](harness_server::task_runner::TaskStatus) — execution phase,
+//! * [`TaskStatus`] — execution phase,
 //!   persisted in the `tasks.status` column.
-//! * [`SchedulerAuthorityState`](harness_server::task_runner::SchedulerAuthorityState)
+//! * [`SchedulerAuthorityState`]
 //!   — scheduler ownership and recovery, persisted in `tasks.scheduler_state`.
 //! * [`IssueLifecycleState`](harness_workflow::issue_lifecycle::IssueLifecycleState)
 //!   — issue → PR → merge lifecycle, persisted in JSONB on
@@ -17,7 +17,7 @@
 //! arm: any new variant breaks compilation here, forcing the contributor to
 //! decide explicitly how the new variant relates to the rest.
 
-use harness_server::task_runner::{SchedulerAuthorityState, TaskStatus};
+use harness_server::server::test_support::{SchedulerAuthorityState, TaskStatus};
 use harness_workflow::issue_lifecycle::IssueLifecycleState;
 
 fn all_task_statuses() -> Vec<TaskStatus> {

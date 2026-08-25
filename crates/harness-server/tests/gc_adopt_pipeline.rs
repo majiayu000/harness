@@ -21,7 +21,10 @@ use harness_core::types::{
 };
 use harness_protocol::methods::CONFLICT;
 use harness_server::{
-    handlers::gc::gc_adopt, http::build_app_state, server::HarnessServer,
+    server::{
+        test_support::{build_app_state, gc_adopt, AppState},
+        HarnessServer,
+    },
     thread_manager::ThreadManager,
 };
 use std::path::{Path, PathBuf};
@@ -86,14 +89,11 @@ fn configured_test_database_url() -> anyhow::Result<Option<String>> {
     }
 }
 
-async fn make_state(root: &Path) -> anyhow::Result<Option<harness_server::http::AppState>> {
+async fn make_state(root: &Path) -> anyhow::Result<Option<AppState>> {
     make_state_with_auto_pr(root, true).await
 }
 
-async fn make_state_with_auto_pr(
-    root: &Path,
-    auto_pr: bool,
-) -> anyhow::Result<Option<harness_server::http::AppState>> {
+async fn make_state_with_auto_pr(root: &Path, auto_pr: bool) -> anyhow::Result<Option<AppState>> {
     let Some(database_url) = configured_test_database_url()? else {
         return Ok(None);
     };
@@ -115,9 +115,7 @@ async fn make_state_with_auto_pr(
     Ok(Some(build_app_state(server).await?))
 }
 
-async fn make_state_without_default_agent(
-    root: &Path,
-) -> anyhow::Result<Option<harness_server::http::AppState>> {
+async fn make_state_without_default_agent(root: &Path) -> anyhow::Result<Option<AppState>> {
     let Some(database_url) = configured_test_database_url()? else {
         return Ok(None);
     };

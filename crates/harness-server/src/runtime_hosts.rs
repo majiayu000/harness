@@ -28,12 +28,6 @@ pub struct RuntimeHostInfo {
     pub lifecycle: RuntimeHostLifecycle,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct TaskClaimResult {
-    pub task_id: harness_core::types::TaskId,
-    pub lease_expires_at: String,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeHostRecord {
     pub(crate) id: String,

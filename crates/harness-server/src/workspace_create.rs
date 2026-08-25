@@ -11,6 +11,7 @@ impl WorkspaceManager {
     /// upstream state. Creates branch `harness/<task_id>` based on `remote/base_branch`.
     /// Runs `after_create_hook` on new creation only. Idempotent: returns existing path
     /// if already active.
+    #[cfg(test)]
     pub(crate) async fn create_workspace(
         &self,
         task_id: &TaskId,

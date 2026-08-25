@@ -187,6 +187,7 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_workspace_cleanup_required(&self, task_id: &TaskId, acquisition_id: &str) {
         if let Some(mut active) = self.active.get_mut(task_id) {
             if active.acquisition_id == acquisition_id {

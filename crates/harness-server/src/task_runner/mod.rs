@@ -12,49 +12,25 @@ pub type CompletionCallback =
 
 // Re-export everything that was previously public from the flat task_runner.rs.
 pub use crate::workflow_runtime_submission::runtime_models::{
-    TaskFailureKind, TaskKind, TaskPhase, TaskStatus, TaskTerminalClassification,
-    TaskTerminalFailure, TaskTerminalInfo, TaskTerminalOutcome, ROUND_BUDGET_EXHAUSTED_REASON,
+    TaskFailureKind, TaskKind, TaskPhase, TaskStatus, TaskTerminalFailure, TaskTerminalInfo,
+    TaskTerminalOutcome, ROUND_BUDGET_EXHAUSTED_REASON,
 };
 pub use crate::workflow_runtime_submission::runtime_request::{
-    fill_missing_repo_from_project, CreateTaskRequest, PersistedRequestSettings, SystemTaskInput,
-    MAX_TASK_PRIORITY,
+    CreateTaskRequest, PersistedRequestSettings, SystemTaskInput,
 };
 pub use crate::workflow_runtime_submission::runtime_state::{
-    RecentFailureTask, RoundResult, SchedulerAuthorityState, SchedulerOwner, SchedulerOwnerKind,
-    TaskSchedulerState, TaskState, TaskSummary, TaskWorkflowSummary,
+    RecentFailureTask, SchedulerAuthorityState, TaskSchedulerState, TaskState, TaskSummary,
 };
 pub(crate) use artifacts::TaskArtifactSink;
 pub use harness_core::types::TaskId;
-pub use metrics::{DashboardCounts, LlmMetricsInputs, ProjectCounts};
-use store::{
-    mark_terminal_once as mark_terminal_once_impl, mutate_and_persist as mutate_and_persist_impl,
-    update_status as update_status_impl,
-};
+pub use metrics::DashboardCounts;
+use store::mark_terminal_once as mark_terminal_once_impl;
 pub use store::{TaskStore, TaskSummaryFilter, TaskSummaryPageCursor, TerminalTransition};
 
 fn record_task_runner_usage() {
     harness_core::usage_probe::record_usage(
         harness_core::usage_probe::UsageProbeSurface::TaskRunner,
     );
-}
-
-pub async fn update_status(
-    store: &TaskStore,
-    task_id: &TaskId,
-    status: TaskStatus,
-    turn: u32,
-) -> anyhow::Result<()> {
-    record_task_runner_usage();
-    update_status_impl(store, task_id, status, turn).await
-}
-
-pub async fn mutate_and_persist(
-    store: &TaskStore,
-    id: &TaskId,
-    f: impl FnOnce(&mut TaskState),
-) -> anyhow::Result<()> {
-    record_task_runner_usage();
-    mutate_and_persist_impl(store, id, f).await
 }
 
 pub async fn mark_terminal_once(

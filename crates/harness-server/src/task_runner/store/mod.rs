@@ -67,7 +67,9 @@ pub struct TaskSummaryPageCursor {
     pub id: String,
 }
 
-pub(super) use transitions::{mark_terminal_once, mutate_and_persist, update_status};
+pub(super) use transitions::mark_terminal_once;
+#[cfg(test)]
+pub(super) use transitions::{mutate_and_persist, update_status};
 
 #[cfg(test)]
 use recovered_prs::{recovered_pr_candidate, RecoveredPrCandidate};

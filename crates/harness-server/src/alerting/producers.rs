@@ -12,6 +12,7 @@ use super::AlertHandle;
 
 const NOTIFY_DROP_POLL_SECS: u64 = 30;
 
+#[cfg(test)]
 pub fn task_failure_exhausted(
     task_id: &str,
     issue: Option<&str>,

@@ -4,6 +4,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const PUBLIC_SERVER_MODULES: [&str; 4] = [
+    "project_registry",
+    "reconciliation",
+    "server",
+    "thread_manager",
+];
+
 const LEGACY_PLACEMENT: &str = include_str!("fixtures/src_test_placement.txt");
 
 #[test]
@@ -24,6 +31,52 @@ fn src_test_placement_can_only_shrink() -> anyhow::Result<()> {
         "harness-server src/ test homes must match the shrinking inventory. Put new unit tests in the same file as `#[cfg(test)] mod tests`, and new API/route-contract tests in crates/harness-server/tests/. Remove migrated paths from the inventory so they cannot be recreated.\nNew entries:\n{}\nRetired entries still in the inventory:\n{}",
         additions.join("\n"),
         retired.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn top_level_public_modules_match_the_supported_server_api() -> anyhow::Result<()> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(manifest_dir.join("src/lib.rs"))?;
+    let syntax = syn::parse_file(&source)?;
+    let actual = syntax
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(module) if matches!(module.vis, syn::Visibility::Public(_)) => {
+                Some(module.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let expected = PUBLIC_SERVER_MODULES
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        actual, expected,
+        "harness-server must expose only the supported top-level modules; add new public API through an existing facade or justify updating this allowlist"
+    );
+    let public_reexports = syntax
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                syn::Item::Use(item_use)
+                    if matches!(item_use.vis, syn::Visibility::Public(_))
+            ) || matches!(
+                item,
+                syn::Item::ExternCrate(item_extern_crate)
+                    if matches!(item_extern_crate.vis, syn::Visibility::Public(_))
+            )
+        })
+        .count();
+    assert_eq!(
+        public_reexports, 0,
+        "harness-server must not expose root-level re-exports that bypass the four-module API contract"
     );
     Ok(())
 }

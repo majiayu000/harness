@@ -17,6 +17,8 @@ const DEFAULT_RATE_LIMIT_RETRY_SECS: i64 = 60;
 
 #[async_trait]
 pub(crate) trait DispatchedTaskChecker: Send + Sync {
+    // Kept for the persisted-dispatch reconciliation compatibility path below.
+    #[allow(dead_code)]
     async fn exists(&self, task_id: &TaskId) -> anyhow::Result<bool>;
 }
 
@@ -108,6 +110,7 @@ impl GitHubRateLimitThrottle {
 }
 
 impl GitHubIssuesPoller {
+    #[cfg(test)]
     pub fn new(
         repo_config: &harness_core::config::intake::GitHubRepoConfig,
         data_dir: Option<&Path>,
@@ -115,6 +118,7 @@ impl GitHubIssuesPoller {
         Self::new_with_token(repo_config, data_dir, None)
     }
 
+    #[cfg(test)]
     pub fn new_with_token(
         repo_config: &harness_core::config::intake::GitHubRepoConfig,
         data_dir: Option<&Path>,
@@ -218,10 +222,14 @@ impl GitHubIssuesPoller {
         }
     }
 
+    // Retained for explicit persisted-dispatch reconciliation; production intake
+    // currently wires the checker but does not invoke reconciliation automatically.
+    #[allow(dead_code)]
     fn is_synthetic_skip_marker(task_id: &TaskId) -> bool {
         task_id.0.starts_with("skip-")
     }
 
+    #[allow(dead_code)]
     async fn prune_missing_task_entries(&self) -> anyhow::Result<usize> {
         let Some(task_checker) = &self.task_checker else {
             return Ok(0);
@@ -262,6 +270,7 @@ impl GitHubIssuesPoller {
         Ok(stale_issue_ids.len())
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_dispatched_with_store(&self) -> anyhow::Result<usize> {
         self.prune_missing_task_entries().await
     }
