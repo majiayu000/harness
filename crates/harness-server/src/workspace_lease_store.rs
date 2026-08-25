@@ -8,6 +8,9 @@ use std::sync::Arc;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::sync::Semaphore;
 
+#[cfg(test)]
+const TEST_REPOSITORY_LOCK_CAPACITY: u32 = 4;
+
 #[path = "workspace_cleanup_store.rs"]
 mod workspace_cleanup_store;
 pub(crate) use workspace_cleanup_store::{
@@ -83,10 +86,11 @@ impl WorkspaceLeaseStore {
         let pool = context.open_pool_with_setup_pool(setup_pool).await?;
         // Session-level advisory locks retain their connection for the full
         // workspace lifetime. Keep them out of the ordinary lease-query pool.
-        let repository_lock_pool = context.open_runtime_pool().await?;
-        let repository_lock_slots = Arc::new(Semaphore::new(
-            repository_lock_pool.options().get_max_connections() as usize,
-        ));
+        let repository_lock_pool = context
+            .open_runtime_pool_with_max_connections(TEST_REPOSITORY_LOCK_CAPACITY)
+            .await?;
+        let repository_lock_slots =
+            Arc::new(Semaphore::new(TEST_REPOSITORY_LOCK_CAPACITY as usize));
         Ok(Self {
             pool,
             repository_lock_pool,
@@ -116,14 +120,22 @@ impl WorkspaceLeaseStore {
 
     #[cfg(test)]
     pub(crate) async fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::open_with_repository_lock_capacity(path, TEST_REPOSITORY_LOCK_CAPACITY).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_with_repository_lock_capacity(
+        path: &std::path::Path,
+        repository_lock_capacity: u32,
+    ) -> anyhow::Result<Self> {
         let context = PgStoreContext::from_legacy_path_schema(path, None)?;
         let store_key = context.schema().to_owned();
         let pool = context.open_pool().await?;
         ensure_workspace_leases_table(&pool).await?;
-        let repository_lock_pool = context.open_runtime_pool().await?;
-        let repository_lock_slots = Arc::new(Semaphore::new(
-            repository_lock_pool.options().get_max_connections() as usize,
-        ));
+        let repository_lock_pool = context
+            .open_runtime_pool_with_max_connections(repository_lock_capacity)
+            .await?;
+        let repository_lock_slots = Arc::new(Semaphore::new(repository_lock_capacity as usize));
         Ok(Self {
             pool,
             repository_lock_pool,

@@ -978,7 +978,11 @@ async fn immediate_repository_lease_reopens_connections_after_drop() -> anyhow::
         return Ok(());
     }
     let dir = tempfile::tempdir()?;
-    let store = WorkspaceLeaseStore::open(&dir.path().join("immediate-repository-lease")).await?;
+    let store = WorkspaceLeaseStore::open_with_repository_lock_capacity(
+        &dir.path().join("immediate-repository-lease"),
+        1,
+    )
+    .await?;
 
     for _ in 0..3 {
         let lease = store

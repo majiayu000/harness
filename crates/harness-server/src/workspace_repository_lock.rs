@@ -49,14 +49,18 @@ impl RepositoryWriteLease {
     ) -> Self {
         let connection = Arc::new(tokio::sync::Mutex::new(Some(connection)));
         let slot_permit = Arc::new(tokio::sync::Mutex::new(Some(slot_permit)));
-        let monitor_connection = connection.clone();
-        let monitor_slot_permit = slot_permit.clone();
+        let monitor_connection = Arc::downgrade(&connection);
+        let monitor_slot_permit = Arc::downgrade(&slot_permit);
         let (state_tx, state) = watch::channel(RepositoryLeaseState::Healthy);
         let monitor_state_tx = state_tx.clone();
         let liveness_task = tokio::spawn(async move {
             loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Some(connection_owner) = monitor_connection.upgrade() else {
+                    break;
+                };
                 let result = {
-                    let mut connection = monitor_connection.lock().await;
+                    let mut connection = connection_owner.lock().await;
                     let Some(connection) = connection.as_mut() else {
                         break;
                     };
@@ -83,23 +87,27 @@ impl RepositoryWriteLease {
                     if !started_revoking {
                         break;
                     }
-                    if let Some(connection) = monitor_connection.lock().await.take() {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(1),
-                            connection.close(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(close_error)) => tracing::warn!(
-                                "failed to close lost repository advisory-lock session: {close_error}"
-                            ),
-                            Err(_) => tracing::warn!(
-                                "timed out closing lost repository advisory-lock session"
-                            ),
+                    if let Some(connection_owner) = monitor_connection.upgrade() {
+                        if let Some(connection) = connection_owner.lock().await.take() {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                connection.close(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(close_error)) => tracing::warn!(
+                                    "failed to close lost repository advisory-lock session: {close_error}"
+                                ),
+                                Err(_) => tracing::warn!(
+                                    "timed out closing lost repository advisory-lock session"
+                                ),
+                            }
                         }
                     }
-                    monitor_slot_permit.lock().await.take();
+                    if let Some(slot_permit_owner) = monitor_slot_permit.upgrade() {
+                        slot_permit_owner.lock().await.take();
+                    }
                     if !transition_repository_lease_state(
                         &monitor_state_tx,
                         RepositoryLeaseState::Revoking,
@@ -111,7 +119,6 @@ impl RepositoryWriteLease {
                     }
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
         Self {
