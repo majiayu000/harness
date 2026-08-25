@@ -67,8 +67,12 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
     super::test_support::init_git_repo(&source_repo);
     let workspace_path = tmp.path().join("workspaces/task-a");
     std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+    let workflow_hook_marker = tmp.path().join("workflow-before-remove");
+    let manager_hook_marker = tmp.path().join("manager-before-remove");
     let mgr = WorkspaceManager::new(WorkspaceConfig {
         root: tmp.path().join("workspaces"),
+        before_remove_hook: Some(format!("touch {}", manager_hook_marker.display())),
+        hook_timeout_secs: 2,
         ..Default::default()
     })
     .expect("manager");
@@ -95,7 +99,12 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
     );
 
     let guard = mgr
-        .begin_workspace_preparation(&task_id, "acquisition-a")
+        .begin_workspace_preparation(
+            &task_id,
+            "acquisition-a",
+            Some(format!("touch {}", workflow_hook_marker.display())),
+            2,
+        )
         .expect("begin preparation");
     assert_eq!(
         mgr.active.get(&task_id).expect("active").state,
@@ -110,6 +119,38 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
     .await
     .expect("cancelled preparation cleanup should converge");
     assert!(!tmp.path().join("workspaces/task-a").exists());
+    assert!(workflow_hook_marker.exists());
+    assert!(manager_hook_marker.exists());
+}
+
+#[test]
+fn retry_cleanup_treats_disappeared_acquisition_as_converged() {
+    assert!(
+        !workspace_active_reuse::retry_cleanup_target_is_current(None, "acquisition-a")
+            .expect("a missing acquisition is already converged")
+    );
+    assert!(workspace_active_reuse::retry_cleanup_target_is_current(
+        Some(("acquisition-a", &ActiveWorkspaceState::CleanupRequired)),
+        "acquisition-a",
+    )
+    .expect("the matching cleanup target remains current"));
+    assert!(workspace_active_reuse::retry_cleanup_target_is_current(
+        Some(("acquisition-b", &ActiveWorkspaceState::CleanupRequired)),
+        "acquisition-a",
+    )
+    .is_err());
+}
+
+#[test]
+fn cancelled_cleanup_retry_delay_is_bounded() {
+    assert_eq!(
+        workspace_active_reuse::cancelled_cleanup_retry_delay(1),
+        std::time::Duration::from_millis(250)
+    );
+    assert_eq!(
+        workspace_active_reuse::cancelled_cleanup_retry_delay(u64::MAX),
+        std::time::Duration::from_secs(30)
+    );
 }
 
 #[test]
@@ -153,7 +194,7 @@ fn execution_ownership_blocks_reuse_and_stale_finalization() {
         .claim_workspace_execution(&task_id, "acquisition-a")
         .is_err());
     assert!(mgr
-        .begin_workspace_preparation(&task_id, "acquisition-a")
+        .begin_workspace_preparation(&task_id, "acquisition-a", None, 0)
         .is_err());
     assert!(mgr
         .begin_workspace_finalization(&task_id, "acquisition-a", "stale-execution")

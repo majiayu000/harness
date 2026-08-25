@@ -46,11 +46,17 @@ impl WorkspaceManager {
         repo: Option<&str>,
         options: WorkspaceCreateOptions,
     ) -> Result<WorkspaceLease, WorkspaceLifecycleError> {
-        self.cleanup_required_workspace_for_retry(task_id, None, 0)
-            .await
-            .map_err(|error| WorkspaceLifecycleError::ReconcileFailed {
-                message: format!("failed to clean interrupted workspace acquisition: {error}"),
-            })?;
+        self.cleanup_required_workspace_for_retry(
+            task_id,
+            options.before_remove_hook.as_deref(),
+            options
+                .hook_timeout_secs
+                .unwrap_or(self.config.hook_timeout_secs),
+        )
+        .await
+        .map_err(|error| WorkspaceLifecycleError::ReconcileFailed {
+            message: format!("failed to clean interrupted workspace acquisition: {error}"),
+        })?;
         let project_key = crate::workspace_pool::project_limit_key(source_repo);
         if matches!(
             &options.repository_write_lease,
@@ -406,7 +412,14 @@ impl WorkspaceManager {
             }
             return Err(error);
         }
-        let creation_guard = self.guard_workspace_creation(task_id, &acquisition_id)?;
+        let creation_guard = self.guard_workspace_creation(
+            task_id,
+            &acquisition_id,
+            options.before_remove_hook.clone(),
+            options
+                .hook_timeout_secs
+                .unwrap_or(self.config.hook_timeout_secs),
+        )?;
         persisted_acquisition_guard.disarm();
         drop(slot_guard);
 

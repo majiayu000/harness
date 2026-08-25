@@ -5,6 +5,8 @@ pub(crate) struct WorkspaceStateGuard<'a> {
     task_id: TaskId,
     acquisition_id: String,
     in_progress_state: ActiveWorkspaceState,
+    before_remove_hook: Option<String>,
+    hook_timeout_secs: u64,
     armed: bool,
 }
 
@@ -23,9 +25,62 @@ struct CancelledWorkspaceSetupCleanup {
     released_workspace_paths: Arc<DashMap<String, PathBuf>>,
     git_ops: Arc<tokio::sync::Mutex<()>>,
     lease_store: Option<Arc<WorkspaceLeaseStore>>,
+    workflow_before_remove_hook: Option<String>,
+    workflow_hook_timeout_secs: u64,
+    manager_before_remove_hook: Option<String>,
+    manager_hook_timeout_secs: u64,
+}
+
+pub(super) fn cancelled_cleanup_retry_delay(attempt: u64) -> std::time::Duration {
+    let exponent = attempt.saturating_sub(1).min(7) as u32;
+    std::time::Duration::from_millis(250_u64.saturating_mul(1_u64 << exponent))
+        .min(std::time::Duration::from_secs(30))
+}
+
+pub(super) fn retry_cleanup_target_is_current(
+    current: Option<(&str, &ActiveWorkspaceState)>,
+    expected_acquisition_id: &str,
+) -> anyhow::Result<bool> {
+    let Some((acquisition_id, state)) = current else {
+        return Ok(false);
+    };
+    if acquisition_id != expected_acquisition_id || state != &ActiveWorkspaceState::CleanupRequired
+    {
+        anyhow::bail!("workspace acquisition changed before retry cleanup");
+    }
+    Ok(true)
 }
 
 impl CancelledWorkspaceSetupCleanup {
+    async fn run_before_remove_hook(
+        &self,
+        task_id: &TaskId,
+        label: &str,
+        hook: Option<&str>,
+        hook_timeout_secs: u64,
+        workspace_path: &Path,
+    ) {
+        let Some(hook) = hook else {
+            return;
+        };
+        match timeout(
+            Duration::from_secs(hook_timeout_secs),
+            run_hook(hook, workspace_path),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(
+                task_id = %task_id.0,
+                "{label} hook failed during cancelled workspace setup cleanup: {error}"
+            ),
+            Err(_) => tracing::warn!(
+                task_id = %task_id.0,
+                "{label} hook timed out during cancelled workspace setup cleanup"
+            ),
+        }
+    }
+
     async fn converge(self, task_id: TaskId, snapshot: ActiveWorkspaceSnapshot) {
         let mut attempt = 1_u64;
         loop {
@@ -50,8 +105,9 @@ impl CancelledWorkspaceSetupCleanup {
                             attempt,
                             "failed to reacquire the repository lease for cancelled workspace setup cleanup; retrying: {error}"
                         );
+                        let retry_delay = cancelled_cleanup_retry_delay(attempt);
                         attempt = attempt.saturating_add(1);
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        tokio::time::sleep(retry_delay).await;
                         continue;
                     }
                 },
@@ -61,6 +117,29 @@ impl CancelledWorkspaceSetupCleanup {
                 .as_ref()
                 .map(RepositoryWriteLease::loss_receiver);
             let cleanup = async {
+                let still_current = self.active.get(&task_id).is_some_and(|active| {
+                    active.acquisition_id == snapshot.acquisition_id
+                        && active.state == ActiveWorkspaceState::CleanupRequired
+                });
+                if !still_current {
+                    return Ok(false);
+                }
+                self.run_before_remove_hook(
+                    &task_id,
+                    "workflow before_remove",
+                    self.workflow_before_remove_hook.as_deref(),
+                    self.workflow_hook_timeout_secs,
+                    &snapshot.workspace_path,
+                )
+                .await;
+                self.run_before_remove_hook(
+                    &task_id,
+                    "workspace before_remove",
+                    self.manager_before_remove_hook.as_deref(),
+                    self.manager_hook_timeout_secs,
+                    &snapshot.workspace_path,
+                )
+                .await;
                 let _git_ops = self.git_ops.lock().await;
                 let still_current = self.active.get(&task_id).is_some_and(|active| {
                     active.acquisition_id == snapshot.acquisition_id
@@ -117,8 +196,9 @@ impl CancelledWorkspaceSetupCleanup {
                     "repository lease was lost during cancelled workspace setup cleanup; retrying"
                 ),
             }
+            let retry_delay = cancelled_cleanup_retry_delay(attempt);
             attempt = attempt.saturating_add(1);
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            tokio::time::sleep(retry_delay).await;
         }
     }
 }
@@ -128,8 +208,16 @@ impl WorkspaceManager {
         &'a self,
         task_id: &TaskId,
         acquisition_id: &str,
+        before_remove_hook: Option<String>,
+        hook_timeout_secs: u64,
     ) -> Result<WorkspaceStateGuard<'a>, WorkspaceLifecycleError> {
-        self.workspace_state_guard(task_id, acquisition_id, ActiveWorkspaceState::Creating)
+        self.workspace_state_guard(
+            task_id,
+            acquisition_id,
+            ActiveWorkspaceState::Creating,
+            before_remove_hook,
+            hook_timeout_secs,
+        )
     }
 
     pub(crate) async fn cleanup_required_workspace_for_retry(
@@ -155,14 +243,14 @@ impl WorkspaceManager {
             .as_ref()
             .map(RepositoryWriteLease::loss_receiver);
         let cleanup = async {
-            let active = self
-                .active
-                .get(task_id)
-                .ok_or_else(|| anyhow::anyhow!("workspace disappeared before retry cleanup"))?;
-            if active.acquisition_id != snapshot.acquisition_id
-                || active.state != ActiveWorkspaceState::CleanupRequired
-            {
-                anyhow::bail!("workspace acquisition changed before retry cleanup");
+            let active = self.active.get(task_id);
+            if !retry_cleanup_target_is_current(
+                active
+                    .as_ref()
+                    .map(|active| (active.acquisition_id.as_str(), &active.state)),
+                &snapshot.acquisition_id,
+            )? {
+                return Ok(());
             }
             drop(active);
             if let Some(hook) = before_remove_hook {
@@ -205,6 +293,8 @@ impl WorkspaceManager {
         &'a self,
         task_id: &TaskId,
         acquisition_id: &str,
+        before_remove_hook: Option<String>,
+        hook_timeout_secs: u64,
     ) -> anyhow::Result<WorkspaceStateGuard<'a>> {
         let mut active = self
             .active
@@ -222,6 +312,8 @@ impl WorkspaceManager {
             task_id: task_id.clone(),
             acquisition_id: acquisition_id.to_string(),
             in_progress_state: ActiveWorkspaceState::Preparing,
+            before_remove_hook,
+            hook_timeout_secs,
             armed: true,
         })
     }
@@ -231,6 +323,8 @@ impl WorkspaceManager {
         task_id: &TaskId,
         acquisition_id: &str,
         state: ActiveWorkspaceState,
+        before_remove_hook: Option<String>,
+        hook_timeout_secs: u64,
     ) -> Result<WorkspaceStateGuard<'a>, WorkspaceLifecycleError> {
         let active =
             self.active
@@ -248,6 +342,8 @@ impl WorkspaceManager {
             task_id: task_id.clone(),
             acquisition_id: acquisition_id.to_string(),
             in_progress_state: state,
+            before_remove_hook,
+            hook_timeout_secs,
             armed: true,
         })
     }
@@ -491,6 +587,10 @@ impl Drop for WorkspaceStateGuard<'_> {
             released_workspace_paths: Arc::clone(&self.manager.released_workspace_paths),
             git_ops: Arc::clone(&self.manager.git_ops),
             lease_store: self.manager.lease_store.clone(),
+            workflow_before_remove_hook: self.before_remove_hook.take(),
+            workflow_hook_timeout_secs: self.hook_timeout_secs,
+            manager_before_remove_hook: self.manager.config.before_remove_hook.clone(),
+            manager_hook_timeout_secs: self.manager.config.hook_timeout_secs,
         };
         let task_id = self.task_id.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {

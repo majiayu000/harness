@@ -178,6 +178,7 @@ impl WorkspaceManager {
             require_remote_head: options.require_remote_head,
             reuse_existing_workspace: options.reuse_existing_workspace,
             after_create_hook: options.after_create_hook,
+            before_remove_hook: options.before_remove_hook,
             hook_timeout_secs: options.hook_timeout_secs,
             branch_prefix: options.branch_prefix,
             runtime_workflow_id: options.runtime_workflow_id,
