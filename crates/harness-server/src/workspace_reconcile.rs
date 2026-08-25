@@ -1,4 +1,5 @@
 use super::workspace_helpers::*;
+use super::workspace_repository::RepositoryWriteLeaseAttempt;
 use super::*;
 
 /// Minimal rate-limiter for the disk reconciliation scan's GitHub API calls.
@@ -172,16 +173,17 @@ impl WorkspaceManager {
                     .and_then(owner_record_external_id)
                     .is_some();
                 match self
-                    .cleanup_workspace_path_locked(&cleanup_repo, &path)
+                    .cleanup_reconciliation_workspace_path(&cleanup_repo, &path)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(true) => {
                         if is_new_key {
                             summary.migrated += 1;
                         } else {
                             summary.removed += 1;
                         }
                     }
+                    Ok(false) => summary.preserved += 1,
                     Err(e) => {
                         tracing::warn!(
                             path = ?path,
@@ -210,12 +212,13 @@ impl WorkspaceManager {
             }
 
             match self
-                .cleanup_workspace_path_locked(&cleanup_repo, path)
+                .cleanup_reconciliation_workspace_path(&cleanup_repo, path)
                 .await
             {
-                Ok(()) => {
+                Ok(true) => {
                     summary.removed += 1;
                 }
+                Ok(false) => summary.preserved += 1,
                 Err(e) => {
                     tracing::warn!(
                         path = ?path,
@@ -385,16 +388,59 @@ impl WorkspaceManager {
             );
 
             if should_remove {
-                let _git_ops = self.git_ops.lock().await;
-                match try_reclaim_workspace(
-                    source_repo,
-                    &path,
-                    self.lease_store.as_deref(),
-                    None,
-                    WorkspaceReclaimMode::Guard,
-                )
-                .await
+                let repository_lease = match self
+                    .try_acquire_repository_write_lease_for_reconciliation(source_repo)
+                    .await
                 {
+                    Ok(RepositoryWriteLeaseAttempt::NotRequired) => None,
+                    Ok(RepositoryWriteLeaseAttempt::Acquired(lease)) => Some(lease),
+                    Ok(RepositoryWriteLeaseAttempt::Contended) => {
+                        tracing::debug!(
+                            workspace_path = ?path,
+                            "reconcile_disk_workspaces: repository is busy; deferring cleanup until remote state can be refreshed"
+                        );
+                        summary.skipped_open += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            workspace_path = ?path,
+                            "reconcile_disk_workspaces: failed to acquire repository lease: {error}"
+                        );
+                        summary.skipped_open += 1;
+                        summary.errors = summary.errors.saturating_add(1);
+                        continue;
+                    }
+                };
+                let repository_lease_lost = repository_lease
+                    .as_ref()
+                    .map(RepositoryWriteLease::loss_receiver);
+                let _git_ops = self.git_ops.lock().await;
+                if self.active.iter().any(|entry| entry.workspace_path == path) {
+                    summary.skipped_open += 1;
+                    continue;
+                }
+                let reclaim = run_until_repository_lease_loss(
+                    repository_lease_lost,
+                    try_reclaim_workspace(
+                        source_repo,
+                        &path,
+                        self.lease_store.as_deref(),
+                        None,
+                        WorkspaceReclaimMode::Guard,
+                    ),
+                )
+                .await;
+                let Some(reclaim) = reclaim else {
+                    tracing::warn!(
+                        workspace_path = ?path,
+                        "reconcile_disk_workspaces: repository lease was lost during cleanup"
+                    );
+                    summary.skipped_open += 1;
+                    summary.errors = summary.errors.saturating_add(1);
+                    continue;
+                };
+                match reclaim {
                     Ok(WorkspaceReclaimOutcome::Deleted) => summary.removed += 1,
                     Ok(WorkspaceReclaimOutcome::ForcedDeleted { .. }) => summary.removed += 1,
                     Ok(WorkspaceReclaimOutcome::SkippedLiveLease {
@@ -460,7 +506,12 @@ impl WorkspaceManager {
     /// This cleans up orphaned worktrees left behind by a previous server crash.
     ///
     /// Errors from individual removals are logged and do not abort the sweep.
-    pub async fn cleanup_orphan_worktrees(&self, source_repo: &Path, terminal_task_ids: &[TaskId]) {
+    pub async fn cleanup_orphan_worktrees(
+        &self,
+        source_repo: &Path,
+        terminal_task_ids: &[TaskId],
+    ) -> OrphanWorkspaceCleanupSummary {
+        let mut summary = OrphanWorkspaceCleanupSummary::default();
         let terminal_set: std::collections::HashSet<&str> =
             terminal_task_ids.iter().map(|id| id.0.as_str()).collect();
         let terminal_dirs: std::collections::HashSet<String> = terminal_task_ids
@@ -475,13 +526,23 @@ impl WorkspaceManager {
                     "cleanup_orphan_worktrees: failed to read workspace root {:?}: {e}",
                     self.config.root
                 );
-                return;
+                summary.errors = summary.errors.saturating_add(1);
+                return summary;
             }
         };
 
         let mut orphan_paths = Vec::new();
-        for entry in read_dir.flatten() {
-            let path = entry.path();
+        for entry in read_dir {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => {
+                    summary.errors = summary.errors.saturating_add(1);
+                    tracing::warn!(
+                        "cleanup_orphan_worktrees: failed to read workspace directory entry: {error}"
+                    );
+                    continue;
+                }
+            };
             if !path.is_dir() {
                 continue;
             }
@@ -522,26 +583,66 @@ impl WorkspaceManager {
             if self.active.iter().any(|e| e.workspace_path == path) {
                 continue;
             }
+            let repository_lease = match self
+                .try_acquire_repository_write_lease_for_reconciliation(source_repo)
+                .await
+            {
+                Ok(RepositoryWriteLeaseAttempt::NotRequired) => None,
+                Ok(RepositoryWriteLeaseAttempt::Acquired(lease)) => Some(lease),
+                Ok(RepositoryWriteLeaseAttempt::Contended) => {
+                    tracing::debug!(
+                        workspace_path = ?path,
+                        "cleanup_orphan_worktrees: repository is busy; deferring orphan cleanup"
+                    );
+                    summary.deferred = summary.deferred.saturating_add(1);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        workspace_path = ?path,
+                        "cleanup_orphan_worktrees: failed to acquire repository lease: {error}"
+                    );
+                    summary.errors = summary.errors.saturating_add(1);
+                    continue;
+                }
+            };
+            let repository_lease_lost = repository_lease
+                .as_ref()
+                .map(RepositoryWriteLease::loss_receiver);
             let _git_ops = self.git_ops.lock().await;
             if self.active.iter().any(|e| e.workspace_path == path) {
                 continue;
             }
-            match try_reclaim_workspace(
-                source_repo,
-                &path,
-                self.lease_store.as_deref(),
-                None,
-                WorkspaceReclaimMode::Guard,
+            let reclaim = run_until_repository_lease_loss(
+                repository_lease_lost,
+                try_reclaim_workspace(
+                    source_repo,
+                    &path,
+                    self.lease_store.as_deref(),
+                    None,
+                    WorkspaceReclaimMode::Guard,
+                ),
             )
-            .await
-            {
+            .await;
+            let Some(reclaim) = reclaim else {
+                tracing::warn!(
+                    workspace_path = ?path,
+                    "cleanup_orphan_worktrees: repository lease was lost during cleanup"
+                );
+                summary.deferred = summary.deferred.saturating_add(1);
+                summary.errors = summary.errors.saturating_add(1);
+                continue;
+            };
+            match reclaim {
                 Ok(WorkspaceReclaimOutcome::Deleted) => {
+                    summary.removed = summary.removed.saturating_add(1);
                     tracing::info!(
                         "cleanup_orphan_worktrees: removed orphan worktree {:?}",
                         path
                     );
                 }
                 Ok(WorkspaceReclaimOutcome::ForcedDeleted { .. }) => {
+                    summary.removed = summary.removed.saturating_add(1);
                     tracing::info!(
                         "cleanup_orphan_worktrees: force-removed orphan worktree {:?}",
                         path
@@ -551,6 +652,7 @@ impl WorkspaceManager {
                     task_id,
                     owner_session,
                 }) => {
+                    summary.skipped_live = summary.skipped_live.saturating_add(1);
                     tracing::debug!(
                         workspace_path = ?path,
                         task_id = %task_id.0,
@@ -559,6 +661,7 @@ impl WorkspaceManager {
                     );
                 }
                 Ok(WorkspaceReclaimOutcome::SkippedLeaseLookupFailed { error }) => {
+                    summary.errors = summary.errors.saturating_add(1);
                     tracing::warn!(
                         workspace_path = ?path,
                         "cleanup_orphan_worktrees: reclaim gate failed closed after lease lookup error: {error}"
@@ -568,6 +671,7 @@ impl WorkspaceManager {
                     task_id,
                     owner_session,
                 }) => {
+                    summary.errors = summary.errors.saturating_add(1);
                     tracing::warn!(
                         workspace_path = ?path,
                         task_id = %task_id.0,
@@ -576,19 +680,68 @@ impl WorkspaceManager {
                     );
                 }
                 Err(e) => {
+                    summary.errors = summary.errors.saturating_add(1);
                     tracing::warn!("cleanup_orphan_worktrees: failed to remove {:?}: {e}", path);
                 }
             }
         }
 
         // Prune stale worktree metadata so git no longer tracks removed directories.
-        let _git_ops = self.git_ops.lock().await;
-        if let Err(e) = git_command()
-            .args(["-C", &source_repo.to_string_lossy(), "worktree", "prune"])
-            .output()
+        let repository_lease = match self
+            .try_acquire_repository_write_lease_for_reconciliation(source_repo)
             .await
         {
-            tracing::warn!("cleanup_orphan_worktrees: git worktree prune failed: {e}");
+            Ok(RepositoryWriteLeaseAttempt::NotRequired) => None,
+            Ok(RepositoryWriteLeaseAttempt::Acquired(lease)) => Some(lease),
+            Ok(RepositoryWriteLeaseAttempt::Contended) => {
+                tracing::debug!(
+                    "cleanup_orphan_worktrees: repository is busy; deferring worktree prune"
+                );
+                summary.prune_deferred = true;
+                return summary;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "cleanup_orphan_worktrees: failed to acquire repository lease for prune: {error}"
+                );
+                summary.errors = summary.errors.saturating_add(1);
+                return summary;
+            }
+        };
+        let repository_lease_lost = repository_lease
+            .as_ref()
+            .map(RepositoryWriteLease::loss_receiver);
+        let _git_ops = self.git_ops.lock().await;
+        let prune = run_until_repository_lease_loss(repository_lease_lost, async {
+            git_command()
+                .args(["-C", &source_repo.to_string_lossy(), "worktree", "prune"])
+                .output()
+                .await
+        })
+        .await;
+        let Some(prune) = prune else {
+            tracing::warn!(
+                "cleanup_orphan_worktrees: repository lease was lost during worktree prune"
+            );
+            summary.errors = summary.errors.saturating_add(1);
+            summary.prune_deferred = true;
+            return summary;
+        };
+        match prune {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                summary.errors = summary.errors.saturating_add(1);
+                tracing::warn!(
+                    status = %output.status,
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "cleanup_orphan_worktrees: git worktree prune exited unsuccessfully"
+                );
+            }
+            Err(error) => {
+                summary.errors = summary.errors.saturating_add(1);
+                tracing::warn!("cleanup_orphan_worktrees: git worktree prune failed: {error}");
+            }
         }
+        summary
     }
 }

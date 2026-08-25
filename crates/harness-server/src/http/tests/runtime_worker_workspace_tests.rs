@@ -1,6 +1,237 @@
 use super::*;
 
 #[tokio::test]
+async fn terminal_runtime_cleanup_waits_for_and_removes_released_candidate_workspace(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-terminal-active-lease");
+    std::fs::create_dir_all(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nbase:\n  require_remote_head: false\nworkspace:\n  strategy: worktree\n  cleanup: on_terminal\n  reuse_existing_workspace: true\n---\n",
+    )?;
+    init_worktree_git_repo(&project_root)?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.workspace.root = dir.path().join("workspaces");
+    config.workspace.root_configured = true;
+    config.concurrency.max_concurrent_tasks = 2;
+    let agent = RuntimeStreamAgent::new();
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register("codex", agent);
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        &project_root,
+        config.clone(),
+        registry,
+    )
+    .await?;
+    let lease_store = Arc::new(
+        crate::workspace_lease_store::WorkspaceLeaseStore::open(
+            &dir.path().join("terminal-active-lease-store"),
+        )
+        .await?,
+    );
+    let workspace_mgr_a = Arc::new(crate::workspace::WorkspaceManager::new_with_pool(
+        config.workspace.clone(),
+        crate::workspace_pool::WorkspacePoolConfig::new(2, std::collections::HashMap::new()),
+        Some(lease_store.clone()),
+    )?);
+    let workspace_mgr_b = Arc::new(crate::workspace::WorkspaceManager::new_with_pool(
+        config.workspace.clone(),
+        crate::workspace_pool::WorkspacePoolConfig::new(2, std::collections::HashMap::new()),
+        Some(lease_store),
+    )?);
+    let mut state = match Arc::try_unwrap(state) {
+        Ok(state) => state,
+        Err(_) => panic!("test state should have one owner before workspace manager injection"),
+    };
+    state.concurrency.workspace_mgr = Some(workspace_mgr_b.clone());
+    let state = Arc::new(state);
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "failed",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1300"),
+    )
+    .with_id("issue-1300-active-repository-lease")
+    .with_server_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 1300,
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let task_id_c1 = crate::task_runner::TaskId::from_str("issue-1300-c1");
+    let lease_c1 = workspace_mgr_a
+        .create_workspace_with_options(
+            &task_id_c1,
+            &project_root,
+            "origin",
+            "main",
+            1,
+            Some(workflow.subject.subject_key.as_str()),
+            Some("owner/repo"),
+            crate::workspace::WorkspaceCreateOptions {
+                require_remote_head: false,
+                runtime_workflow_id: Some(workflow.id.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let task_id_c2 = crate::task_runner::TaskId::from_str("issue-1300-c2");
+    let lease_c2 = workspace_mgr_a
+        .create_workspace_with_options(
+            &task_id_c2,
+            &project_root,
+            "origin",
+            "main",
+            1,
+            Some(workflow.subject.subject_key.as_str()),
+            Some("owner/repo"),
+            crate::workspace::WorkspaceCreateOptions {
+                require_remote_head: false,
+                runtime_workflow_id: Some(workflow.id.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(lease_c1.workspace_path.exists());
+    assert!(lease_c2.workspace_path.exists());
+    assert_ne!(lease_c1.workspace_path, lease_c2.workspace_path);
+    assert_eq!(
+        workspace_mgr_b
+            .workspace_targets_for_runtime_workflow(&workflow.id)
+            .await?
+            .len(),
+        2,
+        "a different manager must discover every candidate from durable lease records"
+    );
+
+    let cleanup_state = state.clone();
+    let workflow_id = workflow.id.clone();
+    let cleanup = tokio::spawn(async move {
+        crate::workflow_runtime_worker::notify_runtime_submission_terminal_workflow(
+            &cleanup_state,
+            &workflow_id,
+            None,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !cleanup.is_finished(),
+        "terminal cleanup must wait for the active repository lease"
+    );
+    assert!(lease_c1.workspace_path.exists());
+    assert!(lease_c2.workspace_path.exists());
+
+    workspace_mgr_a.release_workspace(&task_id_c1).await;
+    workspace_mgr_a.release_workspace(&task_id_c2).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+        .await
+        .map_err(|_| anyhow::anyhow!("terminal cleanup did not resume after lease release"))???;
+
+    assert!(!lease_c1.workspace_path.exists());
+    assert!(!lease_c2.workspace_path.exists());
+    assert!(!workspace_mgr_a.active.contains_key(&task_id_c1));
+    assert!(!workspace_mgr_a.active.contains_key(&task_id_c2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_workspace_admission_rejects_old_job_after_workflow_reopens() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-reopened-workflow");
+    std::fs::create_dir_all(&project_root)?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let mut workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1301"),
+    )
+    .with_id("issue-1301-reopened-admission")
+    .with_server_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 1301,
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
+        "implement_issue",
+        "impl-1301-c1",
+    );
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "workflow_id": workflow.id,
+                "candidate_index": 1,
+            }),
+        )
+        .await?;
+    let claimed = store
+        .claim_next_runtime_job(
+            "old-worker",
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await?
+        .expect("runtime job should be claimable");
+    crate::workflow_runtime_worker::revalidate_runtime_workspace_admission(
+        &state,
+        &claimed,
+        Some(&workflow),
+    )
+    .await?;
+
+    store
+        .cancel_command_and_unfinished_runtime_jobs(
+            &command_id,
+            "implement_issue",
+            "workflow terminalized",
+        )
+        .await?;
+    workflow.state = "cancelled".to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    workflow.state = "implementing".to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+
+    let error = crate::workflow_runtime_worker::revalidate_runtime_workspace_admission(
+        &state,
+        &claimed,
+        Some(&workflow),
+    )
+    .await
+    .expect_err("an old cancelled job must not be admitted after workflow reopen");
+    assert!(
+        error.to_string().contains("lost its running lease"),
+        "unexpected stale-job admission error: {error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn terminal_runtime_cleanup_releases_missing_workspace_without_git_cleanup(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
@@ -80,7 +311,10 @@ async fn terminal_runtime_cleanup_releases_missing_workspace_without_git_cleanup
             created_at: std::time::SystemTime::now(),
             owner_session: workspace_mgr.owner_session.clone(),
             run_generation: 1,
+            acquisition_id: "test-acquisition".to_string(),
+            state: crate::workspace::ActiveWorkspaceState::Ready,
             _pool_permit: None,
+            _repository_write_lease: None,
         },
     );
     workspace_mgr
@@ -116,6 +350,44 @@ async fn terminal_runtime_cleanup_releases_missing_workspace_without_git_cleanup
         workspace_mgr.active_paths.get(&workspace_path).is_none(),
         "missing workspace release should clear the active path reservation"
     );
+
+    let outside = tempfile::tempdir()?;
+    let outside_path = outside.path().join("must-remain");
+    std::fs::create_dir_all(&outside_path)?;
+    let outside_task = crate::task_runner::TaskId::from_str("terminal-outside-root");
+    workspace_mgr.active.insert(
+        outside_task.clone(),
+        crate::workspace::ActiveWorkspace {
+            workspace_path: outside_path.clone(),
+            source_repo: project_root.clone(),
+            repo: Some("owner/repo".to_string()),
+            runtime_workflow_id: Some(workflow.id.clone()),
+            workspace_key: "terminal-outside-root".to_string(),
+            project_key: "test-project".to_string(),
+            slot_index: 0,
+            branch: "harness/terminal-outside-root".to_string(),
+            created_at: std::time::SystemTime::now(),
+            owner_session: workspace_mgr.owner_session.clone(),
+            run_generation: 1,
+            acquisition_id: "outside-acquisition".to_string(),
+            state: crate::workspace::ActiveWorkspaceState::Ready,
+            _pool_permit: None,
+            _repository_write_lease: None,
+        },
+    );
+    workspace_mgr
+        .active_paths
+        .insert(outside_path.clone(), outside_task.clone());
+
+    crate::workflow_runtime_worker::notify_runtime_submission_terminal_workflow(
+        &state,
+        &workflow.id,
+        None,
+    )
+    .await?;
+    assert!(outside_path.exists());
+    assert!(workspace_mgr.active.contains_key(&outside_task));
+    assert!(workspace_mgr.active_paths.contains_key(&outside_path));
     Ok(())
 }
 

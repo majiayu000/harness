@@ -396,15 +396,32 @@ pub async fn migrate_legacy_task_db_if_needed(
         "INSERT INTO workspace_leases (
             store_key, project_key, slot_index, task_id, workspace_key, workspace_path, source_repo,
             repo, runtime_workflow_id, owner_session, run_generation, process_id,
-            process_started_at, state, acquired_at, released_at, last_used_at
+            acquisition_id, process_started_at, state, acquired_at, released_at, last_used_at
          )
          SELECT $1, project_key, slot_index, task_id, workspace_key, workspace_path, source_repo,
                 repo, runtime_workflow_id, owner_session, run_generation, process_id,
-                process_started_at, state, acquired_at, released_at, last_used_at
+                acquisition_id, process_started_at, state, acquired_at, released_at, last_used_at
          FROM {legacy_schema_sql}.workspace_leases
          ON CONFLICT (store_key, project_key, slot_index) DO NOTHING"
     );
     sqlx::query(&leases_sql)
+        .bind(target_db.store_key())
+        .execute(&mut *tx)
+        .await?;
+
+    let cleanup_targets_sql = format!(
+        "INSERT INTO workspace_cleanup_targets (
+            store_key, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
+            workspace_key, source_repo, repo, owner_session, run_generation, process_id,
+            acquisition_id, process_started_at, created_at, last_used_at
+         )
+         SELECT $1, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
+                workspace_key, source_repo, repo, owner_session, run_generation, process_id,
+                acquisition_id, process_started_at, created_at, last_used_at
+         FROM {legacy_schema_sql}.workspace_cleanup_targets
+         ON CONFLICT (store_key, runtime_workflow_id, workspace_path) DO NOTHING"
+    );
+    sqlx::query(&cleanup_targets_sql)
         .bind(target_db.store_key())
         .execute(&mut *tx)
         .await?;

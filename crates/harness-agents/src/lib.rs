@@ -135,7 +135,7 @@ unsafe fn nix_kill(pid: i32, sig: i32) -> i32 {
 }
 
 pub(crate) struct ManagedChild {
-    /// Only `None` after `Drop` has taken the child for background reaping;
+    /// Only `None` after `Drop` has taken the child for synchronous reaping;
     /// every other method may assume it is present.
     child: Option<tokio::process::Child>,
     process_group_id: Option<u32>,
@@ -486,81 +486,30 @@ impl Drop for ManagedChild {
         }
         let _ = child.start_kill();
 
-        // Drop runs on the async runtime for every cancelled/timed-out turn, so
-        // it must not block the worker thread: hand reaping and group-drain
-        // verification to a detached task. The blocking loop is kept only for
-        // drops outside a runtime (e.g. process teardown).
-        let label = self.label;
-        let process_group_id = self.process_group_id;
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(reap_killed_child(
-                    child,
-                    label,
-                    process_group_id,
-                    egress_proxy_lease,
-                ));
-            }
-            Err(_) => drain_killed_child_blocking(
+        // A cancelled agent must stop mutating its workspace before the caller
+        // can release the repository lease. Reap synchronously so returning
+        // from Drop is the cancellation acknowledgement; a detached reaper
+        // would allow a replacement writer to overlap the dying process.
+        let drain = || {
+            drain_killed_child_blocking(
                 child,
                 child_reaped,
-                label,
-                process_group_id,
+                self.label,
+                self.process_group_id,
                 egress_proxy_lease,
-            ),
+            )
+        };
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(drain);
+        } else {
+            drain();
         }
     }
 }
 
-/// Await the killed child's exit and verify its process group drains.
-///
-/// The SIGKILL was already issued by `Drop`; this task only reaps and reports.
-async fn reap_killed_child(
-    mut child: tokio::process::Child,
-    label: &'static str,
-    process_group_id: Option<u32>,
-    _egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
-) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    match tokio::time::timeout_at(deadline, child.wait()).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(
-                agent_process = label,
-                "failed waiting for killed agent child to exit: {error}"
-            );
-        }
-        Err(_) => {
-            tracing::warn!(
-                agent_process = label,
-                "timed out waiting for killed agent child to exit"
-            );
-            return;
-        }
-    }
-
-    #[cfg(unix)]
-    if let Some(pgid) = process_group_id {
-        loop {
-            if !process_group_has_members(pgid) {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    agent_process = label,
-                    "timed out waiting for killed agent process group to drain"
-                );
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = process_group_id;
-}
-
-/// Blocking fallback for drops outside a tokio runtime, where a detached
-/// reaper task cannot be spawned.
+/// Reap a killed child and wait until its process group has no remaining members.
 fn drain_killed_child_blocking(
     mut child: tokio::process::Child,
     mut child_reaped: bool,
@@ -568,7 +517,6 @@ fn drain_killed_child_blocking(
     process_group_id: Option<u32>,
     _egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
 ) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         if !child_reaped {
             match child.try_wait() {
@@ -592,22 +540,6 @@ fn drain_killed_child_blocking(
         let group_drained = true;
 
         if child_reaped && group_drained {
-            return;
-        }
-
-        if std::time::Instant::now() >= deadline {
-            if !child_reaped {
-                tracing::warn!(
-                    agent_process = label,
-                    "timed out waiting for killed agent child to exit"
-                );
-            }
-            if !group_drained {
-                tracing::warn!(
-                    agent_process = label,
-                    "timed out waiting for killed agent process group to drain"
-                );
-            }
             return;
         }
 
@@ -693,33 +625,19 @@ mod managed_child_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn drop_of_running_child_returns_promptly_and_reaps_in_background() {
+    async fn drop_of_running_child_reaps_process_group_before_returning() {
         let mut cmd = tokio::process::Command::new("/bin/sh");
-        cmd.arg("-c").arg("sleep 5").kill_on_drop(true);
+        cmd.arg("-c").arg("sleep 30 & wait").kill_on_drop(true);
         set_process_group(&mut cmd);
         let child = cmd.spawn().expect("spawn sleeping child");
         let pgid = child.id().expect("child pid");
         let managed = ManagedChild::new(child, "drop latency test");
 
-        let start = std::time::Instant::now();
         drop(managed);
-        let elapsed = start.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "drop must not block the runtime worker; took {elapsed:?}"
+            !process_group_has_members(pgid),
+            "drop returned before the killed process group drained"
         );
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            if !process_group_has_members(pgid) {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "detached reaper should drain the killed process group"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
     }
 
     #[test]

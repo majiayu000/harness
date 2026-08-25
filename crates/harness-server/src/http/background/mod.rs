@@ -23,6 +23,7 @@ mod pr_feedback;
 mod runtime_command_dispatch;
 mod runtime_profiles;
 mod runtime_workers;
+mod runtime_workspace_cleanup;
 pub(crate) use loop_health::{BackgroundLoopHealth, LoopHandle};
 use runtime_command_dispatch::workflow_project_root;
 use runtime_profiles::{
@@ -45,6 +46,7 @@ pub(super) use runtime_command_dispatch::{
 #[cfg(test)]
 pub(super) use runtime_profiles::runtime_profile_manifest_definition;
 pub(super) use runtime_workers::spawn_runtime_job_workers;
+pub(super) use runtime_workspace_cleanup::spawn_runtime_workspace_cleanup_sweeper;
 
 /// Load the workflow config for a background loop, reporting parse failures
 /// into the loop-health registry instead of silently degrading (GH-1880).

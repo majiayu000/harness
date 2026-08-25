@@ -196,6 +196,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // workflow command outbox rows.
     background::spawn_runtime_pr_feedback_sweeper(&state);
 
+    // Retry durable workspace cleanup obligations, including targets backfilled
+    // for workflows that were already terminal before this server started.
+    background::spawn_runtime_workspace_cleanup_sweeper(&state);
+
     // Periodically inspect managed open PRs for stale DIRTY/BEHIND mergeability
     // and route repair through workflow-owned PR feedback activities.
     pr_hygiene_background::spawn_runtime_pr_hygiene_sweeper(&state);

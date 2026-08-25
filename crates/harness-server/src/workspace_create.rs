@@ -1,4 +1,5 @@
 use super::workspace_helpers::*;
+use super::workspace_repository::ResolvedWorkspaceAdmission;
 use super::*;
 
 const PERSISTED_SLOT_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -44,72 +45,71 @@ impl WorkspaceManager {
         repo: Option<&str>,
         options: WorkspaceCreateOptions,
     ) -> Result<WorkspaceLease, WorkspaceLifecycleError> {
-        if let Some(active) = self.active.get(task_id) {
-            if active.run_generation == run_generation && active.owner_session == self.owner_session
-            {
-                return Ok(WorkspaceLease {
-                    workspace_path: active.workspace_path.clone(),
-                    #[cfg(test)]
-                    owner_session: active.owner_session.clone(),
-                    #[cfg(test)]
+        self.cleanup_required_workspace_for_retry(task_id, None, 0)
+            .await
+            .map_err(|error| WorkspaceLifecycleError::ReconcileFailed {
+                message: format!("failed to clean interrupted workspace acquisition: {error}"),
+            })?;
+        let project_key = crate::workspace_pool::project_limit_key(source_repo);
+        if matches!(
+            &options.repository_write_lease,
+            RepositoryWriteLeaseInput::ResolveFromStartupConfig
+        ) {
+            return self
+                .create_workspace_with_resolved_repository_lease(
+                    task_id,
+                    source_repo,
+                    remote,
+                    base_branch,
                     run_generation,
-                    #[cfg(test)]
-                    decision: WorkspaceAcquireDecision::ReusedTracked,
-                    #[cfg(test)]
-                    project_key: active.project_key.clone(),
-                    #[cfg(test)]
-                    slot_index: active.slot_index,
-                });
-            }
-            return Err(WorkspaceLifecycleError::LiveForeignOwner {
-                message: format!(
-                    "WorktreeCollision: workspace path {:?} already owned by another harness session; manual resolution required",
-                    active.workspace_path
-                ),
-            });
+                    external_id,
+                    repo,
+                    options,
+                )
+                .await;
         }
-
-        let pool_permit = match self.pool.acquire(source_repo, repo).await {
-            Ok(permit) => permit,
-            Err(err) => {
-                return Err(WorkspaceLifecycleError::CreateFailed {
-                    message: format!(
-                        "workspace pool acquisition failed for task {}: {err}",
-                        task_id.0
-                    ),
-                });
-            }
+        let mut repository_write_lease = match options.repository_write_lease {
+            RepositoryWriteLeaseInput::Held(lease) => Some(lease),
+            RepositoryWriteLeaseInput::NotRequired => None,
+            RepositoryWriteLeaseInput::ResolveFromStartupConfig => unreachable!(),
         };
-        let project_key = pool_permit.project_key.clone();
-        let workspace_project_key = pool_permit.workspace_project_key.clone();
-        let capacity = pool_permit.capacity;
-        let mut pool_permit = Some(pool_permit.permit);
-        let slot_lock = self.pool.selection_lock(&project_key);
-        let slot_guard = slot_lock.lock().await;
-        if let Some(active) = self.active.get(task_id) {
-            if active.run_generation == run_generation && active.owner_session == self.owner_session
-            {
-                return Ok(WorkspaceLease {
-                    workspace_path: active.workspace_path.clone(),
-                    #[cfg(test)]
-                    owner_session: active.owner_session.clone(),
-                    #[cfg(test)]
-                    run_generation,
-                    #[cfg(test)]
-                    decision: WorkspaceAcquireDecision::ReusedTracked,
-                    #[cfg(test)]
-                    project_key: active.project_key.clone(),
-                    #[cfg(test)]
-                    slot_index: active.slot_index,
-                });
-            }
-            return Err(WorkspaceLifecycleError::LiveForeignOwner {
-                message: format!(
-                    "WorktreeCollision: workspace path {:?} already owned by another harness session; manual resolution required",
-                    active.workspace_path
-                ),
-            });
-        }
+        let resolved_workspace_capacity = options.workspace_capacity_override;
+        let desired_workspace_capacity =
+            resolved_workspace_capacity.unwrap_or_else(|| self.pool.capacity_for(source_repo));
+        let admission = self
+            .acquire_resolved_workspace_admission(
+                task_id,
+                source_repo,
+                repo,
+                run_generation,
+                repository_write_lease,
+                desired_workspace_capacity,
+            )
+            .await?;
+        let (
+            admitted_repository_lease,
+            workspace_project_key,
+            capacity,
+            admitted_pool_permit,
+            slot_guard,
+        ) = match admission {
+            ResolvedWorkspaceAdmission::Reused(lease) => return Ok(lease),
+            ResolvedWorkspaceAdmission::Acquired {
+                repository_write_lease,
+                workspace_project_key,
+                capacity,
+                pool_permit,
+                slot_guard,
+            } => (
+                repository_write_lease,
+                workspace_project_key,
+                capacity,
+                pool_permit,
+                slot_guard,
+            ),
+        };
+        repository_write_lease = admitted_repository_lease;
+        let mut pool_permit = Some(admitted_pool_permit);
         // Validate inputs to prevent unexpected git behavior.
         if !is_valid_branch_name(base_branch) {
             return Err(WorkspaceLifecycleError::CreateFailed {
@@ -129,6 +129,7 @@ impl WorkspaceManager {
             });
         }
         let owner_session = self.owner_session.clone();
+        let acquisition_id = SessionId::new().to_string();
         let owner_record_task_id = external_id.unwrap_or(task_id.0.as_str()).to_string();
         let owner_record_workspace_key =
             derive_workspace_key(task_id, external_id, repo, Some(source_repo));
@@ -189,7 +190,31 @@ impl WorkspaceManager {
                     .filter(|slot| *slot < capacity as u32)
             });
         let wait_for_persisted_slot = self.lease_store.is_some();
-        let (slot_index, _workspace_key, workspace_path, reacquired_released_task_slot) = loop {
+        let (
+            slot_index,
+            _workspace_key,
+            workspace_path,
+            reacquired_released_task_slot,
+            mut persisted_acquisition_guard,
+        ) = loop {
+            let admission_is_stale = self
+                .repository_admission_is_stale(
+                    source_repo,
+                    capacity,
+                    repository_write_lease.as_ref(),
+                )
+                .await
+                .map_err(|error| WorkspaceLifecycleError::CreateFailed {
+                    message: format!(
+                        "failed to revalidate repository capacity before durable workspace acquisition: {error}"
+                    ),
+                })?;
+            if admission_is_stale {
+                return Err(WorkspaceLifecycleError::CreateFailed {
+                    message: "live workspace capacity changed while waiting for a durable slot; retry acquisition"
+                        .to_string(),
+                });
+            }
             let mut occupied_slots = self.occupied_slots_for_project(&project_key);
             let persisted_occupied_slots = if let Some(store) = self.lease_store.as_ref() {
                 match store.leased_slots_for_project(&project_key).await {
@@ -206,6 +231,16 @@ impl WorkspaceManager {
                 std::collections::HashSet::new()
             };
             occupied_slots.extend(persisted_occupied_slots.iter().copied());
+            if occupied_slots.iter().any(|slot| *slot >= capacity as u32) {
+                tracing::debug!(
+                    task_id = %task_id.0,
+                    project_key = %project_key,
+                    capacity,
+                    "workspace pool waiting for leases outside the reduced capacity"
+                );
+                tokio::time::sleep(PERSISTED_SLOT_RETRY_DELAY).await;
+                continue;
+            }
             let preferred_slot =
                 preferred_released_slot.filter(|slot| !occupied_slots.contains(slot));
             let Some(slot_index) =
@@ -250,27 +285,27 @@ impl WorkspaceManager {
                 workspace_key: owner_record_workspace_key.clone(),
                 owner_session: owner_session.clone(),
                 run_generation,
+                acquisition_id: Some(acquisition_id.clone()),
                 process_id: std::process::id(),
                 process_started_at,
             };
-            let Some(store) = self.lease_store.as_ref() else {
-                break (
-                    slot_index,
-                    workspace_key,
-                    workspace_path,
-                    selected_released_task_slot,
-                );
-            };
-            match store.try_acquire_lease(&lease_record).await {
-                Ok(true) => {
+            match self
+                .acquire_persisted_workspace_guard(
+                    lease_record,
+                    options.persist_runtime_cleanup_target,
+                )
+                .await
+            {
+                Ok(Some(guard)) => {
                     break (
                         slot_index,
                         workspace_key,
                         workspace_path,
                         selected_released_task_slot,
+                        guard,
                     )
                 }
-                Ok(false) => {
+                Ok(None) => {
                     if preferred_released_slot == Some(slot_index) {
                         preferred_released_slot = None;
                     }
@@ -284,6 +319,7 @@ impl WorkspaceManager {
             }
         };
 
+        let git_ops_guard = self.git_ops.lock().await;
         let path_tracking_error = {
             use dashmap::mapref::entry::Entry;
             match self.active_paths.entry(workspace_path.clone()) {
@@ -313,17 +349,12 @@ impl WorkspaceManager {
             }
         };
         if let Some(error) = path_tracking_error {
-            if let Some(store) = self.lease_store.as_ref() {
-                if let Err(release_error) =
-                    store.release_slot(&project_key, slot_index, task_id).await
-                {
-                    tracing::warn!(
-                        task_id = %task_id.0,
-                        project_key = %project_key,
-                        slot_index,
-                        "failed to release persisted workspace lease after path collision: {release_error}"
-                    );
-                }
+            if let Err(release_error) = persisted_acquisition_guard.rollback().await {
+                return Err(WorkspaceLifecycleError::ReconcileFailed {
+                    message: format!(
+                        "{error}; failed to release persisted workspace acquisition: {release_error}"
+                    ),
+                });
             }
             return Err(error);
         }
@@ -355,30 +386,43 @@ impl WorkspaceManager {
                         created_at: SystemTime::now(),
                         owner_session: owner_session.clone(),
                         run_generation,
+                        acquisition_id: acquisition_id.clone(),
+                        state: ActiveWorkspaceState::Creating,
                         _pool_permit: pool_permit.take(),
+                        _repository_write_lease: repository_write_lease,
                     });
                     None
                 }
             }
         };
         if let Some(error) = active_tracking_error {
-            if let Some(store) = self.lease_store.as_ref() {
-                if let Err(release_error) =
-                    store.release_slot(&project_key, slot_index, task_id).await
-                {
-                    tracing::warn!(
-                        task_id = %task_id.0,
-                        project_key = %project_key,
-                        slot_index,
-                        "failed to release persisted workspace lease after active collision: {release_error}"
-                    );
-                }
+            if let Err(release_error) = persisted_acquisition_guard.rollback().await {
+                return Err(WorkspaceLifecycleError::ReconcileFailed {
+                    message: format!(
+                        "{error}; failed to release persisted workspace acquisition: {release_error}"
+                    ),
+                });
             }
             return Err(error);
         }
+        let creation_guard = self.guard_workspace_creation(task_id, &acquisition_id)?;
+        persisted_acquisition_guard.disarm();
         drop(slot_guard);
 
-        let git_ops_guard = self.git_ops.lock().await;
+        let creation_still_active = self.active.get(task_id).is_some_and(|active| {
+            active.owner_session == owner_session
+                && active.run_generation == run_generation
+                && active.acquisition_id == acquisition_id
+                && active.workspace_path == workspace_path
+        });
+        if !creation_still_active {
+            return Err(WorkspaceLifecycleError::CreateFailed {
+                message: format!(
+                    "workspace creation was cancelled before git setup for task {}",
+                    task_id.0
+                ),
+            });
+        }
         let mut _decision = WorkspaceAcquireDecision::CreatedFresh;
         let workspace_path_exists = workspace_path.exists();
         let missing_path_registered_worktree = if workspace_path_exists {
@@ -401,7 +445,8 @@ impl WorkspaceManager {
         {
             Ok(output) => output,
             Err(e) => {
-                self.release_workspace(task_id).await;
+                self.release_workspace_after_create_failure(task_id, &acquisition_id)
+                    .await?;
                 return Err(WorkspaceLifecycleError::CreateFailed {
                     message: format!("git fetch failed for task {}: {e}", task_id.0),
                 });
@@ -417,7 +462,8 @@ impl WorkspaceManager {
         if !fetch_output.status.success() {
             let stderr = String::from_utf8_lossy(&fetch_output.stderr);
             if options.require_remote_head {
-                self.release_workspace(task_id).await;
+                self.release_workspace_after_create_failure(task_id, &acquisition_id)
+                    .await?;
                 return Err(WorkspaceLifecycleError::CreateFailed {
                     message: format!(
                         "git fetch {remote} {base_branch} failed for task {}: {}",
@@ -447,7 +493,8 @@ impl WorkspaceManager {
                     .as_ref()
                     .is_some_and(|record| record.owner_session != owner_session)
             {
-                self.release_workspace(task_id).await;
+                self.release_workspace_after_create_failure(task_id, &acquisition_id)
+                    .await?;
                 return Err(WorkspaceLifecycleError::LiveForeignOwner {
                     message: format!(
                         "WorktreeCollision: workspace path {:?} is managed by another harness session; manual resolution required",
@@ -482,6 +529,7 @@ impl WorkspaceManager {
                             source_repo,
                             &workspace_path,
                             Some(true),
+                            &acquisition_id,
                         )
                         .await
                     {
@@ -503,17 +551,22 @@ impl WorkspaceManager {
                 task_id: owner_record_task_id.clone(),
                 run_generation,
                 owner_session: owner_session.clone(),
+                acquisition_id: Some(acquisition_id.clone()),
                 workspace_key: Some(owner_record_workspace_key.clone()),
             };
             if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
-                self.release_workspace(task_id).await;
+                self.release_workspace_after_create_failure(task_id, &acquisition_id)
+                    .await?;
                 return Err(WorkspaceLifecycleError::CreateFailed {
                     message: format!("failed to persist workspace owner record: {err}"),
                 });
             }
             drop(git_ops_guard);
+            creation_guard.complete()?;
             return Ok(WorkspaceLease {
                 workspace_path,
+                acquisition_id,
+                repository_lease_lost: self.repository_lease_lost_for_task(task_id),
                 #[cfg(test)]
                 owner_session,
                 #[cfg(test)]
@@ -535,7 +588,8 @@ impl WorkspaceManager {
             )
             .await
             {
-                self.release_workspace(task_id).await;
+                self.release_workspace_after_create_failure(task_id, &acquisition_id)
+                    .await?;
                 return Err(WorkspaceLifecycleError::ReconcileFailed {
                     message: format!(
                         "workspace lifecycle reconciliation failed for task {} at {:?}: {err}",
@@ -566,6 +620,7 @@ impl WorkspaceManager {
                             source_repo,
                             &workspace_path,
                             None,
+                            &acquisition_id,
                         )
                         .await
                     {
@@ -585,6 +640,7 @@ impl WorkspaceManager {
                                 source_repo,
                                 &workspace_path,
                                 None,
+                                &acquisition_id,
                             )
                             .await
                         {
@@ -615,6 +671,7 @@ impl WorkspaceManager {
                                 source_repo,
                                 &workspace_path,
                                 None,
+                                &acquisition_id,
                             )
                             .await
                         {
@@ -645,11 +702,18 @@ impl WorkspaceManager {
             task_id: owner_record_task_id,
             run_generation,
             owner_session: owner_session.clone(),
+            acquisition_id: Some(acquisition_id.clone()),
             workspace_key: Some(owner_record_workspace_key),
         };
         if let Err(err) = write_owner_record(&workspace_path, &owner_record) {
             if let Err(cleanup_err) = self
-                .cleanup_created_workspace_then_release(task_id, source_repo, &workspace_path, None)
+                .cleanup_created_workspace_then_release(
+                    task_id,
+                    source_repo,
+                    &workspace_path,
+                    None,
+                    &acquisition_id,
+                )
                 .await
             {
                 tracing::warn!(
@@ -691,13 +755,17 @@ impl WorkspaceManager {
                         "failed to cleanup partial worktree after hook failure: {cleanup_err}"
                     );
                 }
-                self.release_workspace(task_id).await;
+                self.release_workspace_after_create_failure(task_id, &acquisition_id)
+                    .await?;
                 return Err(WorkspaceLifecycleError::CreateFailed { message: err_msg });
             }
         }
 
+        creation_guard.complete()?;
         Ok(WorkspaceLease {
             workspace_path,
+            acquisition_id,
+            repository_lease_lost: self.repository_lease_lost_for_task(task_id),
             #[cfg(test)]
             owner_session,
             #[cfg(test)]
@@ -709,22 +777,5 @@ impl WorkspaceManager {
             #[cfg(test)]
             slot_index,
         })
-    }
-
-    async fn cleanup_created_workspace_then_release(
-        &self,
-        task_id: &TaskId,
-        source_repo: &Path,
-        workspace_path: &Path,
-        known_worktree_registered: Option<bool>,
-    ) -> anyhow::Result<()> {
-        let cleanup_result = cleanup_workspace_path_with_registration(
-            source_repo,
-            workspace_path,
-            known_worktree_registered,
-        )
-        .await;
-        self.release_workspace(task_id).await;
-        cleanup_result
     }
 }

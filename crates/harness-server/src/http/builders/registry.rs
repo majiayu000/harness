@@ -425,10 +425,15 @@ pub(crate) async fn build_registry(
                 .push(StoreStartupResult::optional("workspace_lease_store").failed(error));
             None
         }
-        None => match crate::workspace_lease_store::WorkspaceLeaseStore::open_shared_with_data_dir(
+        None => match crate::workspace_lease_store::WorkspaceLeaseStore::open_shared_with_data_dir_and_repository_lock_capacity(
             &task_context,
             &setup_pool,
             data_dir,
+            server
+                .config
+                .concurrency
+                .max_concurrent_tasks
+                .saturating_add(1),
         )
         .await
         {
@@ -449,29 +454,44 @@ pub(crate) async fn build_registry(
         },
     };
 
-    let workspace_pool_config = super::workspace_pool_config::build_workspace_pool_config(
+    let workspace_mgr = match super::workspace_pool_config::build_workspace_pool_config(
         server,
         project_registry.as_ref(),
     )
-    .await;
-    let workspace_mgr = match crate::workspace::WorkspaceManager::new_with_pool(
-        server.config.workspace.clone(),
-        workspace_pool_config,
-        workspace_lease_store,
-    ) {
-        Ok(mgr) => {
-            startup_results.push(StoreStartupResult::optional("workspace_manager"));
-            tracing::debug!(
-                root = %server.config.workspace.root.display(),
-                "workspace manager initialized"
-            );
-            Some(Arc::new(mgr))
+    .await
+    {
+        Ok(workspace_pool_config) => {
+            match crate::workspace::WorkspaceManager::new_with_pool_and_capacity_source(
+                server.config.workspace.clone(),
+                workspace_pool_config,
+                workspace_lease_store,
+                server.clone(),
+                project_registry.clone(),
+            ) {
+                Ok(mgr) => {
+                    startup_results.push(StoreStartupResult::optional("workspace_manager"));
+                    tracing::debug!(
+                        root = %server.config.workspace.root.display(),
+                        "workspace manager initialized"
+                    );
+                    Some(Arc::new(mgr))
+                }
+                Err(error) => {
+                    startup_results.push(
+                        StoreStartupResult::optional("workspace_manager").failed(error.to_string()),
+                    );
+                    tracing::warn!(
+                    "failed to initialize workspace manager: {error}; running without workspace isolation"
+                );
+                    None
+                }
+            }
         }
-        Err(e) => {
+        Err(error) => {
             startup_results
-                .push(StoreStartupResult::optional("workspace_manager").failed(e.to_string()));
-            tracing::warn!(
-                "failed to initialize workspace manager: {e}; running without workspace isolation"
+                .push(StoreStartupResult::optional("workspace_manager").failed(error.to_string()));
+            tracing::error!(
+                "failed to resolve workspace concurrency limits: {error}; running without workspace isolation"
             );
             None
         }

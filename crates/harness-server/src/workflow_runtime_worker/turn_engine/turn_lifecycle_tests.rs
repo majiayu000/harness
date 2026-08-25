@@ -126,6 +126,7 @@ impl AgentAdapter for CountingAdapter {
 
 struct InterruptTrackingAdapter {
     interrupt_calls: Arc<AtomicUsize>,
+    terminate_calls: Arc<AtomicUsize>,
     /// start_turn blocks until interrupt fires, so the lease-lost branch
     /// of the turn loop deterministically wins the select race.
     release: Arc<tokio::sync::Notify>,
@@ -156,6 +157,11 @@ impl AgentAdapter for InterruptTrackingAdapter {
     async fn interrupt(&self) -> harness_core::error::Result<()> {
         self.interrupt_calls.fetch_add(1, Ordering::AcqRel);
         self.release.notify_waiters();
+        Ok(())
+    }
+
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        self.terminate_calls.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -217,6 +223,42 @@ impl AgentAdapter for ControlTrackingAdapter {
 struct PendingTurnAdapter {
     start_calls: Arc<AtomicUsize>,
     interrupt_calls: Arc<AtomicUsize>,
+    terminate_calls: Arc<AtomicUsize>,
+}
+
+struct InitializationLockingAdapter {
+    state: Arc<tokio::sync::Mutex<()>>,
+    started: Arc<tokio::sync::Notify>,
+    terminate_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentAdapter for InitializationLockingAdapter {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    async fn start_turn(
+        &self,
+        _req: AgentRequest,
+        _tx: mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        let _state = self.state.lock().await;
+        self.started.notify_waiters();
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
+        let _state = self.state.lock().await;
+        Ok(())
+    }
+
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        let _state = self.state.lock().await;
+        self.terminate_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -237,6 +279,11 @@ impl AgentAdapter for PendingTurnAdapter {
 
     async fn interrupt(&self) -> harness_core::error::Result<()> {
         self.interrupt_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        self.terminate_calls.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -451,21 +498,24 @@ async fn lifecycle_preserves_egress_verification_after_unrelated_failure() -> an
 }
 
 #[tokio::test]
-async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
+async fn prefired_lease_lost_still_terminates_turn() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let agent_calls = Arc::new(AtomicUsize::new(0));
     let interrupt_calls = Arc::new(AtomicUsize::new(0));
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
     let mut config = HarnessConfig::default();
     config.server.project_root = root.path().to_path_buf();
     config.agents.default_agent = "codex".to_string();
     let mut registry = AgentRegistry::new("codex");
     registry.register("codex", Arc::new(CountingAgent { calls: agent_calls }));
     let interrupt_calls_for_factory = interrupt_calls.clone();
+    let terminate_calls_for_factory = terminate_calls.clone();
     let release_for_factory = Arc::new(tokio::sync::Notify::new());
     registry
         .register_turn_backend_factory("codex", move || {
             Arc::new(InterruptTrackingAdapter {
                 interrupt_calls: interrupt_calls_for_factory.clone(),
+                terminate_calls: terminate_calls_for_factory.clone(),
                 release: release_for_factory.clone(),
             })
         })
@@ -476,7 +526,7 @@ async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
     // Fire the lease-lost signal BEFORE the turn loop starts polling: the
     // watch channel must not lose it (GH-1877).
     let (lease_lost, receiver) = tokio::sync::watch::channel(false);
-    let _ = lease_lost.send(true);
+    lease_lost.send_replace(true);
     run_test_turn(
         server.clone(),
         root.path(),
@@ -490,8 +540,13 @@ async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
 
     assert_eq!(
         interrupt_calls.load(Ordering::Acquire),
+        0,
+        "the execution adapter must be cancelled before taking its state lock"
+    );
+    assert_eq!(
+        terminate_calls.load(Ordering::Acquire),
         1,
-        "pre-fired lease-lost must interrupt the agent"
+        "lease loss must force-stop and drain the adapter"
     );
     let thread_id = server
         .thread_manager
@@ -502,6 +557,58 @@ async fn prefired_lease_lost_still_interrupts_turn() -> anyhow::Result<()> {
         .get_turn(&thread_id, &turn_id)
         .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
     assert_eq!(turn.status, TurnStatus::Failed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_loss_drops_initializing_turn_before_force_termination() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let agent_calls = Arc::new(AtomicUsize::new(0));
+    let state = Arc::new(tokio::sync::Mutex::new(()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
+    let mut config = HarnessConfig::default();
+    config.server.project_root = root.path().to_path_buf();
+    config.agents.default_agent = "codex".to_string();
+    let mut registry = AgentRegistry::new("codex");
+    registry.register("codex", Arc::new(CountingAgent { calls: agent_calls }));
+    let state_for_factory = state.clone();
+    let started_for_factory = started.clone();
+    let terminate_calls_for_factory = terminate_calls.clone();
+    registry
+        .register_turn_backend_factory("codex", move || {
+            Arc::new(InitializationLockingAdapter {
+                state: state_for_factory.clone(),
+                started: started_for_factory.clone(),
+                terminate_calls: terminate_calls_for_factory.clone(),
+            })
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let turn_id = start_test_turn(&server, root.path())?;
+    let (lease_lost, receiver) = tokio::sync::watch::channel(false);
+    let root_path = root.path().to_path_buf();
+    let run = tokio::spawn(async move {
+        run_test_turn(
+            server,
+            &root_path,
+            turn_id,
+            TurnLifecycleOptions {
+                lease_lost: Some(receiver),
+                ..TurnLifecycleOptions::default()
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .map_err(|_| anyhow::anyhow!("turn adapter did not enter initialization"))?;
+    lease_lost.send_replace(true);
+    tokio::time::timeout(std::time::Duration::from_secs(2), run)
+        .await
+        .map_err(|_| anyhow::anyhow!("lease loss deadlocked on the adapter state lock"))???;
+    assert_eq!(terminate_calls.load(Ordering::Acquire), 1);
     Ok(())
 }
 
@@ -567,6 +674,7 @@ async fn lifecycle_interrupts_registered_control_backend_when_turn_factory_exist
     let control_interrupts = Arc::new(AtomicUsize::new(0));
     let turn_starts = Arc::new(AtomicUsize::new(0));
     let turn_interrupts = Arc::new(AtomicUsize::new(0));
+    let turn_terminations = Arc::new(AtomicUsize::new(0));
     let mut config = HarnessConfig::default();
     config.server.project_root = root.path().to_path_buf();
     config.agents.default_agent = "codex".to_string();
@@ -582,11 +690,13 @@ async fn lifecycle_interrupts_registered_control_backend_when_turn_factory_exist
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let turn_starts_for_factory = turn_starts.clone();
     let turn_interrupts_for_factory = turn_interrupts.clone();
+    let turn_terminations_for_factory = turn_terminations.clone();
     registry
         .register_turn_backend_factory("codex", move || {
             Arc::new(PendingTurnAdapter {
                 start_calls: turn_starts_for_factory.clone(),
                 interrupt_calls: turn_interrupts_for_factory.clone(),
+                terminate_calls: turn_terminations_for_factory.clone(),
             })
         })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -611,6 +721,11 @@ async fn lifecycle_interrupts_registered_control_backend_when_turn_factory_exist
         turn_interrupts.load(Ordering::Acquire),
         0,
         "active control must use the registered control backend, not the turn execution backend"
+    );
+    assert_eq!(
+        turn_terminations.load(Ordering::Acquire),
+        1,
+        "lease loss must terminate the actual turn execution backend"
     );
     let thread_id = server
         .thread_manager

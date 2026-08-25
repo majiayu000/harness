@@ -442,8 +442,18 @@ async fn reconcile_startup_continues_after_workspace_cleanup_failure() {
         .await
         .expect("startup reconcile should continue after per-entry cleanup failure");
 
-    std::fs::set_permissions(&bad_path, std::fs::Permissions::from_mode(0o700))
-        .expect("unlock bad workspace");
+    let quarantine_path = std::fs::read_dir(workspaces.path())
+        .expect("read workspace root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".harness-cleanup-bad-stale-workspace-"))
+        })
+        .expect("failed cleanup should preserve the quarantined workspace");
+    std::fs::set_permissions(&quarantine_path, std::fs::Permissions::from_mode(0o700))
+        .expect("unlock quarantined workspace");
 
     assert_eq!(
         summary.removed, 1,
@@ -454,8 +464,8 @@ async fn reconcile_startup_continues_after_workspace_cleanup_failure() {
         "good stale workspace should still be cleaned"
     );
     assert!(
-        bad_path.exists(),
-        "failed stale workspace should remain for later retry or operator cleanup"
+        quarantine_path.exists(),
+        "failed stale workspace should remain quarantined for a later retry"
     );
 }
 
@@ -619,6 +629,7 @@ async fn reconcile_startup_migration_counts_new_key_terminal_as_migrated() {
             task_id: "issue:42".to_string(),
             run_generation: 1,
             owner_session: "test-session".to_string(),
+            acquisition_id: None,
             workspace_key: None,
         })
         .expect("serialize"),

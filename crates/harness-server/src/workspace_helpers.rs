@@ -137,12 +137,10 @@ pub(super) fn repo_slug_from_workspace_key(key: &str) -> Option<String> {
 /// Used to distinguish crash-recovery (same task's worktree) from a true collision.
 pub(crate) async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
     crate::command_safety::validate_command_safety(script).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let output = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .current_dir(cwd)
-        .output()
-        .await?;
+    let mut command =
+        crate::workspace::workspace_process::WorkspaceCommand::new("sh", "workspace-hook");
+    command.arg("-c").arg(script).current_dir(cwd);
+    let output = command.output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
@@ -351,7 +349,9 @@ async fn force_reclaim_leased_workspace(
         known_worktree_registered,
     )
     .await?;
-    lease_store.release_task(&task_id).await?;
+    if !lease_store.release_exact_lease(&record).await? {
+        anyhow::bail!("workspace lease changed before forced reclamation completed");
+    }
     Ok(WorkspaceReclaimOutcome::ForcedDeleted {
         task_id,
         owner_session,
@@ -367,6 +367,40 @@ pub(super) async fn cleanup_workspace_path_with_registration(
         Some(registered) => registered,
         None => is_registered_worktree(source_repo, workspace_path).await,
     };
+    let parent = workspace_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "workspace path has no parent for safe cleanup: {}",
+            workspace_path.display()
+        )
+    })?;
+    let file_name = workspace_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "workspace path has no valid file name for safe cleanup: {}",
+                workspace_path.display()
+            )
+        })?;
+    let quarantine_prefix = format!(".harness-cleanup-{file_name}-");
+    let mut quarantine_paths = Vec::new();
+    if parent.exists() {
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&quarantine_prefix))
+            {
+                quarantine_paths.push(entry.path());
+            }
+        }
+    }
+    if workspace_path.exists() {
+        let quarantine = parent.join(format!("{quarantine_prefix}{}", SessionId::new()));
+        std::fs::rename(workspace_path, &quarantine)?;
+        quarantine_paths.push(quarantine);
+    }
     if worktree_registered {
         match remove_worktree(source_repo, workspace_path).await {
             Ok(()) => {}
@@ -382,16 +416,24 @@ pub(super) async fn cleanup_workspace_path_with_registration(
         }
     }
 
-    if workspace_path.exists() {
-        std::fs::remove_dir_all(workspace_path)?;
+    for quarantine_path in quarantine_paths {
+        std::fs::remove_dir_all(&quarantine_path).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to remove quarantined workspace {}: {error}",
+                quarantine_path.display()
+            )
+        })?;
     }
 
-    if let Err(e) = git_command()
+    let prune = git_command()
         .args(["-C", &source_repo.to_string_lossy(), "worktree", "prune"])
         .output()
-        .await
-    {
-        tracing::warn!("cleanup_workspace_path: git worktree prune failed: {e}");
+        .await?;
+    if !prune.status.success() {
+        anyhow::bail!(
+            "git worktree prune failed: {}",
+            String::from_utf8_lossy(&prune.stderr).trim()
+        );
     }
 
     Ok(())
@@ -416,15 +458,21 @@ pub(super) async fn infer_workspace_source_repo(workspace_path: &Path) -> Option
         .args([
             "-C",
             &workspace_path.to_string_lossy(),
-            "rev-parse",
-            "--show-toplevel",
+            "worktree",
+            "list",
+            "--porcelain",
         ])
         .output()
         .await
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|stdout| PathBuf::from(stdout.trim()))
+        .and_then(|stdout| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("worktree "))
+                .map(PathBuf::from)
+        })
 }
 
 pub(super) async fn is_registered_worktree(source_repo: &Path, workspace_path: &Path) -> bool {
@@ -565,4 +613,77 @@ pub(super) fn canonicalize_existing_or_parent(path: &Path) -> PathBuf {
         normalized.push(component);
     }
     normalized
+}
+
+pub(crate) fn ensure_workspace_cleanup_path_within_root(
+    workspace_root: &Path,
+    workspace_path: &Path,
+) -> anyhow::Result<()> {
+    let canonical_root = canonicalize_existing_or_parent(workspace_root);
+    let canonical_path = canonicalize_existing_or_parent(workspace_path);
+    if !canonical_path.starts_with(&canonical_root) {
+        anyhow::bail!(
+            "refusing to clean runtime workspace target outside configured root: {}",
+            workspace_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn infer_workspace_source_repo_returns_primary_worktree() -> anyhow::Result<()> {
+        let source_repo = tempfile::tempdir()?;
+        super::super::test_support::init_git_repo(source_repo.path());
+        let workspace_parent = tempfile::tempdir()?;
+        let workspace_path = workspace_parent.path().join("linked-worktree");
+        let output = git_command()
+            .args([
+                "-C",
+                &source_repo.path().to_string_lossy(),
+                "worktree",
+                "add",
+                "--detach",
+                &workspace_path.to_string_lossy(),
+                "HEAD",
+            ])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to create linked worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+
+        let inferred = infer_workspace_source_repo(&workspace_path)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("source repository should be inferred"))?;
+        assert_eq!(
+            std::fs::canonicalize(inferred)?,
+            std::fs::canonicalize(source_repo.path())?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_recovers_quarantine_after_original_path_disappears() -> anyhow::Result<()> {
+        let source_repo = tempfile::tempdir()?;
+        super::super::test_support::init_git_repo(source_repo.path());
+        let workspace_parent = tempfile::tempdir()?;
+        let workspace_path = workspace_parent.path().join("slot-0");
+        let abandoned_quarantine = workspace_parent
+            .path()
+            .join(".harness-cleanup-slot-0-interrupted");
+        std::fs::create_dir_all(&abandoned_quarantine)?;
+        std::fs::write(abandoned_quarantine.join("leftover"), b"data")?;
+
+        cleanup_workspace_path_with_registration(source_repo.path(), &workspace_path, Some(false))
+            .await?;
+
+        assert!(!abandoned_quarantine.exists());
+        Ok(())
+    }
 }

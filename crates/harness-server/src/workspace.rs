@@ -1,5 +1,8 @@
 use crate::task_runner::{TaskId, TaskSummary};
-use crate::workspace_lease_store::{WorkspaceLeaseRecord, WorkspaceLeaseStore};
+use crate::workspace_lease_store::{
+    RepositoryLeaseMode, RepositoryLeaseState, RepositoryWriteLease, WorkspaceLeaseRecord,
+    WorkspaceLeaseStore,
+};
 use crate::workspace_pool::{
     select_available_slot, workspace_slot_key, WorkspacePool, WorkspacePoolConfig,
 };
@@ -39,24 +42,37 @@ const GIT_LOCAL_ENV_VARS: &[&str] = &[
 
 const OWNER_RECORD_FILE: &str = "harness-workspace-owner.json";
 
+#[path = "workspace_active_reuse.rs"]
+mod workspace_active_reuse;
+pub(crate) use workspace_active_reuse::WorkspaceExecutionGuard;
 #[path = "workspace_create.rs"]
 mod workspace_create;
 #[path = "workspace_helpers.rs"]
 pub(crate) mod workspace_helpers;
+#[path = "workspace_process.rs"]
+mod workspace_process;
 #[path = "workspace_reconcile.rs"]
 mod workspace_reconcile;
+#[path = "workspace_removal.rs"]
+mod workspace_removal;
+#[path = "workspace_repository.rs"]
+mod workspace_repository;
 #[path = "workspace_worktree_add.rs"]
 mod workspace_worktree_add;
 
 pub(crate) use workspace_helpers::run_hook;
 use workspace_helpers::*;
+pub(crate) use workspace_removal::WorkspaceRetryCleanupOutcome;
+pub(crate) use workspace_repository::{
+    run_until_repository_lease_loss, RepositoryWriteLeaseAttempt,
+};
 
 fn git_binary() -> String {
     harness_core::config::process_env::var("HARNESS_GIT_BIN").unwrap_or_else(|_| "git".to_string())
 }
 
-pub(crate) fn git_command() -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(git_binary());
+pub(crate) fn git_command() -> workspace_process::WorkspaceCommand {
+    let mut cmd = workspace_process::WorkspaceCommand::new(git_binary(), "workspace-git");
     for key in GIT_LOCAL_ENV_VARS {
         cmd.env_remove(key);
     }
@@ -75,7 +91,20 @@ pub(crate) struct ActiveWorkspace {
     pub(crate) created_at: SystemTime,
     pub(crate) owner_session: String,
     pub(crate) run_generation: u32,
+    pub(crate) acquisition_id: String,
+    pub(crate) state: ActiveWorkspaceState,
     pub(crate) _pool_permit: Option<OwnedSemaphorePermit>,
+    pub(crate) _repository_write_lease: Option<RepositoryWriteLease>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActiveWorkspaceState {
+    Creating,
+    Ready,
+    Preparing,
+    Running(String),
+    Finalizing(String),
+    CleanupRequired,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +116,7 @@ struct ActiveWorkspaceSnapshot {
     slot_index: u32,
     owner_session: String,
     run_generation: u32,
+    acquisition_id: String,
 }
 
 impl From<&ActiveWorkspace> for ActiveWorkspaceSnapshot {
@@ -99,6 +129,7 @@ impl From<&ActiveWorkspace> for ActiveWorkspaceSnapshot {
             slot_index: active.slot_index,
             owner_session: active.owner_session.clone(),
             run_generation: active.run_generation,
+            acquisition_id: active.acquisition_id.clone(),
         }
     }
 }
@@ -114,7 +145,6 @@ pub struct WorkspaceEntry {
     pub created_at: SystemTime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspaceCreateOptions {
     pub(crate) require_remote_head: bool,
     pub(crate) reuse_existing_workspace: bool,
@@ -122,6 +152,15 @@ pub(crate) struct WorkspaceCreateOptions {
     pub(crate) hook_timeout_secs: Option<u64>,
     pub(crate) branch_prefix: String,
     pub(crate) runtime_workflow_id: Option<String>,
+    pub(crate) persist_runtime_cleanup_target: bool,
+    pub(crate) workspace_capacity_override: Option<usize>,
+    pub(crate) repository_write_lease: RepositoryWriteLeaseInput,
+}
+
+pub(crate) enum RepositoryWriteLeaseInput {
+    ResolveFromStartupConfig,
+    NotRequired,
+    Held(RepositoryWriteLease),
 }
 
 impl Default for WorkspaceCreateOptions {
@@ -133,6 +172,9 @@ impl Default for WorkspaceCreateOptions {
             hook_timeout_secs: None,
             branch_prefix: "harness/".to_string(),
             runtime_workflow_id: None,
+            persist_runtime_cleanup_target: true,
+            workspace_capacity_override: None,
+            repository_write_lease: RepositoryWriteLeaseInput::ResolveFromStartupConfig,
         }
     }
 }
@@ -142,6 +184,8 @@ struct WorkspaceOwnerRecord {
     task_id: String,
     run_generation: u32,
     owner_session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acquisition_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace_key: Option<String>,
 }
@@ -158,6 +202,8 @@ pub(crate) enum WorkspaceAcquireDecision {
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceLease {
     pub(crate) workspace_path: PathBuf,
+    pub(crate) acquisition_id: String,
+    pub(crate) repository_lease_lost: Option<tokio::sync::watch::Receiver<RepositoryLeaseState>>,
     #[cfg(test)]
     pub(crate) owner_session: String,
     #[cfg(test)]
@@ -217,6 +263,15 @@ pub(crate) struct DiskReconciliationSummary {
     pub(crate) errors: u32,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanWorkspaceCleanupSummary {
+    pub removed: u32,
+    pub skipped_live: u32,
+    pub deferred: u32,
+    pub errors: u32,
+    pub prune_deferred: bool,
+}
+
 pub struct WorkspaceManager {
     pub(crate) config: WorkspaceConfig,
     pub(crate) active: DashMap<TaskId, ActiveWorkspace>,
@@ -227,17 +282,55 @@ pub struct WorkspaceManager {
     git_ops: tokio::sync::Mutex<()>,
     pool: WorkspacePool,
     lease_store: Option<Arc<WorkspaceLeaseStore>>,
+    capacity_source: Option<WorkspaceCapacitySource>,
+}
+
+struct WorkspaceCapacitySource {
+    server: Arc<crate::server::HarnessServer>,
+    project_registry: Option<Arc<crate::project_registry::ProjectRegistry>>,
 }
 
 impl WorkspaceManager {
     pub fn new(config: WorkspaceConfig) -> anyhow::Result<Self> {
-        Self::new_with_pool(config, WorkspacePoolConfig::default(), None)
+        #[cfg(not(test))]
+        let pool_config = WorkspacePoolConfig::default();
+        #[cfg(test)]
+        let pool_config =
+            WorkspacePoolConfig::new_for_local_pool_tests(4, std::collections::HashMap::new());
+        Self::new_with_pool(config, pool_config, None)
     }
 
     pub(crate) fn new_with_pool(
+        config: WorkspaceConfig,
+        pool_config: WorkspacePoolConfig,
+        lease_store: Option<Arc<WorkspaceLeaseStore>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_inner(config, pool_config, lease_store, None)
+    }
+
+    pub(crate) fn new_with_pool_and_capacity_source(
+        config: WorkspaceConfig,
+        pool_config: WorkspacePoolConfig,
+        lease_store: Option<Arc<WorkspaceLeaseStore>>,
+        server: Arc<crate::server::HarnessServer>,
+        project_registry: Option<Arc<crate::project_registry::ProjectRegistry>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pool_inner(
+            config,
+            pool_config,
+            lease_store,
+            Some(WorkspaceCapacitySource {
+                server,
+                project_registry,
+            }),
+        )
+    }
+
+    fn new_with_pool_inner(
         mut config: WorkspaceConfig,
         pool_config: WorkspacePoolConfig,
         lease_store: Option<Arc<WorkspaceLeaseStore>>,
+        capacity_source: Option<WorkspaceCapacitySource>,
     ) -> anyhow::Result<Self> {
         if !config.root.is_absolute() {
             config.root = std::env::current_dir()?.join(&config.root);
@@ -253,6 +346,7 @@ impl WorkspaceManager {
             git_ops: tokio::sync::Mutex::new(()),
             pool: WorkspacePool::new(pool_config),
             lease_store,
+            capacity_source,
         })
     }
 
@@ -266,12 +360,6 @@ impl WorkspaceManager {
         }
     }
 
-    fn remove_active_workspace(&self, task_id: &TaskId) -> Option<ActiveWorkspace> {
-        let (_, active) = self.active.remove(task_id)?;
-        self.release_active_path(task_id, &active.workspace_path);
-        Some(active)
-    }
-
     fn occupied_slots_for_project(&self, project_key: &str) -> HashSet<u32> {
         self.active
             .iter()
@@ -280,23 +368,31 @@ impl WorkspaceManager {
             .collect()
     }
 
-    async fn release_persisted_slot(&self, task_id: &TaskId, project_key: &str, slot_index: u32) {
+    async fn release_persisted_lease(
+        &self,
+        task_id: &TaskId,
+        entry: &ActiveWorkspace,
+    ) -> anyhow::Result<()> {
         let Some(store) = self.lease_store.as_ref() else {
-            return;
+            return Ok(());
         };
-        if let Err(error) = store.release_slot(project_key, slot_index, task_id).await {
-            tracing::warn!(
-                task_id = %task_id.0,
-                project_key = %project_key,
-                slot_index,
-                "failed to release persisted workspace lease: {error}"
+        let released = store
+            .release_owned_slot(
+                &entry.project_key,
+                entry.slot_index,
+                task_id,
+                &entry.owner_session,
+                entry.run_generation,
+                &entry.acquisition_id,
+            )
+            .await?;
+        if !released {
+            anyhow::bail!(
+                "persisted workspace acquisition was not leased for task {}",
+                task_id.0
             );
         }
-    }
-
-    async fn release_persisted_lease(&self, task_id: &TaskId, entry: &ActiveWorkspace) {
-        self.release_persisted_slot(task_id, &entry.project_key, entry.slot_index)
-            .await;
+        Ok(())
     }
 
     async fn cleanup_workspace_path_locked(
@@ -308,167 +404,47 @@ impl WorkspaceManager {
         cleanup_workspace_path(source_repo, workspace_path).await
     }
 
-    pub async fn force_reclaim_workspace(
-        &self,
-        task_store: &crate::task_runner::TaskStore,
-        source_repo: &Path,
-        workspace_path: &Path,
-    ) -> anyhow::Result<bool> {
-        let _git_ops = self.git_ops.lock().await;
-        let outcome = try_reclaim_workspace(
-            source_repo,
-            workspace_path,
-            self.lease_store.as_deref(),
-            None,
-            WorkspaceReclaimMode::Force { task_store },
-        )
-        .await?;
-        Ok(matches!(
-            outcome,
-            WorkspaceReclaimOutcome::Deleted | WorkspaceReclaimOutcome::ForcedDeleted { .. }
-        ))
-    }
-
-    /// Remove the workspace for the given task. Runs `before_remove_hook` first (non-fatal).
-    /// Idempotent: returns Ok if the task has no active workspace.
-    pub async fn remove_workspace(&self, task_id: &TaskId) -> anyhow::Result<()> {
-        let snapshot = match self
-            .active
-            .get(task_id)
-            .map(|entry| ActiveWorkspaceSnapshot::from(entry.value()))
-        {
-            Some(snapshot) => snapshot,
-            None => {
-                if let Some(store) = self.lease_store.as_ref() {
-                    if let Err(error) = store.release_task(task_id).await {
-                        tracing::warn!(
-                            task_id = %task_id.0,
-                            "failed to release persisted workspace lease for inactive removed task: {error}"
-                        );
-                    }
-                }
-                return Ok(());
-            }
-        };
-
-        // Run before_remove_hook if set. Non-fatal on failure.
-        if let Some(hook) = &self.config.before_remove_hook {
-            let timeout_secs = self.config.hook_timeout_secs;
-            match timeout(
-                Duration::from_secs(timeout_secs),
-                run_hook(hook, &snapshot.workspace_path),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!("before_remove_hook failed: {e}"),
-                Err(_) => {
-                    tracing::warn!("before_remove_hook timed out after {timeout_secs}s")
-                }
-            }
-        }
-
-        if let Err(e) = self
-            .cleanup_workspace_path_locked(&snapshot.source_repo, &snapshot.workspace_path)
-            .await
-        {
-            tracing::warn!(
-                "git worktree remove failed for {:?}: {e}",
-                snapshot.workspace_path
-            );
-        }
-        let removed = self
-            .active
-            .remove_if(task_id, |_, active| {
-                active.workspace_path == snapshot.workspace_path
-                    && active.owner_session == snapshot.owner_session
-                    && active.run_generation == snapshot.run_generation
-            })
-            .map(|(_, active)| active);
-        if let Some(entry) = removed {
-            self.release_active_path(task_id, &entry.workspace_path);
-            self.released_paths.remove(task_id);
-            self.released_workspace_paths.remove(&entry.workspace_key);
-            self.release_persisted_lease(task_id, &entry).await;
-        } else {
-            self.release_persisted_slot(task_id, &snapshot.project_key, snapshot.slot_index)
-                .await;
-            self.released_paths.remove(task_id);
-            self.released_workspace_paths
-                .remove(&snapshot.workspace_key);
-        }
-        Ok(())
-    }
-
     /// Release the in-memory lease without deleting the workspace on disk.
     ///
     /// Used when `auto_cleanup=false` so a later task with the same deterministic
     /// issue/PR workspace key can reuse the directory while concurrent tasks are
     /// still protected by the active-path collision check.
     pub async fn release_workspace(&self, task_id: &TaskId) {
-        if let Some(entry) = self.remove_active_workspace(task_id) {
-            self.released_paths
-                .insert(task_id.clone(), entry.workspace_path.clone());
-            self.released_workspace_paths
-                .insert(entry.workspace_key.clone(), entry.workspace_path.clone());
-            self.release_persisted_lease(task_id, &entry).await;
-        } else if let Some(store) = self.lease_store.as_ref() {
-            if let Err(error) = store.release_task(task_id).await {
-                tracing::warn!(
-                    task_id = %task_id.0,
-                    "failed to release persisted workspace lease for inactive task: {error}"
-                );
+        let acquisition_id = self
+            .active
+            .get(task_id)
+            .map(|active| active.acquisition_id.clone());
+        if let Some(acquisition_id) = acquisition_id {
+            if let Err(error) = self
+                .release_workspace_acquisition(task_id, &acquisition_id)
+                .await
+            {
+                tracing::warn!(task_id = %task_id.0, "failed to release workspace: {error}");
             }
         }
     }
 
-    pub async fn cleanup_workspace_for_retry(
+    pub(crate) async fn release_workspace_acquisition(
         &self,
         task_id: &TaskId,
-        source_repo: &Path,
-        workspace_path: Option<&Path>,
+        acquisition_id: &str,
     ) -> anyhow::Result<()> {
-        // Resolve target before removing from active so deterministic-key workspaces
-        // (whose directory name differs from sanitize_task_id(task_id)) are found.
-        let target = workspace_path
-            .map(Path::to_path_buf)
-            .or_else(|| self.active.get(task_id).map(|e| e.workspace_path.clone()))
-            .unwrap_or_else(|| self.config.root.join(sanitize_task_id(&task_id.0)));
-        if let Some(owner_task) = self.active_paths.get(&target) {
-            if owner_task.value() != task_id {
-                tracing::warn!(
-                    task_id = %task_id.0,
-                    owner_task_id = %owner_task.value().0,
-                    workspace_path = ?target,
-                    "cleanup_workspace_for_retry: skipped deleting workspace reserved by another active task"
-                );
-                return Ok(());
+        let entry = self
+            .active
+            .remove_if(task_id, |_, active| active.acquisition_id == acquisition_id)
+            .map(|(_, active)| active);
+        if let Some(entry) = entry {
+            if let Err(error) = self.release_persisted_lease(task_id, &entry).await {
+                self.active.entry(task_id.clone()).or_insert(entry);
+                return Err(error);
             }
+            self.release_active_path(task_id, &entry.workspace_path);
+            self.released_paths
+                .insert(task_id.clone(), entry.workspace_path.clone());
+            self.released_workspace_paths
+                .insert(entry.workspace_key.clone(), entry.workspace_path.clone());
         }
-        let active_entry = self.remove_active_workspace(task_id);
-        self.released_paths.remove(task_id);
-        if let Some(entry) = active_entry.as_ref() {
-            self.released_workspace_paths.remove(&entry.workspace_key);
-        }
-        if let Some(owner_task) = self.active_paths.get(&target) {
-            tracing::warn!(
-                task_id = %task_id.0,
-                owner_task_id = %owner_task.value().0,
-                workspace_path = ?target,
-                "cleanup_workspace_for_retry: skipped deleting workspace claimed during retry cleanup"
-            );
-            if let Some(entry) = active_entry.as_ref() {
-                self.release_persisted_lease(task_id, entry).await;
-            }
-            return Ok(());
-        }
-        let cleanup_result = self
-            .cleanup_workspace_path_locked(source_repo, &target)
-            .await;
-        if let Some(entry) = active_entry.as_ref() {
-            self.release_persisted_lease(task_id, entry).await;
-        }
-        cleanup_result
+        Ok(())
     }
 
     pub(crate) fn workspace_path_for(

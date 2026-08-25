@@ -417,6 +417,29 @@ impl PgStoreContext {
             })
     }
 
+    /// Open a schema-scoped pool with a caller-owned connection budget.
+    ///
+    /// Long-lived session consumers such as advisory locks must be sized from
+    /// their own admission limit instead of inheriting the ordinary query-pool
+    /// budget.
+    pub async fn open_runtime_pool_with_max_connections(
+        &self,
+        max_connections: u32,
+    ) -> anyhow::Result<PgPool> {
+        pg_open_pool_schematized_with_max_connections(
+            &self.database_url,
+            &self.schema,
+            max_connections,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to open Postgres runtime pool for schema '{}': {error}",
+                self.schema
+            )
+        })
+    }
+
     pub async fn open_pool_with_setup_pool(&self, setup_pool: &PgPool) -> anyhow::Result<PgPool> {
         self.ensure_schema(setup_pool).await?;
         self.open_runtime_pool().await
@@ -574,9 +597,30 @@ fn pg_create_schema_if_not_exists_race(error: &sqlx::Error) -> bool {
 /// does not start with a letter or underscore — rejecting invalid names before
 /// they are interpolated into SQL.
 pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyhow::Result<PgPool> {
+    let settings = pg_pool_settings(database_url)?;
+    pg_open_pool_schematized_with_settings(database_url, schema, settings).await
+}
+
+async fn pg_open_pool_schematized_with_max_connections(
+    database_url: &str,
+    schema: &str,
+    max_connections: u32,
+) -> anyhow::Result<PgPool> {
+    if max_connections == 0 {
+        anyhow::bail!("Postgres pool max_connections must be greater than 0");
+    }
+    let mut settings = pg_pool_settings(database_url)?;
+    settings.max_connections = max_connections;
+    pg_open_pool_schematized_with_settings(database_url, schema, settings).await
+}
+
+async fn pg_open_pool_schematized_with_settings(
+    database_url: &str,
+    schema: &str,
+    settings: PgPoolSettings,
+) -> anyhow::Result<PgPool> {
     validate_identifier(schema)?;
     let opts = PgConnectOptions::from_str(database_url)?;
-    let settings = pg_pool_settings(database_url)?;
     let schema_for_hook = schema.to_string();
     let pool = PgPoolOptions::new()
         .max_connections(settings.max_connections)

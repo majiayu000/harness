@@ -680,6 +680,11 @@ impl AgentAdapter for CodexAdapter {
         Ok(())
     }
 
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        self.state.lock().await.reset_child().await;
+        Ok(())
+    }
+
     async fn steer(&self, text: String) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
         let thread_id = state.thread_id.clone().ok_or_else(|| {

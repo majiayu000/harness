@@ -86,6 +86,13 @@ pub trait AgentBackend: Send + Sync {
         ))
     }
 
+    /// Force-stop the backend and return only after it can no longer mutate the workspace.
+    async fn terminate_and_drain(&self) -> crate::error::Result<()> {
+        Err(crate::error::Error::Unsupported(
+            "forced termination not supported".into(),
+        ))
+    }
+
     /// Append instructions to an active turn (steer).
     async fn steer(&self, _text: String) -> crate::error::Result<()> {
         Err(crate::error::Error::Unsupported(
