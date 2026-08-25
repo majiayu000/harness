@@ -1,7 +1,9 @@
 use harness_core::db::{pg_open_pool, resolve_test_database_url, PgStoreContext, TestSchemaGuard};
 use harness_core::types::TaskId as CoreTaskId;
-use harness_server::task_db::{migrate_legacy_task_db_if_needed, TaskDb, TASK_DB_SCHEMA};
-use harness_server::task_runner::{TaskKind, TaskPhase, TaskSchedulerState, TaskState, TaskStatus};
+use harness_server::server::test_support::{
+    migrate_legacy_task_db_if_needed, TaskDb, TaskKind, TaskPhase, TaskSchedulerState, TaskState,
+    TaskStatus, TASK_DB_SCHEMA,
+};
 
 fn make_task(id: &str, description: &str) -> TaskState {
     TaskState {

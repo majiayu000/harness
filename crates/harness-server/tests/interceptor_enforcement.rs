@@ -2,7 +2,7 @@ use harness_core::interceptor::{InterceptResult, ToolUseEvent, TurnInterceptor};
 use harness_core::types::{Decision, EventFilters, SessionId};
 use harness_observe::event_store::EventStore;
 use harness_rules::engine::{Guard, RuleEngine};
-use harness_server::hook_enforcer::HookEnforcer;
+use harness_server::server::test_support::HookEnforcer;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;

@@ -19,11 +19,11 @@ use serde::{de::DeserializeOwned, Serialize};
 /// A server-local DTO cannot be used here because `RestDto` is sealed:
 ///
 /// ```compile_fail
-/// use harness_server::http::rest_contract::ContractJson;
+/// use harness_protocol::rest::RestDto;
 ///
 /// struct ServerLocalDto;
 ///
-/// let _: Option<ContractJson<ServerLocalDto>> = None;
+/// impl RestDto for ServerLocalDto {}
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ContractJson<T: RestDto>(pub T);
@@ -73,6 +73,8 @@ where
 }
 
 /// Path extractor for protocol-owned named DTOs.
+// Reserved by the enforced REST boundary for the first named path DTO migration.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ContractPath<T: RestDto>(pub T);
 

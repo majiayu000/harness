@@ -61,6 +61,7 @@ pub enum ValidationOutcomeKind {
 }
 
 impl ValidationOutcome {
+    #[cfg(test)]
     pub fn is_success(&self) -> bool {
         matches!(self.kind, ValidationOutcomeKind::Success)
     }

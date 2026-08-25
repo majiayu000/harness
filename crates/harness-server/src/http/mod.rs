@@ -60,10 +60,11 @@ mod tests_password_reset;
 
 // Re-export all public symbols so callers using `crate::http::*` paths continue to work.
 pub use init::build_app_state;
+pub use state::{AppState, GitHubTokenDispatchCounterSnapshot, GitHubTokenDispatchMetric};
+#[cfg(test)]
 pub use state::{
-    AppState, ConcurrencyServices, CoreServices, EngineServices,
-    GitHubTokenDispatchCounterSnapshot, GitHubTokenDispatchMetric, IntakeServices,
-    NotificationServices, ObservabilityServices,
+    ConcurrencyServices, CoreServices, EngineServices, IntakeServices, NotificationServices,
+    ObservabilityServices,
 };
 
 /// Extract the PR number from a GitHub PR URL.

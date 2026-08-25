@@ -104,6 +104,7 @@ impl QualityTrigger {
 
     /// Grade recent events, run optional cross-review, log the result, and
     /// auto-trigger GC if warranted.
+    #[cfg(test)]
     pub async fn check_and_maybe_trigger(&self, task_ctx: Option<&TaskReviewContext>) {
         self.check_and_maybe_trigger_inner(task_ctx, None).await;
     }

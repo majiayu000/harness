@@ -23,9 +23,9 @@ pub struct PostExecutionValidator {
     /// Deprecated test-only field retained for struct literal compatibility.
     gh_bin: String,
     github_token: Option<String>,
-    /// Executor for shell validation commands. Defaults to
-    /// [`ShellValidationExecutor`]; tests substitute via
-    /// [`PostExecutionValidator::with_executor`].
+    /// Executor for shell validation commands.
+    ///
+    /// Defaults to [`ShellValidationExecutor`].
     validation_executor: Arc<dyn ValidationExecutor>,
 }
 
@@ -80,6 +80,7 @@ fn parse_github_pr_url(pr_url: &str) -> Option<(String, u64)> {
 }
 
 impl PostExecutionValidator {
+    #[cfg(test)]
     pub fn new(config: ValidationConfig) -> Self {
         Self::new_with_github_token(config, None)
     }
@@ -91,15 +92,6 @@ impl PostExecutionValidator {
             github_token,
             validation_executor: Arc::new(ShellValidationExecutor::new()),
         }
-    }
-
-    /// Substitute the [`ValidationExecutor`] used to run shell validation
-    /// commands. Intended for tests that want to assert how the validator
-    /// reacts to specific outcomes (timeout, non-zero exit, captured stderr)
-    /// without spawning real processes.
-    pub fn with_executor(mut self, executor: Arc<dyn ValidationExecutor>) -> Self {
-        self.validation_executor = executor;
-        self
     }
 
     /// Verify that a PR URL exists through the GitHub REST API.

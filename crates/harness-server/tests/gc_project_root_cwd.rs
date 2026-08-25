@@ -1,7 +1,10 @@
 use harness_agents::registry::AgentRegistry;
 use harness_core::{config::HarnessConfig, types::GuardId, types::Language};
 use harness_server::{
-    handlers::gc::gc_run, http::build_app_state, server::HarnessServer,
+    server::{
+        test_support::{build_app_state, gc_run},
+        HarnessServer,
+    },
     thread_manager::ThreadManager,
 };
 use std::sync::Arc;
