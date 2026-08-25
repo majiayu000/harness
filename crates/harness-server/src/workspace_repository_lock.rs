@@ -11,6 +11,27 @@ fn repository_heartbeat_failure_is_terminal(consecutive_failures: u32) -> bool {
     consecutive_failures >= REPOSITORY_LEASE_HEARTBEAT_FAILURE_LIMIT
 }
 
+fn repository_heartbeat_error_is_definitive(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Protocol(_)
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => true,
+        sqlx::Error::Database(error) => error
+            .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+            .is_some_and(|error| repository_heartbeat_severity_is_definitive(error.severity())),
+        _ => false,
+    }
+}
+
+fn repository_heartbeat_severity_is_definitive(severity: sqlx::postgres::PgSeverity) -> bool {
+    matches!(
+        severity,
+        sqlx::postgres::PgSeverity::Fatal | sqlx::postgres::PgSeverity::Panic
+    )
+}
+
 pub(crate) struct RepositoryWriteLease {
     _connection: Arc<tokio::sync::Mutex<Option<PoolConnection<Postgres>>>>,
     _slot_permit: Arc<tokio::sync::Mutex<Option<OwnedSemaphorePermit>>>,
@@ -79,20 +100,28 @@ impl RepositoryWriteLease {
                     )
                     .await
                 };
-                let loss = match result {
+                let failure = match result {
                     Ok(Ok(_)) => {
                         consecutive_failures = 0;
                         None
                     }
-                    Ok(Err(error)) => Some(error.to_string()),
-                    Err(_) => Some(format!(
-                        "heartbeat timed out after {}s",
-                        REPOSITORY_LEASE_HEARTBEAT_TIMEOUT.as_secs()
+                    Ok(Err(error)) => Some((
+                        repository_heartbeat_error_is_definitive(&error),
+                        error.to_string(),
+                    )),
+                    Err(_) => Some((
+                        false,
+                        format!(
+                            "heartbeat timed out after {}s",
+                            REPOSITORY_LEASE_HEARTBEAT_TIMEOUT.as_secs()
+                        ),
                     )),
                 };
-                if let Some(error) = loss {
+                if let Some((definitive, error)) = failure {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    if !repository_heartbeat_failure_is_terminal(consecutive_failures) {
+                    if !definitive
+                        && !repository_heartbeat_failure_is_terminal(consecutive_failures)
+                    {
                         tracing::warn!(
                             consecutive_failures,
                             failure_limit = REPOSITORY_LEASE_HEARTBEAT_FAILURE_LIMIT,
@@ -100,10 +129,17 @@ impl RepositoryWriteLease {
                         );
                         continue;
                     }
-                    tracing::error!(
-                        consecutive_failures,
-                        "PostgreSQL repository advisory-lock session was lost after repeated heartbeat failures: {error}"
-                    );
+                    if definitive {
+                        tracing::error!(
+                            consecutive_failures,
+                            "PostgreSQL repository advisory-lock session was definitively lost: {error}"
+                        );
+                    } else {
+                        tracing::error!(
+                            consecutive_failures,
+                            "PostgreSQL repository advisory-lock session was lost after repeated heartbeat failures: {error}"
+                        );
+                    }
                     let started_revoking = transition_repository_lease_state(
                         &monitor_state_tx,
                         RepositoryLeaseState::Healthy,
@@ -239,6 +275,25 @@ mod tests {
         assert!(!repository_heartbeat_failure_is_terminal(1));
         assert!(!repository_heartbeat_failure_is_terminal(2));
         assert!(repository_heartbeat_failure_is_terminal(3));
+    }
+
+    #[test]
+    fn repository_heartbeat_revokes_immediately_on_definitive_session_errors() {
+        assert!(repository_heartbeat_error_is_definitive(
+            &sqlx::Error::PoolClosed
+        ));
+        assert!(repository_heartbeat_error_is_definitive(&sqlx::Error::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset",)
+        )));
+        assert!(!repository_heartbeat_error_is_definitive(
+            &sqlx::Error::RowNotFound
+        ));
+        assert!(repository_heartbeat_severity_is_definitive(
+            sqlx::postgres::PgSeverity::Fatal
+        ));
+        assert!(!repository_heartbeat_severity_is_definitive(
+            sqlx::postgres::PgSeverity::Error
+        ));
     }
 }
 

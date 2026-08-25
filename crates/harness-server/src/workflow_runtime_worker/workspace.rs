@@ -131,6 +131,7 @@ pub(super) async fn prepare_runtime_workspace(
         require_remote_head: workflow_document.config.base.require_remote_head,
         reuse_existing_workspace,
         after_create_hook: workflow_document.config.hooks.after_create.clone(),
+        before_remove_hook: workflow_document.config.hooks.before_remove.clone(),
         hook_timeout_secs: Some(workflow_document.config.hooks.timeout_secs),
         branch_prefix: workflow_document.config.workspace.branch_prefix.clone(),
         runtime_workflow_id: workflow.map(|workflow| workflow.id.clone()),
@@ -164,8 +165,12 @@ pub(super) async fn prepare_runtime_workspace(
     .await?;
 
     if let Some(hook) = workflow_document.config.hooks.before_run.as_deref() {
-        let preparation_guard =
-            workspace_mgr.begin_workspace_preparation(&task_id, &lease.acquisition_id)?;
+        let preparation_guard = workspace_mgr.begin_workspace_preparation(
+            &task_id,
+            &lease.acquisition_id,
+            workflow_document.config.hooks.before_remove.clone(),
+            workflow_document.config.hooks.timeout_secs,
+        )?;
         if let Err(error) = run_preparation_phase(
             lease.repository_lease_lost.clone(),
             execution_cancelled.clone(),
