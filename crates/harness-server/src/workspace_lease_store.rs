@@ -189,8 +189,9 @@ impl WorkspaceLeaseStore {
         persist_cleanup_target: bool,
     ) -> anyhow::Result<bool> {
         let mut transaction = self.pool.begin().await?;
-        let cleanup_claims: Vec<Option<String>> = sqlx::query_scalar(
-            "SELECT cleanup_claim_id
+        let cleanup_claims: Vec<bool> = sqlx::query_scalar(
+            "SELECT cleanup_claim_id IS NOT NULL
+                    AND COALESCE(cleanup_claim_expires_at > CURRENT_TIMESTAMP, FALSE)
              FROM workspace_cleanup_targets
              WHERE store_key = $1 AND workspace_path = $2
              FOR UPDATE",
@@ -199,10 +200,7 @@ impl WorkspaceLeaseStore {
         .bind(record.workspace_path.to_string_lossy().as_ref())
         .fetch_all(&mut *transaction)
         .await?;
-        if cleanup_claims
-            .into_iter()
-            .any(|claim_id| claim_id.is_some())
-        {
+        if cleanup_claims.into_iter().any(std::convert::identity) {
             transaction.rollback().await?;
             return Ok(false);
         }

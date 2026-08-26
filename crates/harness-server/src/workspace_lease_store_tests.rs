@@ -384,6 +384,81 @@ async fn cleanup_claim_blocks_slot_reuse_until_physical_cleanup_completes() -> a
 }
 
 #[tokio::test]
+async fn expired_cleanup_claim_does_not_block_workspace_admission() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkspaceLeaseStore::open(&dir.path().join("expired-cleanup-claim")).await?;
+    let record_a = WorkspaceLeaseRecord {
+        project_key: "expired-cleanup-project".to_string(),
+        slot_index: 0,
+        task_id: TaskId::from_str("expired-cleanup-task-a"),
+        workspace_key: "expired-cleanup-workspace".to_string(),
+        workspace_path: dir.path().join("workspaces/expired-cleanup"),
+        source_repo: dir.path().join("repo"),
+        repo: Some("owner/repo".to_string()),
+        runtime_workflow_id: Some("expired-cleanup-workflow".to_string()),
+        owner_session: "expired-cleanup-session-a".to_string(),
+        run_generation: 1,
+        acquisition_id: Some("expired-cleanup-acquisition-a".to_string()),
+        process_id: std::process::id(),
+        process_started_at: WorkspaceLeaseStore::current_process_started_at()?,
+    };
+    assert!(store.try_acquire_lease(&record_a).await?);
+    assert!(
+        store
+            .release_owned_slot(
+                &record_a.project_key,
+                record_a.slot_index,
+                &record_a.task_id,
+                &record_a.owner_session,
+                record_a.run_generation,
+                record_a.acquisition_id.as_deref().expect("acquisition A"),
+            )
+            .await?
+    );
+    let target = store
+        .workspace_cleanup_targets_for_runtime_workflow("expired-cleanup-workflow")
+        .await?
+        .pop()
+        .expect("cleanup target");
+    let cleanup_claim_id = "expired-cleanup-claim-a";
+    assert!(
+        store
+            .claim_workspace_cleanup_target(
+                &target,
+                cleanup_claim_id,
+                "expired-cleanup-worker-a",
+                std::process::id(),
+                WorkspaceLeaseStore::current_process_started_at()?,
+            )
+            .await?
+    );
+    let record_b = WorkspaceLeaseRecord {
+        task_id: TaskId::from_str("expired-cleanup-task-b"),
+        owner_session: "expired-cleanup-session-b".to_string(),
+        acquisition_id: Some("expired-cleanup-acquisition-b".to_string()),
+        ..record_a.clone()
+    };
+    assert!(!store.try_acquire_lease(&record_b).await?);
+    assert!(
+        store
+            .expire_workspace_cleanup_claim_for_test(
+                &target,
+                cleanup_claim_id,
+                "expired-cleanup-worker-a",
+            )
+            .await?
+    );
+    assert!(
+        store.try_acquire_lease(&record_b).await?,
+        "an expired cleanup claim must not block a new acquisition"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelled_persisted_acquisition_preserves_cleanup_target() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

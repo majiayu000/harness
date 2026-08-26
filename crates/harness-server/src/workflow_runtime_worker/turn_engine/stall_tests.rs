@@ -7,7 +7,7 @@ use harness_core::config::HarnessConfig;
 use harness_core::error::HarnessError;
 use harness_core::types::{AgentId, Capability, Item, TokenUsage, TurnStatus};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -15,6 +15,7 @@ struct SilentLifecycleAgent;
 
 struct PendingDrainAdapter {
     terminate_calls: Arc<AtomicUsize>,
+    terminate_error: bool,
 }
 
 #[async_trait]
@@ -33,6 +34,11 @@ impl AgentAdapter for PendingDrainAdapter {
 
     async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
         self.terminate_calls.fetch_add(1, Ordering::AcqRel);
+        if self.terminate_error {
+            return Err(HarnessError::AgentExecution(
+                "forced termination failed".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -186,6 +192,7 @@ async fn lifecycle_drains_pending_adapter_after_stall_and_wall_clock_timeout() -
             .register_turn_backend_factory("codex", move || {
                 Arc::new(PendingDrainAdapter {
                     terminate_calls: terminate_calls_for_factory.clone(),
+                    terminate_error: false,
                 })
             })
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -218,5 +225,62 @@ async fn lifecycle_drains_pending_adapter_after_stall_and_wall_clock_timeout() -
 
         assert_eq!(terminate_calls.load(Ordering::Acquire), 1);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_retains_running_turn_when_agent_cannot_be_drained() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut config = HarnessConfig::default();
+    config.server.project_root = root.path().to_path_buf();
+    config.agents.default_agent = "codex".to_string();
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
+    let terminate_calls_for_factory = terminate_calls.clone();
+    let mut registry = AgentRegistry::new("codex");
+    registry.register("codex", Arc::new(SilentLifecycleAgent));
+    registry
+        .register_turn_backend_factory("codex", move || {
+            Arc::new(PendingDrainAdapter {
+                terminate_calls: terminate_calls_for_factory.clone(),
+                terminate_error: true,
+            })
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let thread_id = server
+        .thread_manager
+        .start_thread(root.path().to_path_buf());
+    let turn_id = server.thread_manager.start_turn(
+        &thread_id,
+        "prompt".to_string(),
+        AgentId::from_str("codex"),
+    )?;
+    let (notification_tx, _) = tokio::sync::broadcast::channel(16);
+    let termination_not_drained = Arc::new(AtomicBool::new(false));
+
+    run_turn_lifecycle_with_options(
+        server.clone(),
+        None,
+        notification_tx,
+        thread_id.clone(),
+        turn_id.clone(),
+        "prompt".to_string(),
+        "codex".to_string(),
+        TurnLifecycleOptions {
+            timeout_secs: Some(1),
+            stall_timeout_secs: Some(600),
+            termination_not_drained: Some(termination_not_drained.clone()),
+            ..TurnLifecycleOptions::default()
+        },
+    )
+    .await;
+
+    assert_eq!(terminate_calls.load(Ordering::Acquire), 1);
+    assert!(termination_not_drained.load(Ordering::Acquire));
+    let turn = server
+        .thread_manager
+        .get_turn(&thread_id, &turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
+    assert_eq!(turn.status, TurnStatus::Running);
     Ok(())
 }

@@ -173,6 +173,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         lease_lost.send_replace(true);
                     })
                 });
+        let termination_not_drained = Arc::new(AtomicBool::new(false));
         let activity = async {
             let project_root = runtime_workspace.run_project.clone();
             let memory_enabled = workflow_document.config.memory.enabled;
@@ -323,9 +324,13 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                             &source_project_root,
                         ),
                         egress_verified_at_dispatch: Some(Arc::clone(&egress_verified_at_dispatch)),
+                        termination_not_drained: Some(Arc::clone(&termination_not_drained)),
                     },
                 )
                 .await;
+                if termination_not_drained.load(Ordering::Acquire) {
+                    anyhow::bail!("agent termination could not be confirmed");
+                }
                 let turn = self
                     .state
                     .core
@@ -432,6 +437,11 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         let activity_result: anyhow::Result<ActivityResult> = activity.await;
         if let Some(forwarder) = repository_lease_forwarder {
             forwarder.abort();
+        }
+        if termination_not_drained.load(Ordering::Acquire) {
+            return Err(super::workspace::quarantine_runtime_workspace(
+                runtime_workspace,
+            ));
         }
         let finish_result = finish_runtime_workspace(self.state, &runtime_workspace).await;
         let activity_completed = activity_result.is_ok();
