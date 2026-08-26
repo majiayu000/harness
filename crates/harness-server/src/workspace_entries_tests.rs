@@ -76,6 +76,8 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
         ..Default::default()
     })
     .expect("manager");
+    let pool = Arc::new(tokio::sync::Semaphore::new(1));
+    let pool_permit = Arc::clone(&pool).try_acquire_owned().expect("pool permit");
     let task_id = TaskId("task-a".to_string());
     mgr.active.insert(
         task_id.clone(),
@@ -93,7 +95,7 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
             run_generation: 1,
             acquisition_id: "acquisition-a".to_string(),
             state: ActiveWorkspaceState::Ready,
-            _pool_permit: None,
+            _pool_permit: Some(pool_permit),
             _repository_write_lease: None,
         },
     );
@@ -111,6 +113,7 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
         ActiveWorkspaceState::Preparing
     );
     drop(guard);
+    assert_eq!(pool.available_permits(), 1);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while mgr.active.contains_key(&task_id) {
             tokio::task::yield_now().await;
@@ -248,20 +251,27 @@ async fn cleanup_serialization_is_scoped_to_acquisition() {
         ..Default::default()
     })
     .expect("manager");
-    let first = manager
-        .local_workspace_cleanup_operation("acquisition-a")
-        .expect("local cleanup operation");
-    let same = manager
-        .local_workspace_cleanup_operation("acquisition-a")
-        .expect("shared local cleanup operation");
-    let independent = manager
-        .local_workspace_cleanup_operation("acquisition-b")
-        .expect("independent local cleanup operation");
+    let first = manager.workspace_cleanup_operation("acquisition-a");
+    let same = manager.workspace_cleanup_operation("acquisition-a");
+    let independent = manager.workspace_cleanup_operation("acquisition-b");
 
     assert!(Arc::ptr_eq(&first, &same));
-    let _first_guard = first.lock().await;
-    assert!(same.try_lock().is_err());
-    assert!(independent.try_lock().is_ok());
+    manager
+        .run_workspace_cleanup_hooks_once(
+            Some(&first),
+            &TaskId("task-a".to_string()),
+            None,
+            1,
+            tmp.path(),
+        )
+        .await;
+    assert!(first.claim_workflow_hook());
+    assert!(!same.claim_workflow_hook());
+    assert!(first.claim_manager_hook());
+    assert!(!same.claim_manager_hook());
+    let _first_guard = first.lock.lock().await;
+    assert!(same.lock.try_lock().is_err());
+    assert!(independent.lock.try_lock().is_ok());
 }
 
 #[test]

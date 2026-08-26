@@ -308,7 +308,7 @@ impl WorkspaceManager {
     /// physical cleanup succeeds. Cancellation converges metadata when the path
     /// has already disappeared and leaves the durable cleanup target for retry.
     pub async fn remove_workspace(&self, task_id: &TaskId) -> anyhow::Result<()> {
-        self.remove_workspace_inner(task_id, None).await
+        self.remove_workspace_inner(task_id, None, true).await
     }
 
     pub(crate) async fn remove_workspace_acquisition(
@@ -316,7 +316,16 @@ impl WorkspaceManager {
         task_id: &TaskId,
         acquisition_id: &str,
     ) -> anyhow::Result<()> {
-        self.remove_workspace_inner(task_id, Some(acquisition_id))
+        self.remove_workspace_inner(task_id, Some(acquisition_id), true)
+            .await
+    }
+
+    pub(crate) async fn remove_workspace_acquisition_without_hook(
+        &self,
+        task_id: &TaskId,
+        acquisition_id: &str,
+    ) -> anyhow::Result<()> {
+        self.remove_workspace_inner(task_id, Some(acquisition_id), false)
             .await
     }
 
@@ -324,6 +333,7 @@ impl WorkspaceManager {
         &self,
         task_id: &TaskId,
         expected_acquisition_id: Option<&str>,
+        run_before_remove_hook: bool,
     ) -> anyhow::Result<()> {
         let snapshot = match self
             .active
@@ -338,17 +348,19 @@ impl WorkspaceManager {
         };
         let mut guard = WorkspaceRemovalGuard::new(self, task_id, snapshot.clone());
 
-        if let Some(hook) = &self.config.before_remove_hook {
-            let timeout_secs = self.config.hook_timeout_secs;
-            match timeout(
-                Duration::from_secs(timeout_secs),
-                run_hook(hook, &snapshot.workspace_path),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!("before_remove_hook failed: {error}"),
-                Err(_) => tracing::warn!("before_remove_hook timed out after {timeout_secs}s"),
+        if run_before_remove_hook {
+            if let Some(hook) = &self.config.before_remove_hook {
+                let timeout_secs = self.config.hook_timeout_secs;
+                match timeout(
+                    Duration::from_secs(timeout_secs),
+                    run_hook(hook, &snapshot.workspace_path),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!("before_remove_hook failed: {error}"),
+                    Err(_) => tracing::warn!("before_remove_hook timed out after {timeout_secs}s"),
+                }
             }
         }
 

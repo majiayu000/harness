@@ -107,6 +107,34 @@ pub(crate) enum ActiveWorkspaceState {
     CleanupRequired,
 }
 
+pub(crate) struct WorkspaceCleanupOperation {
+    pub(crate) lock: tokio::sync::Mutex<()>,
+    workflow_hook_claimed: std::sync::atomic::AtomicBool,
+    manager_hook_claimed: std::sync::atomic::AtomicBool,
+}
+
+impl WorkspaceCleanupOperation {
+    fn new() -> Self {
+        Self {
+            lock: tokio::sync::Mutex::new(()),
+            workflow_hook_claimed: std::sync::atomic::AtomicBool::new(false),
+            manager_hook_claimed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn claim_workflow_hook(&self) -> bool {
+        !self
+            .workflow_hook_claimed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn claim_manager_hook(&self) -> bool {
+        !self
+            .manager_hook_claimed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveWorkspaceSnapshot {
     workspace_path: PathBuf,
@@ -282,7 +310,7 @@ pub struct WorkspaceManager {
     released_workspace_paths: Arc<DashMap<String, PathBuf>>,
     pub(crate) owner_session: String,
     git_ops: Arc<tokio::sync::Mutex<()>>,
-    cleanup_ops: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    cleanup_ops: Arc<DashMap<String, Arc<WorkspaceCleanupOperation>>>,
     pool: WorkspacePool,
     lease_store: Option<Arc<WorkspaceLeaseStore>>,
     capacity_source: Option<WorkspaceCapacitySource>,
@@ -364,19 +392,21 @@ impl WorkspaceManager {
         }
     }
 
-    pub(crate) fn local_workspace_cleanup_operation(
+    pub(crate) fn workspace_cleanup_operation(
         &self,
         acquisition_id: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<()>>> {
-        self.lease_store.is_none().then(|| {
-            workspace_active_reuse::workspace_cleanup_operation(&self.cleanup_ops, acquisition_id)
-        })
+    ) -> Arc<WorkspaceCleanupOperation> {
+        workspace_active_reuse::workspace_cleanup_operation(&self.cleanup_ops, acquisition_id)
+    }
+
+    pub(crate) fn workspace_cleanup_uses_local_serialization(&self) -> bool {
+        self.lease_store.is_none()
     }
 
     pub(crate) fn forget_local_workspace_cleanup_operation(
         &self,
         acquisition_id: &str,
-        cleanup_operation: &Arc<tokio::sync::Mutex<()>>,
+        cleanup_operation: &Arc<WorkspaceCleanupOperation>,
     ) {
         self.cleanup_ops.remove_if(acquisition_id, |_, current| {
             Arc::ptr_eq(current, cleanup_operation)

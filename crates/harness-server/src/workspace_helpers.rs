@@ -152,6 +152,34 @@ pub(crate) async fn run_hook(script: &str, cwd: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) async fn run_workspace_cleanup_hook(
+    task_id: &TaskId,
+    label: &str,
+    hook: Option<&str>,
+    hook_timeout_secs: u64,
+    workspace_path: &Path,
+) {
+    let Some(hook) = hook else {
+        return;
+    };
+    match timeout(
+        Duration::from_secs(hook_timeout_secs),
+        run_hook(hook, workspace_path),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            task_id = %task_id.0,
+            "{label} hook failed during workspace cleanup: {error}"
+        ),
+        Err(_) => tracing::warn!(
+            task_id = %task_id.0,
+            "{label} hook timed out during workspace cleanup"
+        ),
+    }
+}
+
 pub(super) fn workspace_git_dir(workspace_path: &Path) -> anyhow::Result<PathBuf> {
     let dot_git = workspace_path.join(".git");
     let metadata = std::fs::metadata(&dot_git)?;

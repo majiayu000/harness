@@ -230,16 +230,18 @@ async fn cleanup_terminal_runtime_workspace_with_admission(
                     .acquisition_id()
                     .map(str::to_owned)
                     .or(active_acquisition_id);
-                let cleanup_operation = acquisition_id.as_deref().and_then(|acquisition_id| {
-                    workspace_mgr.local_workspace_cleanup_operation(acquisition_id)
-                });
-                let cleanup_guard = match cleanup_operation.as_ref() {
-                    Some(cleanup_operation) => {
-                        Some(Arc::clone(cleanup_operation).lock_owned().await)
+                let cleanup_operation = acquisition_id
+                    .as_deref()
+                    .map(|acquisition_id| workspace_mgr.workspace_cleanup_operation(acquisition_id));
+                let serialized_locally = workspace_mgr.workspace_cleanup_uses_local_serialization();
+                let cleanup_guard = match (serialized_locally, cleanup_operation.as_ref()) {
+                    (true, Some(cleanup_operation)) => {
+                        Some(cleanup_operation.lock.lock().await)
                     }
-                    None => None,
+                    _ => None,
                 };
-                if cleanup_operation.is_some()
+                if serialized_locally
+                    && cleanup_operation.is_some()
                     && workspace_mgr
                         .active_workspace_acquisition_id(&target.task_id, &target.workspace_path)
                         .as_deref()
@@ -262,22 +264,15 @@ async fn cleanup_terminal_runtime_workspace_with_admission(
                 else {
                     continue;
                 };
-                if let Some(hook) = workflow_document.config.hooks.before_remove.as_deref() {
-                    if let Err(error) = run_workflow_hook(
-                        "before_remove",
-                        hook,
-                        &target.workspace_path,
+                workspace_mgr
+                    .run_workspace_cleanup_hooks_once(
+                        cleanup_operation.as_deref(),
+                        &target.task_id,
+                        workflow_document.config.hooks.before_remove.as_deref(),
                         workflow_document.config.hooks.timeout_secs,
+                        &target.workspace_path,
                     )
-                    .await
-                    {
-                        tracing::warn!(
-                            workflow_id = %workflow.id,
-                            workspace_path = %target.workspace_path.display(),
-                            "before_remove hook failed during terminal runtime workspace cleanup: {error}"
-                        );
-                    }
-                }
+                    .await;
                 let outcome = if let Some(acquisition_id) = acquisition_id.as_deref() {
                     if !target.is_persisted() && !target.workspace_path.exists() {
                         workspace_mgr

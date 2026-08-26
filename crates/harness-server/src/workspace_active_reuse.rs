@@ -24,7 +24,7 @@ struct CancelledWorkspaceSetupCleanup {
     released_paths: Arc<DashMap<TaskId, PathBuf>>,
     released_workspace_paths: Arc<DashMap<String, PathBuf>>,
     git_ops: Arc<tokio::sync::Mutex<()>>,
-    cleanup_ops: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    cleanup_ops: Arc<DashMap<String, Arc<WorkspaceCleanupOperation>>>,
     lease_store: Option<Arc<WorkspaceLeaseStore>>,
     workflow_before_remove_hook: Option<String>,
     workflow_hook_timeout_secs: u64,
@@ -33,19 +33,19 @@ struct CancelledWorkspaceSetupCleanup {
 }
 
 pub(super) fn workspace_cleanup_operation(
-    cleanup_ops: &DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    cleanup_ops: &DashMap<String, Arc<WorkspaceCleanupOperation>>,
     acquisition_id: &str,
-) -> Arc<tokio::sync::Mutex<()>> {
+) -> Arc<WorkspaceCleanupOperation> {
     cleanup_ops
         .entry(acquisition_id.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .or_insert_with(|| Arc::new(WorkspaceCleanupOperation::new()))
         .clone()
 }
 
 fn remove_workspace_cleanup_operation(
-    cleanup_ops: &DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    cleanup_ops: &DashMap<String, Arc<WorkspaceCleanupOperation>>,
     acquisition_id: &str,
-    cleanup_operation: &Arc<tokio::sync::Mutex<()>>,
+    cleanup_operation: &Arc<WorkspaceCleanupOperation>,
 ) {
     cleanup_ops.remove_if(acquisition_id, |_, current| {
         Arc::ptr_eq(current, cleanup_operation)
@@ -73,39 +73,9 @@ pub(super) fn retry_cleanup_target_is_current(
 }
 
 impl CancelledWorkspaceSetupCleanup {
-    async fn run_before_remove_hook(
-        &self,
-        task_id: &TaskId,
-        label: &str,
-        hook: Option<&str>,
-        hook_timeout_secs: u64,
-        workspace_path: &Path,
-    ) {
-        let Some(hook) = hook else {
-            return;
-        };
-        match timeout(
-            Duration::from_secs(hook_timeout_secs),
-            run_hook(hook, workspace_path),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(
-                task_id = %task_id.0,
-                "{label} hook failed during cancelled workspace setup cleanup: {error}"
-            ),
-            Err(_) => tracing::warn!(
-                task_id = %task_id.0,
-                "{label} hook timed out during cancelled workspace setup cleanup"
-            ),
-        }
-    }
-
     async fn converge(self, task_id: TaskId, snapshot: ActiveWorkspaceSnapshot) {
         let cleanup_operation =
             workspace_cleanup_operation(&self.cleanup_ops, &snapshot.acquisition_id);
-        let mut removal_hooks_completed = false;
         let mut attempt = 1_u64;
         loop {
             let still_current = self.active.get(&task_id).is_some_and(|active| {
@@ -121,7 +91,7 @@ impl CancelledWorkspaceSetupCleanup {
                 return;
             }
 
-            let cleanup_guard = cleanup_operation.lock().await;
+            let cleanup_guard = cleanup_operation.lock.lock().await;
             let still_current = self.active.get(&task_id).is_some_and(|active| {
                 active.acquisition_id == snapshot.acquisition_id
                     && active.state == ActiveWorkspaceState::CleanupRequired
@@ -169,8 +139,10 @@ impl CancelledWorkspaceSetupCleanup {
                 if !still_current {
                     return Ok(false);
                 }
-                if !removal_hooks_completed {
-                    self.run_before_remove_hook(
+                if self.workflow_before_remove_hook.is_some()
+                    && cleanup_operation.claim_workflow_hook()
+                {
+                    run_workspace_cleanup_hook(
                         &task_id,
                         "workflow before_remove",
                         self.workflow_before_remove_hook.as_deref(),
@@ -178,7 +150,11 @@ impl CancelledWorkspaceSetupCleanup {
                         &snapshot.workspace_path,
                     )
                     .await;
-                    self.run_before_remove_hook(
+                }
+                if self.manager_before_remove_hook.is_some()
+                    && cleanup_operation.claim_manager_hook()
+                {
+                    run_workspace_cleanup_hook(
                         &task_id,
                         "workspace before_remove",
                         self.manager_before_remove_hook.as_deref(),
@@ -186,7 +162,6 @@ impl CancelledWorkspaceSetupCleanup {
                         &snapshot.workspace_path,
                     )
                     .await;
-                    removal_hooks_completed = true;
                 }
                 let _git_ops = self.git_ops.lock().await;
                 let still_current = self.active.get(&task_id).is_some_and(|active| {
@@ -283,6 +258,40 @@ impl WorkspaceManager {
         )
     }
 
+    pub(crate) async fn run_workspace_cleanup_hooks_once(
+        &self,
+        cleanup_operation: Option<&WorkspaceCleanupOperation>,
+        task_id: &TaskId,
+        workflow_hook: Option<&str>,
+        workflow_hook_timeout_secs: u64,
+        workspace_path: &Path,
+    ) {
+        if workflow_hook.is_some()
+            && cleanup_operation.is_none_or(WorkspaceCleanupOperation::claim_workflow_hook)
+        {
+            run_workspace_cleanup_hook(
+                task_id,
+                "workflow before_remove",
+                workflow_hook,
+                workflow_hook_timeout_secs,
+                workspace_path,
+            )
+            .await;
+        }
+        if self.config.before_remove_hook.is_some()
+            && cleanup_operation.is_none_or(WorkspaceCleanupOperation::claim_manager_hook)
+        {
+            run_workspace_cleanup_hook(
+                task_id,
+                "workspace before_remove",
+                self.config.before_remove_hook.as_deref(),
+                self.config.hook_timeout_secs,
+                workspace_path,
+            )
+            .await;
+        }
+    }
+
     pub(crate) async fn cleanup_required_workspace_for_retry(
         &self,
         task_id: &TaskId,
@@ -297,11 +306,12 @@ impl WorkspaceManager {
                 return Ok(());
             }
             active._repository_write_lease = None;
+            active._pool_permit = None;
             ActiveWorkspaceSnapshot::from(active.value())
         };
         let cleanup_operation =
             workspace_cleanup_operation(&self.cleanup_ops, &snapshot.acquisition_id);
-        let cleanup_guard = cleanup_operation.lock().await;
+        let cleanup_guard = cleanup_operation.lock.lock().await;
         let target_is_current = {
             let active = self.active.get(task_id);
             retry_cleanup_target_is_current(
@@ -349,25 +359,15 @@ impl WorkspaceManager {
                 return Ok(());
             }
             drop(active);
-            if let Some(hook) = before_remove_hook {
-                match timeout(
-                    Duration::from_secs(hook_timeout_secs),
-                    run_hook(hook, &snapshot.workspace_path),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::warn!(
-                        task_id = %task_id.0,
-                        "before_remove hook failed during retry cleanup: {error}"
-                    ),
-                    Err(_) => tracing::warn!(
-                        task_id = %task_id.0,
-                        "before_remove hook timed out during retry cleanup"
-                    ),
-                }
-            }
-            self.remove_workspace_acquisition(task_id, &snapshot.acquisition_id)
+            self.run_workspace_cleanup_hooks_once(
+                Some(&cleanup_operation),
+                task_id,
+                before_remove_hook,
+                hook_timeout_secs,
+                &snapshot.workspace_path,
+            )
+            .await;
+            self.remove_workspace_acquisition_without_hook(task_id, &snapshot.acquisition_id)
                 .await
         };
         tokio::pin!(cleanup);
@@ -501,6 +501,7 @@ impl WorkspaceManager {
             if active.acquisition_id == acquisition_id {
                 active.state = ActiveWorkspaceState::CleanupRequired;
                 active._repository_write_lease = None;
+                active._pool_permit = None;
             }
         }
     }
@@ -549,6 +550,7 @@ impl WorkspaceManager {
                 if active.acquisition_id == acquisition_id {
                     active.state = ActiveWorkspaceState::CleanupRequired;
                     active._repository_write_lease = None;
+                    active._pool_permit = None;
                 }
             }
             return Err(WorkspaceLifecycleError::CreateFailed {
@@ -675,6 +677,7 @@ impl Drop for WorkspaceStateGuard<'_> {
             {
                 active.state = ActiveWorkspaceState::CleanupRequired;
                 active._repository_write_lease = None;
+                active._pool_permit = None;
                 Some(ActiveWorkspaceSnapshot::from(active.value()))
             } else {
                 None
@@ -737,6 +740,7 @@ impl Drop for WorkspaceExecutionGuard {
             {
                 active.state = ActiveWorkspaceState::CleanupRequired;
                 active._repository_write_lease = None;
+                active._pool_permit = None;
                 true
             } else {
                 false
