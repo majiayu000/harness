@@ -1,9 +1,11 @@
+use super::migrator::reject_newer_applied_migrations;
 use super::{
     configure_pg_pool_from_server, pg_create_schema_if_not_exists, pg_open_pool, pg_pool_settings,
     pg_schema_for_path, resolve_database_url, validate_schema_name, PgStoreContext,
     DEFAULT_PG_ACQUIRE_TIMEOUT_SECS, DEFAULT_PG_MAX_CONNECTIONS,
 };
 use crate::config::server::ServerConfig;
+use crate::db::Migration;
 use crate::db_pg_schema_registry::{PG_SCHEMA_REGISTRY_SCHEMA, PG_SCHEMA_REGISTRY_TABLE};
 use crate::test_support::process_env_lock;
 use std::path::Path;
@@ -52,6 +54,42 @@ where
             configure_pg_pool_from_server(&ServerConfig::default());
         },
     );
+}
+
+#[test]
+fn migrator_rejects_schema_newer_than_binary() {
+    let applied = [1, 2].into_iter().collect();
+    let known = [Migration {
+        version: 1,
+        description: "known migration",
+        sql: "SELECT 1",
+    }];
+
+    let error = reject_newer_applied_migrations(&applied, &known)
+        .expect_err("newer schema must fail closed");
+
+    assert!(error.to_string().contains("v2"));
+    assert!(error.to_string().contains("latest known: v1"));
+}
+
+#[test]
+fn migrator_accepts_schema_at_binary_version() {
+    let applied = [1, 2].into_iter().collect();
+    let known = [
+        Migration {
+            version: 1,
+            description: "first migration",
+            sql: "SELECT 1",
+        },
+        Migration {
+            version: 2,
+            description: "second migration",
+            sql: "SELECT 2",
+        },
+    ];
+
+    reject_newer_applied_migrations(&applied, &known)
+        .expect("matching schema version should be accepted");
 }
 
 #[test]

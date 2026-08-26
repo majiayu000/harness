@@ -225,7 +225,7 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
 
     // Execute pending workflow runtime jobs through registered agent runtimes
     // when the workflow policy keeps the worker enabled.
-    background::spawn_runtime_job_workers(&state);
+    let runtime_worker_supervisor = background::spawn_runtime_job_workers(&state);
 
     let initial_grade = {
         let events = state
@@ -278,6 +278,11 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
         .map_err(|error| anyhow::anyhow!("HTTP server task failed: {error}"))?;
     tracing::info!("server shutting down");
     ws_shutdown_tx.send(()).ok();
+    if let Some(supervisor) = runtime_worker_supervisor {
+        supervisor
+            .await
+            .map_err(|error| anyhow::anyhow!("runtime worker supervisor failed: {error}"))?;
+    }
     // Bounded alert flush before the event store closes (GH1582 B-018).
     state.observability.alerts.shutdown().await;
     state.observability.events.shutdown().await;

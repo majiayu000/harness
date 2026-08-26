@@ -13,9 +13,10 @@ const TEST_REPOSITORY_LOCK_CAPACITY: u32 = 4;
 
 #[path = "workspace_cleanup_store.rs"]
 mod workspace_cleanup_store;
+#[cfg(test)]
+pub(crate) use workspace_cleanup_store::WORKSPACE_CLEANUP_TARGETS_TABLE_SQL;
 pub(crate) use workspace_cleanup_store::{
     PersistedWorkspaceCleanupClaim, WorkspaceCleanupHook, WorkspaceCleanupTargetRecord,
-    WORKSPACE_CLEANUP_TARGETS_TABLE_SQL,
 };
 #[path = "workspace_repository_lock.rs"]
 mod workspace_repository_lock;
@@ -192,7 +193,7 @@ impl WorkspaceLeaseStore {
         let cleanup_claims: Vec<bool> = sqlx::query_scalar(
             "SELECT cleanup_claim_id IS NOT NULL
                     AND COALESCE(cleanup_claim_expires_at > CURRENT_TIMESTAMP, FALSE)
-             FROM workspace_cleanup_targets
+             FROM workspace_cleanup_targets_v2
              WHERE store_key = $1 AND workspace_path = $2
              FOR UPDATE",
         )
@@ -258,7 +259,7 @@ impl WorkspaceLeaseStore {
         if persist_cleanup_target {
             if let Some(runtime_workflow_id) = record.runtime_workflow_id.as_deref() {
                 sqlx::query(
-                    "INSERT INTO workspace_cleanup_targets (
+                    "INSERT INTO workspace_cleanup_targets_v2 (
                     store_key, runtime_workflow_id, workspace_path, task_id, project_key,
                     slot_index, workspace_key, source_repo, repo, owner_session, run_generation,
                     acquisition_id, process_id, process_started_at, created_at, last_used_at
@@ -305,7 +306,7 @@ impl WorkspaceLeaseStore {
             }
         } else {
             sqlx::query(
-                "DELETE FROM workspace_cleanup_targets
+                "DELETE FROM workspace_cleanup_targets_v2
                  WHERE store_key = $1
                    AND runtime_workflow_id IS NOT DISTINCT FROM $2
                    AND workspace_path = $3

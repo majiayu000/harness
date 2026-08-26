@@ -7,7 +7,7 @@ use harness_core::config::HarnessConfig;
 use harness_core::error::HarnessError;
 use harness_core::types::{AgentId, Capability, Item, TokenUsage, TurnStatus};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Arc,
 };
 
@@ -15,7 +15,7 @@ struct SilentLifecycleAgent;
 
 struct PendingDrainAdapter {
     terminate_calls: Arc<AtomicUsize>,
-    terminate_error: bool,
+    terminate_failures_remaining: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -34,7 +34,13 @@ impl AgentAdapter for PendingDrainAdapter {
 
     async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
         self.terminate_calls.fetch_add(1, Ordering::AcqRel);
-        if self.terminate_error {
+        if self
+            .terminate_failures_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
             return Err(HarnessError::AgentExecution(
                 "forced termination failed".to_string(),
             ));
@@ -186,13 +192,14 @@ async fn lifecycle_drains_pending_adapter_after_stall_and_wall_clock_timeout() -
         config.agents.default_agent = "codex".to_string();
         let terminate_calls = Arc::new(AtomicUsize::new(0));
         let terminate_calls_for_factory = terminate_calls.clone();
+        let terminate_failures_remaining = Arc::new(AtomicUsize::new(0));
         let mut registry = AgentRegistry::new("codex");
         registry.register("codex", Arc::new(SilentLifecycleAgent));
         registry
             .register_turn_backend_factory("codex", move || {
                 Arc::new(PendingDrainAdapter {
                     terminate_calls: terminate_calls_for_factory.clone(),
-                    terminate_error: false,
+                    terminate_failures_remaining: terminate_failures_remaining.clone(),
                 })
             })
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -229,20 +236,22 @@ async fn lifecycle_drains_pending_adapter_after_stall_and_wall_clock_timeout() -
 }
 
 #[tokio::test]
-async fn lifecycle_retains_running_turn_when_agent_cannot_be_drained() -> anyhow::Result<()> {
+async fn lifecycle_retries_drain_before_persisting_terminal_turn() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let mut config = HarnessConfig::default();
     config.server.project_root = root.path().to_path_buf();
     config.agents.default_agent = "codex".to_string();
     let terminate_calls = Arc::new(AtomicUsize::new(0));
     let terminate_calls_for_factory = terminate_calls.clone();
+    let terminate_failures_remaining = Arc::new(AtomicUsize::new(1));
+    let terminate_failures_for_factory = terminate_failures_remaining.clone();
     let mut registry = AgentRegistry::new("codex");
     registry.register("codex", Arc::new(SilentLifecycleAgent));
     registry
         .register_turn_backend_factory("codex", move || {
             Arc::new(PendingDrainAdapter {
                 terminate_calls: terminate_calls_for_factory.clone(),
-                terminate_error: true,
+                terminate_failures_remaining: terminate_failures_for_factory.clone(),
             })
         })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -256,8 +265,6 @@ async fn lifecycle_retains_running_turn_when_agent_cannot_be_drained() -> anyhow
         AgentId::from_str("codex"),
     )?;
     let (notification_tx, _) = tokio::sync::broadcast::channel(16);
-    let termination_not_drained = Arc::new(AtomicBool::new(false));
-
     run_turn_lifecycle_with_options(
         server.clone(),
         None,
@@ -269,18 +276,17 @@ async fn lifecycle_retains_running_turn_when_agent_cannot_be_drained() -> anyhow
         TurnLifecycleOptions {
             timeout_secs: Some(1),
             stall_timeout_secs: Some(600),
-            termination_not_drained: Some(termination_not_drained.clone()),
             ..TurnLifecycleOptions::default()
         },
     )
     .await;
 
-    assert_eq!(terminate_calls.load(Ordering::Acquire), 1);
-    assert!(termination_not_drained.load(Ordering::Acquire));
+    assert_eq!(terminate_calls.load(Ordering::Acquire), 2);
+    assert_eq!(terminate_failures_remaining.load(Ordering::Acquire), 0);
     let turn = server
         .thread_manager
         .get_turn(&thread_id, &turn_id)
         .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
-    assert_eq!(turn.status, TurnStatus::Running);
+    assert_eq!(turn.status, TurnStatus::Failed);
     Ok(())
 }

@@ -35,9 +35,6 @@ pub(crate) struct TurnLifecycleOptions {
     /// established before dispatch. The marker is consumed here and is not
     /// persisted as a transcript item.
     pub egress_verified_at_dispatch: Option<Arc<AtomicBool>>,
-    /// Set when forced termination cannot confirm that the agent stopped
-    /// mutating its workspace. Callers must retain the workspace in that case.
-    pub termination_not_drained: Option<Arc<AtomicBool>>,
     /// Stateful lease-lost signal (watch channel): when the owning runtime
     /// job lease is lost mid-turn, the turn interrupts the agent so the
     /// child process terminates and the workspace cleanup can run (GH-1877).
@@ -404,16 +401,18 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     drop(execution);
     if terminate_execution_after_drop {
         if let Some(adapter) = execution_terminator.as_ref() {
-            if let Err(error) = adapter.terminate_and_drain().await {
-                if let Some(not_drained) = options.termination_not_drained.as_ref() {
-                    not_drained.store(true, Ordering::Release);
+            loop {
+                match adapter.terminate_and_drain().await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        tracing::error!(
+                            thread_id = %thread_id,
+                            turn_id = %turn_id,
+                            "failed to force-stop and drain agent after an early turn exit; retrying: {error}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
                 }
-                tracing::error!(
-                    thread_id = %thread_id,
-                    turn_id = %turn_id,
-                    "failed to force-stop and drain agent after an early turn exit: {error}"
-                );
-                return;
             }
         }
     }

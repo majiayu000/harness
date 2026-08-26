@@ -250,7 +250,6 @@ impl<'a> RuntimeWorker<'a> {
     ) -> anyhow::Result<RuntimeJobExecution> {
         let mut lease_expires_at = initial_lease_expires_at;
         let renewal_interval = runtime_lease_renewal_interval(self.lease_ttl);
-        let activity = runtime_job_activity_name(job);
         let execution = executor.execute(job.clone());
         tokio::pin!(execution);
 
@@ -279,21 +278,11 @@ impl<'a> RuntimeWorker<'a> {
                         // Lease lost mid-turn: cancel the in-flight agent and
                         // wait for the executor's cleanup (agent termination +
                         // workspace release) so a reclaimer never sees a
-                        // dirty tree. Bounded by a grace period; if cleanup
-                        // does not finish, the future is dropped and the
-                        // workspace reaper is the backstop (GH-1877).
+                        // dirty tree. This wait is intentionally unbounded:
+                        // dropping the executor cannot prove that an external
+                        // agent stopped mutating its workspace (GH-1877).
                         executor.cancel_execution(job).await;
-                        let cleanup_grace = std::time::Duration::from_secs(30);
-                        let result = match tokio::time::timeout(cleanup_grace, &mut execution)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => ActivityResult::failed(
-                                activity,
-                                "Runtime job lease was lost before the agent completed.",
-                                "Another runtime worker reclaimed the job after this worker's lease expired; agent cleanup exceeded the grace period.",
-                            ),
-                        };
+                        let result = (&mut execution).await;
                         return Ok(RuntimeJobExecution {
                             result,
                             lease_expires_at,

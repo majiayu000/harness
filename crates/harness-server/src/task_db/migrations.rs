@@ -1,5 +1,52 @@
 use harness_core::db::Migration;
 
+const WORKSPACE_CLEANUP_TARGETS_MIGRATION_V27_SQL: &str =
+    "ALTER TABLE workspace_leases ADD COLUMN IF NOT EXISTS acquisition_id TEXT;
+CREATE TABLE IF NOT EXISTS workspace_cleanup_targets (
+    store_key           TEXT NOT NULL DEFAULT current_schema(),
+    runtime_workflow_id TEXT NOT NULL,
+    workspace_path      TEXT NOT NULL,
+    task_id             TEXT NOT NULL,
+    project_key         TEXT NOT NULL,
+    slot_index          BIGINT NOT NULL,
+    workspace_key       TEXT NOT NULL,
+    source_repo         TEXT NOT NULL,
+    repo                TEXT,
+    owner_session       TEXT NOT NULL,
+    run_generation      BIGINT NOT NULL,
+    acquisition_id      TEXT,
+    process_id          BIGINT NOT NULL,
+    process_started_at  BIGINT NOT NULL DEFAULT 0,
+    cleanup_in_progress BOOLEAN NOT NULL DEFAULT FALSE,
+    cleanup_claim_id TEXT,
+    cleanup_owner_session TEXT,
+    cleanup_process_id BIGINT,
+    cleanup_process_started_at BIGINT,
+    cleanup_claim_expires_at TIMESTAMPTZ,
+    workflow_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE,
+    manager_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(store_key, runtime_workflow_id, workspace_path)
+);
+ALTER TABLE workspace_cleanup_targets
+    ADD COLUMN IF NOT EXISTS workflow_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE workspace_cleanup_targets
+    ADD COLUMN IF NOT EXISTS manager_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_workspace_cleanup_targets_workflow
+    ON workspace_cleanup_targets(store_key, runtime_workflow_id, last_used_at);
+INSERT INTO workspace_cleanup_targets (
+    store_key, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
+    workspace_key, source_repo, repo, owner_session, run_generation, acquisition_id, process_id,
+    process_started_at, created_at, last_used_at
+)
+SELECT store_key, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
+       workspace_key, source_repo, repo, owner_session, run_generation, acquisition_id, process_id,
+       process_started_at, acquired_at, last_used_at
+FROM workspace_leases
+WHERE runtime_workflow_id IS NOT NULL
+ON CONFLICT(store_key, runtime_workflow_id, workspace_path) DO NOTHING";
+
 /// Versioned migrations for the tasks table.
 ///
 /// v1 – baseline schema (all columns including those added in later iterations)
@@ -273,7 +320,7 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 27,
         description: "create durable runtime workspace cleanup targets",
-        sql: crate::workspace_lease_store::WORKSPACE_CLEANUP_TARGETS_TABLE_SQL,
+        sql: WORKSPACE_CLEANUP_TARGETS_MIGRATION_V27_SQL,
     },
     Migration {
         version: 28,
@@ -302,6 +349,32 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
               UPDATE workspace_cleanup_targets
               SET workflow_hook_claimed = TRUE, manager_hook_claimed = TRUE
               WHERE cleanup_in_progress = TRUE",
+    },
+    Migration {
+        version: 31,
+        description: "fence legacy runtime workspace cleanup writers",
+        sql: "LOCK TABLE workspace_cleanup_targets IN ACCESS EXCLUSIVE MODE;
+              DO $$
+              BEGIN
+                  IF EXISTS (
+                      SELECT 1 FROM workspace_cleanup_targets WHERE cleanup_in_progress = TRUE
+                  ) THEN
+                      RAISE EXCEPTION 'cannot upgrade workspace cleanup schema while cleanup is in progress';
+                  END IF;
+              END
+              $$;
+              ALTER TABLE workspace_cleanup_targets
+              RENAME TO workspace_cleanup_targets_v2;
+              CREATE FUNCTION reject_legacy_workspace_cleanup_targets()
+              RETURNS SETOF workspace_cleanup_targets_v2
+              LANGUAGE plpgsql
+              AS $$
+              BEGIN
+                  RAISE EXCEPTION 'workspace cleanup schema requires a current Harness binary';
+              END
+              $$;
+              CREATE VIEW workspace_cleanup_targets AS
+              SELECT * FROM reject_legacy_workspace_cleanup_targets()",
     },
 ];
 
@@ -421,5 +494,27 @@ mod tests {
         assert!(migration.sql.contains("NOT NULL DEFAULT FALSE"));
         assert!(migration.sql.contains("SET workflow_hook_claimed = TRUE"));
         assert!(migration.sql.contains("WHERE cleanup_in_progress = TRUE"));
+    }
+
+    #[test]
+    fn legacy_cleanup_writer_fence_requires_quiescence() {
+        let migration = TASK_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 31)
+            .expect("v31 migration should exist");
+
+        assert!(migration
+            .sql
+            .contains("LOCK TABLE workspace_cleanup_targets"));
+        assert!(migration.sql.contains("cleanup_in_progress = TRUE"));
+        assert!(migration
+            .sql
+            .contains("RENAME TO workspace_cleanup_targets_v2"));
+        assert!(migration
+            .sql
+            .contains("CREATE VIEW workspace_cleanup_targets"));
+        assert!(migration
+            .sql
+            .contains("reject_legacy_workspace_cleanup_targets"));
     }
 }

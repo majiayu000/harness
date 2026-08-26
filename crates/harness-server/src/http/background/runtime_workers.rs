@@ -131,7 +131,6 @@ fn spawn_runtime_worker_ticks(
 }
 
 fn stop_runtime_job_worker_supervisor_for_shutdown(
-    workers: &mut RuntimeWorkerJoinSet,
     shutdown_result: Result<(), tokio::sync::broadcast::error::RecvError>,
 ) {
     match shutdown_result {
@@ -145,33 +144,39 @@ fn stop_runtime_job_worker_supervisor_for_shutdown(
             );
         }
     }
-    workers.abort_all();
+}
+
+async fn drain_runtime_worker_ticks_for_shutdown(mut workers: RuntimeWorkerJoinSet) {
+    while let Some(result) = workers.join_next().await {
+        log_runtime_worker_tick_result(result);
+    }
 }
 
 pub(super) async fn runtime_worker_sleep_or_shutdown(
     delay: std::time::Duration,
     shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
-    workers: &mut RuntimeWorkerJoinSet,
 ) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(delay) => false,
         shutdown_result = shutdown_rx.recv() => {
-            stop_runtime_job_worker_supervisor_for_shutdown(workers, shutdown_result);
+            stop_runtime_job_worker_supervisor_for_shutdown(shutdown_result);
             true
         }
     }
 }
 
-pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
+pub(in crate::http) fn spawn_runtime_job_workers(
+    state: &Arc<AppState>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if state.core.workflow_runtime_store.is_none() {
         tracing::debug!("workflow runtime job workers disabled: store unavailable");
-        return;
+        return None;
     }
 
     let weak_state = Arc::downgrade(state);
     let mut shutdown_rx = state.notifications.ws_shutdown_tx.subscribe();
     let handle = state.background_loops.register_loop("runtime_job_workers");
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut workers = tokio::task::JoinSet::new();
         let active_worker_state_clones = Arc::new(AtomicUsize::new(0));
         let mut next_worker_id = 0;
@@ -188,7 +193,6 @@ pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                     if runtime_worker_sleep_or_shutdown(
                         std::time::Duration::from_secs(RUNTIME_WORKFLOW_CONFIG_RETRY_SECS),
                         &mut shutdown_rx,
-                        &mut workers,
                     )
                     .await
                     {
@@ -211,7 +215,6 @@ pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                     worker_state_clones,
                     "workflow runtime job worker supervisor stopping: app state owner dropped"
                 );
-                workers.abort_all();
                 break;
             }
             spawn_runtime_worker_ticks(
@@ -229,11 +232,12 @@ pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                 handle.tick_ok();
             }
             handle.set_interval(interval.as_secs());
-            if runtime_worker_sleep_or_shutdown(interval, &mut shutdown_rx, &mut workers).await {
+            if runtime_worker_sleep_or_shutdown(interval, &mut shutdown_rx).await {
                 break;
             }
         }
-    });
+        drain_runtime_worker_ticks_for_shutdown(workers).await;
+    }))
 }
 
 #[cfg(test)]
@@ -245,5 +249,21 @@ mod tests {
         let error = log_runtime_worker_tick_result(Ok(Err(anyhow::anyhow!("worker failed"))));
 
         assert_eq!(error.as_deref(), Some("worker failed"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_does_not_abort_active_worker_ticks() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut workers = RuntimeWorkerJoinSet::new();
+        workers.spawn(async move {
+            release_rx.await.expect("release worker");
+            Err(anyhow::anyhow!("test worker released"))
+        });
+        let drain = tokio::spawn(drain_runtime_worker_ticks_for_shutdown(workers));
+
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        release_tx.send(()).expect("release drain");
+        drain.await.expect("drain task");
     }
 }

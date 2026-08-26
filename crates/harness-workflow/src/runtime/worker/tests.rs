@@ -290,6 +290,7 @@ fn prompt_task_instance() -> WorkflowInstance {
 
 struct LeaseLostExecutor {
     cancel_calls: Arc<AtomicUsize>,
+    cancel_observed: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
 
@@ -302,7 +303,7 @@ impl RuntimeJobExecutor for LeaseLostExecutor {
 
     async fn cancel_execution(&self, _job: &RuntimeJob) {
         self.cancel_calls.fetch_add(1, Ordering::SeqCst);
-        self.release.notify_waiters();
+        self.cancel_observed.notify_one();
     }
 }
 
@@ -324,9 +325,11 @@ async fn lease_lost_cancels_execution_and_waits_for_cleanup() -> anyhow::Result<
     .await?;
 
     let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let cancel_observed = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let executor = LeaseLostExecutor {
         cancel_calls: Arc::clone(&cancel_calls),
+        cancel_observed: Arc::clone(&cancel_observed),
         release: Arc::clone(&release),
     };
     // Short lease so the renewal loop hits the tampered lease quickly; the
@@ -348,7 +351,20 @@ async fn lease_lost_cancels_execution_and_waits_for_cleanup() -> anyhow::Result<
         .expect("lease tamper should apply");
     });
 
-    let completed = worker.run_once(&executor).await?;
+    let completed = worker.run_once(&executor);
+    tokio::pin!(completed);
+    tokio::select! {
+        _ = cancel_observed.notified() => {}
+        result = &mut completed => panic!("worker returned before cancellation was observed: {result:?}"),
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut completed)
+            .await
+            .is_err(),
+        "lease loss must keep waiting while executor cleanup is incomplete"
+    );
+    release.notify_waiters();
+    let completed = completed.await?;
 
     assert_eq!(
         cancel_calls.load(Ordering::SeqCst),

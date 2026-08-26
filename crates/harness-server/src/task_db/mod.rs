@@ -408,7 +408,7 @@ pub async fn migrate_legacy_task_db_if_needed(
         .await?;
 
     let cleanup_targets_sql = format!(
-        "INSERT INTO workspace_cleanup_targets (
+        "INSERT INTO workspace_cleanup_targets_v2 (
             store_key, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
             workspace_key, source_repo, repo, owner_session, run_generation, process_id,
             acquisition_id, process_started_at, created_at, last_used_at,
@@ -418,7 +418,7 @@ pub async fn migrate_legacy_task_db_if_needed(
                 workspace_key, source_repo, repo, owner_session, run_generation, process_id,
                 acquisition_id, process_started_at, created_at, last_used_at,
                 workflow_hook_claimed, manager_hook_claimed
-         FROM {legacy_schema_sql}.workspace_cleanup_targets
+         FROM {legacy_schema_sql}.workspace_cleanup_targets_v2
          ON CONFLICT (store_key, runtime_workflow_id, workspace_path) DO NOTHING"
     );
     sqlx::query(&cleanup_targets_sql)
@@ -472,5 +472,29 @@ mod tests {
     #[test]
     fn numbered_placeholders_offset() {
         assert_eq!(TaskDb::numbered_placeholders(4, 2), "$4, $5");
+    }
+
+    #[tokio::test]
+    async fn current_schema_rejects_legacy_cleanup_table_reads() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let db = TaskDb::open(&dir.path().join("legacy-cleanup-fence")).await?;
+
+        let current_table_exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('workspace_cleanup_targets_v2') IS NOT NULL")
+                .fetch_one(&db.pool)
+                .await?;
+        assert!(current_table_exists);
+
+        let error = sqlx::query("SELECT * FROM workspace_cleanup_targets")
+            .fetch_all(&db.pool)
+            .await
+            .expect_err("legacy cleanup table access must fail closed");
+        assert!(error
+            .to_string()
+            .contains("workspace cleanup schema requires a current Harness binary"));
+        Ok(())
     }
 }

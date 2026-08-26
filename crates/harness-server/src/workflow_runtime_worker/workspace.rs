@@ -44,18 +44,6 @@ pub(super) enum RuntimeWorkspaceFinishAction {
     Release,
 }
 
-pub(super) fn quarantine_runtime_workspace(workspace: PreparedRuntimeWorkspace) -> anyhow::Error {
-    let workspace_path = workspace.run_project.clone();
-    tokio::spawn(async move {
-        let _quarantined_workspace = workspace;
-        std::future::pending::<()>().await;
-    });
-    anyhow::anyhow!(
-        "agent termination could not be confirmed; runtime workspace {} was retained",
-        workspace_path.display()
-    )
-}
-
 pub(super) async fn prepare_runtime_workspace(
     state: &Arc<AppState>,
     job: &RuntimeJob,

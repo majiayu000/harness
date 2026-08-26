@@ -224,13 +224,13 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<Option<bool>> {
         let query = match hook {
             WorkspaceCleanupHook::Workflow => {
-                "UPDATE workspace_cleanup_targets
+                "UPDATE workspace_cleanup_targets_v2
                  SET workflow_hook_claimed = TRUE, last_used_at = CURRENT_TIMESTAMP
                  WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
                    AND workflow_hook_claimed = FALSE"
             }
             WorkspaceCleanupHook::Manager => {
-                "UPDATE workspace_cleanup_targets
+                "UPDATE workspace_cleanup_targets_v2
                  SET manager_hook_claimed = TRUE, last_used_at = CURRENT_TIMESTAMP
                  WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
                    AND manager_hook_claimed = FALSE"
@@ -249,7 +249,7 @@ impl WorkspaceLeaseStore {
         }
         let target_exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
-                SELECT 1 FROM workspace_cleanup_targets
+                SELECT 1 FROM workspace_cleanup_targets_v2
                 WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
              )",
         )
@@ -273,7 +273,7 @@ impl WorkspaceLeaseStore {
         let existing_claim_is_live: Option<bool> = sqlx::query_scalar(
             "SELECT cleanup_claim_id IS NOT NULL
                     AND COALESCE(cleanup_claim_expires_at > CURRENT_TIMESTAMP, FALSE)
-             FROM workspace_cleanup_targets
+             FROM workspace_cleanup_targets_v2
              WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
                AND task_id = $4 AND project_key = $5 AND slot_index = $6
                AND owner_session = $7 AND run_generation = $8
@@ -340,7 +340,7 @@ impl WorkspaceLeaseStore {
             return Ok(false);
         }
         sqlx::query(
-            "UPDATE workspace_cleanup_targets
+            "UPDATE workspace_cleanup_targets_v2
              SET cleanup_in_progress = TRUE,
                  cleanup_claim_id = $4,
                  cleanup_owner_session = $5,
@@ -375,7 +375,7 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
-            "DELETE FROM workspace_cleanup_targets
+            "DELETE FROM workspace_cleanup_targets_v2
              WHERE store_key = $1 AND project_key = $2 AND slot_index = $3
                AND task_id = $4 AND owner_session = $5 AND run_generation = $6
                AND acquisition_id = $7",
@@ -438,7 +438,7 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<Vec<String>> {
         Ok(sqlx::query_scalar(
             "SELECT DISTINCT runtime_workflow_id
-             FROM workspace_cleanup_targets
+             FROM workspace_cleanup_targets_v2
              WHERE store_key = $1
                AND ($2::TEXT IS NULL OR runtime_workflow_id > $2)
              ORDER BY runtime_workflow_id
@@ -459,7 +459,7 @@ impl WorkspaceLeaseStore {
             "SELECT project_key, slot_index, task_id, workspace_key, workspace_path, source_repo,
                     repo, runtime_workflow_id, owner_session, run_generation, acquisition_id, process_id,
                     process_started_at
-             FROM workspace_cleanup_targets
+             FROM workspace_cleanup_targets_v2
              WHERE store_key = $1
                AND runtime_workflow_id = $2
              ORDER BY last_used_at ASC, project_key, slot_index",
@@ -499,7 +499,7 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
-            "DELETE FROM workspace_cleanup_targets
+            "DELETE FROM workspace_cleanup_targets_v2
              WHERE store_key = $1
                AND runtime_workflow_id = $2
                AND workspace_path = $3
@@ -565,7 +565,7 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
         let deleted = sqlx::query(
-            "DELETE FROM workspace_cleanup_targets
+            "DELETE FROM workspace_cleanup_targets_v2
              WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
                AND task_id = $4 AND project_key = $5 AND slot_index = $6
                AND owner_session = $7 AND run_generation = $8
@@ -624,7 +624,7 @@ impl WorkspaceLeaseStore {
         cleanup_owner_session: &str,
     ) -> anyhow::Result<bool> {
         let updated = sqlx::query(
-            "UPDATE workspace_cleanup_targets
+            "UPDATE workspace_cleanup_targets_v2
              SET cleanup_in_progress = FALSE,
                  cleanup_claim_id = NULL,
                  cleanup_owner_session = NULL,
@@ -652,7 +652,7 @@ impl WorkspaceLeaseStore {
         cleanup_owner_session: &str,
     ) -> anyhow::Result<bool> {
         let updated = sqlx::query(
-            "UPDATE workspace_cleanup_targets
+            "UPDATE workspace_cleanup_targets_v2
              SET cleanup_claim_expires_at = CURRENT_TIMESTAMP + ($6 * INTERVAL '1 second'),
                  last_used_at = CURRENT_TIMESTAMP
              WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
@@ -681,7 +681,7 @@ impl WorkspaceLeaseStore {
         cleanup_owner_session: &str,
     ) -> anyhow::Result<bool> {
         let updated = sqlx::query(
-            "UPDATE workspace_cleanup_targets
+            "UPDATE workspace_cleanup_targets_v2
              SET cleanup_claim_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second'
              WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
                AND cleanup_claim_id = $4 AND cleanup_owner_session = $5",
@@ -736,9 +736,10 @@ impl TryFrom<WorkspaceCleanupTargetRow> for WorkspaceCleanupTargetRecord {
     }
 }
 
+#[cfg(test)]
 pub(crate) const WORKSPACE_CLEANUP_TARGETS_TABLE_SQL: &str =
     "ALTER TABLE workspace_leases ADD COLUMN IF NOT EXISTS acquisition_id TEXT;
-CREATE TABLE IF NOT EXISTS workspace_cleanup_targets (
+CREATE TABLE IF NOT EXISTS workspace_cleanup_targets_v2 (
     store_key           TEXT NOT NULL DEFAULT current_schema(),
     runtime_workflow_id TEXT NOT NULL,
     workspace_path      TEXT NOT NULL,
@@ -765,13 +766,13 @@ CREATE TABLE IF NOT EXISTS workspace_cleanup_targets (
     last_used_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY(store_key, runtime_workflow_id, workspace_path)
 );
-ALTER TABLE workspace_cleanup_targets
+ALTER TABLE workspace_cleanup_targets_v2
     ADD COLUMN IF NOT EXISTS workflow_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE workspace_cleanup_targets
+ALTER TABLE workspace_cleanup_targets_v2
     ADD COLUMN IF NOT EXISTS manager_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_workspace_cleanup_targets_workflow
-    ON workspace_cleanup_targets(store_key, runtime_workflow_id, last_used_at);
-INSERT INTO workspace_cleanup_targets (
+    ON workspace_cleanup_targets_v2(store_key, runtime_workflow_id, last_used_at);
+INSERT INTO workspace_cleanup_targets_v2 (
     store_key, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
     workspace_key, source_repo, repo, owner_session, run_generation, acquisition_id, process_id,
     process_started_at, created_at, last_used_at
