@@ -81,7 +81,7 @@ async fn persist_plan_issue_decision(
                 canonical_repo,
                 ctx.issue_number,
                 "implementing",
-            ),
+            )?,
             true,
         ),
     };
@@ -109,8 +109,9 @@ async fn persist_plan_issue_decision(
     final_instance.version = final_instance.version.saturating_add(1);
     replace_plan_issue_data(
         &mut final_instance,
-        crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        runtime_policy_data(
             ctx.project_root,
+            &instance.data,
             json!({
                 "project_id": ctx.project_root.to_string_lossy(),
                 "repo": ctx.repo,
@@ -242,8 +243,9 @@ async fn persist_replan_completed(
     final_instance.version = final_instance.version.saturating_add(1);
     replace_plan_issue_data(
         &mut final_instance,
-        crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        runtime_policy_data(
             project_root,
+            &instance.data,
             json!({
                 "project_id": project_id,
                 "repo": repo,
@@ -317,8 +319,8 @@ fn issue_instance(
     repo: Option<String>,
     issue_number: u64,
     state: &str,
-) -> WorkflowInstance {
-    WorkflowInstance::new(
+) -> anyhow::Result<WorkflowInstance> {
+    Ok(WorkflowInstance::new(
         "github_issue_pr",
         1,
         state,
@@ -326,16 +328,33 @@ fn issue_instance(
     )
     .with_id(workflow_id)
     .with_classified_data(
-        crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        crate::workflow_runtime_policy::pin_change_scope_classifier_policy(
             Path::new(&project_id),
-            json!({
-                "project_id": project_id,
-                "repo": repo,
-                "issue_number": issue_number,
-            }),
-        ),
+            crate::workflow_runtime_policy::merge_runtime_retry_policy(
+                Path::new(&project_id),
+                json!({
+                    "project_id": project_id,
+                    "repo": repo,
+                    "issue_number": issue_number,
+                }),
+            ),
+        )?,
         DataProvenance::Server,
-    )
+    ))
+}
+
+fn runtime_policy_data(
+    project_root: &Path,
+    existing: &serde_json::Value,
+    mut data: serde_json::Value,
+) -> serde_json::Value {
+    if let Some(policy) = existing
+        .get(crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD)
+        .cloned()
+    {
+        data[crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD] = policy;
+    }
+    crate::workflow_runtime_policy::merge_runtime_retry_policy(project_root, data)
 }
 
 fn replace_plan_issue_data(
@@ -512,7 +531,7 @@ Workflow policy
             Some("owner/repo".to_string()),
             124,
             "replanning",
-        )
+        )?
         .with_server_data(json!({
             "project_id": project_root.to_string_lossy(),
             "repo": "owner/repo",
@@ -568,7 +587,7 @@ Workflow policy
             Some("owner/repo".to_string()),
             125,
             "planning",
-        )
+        )?
         .with_server_data(json!({
             "project_id": project_root.to_string_lossy(),
             "repo": "owner/repo",

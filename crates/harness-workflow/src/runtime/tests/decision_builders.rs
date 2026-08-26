@@ -455,8 +455,8 @@ fn pr_detected_decision_binds_pr_from_implementation() {
 
     assert_eq!(output.action, PrFeedbackWorkflowAction::BindPr);
     assert_eq!(output.decision.decision, "bind_pr");
-    assert_eq!(output.decision.next_state, "pr_open");
-    assert_eq!(output.decision.commands.len(), 1);
+    assert_eq!(output.decision.next_state, "pr_scope_review");
+    assert_eq!(output.decision.commands.len(), 2);
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,
@@ -479,7 +479,7 @@ fn pr_detected_decision_binds_pr_after_shadow_issue_submission() {
     );
 
     assert_eq!(output.action, PrFeedbackWorkflowAction::BindPr);
-    assert_eq!(output.decision.next_state, "pr_open");
+    assert_eq!(output.decision.next_state, "pr_scope_review");
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,

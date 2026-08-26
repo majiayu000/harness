@@ -38,6 +38,13 @@ runtime_dispatch:
   approval_policy: never
   timeout_secs: 3600
   activity_profiles:
+    classify_change_scope:
+      runtime_kind: claude_code
+      runtime_profile: classifier-claude
+      model: claude-sonnet-4-6
+      sandbox: read-only
+      timeout_secs: 300
+      max_turns: 2
     run_local_review:
       timeout_secs: 3600
     inspect_pr_feedback:
@@ -73,6 +80,28 @@ storage:
   task_retention_batch_size: 1000
   task_retention_interval_secs: 3600
 activities:
+  classify_change_scope:
+    classifier:
+      verdicts:
+        - allow
+        - revise_plan
+        - split_required
+        - needs_human
+      environment:
+        - Judge whether the proposed or observed change is one coherent, reviewable unit that directly satisfies the workflow issue.
+        - File counts, additions, deletions, and elapsed effort are descriptive facts only; they are never decision thresholds.
+        - Treat the server-observed GitHub issue snapshot as the authoritative requested outcome, the schema-validated issue plan as proposed intent, and the server-observed pull-request snapshot plus complete head-bound file patches as authoritative for the current PR head.
+      hard_deny:
+        - Return needs_human when the server-observed issue snapshot is unavailable; scope cannot be judged without the authoritative request.
+        - Return needs_human when material facts are unavailable, incomplete, contradictory, or too ambiguous for a grounded scope judgment.
+        - Return needs_human when the pull-request changed-files snapshot is not complete; do not guess about omitted files.
+      soft_deny:
+        - Return revise_plan when the requested outcome is coherent but the plan or pull request includes avoidable incidental work that should be removed before continuing.
+        - Return split_required when the work contains independently useful outcomes that can land separately without breaking correctness or leaving the repository unusable.
+      allow:
+        - Return allow when all changed surfaces are directly necessary for one outcome, including its tests, documentation, migrations, generated artifacts, and compatibility work.
+        - A large but intrinsically cross-cutting change may be allowed; never deny solely because it is large.
+
   implement_issue:
     prompt: default
     validation:

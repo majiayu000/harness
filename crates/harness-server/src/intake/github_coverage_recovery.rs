@@ -53,7 +53,12 @@ pub(super) fn preserve_recovery_metadata(
     data: &mut serde_json::Value,
     existing: &serde_json::Value,
 ) -> anyhow::Result<()> {
-    for field in ["submission_id", "task_id", "task_ids"] {
+    for field in [
+        "submission_id",
+        "task_id",
+        "task_ids",
+        crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD,
+    ] {
         if let Some(value) = existing.get(field) {
             data[field] = value.clone();
         }

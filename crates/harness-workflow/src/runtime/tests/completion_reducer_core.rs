@@ -1,7 +1,18 @@
 #[test]
 fn event_transition_dedupe_keys() {
     let instance = issue_instance("replanning");
-    let result = ActivityResult::succeeded("replan_issue", "Replan completed.");
+    let result = ActivityResult::succeeded("replan_issue", "Replan completed.").with_artifact(
+        ActivityArtifact::new(
+            crate::runtime::ISSUE_PLAN_ARTIFACT,
+            json!({
+                "summary": "Narrow the change before continuing.",
+                "task_class": "standard_code",
+                "target_files": ["src/lib.rs"],
+                "validation_plan": ["cargo test -p harness-workflow issue_planning"],
+                "blockers": []
+            }),
+        ),
+    );
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -18,16 +29,16 @@ fn event_transition_dedupe_keys() {
         .expect("event should parse")
         .expect("replan completion should produce a decision");
 
-    assert_eq!(decision.decision, "resume_implementation_after_replan");
-    assert_eq!(decision.next_state, "implementing");
+    assert_eq!(decision.decision, "review_issue_plan_scope");
+    assert_eq!(decision.next_state, "plan_scope_review");
     assert_eq!(decision.commands.len(), 1);
     assert_eq!(
         decision.commands[0].activity_name(),
-        Some("implement_issue")
+        Some(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY)
     );
     assert_eq!(
         decision.commands[0].dedupe_key,
-        format!("issue-replan:{}:implement:command-1", instance.id)
+        format!("issue-plan:{}:classify-scope:command-1", instance.id)
     );
     DecisionValidator::github_issue_pr()
         .validate(
@@ -113,7 +124,7 @@ fn runtime_completion_reducer_binds_pr_from_structured_pull_request_artifact() {
         .expect("structured pull request artifact should bind the PR");
 
     assert_eq!(decision.decision, "bind_pr");
-    assert_eq!(decision.next_state, "pr_open");
+    assert_eq!(decision.next_state, "pr_scope_review");
     assert_eq!(
         decision.commands[0].command_type,
         WorkflowCommandType::BindPr
@@ -304,6 +315,52 @@ fn runtime_completion_reducer_finishes_merge_pr_with_merged_pull_request_artifac
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("merged PR decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_reclassifies_head_changed_before_merge() {
+    let instance = issue_instance("merging").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "issue_plan": {"summary": "Keep the change scoped"},
+        "scope_assessed_head_oid": "old-head",
+    }));
+    let result = ActivityResult::succeeded(
+        "merge_pr",
+        "The pull request head changed after scope assessment.",
+    )
+    .with_signal(ActivitySignal::new(
+        "PrHeadChanged",
+        json!({"observed_head_sha": "new-head"}),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "head_oid": "new-head",
+        }),
+    ));
+    let event = runtime_completion_event(&instance, "merge_pr", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("head drift should produce a scope recheck decision");
+
+    assert_eq!(decision.decision, "reassess_pr_scope");
+    assert_eq!(decision.next_state, "pr_scope_review");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY)
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("server-observed head drift should validate");
 }
 
 #[test]
@@ -1006,6 +1063,13 @@ fn runtime_completion_reducer_canonicalizes_verified_structured_bind_pr_url() {
             "workflow_decision",
             serde_json::to_value(&proposed_decision).expect("decision should serialize"),
         ))
+        .with_artifact(ActivityArtifact::new(
+            "pull_request",
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/OWNER/REPO/pull/77/files?diff=split#discussion"
+            }),
+        ))
         .with_artifact(verified_pr_binding(77));
     let event = WorkflowEvent::new(
         &instance.id,
@@ -1023,7 +1087,7 @@ fn runtime_completion_reducer_canonicalizes_verified_structured_bind_pr_url() {
         .expect("event should parse")
         .expect("verified structured binding should be accepted");
 
-    assert_eq!(decision.next_state, "pr_open");
+    assert_eq!(decision.next_state, "pr_scope_review");
     let bind_pr = decision
         .commands
         .iter()

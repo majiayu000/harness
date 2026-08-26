@@ -8,13 +8,16 @@ pub(super) const GITHUB_PR_SNAPSHOT_QUERY: &str = r#"
     query HarnessPrSnapshot($owner: String!, $repo: String!, $pr: Int!) {
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $pr) {
+          id
           number
           state
           merged
           url
           title
+          body
           updatedAt
           baseRefName
+          baseRefOid
           headRefName
           headRefOid
           mergeCommit {
@@ -129,6 +132,29 @@ const GITHUB_PR_CHECK_CONTEXTS_QUERY: &str = r#"
     }
 "#;
 
+const GITHUB_PR_FILES_QUERY: &str = r#"
+    query HarnessPrFiles($pullRequest: ID!, $after: String!) {
+      node(id: $pullRequest) {
+        ... on PullRequest {
+          baseRefOid
+          headRefOid
+          files(first: 100, after: $after) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            nodes {
+              path
+              additions
+              deletions
+              changeType
+            }
+          }
+        }
+      }
+    }
+"#;
+
 const GITHUB_PR_CHECK_CONTEXT_MAX_ADDITIONAL_PAGES: usize = 3;
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +192,7 @@ pub(super) async fn fetch_github_pr_snapshot_value(
         .filter(|pr| !pr.is_null())
         .ok_or_else(|| anyhow::anyhow!("GitHub PR snapshot query returned no PR data"))?;
     fetch_remaining_status_check_contexts(client, github_token, graphql_url, &mut pr).await?;
+    fetch_remaining_files(client, github_token, graphql_url, &mut pr).await?;
     Ok(pr)
 }
 
@@ -238,6 +265,97 @@ async fn fetch_remaining_status_check_contexts(
         .await?;
         append_status_check_context_page(pr, &data)?;
     }
+    Ok(())
+}
+
+async fn fetch_remaining_files(
+    client: &reqwest::Client,
+    github_token: Option<&str>,
+    graphql_url: &str,
+    pr: &mut Value,
+) -> anyhow::Result<()> {
+    if !has_more_files(pr) {
+        return Ok(());
+    }
+    let pull_request_id = pr
+        .get("id")
+        .and_then(|value| value_string(Some(value)))
+        .context("GitHub PR snapshot paginated files are missing pull request id")?;
+    let expected_base_oid = pr
+        .get("baseRefOid")
+        .and_then(|value| value_string(Some(value)))
+        .context("GitHub PR snapshot paginated files are missing baseRefOid")?;
+    let expected_head_oid = pr
+        .get("headRefOid")
+        .and_then(|value| value_string(Some(value)))
+        .context("GitHub PR snapshot paginated files are missing headRefOid")?;
+    let mut seen_cursors = HashSet::new();
+
+    while has_more_files(pr) {
+        let cursor = pr
+            .pointer("/files/pageInfo/endCursor")
+            .and_then(|value| value_string(Some(value)))
+            .context("GitHub PR snapshot paginated files are missing end cursor")?;
+        if !seen_cursors.insert(cursor.clone()) {
+            anyhow::bail!("GitHub PR snapshot file pagination repeated cursor `{cursor}`");
+        }
+        let data = execute_github_pr_graphql(
+            client,
+            github_token,
+            graphql_url,
+            GITHUB_PR_FILES_QUERY,
+            json!({
+                "pullRequest": pull_request_id,
+                "after": cursor,
+            }),
+        )
+        .await?;
+        let observed_base_oid = data
+            .pointer("/node/baseRefOid")
+            .and_then(|value| value_string(Some(value)))
+            .context("GitHub PR file page is missing baseRefOid")?;
+        let observed_head_oid = data
+            .pointer("/node/headRefOid")
+            .and_then(|value| value_string(Some(value)))
+            .context("GitHub PR file page is missing headRefOid")?;
+        if observed_base_oid != expected_base_oid || observed_head_oid != expected_head_oid {
+            anyhow::bail!(
+                "GitHub PR base or head changed while collecting paginated classifier facts"
+            );
+        }
+        append_connection_page(pr, "files", data.pointer("/node/files"))?;
+    }
+    Ok(())
+}
+
+fn has_more_files(pr: &Value) -> bool {
+    pr.pointer("/files/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn append_connection_page(pr: &mut Value, field: &str, page: Option<&Value>) -> anyhow::Result<()> {
+    let page =
+        page.with_context(|| format!("GitHub PR snapshot {field} pagination returned no page"))?;
+    let page_nodes = page
+        .get("nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .context("GitHub PR snapshot paginated nodes are invalid")?;
+    let page_info = page
+        .get("pageInfo")
+        .cloned()
+        .context("GitHub PR snapshot pagination returned no page info")?;
+    let connection = pr
+        .get_mut(field)
+        .and_then(Value::as_object_mut)
+        .context("GitHub PR snapshot connection is invalid")?;
+    connection
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .context("GitHub PR snapshot connection nodes are invalid")?
+        .extend(page_nodes);
+    connection.insert("pageInfo".to_string(), page_info);
     Ok(())
 }
 

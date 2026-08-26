@@ -74,8 +74,11 @@ fn local_review_changes_requested_command_carries_review_findings() {
 }
 
 #[test]
-fn local_review_after_rework_uses_completion_command_dedupe_key() {
-    let instance = issue_instance("addressing_feedback");
+fn scope_recheck_after_rework_uses_completion_event_dedupe_key() {
+    let instance = issue_instance("addressing_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
     let command = WorkflowCommand::enqueue_activity("address_pr_feedback", "feedback-1");
     let result = address_pr_feedback_result("Feedback addressed.");
     let first_event = WorkflowEvent::new(
@@ -105,30 +108,30 @@ fn local_review_after_rework_uses_completion_command_dedupe_key() {
 
     let first_decision = reduce_runtime_job_completed(&instance, &first_event)
         .expect("event should parse")
-        .expect("feedback completion should request local review");
+        .expect("feedback completion should request scope recheck");
     let second_decision = reduce_runtime_job_completed(&instance, &second_event)
         .expect("event should parse")
-        .expect("second feedback completion should request local review");
+        .expect("second feedback completion should request scope recheck");
 
-    assert_eq!(first_decision.next_state, "local_review_gate");
-    assert_eq!(second_decision.next_state, "local_review_gate");
+    assert_eq!(first_decision.next_state, "pr_scope_review");
+    assert_eq!(second_decision.next_state, "pr_scope_review");
     assert_eq!(first_decision.commands.len(), 1);
     assert_eq!(second_decision.commands.len(), 1);
     assert_eq!(
         first_decision.commands[0].activity_name(),
-        Some(LOCAL_REVIEW_ACTIVITY)
+        Some(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY)
     );
     assert_eq!(
         second_decision.commands[0].activity_name(),
-        Some(LOCAL_REVIEW_ACTIVITY)
+        Some(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY)
     );
     assert_eq!(
         first_decision.commands[0].dedupe_key,
-        format!("local-review:{}:after-rework:command-1", instance.id)
+        format!("pr-scope-recheck:{}:77:command-1", instance.id)
     );
     assert_eq!(
         second_decision.commands[0].dedupe_key,
-        format!("local-review:{}:after-rework:command-2", instance.id)
+        format!("pr-scope-recheck:{}:77:command-2", instance.id)
     );
     assert_ne!(
         first_decision.commands[0].dedupe_key,
@@ -489,8 +492,11 @@ fn local_review_success_without_outcome_signal_blocks_invalid_output() {
 }
 
 #[test]
-fn local_review_after_rework_replay_keeps_command_dedupe_key() {
-    let instance = issue_instance("addressing_feedback");
+fn scope_recheck_after_rework_replay_keeps_command_dedupe_key() {
+    let instance = issue_instance("addressing_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
     let event_payload = json!({
         "command_id": "command-1",
         "command": WorkflowCommand::enqueue_activity("address_pr_feedback", "feedback-1"),
@@ -514,15 +520,15 @@ fn local_review_after_rework_replay_keeps_command_dedupe_key() {
 
     let first_decision = reduce_runtime_job_completed(&instance, &first_event)
         .expect("event should parse")
-        .expect("feedback completion should request local review");
+        .expect("feedback completion should request scope recheck");
     let replayed_decision = reduce_runtime_job_completed(&instance, &replayed_event)
         .expect("event should parse")
-        .expect("replayed feedback completion should request local review");
+        .expect("replayed feedback completion should request scope recheck");
 
     assert_ne!(first_event.id, replayed_event.id);
     assert_eq!(
         first_decision.commands[0].dedupe_key,
-        format!("local-review:{}:after-rework:command-1", instance.id)
+        format!("pr-scope-recheck:{}:77:command-1", instance.id)
     );
     assert_eq!(
         first_decision.commands[0].dedupe_key,

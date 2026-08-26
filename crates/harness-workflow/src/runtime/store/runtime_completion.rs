@@ -466,6 +466,21 @@ fn apply_runtime_completion_data_side_effect(
     decision: &WorkflowDecision,
     event: &WorkflowEvent,
 ) -> anyhow::Result<()> {
+    let classifier_scope_approval = instance.definition_id
+        == crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "pr_scope_review"
+        && decision.observed_state == "pr_scope_review"
+        && decision.next_state == "pr_open";
+    if classifier_scope_approval {
+        let head_oid = classifier_assessed_head_from_completion_event(event).ok_or_else(|| {
+            anyhow::anyhow!("PR scope approval is missing its server-attested subject head OID")
+        })?;
+        instance.set_data_field(
+            "scope_assessed_head_oid",
+            json!(head_oid),
+            DataProvenance::Server,
+        )?;
+    }
     let child_inspection = instance.definition_id == crate::runtime::PR_FEEDBACK_DEFINITION_ID
         && instance.state == "inspecting"
         && decision.observed_state == "inspecting"
@@ -543,6 +558,22 @@ fn apply_runtime_completion_data_side_effect(
         None => WorkflowDataWrite::remove("remote_fact_activity_at", DataProvenance::External),
     });
     instance.apply_data_writes(writes)
+}
+
+fn classifier_assessed_head_from_completion_event(event: &WorkflowEvent) -> Option<&str> {
+    event
+        .event
+        .pointer("/activity_result/artifacts")?
+        .as_array()?
+        .iter()
+        .find(|artifact| {
+            artifact.get("artifact_type").and_then(Value::as_str)
+                == Some(crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT)
+        })?
+        .pointer("/artifact/subject_head_oid")?
+        .as_str()
+        .map(str::trim)
+        .filter(|head| !head.is_empty())
 }
 
 fn pr_feedback_snapshot_from_completion_event(event: &WorkflowEvent) -> Option<&Value> {

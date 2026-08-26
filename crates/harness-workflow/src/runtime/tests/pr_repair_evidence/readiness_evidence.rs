@@ -19,6 +19,11 @@ fn server_owned_eval_draft_snapshot_passes_quality_gate() -> anyhow::Result<()> 
         json!({"eval_run_id": "run-1", "case_id": "case-1"}),
         DataProvenance::Server,
     )?;
+    instance.set_data_field(
+        "scope_assessed_head_oid",
+        json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        DataProvenance::Server,
+    )?;
     let result = ActivityResult::succeeded(
         PR_FEEDBACK_INSPECT_ACTIVITY,
         "Server-owned eval draft snapshot is ready for evaluator validation.",
@@ -57,6 +62,11 @@ fn server_owned_eval_draft_snapshot_fails_quality_gate() -> anyhow::Result<()> {
     instance.set_data_field(
         "eval",
         json!({"eval_run_id": "run-1", "case_id": "case-1"}),
+        DataProvenance::Server,
+    )?;
+    instance.set_data_field(
+        "scope_assessed_head_oid",
+        json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         DataProvenance::Server,
     )?;
     let result = ActivityResult::succeeded(

@@ -83,11 +83,13 @@ empty list remains deny-all.
 
 The resolved settings participate in prompt-provenance hashing, and every
 runtime result carries an `agent_permission_profile` artifact. Its
-`tool_allowlist_enforcement` field distinguishes Claude CLI enforcement from
-backends where Harness records the requested profile but does not enforce that
-tool list. Structured-output correction turns request scoped deny-all; the
-same enforcement field prevents that request from being misreported as a hard
-tool boundary on unsupported backends. This closes Claude's implicit
+`tool_allowlist_enforcement` field distinguishes Claude's CLI allowlist,
+Codex's finite feature denylist, OpenCode's permission environment, direct
+providers with no tool surface, and unsupported backends. Structured-output
+correction turns use the available deny surface, while classifier turns require
+a complete default-deny contract and fail before launch when the selected
+backend cannot enforce it. Codex is therefore unsupported for classifier
+turns. This closes Claude's implicit
 `allowed_tools = None` to unrestricted-access coupling without overstating the
 guarantee for other runtimes. Per-activity profiles remain a possible future
 refinement.

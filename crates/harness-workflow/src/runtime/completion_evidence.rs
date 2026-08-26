@@ -10,7 +10,7 @@
 use super::model::{ActivityResult, WorkflowDecision};
 use serde_json::Value;
 
-/// Evidence kind required on `github_issue_pr` `implementing -> pr_open`.
+/// Evidence kind required when `github_issue_pr` first binds a PR.
 pub const EVIDENCE_VERIFIED_PR_BINDING: &str = "verified_pr_binding";
 /// Evidence kind required on `quality_gate` `checking -> passed`.
 pub const EVIDENCE_SERVER_VALIDATION_DIGEST: &str = "server_validation_digest";
@@ -41,6 +41,8 @@ pub const ARTIFACT_RUNTIME_HOST_USAGE: &str = "server_runtime_host_usage";
 pub const ARTIFACT_EVAL_ISOLATION_CLEANUP: &str = "server_eval_isolation_cleanup";
 pub const ARTIFACT_VERIFIED_ISSUE_STATE: &str = "verified_issue_state";
 pub const ARTIFACT_MERGE_COMPLETION_VERIFICATION: &str = "merge_completion_verification";
+/// Server-attached, policy-bound output from an independent classifier turn.
+pub const ARTIFACT_CLASSIFIER_ASSESSMENT: &str = "classifier_assessment";
 pub const MERGE_COMPLETION_VERIFICATION_SCHEMA: &str =
     "harness.github.merge_completion_verification.v1";
 
@@ -54,7 +56,7 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 10] = [
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 11] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
@@ -64,6 +66,7 @@ pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 10] = [
     ARTIFACT_EVAL_ISOLATION_CLEANUP,
     ARTIFACT_VERIFIED_ISSUE_STATE,
     ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+    ARTIFACT_CLASSIFIER_ASSESSMENT,
     super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
 ];
 
@@ -305,6 +308,10 @@ mod tests {
             .with_artifact(ActivityArtifact::new(
                 ARTIFACT_MERGE_COMPLETION_VERIFICATION,
                 json!({ "verified": true, "observed_merged": true }),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                ARTIFACT_CLASSIFIER_ASSESSMENT,
+                json!({ "verdict": "allow" }),
             ))
             .with_artifact(ActivityArtifact::new(
                 super::super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,

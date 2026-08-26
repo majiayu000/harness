@@ -198,6 +198,20 @@ impl ClaudeCodeAgent {
             base_args.push(OsString::from("--allowedTools"));
             let tools = req.scoped_allowed_tools();
             base_args.push(OsString::from(tools.join(",")));
+            if tools.is_empty() {
+                // Claude treats an empty --allowedTools value as "no extra
+                // restriction". --tools "" is the native deny-all surface.
+                // Safe mode and an explicit empty MCP set also prevent user
+                // hooks, skills, plugins, and MCP servers from escaping the
+                // model-only classifier/correction boundary.
+                base_args.push(OsString::from("--tools"));
+                base_args.push(OsString::new());
+                base_args.push(OsString::from("--safe-mode"));
+                base_args.push(OsString::from("--disable-slash-commands"));
+                base_args.push(OsString::from("--strict-mcp-config"));
+                base_args.push(OsString::from("--mcp-config"));
+                base_args.push(OsString::from(r#"{"mcpServers":{}}"#));
+            }
         }
 
         if let Some(reasoning_effort) = req.reasoning_effort.as_deref() {

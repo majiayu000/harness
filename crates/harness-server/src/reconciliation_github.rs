@@ -1,5 +1,7 @@
+use anyhow::Context;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Deserializer};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 /// External GitHub state observed for one candidate.
@@ -48,6 +50,14 @@ pub(super) struct GitHubIssueState {
 struct ExactGitHubIssueState {
     number: u64,
     repository_url: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    html_url: String,
+    labels: Option<Vec<ExactGitHubIssueLabel>>,
+    updated_at: Option<String>,
     state: String,
     #[serde(default)]
     state_reason: Option<String>,
@@ -57,6 +67,11 @@ struct ExactGitHubIssueState {
         deserialize_with = "deserialize_field_presence"
     )]
     has_pull_request_marker: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExactGitHubIssueLabel {
+    name: String,
 }
 
 fn deserialize_field_presence<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -277,16 +292,90 @@ pub(crate) async fn fetch_exact_issue_state_with_token(
     else {
         return GitHubState::Unknown;
     };
-    if state.number != issue_num
-        || state.has_pull_request_marker
-        || !repository_url_matches_slug(&state.repository_url, repo_slug)
-    {
+    if !exact_issue_identity_matches(&state, repo_slug, issue_num) {
         return GitHubState::Unknown;
     }
     classify_issue_state(&GitHubIssueState {
         state: state.state,
         state_reason: state.state_reason,
     })
+}
+
+pub(crate) async fn fetch_exact_issue_scope_facts(
+    repo_slug: &str,
+    issue_num: u64,
+    github_token: Option<&str>,
+) -> anyhow::Result<Value> {
+    let state = try_github_get_json::<ExactGitHubIssueState>(
+        &format!("/repos/{repo_slug}/issues/{issue_num}"),
+        github_token,
+    )
+    .await?;
+    if !exact_issue_identity_matches(&state, repo_slug, issue_num) {
+        anyhow::bail!("GitHub issue response did not match the requested issue identity");
+    }
+    let labels = state
+        .labels
+        .context("GitHub issue response omitted its labels")?;
+    let updated_at = state
+        .updated_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("GitHub issue response omitted its update timestamp")?;
+    if state.title.trim().is_empty() || state.html_url.trim().is_empty() {
+        anyhow::bail!("GitHub issue response omitted its title or canonical URL");
+    }
+    Ok(json!({
+        "snapshot_source": "server_github_rest",
+        "repo": repo_slug.to_ascii_lowercase(),
+        "issue_number": issue_num,
+        "title": state.title,
+        "body": state.body,
+        "url": state.html_url,
+        "labels": labels.into_iter().map(|label| label.name).collect::<Vec<_>>(),
+        "state": state.state,
+        "updated_at": updated_at,
+    }))
+}
+
+fn exact_issue_identity_matches(
+    state: &ExactGitHubIssueState,
+    repo_slug: &str,
+    issue_num: u64,
+) -> bool {
+    state.number == issue_num
+        && !state.has_pull_request_marker
+        && repository_url_matches_slug(&state.repository_url, repo_slug)
+        && issue_url_matches_identity(&state.html_url, repo_slug, issue_num)
+}
+
+fn issue_url_matches_identity(issue_url: &str, repo_slug: &str, issue_num: u64) -> bool {
+    let Ok(url) = reqwest::Url::parse(issue_url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return false;
+    }
+    let Some((owner, repo)) = repo_slug.split_once('/') else {
+        return false;
+    };
+    let Some(mut segments) = url.path_segments() else {
+        return false;
+    };
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some(url_owner), Some(url_repo), Some("issues"), Some(url_issue), None)
+            if url_owner.eq_ignore_ascii_case(owner)
+                && url_repo.eq_ignore_ascii_case(repo)
+                && url_issue.parse::<u64>().ok() == Some(issue_num)
+    )
 }
 
 fn repository_url_matches_slug(repository_url: &str, repo_slug: &str) -> bool {

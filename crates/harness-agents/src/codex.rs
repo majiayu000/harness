@@ -157,6 +157,20 @@ impl CodexAgent {
         ];
         if let Some([]) = req.allowed_tools.as_deref() {
             args.push(OsString::from("--ignore-user-config"));
+            for feature in [
+                "shell_tool",
+                "unified_exec",
+                "code_mode",
+                "code_mode_host",
+                "multi_agent",
+                "multi_agent_v2",
+                "apps",
+                "browser_use",
+                "image_generation",
+            ] {
+                args.push(OsString::from("--disable"));
+                args.push(OsString::from(feature));
+            }
         }
         push_codex_sandbox_args(&mut args, sandbox_mode);
         if let Some(approval_policy) = req.approval_policy.as_deref() {

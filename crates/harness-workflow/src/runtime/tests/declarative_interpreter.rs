@@ -3,7 +3,8 @@ mod declarative_interpreter {
     use super::issue_instance;
     use crate::runtime::reducer::declarative_completion::reduce_declarative_completion;
     use harness_core::config::workflow::{
-        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowClassifierPolicy,
+        WorkflowDefinitionPolicy,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -146,6 +147,59 @@ mod declarative_interpreter {
         let mut result = ActivityResult::failed(activity, "blocked", "operator input required");
         result.status = ActivityStatus::Blocked;
         result
+    }
+
+    #[test]
+    fn custom_classifier_signal_without_server_assessment_fails_closed() {
+        let mut classifier_policy = policy();
+        let reviewing = classifier_policy
+            .states
+            .get_mut("reviewing")
+            .expect("fixture state");
+        reviewing.on_success = None;
+        reviewing.on_blocked = Some("needs_operator".to_string());
+        reviewing.on_failure = Some("blocked".to_string());
+        reviewing.on_signal = BTreeMap::from([
+            ("allow".to_string(), "publishing".to_string()),
+            ("cancel".to_string(), "withdrawn".to_string()),
+            ("wait".to_string(), "waiting".to_string()),
+        ]);
+        let definition = build_declarative_definition(
+            &classifier_policy,
+            &BTreeMap::from([
+                ("publish".to_string(), WorkflowActivityPolicy::default()),
+                (
+                    "review".to_string(),
+                    WorkflowActivityPolicy {
+                        classifier: Some(WorkflowClassifierPolicy {
+                            verdicts: vec![
+                                "allow".to_string(),
+                                "cancel".to_string(),
+                                "wait".to_string(),
+                            ],
+                            allow: vec!["The document is coherent.".to_string()],
+                            ..WorkflowClassifierPolicy::default()
+                        }),
+                        ..WorkflowActivityPolicy::default()
+                    },
+                ),
+            ]),
+        )
+        .expect("custom classifier fixture should compile");
+        let persisted = persisted_declarative_definition(&definition, None);
+        let hydrated = hydrate_persisted_declarative_definition(&persisted)
+            .expect("classifier metadata should survive persistence");
+        assert!(hydrated.requires_server_classifier_assessment("reviewing"));
+        let instance = instance_for(&definition, "reviewing");
+        let result = ActivityResult::succeeded("review", "agent verdict")
+            .with_signal(ActivitySignal::new("allow", json!({})));
+        let event = completion_event(&instance, "review", &result);
+
+        let decision = reduce_decision(&definition, &instance, &event, &result);
+
+        assert_eq!(decision.decision, "block_invalid_agent_output");
+        assert_eq!(decision.next_state, "blocked");
+        assert!(definition.requires_server_classifier_assessment("reviewing"));
     }
 
     #[test]
@@ -436,7 +490,17 @@ mod declarative_interpreter {
 
         let builtin = issue_instance("replanning");
         assert!(registry.instance_is_declarative(&builtin));
-        let builtin_result = ActivityResult::succeeded("replan_issue", "replanned");
+        let builtin_result = ActivityResult::succeeded("replan_issue", "replanned")
+            .with_artifact(ActivityArtifact::new(
+                crate::runtime::ISSUE_PLAN_ARTIFACT,
+                json!({
+                    "summary": "Narrow the implementation.",
+                    "task_class": "standard_code",
+                    "target_files": ["src/lib.rs"],
+                    "validation_plan": ["cargo test -p harness-workflow issue_planning"],
+                    "blockers": []
+                }),
+            ));
         let builtin_event = WorkflowEvent::new(
             &builtin.id,
             1,
@@ -452,7 +516,7 @@ mod declarative_interpreter {
             .expect("builtin declarative completion should produce a decision");
         assert_eq!(
             builtin_decision.decision,
-            "resume_implementation_after_replan"
+            "review_issue_plan_scope"
         );
     }
 }

@@ -61,6 +61,9 @@ pub(super) enum ResolvedApprovalPolicy {
 #[serde(rename_all = "snake_case")]
 pub(super) enum ToolAllowlistEnforcement {
     ClaudeCli,
+    CodexCliFeatureDenylist,
+    OpenCodePermissionEnv,
+    ProviderHasNoTools,
     NotEnforcedByHarness,
 }
 
@@ -68,12 +71,26 @@ impl ToolAllowlistEnforcement {
     fn for_runtime_kind(runtime_kind: RuntimeKind) -> Self {
         match runtime_kind {
             RuntimeKind::ClaudeCode => Self::ClaudeCli,
-            RuntimeKind::CodexExec
-            | RuntimeKind::CodexJsonrpc
-            | RuntimeKind::AnthropicApi
-            | RuntimeKind::RemoteHost
-            | RuntimeKind::OpenCode => Self::NotEnforcedByHarness,
+            RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => Self::CodexCliFeatureDenylist,
+            RuntimeKind::OpenCode => Self::OpenCodePermissionEnv,
+            RuntimeKind::AnthropicApi => Self::ProviderHasNoTools,
+            RuntimeKind::RemoteHost => Self::NotEnforcedByHarness,
         }
+    }
+
+    pub(super) fn enforces_empty_allowlist(self) -> bool {
+        matches!(
+            self,
+            Self::ClaudeCli | Self::OpenCodePermissionEnv | Self::ProviderHasNoTools
+        )
+    }
+
+    pub(super) fn supports_correction_denylist(self) -> bool {
+        !matches!(self, Self::NotEnforcedByHarness)
+    }
+
+    pub(super) fn supports_classifier_model_attestation(self) -> bool {
+        matches!(self, Self::ClaudeCli | Self::ProviderHasNoTools)
     }
 }
 
@@ -355,7 +372,7 @@ mod tests {
         assert_eq!(resolved.permission_mode, AgentPermissionMode::Scoped);
         assert_eq!(
             resolved.tool_allowlist_enforcement,
-            ToolAllowlistEnforcement::NotEnforcedByHarness
+            ToolAllowlistEnforcement::CodexCliFeatureDenylist
         );
         assert_eq!(resolved.allowed_tools, CapabilityProfile::ReadOnly.tools());
 

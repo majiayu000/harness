@@ -91,7 +91,7 @@ async fn exact_subject_fetch_rejects_identity_or_kind_mismatches() {
 
     let api_base = crate::workspace::test_support::github_state_server(
         "/repos/owner/repo/issues/7",
-        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo/","state":"open"}"#,
+        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo/","html_url":"https://github.test/owner/repo/issues/7","state":"open"}"#,
     )
     .await;
     let api_guard =
@@ -155,6 +155,75 @@ async fn exact_subject_fetch_rejects_identity_or_kind_mismatches() {
         GitHubState::Unknown
     );
     drop(api_guard);
+}
+
+#[tokio::test]
+async fn exact_issue_scope_facts_include_authoritative_title_and_body() {
+    let _env_guard = crate::workspace::test_support::async_env_lock()
+        .lock()
+        .await;
+    let api_base = crate::workspace::test_support::github_state_server(
+        "/repos/owner/repo/issues/7",
+        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo","title":"Fix the parser","body":"Reject malformed input.","html_url":"https://github.test/owner/repo/issues/7","labels":[{"name":"bug"}],"updated_at":"2026-08-26T00:00:00Z","state":"open"}"#,
+    )
+    .await;
+    let _api_guard =
+        crate::workspace::test_support::ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+
+    let facts = fetch_exact_issue_scope_facts("owner/repo", 7, None)
+        .await
+        .expect("exact issue facts should load");
+
+    assert_eq!(facts["title"], "Fix the parser");
+    assert_eq!(facts["body"], "Reject malformed input.");
+    assert_eq!(facts["labels"][0], "bug");
+    assert_eq!(facts["snapshot_source"], "server_github_rest");
+}
+
+#[tokio::test]
+async fn exact_issue_scope_facts_reject_mismatched_canonical_url() {
+    let _env_guard = crate::workspace::test_support::async_env_lock()
+        .lock()
+        .await;
+    let api_base = crate::workspace::test_support::github_state_server(
+        "/repos/owner/repo/issues/7",
+        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo","title":"Fix the parser","html_url":"https://github.test/other/repo/issues/7","labels":[],"updated_at":"2026-08-26T00:00:00Z","state":"open"}"#,
+    )
+    .await;
+    let _api_guard =
+        crate::workspace::test_support::ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+
+    let error = fetch_exact_issue_scope_facts("owner/repo", 7, None)
+        .await
+        .expect_err("canonical issue URL must match the requested identity");
+
+    assert!(error.to_string().contains("requested issue identity"));
+}
+
+#[tokio::test]
+async fn exact_issue_scope_facts_reject_missing_authoritative_fields() {
+    let _env_guard = crate::workspace::test_support::async_env_lock()
+        .lock()
+        .await;
+    for response in [
+        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo","title":"Fix the parser","html_url":"https://github.test/owner/repo/issues/7","updated_at":"2026-08-26T00:00:00Z","state":"open"}"#,
+        r#"{"number":7,"repository_url":"https://api.github.test/repos/owner/repo","title":"Fix the parser","html_url":"https://github.test/owner/repo/issues/7","labels":[],"state":"open"}"#,
+    ] {
+        let api_base = crate::workspace::test_support::github_state_server(
+            "/repos/owner/repo/issues/7",
+            response,
+        )
+        .await;
+        let api_guard = crate::workspace::test_support::ScopedEnvVar::set(
+            "HARNESS_GITHUB_API_BASE_URL",
+            &api_base,
+        );
+
+        fetch_exact_issue_scope_facts("owner/repo", 7, None)
+            .await
+            .expect_err("missing labels or updated_at must fail closed");
+        drop(api_guard);
+    }
 }
 
 #[tokio::test]

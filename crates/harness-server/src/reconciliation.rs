@@ -32,9 +32,10 @@ use self::reconciliation_github::{
     GitHubPullState,
 };
 pub(crate) use self::reconciliation_github::{
-    fetch_exact_issue_state_with_token, fetch_exact_pr_state_with_token,
-    fetch_issue_state_with_token, fetch_pr_state_by_slug_with_token, github_api_base_url,
-    try_fetch_issue_state_with_token, try_fetch_pr_state_by_slug_with_token, GitHubState,
+    fetch_exact_issue_scope_facts, fetch_exact_issue_state_with_token,
+    fetch_exact_pr_state_with_token, fetch_issue_state_with_token,
+    fetch_pr_state_by_slug_with_token, github_api_base_url, try_fetch_issue_state_with_token,
+    try_fetch_pr_state_by_slug_with_token, GitHubState,
 };
 #[cfg(test)]
 use self::reconciliation_runtime::runtime_candidate_from_instance;

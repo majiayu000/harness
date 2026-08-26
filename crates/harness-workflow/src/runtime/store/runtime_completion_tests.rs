@@ -5,6 +5,62 @@ use harness_core::db::resolve_database_url;
 use serde_json::json;
 use std::collections::BTreeSet;
 
+#[test]
+fn reads_scope_assessed_head_only_from_classifier_assessment() {
+    let event = WorkflowEvent::new("workflow-1", 1, "RuntimeJobCompleted", "runtime")
+        .with_payload(json!({
+            "activity_result": {
+                "artifacts": [{
+                    "artifact_type": crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
+                    "artifact": {"subject_head_oid": "head-123"}
+                }]
+            }
+        }));
+
+    assert_eq!(
+        classifier_assessed_head_from_completion_event(&event),
+        Some("head-123")
+    );
+}
+
+#[test]
+fn persists_scope_assessed_head_on_pr_scope_approval() -> anyhow::Result<()> {
+    let mut instance = WorkflowInstance::new(
+        crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "pr_scope_review",
+        WorkflowSubject::new("issue", "owner/repo#42"),
+    );
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        "pr_scope_review",
+        "apply_declarative_transition",
+        "pr_open",
+        "scope classifier allowed this head",
+    );
+    let event = WorkflowEvent::new("workflow-1", 1, "RuntimeJobCompleted", "runtime")
+        .with_payload(json!({
+            "activity_result": {
+                "artifacts": [{
+                    "artifact_type": crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
+                    "artifact": {"subject_head_oid": "head-456"}
+                }]
+            }
+        }));
+
+    apply_runtime_completion_data_side_effect(&mut instance, &decision, &event)?;
+
+    assert_eq!(instance.data["scope_assessed_head_oid"], "head-456");
+    assert_eq!(
+        instance
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/scope_assessed_head_oid")),
+        Some(DataProvenance::Server)
+    );
+    Ok(())
+}
+
 fn pin_error_instance(id: &str) -> WorkflowInstance {
     WorkflowInstance::new(
         "missing_declarative_definition",

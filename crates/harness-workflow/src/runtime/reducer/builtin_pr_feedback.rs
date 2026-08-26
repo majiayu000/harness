@@ -14,6 +14,7 @@ use crate::runtime::pr_feedback::{
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
+use crate::runtime::scope_review::enqueue_pr_scope_review;
 use crate::runtime::WorkflowDefinitionRegistry;
 use serde_json::Value;
 
@@ -45,6 +46,16 @@ pub(super) fn pr_feedback_sweep_decision_from_activity_result(
     let task_id = event_field_string(event, "runtime_job_id")
         .or_else(|| optional_data_string(instance, "task_id"))
         .unwrap_or_else(|| event.id.clone());
+    if pr_head_requires_scope_recheck(instance, result) {
+        return Some(pr_scope_recheck_decision(
+            instance,
+            event,
+            result,
+            pr_number,
+            pr_url.as_deref()?,
+            "server-observed PR head differs from the last scope-assessed head",
+        ));
+    }
     Some(
         build_pr_feedback_decision(
             instance,
@@ -59,6 +70,102 @@ pub(super) fn pr_feedback_sweep_decision_from_activity_result(
         .decision
         .with_evidence(runtime_completion_evidence(event, result)),
     )
+}
+
+pub(super) fn pr_scope_recheck_after_repair(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || instance.state != "addressing_feedback"
+        || result.activity != "address_pr_feedback"
+    {
+        return None;
+    }
+    let pr_number = instance.data.get("pr_number").and_then(Value::as_u64)?;
+    let pr_url = optional_data_string(instance, "pr_url")?;
+    Some(pr_scope_recheck_decision(
+        instance,
+        event,
+        result,
+        pr_number,
+        &pr_url,
+        "PR feedback repair completed; reassess the resulting head before further review",
+    ))
+}
+
+pub(super) fn pr_scope_recheck_before_merge(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || instance.state != "merging"
+        || result.activity != "merge_pr"
+        || !has_signal(result, "PrHeadChanged")
+        || !pr_head_requires_scope_recheck(instance, result)
+    {
+        return None;
+    }
+    let pr_number = instance.data.get("pr_number").and_then(Value::as_u64)?;
+    let pr_url = optional_data_string(instance, "pr_url")?;
+    Some(pr_scope_recheck_decision(
+        instance,
+        event,
+        result,
+        pr_number,
+        &pr_url,
+        "server observed a new PR head immediately before merge; reassess scope before continuing",
+    ))
+}
+
+fn pr_scope_recheck_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    pr_number: u64,
+    pr_url: &str,
+    reason: &str,
+) -> WorkflowDecision {
+    let issue_plan = instance
+        .data
+        .get("issue_plan")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let dedupe_source = event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+    WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "reassess_pr_scope",
+        "pr_scope_review",
+        reason,
+    )
+    .with_command(enqueue_pr_scope_review(
+        format!(
+            "pr-scope-recheck:{}:{}:{dedupe_source}",
+            instance.id, pr_number
+        ),
+        pr_number,
+        pr_url,
+        issue_plan,
+    ))
+    .with_evidence(runtime_completion_evidence(event, result))
+    .high_confidence()
+}
+
+fn pr_head_requires_scope_recheck(instance: &WorkflowInstance, result: &ActivityResult) -> bool {
+    let assessed = instance
+        .data
+        .get("scope_assessed_head_oid")
+        .and_then(Value::as_str);
+    let observed = result
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == SERVER_PR_SNAPSHOT_ARTIFACT)
+        .and_then(|artifact| artifact.artifact.get("head_oid"))
+        .and_then(Value::as_str);
+    observed.is_some_and(|observed| Some(observed) != assessed)
 }
 
 pub(super) fn pr_feedback_success_contract_error(

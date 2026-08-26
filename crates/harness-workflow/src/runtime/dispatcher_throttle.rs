@@ -7,12 +7,59 @@
 //! so a single busy profile still makes progress instead of starving.
 
 use super::dispatcher::RuntimeProfileSelector;
-use super::model::WorkflowCommandRecord;
+use super::model::{RuntimeKind, RuntimeProfile, WorkflowCommandRecord, WorkflowInstance};
 use super::store::{cost_usd_from_micros, cost_usd_to_micros, WorkflowRuntimeStore};
+use super::GITHUB_ISSUE_PR_DEFINITION_ID;
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use harness_core::config::workflow::RuntimeBudgetPolicy;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+
+const SERVER_OWNED_MERGE_PROFILE: &str = "server-owned-merge";
+
+pub(super) fn force_server_owned_profile(
+    instance: Option<&WorkflowInstance>,
+    activity: &str,
+    profile: &mut RuntimeProfile,
+) {
+    if activity != "merge_pr"
+        || !instance.is_some_and(|instance| instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID)
+    {
+        return;
+    }
+
+    // The in-process worker excludes RemoteHost jobs and intercepts merge_pr
+    // before resolving an agent, so no remote runtime sees the mutation job.
+    profile.kind = RuntimeKind::CodexExec;
+    profile.name = SERVER_OWNED_MERGE_PROFILE.to_string();
+    profile.model = None;
+    profile.reasoning_effort = None;
+    profile.sandbox = None;
+    profile.approval_policy = None;
+}
+
+pub(super) fn retry_not_before_for_command(
+    command: &WorkflowCommandRecord,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let Some(raw) = command
+        .command
+        .command
+        .get("retry_not_before")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    DateTime::parse_from_rfc3339(raw)
+        .map(|value| Some(value.with_timezone(&Utc)))
+        .with_context(|| {
+            format!(
+                "workflow command {} has invalid retry_not_before",
+                command.id
+            )
+        })
+}
 
 /// A throttle-band breach: the profile is inside its daily band and another
 /// profile under its own threshold has claimable work.

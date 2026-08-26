@@ -303,6 +303,7 @@ pub(crate) async fn stream_codex_exec_output(
                 StreamItem::ItemCompleted { .. } => "item_completed",
                 StreamItem::ItemCompletedKind => "item_completed",
                 StreamItem::TokenUsage { .. } => "token_usage",
+                StreamItem::ModelReported { .. } => "model_reported",
                 StreamItem::Warning { .. } => "warning",
                 StreamItem::Diagnostic { .. } => "diagnostic",
                 StreamItem::TurnCancelled { .. } => "turn_cancelled",

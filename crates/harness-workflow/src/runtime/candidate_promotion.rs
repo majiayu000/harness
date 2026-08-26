@@ -269,7 +269,7 @@ fn candidate_promotion_success_decision_inner(
         &instance.id,
         &instance.state,
         "bind_promoted_candidate_pr",
-        "pr_open",
+        "pr_scope_review",
         &reason,
     )
     .with_command(WorkflowCommand::bind_pr(
@@ -277,6 +277,11 @@ fn candidate_promotion_success_decision_inner(
         pr_url.clone(),
         format!("candidate-promotion:{}:bind-pr:{pr_number}", event.id),
     ))
+    .with_command(
+        crate::runtime::scope_review::enqueue_candidate_pr_scope_review(
+            &event.id, pr_number, &pr_url,
+        ),
+    )
     .with_evidence(WorkflowEvidence::new("pull_request", pr_url))
     .with_evidence(binding.evidence)
     .with_evidence(WorkflowEvidence::new(
@@ -729,7 +734,7 @@ mod tests {
             &command,
         )?;
 
-        assert_eq!(decision.next_state, "pr_open");
+        assert_eq!(decision.next_state, "pr_scope_review");
         assert!(decision.evidence.iter().any(|evidence| evidence.kind
             == crate::runtime::completion_evidence::EVIDENCE_VERIFIED_PR_BINDING));
         assert_eq!(

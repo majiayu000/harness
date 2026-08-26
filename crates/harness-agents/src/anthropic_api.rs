@@ -170,6 +170,15 @@ impl CodeAgent for AnthropicApiAgent {
         let resp = self.execute(req).await?;
         crate::streaming::send_stream_item(
             &tx,
+            StreamItem::ModelReported {
+                model: resp.model.clone(),
+            },
+            self.name(),
+            "model_reported",
+        )
+        .await?;
+        crate::streaming::send_stream_item(
+            &tx,
             StreamItem::ItemCompleted {
                 item: Item::AgentReasoning {
                     content: resp.output.clone(),

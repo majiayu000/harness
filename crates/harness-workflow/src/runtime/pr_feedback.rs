@@ -130,13 +130,22 @@ pub fn build_pr_detected_decision(
         &instance.id,
         &instance.state,
         "bind_pr",
-        "pr_open",
-        "implementation produced a pull request for the issue workflow",
+        "pr_scope_review",
+        "implementation produced a pull request for independent scope review",
     )
     .with_command(WorkflowCommand::bind_pr(
         input.pr_number,
         input.pr_url,
         format!("pr-detected:{}:{}", input.task_id, input.pr_number),
+    ))
+    .with_command(super::scope_review::enqueue_pr_scope_review(
+        format!(
+            "pr-detected:{}:{}:classify-scope",
+            input.task_id, input.pr_number
+        ),
+        input.pr_number,
+        input.pr_url,
+        serde_json::Value::Null,
     ))
     .with_evidence(WorkflowEvidence::new("pr", input.pr_url))
     // PR detection is driven by a server-observed GitHub event or API

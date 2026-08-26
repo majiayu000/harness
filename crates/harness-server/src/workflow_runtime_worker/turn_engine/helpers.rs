@@ -258,7 +258,7 @@ pub(crate) async fn process_stream_item(
 ) -> Option<TurnBudgetStop> {
     let mut budget_stop = None;
     match stream_item {
-        StreamItem::EgressVerifiedAtDispatch => {}
+        StreamItem::EgressVerifiedAtDispatch | StreamItem::ModelReported { .. } => {}
         StreamItem::ItemStarted { item } => {
             if let Err(err) = server
                 .thread_manager

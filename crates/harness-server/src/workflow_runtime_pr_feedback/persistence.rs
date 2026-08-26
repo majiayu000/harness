@@ -655,22 +655,18 @@ pub(super) async fn approve_runtime_merge(
     }
 }
 
-fn trusted_merge_head_sha(instance: &WorkflowInstance) -> Option<String> {
-    ["pr_head_sha", "head_sha"].into_iter().find_map(|field| {
-        let provenance = instance
-            .data_provenance
-            .as_ref()?
-            .provenance_for(&format!("/{field}"));
-        if !matches!(
-            provenance,
-            Some(DataProvenance::Server | DataProvenance::External)
-        ) {
-            return None;
-        }
-        optional_string_field(&instance.data, field)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })
+pub(super) fn trusted_merge_head_sha(instance: &WorkflowInstance) -> Option<String> {
+    let field = "scope_assessed_head_oid";
+    let provenance = instance
+        .data_provenance
+        .as_ref()?
+        .provenance_for(&format!("/{field}"));
+    if provenance != Some(DataProvenance::Server) {
+        return None;
+    }
+    optional_string_field(&instance.data, field)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub(super) async fn commit_runtime_decision(
@@ -712,7 +708,10 @@ pub(super) async fn commit_runtime_decision(
     let mut final_instance = instance.clone();
     final_instance.state = decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
-    let data = merge_last_decision(accepted_data, &decision.decision);
+    let accepted_data =
+        super::scope_recheck::pin_legacy_classifier_policy(&instance, accepted_data)?;
+    let mut data = merge_last_decision(accepted_data, &decision.decision);
+    preserve_classifier_policy_pin(&instance.data, &mut data);
     replace_pr_runtime_data(&mut final_instance, data)?;
     let create_if_missing = new_instance.then_some(&instance);
     let record = store
@@ -731,4 +730,41 @@ pub(super) async fn commit_runtime_decision(
         )
         .await?;
     Ok(outcome_from_atomic_record(record))
+}
+
+fn preserve_classifier_policy_pin(
+    existing: &serde_json::Value,
+    replacement: &mut serde_json::Value,
+) {
+    if let Some(policy) = existing
+        .get(crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD)
+        .cloned()
+    {
+        replacement[crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD] =
+            policy;
+    }
+}
+
+#[cfg(test)]
+mod classifier_policy_pin_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_preserves_existing_classifier_policy_pin() {
+        let existing = json!({
+            crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD: {
+                "classifier": {"verdicts": ["allow"]}
+            }
+        });
+        let mut replacement = json!({"pr_number": 7});
+
+        preserve_classifier_policy_pin(&existing, &mut replacement);
+
+        assert_eq!(
+            replacement
+                [crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD]
+                ["classifier"]["verdicts"][0],
+            "allow"
+        );
+    }
 }

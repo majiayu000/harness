@@ -215,6 +215,16 @@ fn builtin_evidence_contract_matches_spec_table() {
             vec![
                 (
                     "implementing",
+                    "pr_scope_review",
+                    vec![EVIDENCE_VERIFIED_PR_BINDING],
+                ),
+                (
+                    "scheduled",
+                    "pr_scope_review",
+                    vec![EVIDENCE_VERIFIED_PR_BINDING],
+                ),
+                (
+                    "implementing",
                     "pr_open",
                     vec![EVIDENCE_VERIFIED_PR_BINDING],
                 ),

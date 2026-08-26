@@ -221,6 +221,31 @@ fn rejects_scheduled_pr_open_transition_without_bind_pr_command() {
 }
 
 #[test]
+fn rejects_scheduled_pr_scope_review_without_bind_pr_command() {
+    let instance = issue_instance("scheduled");
+    let decision = WorkflowDecision::new(
+        instance.id.clone(),
+        "scheduled",
+        "classify_unbound_pr",
+        "pr_scope_review",
+        "The decision tried to classify a PR without binding it.",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "classify_change_scope",
+        "issue-123-classify-pr",
+    ));
+
+    let err = DecisionValidator::github_issue_pr()
+        .validate(&instance, &decision, &validation_context())
+        .expect_err("scheduled -> pr_scope_review must require BindPr");
+
+    assert_eq!(
+        err.kind,
+        WorkflowDecisionRejectionKind::RequiredCommandMissing
+    );
+}
+
+#[test]
 fn rejects_done_transition_without_mark_done_command() {
     let instance = issue_instance("ready_to_merge");
     let decision = WorkflowDecision::new(

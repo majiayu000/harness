@@ -4,7 +4,7 @@ use super::{
     GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
     QUALITY_GATE_DEFINITION_ID,
 };
-use crate::runtime::declarative_pinning::declarative_definition_identity;
+use crate::runtime::declarative_pinning::declarative_definition_identity_with_classifier_policies;
 use crate::runtime::model::WorkflowInstance;
 use std::sync::Arc;
 
@@ -105,7 +105,10 @@ impl WorkflowDefinitionRegistry {
         }
         if !is_builtin_definition_id(&definition.policy().id) {
             let (expected_version, expected_hash) =
-                declarative_definition_identity(definition.policy())?;
+                declarative_definition_identity_with_classifier_policies(
+                    definition.policy(),
+                    definition.classifier_activity_policies(),
+                )?;
             if definition.definition_version() != expected_version
                 || definition.definition_hash() != expected_hash
             {

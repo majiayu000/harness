@@ -1,5 +1,8 @@
 use super::{
-    declarative::{build_declarative_definition, DeclarativeWorkflowDefinition},
+    declarative::{
+        build_declarative_definition, build_declarative_definition_with_classifier_policies,
+        DeclarativeWorkflowDefinition,
+    },
     model::WorkflowDefinition as DurableWorkflowDefinition,
     remote_facts::stable_remote_fact_hash,
 };
@@ -26,6 +29,30 @@ pub fn declarative_definition_identity(
     Ok((definition_version, definition_hash))
 }
 
+pub(super) fn declarative_definition_identity_with_classifier_policies(
+    policy: &WorkflowDefinitionPolicy,
+    classifier_activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
+) -> anyhow::Result<(u32, String)> {
+    if classifier_activity_policies.is_empty() {
+        return declarative_definition_identity(policy);
+    }
+    let identity = serde_json::json!({
+        "policy": policy,
+        "classifier_activity_policies": classifier_activity_policies,
+    });
+    let definition_hash = stable_remote_fact_hash(&identity);
+    let version_hex = definition_hash
+        .get(definition_hash.len().saturating_sub(8)..)
+        .ok_or_else(|| anyhow::anyhow!("declarative definition hash is too short"))?;
+    let definition_version = u32::from_str_radix(version_hex, 16).map_err(|error| {
+        anyhow::anyhow!(
+            "declarative definition hash '{}' has an invalid version suffix: {error}",
+            definition_hash
+        )
+    })?;
+    Ok((definition_version, definition_hash))
+}
+
 pub fn persisted_declarative_definition(
     definition: &DeclarativeWorkflowDefinition,
     source_path: Option<&str>,
@@ -40,6 +67,8 @@ pub fn persisted_declarative_definition(
         "kind": DECLARATIVE_DEFINITION_METADATA_KIND,
         "schema_version": METADATA_SCHEMA_VERSION,
         "policy": definition.policy(),
+        "classifier_activities": definition.classifier_activities(),
+        "classifier_activity_policies": definition.classifier_activity_policies(),
     }));
     if let Some(source_path) = source_path {
         persisted = persisted.with_source_path(source_path);
@@ -52,20 +81,50 @@ pub fn hydrate_declarative_definition(
     activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
     let policy = persisted_declarative_policy(definition)?;
-    hydrate_declarative_definition_with_policy(definition, &policy, activity_policies)
+    let hydrated = build_declarative_definition(&policy, activity_policies)?;
+    if let Some(persisted) = persisted_classifier_activity_policies(definition)? {
+        if persisted != *hydrated.classifier_activity_policies() {
+            anyhow::bail!(
+                "persisted declarative workflow definition '{}@{}' classifier policies do not match the supplied activity policies",
+                definition.id,
+                definition.version
+            );
+        }
+    }
+    validate_hydrated_identity(definition, hydrated)
 }
 
 pub fn hydrate_persisted_declarative_definition(
     definition: &DurableWorkflowDefinition,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
     let policy = persisted_declarative_policy(definition)?;
-    let activity_policies = policy
+    let mut activity_policies: BTreeMap<String, WorkflowActivityPolicy> = policy
         .states
         .values()
         .filter_map(|state| state.activity.as_ref())
         .map(|activity| (activity.clone(), WorkflowActivityPolicy::default()))
         .collect();
-    hydrate_declarative_definition_with_policy(definition, &policy, &activity_policies)
+    let classifier_activity_policies =
+        persisted_classifier_activity_policies(definition)?.unwrap_or_default();
+    for (activity, activity_policy) in &classifier_activity_policies {
+        activity_policies.insert(activity.clone(), activity_policy.clone());
+    }
+    let hydrated = build_declarative_definition_with_classifier_policies(
+        &policy,
+        &activity_policies,
+        classifier_activity_policies,
+    )?;
+    validate_hydrated_identity(definition, hydrated)
+}
+
+fn persisted_classifier_activity_policies(
+    definition: &DurableWorkflowDefinition,
+) -> anyhow::Result<Option<BTreeMap<String, WorkflowActivityPolicy>>> {
+    definition
+        .metadata
+        .get("classifier_activity_policies")
+        .map(|value| serde_json::from_value(value.clone()).map_err(Into::into))
+        .transpose()
 }
 
 fn persisted_declarative_policy(
@@ -108,12 +167,10 @@ fn persisted_declarative_policy(
     serde_json::from_value(policy_value.clone()).map_err(Into::into)
 }
 
-fn hydrate_declarative_definition_with_policy(
+fn validate_hydrated_identity(
     definition: &DurableWorkflowDefinition,
-    policy: &WorkflowDefinitionPolicy,
-    activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
+    hydrated: DeclarativeWorkflowDefinition,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
-    let hydrated = build_declarative_definition(policy, activity_policies)?;
     if hydrated.policy().id != definition.id {
         anyhow::bail!(
             "persisted declarative workflow definition id '{}' does not match policy id '{}'",

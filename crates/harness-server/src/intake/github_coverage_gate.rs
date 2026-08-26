@@ -64,6 +64,8 @@ pub(crate) fn runtime_issue_state_is_covered(state: &str) -> bool {
             | "scheduled"
             | "implementing"
             | "replanning"
+            | "plan_scope_review"
+            | "pr_scope_review"
             | "pr_open"
             | "local_review_gate"
             | "awaiting_feedback"
@@ -92,6 +94,7 @@ pub(crate) fn issue_remote_fact_snapshot(
         "subject_type": "issue",
         "number": issue_number,
         "title": issue.title,
+        "body": issue.description,
         "url": issue.url,
         "labels": issue.labels,
         "state": "open",
@@ -381,6 +384,10 @@ async fn persist_recovered_workflow(
         author_trust_class,
     );
     let existing = runtime_store.get_instance(&id).await?;
+    if existing.is_none() {
+        data =
+            crate::workflow_runtime_policy::pin_change_scope_classifier_policy(project_root, data)?;
+    }
     if let Some(existing) = existing.as_ref() {
         if existing.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
             return Ok(RecoveredWorkflowPersistence::Rejected);
@@ -408,6 +415,7 @@ async fn persist_recovered_workflow(
         "author_trust_class"
         | "last_remote_fact_hash"
         | "project_id"
+        | crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD
         | "repo"
         | "runtime_retry_policy"
         | "source"
@@ -559,6 +567,8 @@ mod tests {
         assert!(runtime_issue_state_is_covered("blocked"));
         assert!(runtime_issue_state_is_covered("failed"));
         assert!(runtime_issue_state_is_covered("replanning"));
+        assert!(runtime_issue_state_is_covered("plan_scope_review"));
+        assert!(runtime_issue_state_is_covered("pr_scope_review"));
         assert!(runtime_issue_state_is_covered("local_review_gate"));
         assert!(!runtime_issue_state_is_covered("unknown_scanning"));
     }

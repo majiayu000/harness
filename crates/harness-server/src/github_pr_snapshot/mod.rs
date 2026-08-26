@@ -6,7 +6,9 @@ use harness_workflow::runtime::{
 };
 use serde_json::{json, Value};
 
+mod diff;
 mod graphql;
+pub(crate) use diff::fetch_complete_pr_diff;
 use graphql::fetch_github_pr_snapshot_value;
 #[cfg(test)]
 use graphql::GITHUB_PR_SNAPSHOT_QUERY;
@@ -194,6 +196,23 @@ fn normalize_github_pr_snapshot(
 ) -> anyhow::Result<Value> {
     let pr_number = value_u64(pr.get("number")).context("GitHub PR snapshot missing number")?;
     let pr_url = value_string(pr.get("url")).context("GitHub PR snapshot missing url")?;
+    if pr_number != target.pr_number {
+        anyhow::bail!(
+            "GitHub PR snapshot returned PR #{pr_number}, expected #{}",
+            target.pr_number
+        );
+    }
+    let (url_owner, url_repo, url_number) =
+        harness_agents::output_parsing::parse_github_pr_url(&pr_url)
+            .context("GitHub PR snapshot returned an invalid pull request URL")?;
+    let url_repo_slug = format!("{url_owner}/{url_repo}");
+    if !url_repo_slug.eq_ignore_ascii_case(&target.repo_slug) || url_number != target.pr_number {
+        anyhow::bail!(
+            "GitHub PR snapshot URL identifies {url_repo_slug}#{url_number}, expected {}#{}",
+            target.repo_slug,
+            target.pr_number
+        );
+    }
     let state = value_string(pr.get("state"));
     let updated_at = value_string(pr.get("updatedAt"));
     let merged = pr.get("merged").and_then(Value::as_bool).or_else(|| {
@@ -202,7 +221,9 @@ fn normalize_github_pr_snapshot(
             .map(|state| state.eq_ignore_ascii_case("MERGED"))
     });
     let title = value_string(pr.get("title"));
+    let body = value_string(pr.get("body"));
     let base_ref = value_string(pr.get("baseRefName"));
+    let base_oid = value_string(pr.get("baseRefOid"));
     let expected_base_ref = target.expected_base_ref.clone();
     let head_ref = value_string(pr.get("headRefName"));
     let head_oid = value_string(pr.get("headRefOid"));
@@ -225,9 +246,9 @@ fn normalize_github_pr_snapshot(
     let changed_files = changed_files(pr);
     let closing_issues = closing_issues(pr);
     let observed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let review_threads_complete = !connection_has_next_page(pr, "reviewThreads");
-    let changed_files_complete = !connection_has_next_page(pr, "files");
-    let closing_issues_complete = !connection_has_next_page(pr, "closingIssuesReferences");
+    let review_threads_complete = connection_is_complete(pr, "reviewThreads");
+    let changed_files_complete = connection_is_complete(pr, "files");
+    let closing_issues_complete = connection_is_complete(pr, "closingIssuesReferences");
 
     Ok(json!({
         "schema": SERVER_PR_SNAPSHOT_SCHEMA,
@@ -242,8 +263,10 @@ fn normalize_github_pr_snapshot(
         "updated_at": updated_at,
         "updatedAt": updated_at,
         "title": title,
+        "body": body,
         "base_ref": base_ref,
         "baseRefName": base_ref,
+        "base_oid": base_oid,
         "expected_base_ref": expected_base_ref,
         "head_ref": head_ref,
         "headRefName": head_ref,
@@ -374,12 +397,15 @@ fn connection_nodes<'a>(pr: &'a Value, field: &str) -> impl Iterator<Item = &'a 
         .flatten()
 }
 
-fn connection_has_next_page(pr: &Value, field: &str) -> bool {
-    pr.get(field)
-        .and_then(|connection| connection.get("pageInfo"))
-        .and_then(|page_info| page_info.get("hasNextPage"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+fn connection_is_complete(pr: &Value, field: &str) -> bool {
+    let Some(connection) = pr.get(field) else {
+        return false;
+    };
+    connection.get("nodes").is_some_and(Value::is_array)
+        && connection
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            == Some(false)
 }
 
 fn pr_feedback_signal_for_snapshot(snapshot: &Value) -> ActivitySignal {

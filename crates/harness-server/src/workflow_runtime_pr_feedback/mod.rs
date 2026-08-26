@@ -4,18 +4,17 @@ use harness_workflow::runtime::{
     build_local_review_completed_decision, build_pr_detected_decision, build_pr_feedback_decision,
     DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrierInput,
     DispatchBarrierReasonCode, LocalReviewCompletedInput, LocalReviewOutcome,
-    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome, WorkflowCommand,
-    WorkflowCommandType,
+    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
 };
 use harness_workflow::runtime::{
     build_local_review_request_decision, build_pr_feedback_sweep_decision,
     build_pr_hygiene_repair_decision, DataProvenance, DecisionValidator, LocalReviewDecisionInput,
     PrFeedbackSweepDecisionInput, PrHygieneRepairDecisionInput, RemoteFactSnapshot,
-    ValidationContext, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence, WorkflowInstance,
-    WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY,
+    ValidationContext, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
+    WorkflowDecision, WorkflowDecisionRecord, WorkflowDecisionTransition, WorkflowDefinition,
+    WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -27,6 +26,7 @@ mod persistence;
 pub(crate) mod pr_detection;
 #[cfg(test)]
 mod pr_lifecycle_persist;
+mod scope_recheck;
 mod submission_requests;
 mod targets;
 
@@ -40,6 +40,7 @@ use pr_lifecycle_persist::{
 use pr_lifecycle_persist::{
     set_pr_lifecycle_persist_test_failures, PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS,
 };
+pub(crate) use scope_recheck::requeue_runtime_pr_scope_review_after_head_change;
 use submission_requests::*;
 use targets::*;
 
@@ -189,6 +190,7 @@ fn pr_lifecycle_failure_instance(
             issue_number,
             "failed",
         )
+        .expect("test issue workflow must pin the scope classifier")
     } else {
         pr_scoped_instance(
             pr_workflow_id(&project_id, repo, pr_number),
@@ -199,6 +201,7 @@ fn pr_lifecycle_failure_instance(
             pr_url,
             "failed",
         )
+        .expect("test PR workflow must pin the scope classifier")
     };
     instance
         .apply_data_writes([
@@ -653,6 +656,26 @@ pub(crate) async fn approve_runtime_merge_by_workflow_id(
     let Some(instance) = store.get_instance(workflow_id).await? else {
         return Ok(RuntimeMergeApprovalOutcome::NotFound);
     };
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "ready_to_merge"
+        && trusted_merge_head_sha(&instance).is_none()
+    {
+        if scope_recheck::requeue_legacy_runtime_pr_scope_review(store, instance).await? {
+            return Ok(RuntimeMergeApprovalOutcome::NotReady {
+                workflow_id: workflow_id.to_string(),
+                state: "pr_scope_review".to_string(),
+            });
+        }
+        let state = store
+            .get_instance(workflow_id)
+            .await?
+            .map(|instance| instance.state)
+            .unwrap_or_else(|| "missing".to_string());
+        return Ok(RuntimeMergeApprovalOutcome::NotReady {
+            workflow_id: workflow_id.to_string(),
+            state,
+        });
+    }
     approve_runtime_merge(store, instance, None).await
 }
 

@@ -4,6 +4,9 @@
 //! bindings, and records the operator kill switch as an explicit waiver
 //! artifact.
 
+use crate::github_pr_snapshot::{
+    fetch_github_pr_snapshot, GitHubPrSnapshotTarget, GITHUB_PR_SNAPSHOT_ARTIFACT,
+};
 use crate::http::AppState;
 use crate::reconciliation::{fetch_issue_state_with_token, GitHubState};
 use harness_core::config::workflow::WorkflowConfig;
@@ -12,6 +15,7 @@ use harness_workflow::runtime::quality_gate::QUALITY_GATE_ACTIVITY;
 use harness_workflow::runtime::{
     activity_result_has_closed_issue_evidence, ActivityArtifact, ActivityErrorKind, ActivityResult,
     ActivityStatus, RuntimeJob, WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
+    SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 #[cfg(test)]
 use serde_json::json;
@@ -91,6 +95,9 @@ pub(super) async fn apply_external_completion_evidence(
     workflow: Option<&WorkflowInstance>,
     mut result: ActivityResult,
 ) -> ActivityResult {
+    if activity_name(job) == QUALITY_GATE_ACTIVITY && result.status == ActivityStatus::Succeeded {
+        result = attach_quality_gate_pr_snapshot(state, workflow, result).await;
+    }
     if result_claims_pr_binding(job, workflow, &result) {
         if let Some(workflow) = workflow {
             result = attach_pr_binding_verification(state, workflow, result).await;
@@ -113,6 +120,59 @@ pub(super) async fn apply_external_completion_evidence(
         }
     }
     result
+}
+
+async fn attach_quality_gate_pr_snapshot(
+    state: &Arc<AppState>,
+    workflow: Option<&WorkflowInstance>,
+    result: ActivityResult,
+) -> ActivityResult {
+    let Some(workflow) = workflow else {
+        return result;
+    };
+    let Some(repo) = workflow
+        .data
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+    else {
+        return result;
+    };
+    let Some(pr_number) = workflow.data.get("pr_number").and_then(Value::as_u64) else {
+        return result;
+    };
+    let target = match GitHubPrSnapshotTarget::new(repo, pr_number) {
+        Ok(target) => target,
+        Err(error) => {
+            return ActivityResult::failed(
+                QUALITY_GATE_ACTIVITY,
+                "Quality gate could not resolve the pull request for final head verification.",
+                error.to_string(),
+            )
+            .with_error_kind(ActivityErrorKind::Configuration);
+        }
+    };
+    let token = crate::github_auth::resolve_github_token(
+        state.core.server.config.server.github_token.as_deref(),
+    );
+    match fetch_github_pr_snapshot(&target, token.as_deref()).await {
+        Ok(snapshot) => result
+            .with_artifact(ActivityArtifact::new(
+                SERVER_PR_SNAPSHOT_ARTIFACT,
+                snapshot.normalized_snapshot,
+            ))
+            .with_artifact(ActivityArtifact::new(
+                GITHUB_PR_SNAPSHOT_ARTIFACT,
+                snapshot.raw_pr,
+            )),
+        Err(error) => ActivityResult::failed(
+            QUALITY_GATE_ACTIVITY,
+            "Quality gate could not verify the current pull request head.",
+            error.to_string(),
+        )
+        .with_error_kind(ActivityErrorKind::ExternalDependency),
+    }
 }
 
 fn result_claims_issue_closure(

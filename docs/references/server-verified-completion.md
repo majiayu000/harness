@@ -185,6 +185,7 @@ the transitions that mint user-visible facts:
 | Workflow | Transition | Required evidence class |
 | --- | --- | --- |
 | `github_issue_pr` | `* → done` (non-reconciliation) | `github_pr` (verified PR identity) + `server_pr_snapshot` |
+| `github_issue_pr` | `implementing/scheduled → pr_scope_review` | `verified_pr_binding` (see R3) |
 | `github_issue_pr` | `implementing → pr_open` | `verified_pr_binding` (see R3) |
 | `prompt_task` | `implementing → done` | `prompt_completion_evidence` (umbrella kind, see R4) |
 | `quality_gate` | `checking → passed` | `server_validation_digest` (see R2) |

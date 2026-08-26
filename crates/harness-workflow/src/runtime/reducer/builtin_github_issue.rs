@@ -6,8 +6,7 @@ use super::{
     ISSUE_STATE_ARTIFACT,
 };
 use crate::runtime::completion_evidence::{
-    github_pr_identity, pr_binding_verification_failure,
-    transition_evidence_enforced_with_registry, verified_issue_state_artifact,
+    github_pr_identity, pr_binding_verification_failure, verified_issue_state_artifact,
     verified_pr_binding_artifact, ARTIFACT_MERGE_COMPLETION_VERIFICATION, EVIDENCE_GITHUB_TERMINAL,
     EVIDENCE_VERIFIED_PR_BINDING, MERGE_COMPLETION_VERIFICATION_SCHEMA,
     REASON_PR_BINDING_VERIFICATION_FAILED,
@@ -198,18 +197,32 @@ pub(super) fn bind_pr_from_activity_result(
             }
         };
     let pr_url = binding.canonical_pr_url;
+    let issue_plan = event
+        .event
+        .pointer("/command/command/issue_plan")
+        .cloned()
+        .unwrap_or(Value::Null);
     Some(
         WorkflowDecision::new(
             &instance.id,
             &instance.state,
             "bind_pr",
-            "pr_open",
-            "implementation activity returned a structured pull request artifact",
+            "pr_scope_review",
+            "implementation activity returned a verified pull request for independent scope review",
         )
         .with_command(WorkflowCommand::bind_pr(
             pr_number,
             pr_url.clone(),
             format!("runtime-completion:{}:bind-pr:{pr_number}", event.id),
+        ))
+        .with_command(crate::runtime::scope_review::enqueue_pr_scope_review(
+            format!(
+                "runtime-completion:{}:classify-pr-scope:{pr_number}",
+                event.id
+            ),
+            pr_number,
+            &pr_url,
+            issue_plan,
         ))
         .with_evidence(WorkflowEvidence::new("pull_request", pr_url))
         .with_evidence(binding.evidence)
@@ -229,7 +242,7 @@ pub(crate) struct VerifiedPrBindingEvidence {
 }
 
 pub(crate) fn verified_pr_binding_evidence_with_registry(
-    registry: &WorkflowDefinitionRegistry,
+    _registry: &WorkflowDefinitionRegistry,
     result: &ActivityResult,
     claimed_pr_number: u64,
     claimed_pr_url: &str,
@@ -278,23 +291,6 @@ pub(crate) fn verified_pr_binding_evidence_with_registry(
             canonical_pr_url: format!(
                 "https://github.com/{verified_repo}/pull/{claimed_pr_number}"
             ),
-        });
-    }
-    if !transition_evidence_enforced_with_registry(
-        registry,
-        GITHUB_ISSUE_PR_DEFINITION_ID,
-        "implementing",
-        "pr_open",
-        EVIDENCE_VERIFIED_PR_BINDING,
-    ) {
-        // The transition table no longer demands it, so neither does this
-        // reducer: one authority, no drift.
-        return Ok(VerifiedPrBindingEvidence {
-            evidence: WorkflowEvidence::new(
-                EVIDENCE_VERIFIED_PR_BINDING,
-                "enforcement_lifted_by_deployment_config",
-            ),
-            canonical_pr_url: format!("https://github.com/{claimed_repo}/pull/{claimed_pr_number}"),
         });
     }
     Err(

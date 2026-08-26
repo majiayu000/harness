@@ -32,7 +32,7 @@ pub(super) async fn load_or_issue_instance(
         {
             Some(instance) => (instance, false),
             None => (
-                issue_instance(workflow_id, project_id, repo, issue_number, state),
+                issue_instance(workflow_id, project_id, repo, issue_number, state)?,
                 true,
             ),
         },
@@ -96,7 +96,7 @@ pub(super) async fn load_or_pr_runtime_target(
             pr_number,
             pr_url,
             state,
-        ),
+        )?,
         new_instance: true,
         issue_number: None,
     })
@@ -108,8 +108,8 @@ pub(super) fn issue_instance(
     repo: Option<String>,
     issue_number: u64,
     state: &str,
-) -> WorkflowInstance {
-    WorkflowInstance::new(
+) -> anyhow::Result<WorkflowInstance> {
+    Ok(WorkflowInstance::new(
         "github_issue_pr",
         1,
         state,
@@ -117,16 +117,19 @@ pub(super) fn issue_instance(
     )
     .with_id(workflow_id)
     .with_classified_data(
-        crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        crate::workflow_runtime_policy::pin_change_scope_classifier_policy(
             Path::new(&project_id),
-            json!({
-                "project_id": project_id,
-                "repo": repo,
-                "issue_number": issue_number,
-            }),
-        ),
+            crate::workflow_runtime_policy::merge_runtime_retry_policy(
+                Path::new(&project_id),
+                json!({
+                    "project_id": project_id,
+                    "repo": repo,
+                    "issue_number": issue_number,
+                }),
+            ),
+        )?,
         DataProvenance::Server,
-    )
+    ))
 }
 
 pub(super) fn pr_scoped_instance(
@@ -137,25 +140,28 @@ pub(super) fn pr_scoped_instance(
     pr_number: u64,
     pr_url: Option<&str>,
     state: &str,
-) -> WorkflowInstance {
-    let data = pr_runtime_data(
+) -> anyhow::Result<WorkflowInstance> {
+    let data = crate::workflow_runtime_policy::pin_change_scope_classifier_policy(
         Path::new(&project_id),
-        project_id.clone(),
-        repo.as_deref(),
-        None,
-        task_id,
-        pr_number,
-        pr_url,
-        None,
-    );
-    WorkflowInstance::new(
+        pr_runtime_data(
+            Path::new(&project_id),
+            project_id.clone(),
+            repo.as_deref(),
+            None,
+            task_id,
+            pr_number,
+            pr_url,
+            None,
+        ),
+    )?;
+    Ok(WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
         state,
         WorkflowSubject::new("pr", format!("pr:{pr_number}")),
     )
     .with_id(workflow_id)
-    .with_data_field_provenance(data, pr_runtime_field_provenance)
+    .with_data_field_provenance(data, pr_runtime_field_provenance))
 }
 
 pub(super) fn pr_workflow_id(project_id: &str, repo: Option<&str>, pr_number: u64) -> String {

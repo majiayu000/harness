@@ -10,8 +10,7 @@ use crate::runtime::plan_issue::{
     ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL,
 };
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
-use crate::runtime::submission::append_candidate_commands;
-use crate::runtime::{candidate_fanout_from_value, SubmissionMode};
+use crate::runtime::{SubmissionMode, CHANGE_SCOPE_REVIEW_ACTIVITY};
 use serde_json::{json, Value};
 
 pub(super) fn issue_plan_decision_from_activity_result(
@@ -19,15 +18,19 @@ pub(super) fn issue_plan_decision_from_activity_result(
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
-    if (
-        instance.definition_id.as_str(),
-        instance.state.as_str(),
-        result.activity.as_str(),
-    ) != (
-        GITHUB_ISSUE_PR_DEFINITION_ID,
-        "planning",
-        ISSUE_PLAN_ACTIVITY,
-    ) {
+    let is_plan_activity = matches!(
+        (
+            instance.definition_id.as_str(),
+            instance.state.as_str(),
+            result.activity.as_str(),
+        ),
+        (
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            "planning",
+            ISSUE_PLAN_ACTIVITY
+        ) | (GITHUB_ISSUE_PR_DEFINITION_ID, "replanning", "replan_issue")
+    );
+    if !is_plan_activity {
         return None;
     }
 
@@ -44,45 +47,40 @@ pub(super) fn issue_plan_decision_from_activity_result(
     let completion_command_id =
         event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
     let submission_mode = submission_mode_from_event(event);
-    let candidate_fanout = match candidate_fanout_from_value(&instance.data) {
-        Ok(candidate_fanout) => candidate_fanout,
-        Err(error) => {
-            let reason =
-                format!("runtime issue workflow has invalid candidate_fanout metadata: {error}");
-            return Some(invalid_agent_output_blocked_decision(
-                instance, event, result, &reason,
-            ));
-        }
-    };
-
     let command = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
         format!(
-            "issue-plan:{}:implement:{completion_command_id}",
+            "issue-plan:{}:classify-scope:{completion_command_id}",
             instance.id
         ),
         json!({
-            "activity": "implement_issue",
-            "issue_plan": issue_plan,
-            "issue_plan_summary": plan_summary,
-            "submission_mode": submission_mode.as_str(),
+            "activity": CHANGE_SCOPE_REVIEW_ACTIVITY,
+            "scope_facts": {
+                "issue_plan": issue_plan,
+                "issue_plan_summary": plan_summary,
+            },
+            "classifier_continuations": {
+                "implementing": {
+                    "activity": "implement_issue",
+                    "apply_candidate_fanout": true,
+                    "issue_plan": issue_plan,
+                    "issue_plan_summary": plan_summary,
+                    "submission_mode": submission_mode.as_str(),
+                }
+            }
         }),
     );
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
-        "start_implementation_after_issue_plan",
-        "implementing",
-        "issue planning activity produced a structured plan",
+        "review_issue_plan_scope",
+        "plan_scope_review",
+        "issue planning activity produced a structured plan for independent scope review",
     )
     .with_evidence(WorkflowEvidence::new("issue_plan", plan_summary))
     .with_evidence(runtime_completion_evidence(event, result))
     .high_confidence();
-    Some(append_candidate_commands(
-        decision,
-        command,
-        candidate_fanout.as_ref(),
-    ))
+    Some(decision.with_command(command))
 }
 
 fn submission_mode_from_event(event: &WorkflowEvent) -> SubmissionMode {

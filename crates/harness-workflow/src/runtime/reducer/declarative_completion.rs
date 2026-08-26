@@ -6,6 +6,7 @@ use super::support::{
     event_workflow_command, invalid_agent_output_blocked_decision, runtime_blocked_command,
     runtime_completion_evidence,
 };
+use crate::runtime::candidate_fanout_from_value;
 use crate::runtime::declarative::{
     workflow_evidence_from_activity_artifacts, DeclarativeWorkflowDefinition,
 };
@@ -16,6 +17,7 @@ use crate::runtime::model::{
 use crate::runtime::state_registry::{
     DeclarativeDefinitionPinError, WorkflowDefinitionRegistry, WorkflowTerminalState,
 };
+use crate::runtime::submission::append_candidate_commands;
 use harness_core::config::workflow::DeclaredProgressMode;
 use serde_json::json;
 
@@ -26,6 +28,38 @@ pub(crate) fn reduce_declarative_completion(
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> anyhow::Result<Option<WorkflowDecision>> {
+    let classifier_state = definition.requires_server_classifier_assessment(&instance.state);
+    let has_classifier_assessment =
+        crate::runtime::scope_review::has_server_classifier_assessment(result);
+    if classifier_state && !has_classifier_assessment {
+        return Ok(Some(invalid_completion(
+            instance,
+            event,
+            result,
+            format!(
+                "declarative workflow '{}' state '{}' requires a server-owned classifier assessment",
+                definition.policy().id,
+                instance.state
+            ),
+        )));
+    }
+    if !classifier_state && has_classifier_assessment {
+        return Ok(Some(invalid_completion(
+            instance,
+            event,
+            result,
+            format!(
+                "declarative workflow '{}' state '{}' received a classifier assessment outside a classifier state",
+                definition.policy().id,
+                instance.state
+            ),
+        )));
+    }
+    if classifier_state {
+        return Ok(Some(reduce_generic_declarative_completion(
+            definition, instance, event, result,
+        )));
+    }
     if let Some(outcome) = reduce_builtin_completion(registry, instance, event, result) {
         return outcome;
     }
@@ -207,8 +241,11 @@ fn transition_decision(
         "declarative activity '{}' completed with {:?}; {} selected state '{}'",
         result.activity, result.status, route_reason, target
     );
-    let command = if let Some(class) = terminal_class(policy, target)? {
-        terminal_command(class, instance, event, result, target, &reason)
+    let (command, apply_candidate_fanout) = if let Some(class) = terminal_class(policy, target)? {
+        (
+            terminal_command(class, instance, event, result, target, &reason),
+            false,
+        )
     } else {
         let state = policy.states.get(target).ok_or_else(|| {
             anyhow::anyhow!(
@@ -218,9 +255,9 @@ fn transition_decision(
             )
         })?;
         if let Some(activity) = state.activity.as_deref() {
-            WorkflowCommand::enqueue_activity(activity, event_dedupe_key(instance, target, event))
+            classifier_continuation_command(instance, event, result, target, activity)?
         } else {
-            match state.progress {
+            let command = match state.progress {
                 Some(DeclaredProgressMode::CommandDriven) => anyhow::bail!(
                     "declarative workflow '{}' target state '{}' is command-driven but declares no activity",
                     policy.id,
@@ -230,6 +267,12 @@ fn transition_decision(
                     format!("declarative workflow entered external wait state '{target}'"),
                     event_dedupe_key(instance, target, event),
                 ),
+                Some(DeclaredProgressMode::OperatorGate) if target == "blocked" => {
+                    WorkflowCommand::mark_blocked(
+                        &reason,
+                        event_dedupe_key(instance, target, event),
+                    )
+                }
                 Some(DeclaredProgressMode::OperatorGate) => WorkflowCommand::new(
                     WorkflowCommandType::RequestOperatorAttention,
                     event_dedupe_key(instance, target, event),
@@ -249,19 +292,82 @@ fn transition_decision(
                     policy.id,
                     target
                 ),
-            }
+            };
+            (command, false)
         }
     };
 
-    Ok(WorkflowDecision::new(
+    let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
         "apply_declarative_transition",
         target,
         reason,
     )
-    .with_command(command)
-    .high_confidence())
+    .high_confidence();
+    if apply_candidate_fanout {
+        let candidate_fanout = candidate_fanout_from_value(&instance.data)?;
+        Ok(append_candidate_commands(
+            decision,
+            command,
+            candidate_fanout.as_ref(),
+        ))
+    } else {
+        Ok(decision.with_command(command))
+    }
+}
+
+fn classifier_continuation_command(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    target: &str,
+    activity: &str,
+) -> anyhow::Result<(WorkflowCommand, bool)> {
+    let dedupe_key = event_dedupe_key(instance, target, event);
+    if !crate::runtime::scope_review::has_server_classifier_assessment(result) {
+        return Ok((
+            WorkflowCommand::enqueue_activity(activity, dedupe_key),
+            false,
+        ));
+    }
+    let Some(source_command) = event_workflow_command(event) else {
+        anyhow::bail!("classifier completion is missing its source command");
+    };
+    let Some(mut continuation) = source_command
+        .command
+        .pointer(&format!("/classifier_continuations/{target}"))
+        .cloned()
+    else {
+        return Ok((
+            WorkflowCommand::enqueue_activity(activity, dedupe_key),
+            false,
+        ));
+    };
+    if continuation
+        .get("activity")
+        .and_then(serde_json::Value::as_str)
+        != Some(activity)
+    {
+        anyhow::bail!(
+            "classifier continuation for state '{target}' does not enqueue expected activity '{activity}'"
+        );
+    }
+    let apply_candidate_fanout = continuation
+        .get("apply_candidate_fanout")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if let Some(object) = continuation.as_object_mut() {
+        object.remove("apply_candidate_fanout");
+    }
+    Ok((
+        WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            dedupe_key,
+            continuation,
+        ),
+        apply_candidate_fanout,
+    ))
 }
 
 fn terminal_class(

@@ -69,7 +69,7 @@ where
                 project_id.clone(),
                 ctx.repo.map(ToOwned::to_owned),
                 ctx.issue_number,
-            ),
+            )?,
             true,
         ),
     };
@@ -125,8 +125,8 @@ pub(super) fn issue_instance(
     project_id: String,
     repo: Option<String>,
     issue_number: u64,
-) -> WorkflowInstance {
-    WorkflowInstance::new(
+) -> anyhow::Result<WorkflowInstance> {
+    Ok(WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
         "discovered",
@@ -134,13 +134,16 @@ pub(super) fn issue_instance(
     )
     .with_id(workflow_id)
     .with_classified_data(
-        json!({
-            "project_id": project_id,
-            "repo": repo,
-            "issue_number": issue_number,
-        }),
+        crate::workflow_runtime_policy::pin_change_scope_classifier_policy(
+            Path::new(&project_id),
+            json!({
+                "project_id": project_id,
+                "repo": repo,
+                "issue_number": issue_number,
+            }),
+        )?,
         DataProvenance::Server,
-    )
+    ))
 }
 
 pub(super) fn issue_submission_data(
@@ -173,6 +176,12 @@ pub(super) fn issue_submission_data(
     });
     if let (Some(object), Some(candidate_fanout)) = (data.as_object_mut(), candidate_fanout) {
         object.insert("candidate_fanout".to_string(), json!(candidate_fanout));
+    }
+    if let Some(policy) = existing_data
+        .get(crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD)
+        .cloned()
+    {
+        data[crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD] = policy;
     }
     insert_author_trust_class(&mut data, ctx.author_trust_class);
     crate::workflow_runtime_policy::merge_runtime_retry_policy(ctx.project_root, data)

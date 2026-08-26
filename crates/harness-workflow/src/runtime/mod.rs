@@ -35,6 +35,7 @@ pub mod reason_class;
 pub mod reducer;
 pub mod remote_facts;
 pub mod repo_memory;
+mod scope_review;
 pub mod state_registry;
 pub mod status;
 pub mod store;
@@ -185,6 +186,7 @@ pub use repo_memory::{
     RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, REPO_MEMORY_CONFIG_ARTIFACT,
     REPO_MEMORY_DEGRADATION_ARTIFACT,
 };
+pub use scope_review::CHANGE_SCOPE_REVIEW_ACTIVITY;
 pub use state_registry::{
     DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, RegisteredWorkflowDefinition,
     WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowStateDefinition, WorkflowStateKey,

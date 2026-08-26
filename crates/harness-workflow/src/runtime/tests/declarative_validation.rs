@@ -1,7 +1,8 @@
 mod declarative_validation {
     use super::super::*;
     use harness_core::config::workflow::{
-        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowClassifierPolicy,
+        WorkflowDefinitionPolicy,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -189,6 +190,43 @@ mod declarative_validation {
     }
 
     #[test]
+    fn classifier_state_routes_exactly_through_declared_verdicts() {
+        let mut policy = valid_policy();
+        let reviewing = policy.states.get_mut("reviewing").unwrap();
+        reviewing.on_success = None;
+        reviewing.on_failure = Some("blocked".to_string());
+        reviewing.on_signal = BTreeMap::from([
+            ("allow".to_string(), "done".to_string()),
+            ("needs_human".to_string(), "failed".to_string()),
+        ]);
+        let activities = BTreeMap::from([(
+            "implement".to_string(),
+            WorkflowActivityPolicy {
+                classifier: Some(WorkflowClassifierPolicy {
+                    verdicts: vec!["allow".to_string(), "needs_human".to_string()],
+                    environment: vec!["Judge supplied facts only.".to_string()],
+                    ..WorkflowClassifierPolicy::default()
+                }),
+                ..WorkflowActivityPolicy::default()
+            },
+        )]);
+
+        build_declarative_definition(&policy, &activities)
+            .expect("complete classifier routes should compile");
+
+        policy
+            .states
+            .get_mut("reviewing")
+            .unwrap()
+            .on_signal
+            .remove("needs_human");
+        let error = build_declarative_definition(&policy, &activities)
+            .expect_err("missing classifier route must fail closed")
+            .to_string();
+        assert!(error.contains("signal routes must exactly match classifier verdicts"));
+    }
+
+    #[test]
     fn rejects_undeclared_transition_and_evidence_targets() {
         let mut transition = valid_policy();
         transition.states.get_mut("reviewing").unwrap().on_failure = Some("missing".to_string());
@@ -314,6 +352,13 @@ mod declarative_validation {
                 WorkflowCommandType::RequestOperatorAttention,
                 WorkflowCommandType::Wait,
             ])
+        );
+        assert_eq!(
+            allowlist
+                .rule_for("reviewing", "blocked")
+                .unwrap()
+                .required_command,
+            Some(WorkflowCommandType::MarkBlocked)
         );
     }
 }

@@ -425,6 +425,10 @@ pub enum AgentEvent {
     TokenUsage {
         usage: TokenUsage,
     },
+    /// Model identity reported by the backend/provider for this turn.
+    ModelReported {
+        model: String,
+    },
     Warning {
         message: String,
     },

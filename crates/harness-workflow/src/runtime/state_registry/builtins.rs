@@ -11,11 +11,11 @@ use crate::runtime::reducer::{
     GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
 };
 use crate::runtime::validator::TransitionAllowlist;
-use crate::runtime::RegisteredWorkflowDefinition;
+use crate::runtime::{RegisteredWorkflowDefinition, CHANGE_SCOPE_REVIEW_ACTIVITY};
 use harness_core::config::workflow::{
     DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn builtin_definitions() -> [DeclarativeWorkflowDefinition; 4] {
     [
@@ -68,19 +68,23 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
                         ("PlanIssue", "planning"),
                         ("SubmitImplementation", "implementing"),
                         ("ReplanIssue", "replanning"),
-                        ("PullRequestReady", "pr_open"),
+                        ("PullRequestReady", "pr_scope_review"),
                     ],
                 ),
             ),
             (
                 "planning".to_string(),
-                activity(ISSUE_PLAN_ACTIVITY, Some("implementing"), []),
+                activity(ISSUE_PLAN_ACTIVITY, Some("plan_scope_review"), []),
+            ),
+            (
+                "plan_scope_review".to_string(),
+                classifier_activity(CHANGE_SCOPE_REVIEW_ACTIVITY, "implementing"),
             ),
             (
                 "implementing".to_string(),
                 activity(
                     "implement_issue",
-                    Some("pr_open"),
+                    Some("pr_scope_review"),
                     [
                         (ISSUE_CLOSED_SIGNAL, "done"),
                         (ISSUE_ALREADY_RESOLVED_SIGNAL, "done"),
@@ -90,7 +94,11 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
             ),
             (
                 "replanning".to_string(),
-                activity("replan_issue", Some("implementing"), []),
+                activity("replan_issue", Some("plan_scope_review"), []),
+            ),
+            (
+                "pr_scope_review".to_string(),
+                classifier_activity(CHANGE_SCOPE_REVIEW_ACTIVITY, "pr_open"),
             ),
             (
                 "pr_open".to_string(),
@@ -120,6 +128,7 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
                 progress(
                     ExternalWait,
                     [
+                        ("PrHeadChanged", "pr_scope_review"),
                         ("FeedbackFound", "addressing_feedback"),
                         ("ChangesRequested", "addressing_feedback"),
                         ("ChecksFailed", "addressing_feedback"),
@@ -130,7 +139,7 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
             ),
             (
                 "addressing_feedback".to_string(),
-                activity("address_pr_feedback", Some("local_review_gate"), []),
+                activity("address_pr_feedback", Some("pr_scope_review"), []),
             ),
             (
                 "quality_gate_pending".to_string(),
@@ -138,6 +147,7 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
                     ParentHandoff,
                     [
                         ("QualityPassed", "ready_to_merge"),
+                        ("PrHeadChanged", "pr_scope_review"),
                         (ISSUE_CLOSED_SIGNAL, "done"),
                     ],
                 ),
@@ -146,12 +156,20 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
                 "ready_to_merge".to_string(),
                 progress(
                     OperatorGate,
-                    [("MergeRequested", "merging"), (ISSUE_CLOSED_SIGNAL, "done")],
+                    [
+                        ("MergeRequested", "merging"),
+                        ("PrHeadChanged", "pr_scope_review"),
+                        (ISSUE_CLOSED_SIGNAL, "done"),
+                    ],
                 ),
             ),
             (
                 "merging".to_string(),
-                activity("merge_pr", Some("done"), []),
+                activity(
+                    "merge_pr",
+                    Some("done"),
+                    [("PrHeadChanged", "pr_scope_review")],
+                ),
             ),
             (
                 "blocked".to_string(),
@@ -170,7 +188,11 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
         ],
         intake: None,
     };
-    builtin(policy, TransitionAllowlist::github_issue_pr_defaults())
+    builtin(
+        policy,
+        TransitionAllowlist::github_issue_pr_defaults(),
+        BTreeSet::from([CHANGE_SCOPE_REVIEW_ACTIVITY.to_string()]),
+    )
 }
 
 fn prompt_task_definition() -> DeclarativeWorkflowDefinition {
@@ -215,7 +237,11 @@ fn prompt_task_definition() -> DeclarativeWorkflowDefinition {
         ],
         intake: None,
     };
-    builtin(policy, TransitionAllowlist::prompt_task_defaults())
+    builtin(
+        policy,
+        TransitionAllowlist::prompt_task_defaults(),
+        BTreeSet::new(),
+    )
 }
 
 fn quality_gate_definition() -> DeclarativeWorkflowDefinition {
@@ -251,7 +277,11 @@ fn quality_gate_definition() -> DeclarativeWorkflowDefinition {
         recovery_targets: vec!["checking".to_string()],
         intake: None,
     };
-    builtin(policy, TransitionAllowlist::quality_gate_defaults())
+    builtin(
+        policy,
+        TransitionAllowlist::quality_gate_defaults(),
+        BTreeSet::new(),
+    )
 }
 
 fn pr_feedback_definition() -> DeclarativeWorkflowDefinition {
@@ -295,14 +325,24 @@ fn pr_feedback_definition() -> DeclarativeWorkflowDefinition {
         recovery_targets: vec!["inspecting".to_string()],
         intake: None,
     };
-    builtin(policy, TransitionAllowlist::pr_feedback_defaults())
+    builtin(
+        policy,
+        TransitionAllowlist::pr_feedback_defaults(),
+        BTreeSet::new(),
+    )
 }
 
 fn builtin(
     policy: WorkflowDefinitionPolicy,
     allowlist: TransitionAllowlist,
+    classifier_activities: BTreeSet<String>,
 ) -> DeclarativeWorkflowDefinition {
-    match build_builtin_declarative_definition(&policy, &activity_policies(&policy), allowlist) {
+    match build_builtin_declarative_definition(
+        &policy,
+        &activity_policies(&policy),
+        allowlist,
+        classifier_activities,
+    ) {
         Ok(definition) => definition,
         Err(error) => panic!("built-in declarative workflow definition must compile: {error}"),
     }
@@ -317,6 +357,20 @@ fn activity(
         activity: Some(name.to_string()),
         on_success: on_success.map(str::to_string),
         on_signal: signal_routes(signals),
+        ..DeclaredState::default()
+    }
+}
+
+fn classifier_activity(name: &str, allow_target: &'static str) -> DeclaredState {
+    DeclaredState {
+        activity: Some(name.to_string()),
+        on_failure: Some("blocked".to_string()),
+        on_signal: signal_routes([
+            ("allow", allow_target),
+            ("revise_plan", "blocked"),
+            ("split_required", "blocked"),
+            ("needs_human", "blocked"),
+        ]),
         ..DeclaredState::default()
     }
 }
@@ -424,14 +478,17 @@ mod tests {
         (Some("scheduled"), "planning", &[E, W]),
         (Some("scheduled"), "implementing", &[E, P, W]),
         (Some("scheduled"), "replanning", &[E, P, MB, W]),
-        (Some("planning"), "implementing", &[E, MB]),
+        (Some("planning"), "plan_scope_review", &[E]),
         (Some("planning"), "planning", &[E, W]),
         (Some("implementing"), "implementing", &[E, P, W]),
         (Some("implementing"), "replanning", &[E, P, MB, W]),
-        (Some("replanning"), "implementing", &[E, P, MB, W]),
+        (Some("replanning"), "plan_scope_review", &[E]),
+        (Some("plan_scope_review"), "implementing", &[E]),
+        (Some("implementing"), "pr_scope_review", &[B, E]),
+        (Some("pr_scope_review"), "pr_open", &[W]),
         (Some("implementing"), "pr_open", &[B, E, S, W]),
         (Some("implementing"), "done", &[MD]),
-        (Some("scheduled"), "pr_open", &[B, E, S, W]),
+        (Some("scheduled"), "pr_scope_review", &[B, E, S, W]),
         (Some("pr_open"), "pr_open", &[B, W]),
         (Some("pr_open"), "local_review_gate", &[E, W]),
         (Some("pr_open"), "awaiting_feedback", &[W]),
@@ -455,15 +512,19 @@ mod tests {
             "addressing_feedback",
             &[E, S, MB, W],
         ),
-        (Some("addressing_feedback"), "local_review_gate", &[E, S, W]),
+        (Some("addressing_feedback"), "pr_scope_review", &[E, S, W]),
+        (Some("awaiting_feedback"), "pr_scope_review", &[E, W]),
         (Some("awaiting_feedback"), "quality_gate_pending", &[S, W]),
+        (Some("quality_gate_pending"), "pr_scope_review", &[E]),
         (Some("quality_gate_pending"), "ready_to_merge", &[]),
         (Some("awaiting_feedback"), "done", &[MD]),
         (Some("addressing_feedback"), "done", &[MD]),
         (Some("quality_gate_pending"), "done", &[MD]),
         (Some("quality_gate_pending"), "quality_gate_pending", &[W]),
         (Some("ready_to_merge"), "ready_to_merge", &[W]),
+        (Some("ready_to_merge"), "pr_scope_review", &[E]),
         (Some("ready_to_merge"), "merging", &[E]),
+        (Some("merging"), "pr_scope_review", &[E]),
         (Some("merging"), "done", &[MD]),
         (Some("ready_to_merge"), "done", &[MD]),
         (None, "blocked", &[MB, O, W]),

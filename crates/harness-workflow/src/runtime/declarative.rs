@@ -1,5 +1,5 @@
 use super::{
-    declarative_pinning::declarative_definition_identity,
+    declarative_pinning::declarative_definition_identity_with_classifier_policies,
     model::{ActivityArtifact, WorkflowCommandType, WorkflowEvidence},
     pr_feedback::PR_FEEDBACK_DEFINITION_ID,
     prompt_task::PROMPT_TASK_DEFINITION_ID,
@@ -40,6 +40,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub struct DeclarativeWorkflowDefinition {
     registered: RegisteredWorkflowDefinition,
     policy: WorkflowDefinitionPolicy,
+    classifier_activities: BTreeSet<String>,
+    classifier_activity_policies: BTreeMap<String, WorkflowActivityPolicy>,
     definition_version: u32,
     definition_hash: String,
 }
@@ -61,6 +63,26 @@ impl DeclarativeWorkflowDefinition {
         &self.definition_hash
     }
 
+    pub fn classifier_activities(&self) -> &BTreeSet<String> {
+        &self.classifier_activities
+    }
+
+    pub fn classifier_activity_policy(&self, activity: &str) -> Option<&WorkflowActivityPolicy> {
+        self.classifier_activity_policies.get(activity)
+    }
+
+    pub fn classifier_activity_policies(&self) -> &BTreeMap<String, WorkflowActivityPolicy> {
+        &self.classifier_activity_policies
+    }
+
+    pub fn requires_server_classifier_assessment(&self, state: &str) -> bool {
+        self.policy
+            .states
+            .get(state)
+            .and_then(|state| state.activity.as_ref())
+            .is_some_and(|activity| self.classifier_activities.contains(activity))
+    }
+
     pub fn into_registered(self) -> RegisteredWorkflowDefinition {
         self.registered
     }
@@ -71,6 +93,23 @@ pub fn build_declarative_definition(
     policy: &WorkflowDefinitionPolicy,
     activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
+    let classifier_activity_policies = activity_policies
+        .iter()
+        .filter(|(_, policy)| policy.classifier.is_some())
+        .map(|(activity, policy)| (activity.clone(), policy.clone()))
+        .collect();
+    build_declarative_definition_with_classifier_policies(
+        policy,
+        activity_policies,
+        classifier_activity_policies,
+    )
+}
+
+pub(crate) fn build_declarative_definition_with_classifier_policies(
+    policy: &WorkflowDefinitionPolicy,
+    activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
+    classifier_activity_policies: BTreeMap<String, WorkflowActivityPolicy>,
+) -> anyhow::Result<DeclarativeWorkflowDefinition> {
     validate_top_level(policy, BuiltinIdPolicy::Reject)?;
 
     let terminal_states = parse_terminal_states(policy)?;
@@ -80,11 +119,18 @@ pub fn build_declarative_definition(
 
     let states = compile_states(policy, &terminal_states);
     let allowlist = compile_allowlist(policy, &terminal_states);
-    let (definition_version, definition_hash) = declarative_definition_identity(policy)?;
+    let classifier_activities = classifier_activity_policies.keys().cloned().collect();
+    let (definition_version, definition_hash) =
+        declarative_definition_identity_with_classifier_policies(
+            policy,
+            &classifier_activity_policies,
+        )?;
 
     Ok(DeclarativeWorkflowDefinition {
         registered: RegisteredWorkflowDefinition::new(&policy.id, states, allowlist),
         policy: policy.clone(),
+        classifier_activities,
+        classifier_activity_policies,
         definition_version,
         definition_hash,
     })
@@ -94,6 +140,7 @@ pub(crate) fn build_builtin_declarative_definition(
     policy: &WorkflowDefinitionPolicy,
     activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
     allowlist: TransitionAllowlist,
+    classifier_activities: BTreeSet<String>,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
     validate_top_level(policy, BuiltinIdPolicy::Allow)?;
 
@@ -106,6 +153,8 @@ pub(crate) fn build_builtin_declarative_definition(
     Ok(DeclarativeWorkflowDefinition {
         registered: RegisteredWorkflowDefinition::new(&policy.id, states, allowlist),
         policy: policy.clone(),
+        classifier_activities,
+        classifier_activity_policies: BTreeMap::new(),
         definition_version: 1,
         definition_hash: format!("builtin:{}:v1", policy.id),
     })
@@ -133,10 +182,20 @@ pub fn workflow_evidence_from_activity_artifacts(
         if artifact.artifact_type == "workflow_decision" {
             continue;
         }
-        evidence.push(WorkflowEvidence::new(
-            artifact.artifact_type.clone(),
-            format!("activity produced '{}' artifact", artifact.artifact_type),
-        ));
+        let summary = format!("activity produced '{}' artifact", artifact.artifact_type);
+        evidence.push(
+            if artifact.artifact_type == super::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT
+            {
+                WorkflowEvidence::runtime_observed(
+                    artifact.artifact_type.clone(),
+                    summary,
+                    "server_classifier_attestation",
+                    None,
+                )
+            } else {
+                WorkflowEvidence::new(artifact.artifact_type.clone(), summary)
+            },
+        );
     }
     Ok(evidence)
 }
@@ -306,13 +365,22 @@ fn validate_active_states(
                     state_name
                 );
             }
-            if !activity_policies.contains_key(activity) {
+            let Some(activity_policy) = activity_policies.get(activity) else {
                 anyhow::bail!(
                     "declarative workflow definition '{}' active state '{}' references activity '{}' absent from the workflow activities policy map",
                     policy.id,
                     state_name,
                     activity
                 );
+            };
+            if let Some(classifier) = activity_policy.classifier.as_ref() {
+                classifier.validate(activity)?;
+                classifier.validate_routes(
+                    activity,
+                    state.on_success.as_deref(),
+                    state.on_failure.as_deref(),
+                    &state.on_signal,
+                )?;
             }
         }
         if let Some(signal_type) = state
@@ -577,6 +645,9 @@ fn required_command_for_target(
     terminal_states: &BTreeMap<String, WorkflowTerminalState>,
     target: &str,
 ) -> WorkflowCommandType {
+    if target == "blocked" {
+        return WorkflowCommandType::MarkBlocked;
+    }
     if let Some(terminal_state) = terminal_states.get(target) {
         return match terminal_state {
             WorkflowTerminalState::Succeeded => WorkflowCommandType::MarkDone,

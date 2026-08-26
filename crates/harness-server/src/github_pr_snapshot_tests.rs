@@ -68,7 +68,9 @@ fn ready_pr() -> Value {
         "state": "OPEN",
         "url": "https://github.com/owner/repo/pull/77",
         "title": "Ready PR",
+        "body": "Closes #12 and explains the intended scope.",
         "baseRefName": "main",
+        "baseRefOid": "base123",
         "headRefName": "feature",
         "headRefOid": "abc123",
         "isDraft": false,
@@ -107,6 +109,10 @@ fn maps_graphql_pr_to_runtime_snapshot_artifact() {
     assert_eq!(snapshot["pr_number"], 77);
     assert_eq!(snapshot["state"], "OPEN");
     assert_eq!(snapshot["pr_url"], "https://github.com/owner/repo/pull/77");
+    assert_eq!(
+        snapshot["body"],
+        "Closes #12 and explains the intended scope."
+    );
     assert_eq!(snapshot["head_oid"], "abc123");
     assert_eq!(snapshot["status_check_rollup_state"], "SUCCESS");
     assert_eq!(snapshot["merge_state_status"], "CLEAN");
@@ -120,6 +126,26 @@ fn maps_graphql_pr_to_runtime_snapshot_artifact() {
 }
 
 #[test]
+fn rejects_snapshot_with_mismatched_pr_number() {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
+    let mut pr = ready_pr();
+    pr["number"] = json!(78);
+
+    let error = normalize_github_pr_snapshot(&target, &pr).unwrap_err();
+    assert!(error.to_string().contains("expected #77"));
+}
+
+#[test]
+fn rejects_snapshot_with_mismatched_pr_url_identity() {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
+    let mut pr = ready_pr();
+    pr["url"] = json!("https://github.com/other/repo/pull/77");
+
+    let error = normalize_github_pr_snapshot(&target, &pr).unwrap_err();
+    assert!(error.to_string().contains("expected owner/repo#77"));
+}
+
+#[test]
 fn marks_paginated_closing_issue_snapshot_incomplete() -> anyhow::Result<()> {
     let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
     let mut pr = ready_pr();
@@ -127,6 +153,24 @@ fn marks_paginated_closing_issue_snapshot_incomplete() -> anyhow::Result<()> {
 
     let snapshot = normalize_github_pr_snapshot(&target, &pr)?;
 
+    assert_eq!(snapshot["closing_issues_complete"], false);
+    Ok(())
+}
+
+#[test]
+fn missing_connection_metadata_is_never_reported_complete() -> anyhow::Result<()> {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+    let mut pr = ready_pr();
+    pr.as_object_mut().unwrap().remove("files");
+    pr["reviewThreads"] = json!({"nodes": []});
+    pr["closingIssuesReferences"] = json!({
+        "pageInfo": {"hasNextPage": false}
+    });
+
+    let snapshot = normalize_github_pr_snapshot(&target, &pr)?;
+
+    assert_eq!(snapshot["changed_files_complete"], false);
+    assert_eq!(snapshot["review_threads_complete"], false);
     assert_eq!(snapshot["closing_issues_complete"], false);
     Ok(())
 }
@@ -361,6 +405,105 @@ async fn fetches_all_status_check_context_pages() -> anyhow::Result<()> {
     let received = received.lock().await;
     assert_eq!(received.len(), 2);
     assert!(received[1].contains(r#""after":"cursor-1""#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetches_every_changed_file_page_beyond_one_hundred_files() -> anyhow::Result<()> {
+    let mut first_pr = ready_pr();
+    first_pr["id"] = json!("PR_node");
+    first_pr["files"] = json!({
+        "pageInfo": {"hasNextPage": true, "endCursor": "files-100"},
+        "nodes": (0..100)
+            .map(|index| json!({
+                "path": format!("src/file-{index}.rs"),
+                "additions": 1,
+                "deletions": 0,
+                "changeType": "ADDED",
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let responses = vec![
+        json!({
+            "data": {"repository": {"pullRequest": first_pr}}
+        })
+        .to_string(),
+        json!({
+            "data": {"node": {
+                "baseRefOid": "base123",
+                "headRefOid": "abc123",
+                "files": {
+                    "pageInfo": {"hasNextPage": false, "endCursor": "files-101"},
+                    "nodes": [{
+                        "path": "src/file-100.rs",
+                        "additions": 1,
+                        "deletions": 0,
+                        "changeType": "ADDED",
+                    }],
+                }
+            }}
+        })
+        .to_string(),
+    ];
+    let (graphql_url, received) = spawn_graphql_responses(responses).await?;
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+
+    let artifacts =
+        fetch_github_pr_snapshot_with_client(&reqwest::Client::new(), &target, None, &graphql_url)
+            .await?;
+
+    assert_eq!(
+        artifacts.normalized_snapshot["changed_files_complete"],
+        true
+    );
+    assert_eq!(
+        artifacts.normalized_snapshot["changed_files"]
+            .as_array()
+            .map(Vec::len),
+        Some(101)
+    );
+    let received = received.lock().await;
+    assert_eq!(received.len(), 2);
+    assert!(received[1].contains(r#""after":"files-100""#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_paginated_files_from_a_different_pr_head() -> anyhow::Result<()> {
+    let mut first_pr = ready_pr();
+    first_pr["id"] = json!("PR_node");
+    first_pr["files"] = json!({
+        "pageInfo": {"hasNextPage": true, "endCursor": "files-1"},
+        "nodes": [{
+            "path": "src/first.rs",
+            "additions": 1,
+            "deletions": 0,
+            "changeType": "ADDED",
+        }],
+    });
+    let responses = vec![
+        json!({"data": {"repository": {"pullRequest": first_pr}}}).to_string(),
+        json!({
+            "data": {"node": {
+                "baseRefOid": "base123",
+                "headRefOid": "changed-head",
+                "files": {
+                    "pageInfo": {"hasNextPage": false, "endCursor": "files-2"},
+                    "nodes": []
+                }
+            }}
+        })
+        .to_string(),
+    ];
+    let (graphql_url, _) = spawn_graphql_responses(responses).await?;
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+
+    let error =
+        fetch_github_pr_snapshot_with_client(&reqwest::Client::new(), &target, None, &graphql_url)
+            .await
+            .expect_err("mutable PR pagination must not combine files from different heads");
+
+    assert!(error.to_string().contains("base or head changed"));
     Ok(())
 }
 

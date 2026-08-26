@@ -87,6 +87,42 @@ fn base_args_enable_structured_json_stdout() {
     assert!(args.windows(2).any(|window| window == ["--color", "never"]));
 }
 
+#[test]
+fn empty_tool_allowlist_disables_codex_execution_surfaces() {
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::ReadOnly);
+    let request = AgentRequest {
+        prompt: "classify".to_string(),
+        project_root: PathBuf::from("/tmp/project"),
+        allowed_tools: Some(Vec::new()),
+        ..Default::default()
+    };
+
+    let args = agent
+        .base_args(&request)
+        .iter()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+    for feature in [
+        "shell_tool",
+        "unified_exec",
+        "code_mode",
+        "code_mode_host",
+        "multi_agent",
+        "multi_agent_v2",
+        "apps",
+        "browser_use",
+        "image_generation",
+    ] {
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--disable", feature]),
+            "missing deny-all feature flag for {feature}"
+        );
+    }
+}
+
 enum StreamObservation {
     Item(Option<StreamItem>),
     TaskFinished(Result<harness_core::error::Result<()>, tokio::task::JoinError>),

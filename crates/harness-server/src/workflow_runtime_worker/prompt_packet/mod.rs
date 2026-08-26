@@ -18,21 +18,19 @@ use super::data_helpers::activity_name;
 use super::runtime_profile::ResolvedRuntimeSettings;
 
 mod activity_policy;
-use activity_policy::{append_activity_policy_prompt, apply_activity_policy};
+use activity_policy::apply_activity_policy;
 
 mod context_provenance;
-use context_provenance::{
-    apply_context_provenance, repo_memory_prompt_section, repo_memory_prompt_value,
-    strip_model_facing_audit_sections,
-};
+use context_provenance::{apply_context_provenance, repo_memory_prompt_value};
 
 mod command_input_taint;
 use command_input_taint::render_command_input;
 
 mod workflow_data_taint;
-use workflow_data_taint::{
-    append_continuation_context_prompt, prompt_continuation_context, workflow_prompt_value,
-};
+use workflow_data_taint::{prompt_continuation_context, workflow_prompt_value};
+
+mod prompt_render;
+pub(super) use prompt_render::build_runtime_job_prompt;
 
 /// Shared packet schema for newly produced packets and the
 /// `runtime_prompt_packet` activity artifact. Historical v1 packets remain
@@ -200,78 +198,6 @@ fn deferred_submission_mode(job: &RuntimeJob) -> bool {
         .pointer("/command/submission_mode")
         .and_then(Value::as_str)
         == Some("deferred")
-}
-
-pub(super) fn build_runtime_job_prompt(
-    prompt_packet: &Value,
-    prompt_task_request: Option<&str>,
-) -> String {
-    let workflow_prompt_template = prompt_packet
-        .pointer("/workflow_file/prompt_template")
-        .and_then(Value::as_str)
-        .filter(|template| !template.trim().is_empty())
-        .map(ToOwned::to_owned);
-    let mut model_packet = prompt_packet.clone();
-    if let Some(workflow_file) = model_packet
-        .get_mut("workflow_file")
-        .and_then(Value::as_object_mut)
-    {
-        workflow_file.remove("prompt_template");
-    }
-    strip_model_facing_audit_sections(&mut model_packet);
-    let prompt_packet_json = pretty_json(&model_packet);
-    let activity = prompt_packet
-        .get("runtime_job")
-        .and_then(|runtime_job| runtime_job.get("activity"))
-        .and_then(Value::as_str)
-        .unwrap_or("workflow_activity");
-    let project_root = prompt_packet
-        .get("project")
-        .and_then(|project| project.get("root"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let runtime_profile = prompt_packet
-        .get("runtime_job")
-        .and_then(|runtime_job| runtime_job.get("runtime_profile"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let job_id = prompt_packet
-        .get("runtime_job")
-        .and_then(|runtime_job| runtime_job.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let mut prompt = format!(
-        "You are executing a Harness workflow runtime job.\n\n\
-         Runtime contract:\n\
-         - Treat the workflow database as the source of orchestration state, but do not edit workflow tables directly.\n\
-         - Harness server only manages lifecycle. You, the agent, perform repository and GitHub work when the activity requires it.\n\
-         - Follow the project instructions loaded by the runtime.\n\
-         - Use the prompt packet activity_result_schema to shape your final summary.\n\
-         - When returning structured activity output, return a raw JSON object matching activity_result_schema when your transport enforces output-schema; otherwise put the JSON object in a final fenced `harness-activity-result` block matching activity_result_schema.\n\
-         - The structured result activity field must match this runtime job activity exactly.\n\
-         - Return a concise final summary appropriate to the activity. Include changed files and validation commands only when repository code changes were requested; for discovery and planning activities, report inspected inputs, emitted signals, and remaining blockers.\n\n\
-         Project root: {project_root}\n\
-         Runtime job id: {job_id}\n\
-         Runtime profile: {runtime_profile}\n\
-         Activity: {activity}\n\n\
-         Prompt packet:\n{prompt_packet_json}\n",
-    );
-    append_continuation_context_prompt(&mut prompt, prompt_packet);
-    if let Some(repo_memory_section) = repo_memory_prompt_section(prompt_packet) {
-        prompt.push_str(&repo_memory_section);
-    }
-    append_activity_policy_prompt(&mut prompt, prompt_packet);
-    if let Some(prompt_task_request) = prompt_task_request {
-        prompt.push_str("\nPrompt task request:\n");
-        prompt.push_str(prompt_task_request);
-        prompt.push('\n');
-    }
-    if let Some(template) = workflow_prompt_template {
-        prompt.push_str("\nRepository workflow prompt template:\n");
-        prompt.push_str(&template);
-        prompt.push('\n');
-    }
-    prompt
 }
 
 #[cfg(test)]
@@ -484,13 +410,13 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
     match (workflow_definition, activity) {
         ("github_issue_pr", ISSUE_PLAN_ACTIVITY) => json!({
             "on_succeeded": {
-                "reducer_next_state": "implementing",
+                "reducer_next_state": "plan_scope_review",
                 "accepted_signals": [ISSUE_PLAN_READY_SIGNAL],
                 "accepted_artifacts": [ISSUE_PLAN_ARTIFACT],
                 "success_requires": "A succeeded plan_issue result MUST include an issue_plan artifact or IssuePlanReady signal. Empty success is blocked.",
                 "required_summary": "Describe the planned repair slice, target files, validation plan, and blockers without editing repository files."
             },
-            "follow_up_event": "Harness enqueues implement_issue with the issue_plan payload after this activity succeeds.",
+            "follow_up_event": "Harness enqueues classify_change_scope with the issue_plan payload after this activity succeeds.",
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
                 "retry_policy": "runtime_retry_policy may retry this activity before failure."
@@ -498,7 +424,10 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         }),
         ("github_issue_pr", "replan_issue") => json!({
             "on_succeeded": {
-                "reducer_next_state": "implementing",
+                "reducer_next_state": "plan_scope_review",
+                "accepted_signals": [ISSUE_PLAN_READY_SIGNAL],
+                "accepted_artifacts": [ISSUE_PLAN_ARTIFACT],
+                "success_requires": "A succeeded replan_issue result MUST include the same structured issue_plan payload required by plan_issue.",
                 "required_summary": "Explain the revised implementation direction and validation plan."
             },
             "on_failed": {
@@ -569,7 +498,7 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         }),
         ("github_issue_pr", "implement_issue") => json!({
             "on_succeeded": {
-                "reducer_next_state": "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked",
+                "reducer_next_state": "pr_scope_review_with_verified_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked",
                 "accepted_signals": [ISSUE_CLOSED_SIGNAL, ISSUE_ALREADY_RESOLVED_SIGNAL],
                 "accepted_artifacts": ["pull_request", ISSUE_STATE_ARTIFACT],
                 "success_requires": "A succeeded implement_issue result MUST include either a pull_request artifact with pr_number/pr_url or structured closed-issue evidence with explicit closed/resolved state plus issue_number or issue_url. Empty success is blocked.",
@@ -671,6 +600,12 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
         ("github_issue_pr", "replan_issue") => json!({
             "must_include": ["reason for replan", "new implementation plan", "validation plan"],
             "must_not_include": ["direct workflow state changes"],
+            "artifacts": {
+                "issue_plan": {
+                    "required": true,
+                    "fields": ["summary", "task_class", "target_files", "validation_plan", "blockers"]
+                }
+            }
         }),
         ("github_issue_pr", "address_pr_feedback") => json!({
             "must_include": ["review feedback addressed or explicit no-code reason", "changed files or explicit no-code-change reason", "validation commands or closed issue evidence", "fresh PR state checked before final response", "final PR head or closed issue evidence", "pr_hygiene update/rebase, label, escalation, or stale-comment outcome when command_input.source=pr_hygiene"],

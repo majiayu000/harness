@@ -182,7 +182,7 @@ async fn persistent_pr_lifecycle_persist_failure_preserves_existing_workflow() -
         Some("owner/repo".to_string()),
         123,
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
@@ -245,7 +245,7 @@ async fn rejected_new_runtime_decision_persists_initial_instance() -> anyhow::Re
         Some("owner/repo".to_string()),
         123,
         "pr_open",
-    );
+    )?;
     let decision = WorkflowDecision::new(
         &workflow_id,
         "awaiting_feedback",
@@ -553,7 +553,7 @@ async fn pr_feedback_without_issue_uses_bound_workflow_for_local_review() -> any
         Some("owner/repo".to_string()),
         123,
         "pr_open",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
@@ -754,7 +754,7 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
         Some("owner/repo".to_string()),
         123,
         "pr_open",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",

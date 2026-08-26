@@ -39,7 +39,7 @@ fn ceiling_usage_upsert(workflow_id: &str, cost_usd_micros: u64) -> RuntimeUsage
 }
 
 /// A completion that the reducer turns into the progressing `bind_pr` decision
-/// (`implementing` -> `pr_open`) — the case the ceiling must be able to stop.
+/// (`implementing` -> `pr_scope_review`) — the case the ceiling must be able to stop.
 fn progressing_completion_payload() -> anyhow::Result<serde_json::Value> {
     let result = ActivityResult::succeeded("implement_issue", "Implementation completed.")
         .with_artifact(ActivityArtifact::new(
@@ -154,7 +154,7 @@ async fn budget_ceiling_shadow_records_event_and_keeps_decision() -> anyhow::Res
 
     assert!(record.accepted, "{:?}", record.rejection_reason);
     assert_eq!(record.decision.decision, "bind_pr");
-    assert_eq!(record.decision.next_state, "pr_open");
+    assert_eq!(record.decision.next_state, "pr_scope_review");
 
     let events = store.events_for(&instance.id).await?;
     let shadow = events
@@ -165,7 +165,7 @@ async fn budget_ceiling_shadow_records_event_and_keeps_decision() -> anyhow::Res
     assert_eq!(shadow.event["spent_usd"], 20.0);
     assert_eq!(shadow.event["budget_usd"], 15.0);
     assert_eq!(shadow.event["reducer_decision"], "bind_pr");
-    assert_eq!(shadow.event["reducer_next_state"], "pr_open");
+    assert_eq!(shadow.event["reducer_next_state"], "pr_scope_review");
     Ok(())
 }
 
@@ -191,7 +191,7 @@ async fn budget_ceiling_leaves_under_budget_completion_untouched() -> anyhow::Re
         .expect("an under-budget completion produces the reducer decision");
 
     assert_eq!(record.decision.decision, "bind_pr");
-    assert_eq!(record.decision.next_state, "pr_open");
+    assert_eq!(record.decision.next_state, "pr_scope_review");
     assert!(
         store
             .events_for(&instance.id)
@@ -275,6 +275,6 @@ async fn budget_ceiling_unlimited_policy_never_blocks() -> anyhow::Result<()> {
         .expect("unlimited policy commits the reducer decision");
 
     assert_eq!(record.decision.decision, "bind_pr");
-    assert_eq!(record.decision.next_state, "pr_open");
+    assert_eq!(record.decision.next_state, "pr_scope_review");
     Ok(())
 }

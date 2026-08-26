@@ -1,6 +1,6 @@
 
 #[tokio::test]
-async fn runtime_worker_persists_bind_pr_payload_for_pr_open_transition() -> anyhow::Result<()> {
+async fn runtime_worker_persists_bind_pr_payload_before_scope_review() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
@@ -34,7 +34,7 @@ async fn runtime_worker_persists_bind_pr_payload_for_pr_open_transition() -> any
                     "pr_url": "https://github.com/owner/repo/pull/77",
                 }),
             ))
-            // `implementing -> pr_open` mints a fact, so it requires the
+            // The PR-binding transition mints a fact, so it requires the
             // server's own verification of the claimed PR (GH-1766). In
             // production the runtime worker's executor attaches this after
             // resolving the PR through GitHub; the static test executor
@@ -59,7 +59,7 @@ async fn runtime_worker_persists_bind_pr_payload_for_pr_open_transition() -> any
         .get_instance(&workflow.id)
         .await?
         .expect("workflow should still exist");
-    assert_eq!(reloaded.state, "pr_open");
+    assert_eq!(reloaded.state, "pr_scope_review");
     assert_eq!(reloaded.data["project_id"], "/project-a");
     assert_eq!(reloaded.data["issue_number"], 123);
     assert_eq!(reloaded.data["pr_number"], 77);
@@ -69,13 +69,17 @@ async fn runtime_worker_persists_bind_pr_payload_for_pr_open_transition() -> any
     );
 
     let commands = store.commands_for(&workflow.id).await?;
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 3);
     assert_eq!(commands[0].status, WorkflowCommandStatus::Completed);
     assert_eq!(
         commands[1].command.command_type,
         WorkflowCommandType::BindPr
     );
     assert_ne!(commands[1].status, WorkflowCommandStatus::Pending);
+    assert_eq!(
+        commands[2].command.activity_name(),
+        Some(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY)
+    );
     Ok(())
 }
 

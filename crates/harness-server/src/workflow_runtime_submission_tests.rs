@@ -664,7 +664,7 @@ async fn rejected_issue_submission_keeps_existing_runtime_data() -> anyhow::Resu
         project_id,
         Some("owner/repo".to_string()),
         42,
-    );
+    )?;
     existing.state = "pr_open".to_string();
     existing.replace_classified_data(
         serde_json::json!({

@@ -1169,6 +1169,7 @@ fn auto_merge_snapshot_gate_accepts_ready_matching_head() -> anyhow::Result<()> 
         "issue_number": 77,
         "pr_number": 77,
         "pr_head_sha": "abc123",
+        "scope_assessed_head_oid": "abc123",
     }));
 
     let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
@@ -1185,7 +1186,7 @@ fn auto_merge_snapshot_gate_accepts_ready_matching_head() -> anyhow::Result<()> 
     assert_eq!(prepared.data["merge_delete_branch"], false);
     assert_eq!(prepared.data["merge_require_review_threads_resolved"], true);
     assert_eq!(prepared.data["merge_require_clean_merge_state"], true);
-    assert_eq!(prepared.data["merge_execution"], "agent");
+    assert_eq!(prepared.data["merge_execution"], "server");
     assert_eq!(prepared.data["verify_merge_completion"], true);
     assert_eq!(prepared.data["pr_head_sha"], "abc123");
     assert_eq!(prepared.data["merge_attempted_head_sha"], "abc123");
@@ -1212,6 +1213,7 @@ fn auto_merge_snapshot_gate_accepts_fresh_ready_head_when_stored_head_changed() 
         "issue_number": 78,
         "pr_number": 78,
         "pr_head_sha": "old-head",
+        "scope_assessed_head_oid": "old-head",
     }));
 
     let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
@@ -1220,16 +1222,17 @@ fn auto_merge_snapshot_gate_accepts_fresh_ready_head_when_stored_head_changed() 
         &auto_merge_policy(true, true),
     )?;
 
-    let super::auto_merge::AutoMergeSnapshotGate::Ready(prepared) = outcome else {
-        panic!("fresh ready snapshot should replace stale stored merge head");
-    };
-    assert_eq!(prepared.data["pr_head_sha"], "new-head");
-    assert_eq!(prepared.data["merge_attempted_head_sha"], "new-head");
+    assert_eq!(
+        outcome,
+        super::auto_merge::AutoMergeSnapshotGate::ScopeChanged {
+            observed_head_oid: "new-head".to_string(),
+        }
+    );
     Ok(())
 }
 
 #[test]
-fn auto_merge_snapshot_gate_persists_fresh_head_when_workflow_head_missing() -> anyhow::Result<()> {
+fn auto_merge_snapshot_gate_rejects_missing_scope_assessed_head() -> anyhow::Result<()> {
     let workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
         1,
@@ -1249,11 +1252,12 @@ fn auto_merge_snapshot_gate_persists_fresh_head_when_workflow_head_missing() -> 
         &auto_merge_policy(true, true),
     )?;
 
-    let super::auto_merge::AutoMergeSnapshotGate::Ready(prepared) = outcome else {
-        panic!("fresh ready snapshot should seed the expected merge head");
-    };
-    assert_eq!(prepared.data["pr_head_sha"], "fresh-head");
-    assert_eq!(prepared.data["merge_attempted_head_sha"], "fresh-head");
+    assert_eq!(
+        outcome,
+        super::auto_merge::AutoMergeSnapshotGate::ScopeChanged {
+            observed_head_oid: "fresh-head".to_string(),
+        }
+    );
     Ok(())
 }
 
@@ -1271,6 +1275,7 @@ fn auto_merge_snapshot_gate_honors_relaxed_policy_fields() -> anyhow::Result<()>
         "issue_number": 79,
         "pr_number": 79,
         "pr_head_sha": "abc123",
+        "scope_assessed_head_oid": "abc123",
     }));
     let mut snapshot = ready_auto_merge_snapshot("abc123");
     snapshot.normalized_snapshot["merge_state_status"] = serde_json::json!("DIRTY");
@@ -1318,6 +1323,7 @@ fn auto_merge_snapshot_gate_rejects_wrong_base_ref() -> anyhow::Result<()> {
         "issue_number": 81,
         "pr_number": 81,
         "pr_head_sha": "abc123",
+        "scope_assessed_head_oid": "abc123",
         "expected_base_ref": "main",
     }));
     let mut snapshot = ready_auto_merge_snapshot("abc123");
@@ -1351,6 +1357,7 @@ fn auto_merge_snapshot_gate_allows_unknown_expected_base() -> anyhow::Result<()>
         "issue_number": 82,
         "pr_number": 82,
         "pr_head_sha": "abc123",
+        "scope_assessed_head_oid": "abc123",
     }));
     let mut snapshot = ready_auto_merge_snapshot("abc123");
     snapshot.normalized_snapshot["base_ref"] = serde_json::json!("release");

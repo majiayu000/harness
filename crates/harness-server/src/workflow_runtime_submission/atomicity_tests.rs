@@ -26,7 +26,7 @@ async fn rejected_new_issue_submission_does_not_persist_live_instance_or_command
         project_id,
         Some("owner/repo".to_string()),
         409,
-    );
+    )?;
     let task_id = TaskId::from_str("runtime-rejected-new-issue");
     let ctx = IssueSubmissionRuntimeContext {
         project_root: &project_root,

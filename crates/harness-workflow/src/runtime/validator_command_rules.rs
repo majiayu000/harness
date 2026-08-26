@@ -9,7 +9,10 @@ pub(super) fn required_command_for_transition(
     to_state: &str,
 ) -> Option<WorkflowCommandType> {
     match (from_state, to_state) {
-        (from_state, "pr_open") if from_state != "pr_open" => Some(WorkflowCommandType::BindPr),
+        (from_state, "pr_open") if !matches!(from_state, "pr_open" | "pr_scope_review") => {
+            Some(WorkflowCommandType::BindPr)
+        }
+        ("implementing" | "scheduled", "pr_scope_review") => Some(WorkflowCommandType::BindPr),
         ("idle", "scanning") => Some(WorkflowCommandType::EnqueueActivity),
         ("scanning", "planning_batch") => Some(WorkflowCommandType::EnqueueActivity),
         ("planning_batch", "dispatching") => Some(WorkflowCommandType::StartChildWorkflow),

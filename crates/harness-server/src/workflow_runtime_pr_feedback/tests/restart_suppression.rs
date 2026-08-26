@@ -34,7 +34,7 @@ async fn retrying_child_and_unchanged_remote_fact_suppress_sweeps_after_restart(
         Some("owner/repo".to_string()),
         123,
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",

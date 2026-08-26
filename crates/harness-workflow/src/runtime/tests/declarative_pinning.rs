@@ -1,7 +1,8 @@
 mod declarative_pinning {
     use super::super::*;
     use harness_core::config::workflow::{
-        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowClassifierPolicy,
+        WorkflowDefinitionPolicy,
     };
     use harness_core::db::resolve_database_url;
     use serde_json::json;
@@ -115,6 +116,51 @@ mod declarative_pinning {
             .expect_err("version mismatch must fail closed")
             .to_string()
             .contains("does not match canonical policy version"));
+    }
+
+    #[test]
+    fn classifier_rules_are_part_of_the_pinned_definition_identity() {
+        let mut policy = policy_v1();
+        let reviewing = policy.states.get_mut("reviewing").expect("fixture state");
+        reviewing.on_success = None;
+        reviewing.on_failure = Some("blocked".to_string());
+        reviewing.on_signal = BTreeMap::from([
+            ("allow".to_string(), "done".to_string()),
+            ("needs_human".to_string(), "failed".to_string()),
+        ]);
+        let classifier = WorkflowActivityPolicy {
+            prompt: Some("Judge only the supplied scope facts.".to_string()),
+            classifier: Some(WorkflowClassifierPolicy {
+                verdicts: vec!["allow".to_string(), "needs_human".to_string()],
+                environment: vec!["Treat counts as descriptive facts.".to_string()],
+                ..WorkflowClassifierPolicy::default()
+            }),
+            ..WorkflowActivityPolicy::default()
+        };
+        let original = build_declarative_definition(
+            &policy,
+            &BTreeMap::from([("review".to_string(), classifier.clone())]),
+        )
+        .expect("classifier definition should compile");
+        let mut changed_classifier = classifier;
+        changed_classifier
+            .classifier
+            .as_mut()
+            .expect("classifier fixture")
+            .environment = vec!["Use a different decision rule.".to_string()];
+        let changed = build_declarative_definition(
+            &policy,
+            &BTreeMap::from([("review".to_string(), changed_classifier)]),
+        )
+        .expect("changed classifier definition should compile");
+
+        assert_ne!(original.definition_hash(), changed.definition_hash());
+        assert_ne!(original.definition_version(), changed.definition_version());
+        let hydrated = hydrate_persisted_declarative_definition(
+            &persisted_declarative_definition(&original, None),
+        )
+        .expect("persisted classifier rules should hydrate without mutable project config");
+        assert_eq!(hydrated, original);
     }
 
     #[test]

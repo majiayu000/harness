@@ -9,6 +9,7 @@ fn pr_workflow_state(state: &str) -> WorkflowInstance {
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-1",
+        "scope_assessed_head_oid": "abc123",
     }))
 }
 
@@ -157,6 +158,37 @@ fn ready_to_merge_signal_without_current_pr_snapshot_blocks() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("missing snapshot block should validate");
+}
+
+#[test]
+fn changed_pr_head_is_reclassified_before_quality_gate() {
+    let instance = pr_workflow_state("awaiting_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+        "scope_assessed_head_oid": "previous-head",
+    }));
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "The new PR head is otherwise ready.",
+    )
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ))
+    .with_artifact(ready_snapshot_artifact());
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("a changed head should produce a scope recheck");
+
+    assert_eq!(decision.decision, "reassess_pr_scope");
+    assert_eq!(decision.next_state, "pr_scope_review");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY)
+    );
 }
 
 #[test]
@@ -309,7 +341,7 @@ fn address_pr_feedback_success_without_repair_evidence_blocks() {
 }
 
 #[test]
-fn address_pr_feedback_success_with_repair_snapshot_requests_local_review() {
+fn address_pr_feedback_success_with_repair_snapshot_requests_scope_recheck() {
     let instance = pr_workflow_state("addressing_feedback");
     let result = ActivityResult::succeeded(
         "address_pr_feedback",
@@ -324,13 +356,13 @@ fn address_pr_feedback_success_with_repair_snapshot_requests_local_review() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("valid repair snapshot should request local review");
+        .expect("valid repair snapshot should request scope recheck");
 
-    assert_eq!(decision.decision, "run_local_review_after_rework");
-    assert_eq!(decision.next_state, "local_review_gate");
+    assert_eq!(decision.decision, "reassess_pr_scope");
+    assert_eq!(decision.next_state, "pr_scope_review");
     assert_eq!(
         decision.commands[0].activity_name(),
-        Some(LOCAL_REVIEW_ACTIVITY)
+        Some(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY)
     );
 }
 

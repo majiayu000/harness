@@ -300,6 +300,15 @@ async fn request_auto_merge_if_enabled(
     .await?;
     let workflow = match prepare_auto_merge_workflow_from_snapshot(workflow, &snapshot, &policy)? {
         AutoMergeSnapshotGate::Ready(workflow) => workflow,
+        AutoMergeSnapshotGate::ScopeChanged { observed_head_oid } => {
+            crate::workflow_runtime_pr_feedback::requeue_runtime_pr_scope_review_after_head_change(
+                store,
+                workflow.clone(),
+                &observed_head_oid,
+            )
+            .await?;
+            return Ok(AutoMergeRequestOutcome::NotReady);
+        }
         AutoMergeSnapshotGate::NotReady => return Ok(AutoMergeRequestOutcome::NotReady),
     };
     match crate::workflow_runtime_pr_feedback::approve_runtime_merge_with_instance(store, *workflow)

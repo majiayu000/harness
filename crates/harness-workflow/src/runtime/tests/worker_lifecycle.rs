@@ -429,7 +429,18 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
         .await?;
     let worker = RuntimeWorker::new(&store, "runtime-1").with_lease_ttl(Duration::minutes(5));
     let executor = StaticRuntimeExecutor {
-        result: ActivityResult::succeeded("replan_issue", "Replan completed."),
+        result: ActivityResult::succeeded("replan_issue", "Replan completed.").with_artifact(
+            ActivityArtifact::new(
+                crate::runtime::ISSUE_PLAN_ARTIFACT,
+                json!({
+                    "summary": "Narrow the implementation before continuing.",
+                    "task_class": "standard_code",
+                    "target_files": ["src/lib.rs"],
+                    "validation_plan": ["cargo test -p harness-workflow issue_planning"],
+                    "blockers": []
+                }),
+            ),
+        ),
     };
 
     let completed = worker
@@ -463,10 +474,10 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
         .get_instance(&workflow.id)
         .await?
         .expect("workflow should still exist");
-    assert_eq!(reloaded.state, "implementing");
+    assert_eq!(reloaded.state, "plan_scope_review");
     let decisions = store.decisions_for(&workflow.id).await?;
     assert!(decisions
         .iter()
-        .any(|record| record.decision.decision == "resume_implementation_after_replan"));
+        .any(|record| record.decision.decision == "review_issue_plan_scope"));
     Ok(())
 }

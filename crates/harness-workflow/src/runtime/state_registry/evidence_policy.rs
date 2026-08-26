@@ -189,6 +189,48 @@ mod tests {
     }
 
     #[test]
+    fn disabled_policy_cannot_mint_an_unverified_pr_binding() {
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry
+            .apply_builtin_evidence_enforcement(false)
+            .expect("test policy should apply");
+        let instance = WorkflowInstance::new(
+            crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("github_issue", "owner/repo#42"),
+        )
+        .with_server_data(json!({
+            "repo": "owner/repo",
+            "issue_number": 42,
+        }));
+        let event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime")
+            .with_payload(json!({
+                "activity_result": ActivityResult::succeeded(
+                    "implement_issue",
+                    "reported a pull request without server verification",
+                )
+                .with_artifact(crate::runtime::ActivityArtifact::new(
+                    "pull_request",
+                    json!({
+                        "pr_number": 77,
+                        "pr_url": "https://github.com/owner/repo/pull/77",
+                    }),
+                )),
+            }));
+
+        let decision = reduce_runtime_job_completed_with_registry(&registry, &instance, &event)
+            .expect("completion should reduce")
+            .expect("completion should produce a fail-closed decision");
+
+        assert_eq!(decision.next_state, "blocked");
+        assert!(decision
+            .commands
+            .iter()
+            .all(|command| command.command_type != WorkflowCommandType::BindPr));
+    }
+
+    #[test]
     fn unknown_definitions_and_transitions_declare_nothing() {
         let registry = WorkflowDefinitionRegistry::with_builtins();
         assert!(!registry.transition_requires_evidence(

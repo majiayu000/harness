@@ -143,6 +143,9 @@ fn apply_claude_stream_event(
                 },
             });
         }
+        AgentEvent::ModelReported { model } => {
+            emitted_items.push(StreamItem::ModelReported { model });
+        }
         AgentEvent::EgressVerifiedAtDispatch
         | AgentEvent::TurnStarted
         | AgentEvent::ItemStartedKind { .. }
@@ -178,6 +181,7 @@ fn stream_item_label(item: &StreamItem) -> &'static str {
         StreamItem::ItemCompleted { .. } => "item_completed",
         StreamItem::ItemCompletedKind => "item_completed",
         StreamItem::TokenUsage { .. } => "token_usage",
+        StreamItem::ModelReported { .. } => "model_reported",
         StreamItem::Warning { .. } => "warning",
         StreamItem::Diagnostic { .. } => "diagnostic",
         StreamItem::TurnCancelled { .. } => "turn_cancelled",

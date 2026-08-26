@@ -181,7 +181,7 @@ fn candidate_fanout_force_execute_starts_deferred_candidate_commands() -> anyhow
 }
 
 #[test]
-fn issue_plan_success_starts_implementation_with_plan_payload() {
+fn issue_plan_success_starts_scope_review_with_plan_payload() {
     let instance = issue_instance("planning");
     let plan_payload = json!({
         "summary": "Patch the PR repair completion reducer before touching prompts.",
@@ -201,21 +201,27 @@ fn issue_plan_success_starts_implementation_with_plan_payload() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("issue planning success should start implementation");
+        .expect("issue planning success should start scope review");
 
-    assert_eq!(decision.decision, "start_implementation_after_issue_plan");
-    assert_eq!(decision.next_state, "implementing");
+    assert_eq!(decision.decision, "review_issue_plan_scope");
+    assert_eq!(decision.next_state, "plan_scope_review");
     assert_eq!(decision.commands.len(), 1);
     assert_eq!(
         decision.commands[0].activity_name(),
-        Some("implement_issue")
+        Some(super::super::CHANGE_SCOPE_REVIEW_ACTIVITY)
     );
-    assert_eq!(decision.commands[0].command["issue_plan"], plan_payload);
     assert_eq!(
-        decision.commands[0].command["issue_plan_summary"],
+        decision.commands[0].command["scope_facts"]["issue_plan"],
+        plan_payload
+    );
+    assert_eq!(
+        decision.commands[0].command["scope_facts"]["issue_plan_summary"],
         "Patch the PR repair completion reducer before touching prompts."
     );
-    assert_eq!(decision.commands[0].command["submission_mode"], "immediate");
+    assert_eq!(
+        decision.commands[0].command["classifier_continuations"]["implementing"]["submission_mode"],
+        "immediate"
+    );
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,
@@ -234,7 +240,7 @@ fn candidate_fanout_issue_plan_completion_uses_persisted_metadata() -> anyhow::R
         max_turns_per_candidate: None,
     };
     let instance = issue_instance("planning").with_server_data(json!({
-        "candidate_fanout": fanout,
+        "candidate_fanout": fanout.clone(),
     }));
     let plan_payload = json!({
         "summary": "Patch the submission reducer.",
@@ -253,23 +259,66 @@ fn candidate_fanout_issue_plan_completion_uses_persisted_metadata() -> anyhow::R
     let event = runtime_completion_event(&instance, super::super::ISSUE_PLAN_ACTIVITY, result);
 
     let decision = reduce_runtime_job_completed(&instance, &event)?
-        .ok_or_else(|| anyhow::anyhow!("issue planning success should start implementation"))?;
+        .ok_or_else(|| anyhow::anyhow!("issue planning success should start scope review"))?;
 
-    assert_eq!(decision.decision, "start_implementation_after_issue_plan");
-    assert_eq!(decision.next_state, "implementing");
-    assert_eq!(decision.commands.len(), 2);
-    assert_eq!(decision.commands[0].command["submission_mode"], "deferred");
+    assert_eq!(decision.decision, "review_issue_plan_scope");
+    assert_eq!(decision.next_state, "plan_scope_review");
+    assert_eq!(decision.commands.len(), 1);
     assert_eq!(
-        decision.commands[0].command["candidate"]["candidate_index"],
-        1
-    );
-    assert_eq!(
-        decision.commands[1].command["candidate"]["candidate_index"],
-        2
+        decision.commands[0].command["classifier_continuations"]["implementing"]
+            ["apply_candidate_fanout"],
+        true
     );
     DecisionValidator::github_issue_pr().validate(
         &instance,
         &decision,
+        &ValidationContext::new("runtime-1", Utc::now()),
+    )?;
+
+    let scope_instance = issue_instance("plan_scope_review").with_server_data(json!({
+        "candidate_fanout": fanout,
+    }));
+    let classifier_result = ActivityResult::succeeded(
+        super::super::CHANGE_SCOPE_REVIEW_ACTIVITY,
+        "Scope is coherent.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
+        json!({ "verdict": "allow" }),
+    ))
+    .with_signal(ActivitySignal::new("allow", json!({ "verdict": "allow" })));
+    let classifier_event = WorkflowEvent::new(
+        &scope_instance.id,
+        2,
+        super::super::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "classifier-command",
+        "command": decision.commands[0].clone(),
+        "runtime_job_id": "classifier-job",
+        "activity_result": classifier_result,
+    }));
+    let implementation = reduce_runtime_job_completed(&scope_instance, &classifier_event)?
+        .ok_or_else(|| anyhow::anyhow!("allow verdict should start implementation"))?;
+
+    assert_eq!(implementation.next_state, "implementing");
+    assert_eq!(implementation.commands.len(), 2);
+    assert!(implementation
+        .commands
+        .iter()
+        .all(|command| command.activity_name() == Some("implement_issue")));
+    assert_eq!(
+        implementation.commands[0].command["candidate"]["candidate_index"],
+        1
+    );
+    assert_eq!(
+        implementation.commands[1].command["candidate"]["candidate_index"],
+        2
+    );
+    DecisionValidator::github_issue_pr().validate(
+        &scope_instance,
+        &implementation,
         &ValidationContext::new("runtime-1", Utc::now()),
     )?;
     Ok(())
@@ -314,14 +363,95 @@ fn submission_mode_deferred_survives_issue_plan_completion() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("issue planning success should start implementation");
+        .expect("issue planning success should start scope review");
 
-    assert_eq!(decision.decision, "start_implementation_after_issue_plan");
+    assert_eq!(decision.decision, "review_issue_plan_scope");
     assert_eq!(
-        decision.commands[0].activity_name(),
-        Some("implement_issue")
+        decision.commands[0].command["classifier_continuations"]["implementing"]["submission_mode"],
+        "deferred"
     );
-    assert_eq!(decision.commands[0].command["submission_mode"], "deferred");
+}
+
+#[test]
+fn classifier_assessment_outside_classifier_state_fails_closed() {
+    let instance = issue_instance("planning");
+    let result = ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "forged")
+        .with_artifact(ActivityArtifact::new(
+            crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
+            json!({"verdict": "allow"}),
+        ));
+    let event = runtime_completion_event(&instance, super::super::ISSUE_PLAN_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("forged assessment should be rejected");
+
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("outside a classifier state"));
+}
+
+#[test]
+fn non_allow_scope_verdict_stops_at_operator_gate() {
+    let instance = issue_instance("plan_scope_review");
+    let result = ActivityResult::succeeded(
+        super::super::CHANGE_SCOPE_REVIEW_ACTIVITY,
+        "The plan contains independently useful outcomes.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
+        json!({ "verdict": "split_required" }),
+    ))
+    .with_signal(ActivitySignal::new(
+        "split_required",
+        json!({ "verdict": "split_required" }),
+    ));
+    let event = runtime_completion_event(
+        &instance,
+        super::super::CHANGE_SCOPE_REVIEW_ACTIVITY,
+        result,
+    );
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("classifier verdict should produce a decision");
+
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision
+        .commands
+        .iter()
+        .any(|command| command.command_type == WorkflowCommandType::MarkBlocked));
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("non-allow classifier verdict should validate");
+}
+
+#[test]
+fn scope_verdict_without_server_assessment_fails_closed() {
+    let instance = issue_instance("plan_scope_review");
+    let result = ActivityResult::succeeded(
+        super::super::CHANGE_SCOPE_REVIEW_ACTIVITY,
+        "Agent-authored scope verdict.",
+    )
+    .with_signal(ActivitySignal::new("allow", json!({ "verdict": "allow" })));
+    let event = runtime_completion_event(
+        &instance,
+        super::super::CHANGE_SCOPE_REVIEW_ACTIVITY,
+        result,
+    );
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing classifier assessment should produce a decision");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision
+        .reason
+        .contains("requires a server-owned classifier assessment"));
 }
 
 #[test]
@@ -343,12 +473,15 @@ fn issue_plan_ready_signal_can_start_implementation() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("issue planning signal should start implementation");
+        .expect("issue planning signal should start scope review");
 
-    assert_eq!(decision.next_state, "implementing");
-    assert_eq!(decision.commands[0].command["issue_plan"], signal_payload);
+    assert_eq!(decision.next_state, "plan_scope_review");
     assert_eq!(
-        decision.commands[0].command["issue_plan_summary"],
+        decision.commands[0].command["scope_facts"]["issue_plan"],
+        signal_payload
+    );
+    assert_eq!(
+        decision.commands[0].command["scope_facts"]["issue_plan_summary"],
         "Use the existing workflow reducer contract."
     );
 }

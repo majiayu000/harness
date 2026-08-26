@@ -27,6 +27,20 @@ fn parse_assistant_message_content_blocks() {
 }
 
 #[test]
+fn parse_assistant_message_reports_provider_model() {
+    let line = r#"{"type":"assistant","message":{"model":"claude-sonnet-reported","content":[{"type":"text","text":"done"}]}}"#;
+    let events = parse_stream_json_events(line);
+    assert!(matches!(
+        &events[0],
+        AgentEvent::ModelReported { model } if model == "claude-sonnet-reported"
+    ));
+    assert!(matches!(
+        &events[1],
+        AgentEvent::MessageDelta { text } if text == "done"
+    ));
+}
+
+#[test]
 fn parse_tool_use() {
     let line = r#"{"type": "tool_use", "name": "Read", "input": {"path": "src/main.rs"}}"#;
     let event = parse_stream_json_line(line).unwrap();

@@ -769,3 +769,57 @@ fn load_workflow_document_without_base_uses_repo_only() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn load_workflow_document_reads_declarative_classifier_policy() -> anyhow::Result<()> {
+    let repo_dir = tempfile::tempdir()?;
+    std::fs::write(
+        repo_dir.path().join("WORKFLOW.md"),
+        r#"---
+activities:
+  classify_scope:
+    classifier:
+      verdicts: [allow, needs_human]
+      environment:
+        - Judge only the supplied scope facts.
+      hard_deny:
+        - Escalate when the requested outcome is ambiguous.
+      allow:
+        - Allow a coherent change that directly serves the request.
+---
+"#,
+    )?;
+
+    let document = load_workflow_document(repo_dir.path())?;
+    let classifier = document.config.activities["classify_scope"]
+        .classifier
+        .as_ref()
+        .expect("classifier policy should parse");
+    assert_eq!(classifier.verdicts, ["allow", "needs_human"]);
+    assert_eq!(classifier.hard_deny.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn classifier_activity_rejects_repository_validation_commands() -> anyhow::Result<()> {
+    let repo_dir = tempfile::tempdir()?;
+    std::fs::write(
+        repo_dir.path().join("WORKFLOW.md"),
+        r#"---
+activities:
+  classify_scope:
+    validation: [cargo check]
+    classifier:
+      verdicts: [allow]
+      allow: [Allow a coherent change.]
+---
+"#,
+    )?;
+
+    let error = load_workflow_document(repo_dir.path())
+        .expect_err("classifier validation commands must fail closed");
+    assert!(error
+        .to_string()
+        .contains("cannot declare repository validation commands"));
+    Ok(())
+}

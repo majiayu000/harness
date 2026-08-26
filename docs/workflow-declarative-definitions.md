@@ -1,6 +1,6 @@
 # WORKFLOW.md: Declarative Definitions and Continuation Policies
 
-This page documents the two WORKFLOW.md features that let a repository
+This page documents the WORKFLOW.md features that let a repository
 define workflow behavior without Rust changes:
 
 - the **`definition` block** — declare a custom workflow shape (states,
@@ -8,7 +8,9 @@ define workflow behavior without Rust changes:
   runtime (GH-1609);
 - the **continuation policy** — run a single prompt task as a bounded
   loop that re-invokes the agent while an external tracker subject stays
-  active (GH-1607).
+  active (GH-1607);
+- an **activity classifier** — ask an isolated model to choose among
+  declarative verdict routes without giving it repository tools.
 
 Both features are inert unless configured. The examples below are
 validated by `crates/harness-workflow/tests/docs_examples.rs`, which
@@ -95,6 +97,88 @@ definition — when a declaration violates any of these:
 - Transitions into terminal states emit the matching command:
   `succeeded` → `MarkDone`, `failed` → `MarkFailed`, `cancelled` →
   `MarkCancelled`.
+
+### Model-classified policy activities
+
+An activity may declare a classifier instead of repository validation
+commands:
+
+```yaml
+activities:
+  classify_change_scope:
+    classifier:
+      verdicts: [allow, revise_plan, split_required, needs_human]
+      environment:
+        - Judge whether the supplied plan or pull request is one coherent change.
+        - Change counts are facts, not decision thresholds.
+      hard_deny:
+        - Return needs_human when material facts are incomplete or contradictory.
+      soft_deny:
+        - Return revise_plan when incidental work can be removed.
+        - Return split_required for independently useful outcomes that can land separately.
+      allow:
+        - Allow all directly necessary code, tests, docs, migrations, and generated artifacts.
+```
+
+The activity state must omit `on_success`, route `on_failure` to
+`blocked`, and declare exactly one `on_signal` route for every verdict.
+Harness starts the classifier in a fresh read-only turn with an empty
+tool allowlist and `approval_policy: never`. The model returns one
+`classifier_output` artifact; model-authored signals are discarded.
+Harness validates the verdict and evidence pointers, then persists a
+server-reserved `classifier_assessment` containing the policy hash,
+prompt-packet digest, model, rationale, and evidence references. Replay
+uses that persisted assessment and never calls the classifier again.
+Failures that happen before prompt construction are persisted as
+`prelaunch_failure`; their model and prompt-packet digest remain null instead
+of being fabricated.
+The deployment must provide an isolation tier and provider credentials that
+can uphold this boundary. Container isolation is the supported path when a
+host sandbox cannot launch the selected CLI safely; runtime or credential
+failure is attested and routes through `on_failure` instead of weakening the
+classifier boundary.
+
+The empty allowlist is a launch invariant, not advisory metadata. Claude uses
+`--tools ""` in safe mode with skills and MCP disabled, while the direct
+Anthropic adapter exposes no tools. A classifier backend must also report the
+model identity returned by the provider; every identity event must exactly
+match the requested model, and the assessment records the complete report
+sequence. OpenCode can receive a deny-all permission map but
+does not yet expose that reported identity, so classifier turns reject it
+before launch. Codex's CLI exposes only a finite feature denylist rather than a
+default-deny tool contract, so Codex classifier turns are also rejected before
+launch. Any backend missing either invariant fails the same way.
+The shipped workflow profile selects Claude Code with an exact model ID for
+`classify_change_scope`; deployments may override it only with a backend that
+satisfies both invariants. An explicitly unknown runtime kind is invalid
+configuration and never falls back to the server default.
+For custom declarative workflows, the compiled definition pins the complete
+classifier activity policy, including its prompt and decision rules. A checkout
+edit therefore creates a new definition identity instead of changing an
+in-flight classifier. Built-in definitions pin the classifier activity marker,
+and each workflow instance snapshots its project classifier policy on first
+persistence; later checkout edits cannot replace that snapshot. Each assessment
+records the exact policy hash used. A local replay or remote completion without the
+server-owned assessment lands in `blocked` even if it carries a syntactically
+valid verdict signal.
+
+The built-in `github_issue_pr` flow uses `classify_change_scope` after
+planning and again after a PR is bound. The second pass uses a fresh
+server-observed GitHub snapshot for the current head. Harness paginates the
+entire changed-file connection, fetches every REST file patch, verifies patch
+line counts against GitHub's additions/deletions, cross-checks file identities,
+and re-verifies the head after collection. Missing or truncated content fails
+before model dispatch. The accepted assessment persists its subject head; a
+later external push or feedback repair returns to PR scope review before local
+review or quality gates. Both passes include a
+server-fetched exact GitHub issue snapshot (title, body, labels, URL, and
+identity), so coherence is judged against the authoritative requested outcome;
+candidate-PR recovery does not depend on an agent-authored plan. Repositories using
+that built-in must provide the classifier policy (the central
+`config/WORKFLOW.md` includes one); missing policy or incomplete routes
+fail closed. Remote runtime hosts are not accepted for classifier
+activities because the server cannot attest their exact prompt and
+deny-all tool boundary.
 
 ### Pinning: editing WORKFLOW.md while instances are in flight
 

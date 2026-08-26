@@ -8,8 +8,8 @@ use harness_core::config::intake::{
     GitHubAutoMergeConfig, GitHubMergeExecution, GitHubMergeMethod, ResolvedGitHubAutoMergePolicy,
 };
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob, WorkflowInstance,
-    SERVER_PR_SNAPSHOT_ARTIFACT,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, DataProvenance,
+    RuntimeJob, WorkflowInstance, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::{json, Value};
 
@@ -23,12 +23,11 @@ const SERVER_MERGE_EXECUTION_ARTIFACT: &str = "server_merge_execution";
 const SERVER_MERGE_EXECUTION_SCHEMA: &str = "harness.github.server_merge_execution.v1";
 
 pub(super) fn server_merge_execution_enabled(
-    state: &AppState,
+    _state: &AppState,
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
 ) -> bool {
     merge_activity_matches(job, workflow)
-        && auto_merge_config(state).merge_execution == GitHubMergeExecution::Server
 }
 
 pub(super) async fn execute_server_merge(
@@ -277,19 +276,36 @@ fn server_merge_head_mismatch(
 ) -> ActivityResult {
     let observed_head_sha = value_string(snapshot.normalized_snapshot.get("head_oid"))
         .unwrap_or_else(|| "<missing>".to_string());
-    server_merge_failed(
+    ActivityResult::succeeded(
         activity,
-        Some(target),
-        ActivityErrorKind::Fatal,
-        "Server-side merge gate rejected a stale pull request head.",
-        format!(
-            "PR #{} in {} head {} did not match expected_head_sha {}",
-            target.pr_number, target.repo_slug, observed_head_sha, expected_head_sha
-        ),
-        Some(snapshot),
-        merge_call,
-        "head_mismatch",
+        "The pull request head changed after its last scope assessment; a new model assessment is required.",
     )
+    .with_signal(ActivitySignal::new(
+        "PrHeadChanged",
+        json!({
+            "repo": target.repo_slug,
+            "pr_number": target.pr_number,
+            "expected_head_sha": expected_head_sha,
+            "observed_head_sha": observed_head_sha,
+        }),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        SERVER_PR_SNAPSHOT_ARTIFACT,
+        snapshot.normalized_snapshot,
+    ))
+    .with_artifact(ActivityArtifact::new(
+        GITHUB_PR_SNAPSHOT_ARTIFACT,
+        snapshot.raw_pr,
+    ))
+    .with_artifact(server_merge_execution_artifact(
+        Some(target),
+        "head_changed",
+        Some(format!(
+            "PR #{} in {} head {} did not match the scope-assessed head {}",
+            target.pr_number, target.repo_slug, observed_head_sha, expected_head_sha
+        )),
+        merge_call,
+    ))
 }
 
 fn server_merge_policy(
@@ -338,24 +354,22 @@ fn parse_merge_method(raw: &str) -> Option<GitHubMergeMethod> {
     }
 }
 
-fn expected_head_sha_for_merge(
-    job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
-) -> Option<String> {
-    activity_string(job, workflow, "expected_head_sha")
-        .or_else(|| activity_string(job, workflow, "merge_attempted_head_sha"))
-        .or_else(|| activity_string(job, workflow, "pr_head_sha"))
-        .or_else(|| activity_string(job, workflow, "head_sha"))
-}
-
 fn required_expected_head_sha_for_merge(
-    job: &RuntimeJob,
+    _job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
 ) -> Result<String, &'static str> {
-    expected_head_sha_for_merge(job, workflow)
+    workflow
+        .filter(|workflow| {
+            workflow
+                .data_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.provenance_for("/scope_assessed_head_oid"))
+                == Some(DataProvenance::Server)
+        })
+        .and_then(|workflow| value_string(workflow.data.get("scope_assessed_head_oid")))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or("merge_pr dispatch is missing a non-empty expected_head_sha")
+        .ok_or("merge_pr dispatch is missing a server-owned scope_assessed_head_oid")
 }
 
 fn activity_string(
@@ -659,12 +673,32 @@ mod tests {
             "already_merged_before_merge",
             None,
         );
-        assert_eq!(result.status, ActivityStatus::Failed);
-        assert_eq!(result.error_kind, Some(ActivityErrorKind::Fatal));
+        assert_eq!(result.status, ActivityStatus::Succeeded);
+        assert!(result
+            .signals
+            .iter()
+            .any(|signal| signal.signal_type == "PrHeadChanged"));
+        assert!(result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == SERVER_PR_SNAPSHOT_ARTIFACT));
     }
 
     #[test]
-    fn server_merge_requires_a_nonempty_expected_head() {
+    fn merge_prefers_scope_assessed_head_over_dispatch_head() {
+        let workflow = workflow().with_server_data(json!({
+            "scope_assessed_head_oid": "scope-head",
+            "pr_head_sha": "dispatch-head",
+        }));
+
+        assert_eq!(
+            required_expected_head_sha_for_merge(&job(), Some(&workflow)).as_deref(),
+            Ok("scope-head")
+        );
+    }
+
+    #[test]
+    fn server_merge_requires_a_server_owned_scope_assessed_head() {
         let missing = RuntimeJob::pending(
             "command-missing",
             RuntimeKind::CodexExec,
@@ -680,9 +714,6 @@ mod tests {
 
         assert!(required_expected_head_sha_for_merge(&missing, None).is_err());
         assert!(required_expected_head_sha_for_merge(&blank, None).is_err());
-        assert_eq!(
-            required_expected_head_sha_for_merge(&job(), None).as_deref(),
-            Ok("head-sha")
-        );
+        assert!(required_expected_head_sha_for_merge(&job(), None).is_err());
     }
 }

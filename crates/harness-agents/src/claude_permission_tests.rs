@@ -82,3 +82,20 @@ fn explicit_allowlist_overrides_full_permission_mode() {
         1
     );
 }
+
+#[test]
+fn empty_allowlist_disables_claude_tools_and_customizations() {
+    let req = AgentRequest {
+        allowed_tools: Some(Vec::new()),
+        ..AgentRequest::default()
+    };
+    let args = args_to_strings(&test_agent().base_args(&req));
+
+    assert!(args.windows(2).any(|window| window == ["--tools", ""]));
+    assert!(args.contains(&"--safe-mode".to_string()));
+    assert!(args.contains(&"--disable-slash-commands".to_string()));
+    assert!(args.contains(&"--strict-mcp-config".to_string()));
+    assert!(args
+        .windows(2)
+        .any(|window| window == ["--mcp-config", r#"{"mcpServers":{}}"#]));
+}

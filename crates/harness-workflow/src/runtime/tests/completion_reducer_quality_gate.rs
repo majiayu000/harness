@@ -93,7 +93,12 @@ fn runtime_completion_reducer_passes_quality_gate_after_success() {
 
 #[test]
 fn runtime_completion_reducer_marks_issue_pr_ready_after_quality_gate_pass() {
-    let instance = issue_instance("quality_gate_pending");
+    let instance = issue_instance("quality_gate_pending").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "scope_assessed_head_oid": "current-head",
+    }));
     let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
         .with_signal(ActivitySignal::new(
             QUALITY_PASSED_SIGNAL,
@@ -102,7 +107,15 @@ fn runtime_completion_reducer_marks_issue_pr_ready_after_quality_gate_pass() {
             }),
         ))
         .with_validation(ValidationRecord::new("cargo check", "passed"))
-        .with_artifact(server_validation_digest_ok(&["cargo check"]));
+        .with_artifact(server_validation_digest_ok(&["cargo check"]))
+        .with_artifact(ActivityArtifact::new(
+            crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+            json!({
+                "repo": "owner/repo",
+                "pr_number": 77,
+                "head_oid": "current-head",
+            }),
+        ));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -129,6 +142,97 @@ fn runtime_completion_reducer_marks_issue_pr_ready_after_quality_gate_pass() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("parent quality gate pass transition should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_reclassifies_head_changed_during_quality_gate() {
+    let instance = issue_instance("quality_gate_pending").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "issue_plan": {"summary": "Keep the change scoped"},
+        "scope_assessed_head_oid": "old-head",
+    }));
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({"validation": "passed"}),
+        ))
+        .with_validation(ValidationRecord::new("cargo check", "passed"))
+        .with_artifact(server_validation_digest_ok(&["cargo check"]))
+        .with_artifact(ActivityArtifact::new(
+            crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+            json!({
+                "repo": "owner/repo",
+                "pr_number": 77,
+                "head_oid": "new-head",
+            }),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("quality gate head drift should trigger scope reassessment");
+
+    assert_eq!(decision.decision, "reassess_pr_scope");
+    assert_eq!(decision.next_state, "pr_scope_review");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY)
+    );
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("quality gate head drift decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_blocks_quality_pass_without_current_pr_snapshot() {
+    let instance = issue_instance("quality_gate_pending").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "scope_assessed_head_oid": "current-head",
+    }));
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({"validation": "passed"}),
+        ))
+        .with_validation(ValidationRecord::new("cargo check", "passed"))
+        .with_artifact(server_validation_digest_ok(&["cargo check"]));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing current PR evidence should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("current server PR snapshot"));
 }
 
 #[test]

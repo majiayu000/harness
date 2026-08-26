@@ -33,7 +33,7 @@ async fn completed_inspecting_child_does_not_block_next_feedback_sweep() -> anyh
         Some("owner/repo".to_string()),
         123,
         "awaiting_feedback",
-    );
+    )?;
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &parent).await?;
     let child = WorkflowInstance::new(
         PR_FEEDBACK_DEFINITION_ID,
@@ -99,7 +99,7 @@ async fn failed_pr_feedback_child_suppresses_duplicate_feedback_sweep() -> anyho
         Some("owner/repo".to_string()),
         123,
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
@@ -174,7 +174,7 @@ async fn completed_waiting_pr_feedback_child_suppresses_duplicate_feedback_sweep
         Some("owner/repo".to_string()),
         123,
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
@@ -257,7 +257,7 @@ async fn completed_waiting_pr_feedback_child_uses_row_timestamp_for_cooldown() -
         Some("owner/repo".to_string()),
         123,
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
@@ -327,7 +327,7 @@ async fn completed_waiting_pr_feedback_child_allows_sweep_after_newer_observed_p
         Some("owner/repo".to_string()),
         123,
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
@@ -429,7 +429,7 @@ async fn completed_waiting_pr_feedback_child_uses_pr_url_for_observed_fact_looku
         None,
         123,
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "issue_number": 123,
@@ -514,7 +514,7 @@ async fn failed_pr_feedback_child_allows_sweep_after_changed_observed_fact() -> 
         Some("owner/repo".to_string()),
         123,
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
@@ -601,7 +601,7 @@ async fn explicit_pr_feedback_request_starts_local_review_before_remote_suppress
         77,
         Some("https://github.com/owner/repo/pull/77"),
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
@@ -682,7 +682,7 @@ async fn failed_pr_feedback_child_respects_disabled_suppression_window() -> anyh
         Some("owner/repo".to_string()),
         123,
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",
@@ -766,7 +766,7 @@ async fn orphan_pending_child_does_not_block_next_feedback_sweep() -> anyhow::Re
         Some("owner/repo".to_string()),
         123,
         "awaiting_feedback",
-    )
+    )?
     .with_server_data(json!({
         "project_id": project_root.to_string_lossy(),
         "repo": "owner/repo",

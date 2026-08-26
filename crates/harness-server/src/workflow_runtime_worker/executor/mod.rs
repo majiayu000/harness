@@ -2,8 +2,10 @@ use crate::http::AppState;
 use harness_core::agent::AGENT_OUTPUT_SCHEMA_PATH_ENV;
 use harness_core::config::workflow::WorkflowConfig;
 use harness_core::types::AgentId;
+#[cfg(test)]
+use harness_workflow::runtime::WorkflowInstance;
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, WorkflowInstance, WorkflowTerminalState,
+    ActivityArtifact, ActivityResult, RuntimeJob, WorkflowTerminalState,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -15,15 +17,12 @@ use std::sync::{
 use super::activity_result::{
     activity_result_from_turn_with_workflow, structured_output_correction,
 };
-use super::child_workflow::execute_start_child_workflow;
 use super::data_helpers::{
     activity_name, is_builtin_lifecycle_activity, prompt_payload_unavailable_result,
     prompt_task_request_for_job, PromptTaskRequest,
 };
 use super::merge_completion::verify_merge_completion_if_needed;
-use super::pr_feedback_inspection::{
-    execute_pr_feedback_inspection, is_server_owned_pr_feedback_inspection,
-};
+use super::pr_feedback_inspection::is_server_owned_pr_feedback_inspection;
 use super::prompt_input_telemetry::{
     execution_phase_for_runtime_activity, record_runtime_prompt_input,
 };
@@ -36,7 +35,6 @@ use super::runtime_profile::{
 };
 use super::runtime_turn_control::{force_code_agent_for_runtime_turn, RuntimeTurnAliasGuard};
 use super::runtime_usage::runtime_usage_context;
-use super::server_merge::{execute_server_merge, server_merge_execution_enabled};
 use super::turn_engine::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
 use super::workspace::{
     finish_runtime_workspace, prepare_runtime_workspace, repository_lease_loss_error,
@@ -49,6 +47,7 @@ mod permission_profile;
 use permission_profile::RuntimePermissionProfile;
 mod spawn_env;
 use spawn_env::{correction_spawn_env_vars, isolation_spawn_env_vars};
+mod server_owned;
 mod structured_output;
 use structured_output::{
     codex_output_schema_file, reserve_structured_output_correction_turn,
@@ -77,7 +76,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         self.lease_lost.send_replace(true);
     }
 
-    pub(super) async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {
+    pub(super) async fn execute_inner(
+        &self,
+        mut job: RuntimeJob,
+    ) -> anyhow::Result<ActivityResult> {
         let workflow = super::job_context::workflow_for_job(self.state, &job).await?;
         if let Some(workflow) = workflow.as_ref() {
             let store = self
@@ -110,16 +112,14 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             workflow.as_ref(),
         )
         .await?;
-        if let Some(result) = self
-            .execute_server_owned_activity(&job, workflow.as_ref())
-            .await?
-        {
+        if let Some(result) = server_owned::execute(self.state, &job, workflow.as_ref()).await? {
             return Ok(result);
         }
         let source_project_root =
             super::job_context::project_root_for_job(self.state, &job, workflow.as_ref())?;
         let workflow_document =
             harness_core::config::workflow::load_workflow_document(&source_project_root)?;
+        super::classifier::enrich_scope_facts(self.state, workflow.as_ref(), &mut job).await?;
         let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
         if self
             .state
@@ -138,6 +138,18 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             &job,
         );
         let activity = activity_name(&job);
+        let classifier_policy = super::classifier::policy_for_job(
+            self.state
+                .core
+                .workflow_runtime_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("workflow runtime store unavailable"))?
+                .definition_registry(),
+            workflow.as_ref(),
+            &workflow_document.config,
+            &activity,
+        )?;
+        let classifier_only = classifier_policy.is_some();
         let execution_phase = execution_phase_for_runtime_activity(&activity);
         let resolved_settings = resolve_runtime_settings(
             &runtime_profile,
@@ -146,6 +158,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             &self.state.core.server.config.agents,
             &self.state.core.server.config.concurrency,
         )?;
+        RuntimePermissionProfile::preflight_classifier(&resolved_settings, classifier_only)?;
         let prompt_task_request =
             prompt_task_request_for_job(&job, self.state.core.workflow_runtime_store.as_deref())
                 .await?;
@@ -255,7 +268,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 } else {
                     isolation_spawn_env_vars(&job)
                 };
-                if !correction_only {
+                if !correction_only && !classifier_only {
                     crate::eval_credentials::apply_eval_environment_to_spawn_env(
                         &job,
                         &mut env_vars,
@@ -269,13 +282,15 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     resolved_settings.allowed_tools.clone(),
                     resolved_settings.tool_allowlist_enforcement,
                     correction_only,
-                );
+                    classifier_only,
+                )?;
                 let egress_evidence = AgentEgressEvidence::from_spawn_env(
                     job.runtime_kind,
                     permission_profile.permission_mode,
                     &env_vars,
                 );
                 let egress_verified_at_dispatch = Arc::new(AtomicBool::new(false));
+                let reported_models = Arc::new(std::sync::Mutex::new(Vec::new()));
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
                         AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
@@ -294,12 +309,12 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         model: Some(resolved_settings.model.clone()),
                         reasoning_effort: resolved_settings.reasoning_effort.clone(),
                         execution_phase,
-                        sandbox_mode: Some(if correction_only {
+                        sandbox_mode: Some(if correction_only || classifier_only {
                             harness_core::config::agents::SandboxMode::ReadOnly
                         } else {
                             resolved_settings.sandbox_mode
                         }),
-                        approval_policy: if correction_only {
+                        approval_policy: if correction_only || classifier_only {
                             Some("never".to_string())
                         } else {
                             resolved_settings
@@ -313,7 +328,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         env_vars,
                         permission_mode: permission_profile.permission_mode,
                         allowed_tools: permission_profile.allowed_tools.clone(),
-                        force_code_agent: force_code_agent || correction_only,
+                        force_code_agent: force_code_agent || correction_only || classifier_only,
                         runtime_usage: runtime_usage_context(
                             self.state,
                             &job,
@@ -322,6 +337,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                             agent_name,
                             &source_project_root,
                         ),
+                        reported_models: classifier_only.then(|| Arc::clone(&reported_models)),
                         egress_verified_at_dispatch: Some(Arc::clone(&egress_verified_at_dispatch)),
                     },
                 )
@@ -399,6 +415,18 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(
                         result,
                     );
+                let result = match classifier_policy.as_ref() {
+                    Some(policy) => super::classifier::attest_result(
+                        policy,
+                        &job,
+                        &resolved_settings.model,
+                        &reported_models.lock().unwrap(),
+                        &prompt_packet,
+                        &prompt_packet_digest,
+                        result,
+                    ),
+                    None => result,
+                };
                 let result = super::transcript_durability::attach_runtime_transcript_source(
                     result,
                     transcript_turn.as_ref().unwrap_or(&turn),
@@ -451,24 +479,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             }
         }
         combine_activity_result_with_runtime_workspace_finalization(activity_result, finish_result)
-    }
-    async fn execute_server_owned_activity(
-        &self,
-        job: &RuntimeJob,
-        parent: Option<&WorkflowInstance>,
-    ) -> anyhow::Result<Option<ActivityResult>> {
-        match activity_name(job).as_str() {
-            "start_child_workflow" => Ok(Some(
-                execute_start_child_workflow(self.state, job, parent).await?,
-            )),
-            activity if activity == harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY => Ok(
-                Some(execute_pr_feedback_inspection(self.state, job, parent).await),
-            ),
-            "merge_pr" if server_merge_execution_enabled(self.state, job, parent) => {
-                Ok(Some(execute_server_merge(self.state, job, parent).await))
-            }
-            _ => Ok(None),
-        }
     }
     async fn record_prompt_packet_prepared(
         &self,

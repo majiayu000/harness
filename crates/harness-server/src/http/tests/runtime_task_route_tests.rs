@@ -419,13 +419,17 @@ async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn workflow_runtime_merge_endpoint_rejects_missing_server_observed_head() -> anyhow::Result<()>
+async fn workflow_runtime_merge_endpoint_requeues_legacy_missing_assessment() -> anyhow::Result<()>
 {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
 
     let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        "---\nactivities:\n  classify_change_scope:\n    classifier:\n      verdicts: [allow]\n      allow: [Assess current PR scope.]\n---\n",
+    )?;
     let state = make_test_state_with_workflow_runtime(dir.path()).await?;
     let store = state
         .core
@@ -440,6 +444,7 @@ async fn workflow_runtime_merge_endpoint_rejects_missing_server_observed_head() 
     )
     .with_id("runtime-ready-missing-head")
     .with_server_data(serde_json::json!({
+        "project_id": dir.path().to_string_lossy(),
         "repo": "owner/repo",
         "issue_number": 55,
         "pr_number": 127,
@@ -467,14 +472,22 @@ async fn workflow_runtime_merge_endpoint_rejects_missing_server_observed_head() 
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = response_json(response).await?;
-    assert!(body["reason"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("missing a server-observed PR head SHA"));
-    assert!(store
-        .commands_for("runtime-ready-missing-head")
+    assert_eq!(body["state"], "pr_scope_review");
+    let updated = store
+        .get_instance("runtime-ready-missing-head")
         .await?
-        .is_empty());
+        .expect("legacy workflow should still exist");
+    assert_eq!(updated.state, "pr_scope_review");
+    assert!(updated
+        .data
+        .get("pinned_change_scope_classifier_policy")
+        .is_some());
+    let commands = store.commands_for("runtime-ready-missing-head").await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].command.activity_name(),
+        Some("classify_change_scope")
+    );
     Ok(())
 }
 

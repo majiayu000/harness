@@ -34,9 +34,18 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
             return *result;
         }
         let activity = activity_name(&job);
+        let job_context = job.clone();
         match self.execute_inner(job).await {
             Ok(result) => postprocess_local_execution_result(result),
-            Err(error) => execution_error_result(activity, error),
+            Err(error) => {
+                let result = execution_error_result(activity, error);
+                super::classifier::attest_prelaunch_failure_if_configured(
+                    self.state,
+                    &job_context,
+                    result,
+                )
+                .await
+            }
         }
     }
 

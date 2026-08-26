@@ -136,12 +136,30 @@ impl TransitionAllowlist {
 
     /// The GH-1766 evidence contract for `github_issue_pr`.
     ///
-    /// `implementing -> pr_open` mints the fact "a PR exists for this work",
-    /// so it requires the server's own verification of the claimed PR rather
-    /// than the agent's word. Every declared path into `done` requires
-    /// server-recognized terminal proof.
+    /// Initial transitions from implementation or a detected candidate into
+    /// `pr_scope_review` mint the fact "a PR exists for this work", so they
+    /// require the server's own verification of the claimed PR. Later
+    /// transitions from feedback states reuse that bound identity and only
+    /// request a fresh classifier pass. Every declared path into `done`
+    /// requires server-recognized terminal proof.
     pub fn with_github_issue_pr_evidence_contract(self) -> Self {
         self.require_evidence_with_trust(
+            "implementing",
+            "pr_scope_review",
+            [(
+                completion_evidence::EVIDENCE_VERIFIED_PR_BINDING,
+                ClaimTrustLevel::RuntimeObserved,
+            )],
+        )
+        .require_evidence_with_trust(
+            "scheduled",
+            "pr_scope_review",
+            [(
+                completion_evidence::EVIDENCE_VERIFIED_PR_BINDING,
+                ClaimTrustLevel::RuntimeObserved,
+            )],
+        )
+        .require_evidence_with_trust(
             "implementing",
             "pr_open",
             [(

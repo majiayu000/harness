@@ -23,6 +23,13 @@ fn runtime_completion_validation_uses_event_time_for_replayed_lease() -> anyhow:
             "workflow_decision",
             serde_json::to_value(&decision)?,
         ))
+        .with_artifact(ActivityArtifact::new(
+            "pull_request",
+            json!({
+                "pr_number": 123,
+                "pr_url": "https://github.com/owner/repo/pull/123"
+            }),
+        ))
         // GH-1766: server-verified binding for the claimed PR.
         .with_artifact(ActivityArtifact::new(
             crate::runtime::completion_evidence::ARTIFACT_VERIFIED_PR_BINDING,
@@ -42,7 +49,7 @@ fn runtime_completion_validation_uses_event_time_for_replayed_lease() -> anyhow:
     let reduced = reduce_runtime_job_completed(&instance, &event)?
         .expect("historical event should reduce to the structured decision");
 
-    assert_eq!(reduced.decision, "bind_pr_from_agent");
-    assert_eq!(reduced.next_state, "pr_open");
+    assert_eq!(reduced.decision, "bind_pr");
+    assert_eq!(reduced.next_state, "pr_scope_review");
     Ok(())
 }

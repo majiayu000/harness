@@ -5,6 +5,10 @@ mod child_workflow;
 mod child_workflow_non_issue;
 mod child_workflow_replay;
 mod circuit_breaker_events;
+mod classifier;
+#[cfg(test)]
+#[path = "classifier_model_identity_tests.rs"]
+mod classifier_model_identity_tests;
 mod completion_evidence_integration;
 mod data_helpers;
 mod executor;

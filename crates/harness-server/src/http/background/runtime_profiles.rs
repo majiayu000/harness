@@ -181,16 +181,11 @@ pub(super) fn runtime_dispatch_profile(
     inherited_profile: &RuntimeProfile,
 ) -> anyhow::Result<RuntimeProfile> {
     let base_profile = match policy.runtime_kind.as_deref() {
-        Some(value) => match runtime_kind_from_config(value) {
-            Some(kind) => runtime_profile_from_kind(config, kind),
-            None => {
-                tracing::warn!(
-                    runtime_kind = value,
-                    "workflow runtime command dispatcher: unknown runtime_kind, inheriting the configured default runtime profile"
-                );
-                inherited_profile.clone()
-            }
-        },
+        Some(value) => runtime_profile_from_kind(
+            config,
+            runtime_kind_from_config(value)
+                .ok_or_else(|| anyhow::anyhow!("unknown workflow runtime_kind `{value}`"))?,
+        ),
         None => inherited_profile.clone(),
     };
     let kind = base_profile.kind;
@@ -350,18 +345,18 @@ fn apply_runtime_dispatch_profile_override(
     default_profile: &RuntimeProfile,
     override_policy: &harness_core::config::workflow::RuntimeDispatchProfileOverride,
 ) -> anyhow::Result<RuntimeProfile> {
-    let runtime_kind_profile = override_policy
-        .runtime_kind
-        .as_deref()
-        .and_then(runtime_kind_from_config)
-        .map(|kind| {
+    let runtime_kind_profile = match override_policy.runtime_kind.as_deref() {
+        Some(value) => {
+            let kind = runtime_kind_from_config(value)
+                .ok_or_else(|| anyhow::anyhow!("unknown workflow runtime_kind `{value}`"))?;
             if kind == default_profile.kind {
                 default_profile.clone()
             } else {
                 runtime_profile_from_kind(config, kind)
             }
-        })
-        .unwrap_or_else(|| default_profile.clone());
+        }
+        None => default_profile.clone(),
+    };
     let kind = runtime_kind_profile.kind;
     let profile_name = override_policy
         .runtime_profile
@@ -555,5 +550,26 @@ mod tests {
                 .expect("same-kind Codex inheritance should resolve");
         assert_eq!(profile.kind, RuntimeKind::CodexJsonrpc);
         assert_eq!(profile.approval_policy.as_deref(), Some("on-request"));
+    }
+
+    #[test]
+    fn runtime_dispatch_rejects_unknown_runtime_kinds() {
+        let config = harness_core::config::HarnessConfig::default();
+        let inherited = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+        let policy = dispatch_policy(serde_json::json!({
+            "runtime_kind": "claude_typo",
+        }));
+
+        let error = runtime_dispatch_profile(&config, &policy, &inherited)
+            .expect_err("top-level unknown runtime kind must fail closed");
+        assert!(error.to_string().contains("claude_typo"));
+
+        let override_policy = harness_core::config::workflow::RuntimeDispatchProfileOverride {
+            runtime_kind: Some("claude_typo".to_string()),
+            ..Default::default()
+        };
+        let error = apply_runtime_dispatch_profile_override(&config, &inherited, &override_policy)
+            .expect_err("activity override unknown runtime kind must fail closed");
+        assert!(error.to_string().contains("claude_typo"));
     }
 }

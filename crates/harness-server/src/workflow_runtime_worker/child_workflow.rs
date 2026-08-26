@@ -81,13 +81,7 @@ pub(super) async fn execute_start_child_workflow(
     let child_was_persisted = existing_child.is_some();
     let mut child = match existing_child {
         Some(instance) => instance,
-        None => WorkflowInstance::new(
-            "github_issue_pr",
-            1,
-            "discovered",
-            WorkflowSubject::new("issue", subject_key),
-        )
-        .with_id(child_id.clone()),
+        None => new_github_issue_child(project_id, subject_key, &child_id)?,
     };
     let child_started_by_command = child_started_by_command(&child, &job.command_id);
     let child_start_event_recorded =
@@ -218,4 +212,55 @@ pub(super) async fn execute_start_child_workflow(
         ));
     }
     Ok(result)
+}
+
+fn new_github_issue_child(
+    project_id: &str,
+    subject_key: &str,
+    child_id: &str,
+) -> anyhow::Result<WorkflowInstance> {
+    let data = crate::workflow_runtime_policy::pin_change_scope_classifier_policy(
+        Path::new(project_id),
+        json!({}),
+    )?;
+    Ok(WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "discovered",
+        WorkflowSubject::new("issue", subject_key),
+    )
+    .with_id(child_id)
+    .with_server_data(data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_issue_child_pins_change_scope_classifier_policy() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        std::fs::write(
+            project.path().join("WORKFLOW.md"),
+            "---\nactivities:\n  classify_change_scope:\n    classifier:\n      verdicts: [allow]\n      allow:\n        - Child policy\n---\n",
+        )?;
+
+        let child = new_github_issue_child(
+            project.path().to_str().expect("UTF-8 temp path"),
+            "issue:17",
+            "child-17",
+        )?;
+
+        assert_eq!(
+            child.data[crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD]
+                ["classifier"]["allow"][0],
+            "Child policy"
+        );
+        assert!(child
+            .data_provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.provenance_for("")
+                == Some(harness_workflow::runtime::DataProvenance::Server)));
+        Ok(())
+    }
 }

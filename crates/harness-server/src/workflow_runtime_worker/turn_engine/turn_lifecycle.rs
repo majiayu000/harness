@@ -31,6 +31,8 @@ pub(crate) struct TurnLifecycleOptions {
     pub allowed_tools: Option<Vec<String>>,
     pub env_vars: HashMap<String, String>,
     pub runtime_usage: Option<RuntimeUsageContext>,
+    /// Every backend/provider-reported model identity for server attestation.
+    pub reported_models: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// Set when the agent confirms that its first-party egress proxy was
     /// established before dispatch. The marker is consumed here and is not
     /// persisted as a transcript item.
@@ -253,6 +255,12 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         last_activity = Instant::now();
                         if let Some(verified) = options.egress_verified_at_dispatch.as_ref() {
                             verified.store(true, Ordering::Release);
+                        }
+                    }
+                    Some(StreamItem::ModelReported { model }) => {
+                        last_activity = Instant::now();
+                        if let Some(reported_models) = options.reported_models.as_ref() {
+                            reported_models.lock().unwrap().push(model);
                         }
                     }
                     Some(item) => {

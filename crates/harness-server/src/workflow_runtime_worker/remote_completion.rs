@@ -2,7 +2,7 @@ use crate::http::AppState;
 use harness_workflow::runtime::{
     completion_evidence::{server_validation_digest_passed, ARTIFACT_EVAL_BASE_CHECKOUT},
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivityStatus, RuntimeJob,
-    QUALITY_GATE_ACTIVITY,
+    WorkflowDefinitionRegistry, WorkflowInstance, QUALITY_GATE_ACTIVITY,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -13,6 +13,31 @@ pub(crate) async fn apply_remote_completion_evidence(
     result: ActivityResult,
 ) -> anyhow::Result<ActivityResult> {
     let workflow = super::job_context::workflow_for_job(state, job).await?;
+    let activity = super::data_helpers::activity_name(job);
+    let classifier_job = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .zip(workflow.as_ref())
+        .is_some_and(|(store, workflow)| {
+            is_server_classifier_job(store.definition_registry(), workflow, job)
+        });
+    if classifier_job {
+        return Ok(ActivityResult::failed(
+            activity,
+            "Remote classifier completion was rejected.",
+            "classifier activities require a server-owned local agent runtime so Harness can enforce deny-all tools and attest the exact prompt packet",
+        )
+        .with_error_kind(ActivityErrorKind::Configuration)
+        .with_artifact(ActivityArtifact::new(
+            harness_workflow::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
+            json!({
+                "schema": "harness.runtime.classifier_assessment.v1",
+                "outcome": "unsupported_remote_runtime",
+                "runtime_job_id": job.id,
+            }),
+        )));
+    }
     if super::pr_feedback_inspection::is_server_owned_pr_feedback_inspection(job) {
         return Ok(
             super::pr_feedback_inspection::execute_pr_feedback_inspection(
@@ -62,6 +87,25 @@ pub(crate) async fn apply_remote_completion_evidence(
     })
 }
 
+fn is_server_classifier_job(
+    registry: &WorkflowDefinitionRegistry,
+    workflow: &WorkflowInstance,
+    job: &RuntimeJob,
+) -> bool {
+    let activity = super::data_helpers::activity_name(job);
+    registry
+        .declarative_definition_for_instance(workflow)
+        .is_some_and(|definition| {
+            definition.requires_server_classifier_assessment(&workflow.state)
+                && definition
+                    .policy()
+                    .states
+                    .get(&workflow.state)
+                    .and_then(|state| state.activity.as_deref())
+                    == Some(activity.as_str())
+        })
+}
+
 fn remote_quality_gate_has_revision_bound_verification(result: &ActivityResult) -> bool {
     result
         .artifacts
@@ -91,6 +135,26 @@ fn remote_quality_gate_requires_revision_bound_verification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_workflow::runtime::{RuntimeKind, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID};
+
+    #[test]
+    fn remote_classifier_detection_uses_compiled_definition_metadata() {
+        let registry = WorkflowDefinitionRegistry::with_builtins();
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "plan_scope_review",
+            WorkflowSubject::new("issue", "owner/repo#1"),
+        );
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::RemoteHost,
+            "remote",
+            json!({ "activity": "classify_change_scope" }),
+        );
+
+        assert!(is_server_classifier_job(&registry, &workflow, &job));
+    }
 
     #[test]
     fn remote_quality_gate_success_fails_closed_without_revision_bound_workspace() {

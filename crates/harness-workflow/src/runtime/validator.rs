@@ -202,7 +202,7 @@ impl TransitionAllowlist {
                 "replanning",
                 [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
             )
-            .allow("planning", "implementing", [EnqueueActivity, MarkBlocked])
+            .allow("planning", "plan_scope_review", [EnqueueActivity])
             .allow("planning", "planning", [EnqueueActivity, Wait])
             .allow(
                 "implementing",
@@ -214,11 +214,10 @@ impl TransitionAllowlist {
                 "replanning",
                 [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
             )
-            .allow(
-                "replanning",
-                "implementing",
-                [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
-            )
+            .allow("replanning", "plan_scope_review", [EnqueueActivity])
+            .allow("plan_scope_review", "implementing", [EnqueueActivity])
+            .allow("implementing", "pr_scope_review", [BindPr, EnqueueActivity])
+            .allow("pr_scope_review", "pr_open", [Wait])
             .allow(
                 "implementing",
                 "pr_open",
@@ -227,7 +226,7 @@ impl TransitionAllowlist {
             .allow("implementing", "done", [MarkDone])
             .allow(
                 "scheduled",
-                "pr_open",
+                "pr_scope_review",
                 [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
             )
             .allow("pr_open", "pr_open", [BindPr, Wait])
@@ -267,25 +266,29 @@ impl TransitionAllowlist {
             )
             .allow(
                 "addressing_feedback",
-                "local_review_gate",
+                "pr_scope_review",
                 [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "awaiting_feedback",
+                "pr_scope_review",
+                [EnqueueActivity, Wait],
             )
             .allow(
                 "awaiting_feedback",
                 "quality_gate_pending",
                 [StartChildWorkflow, Wait],
             )
-            .allow(
-                "quality_gate_pending",
-                "ready_to_merge",
-                std::iter::empty::<WorkflowCommandType>(),
-            )
+            .allow("quality_gate_pending", "ready_to_merge", std::iter::empty())
+            .allow("quality_gate_pending", "pr_scope_review", [EnqueueActivity])
             .allow("awaiting_feedback", "done", [MarkDone])
             .allow("addressing_feedback", "done", [MarkDone])
             .allow("quality_gate_pending", "done", [MarkDone])
             .allow("quality_gate_pending", "quality_gate_pending", [Wait])
             .allow("ready_to_merge", "ready_to_merge", [Wait])
+            .allow("ready_to_merge", "pr_scope_review", [EnqueueActivity])
             .allow("ready_to_merge", "merging", [EnqueueActivity])
+            .allow("merging", "pr_scope_review", [EnqueueActivity])
             .allow("merging", "done", [MarkDone])
             .allow("ready_to_merge", "done", [MarkDone])
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])

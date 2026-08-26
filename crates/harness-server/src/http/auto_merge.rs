@@ -7,6 +7,7 @@ use crate::github_pr_snapshot::{value_string, GitHubPrSnapshotArtifacts};
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AutoMergeSnapshotGate {
     Ready(Box<WorkflowInstance>),
+    ScopeChanged { observed_head_oid: String },
     NotReady,
 }
 
@@ -26,7 +27,17 @@ pub(crate) fn prepare_auto_merge_workflow_from_snapshot(
     let Some(snapshot_head_sha) = value_string(snapshot.normalized_snapshot.get("head_oid")) else {
         return Ok(AutoMergeSnapshotGate::NotReady);
     };
-    let expected_head_sha = snapshot_head_sha.as_str();
+    let Some(assessed_head_sha) = server_owned_scope_assessed_head(workflow) else {
+        return Ok(AutoMergeSnapshotGate::ScopeChanged {
+            observed_head_oid: snapshot_head_sha,
+        });
+    };
+    if snapshot_head_sha != assessed_head_sha {
+        return Ok(AutoMergeSnapshotGate::ScopeChanged {
+            observed_head_oid: snapshot_head_sha,
+        });
+    }
+    let expected_head_sha = assessed_head_sha.as_str();
 
     let remote_fact = snapshot.remote_fact_snapshot()?;
     let mut workflow = workflow.clone();
@@ -61,7 +72,7 @@ pub(crate) fn prepare_auto_merge_workflow_from_snapshot(
         ),
         WorkflowDataWrite::set(
             "merge_execution",
-            serde_json::json!(policy.merge_execution.to_string()),
+            serde_json::json!("server"),
             DataProvenance::Server,
         ),
         WorkflowDataWrite::set(
@@ -101,6 +112,19 @@ pub(crate) fn prepare_auto_merge_workflow_from_snapshot(
     }
     workflow.apply_data_writes(writes)?;
     Ok(AutoMergeSnapshotGate::Ready(Box::new(workflow)))
+}
+
+fn server_owned_scope_assessed_head(workflow: &WorkflowInstance) -> Option<String> {
+    let provenance = workflow
+        .data_provenance
+        .as_ref()?
+        .provenance_for("/scope_assessed_head_oid");
+    if provenance != Some(DataProvenance::Server) {
+        return None;
+    }
+    value_string(workflow.data.get("scope_assessed_head_oid"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn auto_merge_snapshot_satisfies_policy(

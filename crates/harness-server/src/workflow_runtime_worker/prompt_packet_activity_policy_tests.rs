@@ -1,6 +1,7 @@
 use super::*;
 use harness_core::config::workflow::{
-    DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+    DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowClassifierPolicy,
+    WorkflowDefinitionPolicy,
 };
 use harness_workflow::runtime::{
     build_declarative_definition, DataProvenance, DeclarativeDefinitionResolution, RuntimeKind,
@@ -76,6 +77,7 @@ fn declarative_activity_policy_binds_exactly_and_missing_policy_fails_closed() {
         WorkflowActivityPolicy {
             prompt: Some("Inspect only the declared repository surface.".to_string()),
             validation: vec!["cargo check -p harness-server --all-targets".to_string()],
+            classifier: None,
         },
     );
     let mut packet = json!({
@@ -141,6 +143,7 @@ fn built_in_or_unmatched_activity_does_not_bind_declarative_activity_policy() {
         WorkflowActivityPolicy {
             prompt: Some("Must not bind to built-in behavior.".to_string()),
             validation: vec!["false".to_string()],
+            classifier: None,
         },
     );
     let mut packet = json!({
@@ -161,6 +164,186 @@ fn built_in_or_unmatched_activity_does_not_bind_declarative_activity_policy() {
     assert!(packet["activity_result_schema"]
         .get("validation_contract")
         .is_none());
+}
+
+#[test]
+fn classifier_policy_uses_independent_prompt_and_structured_contract() {
+    let classifier = WorkflowClassifierPolicy {
+        verdicts: vec!["allow".to_string(), "needs_human".to_string()],
+        environment: vec!["Judge only supplied facts.".to_string()],
+        hard_deny: vec!["Escalate ambiguous scope.".to_string()],
+        ..WorkflowClassifierPolicy::default()
+    };
+    let activity_policy = WorkflowActivityPolicy {
+        classifier: Some(classifier),
+        ..WorkflowActivityPolicy::default()
+    };
+    let policy = WorkflowDefinitionPolicy {
+        id: "classifier_prompt_test".to_string(),
+        initial: "classifying".to_string(),
+        states: BTreeMap::from([
+            (
+                "classifying".to_string(),
+                DeclaredState {
+                    activity: Some("classify_scope".to_string()),
+                    on_failure: Some("blocked".to_string()),
+                    on_signal: BTreeMap::from([
+                        ("allow".to_string(), "done".to_string()),
+                        ("needs_human".to_string(), "failed".to_string()),
+                    ]),
+                    ..DeclaredState::default()
+                },
+            ),
+            (
+                "blocked".to_string(),
+                DeclaredState {
+                    progress: Some(DeclaredProgressMode::OperatorGate),
+                    ..DeclaredState::default()
+                },
+            ),
+        ]),
+        terminal: BTreeMap::from([
+            ("done".to_string(), "succeeded".to_string()),
+            ("failed".to_string(), "failed".to_string()),
+            ("cancelled".to_string(), "cancelled".to_string()),
+        ]),
+        evidence_required: BTreeMap::new(),
+        recovery_targets: vec!["classifying".to_string()],
+        intake: None,
+    };
+    let definition = Arc::new(
+        build_declarative_definition(
+            &policy,
+            &BTreeMap::from([("classify_scope".to_string(), activity_policy.clone())]),
+        )
+        .expect("classifier fixture should compile"),
+    );
+    let workflow = WorkflowInstance::new(
+        policy.id,
+        definition.definition_version(),
+        "classifying",
+        WorkflowSubject::new("declarative", "task:classifier"),
+    )
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
+    let job = RuntimeJob::pending(
+        "command-classifier",
+        RuntimeKind::CodexJsonrpc,
+        "classifier-default",
+        json!({ "activity": "classify_scope" }),
+    );
+    let mut mutable_activity_policy = activity_policy;
+    mutable_activity_policy
+        .classifier
+        .as_mut()
+        .expect("classifier fixture")
+        .environment = vec!["MUTATED_CHECKOUT_RULE_MUST_NOT_APPEAR".to_string()];
+    let mut document = WorkflowDocument::default();
+    document
+        .config
+        .activities
+        .insert("classify_scope".to_string(), mutable_activity_policy);
+    let mut packet = json!({
+        "activity_result_schema": {},
+        "required_structured_output": {},
+        "runtime_job": {
+            "id": job.id,
+            "activity": "classify_scope",
+            "runtime_profile": "classifier-default"
+        },
+        "workflow_file": { "prompt_template": "MUST_NOT_APPEAR" },
+        "project": { "root": "/repo" }
+    });
+
+    super::activity_policy::apply_activity_policy_with_resolver(
+        &mut packet,
+        &job,
+        Some(&workflow),
+        &document,
+        |_| DeclarativeDefinitionResolution::Resolved(definition),
+    )
+    .expect("classifier policy should bind");
+    assert_eq!(
+        packet["activity_policy"]["classifier"]["environment"][0],
+        "Judge only supplied facts."
+    );
+    assert!(!packet.to_string().contains("MUTATED_CHECKOUT_RULE"));
+    assert!(packet["workflow_file"].get("config").is_none());
+    assert!(packet["workflow_file"].get("prompt_template").is_none());
+    let prompt = build_runtime_job_prompt(&packet, Some("MUST_NOT_APPEAR_EITHER"));
+
+    assert_eq!(
+        packet["activity_policy"]["classifier"]["verdicts"][0],
+        "allow"
+    );
+    assert_eq!(
+        packet["activity_result_schema"]["classifier_contract"]["exactly_one"],
+        true
+    );
+    assert!(prompt.contains("independent Harness policy classifier"));
+    assert!(prompt.contains("Do not use tools"));
+    assert!(!prompt.contains("MUST_NOT_APPEAR"));
+}
+
+#[test]
+fn built_in_scope_review_requires_workflow_classifier_policy() {
+    let registry = WorkflowDefinitionRegistry::with_builtins();
+    let workflow = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "plan_scope_review",
+        WorkflowSubject::new("issue", "issue:42"),
+    );
+    let job = RuntimeJob::pending(
+        "command-scope-review",
+        RuntimeKind::CodexJsonrpc,
+        "classifier-default",
+        json!({ "activity": harness_workflow::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY }),
+    );
+    let mut packet = json!({
+        "activity_result_schema": {},
+        "required_structured_output": {},
+    });
+    let mut document = WorkflowDocument::default();
+
+    let error = super::activity_policy::apply_activity_policy(
+        &registry,
+        &mut packet,
+        &job,
+        Some(&workflow),
+        &document,
+    )
+    .expect_err("missing built-in classifier policy must fail closed");
+    assert!(error.to_string().contains("no pinned dispatch policy"));
+
+    let pinned_policy = WorkflowActivityPolicy {
+        classifier: Some(WorkflowClassifierPolicy {
+            verdicts: vec![
+                "allow".to_string(),
+                "revise_plan".to_string(),
+                "split_required".to_string(),
+                "needs_human".to_string(),
+            ],
+            environment: vec!["Judge the supplied scope facts.".to_string()],
+            ..WorkflowClassifierPolicy::default()
+        }),
+        ..WorkflowActivityPolicy::default()
+    };
+    let workflow = workflow.with_server_data(json!({
+        "pinned_change_scope_classifier_policy": pinned_policy
+    }));
+    document.config.activities.clear();
+    super::activity_policy::apply_activity_policy(
+        &registry,
+        &mut packet,
+        &job,
+        Some(&workflow),
+        &document,
+    )
+    .expect("complete built-in classifier policy should bind");
+    assert_eq!(
+        packet["activity_policy"]["classifier"]["verdicts"][0],
+        "allow"
+    );
 }
 
 #[test]

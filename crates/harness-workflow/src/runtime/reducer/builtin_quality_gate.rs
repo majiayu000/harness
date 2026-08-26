@@ -1,5 +1,6 @@
 use super::support::{
-    invalid_agent_output_blocked_decision, runtime_completion_evidence, signal_count,
+    event_field_string, invalid_agent_output_blocked_decision, runtime_completion_evidence,
+    signal_count,
 };
 use crate::runtime::completion_evidence::{
     server_validation_digest_artifact, server_validation_digest_passed,
@@ -12,8 +13,102 @@ use crate::runtime::quality_gate::{
     QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
     QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL,
 };
+use crate::runtime::scope_review::enqueue_pr_scope_review;
 use crate::runtime::WorkflowDefinitionRegistry;
 use serde_json::Value;
+
+pub(super) fn parent_quality_gate_head_decision(
+    registry: &WorkflowDefinitionRegistry,
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        super::GITHUB_ISSUE_PR_DEFINITION_ID,
+        "quality_gate_pending",
+        QUALITY_GATE_ACTIVITY,
+    ) || quality_gate_success_contract_error(registry, result).is_some()
+    {
+        return None;
+    }
+    let pr_number = instance.data.get("pr_number").and_then(Value::as_u64);
+    let pr_url = instance
+        .data
+        .get("pr_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let repo = instance
+        .data
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let assessed_head = instance
+        .data
+        .get("scope_assessed_head_oid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let snapshot = result.artifacts.iter().find_map(|artifact| {
+        (artifact.artifact_type == crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT)
+            .then_some(&artifact.artifact)
+    });
+    let snapshot_matches = snapshot.is_some_and(|snapshot| {
+        snapshot.get("pr_number").and_then(Value::as_u64) == pr_number
+            && snapshot
+                .get("repo")
+                .and_then(Value::as_str)
+                .zip(repo)
+                .is_some_and(|(observed, expected)| observed.eq_ignore_ascii_case(expected))
+    });
+    let observed_head = snapshot
+        .filter(|_| snapshot_matches)
+        .and_then(|snapshot| snapshot.get("head_oid"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (Some(pr_number), Some(pr_url), Some(assessed_head), Some(observed_head)) =
+        (pr_number, pr_url, assessed_head, observed_head)
+    else {
+        return Some(invalid_agent_output_blocked_decision(
+            instance,
+            event,
+            result,
+            "quality gate passed without a current server PR snapshot bound to the scope-assessed head",
+        ));
+    };
+    if observed_head == assessed_head {
+        return None;
+    }
+    let issue_plan = instance
+        .data
+        .get("issue_plan")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let dedupe_source = event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "reassess_pr_scope",
+            "pr_scope_review",
+            "server observed a new PR head after the quality gate; reassess scope before continuing",
+        )
+        .with_command(enqueue_pr_scope_review(
+            format!("quality-gate-scope-recheck:{}:{pr_number}:{dedupe_source}", instance.id),
+            pr_number,
+            pr_url,
+            issue_plan,
+        ))
+        .with_evidence(runtime_completion_evidence(event, result))
+        .high_confidence(),
+    )
+}
 
 pub(super) fn quality_gate_success_decision(
     registry: &WorkflowDefinitionRegistry,

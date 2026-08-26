@@ -8,20 +8,22 @@ use super::builtin_pr_feedback::{
     local_review_decision_from_activity_result,
     pr_feedback_blocking_signal_overrides_structured_ready,
     pr_feedback_child_decision_from_activity_result, pr_feedback_success_contract_error,
-    pr_feedback_sweep_decision_from_activity_result,
+    pr_feedback_sweep_decision_from_activity_result, pr_scope_recheck_after_repair,
+    pr_scope_recheck_before_merge,
 };
 use super::builtin_prompt_task::prompt_task_success_decision_with_registry;
 use super::builtin_quality_gate::{
-    parent_quality_gate_pass_decision, quality_gate_activity_matches,
-    quality_gate_success_contract_error, quality_gate_success_decision,
+    parent_quality_gate_head_decision, parent_quality_gate_pass_decision,
+    quality_gate_activity_matches, quality_gate_success_contract_error,
+    quality_gate_success_decision,
 };
 use super::runtime_failure::{
     retry_failed_activity_decision, runtime_blocked_decision, runtime_cancelled_decision,
     runtime_failed_decision,
 };
 use super::support::{
-    event_command_type, event_field_string, event_workflow_command,
-    invalid_agent_output_blocked_decision, runtime_completion_evidence,
+    event_command_type, event_workflow_command, invalid_agent_output_blocked_decision,
+    runtime_completion_evidence,
 };
 use super::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::candidate_promotion::{
@@ -175,6 +177,10 @@ fn reduce_success(
         return Some(decision);
     }
 
+    if let Some(decision) = parent_quality_gate_head_decision(registry, instance, event, result) {
+        return Some(decision);
+    }
+
     if let Some(decision) = parent_quality_gate_pass_decision(registry, instance, event, result) {
         return Some(decision);
     }
@@ -213,12 +219,20 @@ fn reduce_success(
         return Some(decision);
     }
 
+    if let Some(decision) = pr_scope_recheck_before_merge(instance, event, result) {
+        return Some(decision);
+    }
+
     if let Some(decision) = merged_pr_from_activity_result(instance, event, result) {
         return Some(decision);
     }
 
     if let Some(decision) = pr_feedback_sweep_decision_from_activity_result(instance, event, result)
     {
+        return Some(decision);
+    }
+
+    if let Some(decision) = pr_scope_recheck_after_repair(instance, event, result) {
         return Some(decision);
     }
 
@@ -268,16 +282,6 @@ fn reduce_success(
         instance.state.as_str(),
         result.activity.as_str(),
     ) {
-        (GITHUB_ISSUE_PR_DEFINITION_ID, "replanning", "replan_issue") => (
-            "implementing",
-            "resume_implementation_after_replan",
-            "replan activity completed; implementation can continue",
-        ),
-        (GITHUB_ISSUE_PR_DEFINITION_ID, "addressing_feedback", "address_pr_feedback") => (
-            "local_review_gate",
-            "run_local_review_after_rework",
-            "PR feedback rework activity completed; run local review before remote feedback",
-        ),
         (QUALITY_GATE_DEFINITION_ID, "checking", QUALITY_GATE_ACTIVITY) => (
             "passed",
             "quality_passed",
@@ -298,21 +302,6 @@ fn reduce_success(
     let mut workflow_decision =
         WorkflowDecision::new(&instance.id, &instance.state, decision, next_state, reason)
             .with_evidence(runtime_completion_evidence(event, result));
-    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
-        && instance.state == "replanning"
-        && result.activity == "replan_issue"
-        && next_state == "implementing"
-    {
-        let completion_command_id =
-            event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
-        workflow_decision = workflow_decision.with_command(WorkflowCommand::enqueue_activity(
-            "implement_issue",
-            format!(
-                "issue-replan:{}:implement:{completion_command_id}",
-                instance.id
-            ),
-        ));
-    }
     if instance.definition_id == PROMPT_TASK_DEFINITION_ID
         && instance.state == "implementing"
         && result.activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
@@ -327,22 +316,6 @@ fn reduce_success(
             }),
         ));
     }
-    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
-        && instance.state == "addressing_feedback"
-        && result.activity == "address_pr_feedback"
-        && next_state == "local_review_gate"
-    {
-        let completion_command_id =
-            event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
-        workflow_decision = workflow_decision.with_command(WorkflowCommand::enqueue_activity(
-            LOCAL_REVIEW_ACTIVITY,
-            format!(
-                "local-review:{}:after-rework:{completion_command_id}",
-                instance.id
-            ),
-        ));
-    }
-
     Some(workflow_decision.high_confidence())
 }
 
@@ -556,8 +529,9 @@ fn structured_decision_validates(
     if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
         && instance.state == "implementing"
         && result.activity == "implement_issue"
-        && decision.next_state == "done"
-        && closed_issue_evidence_from_activity_result(result).is_none()
+        && (decision.next_state == "pr_open"
+            || decision.next_state == "done"
+                && closed_issue_evidence_from_activity_result(result).is_none())
     {
         return false;
     }
