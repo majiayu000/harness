@@ -39,6 +39,8 @@ pub(crate) struct TurnLifecycleOptions {
     /// job lease is lost mid-turn, the turn interrupts the agent so the
     /// child process terminates and the workspace cleanup can run (GH-1877).
     pub lease_lost: Option<tokio::sync::watch::Receiver<bool>>,
+    #[cfg(test)]
+    pub stream_closed_observed: Option<Arc<tokio::sync::Notify>>,
 }
 
 pub(crate) async fn run_turn_lifecycle_with_options(
@@ -308,6 +310,10 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     }
                     None => {
                         stream_closed = true;
+                        #[cfg(test)]
+                        if let Some(observed) = options.stream_closed_observed.as_ref() {
+                            observed.notify_one();
+                        }
                     }
                 }
             }
@@ -344,7 +350,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         }
                         None => std::future::pending().await,
                     }
-                }, if execution_result.is_none() && !stream_closed => {
+                }, if execution_result.is_none() => {
                 tracing::warn!(
                     thread_id = %thread_id,
                     turn_id = %turn_id,

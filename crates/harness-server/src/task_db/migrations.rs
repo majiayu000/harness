@@ -367,6 +367,12 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
               CREATE VIEW workspace_cleanup_targets AS
               SELECT * FROM reject_legacy_workspace_cleanup_targets()",
     },
+    Migration {
+        version: 32,
+        description: "track legacy cleanup claim backfill repair",
+        sql: "ALTER TABLE task_db_legacy_backfills
+              ADD COLUMN IF NOT EXISTS cleanup_claims_repaired_at TIMESTAMPTZ",
+    },
 ];
 
 #[cfg(test)]
@@ -507,5 +513,16 @@ mod tests {
         assert!(migration
             .sql
             .contains("reject_legacy_workspace_cleanup_targets"));
+    }
+
+    #[test]
+    fn legacy_cleanup_claim_repair_has_a_durable_marker() {
+        let migration = TASK_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 32)
+            .expect("v32 migration should exist");
+
+        assert!(migration.sql.contains("cleanup_claims_repaired_at"));
+        assert!(migration.sql.contains("TIMESTAMPTZ"));
     }
 }

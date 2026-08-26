@@ -59,9 +59,7 @@ use structured_output::{
 
 pub(super) struct ServerRuntimeJobExecutor<'a> {
     pub(super) state: &'a Arc<AppState>,
-    /// Stateful lease-lost signal: `watch` keeps the latest value, so a
-    /// cancellation that fires before the turn loop starts polling is not
-    /// lost (GH-1877).
+    /// Stateful lease-loss signal retained across turn startup (GH-1877).
     lease_lost: Arc<tokio::sync::watch::Sender<bool>>,
     lease_lost_receiver: tokio::sync::watch::Receiver<bool>,
     execution_admission: RuntimeExecutionAdmission,
@@ -332,6 +330,8 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                             &source_project_root,
                         ),
                         egress_verified_at_dispatch: Some(Arc::clone(&egress_verified_at_dispatch)),
+                        #[cfg(test)]
+                        stream_closed_observed: None,
                     },
                 )
                 .await;

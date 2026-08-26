@@ -1147,6 +1147,72 @@ async fn legacy_backfill_copies_runtime_workspace_cleanup_targets() -> anyhow::R
     )
     .await?;
 
+    let initially_backfilled_targets = shared_store
+        .workspace_cleanup_targets_for_runtime_workflow("legacy-runtime-workflow")
+        .await?;
+    assert_eq!(initially_backfilled_targets.len(), 1);
+    shared_store
+        .complete_claimed_workspace_cleanup_target(
+            &initially_backfilled_targets[0],
+            "legacy-cleanup-claim",
+            "legacy-cleanup-session",
+        )
+        .await?;
+    let shared_test_pool = shared_context
+        .open_pool_with_setup_pool(&setup_pool)
+        .await?;
+    sqlx::query(
+        "UPDATE task_db_legacy_backfills
+         SET cleanup_claims_repaired_at = NULL
+         WHERE store_key = $1",
+    )
+    .bind(shared_db.store_key())
+    .execute(&shared_test_pool)
+    .await?;
+    shared_test_pool.close().await;
+
+    let legacy_context = harness_core::db::PgStoreContext::from_legacy_path_schema(
+        &legacy_path,
+        Some(database_url.as_str()),
+    )?;
+    let legacy_test_pool = legacy_context.open_pool().await?;
+    sqlx::query("DROP VIEW workspace_cleanup_targets")
+        .execute(&legacy_test_pool)
+        .await?;
+    sqlx::query("DROP FUNCTION reject_legacy_workspace_cleanup_targets()")
+        .execute(&legacy_test_pool)
+        .await?;
+    sqlx::query("ALTER TABLE workspace_cleanup_targets_v2 RENAME TO workspace_cleanup_targets")
+        .execute(&legacy_test_pool)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE workspace_cleanup_targets
+         DROP COLUMN workflow_hook_claimed,
+         DROP COLUMN manager_hook_claimed",
+    )
+    .execute(&legacy_test_pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE task_db_legacy_backfills
+         DROP COLUMN cleanup_claims_repaired_at",
+    )
+    .execute(&legacy_test_pool)
+    .await?;
+    sqlx::query("DELETE FROM schema_migrations WHERE version >= 30")
+        .execute(&legacy_test_pool)
+        .await?;
+    legacy_test_pool.close().await;
+
+    assert_eq!(
+        crate::task_db::migrate_legacy_task_db_if_needed(
+            &legacy_path,
+            Some(database_url.as_str()),
+            &shared_db,
+        )
+        .await?,
+        0,
+        "an existing marker must replay cleanup claim repair without recopying tasks"
+    );
     let targets = shared_store
         .workspace_cleanup_targets_for_runtime_workflow("legacy-runtime-workflow")
         .await?;
@@ -1185,6 +1251,29 @@ async fn legacy_backfill_copies_runtime_workspace_cleanup_targets() -> anyhow::R
             .await?,
         Some(false),
         "legacy backfill must preserve the manager hook claim"
+    );
+    shared_store
+        .complete_claimed_workspace_cleanup_target(
+            &targets[0],
+            "legacy-cleanup-claim",
+            "legacy-cleanup-session",
+        )
+        .await?;
+    assert_eq!(
+        crate::task_db::migrate_legacy_task_db_if_needed(
+            &legacy_path,
+            Some(database_url.as_str()),
+            &shared_db,
+        )
+        .await?,
+        0
+    );
+    assert!(
+        shared_store
+            .workspace_cleanup_targets_for_runtime_workflow("legacy-runtime-workflow")
+            .await?
+            .is_empty(),
+        "completed shared cleanup must not be resurrected from the frozen legacy schema"
     );
 
     shared_schema.cleanup_with_pool(&setup_pool).await?;

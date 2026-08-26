@@ -306,19 +306,6 @@ pub async fn migrate_legacy_task_db_if_needed(
         return Ok(0);
     }
 
-    let already_backfilled: Option<String> = sqlx::query_scalar(
-        "SELECT legacy_schema
-         FROM task_db_legacy_backfills
-         WHERE store_key = $1 AND legacy_schema = $2",
-    )
-    .bind(target_db.store_key())
-    .bind(legacy_schema)
-    .fetch_optional(&target_db.pool)
-    .await?;
-    if already_backfilled.is_some() {
-        return Ok(0);
-    }
-
     let legacy_table: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
         .bind(format!("{}.tasks", quote_pg_ident(legacy_schema)))
         .fetch_one(&target_db.pool)
@@ -332,6 +319,88 @@ pub async fn migrate_legacy_task_db_if_needed(
 
     let legacy_schema_sql = quote_pg_ident(legacy_schema);
     let mut tx = target_db.pool.begin().await?;
+    let backfill_lock_key = format!(
+        "task-db-legacy-backfill:{}:{legacy_schema}",
+        target_db.store_key()
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(backfill_lock_key)
+        .execute(&mut *tx)
+        .await?;
+    let backfill_repair_complete: Option<bool> = sqlx::query_scalar(
+        "SELECT cleanup_claims_repaired_at IS NOT NULL
+         FROM task_db_legacy_backfills
+         WHERE store_key = $1 AND legacy_schema = $2
+         FOR UPDATE",
+    )
+    .bind(target_db.store_key())
+    .bind(legacy_schema)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let cleanup_targets_insert_sql = format!(
+        "INSERT INTO workspace_cleanup_targets_v2 (
+            store_key, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
+            workspace_key, source_repo, repo, owner_session, run_generation, process_id,
+            acquisition_id, process_started_at, created_at, last_used_at,
+            cleanup_in_progress, cleanup_claim_id, cleanup_owner_session, cleanup_process_id,
+            cleanup_process_started_at, cleanup_claim_expires_at,
+            workflow_hook_claimed, manager_hook_claimed
+         )
+         SELECT $1, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
+                workspace_key, source_repo, repo, owner_session, run_generation, process_id,
+                acquisition_id, process_started_at, created_at, last_used_at,
+                cleanup_in_progress, cleanup_claim_id, cleanup_owner_session, cleanup_process_id,
+                cleanup_process_started_at, cleanup_claim_expires_at,
+                workflow_hook_claimed, manager_hook_claimed
+         FROM {legacy_schema_sql}.workspace_cleanup_targets_v2 AS legacy_cleanup
+         WHERE $2 OR legacy_cleanup.cleanup_in_progress = TRUE
+         ON CONFLICT (store_key, runtime_workflow_id, workspace_path) DO NOTHING"
+    );
+    let cleanup_targets_update_sql = format!(
+        "UPDATE workspace_cleanup_targets_v2 AS shared_cleanup
+         SET cleanup_in_progress = legacy_cleanup.cleanup_in_progress,
+             cleanup_claim_id = legacy_cleanup.cleanup_claim_id,
+             cleanup_owner_session = legacy_cleanup.cleanup_owner_session,
+             cleanup_process_id = legacy_cleanup.cleanup_process_id,
+             cleanup_process_started_at = legacy_cleanup.cleanup_process_started_at,
+             cleanup_claim_expires_at = legacy_cleanup.cleanup_claim_expires_at,
+             workflow_hook_claimed = legacy_cleanup.workflow_hook_claimed,
+             manager_hook_claimed = legacy_cleanup.manager_hook_claimed,
+             last_used_at = legacy_cleanup.last_used_at
+         FROM {legacy_schema_sql}.workspace_cleanup_targets_v2 AS legacy_cleanup
+         WHERE shared_cleanup.store_key = $1
+           AND shared_cleanup.runtime_workflow_id = legacy_cleanup.runtime_workflow_id
+           AND shared_cleanup.workspace_path = legacy_cleanup.workspace_path
+           AND shared_cleanup.last_used_at <= legacy_cleanup.last_used_at"
+    );
+    if backfill_repair_complete == Some(true) {
+        tx.rollback().await?;
+        return Ok(0);
+    }
+    if backfill_repair_complete == Some(false) {
+        sqlx::query(&cleanup_targets_update_sql)
+            .bind(target_db.store_key())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(&cleanup_targets_insert_sql)
+            .bind(target_db.store_key())
+            .bind(false)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE task_db_legacy_backfills
+             SET cleanup_claims_repaired_at = CURRENT_TIMESTAMP
+             WHERE store_key = $1 AND legacy_schema = $2
+               AND cleanup_claims_repaired_at IS NULL",
+        )
+        .bind(target_db.store_key())
+        .bind(legacy_schema)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(0);
+    }
 
     let tasks_sql = format!(
         "INSERT INTO tasks (
@@ -407,32 +476,17 @@ pub async fn migrate_legacy_task_db_if_needed(
         .execute(&mut *tx)
         .await?;
 
-    let cleanup_targets_sql = format!(
-        "INSERT INTO workspace_cleanup_targets_v2 (
-            store_key, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
-            workspace_key, source_repo, repo, owner_session, run_generation, process_id,
-            acquisition_id, process_started_at, created_at, last_used_at,
-            cleanup_in_progress, cleanup_claim_id, cleanup_owner_session, cleanup_process_id,
-            cleanup_process_started_at, cleanup_claim_expires_at,
-            workflow_hook_claimed, manager_hook_claimed
-         )
-         SELECT $1, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
-                workspace_key, source_repo, repo, owner_session, run_generation, process_id,
-                acquisition_id, process_started_at, created_at, last_used_at,
-                cleanup_in_progress, cleanup_claim_id, cleanup_owner_session, cleanup_process_id,
-                cleanup_process_started_at, cleanup_claim_expires_at,
-                workflow_hook_claimed, manager_hook_claimed
-         FROM {legacy_schema_sql}.workspace_cleanup_targets_v2
-         ON CONFLICT (store_key, runtime_workflow_id, workspace_path) DO NOTHING"
-    );
-    sqlx::query(&cleanup_targets_sql)
+    sqlx::query(&cleanup_targets_insert_sql)
         .bind(target_db.store_key())
+        .bind(true)
         .execute(&mut *tx)
         .await?;
 
     sqlx::query(
-        "INSERT INTO task_db_legacy_backfills (store_key, legacy_schema, copied_rows)
-         VALUES ($1, $2, $3)
+        "INSERT INTO task_db_legacy_backfills (
+            store_key, legacy_schema, copied_rows, cleanup_claims_repaired_at
+         )
+         VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
          ON CONFLICT (store_key, legacy_schema) DO NOTHING",
     )
     .bind(target_db.store_key())

@@ -18,8 +18,8 @@ use std::sync::{
 };
 use tokio::sync::mpsc;
 
-struct CountingAgent {
-    calls: Arc<AtomicUsize>,
+pub(super) struct CountingAgent {
+    pub(super) calls: Arc<AtomicUsize>,
 }
 
 struct VerifiedThenFailedAgent;
@@ -315,7 +315,10 @@ fn server_with_codex_counts(
     )))
 }
 
-fn start_test_turn(server: &HarnessServer, root: &std::path::Path) -> anyhow::Result<TurnId> {
+pub(super) fn start_test_turn(
+    server: &HarnessServer,
+    root: &std::path::Path,
+) -> anyhow::Result<TurnId> {
     let thread_id = server.thread_manager.start_thread(root.to_path_buf());
     server
         .thread_manager
@@ -323,7 +326,7 @@ fn start_test_turn(server: &HarnessServer, root: &std::path::Path) -> anyhow::Re
         .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
-async fn run_test_turn(
+pub(super) async fn run_test_turn(
     server: Arc<HarnessServer>,
     root: &std::path::Path,
     turn_id: TurnId,
