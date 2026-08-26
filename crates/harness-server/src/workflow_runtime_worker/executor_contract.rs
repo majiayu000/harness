@@ -34,6 +34,12 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
             return *result;
         }
         let activity = activity_name(&job);
+        if !self.admit_execution() {
+            return ActivityResult::cancelled(
+                activity,
+                "Runtime job execution was cancelled before admission.",
+            );
+        }
         match self.execute_inner(job).await {
             Ok(result) => postprocess_local_execution_result(result),
             Err(error) => execution_error_result(activity, error),

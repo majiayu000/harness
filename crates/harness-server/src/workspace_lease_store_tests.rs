@@ -1089,6 +1089,28 @@ async fn legacy_backfill_copies_runtime_workspace_cleanup_targets() -> anyhow::R
             .await?,
         Some(true)
     );
+    let legacy_target = legacy_store
+        .workspace_cleanup_targets_for_runtime_workflow("legacy-runtime-workflow")
+        .await?
+        .pop()
+        .expect("legacy cleanup target");
+    let cleanup_process_started_at = WorkspaceLeaseStore::current_process_started_at()?;
+    assert!(
+        legacy_store
+            .claim_workspace_cleanup_target(
+                &legacy_target,
+                "legacy-cleanup-claim",
+                "legacy-cleanup-session",
+                std::process::id(),
+                cleanup_process_started_at,
+            )
+            .await?
+    );
+    assert!(
+        legacy_store
+            .remove_workspace_cleanup_claim_expiry_for_test(&legacy_target, "legacy-cleanup-claim",)
+            .await?
+    );
     assert_eq!(
         legacy_store
             .claim_workspace_cleanup_hook(
@@ -1130,6 +1152,18 @@ async fn legacy_backfill_copies_runtime_workspace_cleanup_targets() -> anyhow::R
         .await?;
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].workspace_path, record.workspace_path);
+    assert!(
+        !shared_store
+            .claim_workspace_cleanup_target(
+                &targets[0],
+                "replacement-cleanup-claim",
+                "replacement-cleanup-session",
+                std::process::id(),
+                cleanup_process_started_at,
+            )
+            .await?,
+        "legacy backfill must preserve a live NULL-expiry cleanup claim"
+    );
     assert_eq!(
         shared_store
             .claim_workspace_cleanup_hook(

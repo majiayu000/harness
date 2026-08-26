@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "workspace_cleanup_store/claim.rs"]
+mod claim;
+
 const CLEANUP_CLAIM_TTL_SECS: i64 = 30;
 const CLEANUP_CLAIM_ABANDON_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -259,109 +262,6 @@ impl WorkspaceLeaseStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(target_exists.then_some(false))
-    }
-
-    pub(crate) async fn claim_workspace_cleanup_target(
-        &self,
-        target: &WorkspaceCleanupTargetRecord,
-        cleanup_claim_id: &str,
-        cleanup_owner_session: &str,
-        cleanup_process_id: u32,
-        cleanup_process_started_at: u64,
-    ) -> anyhow::Result<bool> {
-        let mut transaction = self.pool.begin().await?;
-        let existing_claim_is_live: Option<bool> = sqlx::query_scalar(
-            "SELECT cleanup_claim_id IS NOT NULL
-                    AND COALESCE(cleanup_claim_expires_at > CURRENT_TIMESTAMP, FALSE)
-             FROM workspace_cleanup_targets_v2
-             WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
-               AND task_id = $4 AND project_key = $5 AND slot_index = $6
-               AND owner_session = $7 AND run_generation = $8
-               AND acquisition_id IS NOT DISTINCT FROM $9
-               AND process_id = $10 AND process_started_at = $11
-             FOR UPDATE",
-        )
-        .bind(&self.store_key)
-        .bind(&target.runtime_workflow_id)
-        .bind(target.workspace_path.to_string_lossy().as_ref())
-        .bind(target.task_id.as_str())
-        .bind(&target.project_key)
-        .bind(target.slot_index as i64)
-        .bind(&target.owner_session)
-        .bind(target.run_generation as i64)
-        .bind(target.acquisition_id.as_deref())
-        .bind(target.process_id as i64)
-        .bind(i64::try_from(target.process_started_at)?)
-        .fetch_optional(&mut *transaction)
-        .await?;
-        let Some(existing_claim_is_live) = existing_claim_is_live else {
-            transaction.rollback().await?;
-            return Ok(false);
-        };
-        if existing_claim_is_live {
-            transaction.rollback().await?;
-            return Ok(false);
-        }
-        let leased_path_matches: Vec<bool> = sqlx::query_scalar(
-            "SELECT project_key = $3
-                    AND slot_index = $4
-                    AND task_id = $5
-                    AND workspace_key = $6
-                    AND source_repo = $7
-                    AND repo IS NOT DISTINCT FROM $8
-                    AND runtime_workflow_id = $9
-                    AND owner_session = $10
-                    AND run_generation = $11
-                    AND acquisition_id IS NOT DISTINCT FROM $12
-                    AND process_id = $13
-                    AND process_started_at = $14
-             FROM workspace_leases
-             WHERE store_key = $1 AND workspace_path = $2 AND state = 'leased'
-             FOR UPDATE",
-        )
-        .bind(&self.store_key)
-        .bind(target.workspace_path.to_string_lossy().as_ref())
-        .bind(&target.project_key)
-        .bind(target.slot_index as i64)
-        .bind(target.task_id.as_str())
-        .bind(&target.workspace_key)
-        .bind(target.source_repo.to_string_lossy().as_ref())
-        .bind(target.repo.as_deref())
-        .bind(&target.runtime_workflow_id)
-        .bind(&target.owner_session)
-        .bind(target.run_generation as i64)
-        .bind(target.acquisition_id.as_deref())
-        .bind(target.process_id as i64)
-        .bind(i64::try_from(target.process_started_at)?)
-        .fetch_all(&mut *transaction)
-        .await?;
-        if leased_path_matches.into_iter().any(|matches| !matches) {
-            transaction.rollback().await?;
-            return Ok(false);
-        }
-        sqlx::query(
-            "UPDATE workspace_cleanup_targets_v2
-             SET cleanup_in_progress = TRUE,
-                 cleanup_claim_id = $4,
-                 cleanup_owner_session = $5,
-                 cleanup_process_id = $6,
-                 cleanup_process_started_at = $7,
-                 cleanup_claim_expires_at = CURRENT_TIMESTAMP + ($8 * INTERVAL '1 second'),
-                 last_used_at = CURRENT_TIMESTAMP
-             WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3",
-        )
-        .bind(&self.store_key)
-        .bind(&target.runtime_workflow_id)
-        .bind(target.workspace_path.to_string_lossy().as_ref())
-        .bind(cleanup_claim_id)
-        .bind(cleanup_owner_session)
-        .bind(cleanup_process_id as i64)
-        .bind(i64::try_from(cleanup_process_started_at)?)
-        .bind(CLEANUP_CLAIM_TTL_SECS)
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        Ok(true)
     }
 
     pub(crate) async fn complete_owned_workspace(

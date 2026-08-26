@@ -354,24 +354,6 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         version: 31,
         description: "fence legacy runtime workspace cleanup writers",
         sql: "LOCK TABLE workspace_cleanup_targets IN ACCESS EXCLUSIVE MODE;
-              UPDATE workspace_cleanup_targets
-              SET cleanup_in_progress = FALSE,
-                  cleanup_claim_id = NULL,
-                  cleanup_owner_session = NULL,
-                  cleanup_process_id = NULL,
-                  cleanup_process_started_at = NULL,
-                  cleanup_claim_expires_at = NULL
-              WHERE cleanup_in_progress = TRUE
-                AND cleanup_claim_expires_at <= CURRENT_TIMESTAMP;
-              DO $$
-              BEGIN
-                  IF EXISTS (
-                      SELECT 1 FROM workspace_cleanup_targets WHERE cleanup_in_progress = TRUE
-                  ) THEN
-                      RAISE EXCEPTION 'cannot upgrade workspace cleanup schema while cleanup is in progress';
-                  END IF;
-              END
-              $$;
               ALTER TABLE workspace_cleanup_targets
               RENAME TO workspace_cleanup_targets_v2;
               CREATE FUNCTION reject_legacy_workspace_cleanup_targets()
@@ -506,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cleanup_writer_fence_requires_quiescence() {
+    fn legacy_cleanup_writer_fence_preserves_claims_for_runtime_recovery() {
         let migration = TASK_MIGRATIONS
             .iter()
             .find(|migration| migration.version == 31)
@@ -515,10 +497,7 @@ mod tests {
         assert!(migration
             .sql
             .contains("LOCK TABLE workspace_cleanup_targets"));
-        assert!(migration.sql.contains("cleanup_in_progress = TRUE"));
-        assert!(migration
-            .sql
-            .contains("cleanup_claim_expires_at <= CURRENT_TIMESTAMP"));
+        assert!(!migration.sql.contains("UPDATE workspace_cleanup_targets"));
         assert!(migration
             .sql
             .contains("RENAME TO workspace_cleanup_targets_v2"));

@@ -45,6 +45,8 @@ mod runtime_timeout;
 use runtime_timeout::runtime_profile_with_timeout_fallback;
 mod egress_evidence;
 use egress_evidence::AgentEgressEvidence;
+mod execution_admission;
+use execution_admission::RuntimeExecutionAdmission;
 mod permission_profile;
 use permission_profile::RuntimePermissionProfile;
 mod spawn_env;
@@ -62,6 +64,7 @@ pub(super) struct ServerRuntimeJobExecutor<'a> {
     /// lost (GH-1877).
     lease_lost: Arc<tokio::sync::watch::Sender<bool>>,
     lease_lost_receiver: tokio::sync::watch::Receiver<bool>,
+    execution_admission: RuntimeExecutionAdmission,
 }
 impl<'a> ServerRuntimeJobExecutor<'a> {
     pub(super) fn new(state: &'a Arc<AppState>) -> Self {
@@ -70,11 +73,17 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             state,
             lease_lost: Arc::new(lease_lost),
             lease_lost_receiver,
+            execution_admission: RuntimeExecutionAdmission::default(),
         }
     }
 
     pub(super) fn cancel_lease_lost(&self) {
+        self.execution_admission.cancel();
         self.lease_lost.send_replace(true);
+    }
+
+    pub(super) fn admit_execution(&self) -> bool {
+        self.execution_admission.try_admit()
     }
 
     pub(super) async fn execute_inner(&self, job: RuntimeJob) -> anyhow::Result<ActivityResult> {

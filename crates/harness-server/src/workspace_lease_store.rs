@@ -191,8 +191,9 @@ impl WorkspaceLeaseStore {
     ) -> anyhow::Result<bool> {
         let mut transaction = self.pool.begin().await?;
         let cleanup_claims: Vec<bool> = sqlx::query_scalar(
-            "SELECT cleanup_claim_id IS NOT NULL
-                    AND COALESCE(cleanup_claim_expires_at > CURRENT_TIMESTAMP, FALSE)
+            "SELECT cleanup_in_progress
+                    AND (cleanup_claim_expires_at IS NULL
+                         OR cleanup_claim_expires_at > CURRENT_TIMESTAMP)
              FROM workspace_cleanup_targets_v2
              WHERE store_key = $1 AND workspace_path = $2
              FOR UPDATE",
