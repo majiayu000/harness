@@ -113,7 +113,7 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
         ActiveWorkspaceState::Preparing
     );
     drop(guard);
-    assert_eq!(pool.available_permits(), 1);
+    assert_eq!(pool.available_permits(), 0);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while mgr.active.contains_key(&task_id) {
             tokio::task::yield_now().await;
@@ -121,6 +121,7 @@ async fn cancelled_preparation_marks_workspace_cleanup_required() {
     })
     .await
     .expect("cancelled preparation cleanup should converge");
+    assert_eq!(pool.available_permits(), 1);
     assert!(!tmp.path().join("workspaces/task-a").exists());
     assert!(workflow_hook_marker.exists());
     assert!(manager_hook_marker.exists());

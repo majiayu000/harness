@@ -49,6 +49,36 @@ pub(crate) struct WorkspaceLeaseStore {
 }
 
 impl WorkspaceLeaseStore {
+    pub(crate) async fn owned_workspace_acquisition_is_current(
+        &self,
+        project_key: &str,
+        slot_index: u32,
+        task_id: &TaskId,
+        workspace_path: &std::path::Path,
+        owner_session: &str,
+        run_generation: u32,
+        acquisition_id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM workspace_leases
+                WHERE store_key = $1 AND project_key = $2 AND slot_index = $3
+                  AND task_id = $4 AND workspace_path = $5 AND owner_session = $6
+                  AND run_generation = $7 AND acquisition_id = $8 AND state = 'leased'
+             )",
+        )
+        .bind(&self.store_key)
+        .bind(project_key)
+        .bind(slot_index as i64)
+        .bind(task_id.as_str())
+        .bind(workspace_path.to_string_lossy().as_ref())
+        .bind(owner_session)
+        .bind(run_generation as i64)
+        .bind(acquisition_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     #[cfg(test)]
     pub(crate) async fn open_shared_with_data_dir(
         context: &PgStoreContext,

@@ -73,6 +73,22 @@ pub(super) fn retry_cleanup_target_is_current(
 }
 
 impl CancelledWorkspaceSetupCleanup {
+    fn remove_converged_active(&self, task_id: &TaskId, snapshot: &ActiveWorkspaceSnapshot) {
+        let removed = self
+            .active
+            .remove_if(task_id, |_, active| {
+                active.acquisition_id == snapshot.acquisition_id
+                    && active.state == ActiveWorkspaceState::CleanupRequired
+            })
+            .map(|(_, active)| active);
+        if let Some(entry) = removed {
+            self.active_paths
+                .remove_if(&entry.workspace_path, |_, owner| owner == task_id);
+            self.released_paths.remove(task_id);
+            self.released_workspace_paths.remove(&entry.workspace_key);
+        }
+    }
+
     async fn converge(self, task_id: TaskId, snapshot: ActiveWorkspaceSnapshot) {
         let cleanup_operation =
             workspace_cleanup_operation(&self.cleanup_ops, &snapshot.acquisition_id);
@@ -139,6 +155,22 @@ impl CancelledWorkspaceSetupCleanup {
                 if !still_current {
                     return Ok(false);
                 }
+                if let Some(store) = self.lease_store.as_ref() {
+                    let durable_acquisition_is_current = store
+                        .owned_workspace_acquisition_is_current(
+                            &snapshot.project_key,
+                            snapshot.slot_index,
+                            &task_id,
+                            &snapshot.workspace_path,
+                            &snapshot.owner_session,
+                            snapshot.run_generation,
+                            &snapshot.acquisition_id,
+                        )
+                        .await?;
+                    if !durable_acquisition_is_current {
+                        return Ok(false);
+                    }
+                }
                 if self.workflow_before_remove_hook.is_some()
                     && claim_cleanup_hook_once(
                         self.lease_store.as_deref(),
@@ -204,19 +236,7 @@ impl CancelledWorkspaceSetupCleanup {
             drop(repository_lease);
             match result {
                 Some(Ok(true)) => {
-                    let removed = self
-                        .active
-                        .remove_if(&task_id, |_, active| {
-                            active.acquisition_id == snapshot.acquisition_id
-                                && active.state == ActiveWorkspaceState::CleanupRequired
-                        })
-                        .map(|(_, active)| active);
-                    if let Some(entry) = removed {
-                        self.active_paths
-                            .remove_if(&entry.workspace_path, |_, owner| owner == &task_id);
-                        self.released_paths.remove(&task_id);
-                        self.released_workspace_paths.remove(&entry.workspace_key);
-                    }
+                    self.remove_converged_active(&task_id, &snapshot);
                     drop(cleanup_guard);
                     remove_workspace_cleanup_operation(
                         &self.cleanup_ops,
@@ -226,6 +246,7 @@ impl CancelledWorkspaceSetupCleanup {
                     return;
                 }
                 Some(Ok(false)) => {
+                    self.remove_converged_active(&task_id, &snapshot);
                     drop(cleanup_guard);
                     remove_workspace_cleanup_operation(
                         &self.cleanup_ops,
@@ -286,7 +307,7 @@ impl WorkspaceManager {
                 return Ok(());
             }
             active._repository_write_lease = None;
-            active._pool_permit = None;
+            self.release_pool_permit_for_cleanup(active.value_mut());
             ActiveWorkspaceSnapshot::from(active.value())
         };
         let cleanup_operation =
@@ -482,7 +503,7 @@ impl WorkspaceManager {
             if active.acquisition_id == acquisition_id {
                 active.state = ActiveWorkspaceState::CleanupRequired;
                 active._repository_write_lease = None;
-                active._pool_permit = None;
+                self.release_pool_permit_for_cleanup(active.value_mut());
             }
         }
     }
@@ -531,7 +552,7 @@ impl WorkspaceManager {
                 if active.acquisition_id == acquisition_id {
                     active.state = ActiveWorkspaceState::CleanupRequired;
                     active._repository_write_lease = None;
-                    active._pool_permit = None;
+                    self.release_pool_permit_for_cleanup(active.value_mut());
                 }
             }
             return Err(WorkspaceLifecycleError::CreateFailed {
@@ -658,7 +679,8 @@ impl Drop for WorkspaceStateGuard<'_> {
             {
                 active.state = ActiveWorkspaceState::CleanupRequired;
                 active._repository_write_lease = None;
-                active._pool_permit = None;
+                self.manager
+                    .release_pool_permit_for_cleanup(active.value_mut());
                 Some(ActiveWorkspaceSnapshot::from(active.value()))
             } else {
                 None
@@ -721,7 +743,8 @@ impl Drop for WorkspaceExecutionGuard {
             {
                 active.state = ActiveWorkspaceState::CleanupRequired;
                 active._repository_write_lease = None;
-                active._pool_permit = None;
+                self.manager
+                    .release_pool_permit_for_cleanup(active.value_mut());
                 true
             } else {
                 false

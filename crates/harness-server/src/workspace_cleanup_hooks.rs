@@ -62,6 +62,12 @@ pub(super) async fn run_workspace_cleanup_hook(
 }
 
 impl WorkspaceManager {
+    pub(crate) fn release_pool_permit_for_cleanup(&self, active: &mut ActiveWorkspace) {
+        if self.lease_store.is_some() {
+            active._pool_permit = None;
+        }
+    }
+
     pub(crate) async fn run_workspace_cleanup_hooks_once(
         &self,
         cleanup_operation: Option<&WorkspaceCleanupOperation>,

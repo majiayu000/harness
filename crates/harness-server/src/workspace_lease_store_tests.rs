@@ -138,6 +138,20 @@ async fn acquisition_token_fences_stale_release_and_cleanup() -> anyhow::Result<
         process_started_at: WorkspaceLeaseStore::current_process_started_at()?,
     };
     assert!(store.try_acquire_lease(&record_a).await?);
+    assert!(
+        store
+            .owned_workspace_acquisition_is_current(
+                &record_a.project_key,
+                record_a.slot_index,
+                &task_id,
+                &record_a.workspace_path,
+                &record_a.owner_session,
+                record_a.run_generation,
+                "acquisition-a",
+            )
+            .await?,
+        "the exact durable acquisition should be current before replacement"
+    );
     let target_a = store
         .workspace_cleanup_targets_for_runtime_workflow("workflow-a")
         .await?
@@ -148,6 +162,34 @@ async fn acquisition_token_fences_stale_release_and_cleanup() -> anyhow::Result<
         ..record_a.clone()
     };
     assert!(store.try_acquire_lease(&record_b).await?);
+    assert!(
+        !store
+            .owned_workspace_acquisition_is_current(
+                &record_a.project_key,
+                record_a.slot_index,
+                &task_id,
+                &record_a.workspace_path,
+                &record_a.owner_session,
+                record_a.run_generation,
+                "acquisition-a",
+            )
+            .await?,
+        "a replaced acquisition must fail the detached-cleanup fence"
+    );
+    assert!(
+        store
+            .owned_workspace_acquisition_is_current(
+                &record_b.project_key,
+                record_b.slot_index,
+                &task_id,
+                &record_b.workspace_path,
+                &record_b.owner_session,
+                record_b.run_generation,
+                "acquisition-b",
+            )
+            .await?,
+        "the replacement acquisition should pass the detached-cleanup fence"
+    );
 
     assert!(
         !store

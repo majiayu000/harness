@@ -311,6 +311,7 @@ impl WorkspaceManager {
         self.remove_workspace_inner(task_id, None, true).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn remove_workspace_acquisition(
         &self,
         task_id: &TaskId,

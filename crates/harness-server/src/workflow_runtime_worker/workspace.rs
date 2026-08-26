@@ -14,6 +14,8 @@ use super::data_helpers::activity_name;
 use crate::workspace_lease_store::RepositoryLeaseState;
 use crate::workspace_lease_store::RepositoryWriteLease;
 
+#[path = "workspace_admission.rs"]
+mod admission;
 #[path = "workspace_terminal_cleanup.rs"]
 mod terminal_cleanup;
 pub(crate) use terminal_cleanup::cleanup_terminal_runtime_workspace_if_uncontended;
@@ -26,6 +28,7 @@ pub(super) struct PreparedRuntimeWorkspace {
     pub run_project: PathBuf,
     pub task_id: Option<TaskId>,
     pub acquisition_id: Option<String>,
+    pub runtime_workflow_id: Option<String>,
     pub execution_guard: Option<crate::workspace::WorkspaceExecutionGuard>,
     pub after_run_hook: Option<String>,
     pub before_remove_hook: Option<String>,
@@ -86,6 +89,7 @@ pub(super) async fn prepare_runtime_workspace(
                 run_project: source_project_root.to_path_buf(),
                 task_id: None,
                 acquisition_id: None,
+                runtime_workflow_id: None,
                 execution_guard: None,
                 after_run_hook: workflow_document.config.hooks.after_run.clone(),
                 before_remove_hook: None,
@@ -112,14 +116,6 @@ pub(super) async fn prepare_runtime_workspace(
         )
         .await?;
     workspace_mgr.discard_unhealthy_repository_lease(&task_id);
-    let (repository_write_lease, workspace_capacity) =
-        acquire_runtime_repository_lease(state, workspace_mgr, source_project_root).await?;
-    if repository_write_lease.is_some() {
-        revalidate_runtime_workspace_admission(state, job, workflow).await?;
-    }
-    let repository_lease_lost = repository_write_lease
-        .as_ref()
-        .map(RepositoryWriteLease::loss_receiver);
     let external_id = workflow.map(|workflow| workflow.subject.subject_key.as_str());
     let repo = workflow
         .and_then(|workflow| workflow.data.get("repo"))
@@ -127,40 +123,18 @@ pub(super) async fn prepare_runtime_workspace(
         .or_else(|| job.input.get("repo").and_then(serde_json::Value::as_str))
         .or(workflow_document.config.source.repo.as_deref());
     let reuse_existing_workspace = workflow_document.config.workspace.reuse_existing_workspace;
-    let options = crate::workspace::WorkspaceCreateOptions {
-        require_remote_head: workflow_document.config.base.require_remote_head,
-        reuse_existing_workspace,
-        after_create_hook: workflow_document.config.hooks.after_create.clone(),
-        before_remove_hook: workflow_document.config.hooks.before_remove.clone(),
-        hook_timeout_secs: Some(workflow_document.config.hooks.timeout_secs),
-        branch_prefix: workflow_document.config.workspace.branch_prefix.clone(),
-        runtime_workflow_id: workflow.map(|workflow| workflow.id.clone()),
-        persist_runtime_cleanup_target: workflow_document.config.workspace.cleanup == "on_terminal",
-        workspace_capacity_override: Some(workspace_capacity),
-        repository_write_lease: repository_write_lease.map_or(
-            crate::workspace::RepositoryWriteLeaseInput::NotRequired,
-            crate::workspace::RepositoryWriteLeaseInput::Held,
-        ),
-    };
-    let lease = run_preparation_phase(
-        repository_lease_lost,
+    let lease = admission::create_runtime_worktree_with_admission(
+        state,
+        job,
+        workflow,
+        workspace_mgr,
+        &task_id,
+        source_project_root,
+        workflow_document,
         execution_cancelled.clone(),
-        Box::pin(async {
-            workspace_mgr
-                .create_workspace_with_options(
-                    &task_id,
-                    source_project_root,
-                    &workflow_document.config.base.remote,
-                    &workflow_document.config.base.branch,
-                    1,
-                    external_id,
-                    repo,
-                    options,
-                )
-                .await
-                .map_err(|error| anyhow::anyhow!("{error}"))
-        }),
-        "runtime workspace preparation",
+        external_id,
+        repo,
+        reuse_existing_workspace,
     )
     .await?;
 
@@ -227,6 +201,7 @@ pub(super) async fn prepare_runtime_workspace(
         run_project: lease.workspace_path,
         task_id: Some(task_id),
         acquisition_id: Some(lease.acquisition_id),
+        runtime_workflow_id: workflow.map(|workflow| workflow.id.clone()),
         execution_guard: Some(execution_guard),
         after_run_hook: workflow_document.config.hooks.after_run.clone(),
         before_remove_hook: workflow_document.config.hooks.before_remove.clone(),
@@ -295,28 +270,29 @@ async fn finish_runtime_workspace_inner(
         return hook_result;
     };
     if workspace.finish_action == RuntimeWorkspaceFinishAction::Remove {
-        if let Some(hook) = workspace.before_remove_hook.as_deref() {
-            if let Err(error) = run_workflow_hook(
-                "before_remove",
-                hook,
-                &workspace.run_project,
-                workspace.hook_timeout_secs,
-            )
-            .await
-            {
-                tracing::warn!(
-                    workspace_path = %workspace.run_project.display(),
-                    "before_remove hook failed during runtime workspace cleanup: {error}"
-                );
-            }
-        }
         let acquisition_id = workspace
             .acquisition_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("runtime workspace acquisition ID is missing"))?;
+        let cleanup_operation = workspace_mgr.workspace_cleanup_operation(acquisition_id);
         workspace_mgr
-            .remove_workspace_acquisition(task_id, acquisition_id)
+            .run_workspace_cleanup_hooks_once(
+                Some(&cleanup_operation),
+                task_id,
+                workspace.runtime_workflow_id.as_deref(),
+                workspace.before_remove_hook.as_deref(),
+                workspace.hook_timeout_secs,
+                &workspace.run_project,
+            )
             .await?;
+        let removal = workspace_mgr
+            .remove_workspace_acquisition_without_hook(task_id, acquisition_id)
+            .await;
+        if removal.is_ok() {
+            workspace_mgr
+                .forget_local_workspace_cleanup_operation(acquisition_id, &cleanup_operation);
+        }
+        removal?;
     } else {
         let acquisition_id = workspace
             .acquisition_id
