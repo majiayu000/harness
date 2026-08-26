@@ -191,8 +191,12 @@ pub(super) async fn prepare_runtime_workspace(
         preparation_guard.complete()?;
     }
 
-    let execution_guard =
-        workspace_mgr.claim_workspace_execution(&task_id, &lease.acquisition_id)?;
+    let execution_guard = workspace_mgr.claim_workspace_execution(
+        &task_id,
+        &lease.acquisition_id,
+        workflow_document.config.hooks.before_remove.clone(),
+        workflow_document.config.hooks.timeout_secs,
+    )?;
     if *execution_cancelled.borrow() {
         anyhow::bail!("runtime execution was cancelled after workspace preparation");
     }

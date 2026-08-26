@@ -1004,6 +1004,26 @@ async fn legacy_backfill_copies_runtime_workspace_cleanup_targets() -> anyhow::R
         process_started_at: WorkspaceLeaseStore::current_process_started_at()?,
     };
     assert!(legacy_store.try_acquire_lease(&record).await?);
+    assert_eq!(
+        legacy_store
+            .claim_workspace_cleanup_hook(
+                "legacy-runtime-workflow",
+                &record.workspace_path,
+                WorkspaceCleanupHook::Workflow,
+            )
+            .await?,
+        Some(true)
+    );
+    assert_eq!(
+        legacy_store
+            .claim_workspace_cleanup_hook(
+                "legacy-runtime-workflow",
+                &record.workspace_path,
+                WorkspaceCleanupHook::Manager,
+            )
+            .await?,
+        Some(true)
+    );
 
     let setup_pool = harness_core::db::pg_open_pool(&database_url).await?;
     let mut shared_schema = TestSchemaGuard::new(&database_url, "workspace_lease_scope_test")?;
@@ -1035,6 +1055,28 @@ async fn legacy_backfill_copies_runtime_workspace_cleanup_targets() -> anyhow::R
         .await?;
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].workspace_path, record.workspace_path);
+    assert_eq!(
+        shared_store
+            .claim_workspace_cleanup_hook(
+                "legacy-runtime-workflow",
+                &record.workspace_path,
+                WorkspaceCleanupHook::Workflow,
+            )
+            .await?,
+        Some(false),
+        "legacy backfill must preserve the workflow hook claim"
+    );
+    assert_eq!(
+        shared_store
+            .claim_workspace_cleanup_hook(
+                "legacy-runtime-workflow",
+                &record.workspace_path,
+                WorkspaceCleanupHook::Manager,
+            )
+            .await?,
+        Some(false),
+        "legacy backfill must preserve the manager hook claim"
+    );
 
     shared_schema.cleanup_with_pool(&setup_pool).await?;
     setup_pool.close().await;

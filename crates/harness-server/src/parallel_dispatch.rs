@@ -502,28 +502,32 @@ async fn run_sequential_subtasks(
         }
     };
     let workspace = workspace_lease.workspace_path.clone();
-    let execution_guard =
-        match workspace_mgr.claim_workspace_execution(&seq_id, &workspace_lease.acquisition_id) {
-            Ok(guard) => guard,
-            Err(error) => {
-                let cleanup_error = workspace_mgr
-                    .remove_workspace_acquisition(&seq_id, &workspace_lease.acquisition_id)
-                    .await
-                    .err()
-                    .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
-                    .unwrap_or_default();
-                return ParallelRunResult {
-                    results: vec![SubtaskResult {
-                        index: 0,
-                        response: None,
-                        error: Some(format!(
-                            "workspace execution claim failed: {error}{cleanup_error}"
-                        )),
-                    }],
-                    is_sequential: true,
-                };
-            }
-        };
+    let execution_guard = match workspace_mgr.claim_workspace_execution(
+        &seq_id,
+        &workspace_lease.acquisition_id,
+        None,
+        0,
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let cleanup_error = workspace_mgr
+                .remove_workspace_acquisition(&seq_id, &workspace_lease.acquisition_id)
+                .await
+                .err()
+                .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+            return ParallelRunResult {
+                results: vec![SubtaskResult {
+                    index: 0,
+                    response: None,
+                    error: Some(format!(
+                        "workspace execution claim failed: {error}{cleanup_error}"
+                    )),
+                }],
+                is_sequential: true,
+            };
+        }
+    };
 
     // Single token covers the full sequential run — all steps share one workspace.
     // TTL must span every step: each step can run for up to `turn_timeout`, so
@@ -671,9 +675,12 @@ async fn run_concurrent_subtasks(
                 }
             };
             let workspace = workspace_lease.workspace_path.clone();
-            let execution_guard = match workspace_mgr
-                .claim_workspace_execution(&sub_id, &workspace_lease.acquisition_id)
-            {
+            let execution_guard = match workspace_mgr.claim_workspace_execution(
+                &sub_id,
+                &workspace_lease.acquisition_id,
+                None,
+                0,
+            ) {
                 Ok(guard) => guard,
                 Err(error) => {
                     let cleanup_error = workspace_mgr

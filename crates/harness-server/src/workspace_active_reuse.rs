@@ -15,6 +15,8 @@ pub(crate) struct WorkspaceExecutionGuard {
     task_id: TaskId,
     acquisition_id: String,
     execution_id: String,
+    before_remove_hook: Option<String>,
+    hook_timeout_secs: u64,
     armed: std::sync::atomic::AtomicBool,
 }
 
@@ -459,6 +461,8 @@ impl WorkspaceManager {
         self: &Arc<Self>,
         task_id: &TaskId,
         acquisition_id: &str,
+        before_remove_hook: Option<String>,
+        hook_timeout_secs: u64,
     ) -> anyhow::Result<WorkspaceExecutionGuard> {
         let execution_id = SessionId::new().to_string();
         let mut active = self
@@ -474,6 +478,8 @@ impl WorkspaceManager {
             task_id: task_id.clone(),
             acquisition_id: acquisition_id.to_string(),
             execution_id,
+            before_remove_hook,
+            hook_timeout_secs,
             armed: std::sync::atomic::AtomicBool::new(true),
         })
     }
@@ -757,10 +763,16 @@ impl Drop for WorkspaceExecutionGuard {
         }
         let manager = Arc::clone(&self.manager);
         let task_id = self.task_id.clone();
+        let before_remove_hook = self.before_remove_hook.take();
+        let hook_timeout_secs = self.hook_timeout_secs;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 if let Err(error) = manager
-                    .cleanup_required_workspace_for_retry(&task_id, None, 0)
+                    .cleanup_required_workspace_for_retry(
+                        &task_id,
+                        before_remove_hook.as_deref(),
+                        hook_timeout_secs,
+                    )
                     .await
                 {
                     tracing::error!(

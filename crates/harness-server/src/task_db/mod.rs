@@ -411,11 +411,13 @@ pub async fn migrate_legacy_task_db_if_needed(
         "INSERT INTO workspace_cleanup_targets (
             store_key, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
             workspace_key, source_repo, repo, owner_session, run_generation, process_id,
-            acquisition_id, process_started_at, created_at, last_used_at
+            acquisition_id, process_started_at, created_at, last_used_at,
+            workflow_hook_claimed, manager_hook_claimed
          )
          SELECT $1, runtime_workflow_id, workspace_path, task_id, project_key, slot_index,
                 workspace_key, source_repo, repo, owner_session, run_generation, process_id,
-                acquisition_id, process_started_at, created_at, last_used_at
+                acquisition_id, process_started_at, created_at, last_used_at,
+                workflow_hook_claimed, manager_hook_claimed
          FROM {legacy_schema_sql}.workspace_cleanup_targets
          ON CONFLICT (store_key, runtime_workflow_id, workspace_path) DO NOTHING"
     );
