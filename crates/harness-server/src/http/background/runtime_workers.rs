@@ -112,22 +112,47 @@ fn spawn_runtime_worker_ticks(
     concurrency: u32,
     lease_ttl: chrono::Duration,
     next_worker_id: &mut u64,
-) {
+    supervisor_shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+) -> bool {
     let open_slots = runtime_worker_open_slots(workers.len(), concurrency);
-    for _ in 0..open_slots {
+    let shutdown_receivers = (0..open_slots)
+        .map(|_| state.notifications.ws_shutdown_tx.subscribe())
+        .collect::<Vec<_>>();
+    match supervisor_shutdown_rx.try_recv() {
+        Ok(()) => {
+            stop_runtime_job_worker_supervisor_for_shutdown(Ok(()));
+            return true;
+        }
+        Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+            stop_runtime_job_worker_supervisor_for_shutdown(Err(
+                tokio::sync::broadcast::error::RecvError::Closed,
+            ));
+            return true;
+        }
+        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+            stop_runtime_job_worker_supervisor_for_shutdown(Err(
+                tokio::sync::broadcast::error::RecvError::Lagged(skipped),
+            ));
+            return true;
+        }
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+    }
+    for shutdown_rx in shutdown_receivers {
         let state_lease =
             RuntimeWorkerStateLease::new(state.clone(), active_worker_state_clones.clone());
         let owner = format!("server-runtime-worker-{next_worker_id}");
         *next_worker_id = next_worker_id.saturating_add(1);
         workers.spawn(async move {
-            crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+            crate::workflow_runtime_worker::run_runtime_job_worker_tick_until_shutdown(
                 state_lease.state(),
                 owner,
                 lease_ttl,
+                shutdown_rx,
             )
             .await
         });
     }
+    false
 }
 
 fn stop_runtime_job_worker_supervisor_for_shutdown(
@@ -185,7 +210,15 @@ pub(in crate::http) fn spawn_runtime_job_workers(
                 Some(state) => state,
                 None => break,
             };
-            let workflow_cfg = match load_workflow_config_for_loop(&state, &handle).await {
+            let workflow_config_result = tokio::select! {
+                biased;
+                shutdown_result = shutdown_rx.recv() => {
+                    stop_runtime_job_worker_supervisor_for_shutdown(shutdown_result);
+                    break;
+                }
+                result = load_workflow_config_for_loop(&state, &handle) => result,
+            };
+            let workflow_cfg = match workflow_config_result {
                 Ok(config) => config,
                 Err(error) => {
                     handle.tick_failed(&format!("workflow config load failed: {error}"));
@@ -217,14 +250,17 @@ pub(in crate::http) fn spawn_runtime_job_workers(
                 );
                 break;
             }
-            spawn_runtime_worker_ticks(
+            if spawn_runtime_worker_ticks(
                 &mut workers,
                 &state,
                 &active_worker_state_clones,
                 policy.concurrency,
                 lease_ttl,
                 &mut next_worker_id,
-            );
+                &mut shutdown_rx,
+            ) {
+                break;
+            }
             drop(state);
             if let Some(error) = worker_tick_error {
                 handle.tick_failed(&error);

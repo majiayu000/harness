@@ -22,12 +22,18 @@ mod runtime_execution_queue;
 mod runtime_profile;
 mod runtime_turn_control;
 mod runtime_usage;
+mod runtime_worker_tick;
 mod server_merge;
 mod server_validation;
 mod transcript_durability;
 pub(crate) mod turn_engine;
 mod workspace;
 
+#[cfg(test)]
+pub(crate) use runtime_worker_tick::run_runtime_job_worker_tick;
+pub(crate) use runtime_worker_tick::{
+    run_runtime_job_worker_tick_until_shutdown, RuntimeJobWorkerTick,
+};
 pub(crate) use workspace::cleanup_terminal_runtime_workspace_if_uncontended;
 
 pub(crate) use circuit_breaker_events::emit_circuit_breaker_events;
@@ -46,15 +52,12 @@ use crate::workflow_runtime_submission::{
     runtime_models::{TaskFailureKind, TaskKind, TaskStatus},
     runtime_state::TaskState,
 };
-use chrono::Duration;
 use data_helpers::{optional_data_string, optional_data_u64};
-use executor::ServerRuntimeJobExecutor;
 use harness_workflow::runtime::{
-    ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, RuntimeWorker,
-    WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
-    STOP_REASON_RUNTIME_TRANSCRIPT_LOST, STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE,
+    ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, WorkflowInstance,
+    GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, STOP_REASON_RUNTIME_TRANSCRIPT_LOST,
+    STOP_REASON_RUNTIME_TRANSCRIPT_STORE_UNAVAILABLE,
 };
-use otel_trajectory::emit_runtime_job_trajectory_completion;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,78 +78,6 @@ pub(crate) async fn execute_start_prompt_task_child_workflow_for_test(
         subject_key,
     )
     .await
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RuntimeJobWorkerTick {
-    pub succeeded: usize,
-    pub failed: usize,
-    pub cancelled: usize,
-    pub idle: bool,
-}
-
-impl RuntimeJobWorkerTick {
-    fn from_completed_job(job: Option<RuntimeJob>) -> Self {
-        match job.map(|job| job.status) {
-            Some(RuntimeJobStatus::Succeeded) => Self {
-                succeeded: 1,
-                ..Self::default()
-            },
-            Some(RuntimeJobStatus::Failed) => Self {
-                failed: 1,
-                ..Self::default()
-            },
-            Some(RuntimeJobStatus::Cancelled) => Self {
-                cancelled: 1,
-                ..Self::default()
-            },
-            Some(RuntimeJobStatus::Pending | RuntimeJobStatus::Running) => Self::default(),
-            None => Self {
-                idle: true,
-                ..Self::default()
-            },
-        }
-    }
-
-    pub(crate) fn touched_anything(&self) -> bool {
-        self.succeeded > 0 || self.failed > 0 || self.cancelled > 0
-    }
-}
-
-pub(crate) async fn run_runtime_job_worker_tick(
-    state: &Arc<AppState>,
-    owner: impl Into<String>,
-    lease_ttl: Duration,
-) -> anyhow::Result<RuntimeJobWorkerTick> {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return Ok(RuntimeJobWorkerTick {
-            idle: true,
-            ..RuntimeJobWorkerTick::default()
-        });
-    };
-    defer_open_runtime_profiles(state, store.as_ref()).await?;
-    let worker = RuntimeWorker::new(store.as_ref(), owner)
-        .with_lease_ttl(lease_ttl)
-        .with_claim_guard(state.runtime_circuit_breakers.as_ref());
-    let executor = ServerRuntimeJobExecutor::new(state);
-    let mut completed = worker.run_once(&executor).await?;
-    if let Some(job) = completed.as_mut() {
-        if let Err(error) = emit_runtime_job_trajectory_completion(state, store.as_ref(), job).await
-        {
-            tracing::warn!(
-                runtime_job_id = %job.id,
-                "workflow runtime OTel trajectory emission failed: {error}"
-            );
-        }
-        record_runtime_circuit_breaker_completion(state, store.as_ref(), job).await?;
-        if let Err(error) = notify_runtime_submission_terminal(state, job).await {
-            tracing::warn!(
-                runtime_job_id = %job.id,
-                "workflow runtime completion notification failed: {error}"
-            );
-        }
-    }
-    Ok(RuntimeJobWorkerTick::from_completed_job(completed))
 }
 
 #[cfg(test)]

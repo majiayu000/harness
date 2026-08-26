@@ -354,6 +354,15 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         version: 31,
         description: "fence legacy runtime workspace cleanup writers",
         sql: "LOCK TABLE workspace_cleanup_targets IN ACCESS EXCLUSIVE MODE;
+              UPDATE workspace_cleanup_targets
+              SET cleanup_in_progress = FALSE,
+                  cleanup_claim_id = NULL,
+                  cleanup_owner_session = NULL,
+                  cleanup_process_id = NULL,
+                  cleanup_process_started_at = NULL,
+                  cleanup_claim_expires_at = NULL
+              WHERE cleanup_in_progress = TRUE
+                AND cleanup_claim_expires_at <= CURRENT_TIMESTAMP;
               DO $$
               BEGIN
                   IF EXISTS (
@@ -507,6 +516,9 @@ mod tests {
             .sql
             .contains("LOCK TABLE workspace_cleanup_targets"));
         assert!(migration.sql.contains("cleanup_in_progress = TRUE"));
+        assert!(migration
+            .sql
+            .contains("cleanup_claim_expires_at <= CURRENT_TIMESTAMP"));
         assert!(migration
             .sql
             .contains("RENAME TO workspace_cleanup_targets_v2"));
