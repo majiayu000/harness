@@ -703,6 +703,24 @@ async fn run_concurrent_subtasks(
                 ..Default::default()
             };
             req.apply_configured_policy(&config);
+            if *dispatch_cancelled.borrow() {
+                let cleanup_error = cleanup_parallel_workspace(
+                    &workspace_mgr,
+                    &sub_id,
+                    &workspace_lease,
+                    &execution_guard,
+                )
+                .await
+                .err()
+                .map(|cleanup| format!("; cleanup also failed: {cleanup}"))
+                .unwrap_or_default();
+                return (
+                    i,
+                    Err(format!(
+                        "parallel dispatch was cancelled before agent start{cleanup_error}"
+                    )),
+                );
+            }
             let agent_clone = agent.clone();
             let agent_handle = tokio::spawn(async move { agent_clone.execute(req).await });
             let result = await_spawned_agent_execution(

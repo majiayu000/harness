@@ -105,6 +105,7 @@ impl CancelledWorkspaceSetupCleanup {
     async fn converge(self, task_id: TaskId, snapshot: ActiveWorkspaceSnapshot) {
         let cleanup_operation =
             workspace_cleanup_operation(&self.cleanup_ops, &snapshot.acquisition_id);
+        let mut removal_hooks_completed = false;
         let mut attempt = 1_u64;
         loop {
             let still_current = self.active.get(&task_id).is_some_and(|active| {
@@ -168,22 +169,25 @@ impl CancelledWorkspaceSetupCleanup {
                 if !still_current {
                     return Ok(false);
                 }
-                self.run_before_remove_hook(
-                    &task_id,
-                    "workflow before_remove",
-                    self.workflow_before_remove_hook.as_deref(),
-                    self.workflow_hook_timeout_secs,
-                    &snapshot.workspace_path,
-                )
-                .await;
-                self.run_before_remove_hook(
-                    &task_id,
-                    "workspace before_remove",
-                    self.manager_before_remove_hook.as_deref(),
-                    self.manager_hook_timeout_secs,
-                    &snapshot.workspace_path,
-                )
-                .await;
+                if !removal_hooks_completed {
+                    self.run_before_remove_hook(
+                        &task_id,
+                        "workflow before_remove",
+                        self.workflow_before_remove_hook.as_deref(),
+                        self.workflow_hook_timeout_secs,
+                        &snapshot.workspace_path,
+                    )
+                    .await;
+                    self.run_before_remove_hook(
+                        &task_id,
+                        "workspace before_remove",
+                        self.manager_before_remove_hook.as_deref(),
+                        self.manager_hook_timeout_secs,
+                        &snapshot.workspace_path,
+                    )
+                    .await;
+                    removal_hooks_completed = true;
+                }
                 let _git_ops = self.git_ops.lock().await;
                 let still_current = self.active.get(&task_id).is_some_and(|active| {
                     active.acquisition_id == snapshot.acquisition_id
