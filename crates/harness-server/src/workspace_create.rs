@@ -2,8 +2,6 @@ use super::workspace_helpers::*;
 use super::workspace_repository::ResolvedWorkspaceAdmission;
 use super::*;
 
-const PERSISTED_SLOT_RETRY_DELAY: Duration = Duration::from_millis(250);
-
 impl WorkspaceManager {
     /// Create a git worktree for the given task under `config.root/<sanitized_task_id>`.
     ///
@@ -245,7 +243,7 @@ impl WorkspaceManager {
                     capacity,
                     "workspace pool waiting for leases outside the reduced capacity"
                 );
-                tokio::time::sleep(PERSISTED_SLOT_RETRY_DELAY).await;
+                wait_for_slot_or_readmit(repository_write_lease.as_ref()).await?;
                 continue;
             }
             let preferred_slot =
@@ -260,7 +258,7 @@ impl WorkspaceManager {
                         capacity,
                         "workspace pool waiting for a persisted slot to be released"
                     );
-                    tokio::time::sleep(PERSISTED_SLOT_RETRY_DELAY).await;
+                    wait_for_slot_or_readmit(repository_write_lease.as_ref()).await?;
                     continue;
                 }
                 return Err(WorkspaceLifecycleError::CreateFailed {
@@ -316,7 +314,7 @@ impl WorkspaceManager {
                     if preferred_released_slot == Some(slot_index) {
                         preferred_released_slot = None;
                     }
-                    tokio::task::yield_now().await;
+                    wait_for_slot_or_readmit(repository_write_lease.as_ref()).await?;
                 }
                 Err(err) => {
                     return Err(WorkspaceLifecycleError::CreateFailed {

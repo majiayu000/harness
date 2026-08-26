@@ -1398,6 +1398,110 @@ async fn repository_write_lease_waits_when_dedicated_pool_is_full() -> anyhow::R
 }
 
 #[tokio::test]
+async fn persisted_slot_wait_releases_repository_lease_for_cleanup() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+    let workspaces = tempfile::tempdir()?;
+    let lease_db = tempfile::tempdir()?;
+    let store = std::sync::Arc::new(
+        WorkspaceLeaseStore::open(&lease_db.path().join("slot-readmission")).await?,
+    );
+    let manager = std::sync::Arc::new(WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        },
+        WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        Some(store.clone()),
+    )?);
+    let occupied = WorkspaceLeaseRecord {
+        project_key: crate::workspace_pool::project_limit_key(source.path()),
+        slot_index: 0,
+        task_id: TaskId::from_str("occupied-slot"),
+        workspace_key: "occupied-slot".to_string(),
+        workspace_path: workspaces.path().join("occupied-slot"),
+        source_repo: source.path().to_path_buf(),
+        repo: Some("owner/repo".to_string()),
+        runtime_workflow_id: Some("occupied-workflow".to_string()),
+        owner_session: "occupied-session".to_string(),
+        run_generation: 1,
+        acquisition_id: Some("occupied-acquisition".to_string()),
+        process_id: std::process::id(),
+        process_started_at: WorkspaceLeaseStore::current_process_started_at()?,
+    };
+    assert!(store.try_acquire_lease(&occupied).await?);
+
+    let initial_repository_lease = manager
+        .acquire_repository_write_lease(source.path())
+        .await?;
+    let creator_manager = manager.clone();
+    let creator_source = source.path().to_path_buf();
+    let creator_branch = branch.clone();
+    let creator = tokio::spawn(async move {
+        creator_manager
+            .create_workspace_with_options(
+                &TaskId::from_str("replacement-slot"),
+                &creator_source,
+                "origin",
+                &creator_branch,
+                1,
+                Some("issue:readmission"),
+                Some("owner/repo"),
+                WorkspaceCreateOptions {
+                    require_remote_head: false,
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let cleanup_manager = manager.clone();
+    let cleanup_store = store.clone();
+    let cleanup_source = source.path().to_path_buf();
+    let cleanup_record = occupied.clone();
+    let cleanup = tokio::spawn(async move {
+        let repository_lease = cleanup_manager
+            .acquire_repository_write_lease_for_cleanup(&cleanup_source)
+            .await?;
+        cleanup_store
+            .complete_owned_workspace(
+                &cleanup_record.project_key,
+                cleanup_record.slot_index,
+                &cleanup_record.task_id,
+                &cleanup_record.owner_session,
+                cleanup_record.run_generation,
+                cleanup_record
+                    .acquisition_id
+                    .as_deref()
+                    .expect("occupied acquisition"),
+            )
+            .await?;
+        drop(repository_lease);
+        Ok::<(), anyhow::Error>(())
+    });
+    drop(initial_repository_lease);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+        .await
+        .map_err(|_| anyhow::anyhow!("cleanup starved behind the persisted-slot waiter"))???;
+    let workspace = tokio::time::timeout(std::time::Duration::from_secs(5), creator)
+        .await
+        .map_err(|_| anyhow::anyhow!("workspace creation did not resume after cleanup"))???;
+    manager
+        .remove_workspace_acquisition(
+            &TaskId::from_str("replacement-slot"),
+            &workspace.acquisition_id,
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_creation_accepts_preacquired_repository_write_lease() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());

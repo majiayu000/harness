@@ -256,6 +256,7 @@ pub(crate) enum WorkspaceLifecycleError {
     LiveForeignOwner { message: String },
     ReconcileFailed { message: String },
     CreateFailed { message: String },
+    PersistedSlotContended,
 }
 
 impl std::fmt::Display for WorkspaceLifecycleError {
@@ -264,11 +265,24 @@ impl std::fmt::Display for WorkspaceLifecycleError {
             Self::LiveForeignOwner { message, .. }
             | Self::ReconcileFailed { message, .. }
             | Self::CreateFailed { message, .. } => f.write_str(message),
+            Self::PersistedSlotContended => {
+                f.write_str("persisted workspace slot is still occupied; retry admission")
+            }
         }
     }
 }
 
 impl std::error::Error for WorkspaceLifecycleError {}
+
+async fn wait_for_slot_or_readmit(
+    repository_write_lease: Option<&RepositoryWriteLease>,
+) -> Result<(), WorkspaceLifecycleError> {
+    if repository_write_lease.is_some() {
+        return Err(WorkspaceLifecycleError::PersistedSlotContended);
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    Ok(())
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StartupReconciliation {
