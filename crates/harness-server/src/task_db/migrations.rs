@@ -300,7 +300,8 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
               ALTER TABLE workspace_cleanup_targets
               ADD COLUMN IF NOT EXISTS manager_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE;
               UPDATE workspace_cleanup_targets
-              SET workflow_hook_claimed = TRUE, manager_hook_claimed = TRUE",
+              SET workflow_hook_claimed = TRUE, manager_hook_claimed = TRUE
+              WHERE cleanup_in_progress = TRUE",
     },
 ];
 
@@ -419,5 +420,6 @@ mod tests {
         assert!(migration.sql.contains("manager_hook_claimed"));
         assert!(migration.sql.contains("NOT NULL DEFAULT FALSE"));
         assert!(migration.sql.contains("SET workflow_hook_claimed = TRUE"));
+        assert!(migration.sql.contains("WHERE cleanup_in_progress = TRUE"));
     }
 }

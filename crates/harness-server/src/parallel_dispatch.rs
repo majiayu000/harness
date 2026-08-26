@@ -653,13 +653,13 @@ async fn run_concurrent_subtasks(
             tokio::pin!(workspace_acquisition);
             let workspace_result = tokio::select! {
                 biased;
+                result = &mut workspace_acquisition => result,
                 () = wait_for_dispatch_cancellation(&mut dispatch_cancelled) => {
                     return (
                         i,
                         Err("parallel dispatch was cancelled during workspace acquisition".to_string()),
                     );
                 }
-                result = &mut workspace_acquisition => result,
             };
             let workspace_lease = match workspace_result {
                 Ok(lease) => lease,

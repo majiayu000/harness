@@ -15,8 +15,13 @@ pub(super) async fn create_runtime_worktree_with_admission(
     reuse_existing_workspace: bool,
 ) -> anyhow::Result<crate::workspace::WorkspaceLease> {
     loop {
-        let (repository_write_lease, workspace_capacity) =
-            acquire_runtime_repository_lease(state, workspace_mgr, source_project_root).await?;
+        let (repository_write_lease, workspace_capacity) = run_preparation_phase(
+            None,
+            execution_cancelled.clone(),
+            acquire_runtime_repository_lease(state, workspace_mgr, source_project_root),
+            "runtime workspace repository admission",
+        )
+        .await?;
         if repository_write_lease.is_some() {
             revalidate_runtime_workspace_admission(state, job, workflow).await?;
         }
@@ -67,7 +72,16 @@ pub(super) async fn create_runtime_worktree_with_admission(
                     Some(crate::workspace::WorkspaceLifecycleError::PersistedSlotContended)
                 ) =>
             {
-                tokio::time::sleep(TokioDuration::from_millis(250)).await;
+                run_preparation_phase(
+                    None,
+                    execution_cancelled.clone(),
+                    async {
+                        tokio::time::sleep(TokioDuration::from_millis(250)).await;
+                        Ok(())
+                    },
+                    "runtime workspace repository readmission backoff",
+                )
+                .await?;
             }
             result => return result,
         }
