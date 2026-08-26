@@ -7,7 +7,7 @@ use crate::runtime::{
     WorkflowDecisionRecord, WorkflowInstance,
 };
 use anyhow::Context;
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkflowPrBindingRepairOutcome {
@@ -22,6 +22,41 @@ pub enum WorkflowPrBindingRepairOutcome {
 }
 
 impl WorkflowRuntimeStore {
+    pub async fn backfill_change_scope_classifier_policy_if_missing(
+        &self,
+        workflow_id: &str,
+        value: Value,
+        source: &str,
+    ) -> anyhow::Result<WorkflowInstance> {
+        let field = crate::runtime::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD;
+        let mut tx = self.pool.begin().await?;
+        let current = select_instance_for_update_tx(&mut tx, workflow_id)
+            .await?
+            .with_context(|| format!("workflow instance `{workflow_id}` was not found"))?;
+        if current.data.get(field).is_some() {
+            tx.commit().await?;
+            return Ok(current);
+        }
+        let mut target = current.clone();
+        if !target.data.is_object() {
+            target.replace_classified_data(json!({}), DataProvenance::Server);
+        }
+        target.apply_data_writes([WorkflowDataWrite::set(field, value, DataProvenance::Server)])?;
+        target.version = target.version.saturating_add(1);
+        commit_same_state_instance_tx(&mut tx, &current, &target).await?;
+        insert_event_tx_with_id(
+            &mut tx,
+            workflow_id,
+            "ServerDataFieldBackfilled",
+            source,
+            json!({"field": field}),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(target)
+    }
+
     /// Repair a missing `pr_number`/`pr_url` binding from command evidence.
     ///
     /// The evidence must be a live (non-superseded) `BindPr` command minted by

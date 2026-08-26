@@ -87,16 +87,13 @@ pub(super) async fn execute_server_merge(
     };
     let expected_head_sha = match required_expected_head_sha_for_merge(job, workflow) {
         Ok(expected_head_sha) => expected_head_sha,
-        Err(error) => {
-            return server_merge_failed(
+        Err(_) => {
+            return server_merge_head_mismatch(
                 activity,
-                Some(&target),
-                ActivityErrorKind::Configuration,
-                "Server-side merge requires a pinned pull request head.",
-                error,
-                Some(before_snapshot),
+                &target,
+                before_snapshot,
+                "<missing-scope-assessment>",
                 None,
-                "head_missing",
             );
         }
     };

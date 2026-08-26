@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::path::Path;
 
 pub(crate) const PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD: &str =
-    "pinned_change_scope_classifier_policy";
+    harness_workflow::runtime::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD;
 
 pub(crate) fn pin_change_scope_classifier_policy(
     project_root: &Path,

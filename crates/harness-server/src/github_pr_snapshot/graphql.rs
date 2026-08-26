@@ -16,6 +16,7 @@ pub(super) const GITHUB_PR_SNAPSHOT_QUERY: &str = r#"
           title
           body
           updatedAt
+          changedFiles
           baseRefName
           baseRefOid
           headRefName
@@ -74,6 +75,7 @@ pub(super) const GITHUB_PR_SNAPSHOT_QUERY: &str = r#"
             }
           }
           files(first: 100) {
+            totalCount
             pageInfo {
               hasNextPage
               endCursor
@@ -139,6 +141,7 @@ const GITHUB_PR_FILES_QUERY: &str = r#"
           baseRefOid
           headRefOid
           files(first: 100, after: $after) {
+            totalCount
             pageInfo {
               hasNextPage
               endCursor

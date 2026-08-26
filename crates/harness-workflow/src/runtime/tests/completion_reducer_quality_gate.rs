@@ -200,6 +200,53 @@ fn runtime_completion_reducer_reclassifies_head_changed_during_quality_gate() {
 }
 
 #[test]
+fn runtime_completion_reducer_reclassifies_legacy_quality_gate_without_assessed_head() {
+    let instance = issue_instance("quality_gate_pending").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "issue_plan": {"summary": "Keep the change scoped"},
+    }));
+    let result = ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "Validation passed.")
+        .with_signal(ActivitySignal::new(
+            QUALITY_PASSED_SIGNAL,
+            json!({"validation": "passed"}),
+        ))
+        .with_validation(ValidationRecord::new("cargo check", "passed"))
+        .with_artifact(server_validation_digest_ok(&["cargo check"]))
+        .with_artifact(ActivityArtifact::new(
+            crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+            json!({
+                "repo": "owner/repo",
+                "pr_number": 77,
+                "head_oid": "current-head",
+            }),
+        ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("legacy quality gate must trigger a fresh scope assessment");
+
+    assert_eq!(decision.decision, "reassess_pr_scope");
+    assert_eq!(decision.next_state, "pr_scope_review");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY)
+    );
+}
+
+#[test]
 fn runtime_completion_reducer_blocks_quality_pass_without_current_pr_snapshot() {
     let instance = issue_instance("quality_gate_pending").with_server_data(json!({
         "repo": "owner/repo",

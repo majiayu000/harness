@@ -67,7 +67,7 @@ fn profile_selector_allows_explicit_activity_override() {
 }
 
 #[test]
-fn remote_merge_profile_is_forced_onto_the_local_server_worker() {
+fn remote_merge_profile_is_forced_onto_the_local_server_worker() -> anyhow::Result<()> {
     let instance = WorkflowInstance::new(
         crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
@@ -78,14 +78,38 @@ fn remote_merge_profile_is_forced_onto_the_local_server_worker() {
     profile.model = Some("remote-model".to_string());
 
     super::super::dispatcher_throttle::force_server_owned_profile(
+        &crate::runtime::WorkflowDefinitionRegistry::default(),
         Some(&instance),
         "merge_pr",
         &mut profile,
-    );
+    )?;
 
     assert_eq!(profile.kind, RuntimeKind::CodexExec);
     assert_eq!(profile.name, "server-owned-merge");
     assert_eq!(profile.model, None);
+    Ok(())
+}
+
+#[test]
+fn remote_classifier_profile_is_rejected_before_dispatch() {
+    let registry = crate::runtime::WorkflowDefinitionRegistry::with_builtins();
+    let instance = WorkflowInstance::new(
+        crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "pr_scope_review",
+        crate::runtime::WorkflowSubject::new("issue", "issue:77"),
+    );
+    let mut profile = RuntimeProfile::new("remote-classifier", RuntimeKind::RemoteHost);
+
+    let error = super::super::dispatcher_throttle::force_server_owned_profile(
+        &registry,
+        Some(&instance),
+        crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY,
+        &mut profile,
+    )
+    .expect_err("remote hosts must not produce trusted classifier assessments");
+
+    assert!(error.to_string().contains("must use a local agent runtime"));
 }
 
 #[test]

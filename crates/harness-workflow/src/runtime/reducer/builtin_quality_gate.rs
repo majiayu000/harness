@@ -72,8 +72,7 @@ pub(super) fn parent_quality_gate_head_decision(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let (Some(pr_number), Some(pr_url), Some(assessed_head), Some(observed_head)) =
-        (pr_number, pr_url, assessed_head, observed_head)
+    let (Some(pr_number), Some(pr_url), Some(observed_head)) = (pr_number, pr_url, observed_head)
     else {
         return Some(invalid_agent_output_blocked_decision(
             instance,
@@ -82,7 +81,7 @@ pub(super) fn parent_quality_gate_head_decision(
             "quality gate passed without a current server PR snapshot bound to the scope-assessed head",
         ));
     };
-    if observed_head == assessed_head {
+    if assessed_head == Some(observed_head) {
         return None;
     }
     let issue_plan = instance
@@ -91,16 +90,24 @@ pub(super) fn parent_quality_gate_head_decision(
         .cloned()
         .unwrap_or(Value::Null);
     let dedupe_source = event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+    let reason = if assessed_head.is_some() {
+        "server observed a new PR head after the quality gate; reassess scope before continuing"
+    } else {
+        "legacy quality-gate state has no model-assessed PR head; assess current scope before continuing"
+    };
     Some(
         WorkflowDecision::new(
             &instance.id,
             &instance.state,
             "reassess_pr_scope",
             "pr_scope_review",
-            "server observed a new PR head after the quality gate; reassess scope before continuing",
+            reason,
         )
         .with_command(enqueue_pr_scope_review(
-            format!("quality-gate-scope-recheck:{}:{pr_number}:{dedupe_source}", instance.id),
+            format!(
+                "quality-gate-scope-recheck:{}:{pr_number}:{dedupe_source}",
+                instance.id
+            ),
             pr_number,
             pr_url,
             issue_plan,

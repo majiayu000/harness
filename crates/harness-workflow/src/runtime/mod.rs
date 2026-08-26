@@ -186,7 +186,7 @@ pub use repo_memory::{
     RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, REPO_MEMORY_CONFIG_ARTIFACT,
     REPO_MEMORY_DEGRADATION_ARTIFACT,
 };
-pub use scope_review::CHANGE_SCOPE_REVIEW_ACTIVITY;
+pub use scope_review::{CHANGE_SCOPE_REVIEW_ACTIVITY, PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD};
 pub use state_registry::{
     DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, RegisteredWorkflowDefinition,
     WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowStateDefinition, WorkflowStateKey,

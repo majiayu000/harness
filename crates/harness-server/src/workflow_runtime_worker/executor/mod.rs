@@ -3,10 +3,10 @@ use harness_core::agent::AGENT_OUTPUT_SCHEMA_PATH_ENV;
 use harness_core::config::workflow::WorkflowConfig;
 use harness_core::types::AgentId;
 #[cfg(test)]
+use harness_workflow::runtime::ActivityArtifact;
+#[cfg(test)]
 use harness_workflow::runtime::WorkflowInstance;
-use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, WorkflowTerminalState,
-};
+use harness_workflow::runtime::{ActivityResult, RuntimeJob, WorkflowTerminalState};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::{
@@ -49,6 +49,7 @@ mod spawn_env;
 use spawn_env::{correction_spawn_env_vars, isolation_spawn_env_vars};
 mod server_owned;
 mod structured_output;
+mod workspace_finalization;
 use structured_output::{
     codex_output_schema_file, reserve_structured_output_correction_turn,
     structured_output_correction_artifact, structured_output_correction_prompt,
@@ -80,7 +81,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         &self,
         mut job: RuntimeJob,
     ) -> anyhow::Result<ActivityResult> {
-        let workflow = super::job_context::workflow_for_job(self.state, &job).await?;
+        let mut workflow = super::job_context::workflow_for_job(self.state, &job).await?;
         if let Some(workflow) = workflow.as_ref() {
             let store = self
                 .state
@@ -119,6 +120,13 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             super::job_context::project_root_for_job(self.state, &job, workflow.as_ref())?;
         let workflow_document =
             harness_core::config::workflow::load_workflow_document(&source_project_root)?;
+        server_owned::prepare_classifier(
+            self.state,
+            &job,
+            &mut workflow,
+            &workflow_document.config,
+        )
+        .await?;
         super::classifier::enrich_scope_facts(self.state, workflow.as_ref(), &mut job).await?;
         let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
         if self
@@ -548,39 +556,7 @@ fn combine_activity_result_with_runtime_workspace_finalization(
     activity_result: anyhow::Result<ActivityResult>,
     finish_result: anyhow::Result<()>,
 ) -> anyhow::Result<ActivityResult> {
-    match (activity_result, finish_result) {
-        (Ok(result), Err(error)) => {
-            if result.status == harness_workflow::runtime::ActivityStatus::Succeeded {
-                Ok(activity_result_failed_by_runtime_workspace_finalization(
-                    result, &error,
-                ))
-            } else {
-                Ok(result.with_artifact(runtime_workspace_finalization_warning_artifact(&error)))
-            }
-        }
-        (Ok(result), Ok(())) => Ok(result),
-        (Err(error), Err(finish_error)) => Err(error.context(format!(
-            "runtime workspace finalization also failed: {finish_error}"
-        ))),
-        (Err(error), Ok(())) => Err(error),
-    }
-}
-fn activity_result_failed_by_runtime_workspace_finalization(
-    mut result: ActivityResult,
-    error: &anyhow::Error,
-) -> ActivityResult {
-    result.status = harness_workflow::runtime::ActivityStatus::Failed;
-    result.summary =
-        "Runtime workspace finalization failed after the activity completed.".to_string();
-    result.error = Some(format!("runtime workspace finalization failed: {error}"));
-    result.error_kind = Some(harness_workflow::runtime::ActivityErrorKind::Retryable);
-    result.with_artifact(runtime_workspace_finalization_warning_artifact(error))
-}
-fn runtime_workspace_finalization_warning_artifact(error: &anyhow::Error) -> ActivityArtifact {
-    ActivityArtifact::new(
-        "runtime_workspace_finalization_warning",
-        json!({ "error": error.to_string() }),
-    )
+    workspace_finalization::combine(activity_result, finish_result)
 }
 #[cfg(test)]
 mod tests {

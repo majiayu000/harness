@@ -3,6 +3,8 @@ use super::{ActivityResult, WorkflowCommand, WorkflowCommandType};
 use serde_json::{json, Value};
 
 pub const CHANGE_SCOPE_REVIEW_ACTIVITY: &str = "classify_change_scope";
+pub const PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD: &str =
+    "pinned_change_scope_classifier_policy";
 
 pub(crate) fn has_server_classifier_assessment(result: &ActivityResult) -> bool {
     result

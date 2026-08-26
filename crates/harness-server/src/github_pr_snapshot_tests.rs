@@ -69,6 +69,7 @@ fn ready_pr() -> Value {
         "url": "https://github.com/owner/repo/pull/77",
         "title": "Ready PR",
         "body": "Closes #12 and explains the intended scope.",
+        "changedFiles": 1,
         "baseRefName": "main",
         "baseRefOid": "base123",
         "headRefName": "feature",
@@ -84,6 +85,7 @@ fn ready_pr() -> Value {
             ]
         },
         "files": {
+            "totalCount": 1,
             "pageInfo": {"hasNextPage": false, "endCursor": null},
             "nodes": [
                 {"path": "src/lib.rs", "additions": 3, "deletions": 1, "changeType": "MODIFIED"}
@@ -172,6 +174,20 @@ fn missing_connection_metadata_is_never_reported_complete() -> anyhow::Result<()
     assert_eq!(snapshot["changed_files_complete"], false);
     assert_eq!(snapshot["review_threads_complete"], false);
     assert_eq!(snapshot["closing_issues_complete"], false);
+    Ok(())
+}
+
+#[test]
+fn changed_file_total_mismatch_is_never_reported_complete() -> anyhow::Result<()> {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+    let mut pr = ready_pr();
+    pr["changedFiles"] = json!(2);
+
+    let snapshot = normalize_github_pr_snapshot(&target, &pr)?;
+
+    assert_eq!(snapshot["changed_files_count"], 2);
+    assert_eq!(snapshot["changed_files_connection_count"], 1);
+    assert_eq!(snapshot["changed_files_complete"], false);
     Ok(())
 }
 
@@ -412,7 +428,9 @@ async fn fetches_all_status_check_context_pages() -> anyhow::Result<()> {
 async fn fetches_every_changed_file_page_beyond_one_hundred_files() -> anyhow::Result<()> {
     let mut first_pr = ready_pr();
     first_pr["id"] = json!("PR_node");
+    first_pr["changedFiles"] = json!(101);
     first_pr["files"] = json!({
+        "totalCount": 101,
         "pageInfo": {"hasNextPage": true, "endCursor": "files-100"},
         "nodes": (0..100)
             .map(|index| json!({
@@ -433,6 +451,7 @@ async fn fetches_every_changed_file_page_beyond_one_hundred_files() -> anyhow::R
                 "baseRefOid": "base123",
                 "headRefOid": "abc123",
                 "files": {
+                    "totalCount": 101,
                     "pageInfo": {"hasNextPage": false, "endCursor": "files-101"},
                     "nodes": [{
                         "path": "src/file-100.rs",
@@ -473,6 +492,7 @@ async fn rejects_paginated_files_from_a_different_pr_head() -> anyhow::Result<()
     let mut first_pr = ready_pr();
     first_pr["id"] = json!("PR_node");
     first_pr["files"] = json!({
+        "totalCount": 1,
         "pageInfo": {"hasNextPage": true, "endCursor": "files-1"},
         "nodes": [{
             "path": "src/first.rs",
@@ -488,6 +508,7 @@ async fn rejects_paginated_files_from_a_different_pr_head() -> anyhow::Result<()
                 "baseRefOid": "base123",
                 "headRefOid": "changed-head",
                 "files": {
+                    "totalCount": 1,
                     "pageInfo": {"hasNextPage": false, "endCursor": "files-2"},
                     "nodes": []
                 }

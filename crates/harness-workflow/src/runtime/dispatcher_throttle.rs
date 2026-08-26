@@ -8,6 +8,7 @@
 
 use super::dispatcher::RuntimeProfileSelector;
 use super::model::{RuntimeKind, RuntimeProfile, WorkflowCommandRecord, WorkflowInstance};
+use super::state_registry::WorkflowDefinitionRegistry;
 use super::store::{cost_usd_from_micros, cost_usd_to_micros, WorkflowRuntimeStore};
 use super::GITHUB_ISSUE_PR_DEFINITION_ID;
 use anyhow::Context;
@@ -19,24 +20,44 @@ use std::collections::HashMap;
 const SERVER_OWNED_MERGE_PROFILE: &str = "server-owned-merge";
 
 pub(super) fn force_server_owned_profile(
+    registry: &WorkflowDefinitionRegistry,
     instance: Option<&WorkflowInstance>,
     activity: &str,
     profile: &mut RuntimeProfile,
-) {
-    if activity != "merge_pr"
-        || !instance.is_some_and(|instance| instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID)
-    {
-        return;
+) -> anyhow::Result<()> {
+    let server_merge = activity == "merge_pr"
+        && instance.is_some_and(|instance| instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID);
+    if server_merge {
+        // The in-process worker excludes RemoteHost jobs and intercepts merge_pr
+        // before resolving an agent, so no remote runtime sees the mutation job.
+        profile.kind = RuntimeKind::CodexExec;
+        profile.name = SERVER_OWNED_MERGE_PROFILE.to_string();
+        profile.model = None;
+        profile.reasoning_effort = None;
+        profile.sandbox = None;
+        profile.approval_policy = None;
+        return Ok(());
     }
 
-    // The in-process worker excludes RemoteHost jobs and intercepts merge_pr
-    // before resolving an agent, so no remote runtime sees the mutation job.
-    profile.kind = RuntimeKind::CodexExec;
-    profile.name = SERVER_OWNED_MERGE_PROFILE.to_string();
-    profile.model = None;
-    profile.reasoning_effort = None;
-    profile.sandbox = None;
-    profile.approval_policy = None;
+    let server_classifier = instance.is_some_and(|instance| {
+        registry
+            .declarative_definition_for_instance(instance)
+            .is_some_and(|definition| {
+                definition.requires_server_classifier_assessment(&instance.state)
+                    && definition
+                        .policy()
+                        .states
+                        .get(&instance.state)
+                        .and_then(|state| state.activity.as_deref())
+                        == Some(activity)
+            })
+    });
+    if server_classifier && profile.kind == RuntimeKind::RemoteHost {
+        anyhow::bail!(
+            "classifier activity `{activity}` must use a local agent runtime; remote_host cannot produce a trusted model assessment"
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn retry_not_before_for_command(

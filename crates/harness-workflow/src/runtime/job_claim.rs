@@ -5,7 +5,10 @@ use super::store::runtime_job_leases::{
 use super::store::{
     enum_str, fence_terminal_transition_tx, terminal_state_for_instance_tx, to_jsonb_string,
 };
-use super::{RuntimeJob, RuntimeKind, WorkflowRuntimeStore};
+use super::{
+    RuntimeJob, RuntimeKind, WorkflowDefinitionRegistry, WorkflowInstance, WorkflowRuntimeStore,
+    GITHUB_ISSUE_PR_DEFINITION_ID,
+};
 use chrono::{DateTime, Utc};
 
 impl WorkflowRuntimeStore {
@@ -191,6 +194,16 @@ impl WorkflowRuntimeStore {
             };
 
             let mut job: RuntimeJob = serde_json::from_str(&data)?;
+            if records_remote_host_audit {
+                if let Some(server_owned_kind) =
+                    server_owned_job_kind(&self.definition_registry, &workflow, &job)
+                {
+                    reroute_legacy_remote_server_owned_job(&mut tx, &mut job, server_owned_kind)
+                        .await?;
+                    tx.commit().await?;
+                    continue;
+                }
+            }
             let expires_at = if records_remote_host_audit {
                 postgres_timestamp_floor(expires_at)
             } else {
@@ -237,4 +250,87 @@ impl WorkflowRuntimeStore {
             return Ok(Some(job));
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ServerOwnedJobKind {
+    Merge,
+    Classifier,
+}
+
+fn server_owned_job_kind(
+    registry: &WorkflowDefinitionRegistry,
+    workflow: &WorkflowInstance,
+    job: &RuntimeJob,
+) -> Option<ServerOwnedJobKind> {
+    let activity = job.input.get("activity").and_then(|value| value.as_str())?;
+    if workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && activity == "merge_pr" {
+        return Some(ServerOwnedJobKind::Merge);
+    }
+    registry
+        .declarative_definition_for_instance(workflow)
+        .filter(|definition| {
+            definition.requires_server_classifier_assessment(&workflow.state)
+                && definition
+                    .policy()
+                    .states
+                    .get(&workflow.state)
+                    .and_then(|state| state.activity.as_deref())
+                    == Some(activity)
+        })
+        .map(|_| ServerOwnedJobKind::Classifier)
+}
+
+async fn reroute_legacy_remote_server_owned_job(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &mut RuntimeJob,
+    kind: ServerOwnedJobKind,
+) -> anyhow::Result<()> {
+    let (profile, reason) = match kind {
+        ServerOwnedJobKind::Merge => (
+            "server-owned-merge",
+            "legacy remote merge rerouted to the in-process server worker",
+        ),
+        ServerOwnedJobKind::Classifier => {
+            let input = job
+                .input
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("runtime job input must be an object"))?;
+            input.insert(
+                "server_owned_remote_rejection".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            (
+                "server-owned-classifier-rejected",
+                "legacy remote classifier rejected; retry with a local agent runtime",
+            )
+        }
+    };
+    job.runtime_kind = RuntimeKind::CodexExec;
+    job.runtime_profile = profile.to_string();
+    job.status = super::RuntimeJobStatus::Pending;
+    job.lease = None;
+    job.not_before = None;
+    job.updated_at = Utc::now();
+    let data = to_jsonb_string(job)?;
+    sqlx::query(
+        "UPDATE runtime_jobs
+         SET runtime_kind = $1, runtime_profile = $2, status = 'pending',
+             not_before = NULL, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $4",
+    )
+    .bind(RuntimeKind::CodexExec.as_str())
+    .bind(profile)
+    .bind(data)
+    .bind(&job.id)
+    .execute(&mut **tx)
+    .await?;
+    append_runtime_event_tx(
+        tx,
+        &job.id,
+        "RuntimeJobReroutedToServer",
+        serde_json::json!({"reason": reason, "prior_runtime_kind": "remote_host"}),
+    )
+    .await?;
+    Ok(())
 }

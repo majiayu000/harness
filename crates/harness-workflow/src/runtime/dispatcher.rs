@@ -284,10 +284,11 @@ impl<'a> RuntimeCommandDispatcher<'a> {
         apply_eval_runtime_profile_policy(&mut runtime_profile, &command)?;
         apply_candidate_runtime_budget(&mut runtime_profile, &command.command.command)?;
         super::dispatcher_throttle::force_server_owned_profile(
+            self.store.definition_registry(),
             instance.as_ref(),
             &activity,
             &mut runtime_profile,
-        );
+        )?;
         let isolation =
             isolation_resolution_for_command(instance.as_ref(), &command, &self.isolation_config)
                 .with_context(|| {

@@ -244,13 +244,19 @@ fn normalize_github_pr_snapshot(
         .unwrap_or(false);
     let active_threads = active_unresolved_review_threads(pr);
     let changed_files = changed_files(pr);
+    let changed_files_count = value_u64(pr.get("changedFiles"));
+    let changed_files_connection_count = pr
+        .pointer("/files/totalCount")
+        .and_then(|value| value_u64(Some(value)));
     let closing_issues = closing_issues(pr);
     let observed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let review_threads_complete = connection_is_complete(pr, "reviewThreads");
-    let changed_files_complete = connection_is_complete(pr, "files");
+    let changed_files_complete = connection_is_complete(pr, "files")
+        && changed_files_count == Some(changed_files.len() as u64)
+        && changed_files_connection_count == changed_files_count;
     let closing_issues_complete = connection_is_complete(pr, "closingIssuesReferences");
 
-    Ok(json!({
+    let mut snapshot = json!({
         "schema": SERVER_PR_SNAPSHOT_SCHEMA,
         "snapshot_source": "server_github_graphql",
         "observed_at": observed_at,
@@ -292,7 +298,10 @@ fn normalize_github_pr_snapshot(
         "changed_files_complete": changed_files_complete,
         "closing_issues": closing_issues,
         "closing_issues_complete": closing_issues_complete,
-    }))
+    });
+    snapshot["changed_files_count"] = json!(changed_files_count);
+    snapshot["changed_files_connection_count"] = json!(changed_files_connection_count);
+    Ok(snapshot)
 }
 
 fn active_unresolved_review_threads(pr: &Value) -> Vec<Value> {
