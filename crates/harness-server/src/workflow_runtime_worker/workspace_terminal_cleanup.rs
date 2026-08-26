@@ -268,11 +268,12 @@ async fn cleanup_terminal_runtime_workspace_with_admission(
                     .run_workspace_cleanup_hooks_once(
                         cleanup_operation.as_deref(),
                         &target.task_id,
+                        Some(&workflow.id),
                         workflow_document.config.hooks.before_remove.as_deref(),
                         workflow_document.config.hooks.timeout_secs,
                         &target.workspace_path,
                     )
-                    .await;
+                    .await?;
                 let outcome = if let Some(acquisition_id) = acquisition_id.as_deref() {
                     if !target.is_persisted() && !target.workspace_path.exists() {
                         workspace_mgr

@@ -292,6 +292,14 @@ pub(super) static TASK_MIGRATIONS: &[Migration] = &[
         sql: "ALTER TABLE workspace_cleanup_targets
               ADD COLUMN IF NOT EXISTS cleanup_claim_expires_at TIMESTAMPTZ",
     },
+    Migration {
+        version: 30,
+        description: "persist runtime workspace cleanup hook claims",
+        sql: "ALTER TABLE workspace_cleanup_targets
+              ADD COLUMN IF NOT EXISTS workflow_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE;
+              ALTER TABLE workspace_cleanup_targets
+              ADD COLUMN IF NOT EXISTS manager_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE",
+    },
 ];
 
 #[cfg(test)]
@@ -396,5 +404,17 @@ mod tests {
 
         assert!(migration.sql.contains("cleanup_claim_expires_at"));
         assert!(migration.sql.contains("TIMESTAMPTZ"));
+    }
+
+    #[test]
+    fn workspace_cleanup_hook_claims_are_persisted() {
+        let migration = TASK_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 30)
+            .expect("v30 migration should exist");
+
+        assert!(migration.sql.contains("workflow_hook_claimed"));
+        assert!(migration.sql.contains("manager_hook_claimed"));
+        assert!(migration.sql.contains("NOT NULL DEFAULT FALSE"));
     }
 }

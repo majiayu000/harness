@@ -140,7 +140,14 @@ impl CancelledWorkspaceSetupCleanup {
                     return Ok(false);
                 }
                 if self.workflow_before_remove_hook.is_some()
-                    && cleanup_operation.claim_workflow_hook()
+                    && claim_cleanup_hook_once(
+                        self.lease_store.as_deref(),
+                        Some(&cleanup_operation),
+                        snapshot.runtime_workflow_id.as_deref(),
+                        &snapshot.workspace_path,
+                        WorkspaceCleanupHook::Workflow,
+                    )
+                    .await?
                 {
                     run_workspace_cleanup_hook(
                         &task_id,
@@ -152,7 +159,14 @@ impl CancelledWorkspaceSetupCleanup {
                     .await;
                 }
                 if self.manager_before_remove_hook.is_some()
-                    && cleanup_operation.claim_manager_hook()
+                    && claim_cleanup_hook_once(
+                        self.lease_store.as_deref(),
+                        Some(&cleanup_operation),
+                        snapshot.runtime_workflow_id.as_deref(),
+                        &snapshot.workspace_path,
+                        WorkspaceCleanupHook::Manager,
+                    )
+                    .await?
                 {
                     run_workspace_cleanup_hook(
                         &task_id,
@@ -258,40 +272,6 @@ impl WorkspaceManager {
         )
     }
 
-    pub(crate) async fn run_workspace_cleanup_hooks_once(
-        &self,
-        cleanup_operation: Option<&WorkspaceCleanupOperation>,
-        task_id: &TaskId,
-        workflow_hook: Option<&str>,
-        workflow_hook_timeout_secs: u64,
-        workspace_path: &Path,
-    ) {
-        if workflow_hook.is_some()
-            && cleanup_operation.is_none_or(WorkspaceCleanupOperation::claim_workflow_hook)
-        {
-            run_workspace_cleanup_hook(
-                task_id,
-                "workflow before_remove",
-                workflow_hook,
-                workflow_hook_timeout_secs,
-                workspace_path,
-            )
-            .await;
-        }
-        if self.config.before_remove_hook.is_some()
-            && cleanup_operation.is_none_or(WorkspaceCleanupOperation::claim_manager_hook)
-        {
-            run_workspace_cleanup_hook(
-                task_id,
-                "workspace before_remove",
-                self.config.before_remove_hook.as_deref(),
-                self.config.hook_timeout_secs,
-                workspace_path,
-            )
-            .await;
-        }
-    }
-
     pub(crate) async fn cleanup_required_workspace_for_retry(
         &self,
         task_id: &TaskId,
@@ -362,11 +342,12 @@ impl WorkspaceManager {
             self.run_workspace_cleanup_hooks_once(
                 Some(&cleanup_operation),
                 task_id,
+                snapshot.runtime_workflow_id.as_deref(),
                 before_remove_hook,
                 hook_timeout_secs,
                 &snapshot.workspace_path,
             )
-            .await;
+            .await?;
             self.remove_workspace_acquisition_without_hook(task_id, &snapshot.acquisition_id)
                 .await
         };

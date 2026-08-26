@@ -7,6 +7,12 @@ use std::time::Duration;
 const CLEANUP_CLAIM_TTL_SECS: i64 = 30;
 const CLEANUP_CLAIM_ABANDON_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceCleanupHook {
+    Workflow,
+    Manager,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspaceCleanupTargetRecord {
     pub(crate) project_key: String,
@@ -210,6 +216,51 @@ impl Drop for PersistedWorkspaceCleanupClaim {
 }
 
 impl WorkspaceLeaseStore {
+    pub(crate) async fn claim_workspace_cleanup_hook(
+        &self,
+        runtime_workflow_id: &str,
+        workspace_path: &std::path::Path,
+        hook: WorkspaceCleanupHook,
+    ) -> anyhow::Result<Option<bool>> {
+        let query = match hook {
+            WorkspaceCleanupHook::Workflow => {
+                "UPDATE workspace_cleanup_targets
+                 SET workflow_hook_claimed = TRUE, last_used_at = CURRENT_TIMESTAMP
+                 WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
+                   AND workflow_hook_claimed = FALSE"
+            }
+            WorkspaceCleanupHook::Manager => {
+                "UPDATE workspace_cleanup_targets
+                 SET manager_hook_claimed = TRUE, last_used_at = CURRENT_TIMESTAMP
+                 WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
+                   AND manager_hook_claimed = FALSE"
+            }
+        };
+        let claimed = sqlx::query(query)
+            .bind(&self.store_key)
+            .bind(runtime_workflow_id)
+            .bind(workspace_path.to_string_lossy().as_ref())
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            > 0;
+        if claimed {
+            return Ok(Some(true));
+        }
+        let target_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM workspace_cleanup_targets
+                WHERE store_key = $1 AND runtime_workflow_id = $2 AND workspace_path = $3
+             )",
+        )
+        .bind(&self.store_key)
+        .bind(runtime_workflow_id)
+        .bind(workspace_path.to_string_lossy().as_ref())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(target_exists.then_some(false))
+    }
+
     pub(crate) async fn claim_workspace_cleanup_target(
         &self,
         target: &WorkspaceCleanupTargetRecord,
@@ -708,10 +759,16 @@ CREATE TABLE IF NOT EXISTS workspace_cleanup_targets (
     cleanup_process_id BIGINT,
     cleanup_process_started_at BIGINT,
     cleanup_claim_expires_at TIMESTAMPTZ,
+    workflow_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE,
+    manager_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_used_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY(store_key, runtime_workflow_id, workspace_path)
 );
+ALTER TABLE workspace_cleanup_targets
+    ADD COLUMN IF NOT EXISTS workflow_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE workspace_cleanup_targets
+    ADD COLUMN IF NOT EXISTS manager_hook_claimed BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_workspace_cleanup_targets_workflow
     ON workspace_cleanup_targets(store_key, runtime_workflow_id, last_used_at);
 INSERT INTO workspace_cleanup_targets (

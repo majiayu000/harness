@@ -212,6 +212,57 @@ async fn cleanup_claim_blocks_slot_reuse_until_physical_cleanup_completes() -> a
         .await?
         .pop()
         .expect("cleanup target");
+    assert_eq!(
+        store
+            .claim_workspace_cleanup_hook(
+                "cleanup-workflow",
+                &record_a.workspace_path,
+                WorkspaceCleanupHook::Workflow,
+            )
+            .await?,
+        Some(true)
+    );
+    assert_eq!(
+        store
+            .claim_workspace_cleanup_hook(
+                "cleanup-workflow",
+                &record_a.workspace_path,
+                WorkspaceCleanupHook::Workflow,
+            )
+            .await?,
+        Some(false)
+    );
+    let reopened = WorkspaceLeaseStore::open(&dir.path().join("cleanup-claim")).await?;
+    assert_eq!(
+        reopened
+            .claim_workspace_cleanup_hook(
+                "cleanup-workflow",
+                &record_a.workspace_path,
+                WorkspaceCleanupHook::Workflow,
+            )
+            .await?,
+        Some(false)
+    );
+    assert_eq!(
+        reopened
+            .claim_workspace_cleanup_hook(
+                "cleanup-workflow",
+                &record_a.workspace_path,
+                WorkspaceCleanupHook::Manager,
+            )
+            .await?,
+        Some(true)
+    );
+    assert_eq!(
+        store
+            .claim_workspace_cleanup_hook(
+                "cleanup-workflow",
+                &record_a.workspace_path,
+                WorkspaceCleanupHook::Manager,
+            )
+            .await?,
+        Some(false)
+    );
     let cleanup_claim_id = "cleanup-claim-a";
     assert!(
         store

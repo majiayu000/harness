@@ -1,7 +1,7 @@
 use crate::task_runner::{TaskId, TaskSummary};
 use crate::workspace_lease_store::{
-    RepositoryLeaseMode, RepositoryLeaseState, RepositoryWriteLease, WorkspaceLeaseRecord,
-    WorkspaceLeaseStore,
+    RepositoryLeaseMode, RepositoryLeaseState, RepositoryWriteLease, WorkspaceCleanupHook,
+    WorkspaceLeaseRecord, WorkspaceLeaseStore,
 };
 use crate::workspace_pool::{
     select_available_slot, workspace_slot_key, WorkspacePool, WorkspacePoolConfig,
@@ -45,6 +45,9 @@ const OWNER_RECORD_FILE: &str = "harness-workspace-owner.json";
 #[path = "workspace_active_reuse.rs"]
 mod workspace_active_reuse;
 pub(crate) use workspace_active_reuse::WorkspaceExecutionGuard;
+#[path = "workspace_cleanup_hooks.rs"]
+mod workspace_cleanup_hooks;
+use workspace_cleanup_hooks::{claim_cleanup_hook_once, run_workspace_cleanup_hook};
 #[path = "workspace_create.rs"]
 mod workspace_create;
 #[path = "workspace_helpers.rs"]
@@ -139,6 +142,7 @@ impl WorkspaceCleanupOperation {
 struct ActiveWorkspaceSnapshot {
     workspace_path: PathBuf,
     source_repo: PathBuf,
+    runtime_workflow_id: Option<String>,
     workspace_key: String,
     project_key: String,
     slot_index: u32,
@@ -152,6 +156,7 @@ impl From<&ActiveWorkspace> for ActiveWorkspaceSnapshot {
         Self {
             workspace_path: active.workspace_path.clone(),
             source_repo: active.source_repo.clone(),
+            runtime_workflow_id: active.runtime_workflow_id.clone(),
             workspace_key: active.workspace_key.clone(),
             project_key: active.project_key.clone(),
             slot_index: active.slot_index,

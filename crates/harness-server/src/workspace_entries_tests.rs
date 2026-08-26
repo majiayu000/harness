@@ -261,10 +261,12 @@ async fn cleanup_serialization_is_scoped_to_acquisition() {
             Some(&first),
             &TaskId("task-a".to_string()),
             None,
+            None,
             1,
             tmp.path(),
         )
-        .await;
+        .await
+        .expect("hooks without durable cleanup state");
     assert!(first.claim_workflow_hook());
     assert!(!same.claim_workflow_hook());
     assert!(first.claim_manager_hook());

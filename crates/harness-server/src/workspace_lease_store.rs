@@ -14,7 +14,7 @@ const TEST_REPOSITORY_LOCK_CAPACITY: u32 = 4;
 #[path = "workspace_cleanup_store.rs"]
 mod workspace_cleanup_store;
 pub(crate) use workspace_cleanup_store::{
-    PersistedWorkspaceCleanupClaim, WorkspaceCleanupTargetRecord,
+    PersistedWorkspaceCleanupClaim, WorkspaceCleanupHook, WorkspaceCleanupTargetRecord,
     WORKSPACE_CLEANUP_TARGETS_TABLE_SQL,
 };
 #[path = "workspace_repository_lock.rs"]
@@ -254,6 +254,8 @@ impl WorkspaceLeaseStore {
                     cleanup_process_id = NULL,
                     cleanup_process_started_at = NULL,
                     cleanup_claim_expires_at = NULL,
+                    workflow_hook_claimed = FALSE,
+                    manager_hook_claimed = FALSE,
                     last_used_at = CURRENT_TIMESTAMP",
                 )
                 .bind(&self.store_key)
