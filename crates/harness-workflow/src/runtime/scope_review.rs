@@ -1,7 +1,7 @@
 use super::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT;
 use super::{
-    ActivityResult, RuntimeJob, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowDefinitionRegistry, WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
+    ActivityResult, ActivityStatus, RuntimeJob, WorkflowCommand, WorkflowCommandType,
+    WorkflowDecision, WorkflowDefinitionRegistry, WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 
@@ -10,10 +10,70 @@ pub const PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD: &str =
     "pinned_change_scope_classifier_policy";
 
 pub(crate) fn has_server_classifier_assessment(result: &ActivityResult) -> bool {
-    result
+    validated_server_classifier_assessment(result).is_some()
+}
+
+pub(crate) fn validated_server_classifier_assessment(result: &ActivityResult) -> Option<&Value> {
+    let assessments = result
         .artifacts
         .iter()
-        .any(|artifact| artifact.artifact_type == ARTIFACT_CLASSIFIER_ASSESSMENT)
+        .filter(|artifact| artifact.artifact_type == ARTIFACT_CLASSIFIER_ASSESSMENT)
+        .collect::<Vec<_>>();
+    let [artifact] = assessments.as_slice() else {
+        return None;
+    };
+    let assessment = &artifact.artifact;
+    if assessment.get("schema").and_then(Value::as_str)
+        != Some("harness.runtime.classifier_assessment.v1")
+    {
+        return None;
+    }
+    let attestation = assessment.get("attestation")?;
+    for field in ["runtime_job_id", "runtime_profile"] {
+        if !nonempty_string(attestation.get(field)) {
+            return None;
+        }
+    }
+    match result.status {
+        ActivityStatus::Succeeded => {
+            if !nonempty_string(assessment.get("verdict"))
+                || !nonempty_string(assessment.get("rationale"))
+                || !nonempty_string(attestation.get("requested_model"))
+                || !nonempty_string(attestation.get("model"))
+                || !nonempty_string(attestation.get("prompt_packet_digest"))
+                || !nonempty_string(attestation.get("policy_sha256"))
+            {
+                return None;
+            }
+            let evidence_refs = assessment.get("evidence_refs")?.as_array()?;
+            if evidence_refs
+                .iter()
+                .any(|value| !nonempty_string(Some(value)))
+            {
+                return None;
+            }
+            let [signal] = result.signals.as_slice() else {
+                return None;
+            };
+            if signal.signal_type != assessment.get("verdict")?.as_str()?
+                || signal.signal != *assessment
+            {
+                return None;
+            }
+        }
+        _ => {
+            if !nonempty_string(assessment.get("outcome")) || !result.signals.is_empty() {
+                return None;
+            }
+        }
+    }
+    Some(assessment)
+}
+
+fn nonempty_string(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 pub(crate) fn runtime_job_requires_local_server(

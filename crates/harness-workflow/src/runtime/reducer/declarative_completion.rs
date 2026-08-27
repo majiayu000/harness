@@ -451,7 +451,19 @@ fn with_artifact_evidence(
     mut decision: WorkflowDecision,
     result: &ActivityResult,
 ) -> anyhow::Result<WorkflowDecision> {
-    for evidence in workflow_evidence_from_activity_artifacts(&result.artifacts)? {
+    let validated_classifier =
+        crate::runtime::scope_review::validated_server_classifier_assessment(result).is_some();
+    for mut evidence in workflow_evidence_from_activity_artifacts(&result.artifacts)? {
+        if validated_classifier
+            && evidence.kind == crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT
+        {
+            evidence = WorkflowEvidence::runtime_observed(
+                evidence.kind,
+                evidence.summary,
+                "server_classifier_attestation",
+                None,
+            );
+        }
         decision = decision.with_evidence(evidence);
     }
     Ok(decision)

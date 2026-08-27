@@ -205,19 +205,10 @@ pub fn workflow_evidence_from_activity_artifacts(
             continue;
         }
         let summary = format!("activity produced '{}' artifact", artifact.artifact_type);
-        evidence.push(
-            if artifact.artifact_type == super::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT
-            {
-                WorkflowEvidence::runtime_observed(
-                    artifact.artifact_type.clone(),
-                    summary,
-                    "server_classifier_attestation",
-                    None,
-                )
-            } else {
-                WorkflowEvidence::new(artifact.artifact_type.clone(), summary)
-            },
-        );
+        evidence.push(WorkflowEvidence::new(
+            artifact.artifact_type.clone(),
+            summary,
+        ));
     }
     Ok(evidence)
 }

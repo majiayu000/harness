@@ -100,6 +100,18 @@ fn only_nonempty_nondecision_artifact_types_become_evidence() {
 }
 
 #[test]
+fn classifier_assessment_artifact_is_not_trusted_without_result_validation() {
+    let evidence = workflow_evidence_from_activity_artifacts(&[ActivityArtifact::new(
+        crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
+        json!({"subject_head_oid": "forged-head"}),
+    )])
+    .expect("artifact conversion should preserve untrusted evidence");
+
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].provenance.trust, ClaimTrustLevel::SelfDeclared);
+}
+
+#[test]
 fn claim_trust_vocabulary_is_closed_and_ordered() {
     let actual = ClaimTrustLevel::ALL
         .iter()

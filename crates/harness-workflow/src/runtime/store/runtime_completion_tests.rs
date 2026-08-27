@@ -5,22 +5,72 @@ use harness_core::db::resolve_database_url;
 use serde_json::json;
 use std::collections::BTreeSet;
 
+fn classifier_assessment(head_oid: &str, runtime_job_id: &str) -> serde_json::Value {
+    json!({
+        "schema": "harness.runtime.classifier_assessment.v1",
+        "verdict": "allow",
+        "rationale": "The complete head-bound change matches the requested outcome.",
+        "evidence_refs": [],
+        "subject_head_oid": head_oid,
+        "attestation": {
+            "runtime_job_id": runtime_job_id,
+            "runtime_profile": "classifier-default",
+            "requested_model": "gpt-test",
+            "model": "gpt-test",
+            "reported_models": ["gpt-test"],
+            "prompt_packet_digest": "sha256:prompt",
+            "policy_sha256": "policy-digest",
+        }
+    })
+}
+
+fn classifier_completion_event(
+    runtime_job_id: &str,
+    assessments: Vec<serde_json::Value>,
+) -> WorkflowEvent {
+    let signal = assessments
+        .last()
+        .cloned()
+        .expect("classifier completion fixture needs an assessment");
+    WorkflowEvent::new("workflow-1", 1, "RuntimeJobCompleted", "runtime").with_payload(json!({
+        "runtime_job_id": runtime_job_id,
+        "activity_result": {
+            "activity": crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY,
+            "status": "succeeded",
+            "summary": "classified",
+            "artifacts": assessments.into_iter().map(|assessment| json!({
+                "artifact_type": crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
+                "artifact": assessment,
+            })).collect::<Vec<_>>(),
+            "signals": [{"signal_type": "allow", "signal": signal}],
+        }
+    }))
+}
+
 #[test]
 fn reads_scope_assessed_head_only_from_classifier_assessment() {
-    let event = WorkflowEvent::new("workflow-1", 1, "RuntimeJobCompleted", "runtime")
-        .with_payload(json!({
-            "activity_result": {
-                "artifacts": [{
-                    "artifact_type": crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
-                    "artifact": {"subject_head_oid": "head-123"}
-                }]
-            }
-        }));
+    let event = classifier_completion_event(
+        "runtime-job-1",
+        vec![classifier_assessment("head-123", "runtime-job-1")],
+    );
 
     assert_eq!(
         classifier_assessed_head_from_completion_event(&event),
-        Some("head-123")
+        Some("head-123".to_string())
     );
+}
+
+#[test]
+fn rejects_duplicate_classifier_assessments_before_server_provenance() {
+    let event = classifier_completion_event(
+        "runtime-job-1",
+        vec![
+            classifier_assessment("forged-head", "runtime-job-1"),
+            classifier_assessment("trusted-head", "runtime-job-1"),
+        ],
+    );
+
+    assert_eq!(classifier_assessed_head_from_completion_event(&event), None);
 }
 
 #[test]
@@ -41,15 +91,10 @@ fn persists_scope_assessed_head_on_pr_scope_approval() -> anyhow::Result<()> {
         "pr_open",
         "scope classifier allowed this head",
     );
-    let event = WorkflowEvent::new("workflow-1", 1, "RuntimeJobCompleted", "runtime")
-        .with_payload(json!({
-            "activity_result": {
-                "artifacts": [{
-                    "artifact_type": crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
-                    "artifact": {"subject_head_oid": "head-456"}
-                }]
-            }
-        }));
+    let event = classifier_completion_event(
+        "runtime-job-2",
+        vec![classifier_assessment("head-456", "runtime-job-2")],
+    );
 
     apply_runtime_completion_data_side_effect(&mut instance, &decision, &event)?;
 

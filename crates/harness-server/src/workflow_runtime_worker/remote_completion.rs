@@ -48,7 +48,10 @@ pub(crate) async fn apply_remote_completion_evidence(
             json!({
                 "schema": "harness.runtime.classifier_assessment.v1",
                 "outcome": "unsupported_remote_runtime",
-                "runtime_job_id": job.id,
+                "attestation": {
+                    "runtime_job_id": job.id,
+                    "runtime_profile": job.runtime_profile,
+                },
             }),
         )));
     }

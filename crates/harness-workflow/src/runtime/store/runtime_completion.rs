@@ -560,20 +560,27 @@ fn apply_runtime_completion_data_side_effect(
     instance.apply_data_writes(writes)
 }
 
-fn classifier_assessed_head_from_completion_event(event: &WorkflowEvent) -> Option<&str> {
-    event
-        .event
-        .pointer("/activity_result/artifacts")?
-        .as_array()?
-        .iter()
-        .find(|artifact| {
-            artifact.get("artifact_type").and_then(Value::as_str)
-                == Some(crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT)
-        })?
-        .pointer("/artifact/subject_head_oid")?
+fn classifier_assessed_head_from_completion_event(event: &WorkflowEvent) -> Option<String> {
+    let result =
+        serde_json::from_value::<ActivityResult>(event.event.get("activity_result")?.clone())
+            .ok()?;
+    let assessment = crate::runtime::scope_review::validated_server_classifier_assessment(&result)?;
+    let runtime_job_id = event.event.get("runtime_job_id")?.as_str()?.trim();
+    if runtime_job_id.is_empty()
+        || assessment
+            .pointer("/attestation/runtime_job_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            != Some(runtime_job_id)
+    {
+        return None;
+    }
+    assessment
+        .get("subject_head_oid")?
         .as_str()
         .map(str::trim)
         .filter(|head| !head.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn pr_feedback_snapshot_from_completion_event(event: &WorkflowEvent) -> Option<&Value> {

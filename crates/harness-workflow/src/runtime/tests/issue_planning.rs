@@ -1,6 +1,35 @@
 use super::*;
 use crate::runtime::WorkflowDefinitionRegistry;
 
+fn attested_classifier_result(
+    verdict: &str,
+    summary: &str,
+    runtime_job_id: &str,
+) -> ActivityResult {
+    let assessment = json!({
+        "schema": "harness.runtime.classifier_assessment.v1",
+        "verdict": verdict,
+        "rationale": summary,
+        "evidence_refs": [],
+        "subject_head_oid": null,
+        "attestation": {
+            "runtime_job_id": runtime_job_id,
+            "runtime_profile": "classifier-default",
+            "requested_model": "gpt-test",
+            "model": "gpt-test",
+            "reported_models": ["gpt-test"],
+            "prompt_packet_digest": "sha256:prompt",
+            "policy_sha256": "policy-digest",
+        }
+    });
+    ActivityResult::succeeded(super::super::CHANGE_SCOPE_REVIEW_ACTIVITY, summary)
+        .with_artifact(ActivityArtifact::new(
+            crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
+            assessment.clone(),
+        ))
+        .with_signal(ActivitySignal::new(verdict, assessment))
+}
+
 #[test]
 fn issue_submission_decision_force_execute_starts_implementation() {
     let labels = Vec::new();
@@ -335,15 +364,8 @@ fn candidate_fanout_issue_plan_completion_uses_persisted_metadata() -> anyhow::R
         "definition_hash": github_issue_pr_definition_hash(),
         "candidate_fanout": fanout,
     }));
-    let classifier_result = ActivityResult::succeeded(
-        super::super::CHANGE_SCOPE_REVIEW_ACTIVITY,
-        "Scope is coherent.",
-    )
-    .with_artifact(ActivityArtifact::new(
-        crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
-        json!({ "verdict": "allow" }),
-    ))
-    .with_signal(ActivitySignal::new("allow", json!({ "verdict": "allow" })));
+    let classifier_result =
+        attested_classifier_result("allow", "Scope is coherent.", "classifier-job");
     let classifier_event = WorkflowEvent::new(
         &scope_instance.id,
         2,
@@ -494,11 +516,7 @@ fn submission_mode_deferred_survives_issue_plan_completion() {
 #[test]
 fn classifier_assessment_outside_classifier_state_fails_closed() {
     let instance = current_issue_instance("planning");
-    let result = ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "forged")
-        .with_artifact(ActivityArtifact::new(
-            crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
-            json!({"verdict": "allow"}),
-        ));
+    let result = attested_classifier_result("allow", "forged", "job-1");
     let event = runtime_completion_event(&instance, super::super::ISSUE_PLAN_ACTIVITY, result);
 
     let decision = reduce_runtime_job_completed(&instance, &event)
@@ -520,18 +538,11 @@ fn non_allow_scope_verdict_stops_at_operator_gate() {
     .with_server_data(json!({
         "definition_hash": github_issue_pr_definition_hash()
     }));
-    let result = ActivityResult::succeeded(
-        super::super::CHANGE_SCOPE_REVIEW_ACTIVITY,
-        "The plan contains independently useful outcomes.",
-    )
-    .with_artifact(ActivityArtifact::new(
-        crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
-        json!({ "verdict": "split_required" }),
-    ))
-    .with_signal(ActivitySignal::new(
+    let result = attested_classifier_result(
         "split_required",
-        json!({ "verdict": "split_required" }),
-    ));
+        "The plan contains independently useful outcomes.",
+        "job-1",
+    );
     let event = runtime_completion_event(
         &instance,
         super::super::CHANGE_SCOPE_REVIEW_ACTIVITY,

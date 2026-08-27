@@ -346,6 +346,9 @@ pub(super) fn attest_result(
     mut result: ActivityResult,
 ) -> ActivityResult {
     result.signals.clear();
+    result
+        .artifacts
+        .retain(|artifact| artifact.artifact_type != ARTIFACT_CLASSIFIER_ASSESSMENT);
     let attestation = assessment_attestation(
         policy,
         job,
