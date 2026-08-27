@@ -7,8 +7,8 @@ use harness_core::config::intake::{
     GitHubAutoMergeConfig, GitHubMergeExecution, GitHubMergeMethod, ResolvedGitHubAutoMergePolicy,
 };
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivityStatus, DataProvenance,
-    RuntimeJob, WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID, SERVER_PR_SNAPSHOT_ARTIFACT,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivityStatus, RuntimeJob,
+    WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::{json, Value};
 
@@ -172,26 +172,15 @@ pub(super) fn required_expected_head_sha_for_merge(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "merge_pr command is missing expected_head_sha".to_string())?;
-    let assessed_head = workflow
-        .filter(|workflow| {
-            workflow
-                .data_provenance
-                .as_ref()
-                .and_then(|provenance| provenance.provenance_for("/scope_assessed_head_oid"))
-                == Some(DataProvenance::Server)
-        })
-        .and_then(|workflow| value_string(workflow.data.get("scope_assessed_head_oid")))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "merge_pr dispatch is missing a server-owned scope_assessed_head_oid".to_string()
-        })?;
-    if command_head != assessed_head {
+    let trusted_head = workflow
+        .and_then(crate::workflow_runtime_pr_feedback::trusted_merge_head_sha)
+        .ok_or_else(|| "merge_pr dispatch is missing a trusted workflow head".to_string())?;
+    if command_head != trusted_head {
         return Err(format!(
-            "merge_pr command head `{command_head}` does not match scope-assessed head `{assessed_head}`"
+            "merge_pr command head `{command_head}` does not match trusted workflow head `{trusted_head}`"
         ));
     }
-    Ok(assessed_head)
+    Ok(trusted_head)
 }
 
 pub(super) fn snapshot_head_matches_expected(snapshot: &Value, expected_head_sha: &str) -> bool {

@@ -77,7 +77,9 @@ pub struct GitHubAutoMergeConfig {
     pub enabled: bool,
     #[serde(default)]
     pub method: GitHubMergeMethod,
-    #[serde(default = "default_true")]
+    /// Source branch deletion is disabled by default because server-owned
+    /// merges cannot compare-and-delete a Git ref atomically.
+    #[serde(default)]
     pub delete_branch: bool,
     #[serde(default = "default_true")]
     pub require_review_threads_resolved: bool,
@@ -411,7 +413,7 @@ impl Default for GitHubAutoMergeConfig {
         Self {
             enabled: false,
             method: GitHubMergeMethod::Squash,
-            delete_branch: true,
+            delete_branch: false,
             require_review_threads_resolved: true,
             require_clean_merge_state: true,
             merge_execution: GitHubMergeExecution::Server,

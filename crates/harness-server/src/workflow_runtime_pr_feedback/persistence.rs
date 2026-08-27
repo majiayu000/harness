@@ -557,7 +557,14 @@ pub(super) async fn approve_runtime_merge(
     };
     let merge_method = optional_string_field(&instance.data, "merge_method")
         .unwrap_or_else(|| "squash".to_string());
-    let delete_branch = optional_bool_field(&instance.data, "merge_delete_branch").unwrap_or(true);
+    let delete_branch = optional_bool_field(&instance.data, "merge_delete_branch").unwrap_or(false);
+    if delete_branch {
+        return Ok(RuntimeMergeApprovalOutcome::Rejected {
+            workflow_id,
+            reason: "server-owned merge cannot safely delete the source branch atomically"
+                .to_string(),
+        });
+    }
     let require_review_threads_resolved =
         optional_bool_field(&instance.data, "merge_require_review_threads_resolved")
             .unwrap_or(true);

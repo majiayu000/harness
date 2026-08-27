@@ -41,9 +41,9 @@ use pr_lifecycle_persist::{
 use pr_lifecycle_persist::{
     set_pr_lifecycle_persist_test_failures, PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS,
 };
-use scope_recheck::trusted_merge_head_sha;
 pub(crate) use scope_recheck::{
-    requeue_runtime_pr_scope_review_after_head_change, uses_model_scope_review,
+    requeue_runtime_pr_scope_review_after_head_change, trusted_merge_head_sha,
+    uses_model_scope_review,
 };
 use submission_requests::*;
 use targets::*;

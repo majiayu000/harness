@@ -9,7 +9,7 @@ pub(crate) fn uses_model_scope_review(instance: &WorkflowInstance) -> bool {
             == Some(github_issue_pr_definition_hash().as_str())
 }
 
-pub(super) fn trusted_merge_head_sha(instance: &WorkflowInstance) -> Option<String> {
+pub(crate) fn trusted_merge_head_sha(instance: &WorkflowInstance) -> Option<String> {
     if uses_model_scope_review(instance) {
         return trusted_string_field(
             instance,

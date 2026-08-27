@@ -453,7 +453,7 @@ poll_interval_secs = 60
 [intake.github.auto_merge]
 enabled = true
 method = "squash"
-delete_branch = true
+delete_branch = false
 require_review_threads_resolved = true
 require_clean_merge_state = true
 

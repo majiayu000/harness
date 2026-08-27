@@ -1,6 +1,15 @@
 use super::*;
 
 #[test]
+fn auto_merge_defaults_to_atomic_server_options() {
+    let config = GitHubAutoMergeConfig::default();
+
+    assert!(!config.enabled);
+    assert!(!config.delete_branch);
+    assert_eq!(config.merge_execution, GitHubMergeExecution::Server);
+}
+
+#[test]
 fn feishu_debug_redacts_secrets() {
     let config = FeishuIntakeConfig {
         enabled: true,

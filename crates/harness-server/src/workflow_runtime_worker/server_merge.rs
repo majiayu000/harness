@@ -548,6 +548,22 @@ mod tests {
             "merge_require_review_threads_resolved": true,
             "merge_require_clean_merge_state": true,
             "merge_attempted_head_sha": "head-sha",
+            "pr_head_sha": "head-sha",
+        }))
+    }
+
+    fn current_workflow(scope_head: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
+            "merging",
+            WorkflowSubject::new("issue", "issue:current-77"),
+        )
+        .with_server_data(json!({
+            "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "scope_assessed_head_oid": scope_head,
         }))
     }
 
@@ -678,23 +694,25 @@ mod tests {
     }
 
     #[test]
-    fn merge_requires_command_head_to_match_scope_assessment() {
-        let matching = workflow().with_server_data(json!({
-            "scope_assessed_head_oid": "head-sha",
-        }));
+    fn merge_requires_command_head_to_match_the_versioned_trusted_head() {
+        let legacy = workflow();
+        assert_eq!(
+            required_expected_head_sha_for_merge(&job(), Some(&legacy)).as_deref(),
+            Ok("head-sha")
+        );
+
+        let matching = current_workflow("head-sha");
 
         assert_eq!(
             required_expected_head_sha_for_merge(&job(), Some(&matching)).as_deref(),
             Ok("head-sha")
         );
-        let mismatch = workflow().with_server_data(json!({
-            "scope_assessed_head_oid": "different-head",
-        }));
+        let mismatch = current_workflow("different-head");
         assert!(required_expected_head_sha_for_merge(&job(), Some(&mismatch)).is_err());
     }
 
     #[test]
-    fn server_merge_requires_a_server_owned_scope_assessed_head() {
+    fn server_merge_requires_a_trusted_workflow_head() {
         let missing = RuntimeJob::pending(
             "command-missing",
             RuntimeKind::CodexExec,

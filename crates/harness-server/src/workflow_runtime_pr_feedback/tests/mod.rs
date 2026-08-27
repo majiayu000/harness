@@ -859,6 +859,9 @@ async fn legacy_v1_merge_approval_keeps_the_legacy_transition_contract() -> anyh
         .data
         .get(crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD)
         .is_none());
+    let commands = store.commands_for(&workflow.id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.command["delete_branch"], false);
     Ok(())
 }
 
