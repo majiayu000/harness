@@ -157,6 +157,21 @@ fn legacy_and_current_github_builtins_resolve_their_exact_versions() {
         .policy()
         .states
         .contains_key("plan_scope_review"));
+    let legacy_with_payload_hash = legacy.clone().with_server_data(json!({
+        "definition_hash": "not-a-v1-definition-pin"
+    }));
+    assert!(matches!(
+        registry.resolve_declarative_definition(&legacy_with_payload_hash),
+        DeclarativeDefinitionResolution::Resolved(_)
+    ));
+    let legacy_validator = registry
+        .decision_validator_for_instance(&legacy_with_payload_hash)
+        .expect("legacy definition should resolve")
+        .expect("legacy validator should exist");
+    legacy_validator
+        .binding()
+        .ensure_governs(&legacy_with_payload_hash)
+        .expect("legacy validator must ignore an unrelated payload hash");
     let current = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         GITHUB_ISSUE_PR_DEFINITION_VERSION,

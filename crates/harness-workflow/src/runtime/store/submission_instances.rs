@@ -115,14 +115,9 @@ impl WorkflowRuntimeStore {
                       OR (
                           terminal.definition_version =
                               (workflow_instances.data->>'definition_version')::bigint
-                          AND (
-                              (
-                                  terminal.definition_hash IS NULL
-                                  AND workflow_instances.data->'data'->>'definition_hash' IS NULL
-                              )
+                          AND (terminal.definition_hash IS NULL
                               OR terminal.definition_hash =
-                                  workflow_instances.data->'data'->>'definition_hash'
-                          )
+                                  workflow_instances.data->'data'->>'definition_hash')
                       )
                   )
                  LEFT JOIN persisted_terminal_states AS persisted_terminal
@@ -309,14 +304,9 @@ impl WorkflowRuntimeStore {
                       OR (
                           terminal.definition_version =
                               (workflow_instances.data->>'definition_version')::bigint
-                          AND (
-                              (
-                                  terminal.definition_hash IS NULL
-                                  AND workflow_instances.data->'data'->>'definition_hash' IS NULL
-                              )
+                          AND (terminal.definition_hash IS NULL
                               OR terminal.definition_hash =
-                                  workflow_instances.data->'data'->>'definition_hash'
-                          )
+                                  workflow_instances.data->'data'->>'definition_hash')
                       )
                   )
                  LEFT JOIN persisted_terminal_states AS persisted_terminal

@@ -251,9 +251,11 @@ impl WorkflowDefinitionRegistry {
             if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
                 return DeclarativeDefinitionResolution::Resolved(definition);
             }
-            if definition.definition_version() == 1
-                && instance.data.get("definition_hash").is_none()
-            {
+            // Version 1 predates declarative pinning. Existing workflows may
+            // carry a `definition_hash` payload field with unrelated meaning,
+            // so version identity alone selects the immutable historical
+            // definition. Version 2 and later require the exact content hash.
+            if definition.definition_version() == 1 {
                 return DeclarativeDefinitionResolution::Resolved(definition);
             }
             let Some(expected_hash) = instance.data.get("definition_hash") else {

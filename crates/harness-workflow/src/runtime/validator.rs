@@ -16,6 +16,8 @@ mod evidence_contract;
 mod github_issue_pr_validation;
 #[path = "validator_hidden_transitions.rs"]
 mod hidden_transitions;
+#[path = "validator_identity.rs"]
+mod identity;
 #[path = "validator_prompt_task.rs"]
 mod prompt_task_validation;
 #[path = "validator_context.rs"]
@@ -451,28 +453,6 @@ impl DecisionValidator {
             kind: DecisionValidatorKind::Generic,
             binding: DecisionValidatorBinding::unbound(),
         }
-    }
-
-    /// A validator bound to the exact declarative definition a pin resolved to.
-    pub fn for_declarative_definition(
-        definition_id: &str,
-        definition_version: u32,
-        definition_hash: &str,
-        allowlist: TransitionAllowlist,
-        states: Vec<WorkflowStateDefinition>,
-    ) -> Self {
-        let mut validator = Self::for_definition(definition_id, allowlist, states);
-        validator.binding = DecisionValidatorBinding::for_declarative(
-            definition_id,
-            definition_version,
-            definition_hash,
-        );
-        validator
-    }
-
-    /// The definition identity this validator was resolved from.
-    pub fn binding(&self) -> &DecisionValidatorBinding {
-        &self.binding
     }
 
     pub fn github_issue_pr() -> Self {

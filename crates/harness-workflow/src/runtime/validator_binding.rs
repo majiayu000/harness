@@ -47,6 +47,16 @@ impl DecisionValidatorBinding {
         }
     }
 
+    /// A validator bound to a versioned definition whose historical identity
+    /// predates content-hash pinning.
+    pub fn for_versioned_definition(definition_id: &str, definition_version: u32) -> Self {
+        Self {
+            definition_id: Some(definition_id.to_string()),
+            definition_version: Some(definition_version),
+            definition_hash: None,
+        }
+    }
+
     /// A validator bound to the exact declarative definition a pin resolved to.
     pub fn for_declarative(definition_id: &str, definition_version: u32, hash: &str) -> Self {
         Self {

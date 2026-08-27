@@ -282,13 +282,24 @@ impl WorkflowDefinitionRegistry {
             // the store can re-verify at commit that this validator still
             // governs the row it loaded (GH-1864).
             DeclarativeDefinitionResolution::Resolved(definition) => {
-                Ok(Some(DecisionValidator::for_declarative_definition(
-                    &instance.definition_id,
-                    definition.definition_version(),
-                    definition.definition_hash(),
-                    definition.registered().allowlist.clone(),
-                    definition.registered().states.clone(),
-                )))
+                if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+                    && definition.definition_version() == 1
+                {
+                    Ok(Some(DecisionValidator::for_versioned_definition(
+                        &instance.definition_id,
+                        definition.definition_version(),
+                        definition.registered().allowlist.clone(),
+                        definition.registered().states.clone(),
+                    )))
+                } else {
+                    Ok(Some(DecisionValidator::for_declarative_definition(
+                        &instance.definition_id,
+                        definition.definition_version(),
+                        definition.definition_hash(),
+                        definition.registered().allowlist.clone(),
+                        definition.registered().states.clone(),
+                    )))
+                }
             }
             DeclarativeDefinitionResolution::PinError(error) => Err(error),
             DeclarativeDefinitionResolution::NotDeclarative => {

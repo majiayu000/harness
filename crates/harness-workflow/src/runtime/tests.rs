@@ -65,6 +65,8 @@ include!("tests/declarative_validation.rs");
 include!("tests/declarative_interpreter.rs");
 include!("tests/declarative_recovery_integration.rs");
 include!("tests/driverless_progress.rs");
+include!("tests/job_claim_command_fence.rs");
+include!("tests/version_only_selectors.rs");
 
 mod eval_cancellation_ack;
 mod evidence;

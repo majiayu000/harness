@@ -275,8 +275,8 @@ impl WorkflowRuntimeStore {
                 workflow.state
             );
         }
-        let command_status: Option<(String,)> = sqlx::query_as(
-            "SELECT status FROM workflow_commands
+        let command_status: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, superseded_by_command_id FROM workflow_commands
              WHERE id = $1 AND workflow_id = $2
              FOR UPDATE",
         )
@@ -284,19 +284,18 @@ impl WorkflowRuntimeStore {
         .bind(&workflow_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((command_status,)) = command_status else {
+        let Some((command_status, superseded_by_command_id)) = command_status else {
             anyhow::bail!("workflow command not found: {command_id}");
         };
         let command_status = WorkflowCommandStatus::try_from(command_status.as_str())?;
-        if !matches!(
-            command_status,
-            WorkflowCommandStatus::Pending
-                | WorkflowCommandStatus::Dispatching
-                | WorkflowCommandStatus::Dispatched
-                | WorkflowCommandStatus::Deferred
-        ) {
+        if superseded_by_command_id.is_some()
+            || !matches!(
+                command_status,
+                WorkflowCommandStatus::Pending | WorkflowCommandStatus::Dispatched
+            )
+        {
             anyhow::bail!(
-                "cannot enqueue runtime job for command `{command_id}` in status `{command_status}`"
+                "cannot enqueue runtime job for stale or non-executable command `{command_id}` in status `{command_status}`"
             );
         };
         sqlx::query(
@@ -313,6 +312,21 @@ impl WorkflowRuntimeStore {
         .bind(&data)
         .execute(&mut *tx)
         .await?;
+        if command_status == WorkflowCommandStatus::Pending {
+            let updated = sqlx::query(
+                "UPDATE workflow_commands
+                 SET status = $2, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1 AND status = $3 AND superseded_by_command_id IS NULL",
+            )
+            .bind(command_id)
+            .bind(WorkflowCommandStatus::Dispatched.as_str())
+            .bind(WorkflowCommandStatus::Pending.as_str())
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                anyhow::bail!("workflow command fence changed during runtime job enqueue");
+            }
+        }
         super::artifacts::reconcile_runtime_transcript_dependencies_tx(&mut tx, &workflow_id)
             .await?;
         tx.commit().await?;

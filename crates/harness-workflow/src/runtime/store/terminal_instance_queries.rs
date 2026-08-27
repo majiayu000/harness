@@ -41,7 +41,6 @@ impl WorkflowRuntimeStore {
                        FROM unnest($3::bigint[], $4::text[])
                            AS legacy(definition_version, state)
                        WHERE legacy.definition_version = (data->>'definition_version')::bigint
-                         AND data->'data'->>'definition_hash' IS NULL
                          AND legacy.state = workflow_instances.state
                    )
                    OR EXISTS (
@@ -101,7 +100,6 @@ impl WorkflowRuntimeStore {
                        FROM unnest($3::bigint[], $4::text[])
                            AS legacy(definition_version, state)
                        WHERE legacy.definition_version = (data->>'definition_version')::bigint
-                         AND data->'data'->>'definition_hash' IS NULL
                          AND legacy.state = workflow_instances.state
                    )
                    OR EXISTS (
@@ -152,7 +150,6 @@ impl WorkflowRuntimeStore {
                        FROM unnest($4::bigint[], $5::text[])
                            AS legacy(definition_version, state)
                        WHERE legacy.definition_version = (data->>'definition_version')::bigint
-                         AND data->'data'->>'definition_hash' IS NULL
                          AND legacy.state = workflow_instances.state
                    )
                    OR EXISTS (

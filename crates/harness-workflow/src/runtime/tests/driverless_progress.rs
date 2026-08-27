@@ -8,6 +8,11 @@ async fn driverless_progress_reports_only_unowned_command_driven_instances() -> 
 
     let driverless = driverless_progress_instance(&store, "driverless", "implementing").await?;
     let driverless_decision = accepted_state_entry(&store, &driverless, "implementing").await?;
+    let payload_hash = issue_instance("implementing")
+        .with_id("driverless-progress-payload-hash")
+        .with_server_data(json!({ "definition_hash": "ordinary-v1-payload" }));
+    store.force_upsert_lifecycle_state_for_test(&payload_hash).await?;
+    accepted_state_entry(&store, &payload_hash, "implementing").await?;
 
     let active = driverless_progress_instance(&store, "active", "implementing").await?;
     let active_decision = accepted_state_entry(&store, &active, "implementing").await?;
@@ -181,6 +186,10 @@ async fn driverless_progress_reports_only_unowned_command_driven_instances() -> 
         .collect();
     assert_eq!(
         by_id[driverless.id.as_str()].provenance_status,
+        super::store::DriverlessProgressProvenanceStatus::Established
+    );
+    assert_eq!(
+        by_id[payload_hash.id.as_str()].provenance_status,
         super::store::DriverlessProgressProvenanceStatus::Established
     );
     assert_eq!(

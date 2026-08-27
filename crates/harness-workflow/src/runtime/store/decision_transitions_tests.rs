@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::runtime::validator::TransitionAllowlist;
-use crate::runtime::{WorkflowCommand, WorkflowCommandType, WorkflowSubject};
+use crate::runtime::{
+    WorkflowCommand, WorkflowCommandType, WorkflowDefinitionRegistry, WorkflowSubject,
+};
 use chrono::{Duration, Utc};
 use harness_core::db::resolve_database_url;
 use serde_json::json;
@@ -592,6 +594,10 @@ async fn apply_decision_transition_with_validator_ignores_unpinned_definition_ha
     let mut final_instance = initial.clone();
     final_instance.state = decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
+    let validator = WorkflowDefinitionRegistry::with_builtins()
+        .decision_validator_for_instance(&initial)
+        .expect("the historical built-in definition should resolve")
+        .expect("the historical built-in validator should resolve");
 
     let record = store
         .apply_decision_transition_with_validator(
@@ -605,7 +611,7 @@ async fn apply_decision_transition_with_validator_ignores_unpinned_definition_ha
                 final_instance: &final_instance,
                 command_status: WorkflowCommandStatus::Pending,
             },
-            &DecisionValidator::github_issue_pr(),
+            &validator,
             ValidationContext::new("workflow-runtime-test", Utc::now()),
         )
         .await?
@@ -613,7 +619,8 @@ async fn apply_decision_transition_with_validator_ignores_unpinned_definition_ha
 
     assert!(
         record.accepted,
-        "a built-in validator must not read data.definition_hash as a pin"
+        "a built-in validator must not read data.definition_hash as a pin: {:?}",
+        record.rejection_reason
     );
     assert_eq!(
         store

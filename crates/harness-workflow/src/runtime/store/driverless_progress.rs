@@ -93,7 +93,6 @@ impl WorkflowRuntimeStore {
                           registered.definition_version =
                               (instance.data->>'definition_version')::bigint
                           AND registered.definition_hash IS NULL
-                          AND instance.data->'data'->>'definition_hash' IS NULL
                       )
                       OR (
                           registered.definition_version =

@@ -58,6 +58,8 @@ fn current_issue_instance(state: &str) -> WorkflowInstance {
     )
     .with_server_data(json!({
         "definition_hash": github_issue_pr_definition_hash(),
+        "issue_number": 123,
+        "repo": "owner/repo",
     }))
 }
 

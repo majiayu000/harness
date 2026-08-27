@@ -764,7 +764,7 @@ async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
     let cutoff = Utc::now() - Duration::days(30);
     assert_eq!(
         store.count_terminal_history_candidates(cutoff, 100).await?,
-        3
+        4
     );
     assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
 
@@ -772,7 +772,7 @@ async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
     assert_eq!(summary.workflow_instances_deleted, 1);
     assert_eq!(
         store.count_terminal_history_candidates(cutoff, 100).await?,
-        2
+        3
     );
     assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
     assert!(store.get_instance(&terminal_a.id).await?.is_none());
