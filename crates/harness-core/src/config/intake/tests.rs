@@ -1,12 +1,12 @@
 use super::*;
 
 #[test]
-fn auto_merge_defaults_preserve_agent_compatibility() {
+fn auto_merge_defaults_use_the_server_mutation_fence() {
     let config = GitHubAutoMergeConfig::default();
 
     assert!(!config.enabled);
-    assert!(config.delete_branch);
-    assert_eq!(config.merge_execution, GitHubMergeExecution::Agent);
+    assert!(!config.delete_branch);
+    assert_eq!(config.merge_execution, GitHubMergeExecution::Server);
 }
 
 #[test]
@@ -188,7 +188,7 @@ method = "squash"
 delete_branch = true
 require_review_threads_resolved = true
 require_clean_merge_state = true
-merge_execution = "agent"
+merge_execution = "server"
 verify_merge_completion = true
 
 [[repos]]
@@ -213,7 +213,7 @@ label = "harness"
     assert!(!auto.delete_branch);
     assert!(!auto.require_review_threads_resolved);
     assert!(!auto.require_clean_merge_state);
-    assert_eq!(auto.merge_execution, GitHubMergeExecution::Agent);
+    assert_eq!(auto.merge_execution, GitHubMergeExecution::Server);
     assert!(auto.verify_merge_completion);
 
     let manual = config.auto_merge_policy_for_repo("owner/manual");
@@ -222,7 +222,7 @@ label = "harness"
     assert!(manual.delete_branch);
     assert!(manual.require_review_threads_resolved);
     assert!(manual.require_clean_merge_state);
-    assert_eq!(manual.merge_execution, GitHubMergeExecution::Agent);
+    assert_eq!(manual.merge_execution, GitHubMergeExecution::Server);
     assert!(manual.verify_merge_completion);
 }
 #[test]

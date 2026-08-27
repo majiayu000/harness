@@ -225,6 +225,7 @@ pub(super) fn merge_runtime_merge_data(
         object.insert("last_decision".to_string(), json!(decision));
         object.insert("merge_approved_at".to_string(), json!(chrono::Utc::now()));
         object.insert("merge_delete_branch".to_string(), json!(delete_branch));
+        object.insert("merge_execution".to_string(), json!("server"));
         object.insert(
             "merge_require_review_threads_resolved".to_string(),
             json!(require_review_threads_resolved),

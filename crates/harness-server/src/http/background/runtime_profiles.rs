@@ -238,7 +238,6 @@ fn resolve_runtime_dispatch_profiles(
     for (activity, override_policy) in &policy.activity_profiles {
         let profile =
             apply_runtime_dispatch_profile_override(config, &default_profile, override_policy)?;
-        validate_classifier_runtime_profile(activity, &profile)?;
         activity_profiles.insert(activity.clone(), profile);
     }
     let mut workflow_activity_profiles = std::collections::BTreeMap::new();
@@ -250,7 +249,6 @@ fn resolve_runtime_dispatch_profiles(
                 .unwrap_or(&default_profile);
             let profile =
                 apply_runtime_dispatch_profile_override(config, base_profile, override_policy)?;
-            validate_classifier_runtime_profile(activity, &profile)?;
             workflow_activity_profiles
                 .entry(definition_id.clone())
                 .or_insert_with(std::collections::BTreeMap::new)
@@ -268,18 +266,42 @@ fn resolve_runtime_dispatch_profiles(
 pub(super) fn validate_classifier_runtime_profile(
     activity: &str,
     profile: &RuntimeProfile,
+    classifier_activity: bool,
 ) -> anyhow::Result<()> {
-    if activity == harness_workflow::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY
+    if classifier_activity
         && !matches!(
             profile.kind,
             RuntimeKind::ClaudeCode | RuntimeKind::AnthropicApi
         )
     {
         anyhow::bail!(
-            "classify_change_scope runtime profile `{}` uses `{}`, which cannot enforce classifier isolation and report the provider model identity",
+            "classifier activity `{activity}` runtime profile `{}` uses `{}`, which cannot enforce classifier isolation and report the provider model identity",
             profile.name,
             profile.kind.as_str()
         );
+    }
+    Ok(())
+}
+
+pub(super) fn validate_classifier_runtime_profile_selection<'a>(
+    classifier_activities: impl IntoIterator<Item = &'a str>,
+    policy: &harness_core::config::workflow::RuntimeDispatchPolicy,
+    selector: &RuntimeProfileSelector,
+) -> anyhow::Result<()> {
+    let definition_ids = policy
+        .workflow_profiles
+        .keys()
+        .chain(policy.workflow_activity_profiles.keys())
+        .collect::<std::collections::BTreeSet<_>>();
+    for activity in classifier_activities {
+        validate_classifier_runtime_profile(activity, selector.select(None, Some(activity)), true)?;
+        for definition_id in &definition_ids {
+            validate_classifier_runtime_profile(
+                activity,
+                selector.select(Some(definition_id), Some(activity)),
+                true,
+            )?;
+        }
     }
     Ok(())
 }
@@ -607,9 +629,32 @@ mod tests {
             }
         }));
 
-        let error = runtime_dispatch_profile_selector(&config, &policy, &inherited)
-            .expect_err("Codex cannot provide classifier model attestation");
+        let selector = runtime_dispatch_profile_selector(&config, &policy, &inherited)
+            .expect("runtime profiles resolve structurally");
+        let error = validate_classifier_runtime_profile_selection(
+            [harness_workflow::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY],
+            &policy,
+            &selector,
+        )
+        .expect_err("Codex cannot provide classifier model attestation");
         assert!(error.to_string().contains("classify_change_scope"));
         assert!(error.to_string().contains("provider model identity"));
+    }
+
+    #[test]
+    fn custom_classifier_rejects_an_unsupported_default_profile() {
+        let policy = dispatch_policy(serde_json::json!({}));
+        let selector = RuntimeProfileSelector::new(RuntimeProfile::new(
+            "codex-default",
+            RuntimeKind::CodexJsonrpc,
+        ));
+
+        let error = validate_classifier_runtime_profile_selection(
+            ["assess_architecture_risk"],
+            &policy,
+            &selector,
+        )
+        .expect_err("custom classifiers require an attesting backend");
+        assert!(error.to_string().contains("assess_architecture_risk"));
     }
 }

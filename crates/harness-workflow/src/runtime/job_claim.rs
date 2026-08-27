@@ -345,7 +345,7 @@ fn server_owned_job_kind(
     let Some(activity) = job.input.get("activity").and_then(|value| value.as_str()) else {
         return Ok(None);
     };
-    if activity == "merge_pr" && super::scope_review::workflow_uses_server_merge(workflow) {
+    if super::scope_review::is_github_merge_activity(workflow, activity) {
         return Ok(Some(ServerOwnedJobKind::Merge));
     }
     Ok(

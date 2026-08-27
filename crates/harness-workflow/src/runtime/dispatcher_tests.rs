@@ -95,7 +95,7 @@ fn remote_merge_profile_is_forced_onto_the_local_server_worker() -> anyhow::Resu
 }
 
 #[test]
-fn agent_merge_profile_is_not_intercepted() -> anyhow::Result<()> {
+fn legacy_agent_merge_profile_is_intercepted_for_safe_rejection() -> anyhow::Result<()> {
     let instance = WorkflowInstance::new(
         crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
         crate::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
@@ -115,8 +115,8 @@ fn agent_merge_profile_is_not_intercepted() -> anyhow::Result<()> {
         &mut profile,
     )?;
 
-    assert_eq!(profile.kind, RuntimeKind::RemoteHost);
-    assert_eq!(profile.name, "remote-merge");
+    assert_eq!(profile.kind, RuntimeKind::CodexExec);
+    assert_eq!(profile.name, "server-owned-merge");
     Ok(())
 }
 

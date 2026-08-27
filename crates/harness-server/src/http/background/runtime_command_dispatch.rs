@@ -354,6 +354,21 @@ async fn runtime_dispatch_profile_selector_for_command(
     )
     .await
     .map_err(RuntimeDispatchProfileSelectionError::Other)?;
+    let mut profile_selector = runtime_dispatch_profile_selector(
+        &state.core.server.config,
+        &workflow_cfg.runtime_dispatch,
+        &inherited_profile,
+    )
+    .map_err(RuntimeDispatchProfileSelectionError::Other)?;
+    super::validate_classifier_runtime_profile_selection(
+        workflow_cfg
+            .activities
+            .iter()
+            .filter_map(|(activity, policy)| policy.classifier.as_ref().map(|_| activity.as_str())),
+        &workflow_cfg.runtime_dispatch,
+        &profile_selector,
+    )
+    .map_err(RuntimeDispatchProfileSelectionError::Other)?;
     persist_runtime_profile_manifest(
         store,
         &project_root,
@@ -363,36 +378,43 @@ async fn runtime_dispatch_profile_selector_for_command(
     )
     .await
     .map_err(RuntimeDispatchProfileSelectionError::Other)?;
-    let mut profile_selector = runtime_dispatch_profile_selector(
-        &state.core.server.config,
-        &workflow_cfg.runtime_dispatch,
-        &inherited_profile,
-    )
-    .map_err(RuntimeDispatchProfileSelectionError::Other)?;
     if let Some(instance) = store
         .get_instance(&command.workflow_id)
         .await
         .map_err(RuntimeDispatchProfileSelectionError::Other)?
     {
+        let activity = command.command.runtime_activity_key();
         if let Some(execution_policy) =
             crate::workflow_runtime_submission::prompt_execution_policy(&instance.data)
                 .map_err(RuntimeDispatchProfileSelectionError::Other)?
         {
-            let activity = command.command.runtime_activity_key();
             let profile = runtime_profile_with_prompt_execution_policy(
                 &state.core.server.config,
                 profile_selector.select(Some(&instance.definition_id), Some(activity)),
                 &execution_policy,
             )
             .map_err(RuntimeDispatchProfileSelectionError::Other)?;
-            super::validate_classifier_runtime_profile(activity, &profile)
-                .map_err(RuntimeDispatchProfileSelectionError::Other)?;
             profile_selector = profile_selector.with_workflow_activity_profile(
-                instance.definition_id,
+                instance.definition_id.clone(),
                 activity,
                 profile,
             );
         }
+        let classifier_activity = store
+            .definition_registry()
+            .instance_has_classifier_activity(&instance, activity)
+            .map_err(|error| {
+                RuntimeDispatchProfileSelectionError::Other(anyhow::anyhow!(
+                    "workflow {} has an invalid declarative definition pin: {error:?}",
+                    instance.id
+                ))
+            })?;
+        super::validate_classifier_runtime_profile(
+            activity,
+            profile_selector.select(Some(&instance.definition_id), Some(activity)),
+            classifier_activity,
+        )
+        .map_err(RuntimeDispatchProfileSelectionError::Other)?;
     }
     Ok(Some(profile_selector))
 }

@@ -197,7 +197,7 @@ pub use repo_memory::{
     REPO_MEMORY_DEGRADATION_ARTIFACT,
 };
 pub use scope_review::{
-    workflow_uses_server_merge, CHANGE_SCOPE_REVIEW_ACTIVITY,
+    is_github_merge_activity, workflow_uses_server_merge, CHANGE_SCOPE_REVIEW_ACTIVITY,
     PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD,
 };
 pub use state_registry::{

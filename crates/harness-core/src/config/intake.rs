@@ -56,8 +56,8 @@ impl fmt::Display for GitHubMergeMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GitHubMergeExecution {
-    #[default]
     Agent,
+    #[default]
     Server,
 }
 
@@ -84,8 +84,8 @@ pub struct GitHubAutoMergeConfig {
     #[serde(default = "default_true")]
     pub require_clean_merge_state: bool,
     /// Who executes the merge action once the server-side gate passes.
-    /// Agent execution remains the compatibility default. Server execution is
-    /// fail-closed when GitHub cannot provide the requested atomic preconditions.
+    /// Agent execution is parsed for compatibility but rejected before
+    /// dispatch because an external agent cannot share the server mutation fence.
     #[serde(default)]
     pub merge_execution: GitHubMergeExecution,
     /// Verify agent-reported merge completion with a server-side GitHub read.
@@ -410,10 +410,10 @@ impl Default for GitHubAutoMergeConfig {
         Self {
             enabled: false,
             method: GitHubMergeMethod::Squash,
-            delete_branch: true,
+            delete_branch: false,
             require_review_threads_resolved: true,
             require_clean_merge_state: true,
-            merge_execution: GitHubMergeExecution::Agent,
+            merge_execution: GitHubMergeExecution::Server,
             verify_merge_completion: true,
         }
     }

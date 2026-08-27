@@ -85,10 +85,14 @@ pub(crate) fn runtime_job_requires_local_server(
     let Some(activity) = job.input.get("activity").and_then(Value::as_str) else {
         return Ok(false);
     };
-    if activity == "merge_pr" && workflow_uses_server_merge(workflow) {
+    if is_github_merge_activity(workflow, activity) {
         return Ok(true);
     }
     registry.instance_has_classifier_activity(workflow, activity)
+}
+
+pub fn is_github_merge_activity(workflow: &WorkflowInstance, activity: &str) -> bool {
+    workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && activity == "merge_pr"
 }
 
 pub fn workflow_uses_server_merge(workflow: &WorkflowInstance) -> bool {
@@ -193,7 +197,7 @@ mod server_merge_tests {
         );
         assert_eq!(
             runtime_job_requires_local_server(&registry, &workflow("agent"), &merge_job()),
-            Ok(false)
+            Ok(true)
         );
     }
 

@@ -8,7 +8,8 @@
 //! rollback if agents have not yet caught up with the contract.
 
 use super::{
-    builtin_registered_definitions, RegisteredWorkflowDefinition, WorkflowDefinitionRegistry,
+    builtin_definitions, builtin_registered_definitions, versioning::github_issue_pr_v1_definition,
+    RegisteredWorkflowDefinition, WorkflowDefinitionRegistry,
 };
 
 impl WorkflowDefinitionRegistry {
@@ -34,7 +35,45 @@ impl WorkflowDefinitionRegistry {
     /// policy. Disabling enforcement strips the declared evidence requirements
     /// while leaving every other transition rule intact.
     pub fn apply_builtin_evidence_enforcement(&mut self, enforced: bool) -> anyhow::Result<()> {
-        self.apply_evidence_enforcement(builtin_registered_definitions(), enforced)
+        let mut staged = self.clone();
+        staged.apply_evidence_enforcement(builtin_registered_definitions(), enforced)?;
+        for definition in builtin_definitions()
+            .into_iter()
+            .chain(std::iter::once(github_issue_pr_v1_definition()))
+        {
+            let key = (
+                definition.policy().id.clone(),
+                definition.definition_version(),
+            );
+            if !staged.declarative_versions.contains_key(&key) {
+                anyhow::bail!(
+                    "built-in workflow definition '{}@{}' is not registered; cannot apply the completion-evidence policy",
+                    key.0,
+                    key.1
+                );
+            }
+            let effective = if enforced {
+                definition
+            } else {
+                let allowlist = definition
+                    .registered()
+                    .allowlist
+                    .clone()
+                    .without_required_evidence();
+                definition.with_effective_allowlist(allowlist)
+            };
+            if staged.current_declarative_versions.get(&key.0) == Some(&key.1) {
+                staged.definitions.insert(
+                    key.0.clone(),
+                    std::sync::Arc::new(effective.registered().clone()),
+                );
+            }
+            staged
+                .declarative_versions
+                .insert(key, std::sync::Arc::new(effective));
+        }
+        *self = staged;
+        Ok(())
     }
 
     fn apply_evidence_enforcement(
@@ -123,6 +162,40 @@ mod tests {
                 .expect("built-in definition stays registered");
             let expected = builtin.allowlist.rules().count();
             assert_eq!(registered.allowlist.rules().count(), expected);
+        }
+    }
+
+    #[test]
+    fn disabled_policy_strips_versioned_github_issue_pr_contracts() {
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry
+            .apply_builtin_evidence_enforcement(false)
+            .expect("kill switch applies to versioned built-ins");
+
+        let v1 = WorkflowInstance::new(
+            crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "merging",
+            WorkflowSubject::new("issue", "issue:v1"),
+        );
+        let v2 = WorkflowInstance::new(
+            crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            crate::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
+            "merging",
+            WorkflowSubject::new("issue", "issue:v2"),
+        )
+        .with_server_data(json!({
+            "definition_hash": crate::runtime::github_issue_pr_definition_hash(),
+        }));
+
+        for instance in [&v1, &v2] {
+            let definition = registry
+                .definition_for_instance(instance)
+                .expect("versioned built-in definition resolves");
+            assert!(definition
+                .allowlist
+                .rules()
+                .all(|rule| rule.required_evidence.is_empty()));
         }
     }
 

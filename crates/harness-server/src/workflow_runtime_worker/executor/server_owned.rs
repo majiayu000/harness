@@ -272,11 +272,24 @@ pub(super) async fn execute(
             ))
         }
         "merge_pr"
-            if super::super::server_merge::server_merge_execution_enabled(state, job, parent) =>
+            if parent.is_some_and(|workflow| {
+                harness_workflow::runtime::is_github_merge_activity(workflow, "merge_pr")
+            }) =>
         {
-            Ok(Some(
-                super::super::server_merge::execute_server_merge(state, job, parent).await,
-            ))
+            if super::super::server_merge::server_merge_execution_enabled(state, job, parent) {
+                Ok(Some(
+                    super::super::server_merge::execute_server_merge(state, job, parent).await,
+                ))
+            } else {
+                Ok(Some(
+                    ActivityResult::failed(
+                        "merge_pr",
+                        "Unsafe agent merge execution was rejected before mutation.",
+                        "automated merges require merge_execution=server and the server mutation fence",
+                    )
+                    .with_error_kind(ActivityErrorKind::Configuration),
+                ))
+            }
         }
         _ => Ok(None),
     }

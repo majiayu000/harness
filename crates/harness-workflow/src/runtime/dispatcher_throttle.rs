@@ -24,8 +24,8 @@ pub(super) fn force_server_owned_profile(
     activity: &str,
     profile: &mut RuntimeProfile,
 ) -> anyhow::Result<()> {
-    let server_merge = activity == "merge_pr"
-        && instance.is_some_and(super::scope_review::workflow_uses_server_merge);
+    let server_merge = instance
+        .is_some_and(|instance| super::scope_review::is_github_merge_activity(instance, activity));
     if server_merge {
         // The in-process worker excludes RemoteHost jobs and intercepts merge_pr
         // before resolving an agent, so no remote runtime sees the mutation job.

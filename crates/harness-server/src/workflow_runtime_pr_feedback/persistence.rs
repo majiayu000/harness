@@ -558,12 +558,14 @@ pub(super) async fn approve_runtime_merge(
     let merge_method = optional_string_field(&instance.data, "merge_method")
         .unwrap_or_else(|| "squash".to_string());
     let merge_execution = optional_string_field(&instance.data, "merge_execution")
-        .unwrap_or_else(|| "agent".to_string())
+        .unwrap_or_else(|| "server".to_string())
         .to_ascii_lowercase();
-    if !matches!(merge_execution.as_str(), "agent" | "server") {
+    if merge_execution != "server" {
         return Ok(RuntimeMergeApprovalOutcome::Rejected {
             workflow_id,
-            reason: format!("unsupported merge_execution `{merge_execution}`"),
+            reason: format!(
+                "merge_execution `{merge_execution}` is unsafe; automated merges require the server mutation fence"
+            ),
         });
     }
     if crate::http::auto_merge::expected_base_ref_from_workflow_data(&instance.data).is_some() {
@@ -573,8 +575,8 @@ pub(super) async fn approve_runtime_merge(
                 .to_string(),
         });
     }
-    let delete_branch = optional_bool_field(&instance.data, "merge_delete_branch").unwrap_or(true);
-    if merge_execution == "server" && delete_branch {
+    let delete_branch = optional_bool_field(&instance.data, "merge_delete_branch").unwrap_or(false);
+    if delete_branch {
         return Ok(RuntimeMergeApprovalOutcome::Rejected {
             workflow_id,
             reason: "server-owned merge cannot safely delete the source branch atomically"

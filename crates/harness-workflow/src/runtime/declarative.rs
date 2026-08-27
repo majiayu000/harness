@@ -87,6 +87,14 @@ impl DeclarativeWorkflowDefinition {
     pub fn into_registered(self) -> RegisteredWorkflowDefinition {
         self.registered
     }
+
+    pub(crate) fn with_effective_allowlist(mut self, allowlist: TransitionAllowlist) -> Self {
+        // Completion-evidence enforcement is an operational overlay, not a
+        // new declarative identity. Keep the pinned version/hash while making
+        // the reducer and validator observe the same effective contract.
+        self.registered.allowlist = allowlist;
+        self
+    }
 }
 
 /// Validates and compiles a declarative workflow without registering it.
