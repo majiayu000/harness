@@ -1,5 +1,8 @@
 use super::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT;
-use super::{ActivityResult, WorkflowCommand, WorkflowCommandType};
+use super::{
+    ActivityResult, RuntimeJob, WorkflowCommand, WorkflowCommandType, WorkflowDefinitionRegistry,
+    WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
+};
 use serde_json::{json, Value};
 
 pub const CHANGE_SCOPE_REVIEW_ACTIVITY: &str = "classify_change_scope";
@@ -11,6 +14,18 @@ pub(crate) fn has_server_classifier_assessment(result: &ActivityResult) -> bool 
         .artifacts
         .iter()
         .any(|artifact| artifact.artifact_type == ARTIFACT_CLASSIFIER_ASSESSMENT)
+}
+
+pub(crate) fn runtime_job_requires_local_server(
+    registry: &WorkflowDefinitionRegistry,
+    workflow: &WorkflowInstance,
+    job: &RuntimeJob,
+) -> bool {
+    let Some(activity) = job.input.get("activity").and_then(Value::as_str) else {
+        return false;
+    };
+    (workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && activity == "merge_pr")
+        || registry.definition_has_classifier_activity(&workflow.definition_id, activity)
 }
 
 pub(crate) fn enqueue_pr_scope_review(

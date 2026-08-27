@@ -50,6 +50,15 @@ impl GitHubPrMergeError {
         }
     }
 
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            error_kind: ActivityErrorKind::Fatal,
+            message: message.into(),
+            status_code: None,
+            response_body: None,
+        }
+    }
+
     fn status(status: StatusCode, body: String) -> Self {
         let message = github_error_message(&body)
             .unwrap_or_else(|| format!("GitHub pull request merge failed with status {status}"));
@@ -157,6 +166,7 @@ pub(crate) async fn delete_pull_request_head_branch(
     target: &GitHubPrSnapshotTarget,
     github_token: Option<&str>,
     head_ref: &str,
+    expected_head_sha: &str,
 ) -> Result<Value, GitHubPrMergeError> {
     let client = reqwest::Client::new();
     delete_pull_request_head_branch_with_client(
@@ -165,6 +175,7 @@ pub(crate) async fn delete_pull_request_head_branch(
         target,
         github_token,
         head_ref,
+        expected_head_sha,
     )
     .await
 }
@@ -175,6 +186,7 @@ async fn delete_pull_request_head_branch_with_client(
     target: &GitHubPrSnapshotTarget,
     github_token: Option<&str>,
     head_ref: &str,
+    expected_head_sha: &str,
 ) -> Result<Value, GitHubPrMergeError> {
     let token = crate::github_auth::resolve_github_token(github_token).ok_or_else(|| {
         GitHubPrMergeError::configuration(
@@ -200,6 +212,45 @@ async fn delete_pull_request_head_branch_with_client(
         .map_err(|_| GitHubPrMergeError::configuration("GitHub API base URL cannot be a base"))?
         .pop_if_empty()
         .extend(["repos", owner, repo, "git", "refs", "heads", head_ref]);
+    let observed = tokio::time::timeout(
+        GITHUB_MERGE_TIMEOUT,
+        client
+            .get(url.clone())
+            .header(ACCEPT, "application/vnd.github+json")
+            .header(USER_AGENT, "harness-server")
+            .bearer_auth(&token)
+            .send(),
+    )
+    .await
+    .map_err(|_| GitHubPrMergeError::external("GitHub branch verification timed out"))?
+    .map_err(|error| {
+        GitHubPrMergeError::external(format!(
+            "GitHub branch verification request failed: {error}"
+        ))
+    })?;
+    let observed_status = observed.status();
+    let observed_body = observed.text().await.map_err(|error| {
+        GitHubPrMergeError::external(format!(
+            "GitHub branch verification response could not be read: {error}"
+        ))
+    })?;
+    if !observed_status.is_success() {
+        return Err(GitHubPrMergeError::status(observed_status, observed_body));
+    }
+    let observed_sha = serde_json::from_str::<Value>(&observed_body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/object/sha")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .ok_or_else(|| GitHubPrMergeError::external("GitHub ref response is missing object.sha"))?;
+    if observed_sha != expected_head_sha {
+        return Err(GitHubPrMergeError::fatal(format!(
+            "ref heads/{head_ref} advanced from assessed head {expected_head_sha} to {observed_sha}; refusing branch deletion"
+        )));
+    }
     let response = tokio::time::timeout(
         GITHUB_MERGE_TIMEOUT,
         client
@@ -272,7 +323,7 @@ mod tests {
     use super::*;
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, StatusCode as AxumStatusCode};
-    use axum::routing::{delete, put};
+    use axum::routing::{get, put};
     use axum::{Json, Router};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -361,13 +412,17 @@ mod tests {
             AxumStatusCode::NO_CONTENT
         }
 
+        async fn ref_handler() -> Json<Value> {
+            Json(json!({"object": {"sha": "head-sha"}}))
+        }
+
         let captured = Captured::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let app = Router::new()
             .route(
                 "/repos/owner/repo/git/refs/heads/{*branch}",
-                delete(handler),
+                get(ref_handler).delete(handler),
             )
             .with_state(captured.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -379,6 +434,7 @@ mod tests {
             &target,
             Some("cfg-token"),
             "feature/nested",
+            "head-sha",
         )
         .await?;
 
@@ -387,6 +443,19 @@ mod tests {
             captured.0.lock().expect("branch lock").as_deref(),
             Some("feature/nested")
         );
+        *captured.0.lock().expect("branch lock") = None;
+        let error = delete_pull_request_head_branch_with_client(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            &target,
+            Some("cfg-token"),
+            "feature/nested",
+            "stale-head",
+        )
+        .await
+        .expect_err("advanced branch must not be deleted");
+        assert_eq!(error.error_kind, ActivityErrorKind::Fatal);
+        assert_eq!(*captured.0.lock().expect("branch lock"), None);
         server.abort();
         Ok(())
     }

@@ -171,21 +171,24 @@ impl WorkflowRuntimeStore {
             // eligibility while taking the child-row lock because another
             // legacy writer could still have changed the candidate.
             let row: Option<(String,)> = sqlx::query_as(
-                "SELECT data::text FROM runtime_jobs
-                 WHERE id = $1
+                "SELECT job.data::text FROM runtime_jobs AS job
+                 JOIN workflow_commands AS command ON command.id = job.command_id
+                 WHERE job.id = $1
+                   AND command.status = 'dispatched'
+                   AND command.superseded_by_command_id IS NULL
                    AND (
                        (
-                           status = 'pending'
-                           AND (not_before IS NULL OR not_before <= CURRENT_TIMESTAMP)
+                           job.status = 'pending'
+                           AND (job.not_before IS NULL OR job.not_before <= CURRENT_TIMESTAMP)
                        ) OR (
-                           status = 'running'
-                           AND data ? 'lease'
-                           AND (data->'lease' ? 'expires_at')
-                           AND (data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
+                           job.status = 'running'
+                           AND job.data ? 'lease'
+                           AND (job.data->'lease' ? 'expires_at')
+                           AND (job.data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
                        )
                    )
-                   AND data #> '{input,cancellation_requested}' IS NULL
-                 FOR UPDATE",
+                   AND job.data #> '{input,cancellation_requested}' IS NULL
+                 FOR UPDATE OF command, job",
             )
             .bind(&id)
             .fetch_optional(&mut *tx)
@@ -269,10 +272,8 @@ fn server_owned_job_kind(
     if workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && activity == "merge_pr" {
         return Some(ServerOwnedJobKind::Merge);
     }
-    registry
-        .declarative_definition_for_instance(workflow)
-        .filter(|definition| definition.classifier_activities().contains(activity))
-        .map(|_| ServerOwnedJobKind::Classifier)
+    super::scope_review::runtime_job_requires_local_server(registry, workflow, job)
+        .then_some(ServerOwnedJobKind::Classifier)
 }
 
 async fn reroute_legacy_remote_server_owned_job(

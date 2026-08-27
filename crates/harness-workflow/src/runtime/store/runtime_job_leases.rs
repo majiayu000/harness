@@ -198,16 +198,23 @@ impl WorkflowRuntimeStore {
             tx.commit().await?;
             return Ok(RuntimeJobLeaseRenewalOutcome::NotFound);
         }
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
-                .bind(request.runtime_job_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((data,)) = row else {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT job.data::text, workflow.data::text
+             FROM runtime_jobs AS job
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+             WHERE job.id = $1
+             FOR UPDATE OF job",
+        )
+        .bind(request.runtime_job_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((data, workflow_data)) = row else {
             tx.commit().await?;
             return Ok(RuntimeJobLeaseRenewalOutcome::NotFound);
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        let workflow = super::workflow_instance_from_persisted_json(&workflow_data)?;
         let request_previous_expires_at = postgres_timestamp_floor(request.previous_expires_at);
 
         sqlx::query(
@@ -220,7 +227,15 @@ impl WorkflowRuntimeStore {
         .await?;
 
         let cancellation_requested = job.input.get("cancellation_requested").is_some();
-        let rejection = if cancellation_requested && !cancellation_ack {
+        let server_owned_remote_job =
+            crate::runtime::scope_review::runtime_job_requires_local_server(
+                &self.definition_registry,
+                &workflow,
+                &job,
+            );
+        let rejection = if server_owned_remote_job {
+            Some(RuntimeJobLeaseRenewalRejection::Revoked)
+        } else if cancellation_requested && !cancellation_ack {
             Some(RuntimeJobLeaseRenewalRejection::CancellationRequested)
         } else if cancellation_ack && !cancellation_requested {
             Some(RuntimeJobLeaseRenewalRejection::InvariantViolation)

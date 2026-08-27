@@ -1,9 +1,14 @@
 use crate::http::AppState;
+use crate::{
+    github_pr_merge::delete_pull_request_head_branch,
+    github_pr_snapshot::{value_string, GitHubPrSnapshotArtifacts, GitHubPrSnapshotTarget},
+};
 use harness_core::config::workflow::WorkflowConfig;
 use harness_workflow::runtime::{
     ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, WorkflowCommandStatus,
     WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub(in crate::workflow_runtime_worker) async fn current_merge_authorization(
@@ -60,6 +65,10 @@ pub(in crate::workflow_runtime_worker) async fn current_merge_authorization(
             .as_ref()
             .map(|lease| lease.owner.as_str())
             != job.lease.as_ref().map(|lease| lease.owner.as_str())
+        || persisted_job
+            .lease
+            .as_ref()
+            .is_none_or(|lease| lease.expires_at <= chrono::Utc::now())
     {
         return Err(format!(
             "merge job `{}` no longer owns its current execution lease",
@@ -67,6 +76,120 @@ pub(in crate::workflow_runtime_worker) async fn current_merge_authorization(
         ));
     }
     Ok(workflow)
+}
+
+pub(in crate::workflow_runtime_worker) async fn finish_server_merge(
+    state: &AppState,
+    job: &RuntimeJob,
+    activity: String,
+    target: &GitHubPrSnapshotTarget,
+    snapshot: GitHubPrSnapshotArtifacts,
+    expected_head_sha: &str,
+    outcome: &str,
+    mut merge_call: Option<Value>,
+    delete_branch: bool,
+    github_token: Option<&str>,
+) -> ActivityResult {
+    if delete_branch {
+        let cleanup = match snapshot
+            .normalized_snapshot
+            .get("is_cross_repository")
+            .and_then(Value::as_bool)
+        {
+            Some(true) => json!({"status": "skipped_cross_repository"}),
+            Some(false) => {
+                let current = match current_merge_authorization(state, job).await {
+                    Ok(workflow)
+                        if super::super::merge_completion::required_expected_head_sha_for_merge(
+                            job,
+                            Some(&workflow),
+                        )
+                        .as_deref() == Ok(expected_head_sha) =>
+                    {
+                        workflow
+                    }
+                    Ok(_) => {
+                        return super::super::server_merge::server_merge_head_mismatch(
+                            activity,
+                            target,
+                            snapshot,
+                            expected_head_sha,
+                            merge_call,
+                        );
+                    }
+                    Err(error) => {
+                        return super::super::server_merge::server_merge_failed(
+                            activity,
+                            Some(target),
+                            ActivityErrorKind::Fatal,
+                            "Branch cleanup authorization is no longer current.",
+                            error,
+                            Some(snapshot),
+                            merge_call,
+                            "branch_cleanup_authorization_stale",
+                        );
+                    }
+                };
+                drop(current);
+                let Some(head_ref) = value_string(snapshot.normalized_snapshot.get("head_ref"))
+                else {
+                    return super::super::server_merge::server_merge_failed(
+                        activity,
+                        Some(target),
+                        ActivityErrorKind::Configuration,
+                        "Merged pull request branch cleanup could not resolve the head ref.",
+                        "server PR snapshot is missing head_ref",
+                        Some(snapshot),
+                        merge_call,
+                        "branch_cleanup_missing_head",
+                    );
+                };
+                match delete_pull_request_head_branch(
+                    target,
+                    github_token,
+                    &head_ref,
+                    expected_head_sha,
+                )
+                .await
+                {
+                    Ok(cleanup) => cleanup,
+                    Err(error) => {
+                        return super::super::server_merge::server_merge_failed(
+                            activity,
+                            Some(target),
+                            error.error_kind,
+                            "Merged pull request branch cleanup failed.",
+                            error.to_string(),
+                            Some(snapshot),
+                            merge_call,
+                            "branch_cleanup_failed",
+                        );
+                    }
+                }
+            }
+            None => {
+                return super::super::server_merge::server_merge_failed(
+                    activity,
+                    Some(target),
+                    ActivityErrorKind::Configuration,
+                    "Merged pull request branch cleanup could not establish repository ownership.",
+                    "server PR snapshot is missing is_cross_repository",
+                    Some(snapshot),
+                    merge_call,
+                    "branch_cleanup_repository_unknown",
+                );
+            }
+        };
+        merge_call.get_or_insert_with(|| json!({}))["branch_cleanup"] = cleanup;
+    }
+    super::super::server_merge::server_merge_succeeded(
+        activity,
+        target,
+        snapshot,
+        expected_head_sha,
+        outcome,
+        merge_call,
+    )
 }
 
 pub(super) async fn prepare_classifier(

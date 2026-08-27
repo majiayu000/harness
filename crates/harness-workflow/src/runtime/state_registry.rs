@@ -305,6 +305,14 @@ impl WorkflowDefinitionRegistry {
         }
     }
 
+    pub fn definition_has_classifier_activity(&self, definition_id: &str, activity: &str) -> bool {
+        self.declarative_versions
+            .iter()
+            .any(|((id, _), definition)| {
+                id == definition_id && definition.classifier_activities().contains(activity)
+            })
+    }
+
     pub fn instance_is_declarative(&self, instance: &WorkflowInstance) -> bool {
         !matches!(
             self.resolve_declarative_definition(instance),

@@ -1,6 +1,4 @@
-use crate::github_pr_merge::{
-    delete_pull_request_head_branch, merge_pull_request, GitHubPrMergeError, GitHubPrMergeOptions,
-};
+use crate::github_pr_merge::{merge_pull_request, GitHubPrMergeError, GitHubPrMergeOptions};
 use crate::github_pr_snapshot::{
     fetch_github_pr_snapshot, value_string, GitHubPrSnapshotArtifacts, GitHubPrSnapshotTarget,
     GITHUB_PR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ERROR_ARTIFACT,
@@ -11,15 +9,16 @@ use harness_core::config::intake::{
     GitHubAutoMergeConfig, GitHubMergeExecution, GitHubMergeMethod,
 };
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, DataProvenance,
-    RuntimeJob, WorkflowInstance, SERVER_PR_SNAPSHOT_ARTIFACT,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, RuntimeJob,
+    WorkflowInstance, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::{json, Value};
 
 use super::data_helpers::activity_name;
 use super::merge_completion::{
     auto_merge_config, merge_activity_matches, merge_completion_verified, merge_execution_target,
-    server_merge_policy, snapshot_observes_merged,
+    required_expected_head_sha_for_merge, server_merge_policy, snapshot_head_matches_expected,
+    snapshot_observes_merged,
 };
 
 const SERVER_MERGE_EXECUTION_ARTIFACT: &str = "server_merge_execution";
@@ -143,7 +142,9 @@ pub(super) async fn execute_server_merge(
         }
     };
     if snapshot_observes_merged(&before_snapshot.normalized_snapshot) {
-        return finish_server_merge(
+        return super::executor::server_owned::finish_server_merge(
+            state,
+            job,
             activity,
             &target,
             before_snapshot,
@@ -241,7 +242,9 @@ pub(super) async fn execute_server_merge(
     };
     match fetch_github_pr_snapshot(&target, Some(github_token)).await {
         Ok(snapshot) if snapshot_observes_merged(&snapshot.normalized_snapshot) => {
-            finish_server_merge(
+            super::executor::server_owned::finish_server_merge(
+                state,
+                job,
                 activity,
                 &target,
                 snapshot,
@@ -274,79 +277,6 @@ pub(super) async fn execute_server_merge(
             &error,
         ),
     }
-}
-
-async fn finish_server_merge(
-    activity: String,
-    target: &GitHubPrSnapshotTarget,
-    snapshot: GitHubPrSnapshotArtifacts,
-    expected_head_sha: &str,
-    outcome: &str,
-    mut merge_call: Option<Value>,
-    delete_branch: bool,
-    github_token: Option<&str>,
-) -> ActivityResult {
-    if delete_branch {
-        let cleanup = match snapshot
-            .normalized_snapshot
-            .get("is_cross_repository")
-            .and_then(Value::as_bool)
-        {
-            Some(true) => json!({"status": "skipped_cross_repository"}),
-            Some(false) => {
-                let Some(head_ref) = value_string(snapshot.normalized_snapshot.get("head_ref"))
-                else {
-                    return server_merge_failed(
-                        activity,
-                        Some(target),
-                        ActivityErrorKind::Configuration,
-                        "Merged pull request branch cleanup could not resolve the head ref.",
-                        "server PR snapshot is missing head_ref",
-                        Some(snapshot),
-                        merge_call,
-                        "branch_cleanup_missing_head",
-                    );
-                };
-                match delete_pull_request_head_branch(target, github_token, &head_ref).await {
-                    Ok(cleanup) => cleanup,
-                    Err(error) => {
-                        return server_merge_failed(
-                            activity,
-                            Some(target),
-                            error.error_kind,
-                            "Merged pull request branch cleanup failed.",
-                            error.to_string(),
-                            Some(snapshot),
-                            merge_call,
-                            "branch_cleanup_failed",
-                        );
-                    }
-                }
-            }
-            None => {
-                return server_merge_failed(
-                    activity,
-                    Some(target),
-                    ActivityErrorKind::Configuration,
-                    "Merged pull request branch cleanup could not establish repository ownership.",
-                    "server PR snapshot is missing is_cross_repository",
-                    Some(snapshot),
-                    merge_call,
-                    "branch_cleanup_repository_unknown",
-                );
-            }
-        };
-        let details = merge_call.get_or_insert_with(|| json!({}));
-        details["branch_cleanup"] = cleanup;
-    }
-    server_merge_succeeded(
-        activity,
-        target,
-        snapshot,
-        expected_head_sha,
-        outcome,
-        merge_call,
-    )
 }
 
 async fn merge_error_result(
@@ -390,7 +320,7 @@ async fn merge_error_result(
     }
 }
 
-fn server_merge_head_mismatch(
+pub(in crate::workflow_runtime_worker) fn server_merge_head_mismatch(
     activity: String,
     target: &GitHubPrSnapshotTarget,
     snapshot: GitHubPrSnapshotArtifacts,
@@ -431,44 +361,7 @@ fn server_merge_head_mismatch(
     ))
 }
 
-fn required_expected_head_sha_for_merge(
-    job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
-) -> Result<String, String> {
-    let command_head = job
-        .input
-        .pointer("/command/expected_head_sha")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "merge_pr command is missing expected_head_sha".to_string())?;
-    let assessed_head = workflow
-        .filter(|workflow| {
-            workflow
-                .data_provenance
-                .as_ref()
-                .and_then(|provenance| provenance.provenance_for("/scope_assessed_head_oid"))
-                == Some(DataProvenance::Server)
-        })
-        .and_then(|workflow| value_string(workflow.data.get("scope_assessed_head_oid")))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "merge_pr dispatch is missing a server-owned scope_assessed_head_oid".to_string()
-        })?;
-    if command_head != assessed_head {
-        return Err(format!(
-            "merge_pr command head `{command_head}` does not match scope-assessed head `{assessed_head}`"
-        ));
-    }
-    Ok(assessed_head)
-}
-
-fn snapshot_head_matches_expected(snapshot: &Value, expected_head_sha: &str) -> bool {
-    value_string(snapshot.get("head_oid")).is_some_and(|head_oid| head_oid == expected_head_sha)
-}
-
-fn server_merge_succeeded(
+pub(in crate::workflow_runtime_worker) fn server_merge_succeeded(
     activity: String,
     target: &GitHubPrSnapshotTarget,
     snapshot: GitHubPrSnapshotArtifacts,
@@ -533,7 +426,7 @@ fn server_merge_pull_request_artifact(
     )
 }
 
-fn server_merge_failed(
+pub(in crate::workflow_runtime_worker) fn server_merge_failed(
     activity: String,
     target: Option<&GitHubPrSnapshotTarget>,
     error_kind: ActivityErrorKind,
