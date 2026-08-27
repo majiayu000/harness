@@ -1,6 +1,6 @@
 mod declarative_interpreter {
     use super::super::*;
-    use super::issue_instance;
+    use super::current_issue_instance;
     use crate::runtime::reducer::declarative_completion::reduce_declarative_completion;
     use harness_core::config::workflow::{
         DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowClassifierPolicy,
@@ -488,7 +488,7 @@ mod declarative_interpreter {
         );
         assert!(missing_version_decision.reason.contains("missing_version"));
 
-        let builtin = issue_instance("replanning");
+        let builtin = current_issue_instance("replanning");
         assert!(registry.instance_is_declarative(&builtin));
         let builtin_result = ActivityResult::succeeded("replan_issue", "replanned")
             .with_artifact(ActivityArtifact::new(
