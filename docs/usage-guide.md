@@ -367,7 +367,7 @@ repositories sharing the token until the safe retry time from `Retry-After`,
 | `enabled` | `false` | Enables server-side auto-merge gating for configured GitHub issue workflows. |
 | `method` | `"squash"` | Merge method requested after the deterministic gate passes. |
 | `delete_branch` | `false` | Whether merge execution should request source branch cleanup. Server-owned workflow merges reject `true` because GitHub does not provide atomic compare-and-delete for refs. |
-| `merge_execution` | `"server"` | Selects the merge executor. Automated merges require `"server"` so the authorization check and GitHub mutation share one database fence. Legacy `"agent"` values are parsed but rejected before mutation. |
+| `merge_execution` | `"server"` | Selects the merge executor. Automated merges require `"server"` so authorization and mutation can share one database fence; legacy `"agent"` values are rejected before mutation. The current GitHub merge API cannot atomically bind both the reviewed head and authorized base, so execution remains fail-closed until that precondition can be enforced. |
 | `verify_merge_completion` | `true` | When true, Harness re-reads GitHub before accepting an agent-reported `merge_pr` success. When false, merge completion fails closed while completion-evidence enforcement is active; the deployment-wide emergency kill switch restores claim-trusting behavior. |
 
 Server-executed merge mode requires a GitHub token that can merge pull

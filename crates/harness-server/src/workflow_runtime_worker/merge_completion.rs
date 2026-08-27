@@ -689,11 +689,12 @@ mod tests {
 
     #[test]
     fn merged_snapshot_accepts_the_pinned_dispatched_head() {
+        let target = target().with_expected_base_ref("main");
         let result = verify_merge_completion_snapshot(
             &job_with_expected_head(Some("server-head")),
             None,
             activity_result(),
-            &target(),
+            &target,
             snapshot("MERGED", true),
         );
 

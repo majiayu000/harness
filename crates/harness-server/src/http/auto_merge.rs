@@ -185,7 +185,7 @@ pub(crate) fn snapshot_base_ref_matches_expected(
     expected_base_ref: Option<&str>,
 ) -> bool {
     let Some(expected_base_ref) = expected_base_ref else {
-        return true;
+        return false;
     };
     let expected_base_ref = expected_base_ref.trim();
     !expected_base_ref.is_empty()

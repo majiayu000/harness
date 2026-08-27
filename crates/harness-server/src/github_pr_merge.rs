@@ -9,6 +9,10 @@ use std::time::Duration;
 
 const GITHUB_MERGE_TIMEOUT: Duration = Duration::from_secs(15);
 
+pub(crate) fn supports_atomic_expected_base_ref() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitHubPrMergeOptions {
     pub method: GitHubMergeMethod,

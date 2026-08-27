@@ -598,9 +598,8 @@ fn structured_decision_validates(
     {
         return false;
     }
-    let Some(validator) = registry.decision_validator_for_definition(&instance.definition_id)
-    else {
-        return true;
+    let Ok(Some(validator)) = registry.decision_validator_for_instance(instance) else {
+        return false;
     };
     validator
         .validate(
@@ -621,4 +620,60 @@ fn prompt_task_activity_matches(instance: &WorkflowInstance, result: &ActivityRe
         "implementing",
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
     )
+}
+
+#[cfg(test)]
+mod versioned_structured_decision_tests {
+    use super::*;
+    use crate::runtime::WorkflowSubject;
+
+    #[test]
+    fn historical_issue_decision_uses_the_v1_validator() {
+        let registry = WorkflowDefinitionRegistry::with_builtins();
+        let instance = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "addressing_feedback",
+            WorkflowSubject::new("issue", "issue:v1-structured"),
+        );
+        let event = WorkflowEvent::new(&instance.id, 1, "RuntimeJobCompleted", "runtime");
+        let result = ActivityResult::succeeded("address_pr_feedback", "feedback addressed");
+        let current_only = WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "review_scope",
+            "pr_scope_review",
+            "use the current workflow route",
+        )
+        .with_command(WorkflowCommand::enqueue_activity(
+            "classify_change_scope",
+            "classify-v1",
+        ));
+        let historical = WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "run_local_review_after_rework",
+            "local_review_gate",
+            "use the historical workflow route",
+        )
+        .with_command(WorkflowCommand::enqueue_activity(
+            "run_local_review",
+            "review-v1",
+        ));
+
+        assert!(!structured_decision_validates(
+            &registry,
+            &instance,
+            &event,
+            &result,
+            &current_only,
+        ));
+        assert!(structured_decision_validates(
+            &registry,
+            &instance,
+            &event,
+            &result,
+            &historical,
+        ));
+    }
 }

@@ -148,6 +148,18 @@ pub(super) async fn execute_server_merge(
     let expected_base_ref = workflow.and_then(|workflow| {
         crate::http::auto_merge::expected_base_ref_from_workflow_data(&workflow.data)
     });
+    if expected_base_ref.is_none() {
+        return server_merge_failed(
+            activity,
+            Some(&target),
+            ActivityErrorKind::Configuration,
+            "Server-side merge is missing an authorized base branch.",
+            "automated merge requires a non-empty expected_base_ref",
+            Some(before_snapshot),
+            None,
+            "expected_base_ref_missing",
+        );
+    }
     if snapshot_observes_merged(&before_snapshot.normalized_snapshot) {
         if !crate::http::auto_merge::snapshot_base_ref_matches_expected(
             &before_snapshot.normalized_snapshot,
@@ -197,7 +209,7 @@ pub(super) async fn execute_server_merge(
             "gate_rejected",
         );
     }
-    if expected_base_ref.is_some() {
+    if !crate::github_pr_merge::supports_atomic_expected_base_ref() {
         return server_merge_failed(
             activity,
             Some(&target),

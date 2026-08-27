@@ -568,7 +568,15 @@ pub(super) async fn approve_runtime_merge(
             ),
         });
     }
-    if crate::http::auto_merge::expected_base_ref_from_workflow_data(&instance.data).is_some() {
+    let Some(_expected_base_ref) =
+        crate::http::auto_merge::expected_base_ref_from_workflow_data(&instance.data)
+    else {
+        return Ok(RuntimeMergeApprovalOutcome::Rejected {
+            workflow_id,
+            reason: "automated merge is missing the authorized expected_base_ref".to_string(),
+        });
+    };
+    if !crate::github_pr_merge::supports_atomic_expected_base_ref() {
         return Ok(RuntimeMergeApprovalOutcome::Rejected {
             workflow_id,
             reason: "automated merge cannot atomically bind expected_base_ref because GitHub's pull request merge API only accepts an expected head SHA"

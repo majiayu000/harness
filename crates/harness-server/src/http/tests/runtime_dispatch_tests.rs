@@ -487,6 +487,7 @@ fn legacy_auto_merge_uses_the_fresh_snapshot_head_without_v2_scope_recheck() -> 
         "issue_number": 80,
         "pr_number": 80,
         "pr_head_sha": "old-head",
+        "expected_base_ref": "main",
     }));
 
     let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
@@ -1201,6 +1202,7 @@ fn auto_merge_snapshot_gate_accepts_ready_matching_head() -> anyhow::Result<()> 
         "pr_number": 77,
         "pr_head_sha": "abc123",
         "scope_assessed_head_oid": "abc123",
+        "expected_base_ref": "main",
     }));
 
     let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
@@ -1246,6 +1248,7 @@ fn auto_merge_snapshot_gate_accepts_fresh_ready_head_when_stored_head_changed() 
         "pr_number": 78,
         "pr_head_sha": "old-head",
         "scope_assessed_head_oid": "old-head",
+        "expected_base_ref": "main",
     }));
 
     let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
@@ -1277,6 +1280,7 @@ fn auto_merge_snapshot_gate_rejects_missing_scope_assessed_head() -> anyhow::Res
         "repo": "owner/repo",
         "issue_number": 80,
         "pr_number": 80,
+        "expected_base_ref": "main",
     }));
 
     let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
@@ -1310,6 +1314,7 @@ fn auto_merge_snapshot_gate_honors_relaxed_policy_fields() -> anyhow::Result<()>
         "pr_number": 79,
         "pr_head_sha": "abc123",
         "scope_assessed_head_oid": "abc123",
+        "expected_base_ref": "main",
     }));
     let mut snapshot = ready_auto_merge_snapshot("abc123");
     snapshot.normalized_snapshot["merge_state_status"] = serde_json::json!("DIRTY");
@@ -1379,7 +1384,7 @@ fn auto_merge_snapshot_gate_rejects_wrong_base_ref() -> anyhow::Result<()> {
 }
 
 #[test]
-fn auto_merge_snapshot_gate_allows_unknown_expected_base() -> anyhow::Result<()> {
+fn auto_merge_snapshot_gate_rejects_unknown_expected_base() -> anyhow::Result<()> {
     let workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
         harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
@@ -1406,9 +1411,9 @@ fn auto_merge_snapshot_gate_allows_unknown_expected_base() -> anyhow::Result<()>
         &auto_merge_policy(true, true),
     )?;
 
-    let super::auto_merge::AutoMergeSnapshotGate::Ready(prepared) = outcome else {
-        panic!("unknown expected base should not block an otherwise ready snapshot");
-    };
-    assert!(prepared.data.get("expected_base_ref").is_none());
+    assert!(matches!(
+        outcome,
+        super::auto_merge::AutoMergeSnapshotGate::NotReady
+    ));
     Ok(())
 }
