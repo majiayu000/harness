@@ -4,8 +4,17 @@ use super::{
     GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
     QUALITY_GATE_DEFINITION_ID,
 };
+use crate::runtime::declarative::build_builtin_declarative_definition;
 use crate::runtime::declarative_pinning::declarative_definition_identity_with_classifier_policies;
 use crate::runtime::model::WorkflowInstance;
+use crate::runtime::plan_issue::ISSUE_PLAN_ACTIVITY;
+use crate::runtime::pr_feedback::LOCAL_REVIEW_ACTIVITY;
+use crate::runtime::reducer::{ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL};
+use crate::runtime::validator::TransitionAllowlist;
+use harness_core::config::workflow::{
+    DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 impl WorkflowDefinitionRegistry {
@@ -307,6 +316,199 @@ impl WorkflowDefinitionRegistry {
     ) -> Option<WorkflowStateDefinition> {
         state_definition(self.definition_for_instance(instance)?, state)
     }
+}
+
+pub(super) fn github_issue_pr_v1_definition() -> DeclarativeWorkflowDefinition {
+    use DeclaredProgressMode::{CommandDriven, ExternalWait, OperatorGate, ParentHandoff};
+
+    let policy = WorkflowDefinitionPolicy {
+        id: GITHUB_ISSUE_PR_DEFINITION_ID.to_string(),
+        initial: "discovered".to_string(),
+        states: BTreeMap::from([
+            (
+                "discovered".to_string(),
+                v1_progress(
+                    CommandDriven,
+                    [
+                        ("DependenciesBlocked", "awaiting_dependencies"),
+                        ("IssueScheduled", "scheduled"),
+                        ("PlanIssue", "planning"),
+                        ("SubmitImplementation", "implementing"),
+                    ],
+                ),
+            ),
+            (
+                "awaiting_dependencies".to_string(),
+                v1_progress(
+                    ExternalWait,
+                    [
+                        ("IssueScheduled", "scheduled"),
+                        ("PlanIssue", "planning"),
+                        ("SubmitImplementation", "implementing"),
+                    ],
+                ),
+            ),
+            (
+                "scheduled".to_string(),
+                v1_progress(
+                    CommandDriven,
+                    [
+                        ("PlanIssue", "planning"),
+                        ("SubmitImplementation", "implementing"),
+                        ("ReplanIssue", "replanning"),
+                        ("PullRequestReady", "pr_open"),
+                    ],
+                ),
+            ),
+            (
+                "planning".to_string(),
+                v1_activity(ISSUE_PLAN_ACTIVITY, Some("implementing"), []),
+            ),
+            (
+                "implementing".to_string(),
+                v1_activity(
+                    "implement_issue",
+                    Some("pr_open"),
+                    [
+                        (ISSUE_CLOSED_SIGNAL, "done"),
+                        (ISSUE_ALREADY_RESOLVED_SIGNAL, "done"),
+                        ("PlanIssue", "replanning"),
+                    ],
+                ),
+            ),
+            (
+                "replanning".to_string(),
+                v1_activity("replan_issue", Some("implementing"), []),
+            ),
+            (
+                "pr_open".to_string(),
+                v1_progress(
+                    ExternalWait,
+                    [
+                        ("LocalReviewRequested", "local_review_gate"),
+                        ("AwaitFeedback", "awaiting_feedback"),
+                        (ISSUE_CLOSED_SIGNAL, "done"),
+                    ],
+                ),
+            ),
+            (
+                "local_review_gate".to_string(),
+                v1_activity(
+                    LOCAL_REVIEW_ACTIVITY,
+                    Some("awaiting_feedback"),
+                    [
+                        ("LocalReviewPassed", "awaiting_feedback"),
+                        ("LocalReviewChangesRequested", "addressing_feedback"),
+                        ("LocalReviewBlocked", "blocked"),
+                    ],
+                ),
+            ),
+            (
+                "awaiting_feedback".to_string(),
+                v1_progress(
+                    ExternalWait,
+                    [
+                        ("FeedbackFound", "addressing_feedback"),
+                        ("ChangesRequested", "addressing_feedback"),
+                        ("ChecksFailed", "addressing_feedback"),
+                        ("PrReadyToMerge", "quality_gate_pending"),
+                        (ISSUE_CLOSED_SIGNAL, "done"),
+                    ],
+                ),
+            ),
+            (
+                "addressing_feedback".to_string(),
+                v1_activity("address_pr_feedback", Some("local_review_gate"), []),
+            ),
+            (
+                "quality_gate_pending".to_string(),
+                v1_progress(
+                    ParentHandoff,
+                    [
+                        ("QualityPassed", "ready_to_merge"),
+                        (ISSUE_CLOSED_SIGNAL, "done"),
+                    ],
+                ),
+            ),
+            (
+                "ready_to_merge".to_string(),
+                v1_progress(
+                    OperatorGate,
+                    [("MergeRequested", "merging"), (ISSUE_CLOSED_SIGNAL, "done")],
+                ),
+            ),
+            (
+                "merging".to_string(),
+                v1_activity("merge_pr", Some("done"), []),
+            ),
+            (
+                "blocked".to_string(),
+                v1_progress(OperatorGate, std::iter::empty()),
+            ),
+        ]),
+        terminal: BTreeMap::from([
+            ("cancelled".to_string(), "cancelled".to_string()),
+            ("done".to_string(), "succeeded".to_string()),
+            ("failed".to_string(), "failed".to_string()),
+        ]),
+        evidence_required: BTreeMap::new(),
+        recovery_targets: vec![
+            "implementing".to_string(),
+            "replanning".to_string(),
+            "local_review_gate".to_string(),
+            "awaiting_feedback".to_string(),
+            "addressing_feedback".to_string(),
+            "merging".to_string(),
+        ],
+        intake: None,
+    };
+    let activity_policies = policy
+        .states
+        .values()
+        .filter_map(|state| state.activity.as_ref())
+        .map(|activity| (activity.clone(), WorkflowActivityPolicy::default()))
+        .collect();
+    build_builtin_declarative_definition(
+        &policy,
+        &activity_policies,
+        TransitionAllowlist::github_issue_pr_v1_defaults(),
+        BTreeSet::new(),
+        1,
+    )
+    .unwrap_or_else(|error| panic!("historical github_issue_pr@1 must compile: {error}"))
+}
+
+fn v1_activity(
+    name: &str,
+    on_success: Option<&str>,
+    signals: impl IntoIterator<Item = (&'static str, &'static str)>,
+) -> DeclaredState {
+    DeclaredState {
+        activity: Some(name.to_string()),
+        on_success: on_success.map(str::to_string),
+        on_signal: v1_signal_routes(signals),
+        ..DeclaredState::default()
+    }
+}
+
+fn v1_progress(
+    mode: DeclaredProgressMode,
+    signals: impl IntoIterator<Item = (&'static str, &'static str)>,
+) -> DeclaredState {
+    DeclaredState {
+        progress: Some(mode),
+        on_signal: v1_signal_routes(signals),
+        ..DeclaredState::default()
+    }
+}
+
+fn v1_signal_routes(
+    signals: impl IntoIterator<Item = (&'static str, &'static str)>,
+) -> BTreeMap<String, String> {
+    signals
+        .into_iter()
+        .map(|(signal, target)| (signal.to_string(), target.to_string()))
+        .collect()
 }
 
 fn is_canonical_definition_hash(value: &str) -> bool {

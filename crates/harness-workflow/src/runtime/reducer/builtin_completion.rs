@@ -22,8 +22,8 @@ use super::runtime_failure::{
     runtime_failed_decision,
 };
 use super::support::{
-    event_command_type, event_workflow_command, invalid_agent_output_blocked_decision,
-    runtime_completion_evidence,
+    event_command_type, event_field_string, event_workflow_command,
+    invalid_agent_output_blocked_decision, runtime_completion_evidence,
 };
 use super::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::candidate_promotion::{
@@ -177,8 +177,11 @@ fn reduce_success(
         return Some(decision);
     }
 
-    if let Some(decision) = parent_quality_gate_head_decision(registry, instance, event, result) {
-        return Some(decision);
+    if instance.definition_version != 1 {
+        if let Some(decision) = parent_quality_gate_head_decision(registry, instance, event, result)
+        {
+            return Some(decision);
+        }
     }
 
     if let Some(decision) = parent_quality_gate_pass_decision(registry, instance, event, result) {
@@ -219,8 +222,10 @@ fn reduce_success(
         return Some(decision);
     }
 
-    if let Some(decision) = pr_scope_recheck_before_merge(instance, event, result) {
-        return Some(decision);
+    if instance.definition_version != 1 {
+        if let Some(decision) = pr_scope_recheck_before_merge(instance, event, result) {
+            return Some(decision);
+        }
     }
 
     if let Some(decision) = merged_pr_from_activity_result(instance, event, result) {
@@ -232,8 +237,10 @@ fn reduce_success(
         return Some(decision);
     }
 
-    if let Some(decision) = pr_scope_recheck_after_repair(instance, event, result) {
-        return Some(decision);
+    if instance.definition_version != 1 {
+        if let Some(decision) = pr_scope_recheck_after_repair(instance, event, result) {
+            return Some(decision);
+        }
     }
 
     if let Some(decision) = local_review_decision_from_activity_result(instance, event, result) {
@@ -282,6 +289,24 @@ fn reduce_success(
         instance.state.as_str(),
         result.activity.as_str(),
     ) {
+        (GITHUB_ISSUE_PR_DEFINITION_ID, "replanning", "replan_issue")
+            if instance.definition_version == 1 =>
+        {
+            (
+                "implementing",
+                "resume_implementation_after_replan",
+                "replan activity completed; implementation can continue",
+            )
+        }
+        (GITHUB_ISSUE_PR_DEFINITION_ID, "addressing_feedback", "address_pr_feedback")
+            if instance.definition_version == 1 =>
+        {
+            (
+                "local_review_gate",
+                "run_local_review_after_rework",
+                "PR feedback rework activity completed; run local review before remote feedback",
+            )
+        }
         (QUALITY_GATE_DEFINITION_ID, "checking", QUALITY_GATE_ACTIVITY) => (
             "passed",
             "quality_passed",
@@ -302,6 +327,22 @@ fn reduce_success(
     let mut workflow_decision =
         WorkflowDecision::new(&instance.id, &instance.state, decision, next_state, reason)
             .with_evidence(runtime_completion_evidence(event, result));
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.definition_version == 1
+        && instance.state == "replanning"
+        && result.activity == "replan_issue"
+        && next_state == "implementing"
+    {
+        let completion_command_id =
+            event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+        workflow_decision = workflow_decision.with_command(WorkflowCommand::enqueue_activity(
+            "implement_issue",
+            format!(
+                "issue-replan:{}:implement:{completion_command_id}",
+                instance.id
+            ),
+        ));
+    }
     if instance.definition_id == PROMPT_TASK_DEFINITION_ID
         && instance.state == "implementing"
         && result.activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
@@ -314,6 +355,22 @@ fn reduce_success(
                 "activity": result.activity,
                 "workflow_id": instance.id,
             }),
+        ));
+    }
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.definition_version == 1
+        && instance.state == "addressing_feedback"
+        && result.activity == "address_pr_feedback"
+        && next_state == "local_review_gate"
+    {
+        let completion_command_id =
+            event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+        workflow_decision = workflow_decision.with_command(WorkflowCommand::enqueue_activity(
+            LOCAL_REVIEW_ACTIVITY,
+            format!(
+                "local-review:{}:after-rework:{completion_command_id}",
+                instance.id
+            ),
         ));
     }
     Some(workflow_decision.high_confidence())

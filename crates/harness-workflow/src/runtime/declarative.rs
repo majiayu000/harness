@@ -152,9 +152,24 @@ pub(crate) fn build_builtin_declarative_definition(
     validate_reachability(policy, &terminal_states)?;
 
     let states = compile_states(policy, &terminal_states);
+    let allowlist_identity = allowlist
+        .rules()
+        .map(|rule| {
+            serde_json::json!({
+                "from_state": rule.from_state,
+                "to_state": rule.to_state,
+                "allowed_commands": rule.allowed_commands,
+                "required_command": rule.required_command,
+                "required_evidence": rule.required_evidence,
+                "required_evidence_trust": rule.required_evidence_trust,
+                "operator_recovery_only": rule.operator_recovery_only,
+            })
+        })
+        .collect::<Vec<_>>();
     let definition_hash = stable_remote_fact_hash(&serde_json::json!({
         "policy": policy,
         "classifier_activities": classifier_activities,
+        "transition_allowlist": allowlist_identity,
         "definition_version": definition_version,
     }));
     Ok(DeclarativeWorkflowDefinition {

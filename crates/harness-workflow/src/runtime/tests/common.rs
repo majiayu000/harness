@@ -40,6 +40,27 @@ fn issue_instance(state: &str) -> WorkflowInstance {
     )
 }
 
+fn legacy_issue_instance(state: &str) -> WorkflowInstance {
+    WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        state,
+        WorkflowSubject::new("issue", "legacy-123"),
+    )
+}
+
+fn current_issue_instance(state: &str) -> WorkflowInstance {
+    WorkflowInstance::new(
+        "github_issue_pr",
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
+        state,
+        WorkflowSubject::new("issue", "current-123"),
+    )
+    .with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
+    }))
+}
+
 async fn force_upsert_lifecycle_state_for_test(
     store: &WorkflowRuntimeStore,
     instance: &WorkflowInstance,

@@ -7,12 +7,14 @@ async fn runtime_worker_persists_bind_pr_payload_before_scope_review() -> anyhow
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let workflow = project_issue_instance("/project-a", 123, "implementing").with_server_data(json!({
+    let mut workflow = project_issue_instance("/project-a", 123, "implementing").with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 123,
         "task_id": "task-123",
     }));
+    workflow.definition_version = GITHUB_ISSUE_PR_DEFINITION_VERSION;
     store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("implement_issue", "issue-123-implement");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;

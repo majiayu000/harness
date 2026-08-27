@@ -1,8 +1,9 @@
 use crate::http::AppState;
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, WorkflowChildStart, WorkflowDefinition,
-    WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
-    QUALITY_GATE_DEFINITION_ID,
+    github_issue_pr_definition_hash, ActivityArtifact, ActivityResult, RuntimeJob,
+    WorkflowChildStart, WorkflowDefinition, WorkflowInstance, WorkflowSubject,
+    GITHUB_ISSUE_PR_DEFINITION_ID, GITHUB_ISSUE_PR_DEFINITION_VERSION, PROMPT_TASK_DEFINITION_ID,
+    PR_FEEDBACK_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -69,14 +70,22 @@ pub(super) async fn execute_start_child_workflow(
         issue_number,
     );
     store
-        .upsert_definition(&WorkflowDefinition::new(
-            "github_issue_pr",
-            1,
-            "GitHub issue PR workflow",
-        ))
+        .upsert_definition(
+            &WorkflowDefinition::new(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                GITHUB_ISSUE_PR_DEFINITION_VERSION,
+                "GitHub issue PR workflow",
+            )
+            .with_definition_hash(github_issue_pr_definition_hash()),
+        )
         .await?;
     let existing_child = store
-        .get_instance_by_issue("github_issue_pr", project_id, repo, issue_number)
+        .get_instance_by_issue(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            project_id,
+            repo,
+            issue_number,
+        )
         .await?;
     let child_was_persisted = existing_child.is_some();
     let mut child = match existing_child {
@@ -219,13 +228,14 @@ fn new_github_issue_child(
     subject_key: &str,
     child_id: &str,
 ) -> anyhow::Result<WorkflowInstance> {
-    let data = crate::workflow_runtime_policy::pin_change_scope_classifier_policy(
+    let mut data = crate::workflow_runtime_policy::pin_change_scope_classifier_policy(
         Path::new(project_id),
         json!({}),
     )?;
+    data["definition_hash"] = json!(github_issue_pr_definition_hash());
     Ok(WorkflowInstance::new(
-        "github_issue_pr",
-        1,
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "discovered",
         WorkflowSubject::new("issue", subject_key),
     )

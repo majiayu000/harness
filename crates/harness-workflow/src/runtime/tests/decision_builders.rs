@@ -443,7 +443,7 @@ fn decision_validator_lists_allowed_transitions_from_state() {
 
 #[test]
 fn pr_detected_decision_binds_pr_from_implementation() {
-    let instance = issue_instance("implementing");
+    let instance = current_issue_instance("implementing");
     let output = build_pr_detected_decision(
         &instance,
         PrDetectedDecisionInput {
@@ -468,7 +468,7 @@ fn pr_detected_decision_binds_pr_from_implementation() {
 
 #[test]
 fn pr_detected_decision_binds_pr_after_shadow_issue_submission() {
-    let instance = issue_instance("scheduled");
+    let instance = current_issue_instance("scheduled");
     let output = build_pr_detected_decision(
         &instance,
         PrDetectedDecisionInput {

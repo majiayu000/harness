@@ -415,7 +415,7 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let workflow = issue_instance("replanning");
+    let workflow = current_issue_instance("replanning");
     store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("replan_issue", "replan-1");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;

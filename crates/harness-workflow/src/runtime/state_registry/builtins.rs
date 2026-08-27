@@ -31,10 +31,6 @@ pub(super) fn builtin_registered_definitions() -> [RegisteredWorkflowDefinition;
     builtin_definitions().map(DeclarativeWorkflowDefinition::into_registered)
 }
 
-pub(super) fn builtin_historical_definitions() -> [DeclarativeWorkflowDefinition; 1] {
-    [github_issue_pr_v1_definition()]
-}
-
 fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
     builtin(
         github_issue_pr_policy(),
@@ -202,68 +198,6 @@ fn github_issue_pr_policy() -> WorkflowDefinitionPolicy {
         ],
         intake: None,
     }
-}
-
-fn github_issue_pr_v1_definition() -> DeclarativeWorkflowDefinition {
-    let mut policy = github_issue_pr_policy();
-    policy.states.remove("plan_scope_review");
-    policy.states.remove("pr_scope_review");
-    policy
-        .states
-        .get_mut("scheduled")
-        .expect("built-in scheduled state")
-        .on_signal
-        .insert("PullRequestReady".to_string(), "pr_open".to_string());
-    policy
-        .states
-        .get_mut("planning")
-        .expect("built-in planning state")
-        .on_success = Some("implementing".to_string());
-    policy
-        .states
-        .get_mut("implementing")
-        .expect("built-in implementing state")
-        .on_success = Some("pr_open".to_string());
-    policy
-        .states
-        .get_mut("replanning")
-        .expect("built-in replanning state")
-        .on_success = Some("implementing".to_string());
-    policy
-        .states
-        .get_mut("awaiting_feedback")
-        .expect("built-in awaiting_feedback state")
-        .on_signal
-        .remove("PrHeadChanged");
-    policy
-        .states
-        .get_mut("addressing_feedback")
-        .expect("built-in addressing_feedback state")
-        .on_success = Some("local_review_gate".to_string());
-    policy
-        .states
-        .get_mut("quality_gate_pending")
-        .expect("built-in quality_gate_pending state")
-        .on_signal
-        .remove("PrHeadChanged");
-    policy
-        .states
-        .get_mut("ready_to_merge")
-        .expect("built-in ready_to_merge state")
-        .on_signal
-        .remove("PrHeadChanged");
-    policy
-        .states
-        .get_mut("merging")
-        .expect("built-in merging state")
-        .on_signal
-        .remove("PrHeadChanged");
-    builtin(
-        policy,
-        TransitionAllowlist::github_issue_pr_v1_defaults(),
-        BTreeSet::new(),
-        1,
-    )
 }
 
 fn prompt_task_definition() -> DeclarativeWorkflowDefinition {

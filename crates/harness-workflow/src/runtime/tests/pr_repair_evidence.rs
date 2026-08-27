@@ -13,6 +13,16 @@ fn pr_workflow_state(state: &str) -> WorkflowInstance {
     }))
 }
 
+fn current_pr_workflow_state(state: &str) -> WorkflowInstance {
+    current_issue_instance(state).with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+        "scope_assessed_head_oid": "abc123",
+    }))
+}
+
 fn event_for_result(result: ActivityResult) -> WorkflowEvent {
     WorkflowEvent::new(
         "workflow-1",
@@ -162,7 +172,8 @@ fn ready_to_merge_signal_without_current_pr_snapshot_blocks() {
 
 #[test]
 fn changed_pr_head_is_reclassified_before_quality_gate() {
-    let instance = pr_workflow_state("awaiting_feedback").with_server_data(json!({
+    let instance = current_pr_workflow_state("awaiting_feedback").with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-1",
@@ -342,7 +353,7 @@ fn address_pr_feedback_success_without_repair_evidence_blocks() {
 
 #[test]
 fn address_pr_feedback_success_with_repair_snapshot_requests_scope_recheck() {
-    let instance = pr_workflow_state("addressing_feedback");
+    let instance = current_pr_workflow_state("addressing_feedback");
     let result = ActivityResult::succeeded(
         "address_pr_feedback",
         "Runtime agent addressed review feedback and pushed validation-backed changes.",

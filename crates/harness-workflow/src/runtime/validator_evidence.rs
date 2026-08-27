@@ -11,25 +11,177 @@ use harness_core::claim_trust::ClaimTrustLevel;
 impl TransitionAllowlist {
     pub fn github_issue_pr_v1_defaults() -> Self {
         use super::super::WorkflowCommandType::{
-            BindPr, EnqueueActivity, MarkBlocked, RecordPlanConcern, StartChildWorkflow, Wait,
+            BindPr, EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
+            RecordPlanConcern, RequestOperatorAttention, StartChildWorkflow, Wait,
         };
 
-        Self::github_issue_pr_defaults()
+        Self::default()
+            .allow("discovered", "awaiting_dependencies", [Wait])
+            .allow("failed", "awaiting_dependencies", [Wait])
+            .allow("cancelled", "awaiting_dependencies", [Wait])
+            .allow("awaiting_dependencies", "awaiting_dependencies", [Wait])
+            .allow(
+                "awaiting_dependencies",
+                "scheduled",
+                [EnqueueActivity, Wait],
+            )
+            .allow("awaiting_dependencies", "planning", [EnqueueActivity, Wait])
+            .allow(
+                "awaiting_dependencies",
+                "implementing",
+                [EnqueueActivity, Wait],
+            )
+            .allow("discovered", "scheduled", [EnqueueActivity, Wait])
+            .allow("discovered", "planning", [EnqueueActivity, Wait])
+            .allow("discovered", "implementing", [EnqueueActivity, Wait])
+            .allow("scheduled", "scheduled", [EnqueueActivity, Wait])
+            .allow("failed", "scheduled", [EnqueueActivity, Wait])
+            .allow("failed", "planning", [EnqueueActivity, Wait])
+            .allow("failed", "implementing", [EnqueueActivity, Wait])
+            .allow("failed", "replanning", [EnqueueActivity, Wait])
+            .allow("failed", "local_review_gate", [EnqueueActivity, Wait])
+            .allow(
+                "failed",
+                "awaiting_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "failed",
+                "addressing_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow("failed", "merging", [EnqueueActivity])
+            .allow("blocked", "implementing", [EnqueueActivity, Wait])
+            .allow("blocked", "replanning", [EnqueueActivity, Wait])
+            .allow("blocked", "local_review_gate", [EnqueueActivity, Wait])
+            .allow(
+                "blocked",
+                "awaiting_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "blocked",
+                "addressing_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow("blocked", "merging", [EnqueueActivity])
+            .allow("cancelled", "scheduled", [EnqueueActivity, Wait])
+            .allow("cancelled", "planning", [EnqueueActivity, Wait])
+            .allow("cancelled", "implementing", [EnqueueActivity, Wait])
+            .allow("scheduled", "planning", [EnqueueActivity, Wait])
+            .allow(
+                "scheduled",
+                "implementing",
+                [EnqueueActivity, RecordPlanConcern, Wait],
+            )
+            .allow(
+                "scheduled",
+                "replanning",
+                [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
+            )
             .allow("planning", "implementing", [EnqueueActivity, MarkBlocked])
+            .allow("planning", "planning", [EnqueueActivity, Wait])
+            .allow(
+                "implementing",
+                "implementing",
+                [EnqueueActivity, RecordPlanConcern, Wait],
+            )
+            .allow(
+                "implementing",
+                "replanning",
+                [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
+            )
             .allow(
                 "replanning",
                 "implementing",
                 [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
             )
             .allow(
+                "implementing",
+                "pr_open",
+                [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow("implementing", "done", [MarkDone])
+            .allow(
                 "scheduled",
                 "pr_open",
                 [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow("pr_open", "pr_open", [BindPr, Wait])
+            .allow("pr_open", "local_review_gate", [EnqueueActivity, Wait])
+            .allow("pr_open", "awaiting_feedback", [Wait])
+            .allow(
+                "awaiting_feedback",
+                "local_review_gate",
+                [EnqueueActivity, Wait],
+            )
+            .allow(
+                "local_review_gate",
+                "local_review_gate",
+                [EnqueueActivity, Wait],
+            )
+            .allow("local_review_gate", "awaiting_feedback", [Wait])
+            .allow(
+                "local_review_gate",
+                "addressing_feedback",
+                [EnqueueActivity, MarkBlocked, Wait],
+            )
+            .allow("pr_open", "done", [MarkDone])
+            .allow(
+                "awaiting_feedback",
+                "awaiting_feedback",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "awaiting_feedback",
+                "addressing_feedback",
+                [EnqueueActivity, StartChildWorkflow, MarkBlocked, Wait],
+            )
+            .allow(
+                "addressing_feedback",
+                "addressing_feedback",
+                [EnqueueActivity, StartChildWorkflow, MarkBlocked, Wait],
             )
             .allow(
                 "addressing_feedback",
                 "local_review_gate",
                 [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "awaiting_feedback",
+                "quality_gate_pending",
+                [StartChildWorkflow, Wait],
+            )
+            .allow(
+                "quality_gate_pending",
+                "ready_to_merge",
+                std::iter::empty::<super::super::WorkflowCommandType>(),
+            )
+            .allow("awaiting_feedback", "done", [MarkDone])
+            .allow("addressing_feedback", "done", [MarkDone])
+            .allow("quality_gate_pending", "done", [MarkDone])
+            .allow("quality_gate_pending", "quality_gate_pending", [Wait])
+            .allow("ready_to_merge", "ready_to_merge", [Wait])
+            .allow("ready_to_merge", "merging", [EnqueueActivity])
+            .allow("merging", "done", [MarkDone])
+            .allow("ready_to_merge", "done", [MarkDone])
+            .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
+            .allow_from_any("failed", [MarkFailed])
+            .allow_from_any("cancelled", [MarkCancelled])
+            .require_evidence_with_trust(
+                "implementing",
+                "pr_open",
+                [(
+                    completion_evidence::EVIDENCE_VERIFIED_PR_BINDING,
+                    ClaimTrustLevel::RuntimeObserved,
+                )],
+            )
+            .require_evidence_into_with_trust(
+                "done",
+                [(
+                    completion_evidence::EVIDENCE_GITHUB_TERMINAL,
+                    ClaimTrustLevel::RuntimeObserved,
+                )],
             )
     }
 

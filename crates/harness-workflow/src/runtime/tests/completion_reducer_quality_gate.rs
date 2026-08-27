@@ -146,7 +146,8 @@ fn runtime_completion_reducer_marks_issue_pr_ready_after_quality_gate_pass() {
 
 #[test]
 fn runtime_completion_reducer_reclassifies_head_changed_during_quality_gate() {
-    let instance = issue_instance("quality_gate_pending").with_server_data(json!({
+    let instance = current_issue_instance("quality_gate_pending").with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "repo": "owner/repo",
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -201,7 +202,8 @@ fn runtime_completion_reducer_reclassifies_head_changed_during_quality_gate() {
 
 #[test]
 fn runtime_completion_reducer_reclassifies_legacy_quality_gate_without_assessed_head() {
-    let instance = issue_instance("quality_gate_pending").with_server_data(json!({
+    let instance = current_issue_instance("quality_gate_pending").with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "repo": "owner/repo",
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -248,7 +250,8 @@ fn runtime_completion_reducer_reclassifies_legacy_quality_gate_without_assessed_
 
 #[test]
 fn runtime_completion_reducer_blocks_quality_pass_without_current_pr_snapshot() {
-    let instance = issue_instance("quality_gate_pending").with_server_data(json!({
+    let instance = current_issue_instance("quality_gate_pending").with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "repo": "owner/repo",
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",

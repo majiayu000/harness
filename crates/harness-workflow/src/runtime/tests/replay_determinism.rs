@@ -4,7 +4,7 @@ use crate::runtime::RUNTIME_JOB_COMPLETED_EVENT;
 #[test]
 fn runtime_completion_validation_uses_event_time_for_replayed_lease() -> anyhow::Result<()> {
     let event_created_at = Utc::now() - Duration::hours(1);
-    let instance = issue_instance("implementing")
+    let instance = current_issue_instance("implementing")
         .with_lease("runtime-1", event_created_at + Duration::minutes(5));
     let decision = WorkflowDecision::new(
         &instance.id,

@@ -202,3 +202,46 @@ fn terminal_selector_query_parts(
     }
     Ok(query)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_parts_accept_unpinned_legacy_and_exact_versioned_selectors() -> anyhow::Result<()> {
+        let progress = progress_selector_query_parts(&[
+            WorkflowProgressStateSelector {
+                definition_version: None,
+                definition_hash: None,
+                state: "awaiting_feedback".to_string(),
+            },
+            WorkflowProgressStateSelector {
+                definition_version: Some(2),
+                definition_hash: Some("sha256:current".to_string()),
+                state: "awaiting_feedback".to_string(),
+            },
+        ])?;
+        assert_eq!(progress.unversioned_states, ["awaiting_feedback"]);
+        assert_eq!(progress.definition_versions, [2]);
+        assert_eq!(progress.definition_hashes, ["sha256:current"]);
+
+        let terminal = terminal_selector_query_parts(&[
+            WorkflowTerminalStateSelector {
+                definition_version: None,
+                definition_hash: None,
+                state: "done".to_string(),
+                terminal_state: WorkflowTerminalState::Succeeded,
+            },
+            WorkflowTerminalStateSelector {
+                definition_version: Some(2),
+                definition_hash: Some("sha256:current".to_string()),
+                state: "done".to_string(),
+                terminal_state: WorkflowTerminalState::Succeeded,
+            },
+        ])?;
+        assert_eq!(terminal.unversioned_states, ["done"]);
+        assert_eq!(terminal.definition_versions, [2]);
+        assert_eq!(terminal.definition_hashes, ["sha256:current"]);
+        Ok(())
+    }
+}

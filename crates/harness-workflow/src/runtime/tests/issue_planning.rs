@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::WorkflowDefinitionRegistry;
 
 #[test]
 fn issue_submission_decision_force_execute_starts_implementation() {
@@ -182,7 +183,7 @@ fn candidate_fanout_force_execute_starts_deferred_candidate_commands() -> anyhow
 
 #[test]
 fn issue_plan_success_starts_scope_review_with_plan_payload() {
-    let instance = issue_instance("planning");
+    let instance = current_issue_instance("planning");
     let plan_payload = json!({
         "summary": "Patch the PR repair completion reducer before touching prompts.",
         "task_class": "runtime_or_data",
@@ -229,6 +230,48 @@ fn issue_plan_success_starts_scope_review_with_plan_payload() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("issue plan completion decision should validate");
+}
+
+#[test]
+fn legacy_issue_plan_completions_keep_the_v1_direct_implementation_path() -> anyhow::Result<()> {
+    for (state, activity) in [
+        ("planning", super::super::ISSUE_PLAN_ACTIVITY),
+        ("replanning", "replan_issue"),
+    ] {
+        let instance = legacy_issue_instance(state);
+        let result = ActivityResult::succeeded(activity, "Issue plan ready.").with_artifact(
+            ActivityArtifact::new(
+                super::super::ISSUE_PLAN_ARTIFACT,
+                json!({
+                    "summary": "Keep the historical workflow moving.",
+                    "task_class": "standard_code",
+                    "target_files": ["src/lib.rs"],
+                    "validation_plan": ["cargo test -p harness-workflow issue_planning"],
+                    "blockers": []
+                }),
+            ),
+        );
+        let event = runtime_completion_event(&instance, activity, result);
+        let decision = reduce_runtime_job_completed(&instance, &event)?
+            .ok_or_else(|| anyhow::anyhow!("legacy plan completion should reduce"))?;
+
+        assert_eq!(decision.next_state, "implementing");
+        assert_eq!(decision.commands.len(), 1);
+        assert_eq!(
+            decision.commands[0].activity_name(),
+            Some("implement_issue")
+        );
+        WorkflowDefinitionRegistry::with_builtins()
+            .decision_validator_for_instance(&instance)
+            .expect("legacy pin should resolve")
+            .expect("legacy definition should have a validator")
+            .validate(
+                &instance,
+                &decision,
+                &ValidationContext::new("runtime-1", Utc::now()),
+            )?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -340,7 +383,7 @@ fn candidate_fanout_issue_plan_completion_uses_persisted_metadata() -> anyhow::R
 
 #[test]
 fn legacy_replan_completion_is_requeued_under_structured_contract() -> anyhow::Result<()> {
-    let instance = issue_instance("replanning");
+    let instance = current_issue_instance("replanning");
     let result =
         ActivityResult::succeeded("replan_issue", "Legacy replan completed.").with_artifact(
             ActivityArtifact::new("workflow_decision", json!({"decision": "continue"})),
@@ -367,7 +410,7 @@ fn legacy_replan_completion_is_requeued_under_structured_contract() -> anyhow::R
 
 #[test]
 fn structured_replan_contract_failure_does_not_retry_forever() -> anyhow::Result<()> {
-    let instance = issue_instance("replanning");
+    let instance = current_issue_instance("replanning");
     let result =
         ActivityResult::succeeded("replan_issue", "Invalid new-contract output.").with_artifact(
             ActivityArtifact::new("workflow_decision", json!({"decision": "continue"})),
@@ -402,7 +445,7 @@ fn structured_replan_contract_failure_does_not_retry_forever() -> anyhow::Result
 
 #[test]
 fn submission_mode_deferred_survives_issue_plan_completion() {
-    let instance = issue_instance("planning");
+    let instance = current_issue_instance("planning");
     let plan_payload = json!({
         "summary": "Patch the submission reducer.",
         "task_class": "runtime_or_data",
@@ -450,7 +493,7 @@ fn submission_mode_deferred_survives_issue_plan_completion() {
 
 #[test]
 fn classifier_assessment_outside_classifier_state_fails_closed() {
-    let instance = issue_instance("planning");
+    let instance = current_issue_instance("planning");
     let result = ActivityResult::succeeded(super::super::ISSUE_PLAN_ACTIVITY, "forged")
         .with_artifact(ActivityArtifact::new(
             crate::runtime::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT,
@@ -548,7 +591,7 @@ fn scope_verdict_without_server_assessment_fails_closed() {
 
 #[test]
 fn issue_plan_ready_signal_can_start_implementation() {
-    let instance = issue_instance("planning");
+    let instance = current_issue_instance("planning");
     let signal_payload = json!({
         "plan_summary": "Use the existing workflow reducer contract.",
         "task_class": "standard_code",
@@ -580,7 +623,7 @@ fn issue_plan_ready_signal_can_start_implementation() {
 
 #[test]
 fn issue_plan_empty_success_blocks_as_invalid_agent_output() {
-    let instance = issue_instance("planning");
+    let instance = current_issue_instance("planning");
     let result = ActivityResult::succeeded(
         super::super::ISSUE_PLAN_ACTIVITY,
         "Planning finished without a structured plan.",
@@ -671,7 +714,7 @@ fn issue_plan_invalid_payload_blocks_as_missing_plan_evidence() {
     ];
 
     for result in invalid_results {
-        let instance = issue_instance("planning");
+        let instance = current_issue_instance("planning");
         let event = runtime_completion_event(&instance, super::super::ISSUE_PLAN_ACTIVITY, result);
 
         let decision = reduce_runtime_job_completed(&instance, &event)
@@ -686,7 +729,8 @@ fn issue_plan_invalid_payload_blocks_as_missing_plan_evidence() {
 
 #[test]
 fn runtime_completion_reducer_retries_issue_plan_failure_when_policy_allows() {
-    let instance = issue_instance("planning").with_server_data(json!({
+    let instance = current_issue_instance("planning").with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }

@@ -1,6 +1,8 @@
+use crate::runtime::WorkflowDefinitionRegistry;
+
 #[test]
 fn event_transition_dedupe_keys() {
-    let instance = issue_instance("replanning");
+    let instance = current_issue_instance("replanning");
     let result = ActivityResult::succeeded("replan_issue", "Replan completed.").with_artifact(
         ActivityArtifact::new(
             crate::runtime::ISSUE_PLAN_ARTIFACT,
@@ -90,7 +92,7 @@ fn runtime_completion_reducer_blocks_issue_implementation_success_without_pr() {
 
 #[test]
 fn runtime_completion_reducer_binds_pr_from_structured_pull_request_artifact() {
-    let instance = issue_instance("implementing");
+    let instance = current_issue_instance("implementing");
     let result = ActivityResult::succeeded("implement_issue", "Implementation completed.")
         .with_artifact(ActivityArtifact::new(
             "pull_request",
@@ -141,6 +143,39 @@ fn runtime_completion_reducer_binds_pr_from_structured_pull_request_artifact() {
             &ValidationContext::new("runtime-1", Utc::now()),
         )
         .expect("structured PR binding should validate");
+}
+
+#[test]
+fn legacy_implementation_completion_binds_pr_without_entering_v2_scope_review() {
+    let instance = legacy_issue_instance("implementing");
+    let result = ActivityResult::succeeded("implement_issue", "Implementation completed.")
+        .with_artifact(ActivityArtifact::new(
+            "pull_request",
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77"
+            }),
+        ))
+        .with_artifact(verified_pr_binding(77));
+    let event = runtime_completion_event(&instance, "implement_issue", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("legacy implementation should bind the PR");
+
+    assert_eq!(decision.next_state, "pr_open");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(decision.commands[0].command_type, WorkflowCommandType::BindPr);
+    WorkflowDefinitionRegistry::with_builtins()
+        .decision_validator_for_instance(&instance)
+        .expect("legacy pin should resolve")
+        .expect("legacy definition should have a validator")
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("legacy PR binding should validate against v1");
 }
 
 #[test]
@@ -319,7 +354,8 @@ fn runtime_completion_reducer_finishes_merge_pr_with_merged_pull_request_artifac
 
 #[test]
 fn runtime_completion_reducer_reclassifies_head_changed_before_merge() {
-    let instance = issue_instance("merging").with_server_data(json!({
+    let instance = current_issue_instance("merging").with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "repo": "owner/repo",
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -1045,7 +1081,7 @@ fn runtime_completion_reducer_blocks_same_number_wrong_repo_bind_pr() {
 
 #[test]
 fn runtime_completion_reducer_canonicalizes_verified_structured_bind_pr_url() {
-    let instance = issue_instance("implementing");
+    let instance = current_issue_instance("implementing");
     let proposed_decision = WorkflowDecision::new(
         &instance.id,
         "implementing",

@@ -1,5 +1,5 @@
 use super::{instance_helpers::progress_state_selector_rows, WorkflowRuntimeStore};
-use crate::runtime::WorkflowProgressMode;
+use crate::runtime::{WorkflowProgressMode, GITHUB_ISSUE_PR_DEFINITION_ID};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverlessProgressProvenanceStatus {
@@ -55,10 +55,13 @@ impl WorkflowRuntimeStore {
                     state.progress_mode == Some(WorkflowProgressMode::CommandDriven)
                 })
             {
+                let unpinned_legacy_builtin = definition.registered().id
+                    == GITHUB_ISSUE_PR_DEFINITION_ID
+                    && definition.definition_version() == 1;
                 selectors.insert(
                     definition.registered().id.clone(),
-                    Some(i64::from(definition.definition_version())),
-                    Some(definition.definition_hash().to_string()),
+                    (!unpinned_legacy_builtin).then(|| i64::from(definition.definition_version())),
+                    (!unpinned_legacy_builtin).then(|| definition.definition_hash().to_string()),
                     state.key.state.to_string(),
                 );
             }

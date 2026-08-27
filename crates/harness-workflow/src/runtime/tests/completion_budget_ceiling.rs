@@ -62,7 +62,7 @@ async fn ceiling_instance(
     id: &str,
     spent_usd: f64,
 ) -> anyhow::Result<WorkflowInstance> {
-    let instance = issue_instance("implementing").with_id(id);
+    let instance = current_issue_instance("implementing").with_id(id);
     store
         .force_upsert_lifecycle_state_for_test(&instance)
         .await?;

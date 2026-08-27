@@ -1,7 +1,7 @@
 use super::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT;
 use super::{
-    ActivityResult, RuntimeJob, WorkflowCommand, WorkflowCommandType, WorkflowDefinitionRegistry,
-    WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
+    ActivityResult, RuntimeJob, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
+    WorkflowDefinitionRegistry, WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 
@@ -63,4 +63,20 @@ pub(crate) fn enqueue_candidate_pr_scope_review(
         pr_url,
         Value::Null,
     )
+}
+
+pub(crate) fn finish_candidate_pr_promotion(
+    workflow: &WorkflowInstance,
+    mut decision: WorkflowDecision,
+    event_id: &str,
+    pr_number: u64,
+    pr_url: &str,
+) -> WorkflowDecision {
+    if workflow.definition_version == 1 {
+        decision.next_state = "pr_open".to_string();
+        return decision;
+    }
+    decision.with_command(enqueue_candidate_pr_scope_review(
+        event_id, pr_number, pr_url,
+    ))
 }

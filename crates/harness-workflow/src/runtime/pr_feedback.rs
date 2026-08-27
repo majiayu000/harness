@@ -126,6 +126,35 @@ pub fn build_pr_detected_decision(
     instance: &WorkflowInstance,
     input: PrDetectedDecisionInput<'_>,
 ) -> PrFeedbackDecisionOutput {
+    if instance.definition_version == 1 {
+        let decision = WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "bind_pr",
+            "pr_open",
+            "implementation produced a pull request for the issue workflow",
+        )
+        .with_command(WorkflowCommand::bind_pr(
+            input.pr_number,
+            input.pr_url,
+            format!("pr-detected:{}:{}", input.task_id, input.pr_number),
+        ))
+        .with_evidence(WorkflowEvidence::new("pr", input.pr_url))
+        .with_evidence(WorkflowEvidence::runtime_observed(
+            super::completion_evidence::EVIDENCE_VERIFIED_PR_BINDING,
+            format!(
+                "server_observed_pr_event pr={} url={}",
+                input.pr_number, input.pr_url
+            ),
+            "server_observed_pr_event",
+            None,
+        ))
+        .high_confidence();
+        return PrFeedbackDecisionOutput {
+            action: PrFeedbackWorkflowAction::BindPr,
+            decision,
+        };
+    }
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,

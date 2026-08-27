@@ -15,9 +15,7 @@ mod builtins;
 mod evidence_policy;
 mod versioning;
 
-use self::builtins::{
-    builtin_definitions, builtin_historical_definitions, builtin_registered_definitions,
-};
+use self::builtins::{builtin_definitions, builtin_registered_definitions};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclarativeDefinitionPinError {
@@ -161,8 +159,8 @@ impl WorkflowDefinitionRegistry {
         if let Err(error) = registry.register_declarative_current_batch(builtin_definitions()) {
             panic!("built-in workflow definitions must be unique and valid: {error}");
         }
-        if let Err(error) =
-            registry.register_declarative_historical_batch(builtin_historical_definitions())
+        if let Err(error) = registry
+            .register_declarative_historical_batch([versioning::github_issue_pr_v1_definition()])
         {
             panic!("historical built-in workflow definitions must be unique and valid: {error}");
         }
@@ -430,10 +428,12 @@ impl WorkflowDefinitionRegistry {
             .filter(|((registered_id, _), _)| registered_id == definition_id)
             .flat_map(|((_, definition_version), definition)| {
                 definition.registered().states.iter().filter_map(|state| {
+                    let unpinned_legacy_builtin =
+                        is_builtin_definition_id(definition_id) && *definition_version == 1;
                     Some(WorkflowTerminalStateSelector {
-                        definition_version: Some(*definition_version),
-                        definition_hash: (!is_builtin_definition_id(definition_id)
-                            || *definition_version > 1)
+                        definition_version: (!unpinned_legacy_builtin)
+                            .then_some(*definition_version),
+                        definition_hash: (!unpinned_legacy_builtin)
                             .then(|| definition.definition_hash().to_string()),
                         state: state.key.state.to_string(),
                         terminal_state: state.terminal_state?,
@@ -476,12 +476,16 @@ impl WorkflowDefinitionRegistry {
                     .states
                     .iter()
                     .filter(|state| state.progress_mode == Some(progress_mode))
-                    .map(|state| WorkflowProgressStateSelector {
-                        definition_version: Some(*definition_version),
-                        definition_hash: (!is_builtin_definition_id(definition_id)
-                            || *definition_version > 1)
-                            .then(|| definition.definition_hash().to_string()),
-                        state: state.key.state.to_string(),
+                    .map(|state| {
+                        let unpinned_legacy_builtin =
+                            is_builtin_definition_id(definition_id) && *definition_version == 1;
+                        WorkflowProgressStateSelector {
+                            definition_version: (!unpinned_legacy_builtin)
+                                .then_some(*definition_version),
+                            definition_hash: (!unpinned_legacy_builtin)
+                                .then(|| definition.definition_hash().to_string()),
+                            state: state.key.state.to_string(),
+                        }
                     })
             })
             .collect::<Vec<_>>();

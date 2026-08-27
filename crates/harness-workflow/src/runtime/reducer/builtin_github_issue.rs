@@ -197,6 +197,26 @@ pub(super) fn bind_pr_from_activity_result(
             }
         };
     let pr_url = binding.canonical_pr_url;
+    if instance.definition_version == 1 {
+        return Some(
+            WorkflowDecision::new(
+                &instance.id,
+                &instance.state,
+                "bind_pr",
+                "pr_open",
+                "implementation activity returned a structured pull request artifact",
+            )
+            .with_command(WorkflowCommand::bind_pr(
+                pr_number,
+                pr_url.clone(),
+                format!("runtime-completion:{}:bind-pr:{pr_number}", event.id),
+            ))
+            .with_evidence(WorkflowEvidence::new("pull_request", pr_url))
+            .with_evidence(binding.evidence)
+            .with_evidence(runtime_completion_evidence(event, result))
+            .high_confidence(),
+        );
+    }
     let issue_plan = event
         .event
         .pointer("/command/command/issue_plan")

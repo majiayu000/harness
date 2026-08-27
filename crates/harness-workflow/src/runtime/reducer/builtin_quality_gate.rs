@@ -31,7 +31,8 @@ pub(super) fn parent_quality_gate_head_decision(
         super::GITHUB_ISSUE_PR_DEFINITION_ID,
         "quality_gate_pending",
         QUALITY_GATE_ACTIVITY,
-    ) || quality_gate_success_contract_error(registry, result).is_some()
+    ) || instance.definition_version == 1
+        || quality_gate_success_contract_error(registry, result).is_some()
     {
         return None;
     }

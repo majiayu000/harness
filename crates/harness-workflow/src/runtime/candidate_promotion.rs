@@ -260,7 +260,6 @@ fn candidate_promotion_success_decision_inner(
             plan.selected.candidate_id
         );
     }
-
     let reason = format!(
         "promoted candidate {} opened the selected pull request",
         plan.selected.candidate_id
@@ -277,12 +276,7 @@ fn candidate_promotion_success_decision_inner(
         pr_url.clone(),
         format!("candidate-promotion:{}:bind-pr:{pr_number}", event.id),
     ))
-    .with_command(
-        crate::runtime::scope_review::enqueue_candidate_pr_scope_review(
-            &event.id, pr_number, &pr_url,
-        ),
-    )
-    .with_evidence(WorkflowEvidence::new("pull_request", pr_url))
+    .with_evidence(WorkflowEvidence::new("pull_request", pr_url.clone()))
     .with_evidence(binding.evidence)
     .with_evidence(WorkflowEvidence::new(
         "candidate",
@@ -292,7 +286,9 @@ fn candidate_promotion_success_decision_inner(
         "runtime_completion",
         format!("event_id={} activity={}", event.id, result.activity),
     ));
-
+    decision = crate::runtime::scope_review::finish_candidate_pr_promotion(
+        instance, decision, &event.id, pr_number, &pr_url,
+    );
     if !plan.cleanup_targets.is_empty() {
         decision = decision.with_command(cleanup_candidate_command(&plan, &event.id));
     }
@@ -587,7 +583,7 @@ mod tests {
     fn issue_instance() -> WorkflowInstance {
         WorkflowInstance::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
-            1,
+            2,
             "implementing",
             WorkflowSubject::new("issue", "issue:1449"),
         )

@@ -1,9 +1,10 @@
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
-    build_plan_issue_decision, DataProvenance, PlanIssueDecisionInput, PlanIssueWorkflowAction,
-    WorkflowCommand, WorkflowCommandStatus, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence, WorkflowInstance,
-    WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
+    build_plan_issue_decision, github_issue_pr_definition_hash, DataProvenance,
+    PlanIssueDecisionInput, PlanIssueWorkflowAction, WorkflowCommand, WorkflowCommandStatus,
+    WorkflowDecision, WorkflowDecisionRecord, WorkflowDecisionTransition, WorkflowDefinition,
+    WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, GITHUB_ISSUE_PR_DEFINITION_VERSION,
 };
 use serde_json::json;
 use std::path::Path;
@@ -63,14 +64,22 @@ async fn persist_plan_issue_decision(
         ctx.issue_number,
     );
     store
-        .upsert_definition(&WorkflowDefinition::new(
-            "github_issue_pr",
-            1,
-            "GitHub issue PR workflow",
-        ))
+        .upsert_definition(
+            &WorkflowDefinition::new(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                GITHUB_ISSUE_PR_DEFINITION_VERSION,
+                "GitHub issue PR workflow",
+            )
+            .with_definition_hash(github_issue_pr_definition_hash()),
+        )
         .await?;
     let (instance, new_instance) = match store
-        .get_instance_by_issue("github_issue_pr", &project_id, ctx.repo, ctx.issue_number)
+        .get_instance_by_issue(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            &project_id,
+            ctx.repo,
+            ctx.issue_number,
+        )
         .await?
     {
         Some(instance) => (instance, false),
@@ -187,11 +196,14 @@ async fn persist_replan_completed(
     let workflow_id =
         harness_workflow::issue_lifecycle::workflow_id(&project_id, repo, issue_number);
     store
-        .upsert_definition(&WorkflowDefinition::new(
-            "github_issue_pr",
-            1,
-            "GitHub issue PR workflow",
-        ))
+        .upsert_definition(
+            &WorkflowDefinition::new(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                GITHUB_ISSUE_PR_DEFINITION_VERSION,
+                "GitHub issue PR workflow",
+            )
+            .with_definition_hash(github_issue_pr_definition_hash()),
+        )
         .await?;
     let instance = store.get_instance(&workflow_id).await?.ok_or_else(|| {
         anyhow::anyhow!(
@@ -321,8 +333,8 @@ fn issue_instance(
     state: &str,
 ) -> anyhow::Result<WorkflowInstance> {
     Ok(WorkflowInstance::new(
-        "github_issue_pr",
-        1,
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
         state,
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
@@ -333,6 +345,7 @@ fn issue_instance(
             crate::workflow_runtime_policy::merge_runtime_retry_policy(
                 Path::new(&project_id),
                 json!({
+                    "definition_hash": github_issue_pr_definition_hash(),
                     "project_id": project_id,
                     "repo": repo,
                     "issue_number": issue_number,

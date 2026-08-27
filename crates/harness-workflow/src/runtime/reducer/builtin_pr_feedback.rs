@@ -46,7 +46,7 @@ pub(super) fn pr_feedback_sweep_decision_from_activity_result(
     let task_id = event_field_string(event, "runtime_job_id")
         .or_else(|| optional_data_string(instance, "task_id"))
         .unwrap_or_else(|| event.id.clone());
-    if pr_head_requires_scope_recheck(instance, result) {
+    if instance.definition_version != 1 && pr_head_requires_scope_recheck(instance, result) {
         return Some(pr_scope_recheck_decision(
             instance,
             event,
@@ -78,6 +78,7 @@ pub(super) fn pr_scope_recheck_after_repair(
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
     if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || instance.definition_version == 1
         || instance.state != "addressing_feedback"
         || result.activity != "address_pr_feedback"
     {
@@ -101,6 +102,7 @@ pub(super) fn pr_scope_recheck_before_merge(
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
     if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || instance.definition_version == 1
         || instance.state != "merging"
         || result.activity != "merge_pr"
         || !has_signal(result, "PrHeadChanged")

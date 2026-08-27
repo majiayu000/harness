@@ -75,7 +75,8 @@ fn local_review_changes_requested_command_carries_review_findings() {
 
 #[test]
 fn scope_recheck_after_rework_uses_completion_event_dedupe_key() {
-    let instance = issue_instance("addressing_feedback").with_server_data(json!({
+    let instance = current_issue_instance("addressing_feedback").with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
@@ -493,7 +494,8 @@ fn local_review_success_without_outcome_signal_blocks_invalid_output() {
 
 #[test]
 fn scope_recheck_after_rework_replay_keeps_command_dedupe_key() {
-    let instance = issue_instance("addressing_feedback").with_server_data(json!({
+    let instance = current_issue_instance("addressing_feedback").with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));

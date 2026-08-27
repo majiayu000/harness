@@ -1,12 +1,20 @@
 use super::*;
-use crate::runtime::declarative::build_declarative_definition;
-use crate::runtime::model::{WorkflowInstance, WorkflowSubject};
-use crate::runtime::{github_issue_pr_definition_hash, GITHUB_ISSUE_PR_DEFINITION_VERSION};
+use crate::runtime::declarative::{
+    build_builtin_declarative_definition, build_declarative_definition,
+};
+use crate::runtime::model::{
+    WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowInstance, WorkflowSubject,
+};
+use crate::runtime::validator::{TransitionAllowlist, ValidationContext};
+use crate::runtime::{
+    github_issue_pr_definition_hash, WorkflowProgressMode, GITHUB_ISSUE_PR_DEFINITION_VERSION,
+};
+use chrono::Utc;
 use harness_core::config::workflow::{
     DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
 };
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn definition() -> DeclarativeWorkflowDefinition {
     let policy = WorkflowDefinitionPolicy {
@@ -170,4 +178,84 @@ fn legacy_and_current_github_builtins_resolve_their_exact_versions() {
         .policy()
         .states
         .contains_key("plan_scope_review"));
+
+    let legacy_transition = WorkflowDecision::new(
+        &legacy.id,
+        "discovered",
+        "submit_issue",
+        "planning",
+        "legacy submission starts planning",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "plan_issue",
+        "legacy:plan",
+    ));
+    registry
+        .decision_validator_for_instance(&legacy)
+        .expect("legacy pin should resolve")
+        .expect("legacy definition should expose a validator")
+        .validate(
+            &legacy,
+            &legacy_transition,
+            &ValidationContext::new("versioning-test", Utc::now()),
+        )
+        .expect("v1 transition table must remain independently usable");
+}
+
+#[test]
+fn github_builtin_selectors_keep_v1_unpinned_and_v2_exactly_pinned() {
+    let registry = WorkflowDefinitionRegistry::with_builtins();
+    let terminal = registry.terminal_state_selectors(GITHUB_ISSUE_PR_DEFINITION_ID);
+    assert!(terminal.iter().any(|selector| {
+        selector.state == "done"
+            && selector.definition_version.is_none()
+            && selector.definition_hash.is_none()
+    }));
+    assert!(terminal.iter().any(|selector| {
+        selector.state == "done"
+            && selector.definition_version == Some(GITHUB_ISSUE_PR_DEFINITION_VERSION)
+            && selector.definition_hash.as_deref()
+                == Some(github_issue_pr_definition_hash().as_str())
+    }));
+
+    let progress = registry.progress_state_selectors(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        WorkflowProgressMode::ExternalWait,
+    );
+    assert!(progress.iter().any(|selector| {
+        selector.state == "awaiting_feedback"
+            && selector.definition_version.is_none()
+            && selector.definition_hash.is_none()
+    }));
+    assert!(progress.iter().any(|selector| {
+        selector.state == "awaiting_feedback"
+            && selector.definition_version == Some(GITHUB_ISSUE_PR_DEFINITION_VERSION)
+            && selector.definition_hash.as_deref()
+                == Some(github_issue_pr_definition_hash().as_str())
+    }));
+}
+
+#[test]
+fn builtin_content_hash_covers_the_transition_contract() {
+    let fixture = definition();
+    let policy = fixture.policy().clone();
+    let activities = BTreeMap::from([("run".to_string(), WorkflowActivityPolicy::default())]);
+    let first = build_builtin_declarative_definition(
+        &policy,
+        &activities,
+        TransitionAllowlist::default().allow("running", "done", [WorkflowCommandType::MarkDone]),
+        BTreeSet::new(),
+        7,
+    )
+    .expect("first transition contract should compile");
+    let second = build_builtin_declarative_definition(
+        &policy,
+        &activities,
+        TransitionAllowlist::default().allow("running", "done", [WorkflowCommandType::Wait]),
+        BTreeSet::new(),
+        7,
+    )
+    .expect("second transition contract should compile");
+
+    assert_ne!(first.definition_hash(), second.definition_hash());
 }
