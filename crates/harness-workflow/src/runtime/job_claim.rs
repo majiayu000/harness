@@ -53,6 +53,9 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
+        if runtime_kind == RuntimeKind::RemoteHost {
+            self.reroute_legacy_remote_server_owned_jobs().await?;
+        }
         self.claim_next_runtime_job_matching(
             None,
             Some(runtime_kind),
@@ -62,6 +65,71 @@ impl WorkflowRuntimeStore {
             true,
         )
         .await
+    }
+
+    async fn reroute_legacy_remote_server_owned_jobs(&self) -> anyhow::Result<usize> {
+        let mut inspected_ids = Vec::<String>::new();
+        let mut rerouted = 0_usize;
+        loop {
+            let mut tx = self.pool.begin().await?;
+            let candidate: Option<(String, String)> = sqlx::query_as(
+                "SELECT job.id, workflow.data::text
+                 FROM runtime_jobs AS job
+                 JOIN workflow_commands AS command ON command.id = job.command_id
+                 JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+                 WHERE job.runtime_kind = 'remote_host'
+                   AND job.status IN ('pending', 'running')
+                   AND command.status = 'dispatched'
+                   AND command.superseded_by_command_id IS NULL
+                   AND NOT (job.id = ANY($1::text[]))
+                 ORDER BY job.created_at ASC
+                 LIMIT 1
+                 FOR UPDATE OF workflow SKIP LOCKED",
+            )
+            .bind(&inspected_ids)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((id, workflow_data)) = candidate else {
+                tx.commit().await?;
+                return Ok(rerouted);
+            };
+            let workflow = super::store::workflow_instance_from_persisted_json(&workflow_data)?;
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT job.data::text
+                 FROM runtime_jobs AS job
+                 JOIN workflow_commands AS command ON command.id = job.command_id
+                 WHERE job.id = $1
+                   AND job.runtime_kind = 'remote_host'
+                   AND job.status IN ('pending', 'running')
+                   AND command.status = 'dispatched'
+                   AND command.superseded_by_command_id IS NULL
+                 FOR UPDATE OF command, job",
+            )
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((data,)) = row else {
+                tx.commit().await?;
+                continue;
+            };
+            let mut job: RuntimeJob = serde_json::from_str(&data)?;
+            let kind = server_owned_job_kind(&self.definition_registry, &workflow, &job).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "workflow {} has an invalid declarative definition pin: {error:?}",
+                        workflow.id
+                    )
+                },
+            )?;
+            let Some(kind) = kind else {
+                tx.commit().await?;
+                inspected_ids.push(id);
+                continue;
+            };
+            reroute_legacy_remote_server_owned_job(&mut tx, &mut job, kind).await?;
+            tx.commit().await?;
+            rerouted += 1;
+        }
     }
 
     pub(in crate::runtime) async fn claim_next_runtime_job_matching(
@@ -201,7 +269,14 @@ impl WorkflowRuntimeStore {
             let mut job: RuntimeJob = serde_json::from_str(&data)?;
             if records_remote_host_audit {
                 if let Some(server_owned_kind) =
-                    server_owned_job_kind(&self.definition_registry, &workflow, &job)
+                    server_owned_job_kind(&self.definition_registry, &workflow, &job).map_err(
+                        |error| {
+                            anyhow::anyhow!(
+                                "workflow {} has an invalid declarative definition pin: {error:?}",
+                                workflow.id
+                            )
+                        },
+                    )?
                 {
                     reroute_legacy_remote_server_owned_job(&mut tx, &mut job, server_owned_kind)
                         .await?;
@@ -267,13 +342,17 @@ fn server_owned_job_kind(
     registry: &WorkflowDefinitionRegistry,
     workflow: &WorkflowInstance,
     job: &RuntimeJob,
-) -> Option<ServerOwnedJobKind> {
-    let activity = job.input.get("activity").and_then(|value| value.as_str())?;
+) -> Result<Option<ServerOwnedJobKind>, super::DeclarativeDefinitionPinError> {
+    let Some(activity) = job.input.get("activity").and_then(|value| value.as_str()) else {
+        return Ok(None);
+    };
     if workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && activity == "merge_pr" {
-        return Some(ServerOwnedJobKind::Merge);
+        return Ok(Some(ServerOwnedJobKind::Merge));
     }
-    super::scope_review::runtime_job_requires_local_server(registry, workflow, job)
-        .then_some(ServerOwnedJobKind::Classifier)
+    Ok(
+        super::scope_review::runtime_job_requires_local_server(registry, workflow, job)?
+            .then_some(ServerOwnedJobKind::Classifier),
+    )
 }
 
 async fn reroute_legacy_remote_server_owned_job(
@@ -301,10 +380,12 @@ async fn reroute_legacy_remote_server_owned_job(
             )
         }
     };
+    let prior_lease_generation = job.lease_generation;
     job.runtime_kind = RuntimeKind::CodexExec;
     job.runtime_profile = profile.to_string();
     job.status = super::RuntimeJobStatus::Pending;
     job.lease = None;
+    job.lease_generation = job.lease_generation.saturating_add(1);
     job.not_before = None;
     job.updated_at = Utc::now();
     let data = to_jsonb_string(job)?;
@@ -320,11 +401,17 @@ async fn reroute_legacy_remote_server_owned_job(
     .bind(&job.id)
     .execute(&mut **tx)
     .await?;
+    delete_all_runtime_job_lease_receipts_tx(tx, &job.id).await?;
     append_runtime_event_tx(
         tx,
         &job.id,
         "RuntimeJobReroutedToServer",
-        serde_json::json!({"reason": reason, "prior_runtime_kind": "remote_host"}),
+        serde_json::json!({
+            "reason": reason,
+            "prior_runtime_kind": "remote_host",
+            "prior_lease_generation": prior_lease_generation,
+            "lease_generation": job.lease_generation,
+        }),
     )
     .await?;
     Ok(())
@@ -353,7 +440,7 @@ mod tests {
 
         assert!(matches!(
             server_owned_job_kind(&registry, &workflow, &job),
-            Some(ServerOwnedJobKind::Classifier)
+            Ok(Some(ServerOwnedJobKind::Classifier))
         ));
     }
 }

@@ -232,7 +232,13 @@ impl WorkflowRuntimeStore {
                 &self.definition_registry,
                 &workflow,
                 &job,
-            );
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "workflow {} has an invalid declarative definition pin: {error:?}",
+                    workflow.id
+                )
+            })?;
         let rejection = if server_owned_remote_job {
             Some(RuntimeJobLeaseRenewalRejection::Revoked)
         } else if cancellation_requested && !cancellation_ack {

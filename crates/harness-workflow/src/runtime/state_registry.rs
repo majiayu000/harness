@@ -305,12 +305,18 @@ impl WorkflowDefinitionRegistry {
         }
     }
 
-    pub fn definition_has_classifier_activity(&self, definition_id: &str, activity: &str) -> bool {
-        self.declarative_versions
-            .iter()
-            .any(|((id, _), definition)| {
-                id == definition_id && definition.classifier_activities().contains(activity)
-            })
+    pub fn instance_has_classifier_activity(
+        &self,
+        instance: &WorkflowInstance,
+        activity: &str,
+    ) -> Result<bool, DeclarativeDefinitionPinError> {
+        match self.resolve_declarative_definition(instance) {
+            DeclarativeDefinitionResolution::Resolved(definition) => {
+                Ok(definition.classifier_activities().contains(activity))
+            }
+            DeclarativeDefinitionResolution::PinError(error) => Err(error),
+            DeclarativeDefinitionResolution::NotDeclarative => Ok(false),
+        }
     }
 
     pub fn instance_is_declarative(&self, instance: &WorkflowInstance) -> bool {

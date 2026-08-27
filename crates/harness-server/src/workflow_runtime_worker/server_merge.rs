@@ -231,10 +231,13 @@ pub(super) async fn execute_server_merge(
                 );
             }
             return merge_error_result(
+                state,
+                job,
                 activity,
                 &target,
                 Some(github_token),
                 &expected_head_sha,
+                policy.delete_branch,
                 error,
             )
             .await;
@@ -280,22 +283,30 @@ pub(super) async fn execute_server_merge(
 }
 
 async fn merge_error_result(
+    state: &AppState,
+    job: &RuntimeJob,
     activity: String,
     target: &GitHubPrSnapshotTarget,
     github_token: Option<&str>,
     expected_head_sha: &str,
+    delete_branch: bool,
     error: GitHubPrMergeError,
 ) -> ActivityResult {
     match fetch_github_pr_snapshot(target, github_token).await {
         Ok(snapshot) if snapshot_observes_merged(&snapshot.normalized_snapshot) => {
-            server_merge_succeeded(
+            super::executor::server_owned::finish_server_merge(
+                state,
+                job,
                 activity,
                 target,
                 snapshot,
                 expected_head_sha,
                 "already_merged_after_merge_error",
                 Some(server_merge_error_payload(&error)),
+                delete_branch,
+                github_token,
             )
+            .await
         }
         Ok(snapshot) => server_merge_failed(
             activity,
@@ -598,6 +609,18 @@ mod tests {
         assert!(policy.require_review_threads_resolved);
         assert!(policy.require_clean_merge_state);
         assert_eq!(policy.merge_execution, GitHubMergeExecution::Server);
+    }
+
+    #[test]
+    fn server_merge_policy_rejects_non_atomic_branch_deletion() {
+        let workflow = workflow();
+        let mut job = job();
+        job.input["command"]["delete_branch"] = json!(true);
+
+        let error = server_merge_policy(&GitHubAutoMergeConfig::default(), &job, Some(&workflow))
+            .expect_err("non-atomic branch deletion must fail before merge");
+
+        assert!(error.contains("expected-SHA compare-and-delete"));
     }
 
     #[test]

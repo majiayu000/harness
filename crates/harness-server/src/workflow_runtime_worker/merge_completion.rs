@@ -133,7 +133,7 @@ pub(super) fn server_merge_policy(
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
 ) -> Result<ResolvedGitHubAutoMergePolicy, String> {
-    Ok(ResolvedGitHubAutoMergePolicy {
+    let policy = ResolvedGitHubAutoMergePolicy {
         enabled: true,
         method: merge_method_for_activity(config, job, workflow)?,
         delete_branch: activity_bool(job, workflow, "delete_branch")
@@ -151,7 +151,14 @@ pub(super) fn server_merge_policy(
             .unwrap_or(config.require_clean_merge_state),
         merge_execution: GitHubMergeExecution::Server,
         verify_merge_completion: config.verify_merge_completion,
-    })
+    };
+    if policy.delete_branch {
+        return Err(
+            "server-owned merge cannot safely delete a branch because GitHub does not provide an expected-SHA compare-and-delete operation for refs"
+                .to_string(),
+        );
+    }
+    Ok(policy)
 }
 
 pub(super) fn required_expected_head_sha_for_merge(

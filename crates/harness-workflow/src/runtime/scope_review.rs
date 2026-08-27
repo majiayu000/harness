@@ -20,12 +20,14 @@ pub(crate) fn runtime_job_requires_local_server(
     registry: &WorkflowDefinitionRegistry,
     workflow: &WorkflowInstance,
     job: &RuntimeJob,
-) -> bool {
+) -> Result<bool, super::DeclarativeDefinitionPinError> {
     let Some(activity) = job.input.get("activity").and_then(Value::as_str) else {
-        return false;
+        return Ok(false);
     };
-    (workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && activity == "merge_pr")
-        || registry.definition_has_classifier_activity(&workflow.definition_id, activity)
+    if workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && activity == "merge_pr" {
+        return Ok(true);
+    }
+    registry.instance_has_classifier_activity(workflow, activity)
 }
 
 pub(crate) fn enqueue_pr_scope_review(

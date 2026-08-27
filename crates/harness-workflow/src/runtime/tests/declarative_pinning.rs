@@ -164,6 +164,71 @@ mod declarative_pinning {
     }
 
     #[test]
+    fn classifier_ownership_uses_the_instances_exact_definition_pin() {
+        let mut policy = policy_v1();
+        let reviewing = policy.states.get_mut("reviewing").expect("fixture state");
+        reviewing.on_success = None;
+        reviewing.on_failure = Some("blocked".to_string());
+        reviewing.on_signal = BTreeMap::from([
+            ("allow".to_string(), "done".to_string()),
+            ("needs_human".to_string(), "failed".to_string()),
+        ]);
+        let classifier = WorkflowActivityPolicy {
+            prompt: Some("Judge only the supplied facts.".to_string()),
+            classifier: Some(WorkflowClassifierPolicy {
+                verdicts: vec!["allow".to_string(), "needs_human".to_string()],
+                environment: vec!["Use only the supplied facts.".to_string()],
+                ..WorkflowClassifierPolicy::default()
+            }),
+            ..WorkflowActivityPolicy::default()
+        };
+        let historical = build_declarative_definition(
+            &policy,
+            &BTreeMap::from([("review".to_string(), classifier)]),
+        )
+        .expect("historical classifier definition should compile");
+        let current = build_declarative_definition(&policy, &activity_policies())
+            .expect("current non-classifier definition should compile");
+        let mut registry = WorkflowDefinitionRegistry::new_for_tests();
+        registry
+            .register_declarative_historical(historical.clone())
+            .expect("historical definition should register");
+        registry
+            .register_declarative_current(current.clone())
+            .expect("current definition should register");
+
+        let historical_instance = WorkflowInstance::new(
+            "docs_review",
+            historical.definition_version(),
+            "reviewing",
+            WorkflowSubject::new("document", "historical"),
+        )
+        .with_server_data(json!({"definition_hash": historical.definition_hash()}));
+        let current_instance = WorkflowInstance::new(
+            "docs_review",
+            current.definition_version(),
+            "reviewing",
+            WorkflowSubject::new("document", "current"),
+        )
+        .with_server_data(json!({"definition_hash": current.definition_hash()}));
+
+        assert_eq!(
+            registry.instance_has_classifier_activity(&historical_instance, "review"),
+            Ok(true)
+        );
+        assert_eq!(
+            registry.instance_has_classifier_activity(&current_instance, "review"),
+            Ok(false)
+        );
+        let mismatched = historical_instance
+            .with_server_data(json!({"definition_hash": current.definition_hash()}));
+        assert_eq!(
+            registry.instance_has_classifier_activity(&mismatched, "review"),
+            Err(DeclarativeDefinitionPinError::HashMismatch)
+        );
+    }
+
+    #[test]
     fn registry_preserves_historical_shapes_and_fails_closed_for_missing_versions() {
         let v1 = compiled(&policy_v1());
         let v2 = compiled(&policy_v2());

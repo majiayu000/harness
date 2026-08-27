@@ -39,9 +39,19 @@ pub(super) fn force_server_owned_profile(
         return Ok(());
     }
 
-    let server_classifier = instance.is_some_and(|instance| {
-        registry.definition_has_classifier_activity(&instance.definition_id, activity)
-    });
+    let server_classifier = instance
+        .map(|instance| {
+            registry
+                .instance_has_classifier_activity(instance, activity)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "workflow {} has an invalid declarative definition pin: {error:?}",
+                        instance.id
+                    )
+                })
+        })
+        .transpose()?
+        .unwrap_or(false);
     if server_classifier && profile.kind == RuntimeKind::RemoteHost {
         anyhow::bail!(
             "classifier activity `{activity}` must use a local agent runtime; remote_host cannot produce a trusted model assessment"
