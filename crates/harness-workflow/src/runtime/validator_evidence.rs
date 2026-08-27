@@ -9,6 +9,30 @@ use super::TransitionAllowlist;
 use harness_core::claim_trust::ClaimTrustLevel;
 
 impl TransitionAllowlist {
+    pub fn github_issue_pr_v1_defaults() -> Self {
+        use super::super::WorkflowCommandType::{
+            BindPr, EnqueueActivity, MarkBlocked, RecordPlanConcern, StartChildWorkflow, Wait,
+        };
+
+        Self::github_issue_pr_defaults()
+            .allow("planning", "implementing", [EnqueueActivity, MarkBlocked])
+            .allow(
+                "replanning",
+                "implementing",
+                [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
+            )
+            .allow(
+                "scheduled",
+                "pr_open",
+                [BindPr, EnqueueActivity, StartChildWorkflow, Wait],
+            )
+            .allow(
+                "addressing_feedback",
+                "local_review_gate",
+                [EnqueueActivity, StartChildWorkflow, Wait],
+            )
+    }
+
     /// Attach required evidence classes to an already-allowed transition.
     ///
     /// Transition tables are compile-time constants, so a missing target rule

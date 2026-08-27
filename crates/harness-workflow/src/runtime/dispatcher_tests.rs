@@ -70,10 +70,13 @@ fn profile_selector_allows_explicit_activity_override() {
 fn remote_merge_profile_is_forced_onto_the_local_server_worker() -> anyhow::Result<()> {
     let instance = WorkflowInstance::new(
         crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
+        crate::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "merging",
         crate::runtime::WorkflowSubject::new("issue", "issue:77"),
-    );
+    )
+    .with_server_data(json!({
+        "definition_hash": crate::runtime::github_issue_pr_definition_hash()
+    }));
     let mut profile = RuntimeProfile::new("remote-merge", RuntimeKind::RemoteHost);
     profile.model = Some("remote-model".to_string());
 
@@ -95,10 +98,13 @@ fn remote_classifier_profile_is_rejected_before_dispatch() {
     let registry = crate::runtime::WorkflowDefinitionRegistry::with_builtins();
     let instance = WorkflowInstance::new(
         crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
+        crate::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "pr_scope_review",
         crate::runtime::WorkflowSubject::new("issue", "issue:77"),
-    );
+    )
+    .with_server_data(json!({
+        "definition_hash": crate::runtime::github_issue_pr_definition_hash()
+    }));
     let mut profile = RuntimeProfile::new("remote-classifier", RuntimeKind::RemoteHost);
 
     let error = super::super::dispatcher_throttle::force_server_owned_profile(

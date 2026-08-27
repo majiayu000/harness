@@ -35,6 +35,7 @@ use serde_json::Value;
 
 pub const RUNTIME_JOB_COMPLETED_EVENT: &str = "RuntimeJobCompleted";
 pub const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
+pub const GITHUB_ISSUE_PR_DEFINITION_VERSION: u32 = 2;
 pub const ISSUE_CLOSED_SIGNAL: &str = "IssueClosed";
 pub const ISSUE_ALREADY_RESOLVED_SIGNAL: &str = "IssueAlreadyResolved";
 pub const ISSUE_STATE_ARTIFACT: &str = "issue_state";

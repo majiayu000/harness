@@ -289,10 +289,13 @@ fn built_in_scope_review_requires_workflow_classifier_policy() {
     let registry = WorkflowDefinitionRegistry::with_builtins();
     let workflow = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "plan_scope_review",
         WorkflowSubject::new("issue", "issue:42"),
-    );
+    )
+    .with_server_data(json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash()
+    }));
     let mut job = RuntimeJob::pending(
         "command-scope-review",
         RuntimeKind::CodexJsonrpc,
@@ -338,6 +341,7 @@ fn built_in_scope_review_requires_workflow_classifier_policy() {
         ..WorkflowActivityPolicy::default()
     };
     let workflow = workflow.with_server_data(json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
         "pinned_change_scope_classifier_policy": pinned_policy
     }));
     document.config.activities.clear();

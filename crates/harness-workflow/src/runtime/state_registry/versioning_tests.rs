@@ -1,6 +1,7 @@
 use super::*;
 use crate::runtime::declarative::build_declarative_definition;
 use crate::runtime::model::{WorkflowInstance, WorkflowSubject};
+use crate::runtime::{github_issue_pr_definition_hash, GITHUB_ISSUE_PR_DEFINITION_VERSION};
 use harness_core::config::workflow::{
     DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
 };
@@ -128,20 +129,45 @@ fn historical_only_declarative_definition_is_enumerated() {
 }
 
 #[test]
-fn builtins_resolve_without_requiring_declarative_pin_markers() {
+fn legacy_and_current_github_builtins_resolve_their_exact_versions() {
     let registry = WorkflowDefinitionRegistry::with_builtins();
-    let builtin = WorkflowInstance::new(
+    let legacy = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
         "discovered",
         WorkflowSubject::new("issue", "one"),
+    );
+    let DeclarativeDefinitionResolution::Resolved(legacy_definition) =
+        registry.resolve_declarative_definition(&legacy)
+    else {
+        panic!("legacy built-in definition should resolve");
+    };
+    assert!(!legacy_definition
+        .classifier_activities()
+        .contains(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY));
+    assert!(!legacy_definition
+        .policy()
+        .states
+        .contains_key("plan_scope_review"));
+    let current = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
+        "discovered",
+        WorkflowSubject::new("issue", "two"),
     )
     .with_server_data(json!({
-        "definition_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        "definition_hash": github_issue_pr_definition_hash()
     }));
-    let resolved = registry.resolve_declarative_definition(&builtin);
-    assert!(matches!(
-        resolved,
-        DeclarativeDefinitionResolution::Resolved(_)
-    ));
+    let DeclarativeDefinitionResolution::Resolved(current_definition) =
+        registry.resolve_declarative_definition(&current)
+    else {
+        panic!("current built-in definition should resolve");
+    };
+    assert!(current_definition
+        .classifier_activities()
+        .contains(crate::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY));
+    assert!(current_definition
+        .policy()
+        .states
+        .contains_key("plan_scope_review"));
 }

@@ -2,11 +2,11 @@ use chrono::Utc;
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::issue_lifecycle::{workflow_id, IssueLifecycleState, IssueWorkflowStore};
 use harness_workflow::runtime::{
-    DataProvenance, RemoteFactSnapshot, WorkflowCommand, WorkflowCommandType,
-    WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
+    github_issue_pr_definition_hash, DataProvenance, RemoteFactSnapshot, WorkflowCommand,
+    WorkflowCommandType, WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
     WorkflowCoverageRecoveryTransition, WorkflowDecision, WorkflowDefinition, WorkflowEvidence,
     WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
-    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    GITHUB_ISSUE_PR_DEFINITION_VERSION, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
@@ -308,11 +308,14 @@ async fn recover_github_pr_coverage_with_client(
 
     let state = recovered_runtime_state(*readiness);
     runtime_store
-        .upsert_definition(&WorkflowDefinition::new(
-            GITHUB_ISSUE_PR_DEFINITION_ID,
-            1,
-            "GitHub issue PR workflow",
-        ))
+        .upsert_definition(
+            &WorkflowDefinition::new(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                GITHUB_ISSUE_PR_DEFINITION_VERSION,
+                "GitHub issue PR workflow",
+            )
+            .with_definition_hash(github_issue_pr_definition_hash()),
+        )
         .await?;
     let persistence = persist_recovered_workflow(
         runtime_store,
@@ -387,6 +390,7 @@ async fn persist_recovered_workflow(
     if existing.is_none() {
         data =
             crate::workflow_runtime_policy::pin_change_scope_classifier_policy(project_root, data)?;
+        data["definition_hash"] = json!(github_issue_pr_definition_hash());
     }
     if let Some(existing) = existing.as_ref() {
         if existing.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
@@ -404,7 +408,7 @@ async fn persist_recovered_workflow(
     let mut final_instance = existing.clone().unwrap_or_else(|| {
         WorkflowInstance::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
-            1,
+            GITHUB_ISSUE_PR_DEFINITION_VERSION,
             state,
             WorkflowSubject::new("issue", format!("issue:{issue_number}")),
         )
@@ -413,6 +417,7 @@ async fn persist_recovered_workflow(
     final_instance.state = state.to_string();
     final_instance.replace_data_with_field_provenance(data, |field| match field {
         "author_trust_class"
+        | "definition_hash"
         | "last_remote_fact_hash"
         | "project_id"
         | crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD

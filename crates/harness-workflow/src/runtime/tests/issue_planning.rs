@@ -239,7 +239,14 @@ fn candidate_fanout_issue_plan_completion_uses_persisted_metadata() -> anyhow::R
         trigger_label: "best-of-n".to_string(),
         max_turns_per_candidate: None,
     };
-    let instance = issue_instance("planning").with_server_data(json!({
+    let instance = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
+        "planning",
+        WorkflowSubject::new("issue", "123"),
+    )
+    .with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "candidate_fanout": fanout.clone(),
     }));
     let plan_payload = json!({
@@ -275,7 +282,14 @@ fn candidate_fanout_issue_plan_completion_uses_persisted_metadata() -> anyhow::R
         &ValidationContext::new("runtime-1", Utc::now()),
     )?;
 
-    let scope_instance = issue_instance("plan_scope_review").with_server_data(json!({
+    let scope_instance = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
+        "plan_scope_review",
+        WorkflowSubject::new("issue", "123"),
+    )
+    .with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "candidate_fanout": fanout,
     }));
     let classifier_result = ActivityResult::succeeded(
@@ -454,7 +468,15 @@ fn classifier_assessment_outside_classifier_state_fails_closed() {
 
 #[test]
 fn non_allow_scope_verdict_stops_at_operator_gate() {
-    let instance = issue_instance("plan_scope_review");
+    let instance = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
+        "plan_scope_review",
+        WorkflowSubject::new("issue", "123"),
+    )
+    .with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash()
+    }));
     let result = ActivityResult::succeeded(
         super::super::CHANGE_SCOPE_REVIEW_ACTIVITY,
         "The plan contains independently useful outcomes.",
@@ -493,7 +515,15 @@ fn non_allow_scope_verdict_stops_at_operator_gate() {
 
 #[test]
 fn scope_verdict_without_server_assessment_fails_closed() {
-    let instance = issue_instance("plan_scope_review");
+    let instance = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
+        "plan_scope_review",
+        WorkflowSubject::new("issue", "123"),
+    )
+    .with_server_data(json!({
+        "definition_hash": github_issue_pr_definition_hash()
+    }));
     let result = ActivityResult::succeeded(
         super::super::CHANGE_SCOPE_REVIEW_ACTIVITY,
         "Agent-authored scope verdict.",

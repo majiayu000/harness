@@ -175,6 +175,13 @@ impl WorkflowDefinitionRegistry {
         if let Some(definition) = self.declarative_definition(definition_id, definition_version) {
             return Some(Arc::new(definition.registered().clone()));
         }
+        if definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+            && self
+                .current_declarative_versions
+                .contains_key(definition_id)
+        {
+            return None;
+        }
         is_builtin_definition_id(definition_id).then(|| self.definition(definition_id))?
     }
 
@@ -182,7 +189,9 @@ impl WorkflowDefinitionRegistry {
         &self,
         instance: &WorkflowInstance,
     ) -> Option<Arc<RegisteredWorkflowDefinition>> {
-        if is_builtin_definition_id(&instance.definition_id) {
+        if is_builtin_definition_id(&instance.definition_id)
+            && instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        {
             return self.definition(&instance.definition_id);
         }
         match self.resolve_declarative_definition(instance) {
@@ -231,6 +240,29 @@ impl WorkflowDefinitionRegistry {
             );
         };
         if is_builtin_definition_id(&instance.definition_id) {
+            if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
+                return DeclarativeDefinitionResolution::Resolved(definition);
+            }
+            if definition.definition_version() == 1
+                && instance.data.get("definition_hash").is_none()
+            {
+                return DeclarativeDefinitionResolution::Resolved(definition);
+            }
+            let Some(expected_hash) = instance.data.get("definition_hash") else {
+                return DeclarativeDefinitionResolution::PinError(
+                    DeclarativeDefinitionPinError::MissingHash,
+                );
+            };
+            let Some(expected_hash) = expected_hash.as_str() else {
+                return DeclarativeDefinitionResolution::PinError(
+                    DeclarativeDefinitionPinError::InvalidHash,
+                );
+            };
+            if definition.definition_hash() != expected_hash {
+                return DeclarativeDefinitionResolution::PinError(
+                    DeclarativeDefinitionPinError::HashMismatch,
+                );
+            }
             return DeclarativeDefinitionResolution::Resolved(definition);
         }
         let Some(expected_hash) = instance.data.get("definition_hash") else {

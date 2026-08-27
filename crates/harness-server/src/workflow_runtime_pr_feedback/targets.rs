@@ -4,11 +4,14 @@ pub(super) async fn upsert_github_issue_pr_definition(
     store: &WorkflowRuntimeStore,
 ) -> anyhow::Result<()> {
     store
-        .upsert_definition(&WorkflowDefinition::new(
-            GITHUB_ISSUE_PR_DEFINITION_ID,
-            1,
-            "GitHub issue PR workflow",
-        ))
+        .upsert_definition(
+            &WorkflowDefinition::new(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                GITHUB_ISSUE_PR_DEFINITION_VERSION,
+                "GitHub issue PR workflow",
+            )
+            .with_definition_hash(github_issue_pr_definition_hash()),
+        )
         .await
 }
 
@@ -110,8 +113,8 @@ pub(super) fn issue_instance(
     state: &str,
 ) -> anyhow::Result<WorkflowInstance> {
     Ok(WorkflowInstance::new(
-        "github_issue_pr",
-        1,
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
         state,
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
@@ -122,6 +125,7 @@ pub(super) fn issue_instance(
             crate::workflow_runtime_policy::merge_runtime_retry_policy(
                 Path::new(&project_id),
                 json!({
+                    "definition_hash": github_issue_pr_definition_hash(),
                     "project_id": project_id,
                     "repo": repo,
                     "issue_number": issue_number,
@@ -141,7 +145,7 @@ pub(super) fn pr_scoped_instance(
     pr_url: Option<&str>,
     state: &str,
 ) -> anyhow::Result<WorkflowInstance> {
-    let data = crate::workflow_runtime_policy::pin_change_scope_classifier_policy(
+    let mut data = crate::workflow_runtime_policy::pin_change_scope_classifier_policy(
         Path::new(&project_id),
         pr_runtime_data(
             Path::new(&project_id),
@@ -154,9 +158,10 @@ pub(super) fn pr_scoped_instance(
             None,
         ),
     )?;
+    data["definition_hash"] = json!(github_issue_pr_definition_hash());
     Ok(WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
         state,
         WorkflowSubject::new("pr", format!("pr:{pr_number}")),
     )

@@ -2,16 +2,16 @@ use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
     build_issue_submission_decision, build_prompt_submission_decision,
     candidate_fanout_from_policy, candidate_fanout_from_value, continuation_value,
-    prompt_continuation_state_from_data, CandidateFanoutRequest, DataProvenance, DecisionValidator,
-    IssueSubmissionDecisionInput, PromptContinuationPolicy, PromptSubmissionDecisionInput,
-    SubmissionMode, ValidationContext, WorkflowCommandStatus, WorkflowDecision,
-    WorkflowDecisionTransition, WorkflowDefinition, WorkflowInstance, WorkflowRuntimeStore,
-    WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
+    github_issue_pr_definition_hash, prompt_continuation_state_from_data, CandidateFanoutRequest,
+    DataProvenance, DecisionValidator, IssueSubmissionDecisionInput, PromptContinuationPolicy,
+    PromptSubmissionDecisionInput, SubmissionMode, ValidationContext, WorkflowCommandStatus,
+    WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition, WorkflowInstance,
+    WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    GITHUB_ISSUE_PR_DEFINITION_VERSION, PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
 
-const GITHUB_ISSUE_PR_DEFINITION_ID: &str = "github_issue_pr";
 const EXECUTION_PATH_WORKFLOW_RUNTIME: &str = "workflow_runtime";
 const PROMPT_TASK_DESCRIPTION: &str = "prompt task";
 const GITHUB_TRACKER_SOURCE: &str = "github";

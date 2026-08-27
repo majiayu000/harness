@@ -175,9 +175,19 @@ pub use reason_class::{
 pub use reducer::{
     activity_result_has_closed_issue_evidence, activity_result_value_has_closed_issue_evidence,
     reduce_runtime_job_completed, reduce_runtime_job_completed_with_registry,
-    value_has_closed_issue_evidence, GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL,
-    ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT, RUNTIME_JOB_COMPLETED_EVENT,
+    value_has_closed_issue_evidence, GITHUB_ISSUE_PR_DEFINITION_ID,
+    GITHUB_ISSUE_PR_DEFINITION_VERSION, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
+    ISSUE_STATE_ARTIFACT, RUNTIME_JOB_COMPLETED_EVENT,
 };
+
+pub fn github_issue_pr_definition_hash() -> String {
+    let registry = WorkflowDefinitionRegistry::with_builtins();
+    let Some(definition) = registry.current_declarative_definition(GITHUB_ISSUE_PR_DEFINITION_ID)
+    else {
+        panic!("current github_issue_pr definition must be registered");
+    };
+    definition.definition_hash().to_string()
+}
 pub use remote_facts::{
     remote_fact_command_dedupe_key, stable_pr_snapshot_fact_hash_input, stable_remote_fact_hash,
     RemoteFactSnapshot,

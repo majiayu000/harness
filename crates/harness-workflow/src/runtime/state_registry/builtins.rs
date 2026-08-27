@@ -8,7 +8,8 @@ use crate::runtime::pr_feedback::{
 use crate::runtime::prompt_task::{PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY};
 use crate::runtime::quality_gate::{QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID};
 use crate::runtime::reducer::{
-    GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
+    GITHUB_ISSUE_PR_DEFINITION_ID, GITHUB_ISSUE_PR_DEFINITION_VERSION,
+    ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL,
 };
 use crate::runtime::validator::TransitionAllowlist;
 use crate::runtime::{RegisteredWorkflowDefinition, CHANGE_SCOPE_REVIEW_ACTIVITY};
@@ -30,10 +31,23 @@ pub(super) fn builtin_registered_definitions() -> [RegisteredWorkflowDefinition;
     builtin_definitions().map(DeclarativeWorkflowDefinition::into_registered)
 }
 
+pub(super) fn builtin_historical_definitions() -> [DeclarativeWorkflowDefinition; 1] {
+    [github_issue_pr_v1_definition()]
+}
+
 fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
+    builtin(
+        github_issue_pr_policy(),
+        TransitionAllowlist::github_issue_pr_defaults(),
+        BTreeSet::from([CHANGE_SCOPE_REVIEW_ACTIVITY.to_string()]),
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
+    )
+}
+
+fn github_issue_pr_policy() -> WorkflowDefinitionPolicy {
     use DeclaredProgressMode::{CommandDriven, ExternalWait, OperatorGate, ParentHandoff};
 
-    let policy = WorkflowDefinitionPolicy {
+    WorkflowDefinitionPolicy {
         id: GITHUB_ISSUE_PR_DEFINITION_ID.to_string(),
         initial: "discovered".to_string(),
         states: BTreeMap::from([
@@ -187,11 +201,68 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
             "merging".to_string(),
         ],
         intake: None,
-    };
+    }
+}
+
+fn github_issue_pr_v1_definition() -> DeclarativeWorkflowDefinition {
+    let mut policy = github_issue_pr_policy();
+    policy.states.remove("plan_scope_review");
+    policy.states.remove("pr_scope_review");
+    policy
+        .states
+        .get_mut("scheduled")
+        .expect("built-in scheduled state")
+        .on_signal
+        .insert("PullRequestReady".to_string(), "pr_open".to_string());
+    policy
+        .states
+        .get_mut("planning")
+        .expect("built-in planning state")
+        .on_success = Some("implementing".to_string());
+    policy
+        .states
+        .get_mut("implementing")
+        .expect("built-in implementing state")
+        .on_success = Some("pr_open".to_string());
+    policy
+        .states
+        .get_mut("replanning")
+        .expect("built-in replanning state")
+        .on_success = Some("implementing".to_string());
+    policy
+        .states
+        .get_mut("awaiting_feedback")
+        .expect("built-in awaiting_feedback state")
+        .on_signal
+        .remove("PrHeadChanged");
+    policy
+        .states
+        .get_mut("addressing_feedback")
+        .expect("built-in addressing_feedback state")
+        .on_success = Some("local_review_gate".to_string());
+    policy
+        .states
+        .get_mut("quality_gate_pending")
+        .expect("built-in quality_gate_pending state")
+        .on_signal
+        .remove("PrHeadChanged");
+    policy
+        .states
+        .get_mut("ready_to_merge")
+        .expect("built-in ready_to_merge state")
+        .on_signal
+        .remove("PrHeadChanged");
+    policy
+        .states
+        .get_mut("merging")
+        .expect("built-in merging state")
+        .on_signal
+        .remove("PrHeadChanged");
     builtin(
         policy,
-        TransitionAllowlist::github_issue_pr_defaults(),
-        BTreeSet::from([CHANGE_SCOPE_REVIEW_ACTIVITY.to_string()]),
+        TransitionAllowlist::github_issue_pr_v1_defaults(),
+        BTreeSet::new(),
+        1,
     )
 }
 
@@ -241,6 +312,7 @@ fn prompt_task_definition() -> DeclarativeWorkflowDefinition {
         policy,
         TransitionAllowlist::prompt_task_defaults(),
         BTreeSet::new(),
+        1,
     )
 }
 
@@ -281,6 +353,7 @@ fn quality_gate_definition() -> DeclarativeWorkflowDefinition {
         policy,
         TransitionAllowlist::quality_gate_defaults(),
         BTreeSet::new(),
+        1,
     )
 }
 
@@ -329,6 +402,7 @@ fn pr_feedback_definition() -> DeclarativeWorkflowDefinition {
         policy,
         TransitionAllowlist::pr_feedback_defaults(),
         BTreeSet::new(),
+        1,
     )
 }
 
@@ -336,12 +410,14 @@ fn builtin(
     policy: WorkflowDefinitionPolicy,
     allowlist: TransitionAllowlist,
     classifier_activities: BTreeSet<String>,
+    definition_version: u32,
 ) -> DeclarativeWorkflowDefinition {
     match build_builtin_declarative_definition(
         &policy,
         &activity_policies(&policy),
         allowlist,
         classifier_activities,
+        definition_version,
     ) {
         Ok(definition) => definition,
         Err(error) => panic!("built-in declarative workflow definition must compile: {error}"),

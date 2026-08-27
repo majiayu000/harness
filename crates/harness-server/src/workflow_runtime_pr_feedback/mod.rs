@@ -8,12 +8,13 @@ use harness_workflow::runtime::{
 };
 use harness_workflow::runtime::{
     build_local_review_request_decision, build_pr_feedback_sweep_decision,
-    build_pr_hygiene_repair_decision, DataProvenance, DecisionValidator, LocalReviewDecisionInput,
-    PrFeedbackSweepDecisionInput, PrHygieneRepairDecisionInput, RemoteFactSnapshot,
-    ValidationContext, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
-    WorkflowDecision, WorkflowDecisionRecord, WorkflowDecisionTransition, WorkflowDefinition,
-    WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
-    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
+    build_pr_hygiene_repair_decision, github_issue_pr_definition_hash, DataProvenance,
+    DecisionValidator, LocalReviewDecisionInput, PrFeedbackSweepDecisionInput,
+    PrHygieneRepairDecisionInput, RemoteFactSnapshot, ValidationContext, WorkflowCommand,
+    WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
+    WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence, WorkflowInstance,
+    WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
+    GITHUB_ISSUE_PR_DEFINITION_ID, GITHUB_ISSUE_PR_DEFINITION_VERSION, LOCAL_REVIEW_ACTIVITY,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;

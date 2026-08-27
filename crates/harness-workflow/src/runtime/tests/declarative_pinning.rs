@@ -326,19 +326,39 @@ mod declarative_pinning {
         assert!(registry
             .state_definition_for_instance(&missing_unmarked_version, "completed")
             .is_none());
-        assert!(WorkflowDefinitionRegistry::with_builtins()
+        let builtin_registry = WorkflowDefinitionRegistry::with_builtins();
+        assert!(builtin_registry
             .definition_for_version(GITHUB_ISSUE_PR_DEFINITION_ID, u32::MAX)
-            .is_some());
-        let builtin_with_unrelated_hash = WorkflowInstance::new(
+            .is_none());
+        let current_builtin = WorkflowInstance::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
-            u32::MAX,
+            GITHUB_ISSUE_PR_DEFINITION_VERSION,
             "done",
-            WorkflowSubject::new("issue", "1609"),
+            WorkflowSubject::new("issue", "current"),
         )
-        .with_server_data(json!({ "definition_hash": "unrelated-business-metadata" }));
+        .with_server_data(json!({
+            "definition_hash": github_issue_pr_definition_hash()
+        }));
         assert_eq!(
-            WorkflowDefinitionRegistry::with_builtins()
-                .state_definition_for_instance(&builtin_with_unrelated_hash, "done")
+            builtin_registry
+                .state_definition_for_instance(&current_builtin, "done")
+                .and_then(|state| state.terminal_state),
+            Some(WorkflowTerminalState::Succeeded),
+        );
+        let builtin_with_unrelated_hash = current_builtin
+            .with_server_data(json!({"definition_hash": "builtin:github_issue_pr:v1"}));
+        assert!(builtin_registry
+            .state_definition_for_instance(&builtin_with_unrelated_hash, "done")
+            .is_none());
+        let legacy_builtin = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "done",
+            WorkflowSubject::new("issue", "legacy"),
+        );
+        assert_eq!(
+            builtin_registry
+                .state_definition_for_instance(&legacy_builtin, "done")
                 .and_then(|state| state.terminal_state),
             Some(WorkflowTerminalState::Succeeded),
         );

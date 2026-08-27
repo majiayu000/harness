@@ -15,7 +15,9 @@ mod builtins;
 mod evidence_policy;
 mod versioning;
 
-use self::builtins::{builtin_definitions, builtin_registered_definitions};
+use self::builtins::{
+    builtin_definitions, builtin_historical_definitions, builtin_registered_definitions,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclarativeDefinitionPinError {
@@ -159,6 +161,11 @@ impl WorkflowDefinitionRegistry {
         if let Err(error) = registry.register_declarative_current_batch(builtin_definitions()) {
             panic!("built-in workflow definitions must be unique and valid: {error}");
         }
+        if let Err(error) =
+            registry.register_declarative_historical_batch(builtin_historical_definitions())
+        {
+            panic!("historical built-in workflow definitions must be unique and valid: {error}");
+        }
         registry
     }
 
@@ -267,7 +274,9 @@ impl WorkflowDefinitionRegistry {
         &self,
         instance: &WorkflowInstance,
     ) -> Result<Option<DecisionValidator>, DeclarativeDefinitionPinError> {
-        if is_builtin_definition_id(&instance.definition_id) {
+        if is_builtin_definition_id(&instance.definition_id)
+            && instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        {
             return Ok(self.decision_validator_for_definition(&instance.definition_id));
         }
         match self.resolve_declarative_definition(instance) {
@@ -415,22 +424,6 @@ impl WorkflowDefinitionRegistry {
         &self,
         definition_id: &str,
     ) -> Vec<WorkflowTerminalStateSelector> {
-        if is_builtin_definition_id(definition_id) {
-            if let Some(definition) = self.definition(definition_id) {
-                return definition
-                    .states
-                    .iter()
-                    .filter_map(|state| {
-                        Some(WorkflowTerminalStateSelector {
-                            definition_version: None,
-                            definition_hash: None,
-                            state: state.key.state.to_string(),
-                            terminal_state: state.terminal_state?,
-                        })
-                    })
-                    .collect();
-            }
-        }
         let mut selectors = self
             .declarative_versions
             .iter()
@@ -439,7 +432,9 @@ impl WorkflowDefinitionRegistry {
                 definition.registered().states.iter().filter_map(|state| {
                     Some(WorkflowTerminalStateSelector {
                         definition_version: Some(*definition_version),
-                        definition_hash: Some(definition.definition_hash().to_string()),
+                        definition_hash: (!is_builtin_definition_id(definition_id)
+                            || *definition_version > 1)
+                            .then(|| definition.definition_hash().to_string()),
                         state: state.key.state.to_string(),
                         terminal_state: state.terminal_state?,
                     })
@@ -471,20 +466,6 @@ impl WorkflowDefinitionRegistry {
         definition_id: &str,
         progress_mode: WorkflowProgressMode,
     ) -> Vec<WorkflowProgressStateSelector> {
-        if is_builtin_definition_id(definition_id) {
-            if let Some(definition) = self.definition(definition_id) {
-                return definition
-                    .states
-                    .iter()
-                    .filter(|state| state.progress_mode == Some(progress_mode))
-                    .map(|state| WorkflowProgressStateSelector {
-                        definition_version: None,
-                        definition_hash: None,
-                        state: state.key.state.to_string(),
-                    })
-                    .collect();
-            }
-        }
         let mut selectors = self
             .declarative_versions
             .iter()
@@ -497,7 +478,9 @@ impl WorkflowDefinitionRegistry {
                     .filter(|state| state.progress_mode == Some(progress_mode))
                     .map(|state| WorkflowProgressStateSelector {
                         definition_version: Some(*definition_version),
-                        definition_hash: Some(definition.definition_hash().to_string()),
+                        definition_hash: (!is_builtin_definition_id(definition_id)
+                            || *definition_version > 1)
+                            .then(|| definition.definition_hash().to_string()),
                         state: state.key.state.to_string(),
                     })
             })

@@ -5,6 +5,7 @@ use super::{
     prompt_task::PROMPT_TASK_DEFINITION_ID,
     quality_gate::QUALITY_GATE_DEFINITION_ID,
     reducer::GITHUB_ISSUE_PR_DEFINITION_ID,
+    remote_facts::stable_remote_fact_hash,
     state_registry::{
         RegisteredWorkflowDefinition, WorkflowProgressMode, WorkflowStateDefinition,
         WorkflowTerminalState,
@@ -141,6 +142,7 @@ pub(crate) fn build_builtin_declarative_definition(
     activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
     allowlist: TransitionAllowlist,
     classifier_activities: BTreeSet<String>,
+    definition_version: u32,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
     validate_top_level(policy, BuiltinIdPolicy::Allow)?;
 
@@ -150,13 +152,18 @@ pub(crate) fn build_builtin_declarative_definition(
     validate_reachability(policy, &terminal_states)?;
 
     let states = compile_states(policy, &terminal_states);
+    let definition_hash = stable_remote_fact_hash(&serde_json::json!({
+        "policy": policy,
+        "classifier_activities": classifier_activities,
+        "definition_version": definition_version,
+    }));
     Ok(DeclarativeWorkflowDefinition {
         registered: RegisteredWorkflowDefinition::new(&policy.id, states, allowlist),
         policy: policy.clone(),
         classifier_activities,
         classifier_activity_policies: BTreeMap::new(),
-        definition_version: 1,
-        definition_hash: format!("builtin:{}:v1", policy.id),
+        definition_version,
+        definition_hash,
     })
 }
 

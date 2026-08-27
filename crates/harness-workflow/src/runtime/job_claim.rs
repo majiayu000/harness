@@ -427,10 +427,13 @@ mod tests {
         let registry = WorkflowDefinitionRegistry::with_builtins();
         let workflow = WorkflowInstance::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
-            1,
+            super::super::GITHUB_ISSUE_PR_DEFINITION_VERSION,
             "pr_open",
             super::super::WorkflowSubject::new("issue", "issue:77"),
-        );
+        )
+        .with_server_data(json!({
+            "definition_hash": super::super::github_issue_pr_definition_hash()
+        }));
         let job = RuntimeJob::pending(
             "command-1",
             RuntimeKind::RemoteHost,

@@ -27,10 +27,13 @@ fn reads_scope_assessed_head_only_from_classifier_assessment() {
 fn persists_scope_assessed_head_on_pr_scope_approval() -> anyhow::Result<()> {
     let mut instance = WorkflowInstance::new(
         crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
+        crate::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "pr_scope_review",
         WorkflowSubject::new("issue", "owner/repo#42"),
-    );
+    )
+    .with_server_data(json!({
+        "definition_hash": crate::runtime::github_issue_pr_definition_hash()
+    }));
     let decision = WorkflowDecision::new(
         &instance.id,
         "pr_scope_review",

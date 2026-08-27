@@ -5,11 +5,11 @@ use super::{
     trusted_verifier::{is_trusted_eval_verifier_argv, TRUSTED_EVAL_VERIFIER_V1_CAPABILITY},
 };
 use crate::runtime::{
-    build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeJobStatus,
-    RuntimeProfile, SubmissionMode, ValidationContext, WorkflowCommand, WorkflowCommandStatus,
-    WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition,
-    WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID,
+    build_issue_submission_decision, github_issue_pr_definition_hash, IssueSubmissionDecisionInput,
+    RuntimeJobStatus, RuntimeProfile, SubmissionMode, ValidationContext, WorkflowCommand,
+    WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition,
+    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
+    GITHUB_ISSUE_PR_DEFINITION_ID, GITHUB_ISSUE_PR_DEFINITION_VERSION,
 };
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -129,8 +129,13 @@ pub async fn enqueue_eval_case_workflow(
 
     store
         .upsert_definition(
-            &WorkflowDefinition::new(GITHUB_ISSUE_PR_DEFINITION_ID, 1, "GitHub issue PR workflow")
-                .with_source_path(EVAL_RUN_DEFINITION_SOURCE),
+            &WorkflowDefinition::new(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                GITHUB_ISSUE_PR_DEFINITION_VERSION,
+                "GitHub issue PR workflow",
+            )
+            .with_definition_hash(github_issue_pr_definition_hash())
+            .with_source_path(EVAL_RUN_DEFINITION_SOURCE),
         )
         .await?;
 
@@ -476,7 +481,7 @@ pub(super) fn eval_case_initial_instance(
 ) -> WorkflowInstance {
     WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
-        1,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "discovered",
         WorkflowSubject::new("issue", format!("issue:{}", input.case.issue)),
     )
@@ -496,6 +501,7 @@ fn eval_case_submitted_data(
     verification_argv: &[Vec<String>],
 ) -> Value {
     json!({
+        "definition_hash": github_issue_pr_definition_hash(),
         "project_id": input.project_id,
         "repo": input.case.repo,
         "issue_number": input.case.issue,
