@@ -339,6 +339,58 @@ printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":1,"output_toke
 }
 
 #[tokio::test]
+async fn execute_stream_does_not_wait_for_descendant_held_stdout_after_root_exit() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let descendant_marker = dir.path().join("stdout-descendant-started.txt");
+    let reached_marker = dir.path().join("stdout-descendant-reached.txt");
+    let (script_dir, script) = write_executable_script(&format!(
+        r#"
+( echo descendant > "{}"; sleep 1; echo reached > "{}"; sleep 30 ) &
+while [ ! -f "{}" ]; do sleep 0.01; done
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_0","type":"agent_message","text":"root done"}}}}'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":1,"output_tokens":1}}}}'
+"#,
+        descendant_marker.display(),
+        reached_marker.display(),
+        descendant_marker.display()
+    ));
+    let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
+    let request = AgentRequest {
+        prompt: "ignored".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let mut handle = tokio::spawn(async move { agent.execute_stream(request, tx).await });
+    assert_path_observed_before_task_exit(
+        &descendant_marker,
+        &mut handle,
+        Duration::from_secs(20),
+        "stdout descendant startup marker",
+    )
+    .await;
+
+    let result = match timeout(Duration::from_secs(5), &mut handle).await {
+        Ok(result) => result,
+        Err(_) => {
+            handle.abort();
+            let _ = timeout(Duration::from_secs(2), &mut handle).await;
+            panic!("execute_stream waited for descendant-held stdout after the root exited");
+        }
+    };
+    result
+        .expect("execute_stream task should join")
+        .expect("stream execution should succeed");
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !reached_marker.exists(),
+        "stream cleanup should kill the stdout-holding descendant"
+    );
+    drop(script_dir);
+}
+
+#[tokio::test]
 async fn execute_stream_cancel_path_converges_when_receiver_dropped_mid_stream() {
     let (dir, script) = write_executable_script(
         r#"

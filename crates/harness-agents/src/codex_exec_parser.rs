@@ -238,10 +238,21 @@ pub(crate) async fn stream_codex_exec_output(
     let mut parsed = ParsedCodexExecOutput::default();
     let mut seen_message_deltas = HashSet::new();
     let mut container_egress_verified = !await_container_egress_canary;
+    enum StreamRead {
+        Line(std::io::Result<Option<String>>),
+        Exited(std::io::Result<std::process::ExitStatus>),
+    }
 
     loop {
-        let maybe_line = if let Some(duration) = idle_timeout {
-            tokio::time::timeout(duration, lines.next_line())
+        let read_or_exit = async {
+            tokio::select! {
+                biased;
+                line = lines.next_line() => StreamRead::Line(line),
+                status = child.wait() => StreamRead::Exited(status),
+            }
+        };
+        let read = if let Some(duration) = idle_timeout {
+            tokio::time::timeout(duration, read_or_exit)
                 .await
                 .map_err(|_| {
                     #[cfg(unix)]
@@ -251,17 +262,25 @@ pub(crate) async fn stream_codex_exec_output(
                         duration.as_secs()
                     ))
                 })?
-                .map_err(|error| {
-                    harness_core::error::HarnessError::AgentExecution(format!(
-                        "failed reading codex stdout: {error}"
-                    ))
-                })?
         } else {
-            lines.next_line().await.map_err(|error| {
+            read_or_exit.await
+        };
+        let maybe_line = match read {
+            StreamRead::Line(line) => line.map_err(|error| {
                 harness_core::error::HarnessError::AgentExecution(format!(
                     "failed reading codex stdout: {error}"
                 ))
-            })?
+            })?,
+            StreamRead::Exited(status) => {
+                status.map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "failed waiting for codex process: {error}"
+                    ))
+                })?;
+                #[cfg(unix)]
+                crate::kill_process_group(child);
+                break;
+            }
         };
         let Some(line) = maybe_line else {
             break;
