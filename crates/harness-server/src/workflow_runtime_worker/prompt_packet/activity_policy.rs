@@ -37,7 +37,8 @@ pub(super) fn apply_activity_policy_with_resolver(
             workflow.id
         ),
     };
-    let built_in = definition.definition_hash().starts_with("builtin:");
+    let built_in =
+        harness_workflow::runtime::is_builtin_workflow_definition_id(&definition.policy().id);
     let activity = activity_name(job);
     let state_policy = definition
         .policy()

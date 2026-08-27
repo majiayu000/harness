@@ -1,8 +1,7 @@
 use super::{
     DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, DeclarativeWorkflowDefinition,
     RegisteredWorkflowDefinition, WorkflowDefinitionRegistry, WorkflowStateDefinition,
-    GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
-    QUALITY_GATE_DEFINITION_ID,
+    GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use crate::runtime::declarative::build_builtin_declarative_definition;
 use crate::runtime::declarative_pinning::declarative_definition_identity_with_classifier_policies;
@@ -532,13 +531,7 @@ fn state_definition(
 }
 
 fn is_builtin_definition_id(definition_id: &str) -> bool {
-    [
-        GITHUB_ISSUE_PR_DEFINITION_ID,
-        PROMPT_TASK_DEFINITION_ID,
-        QUALITY_GATE_DEFINITION_ID,
-        PR_FEEDBACK_DEFINITION_ID,
-    ]
-    .contains(&definition_id)
+    super::is_builtin_workflow_definition_id(definition_id)
 }
 
 #[cfg(test)]

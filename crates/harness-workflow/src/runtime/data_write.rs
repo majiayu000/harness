@@ -110,9 +110,22 @@ impl WorkflowInstance {
     /// post-deployment writer defect.
     pub fn replace_data_with_field_provenance(
         &mut self,
-        data: Value,
+        mut data: Value,
         mut provenance_for: impl FnMut(&str) -> DataProvenance,
     ) -> anyhow::Result<()> {
+        let replacement = data
+            .as_object_mut()
+            .context("workflow instance data must be a JSON object")?;
+        for field in [
+            "definition_hash",
+            super::scope_review::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD,
+        ] {
+            if !replacement.contains_key(field) {
+                if let Some(value) = self.data.get(field) {
+                    replacement.insert(field.to_string(), value.clone());
+                }
+            }
+        }
         let object = data
             .as_object()
             .context("workflow instance data must be a JSON object")?;
@@ -300,6 +313,47 @@ mod tests {
         // The boundary itself survives, so later readers can still tell
         // pre-provenance history from a writer defect.
         assert_eq!(sidecar.migrated_at, Some(migrated_at));
+    }
+
+    #[test]
+    fn whole_document_replacement_carries_immutable_pins_forward() {
+        let mut workflow = instance().with_server_data(json!({
+            "definition_hash": "sha256:pinned",
+            super::super::scope_review::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD: {
+                "classifier": {"verdicts": ["allow"]}
+            },
+            "task_id": "task-1"
+        }));
+
+        workflow
+            .replace_data_with_field_provenance(
+                json!({"task_id": "task-1", "last_decision": "planned"}),
+                |_| DataProvenance::Server,
+            )
+            .expect("classified replacement");
+
+        assert_eq!(workflow.data["definition_hash"], "sha256:pinned");
+        assert_eq!(
+            workflow.data[super::super::scope_review::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD]
+                ["classifier"]["verdicts"][0],
+            "allow"
+        );
+    }
+
+    #[test]
+    fn whole_document_replacement_does_not_hide_pin_substitution() {
+        let mut workflow = instance().with_server_data(json!({
+            "definition_hash": "sha256:original"
+        }));
+
+        workflow
+            .replace_data_with_field_provenance(
+                json!({"definition_hash": "sha256:substituted"}),
+                |_| DataProvenance::Server,
+            )
+            .expect("classified replacement");
+
+        assert_eq!(workflow.data["definition_hash"], "sha256:substituted");
     }
 
     #[test]

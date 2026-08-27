@@ -364,6 +364,41 @@ fn built_in_scope_review_requires_workflow_classifier_policy() {
 }
 
 #[test]
+fn built_in_non_classifier_activity_does_not_require_workflow_override() {
+    let registry = WorkflowDefinitionRegistry::with_builtins();
+    let workflow = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
+        "planning",
+        WorkflowSubject::new("issue", "issue:43"),
+    )
+    .with_server_data(json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash()
+    }));
+    let job = RuntimeJob::pending(
+        "command-plan",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({"activity": harness_workflow::runtime::ISSUE_PLAN_ACTIVITY}),
+    );
+    let mut packet = json!({
+        "activity_result_schema": {},
+        "required_structured_output": {},
+    });
+
+    super::activity_policy::apply_activity_policy(
+        &registry,
+        &mut packet,
+        &job,
+        Some(&workflow),
+        &WorkflowDocument::default(),
+    )
+    .expect("built-in non-classifier activities need no checkout override");
+
+    assert!(packet.get("activity_policy").is_none());
+}
+
+#[test]
 fn classifier_input_normalizes_dispatcher_envelopes_for_both_scope_gates() {
     for scope_facts in [
         json!({"issue_plan": {"summary": "Plan scope"}}),

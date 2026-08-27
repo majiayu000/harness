@@ -198,8 +198,9 @@ pub use repo_memory::{
 };
 pub use scope_review::{CHANGE_SCOPE_REVIEW_ACTIVITY, PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD};
 pub use state_registry::{
-    DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, RegisteredWorkflowDefinition,
-    WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowStateDefinition, WorkflowStateKey,
+    is_builtin_workflow_definition_id, DeclarativeDefinitionPinError,
+    DeclarativeDefinitionResolution, RegisteredWorkflowDefinition, WorkflowDefinitionRegistry,
+    WorkflowProgressMode, WorkflowStateDefinition, WorkflowStateKey,
 };
 pub use status::WorkflowCommandStatus;
 pub use store::PromptPayloadIntegrityError;

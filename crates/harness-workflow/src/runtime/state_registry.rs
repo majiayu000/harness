@@ -272,7 +272,7 @@ impl WorkflowDefinitionRegistry {
         &self,
         instance: &WorkflowInstance,
     ) -> Result<Option<DecisionValidator>, DeclarativeDefinitionPinError> {
-        if is_builtin_definition_id(&instance.definition_id)
+        if is_builtin_workflow_definition_id(&instance.definition_id)
             && instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
         {
             return Ok(self.decision_validator_for_definition(&instance.definition_id));
@@ -430,8 +430,8 @@ impl WorkflowDefinitionRegistry {
                 definition.registered().states.iter().filter_map(|state| {
                     let legacy_github_builtin =
                         definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && *definition_version == 1;
-                    let unpinned_builtin =
-                        is_builtin_definition_id(definition_id) && *definition_version == 1;
+                    let unpinned_builtin = is_builtin_workflow_definition_id(definition_id)
+                        && *definition_version == 1;
                     Some(WorkflowTerminalStateSelector {
                         definition_version: legacy_github_builtin
                             .then_some(*definition_version)
@@ -482,8 +482,8 @@ impl WorkflowDefinitionRegistry {
                     .map(|state| {
                         let legacy_github_builtin = definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
                             && *definition_version == 1;
-                        let unpinned_builtin =
-                            is_builtin_definition_id(definition_id) && *definition_version == 1;
+                        let unpinned_builtin = is_builtin_workflow_definition_id(definition_id)
+                            && *definition_version == 1;
                         WorkflowProgressStateSelector {
                             definition_version: legacy_github_builtin
                                 .then_some(*definition_version)
@@ -525,7 +525,7 @@ impl Default for WorkflowDefinitionRegistry {
     }
 }
 
-fn is_builtin_definition_id(definition_id: &str) -> bool {
+pub fn is_builtin_workflow_definition_id(definition_id: &str) -> bool {
     [
         GITHUB_ISSUE_PR_DEFINITION_ID,
         PROMPT_TASK_DEFINITION_ID,
