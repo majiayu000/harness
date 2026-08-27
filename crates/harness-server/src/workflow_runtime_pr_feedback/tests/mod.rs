@@ -815,7 +815,7 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn legacy_v1_merge_approval_rejects_missing_base_authorization() -> anyhow::Result<()> {
+async fn legacy_v1_merge_approval_rejects_unenforceable_base_pin() -> anyhow::Result<()> {
     let Ok(database_url) = resolve_database_url(None) else {
         return Ok(());
     };
@@ -839,6 +839,7 @@ async fn legacy_v1_merge_approval_rejects_missing_base_authorization() -> anyhow
         "pr_number": 1902,
         "pr_url": "https://github.com/owner/repo/pull/1902",
         "pr_head_sha": "legacy-approved-head",
+        "expected_base_ref": "main",
     }));
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow).await?;
 
@@ -847,7 +848,7 @@ async fn legacy_v1_merge_approval_rejects_missing_base_authorization() -> anyhow
     assert!(matches!(
         outcome,
         RuntimeMergeApprovalOutcome::Rejected { reason, .. }
-            if reason.contains("missing the authorized expected_base_ref")
+            if reason.contains("cannot atomically bind expected_base_ref")
     ));
     let updated = store
         .get_instance(&workflow.id)
