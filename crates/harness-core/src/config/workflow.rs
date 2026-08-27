@@ -10,6 +10,7 @@ mod defaults;
 mod intake_binding;
 mod reserved_keys;
 mod runtime_completion;
+mod runtime_dispatch;
 mod storage;
 pub use budget::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 pub use candidates::WorkflowCandidatesPolicy;
@@ -688,6 +689,7 @@ pub(super) fn load_workflow_document_with_base(
     }
     classifier::validate_classifier_activities(&config.activities)?;
     config.runtime_dispatch.apply_default_activity_profiles();
+    runtime_dispatch::validate_reserved_runtime_profiles(&config.runtime_dispatch)?;
     config.runtime_budget_policy.validate()?;
     let defer_floor = config.runtime_dispatch.defer_backoff_secs;
     let defer_ceiling = config.runtime_dispatch.defer_backoff_max_secs;

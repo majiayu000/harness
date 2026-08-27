@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_rerouting_honors_the_persisted_execution_mode() {
+    fn merge_rerouting_rejects_agent_execution_mode() {
         let registry = WorkflowDefinitionRegistry::with_builtins();
         let job = RuntimeJob::pending(
             "command-merge",
@@ -474,7 +474,7 @@ mod tests {
         ));
         assert!(matches!(
             server_owned_job_kind(&registry, &workflow("agent"), &job),
-            Ok(None)
+            Ok(Some(ServerOwnedJobKind::Merge))
         ));
     }
 }

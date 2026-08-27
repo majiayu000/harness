@@ -538,7 +538,19 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
 pub(super) fn is_internal_non_agent_activity(job: &RuntimeJob) -> bool {
     is_builtin_lifecycle_activity(job)
         || is_server_owned_pr_feedback_inspection(job)
-        || job.runtime_profile.starts_with("server-owned-")
+        || matches!(
+            job.runtime_profile.as_str(),
+            "server-owned-merge" if activity_name(job) == "merge_pr"
+        )
+        || matches!(
+            job.runtime_profile.as_str(),
+            "server-owned-classifier-rejected"
+                if job
+                    .input
+                    .get("server_owned_remote_rejection")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        )
 }
 fn runtime_worker_disabled_result_for_config(
     activity: &str,
@@ -779,5 +791,9 @@ mod tests {
         let mut merge = runtime_job("merge_pr");
         merge.runtime_profile = "server-owned-merge".to_string();
         assert!(is_internal_non_agent_activity(&merge));
+
+        let mut spoofed = runtime_job("implement_issue");
+        spoofed.runtime_profile = "server-owned-user-profile".to_string();
+        assert!(!is_internal_non_agent_activity(&spoofed));
     }
 }

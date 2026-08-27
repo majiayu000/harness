@@ -413,6 +413,22 @@ fn load_workflow_document_reads_prompt_template_body() -> anyhow::Result<()> {
 }
 
 #[test]
+fn load_workflow_document_rejects_server_owned_runtime_profile_namespace() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  activity_profiles:\n    implement_issue:\n      runtime_profile: server-owned-spoof\n---\n",
+    )?;
+
+    let error = load_workflow_document(dir.path())
+        .expect_err("server-owned runtime profiles must be reserved for internal jobs");
+    assert!(error
+        .to_string()
+        .contains("reserved runtime profile namespace"));
+    Ok(())
+}
+
+#[test]
 fn load_workflow_config_reads_custom_activity_profile_overrides() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(
