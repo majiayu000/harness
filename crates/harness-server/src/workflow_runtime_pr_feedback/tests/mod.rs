@@ -815,7 +815,7 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn legacy_v1_merge_approval_keeps_the_legacy_transition_contract() -> anyhow::Result<()> {
+async fn legacy_v1_merge_approval_rejects_missing_base_authorization() -> anyhow::Result<()> {
     let Ok(database_url) = resolve_database_url(None) else {
         return Ok(());
     };
@@ -844,24 +844,22 @@ async fn legacy_v1_merge_approval_keeps_the_legacy_transition_contract() -> anyh
 
     let outcome = approve_runtime_merge_by_workflow_id(&store, &workflow.id).await?;
 
-    assert_eq!(
+    assert!(matches!(
         outcome,
-        RuntimeMergeApprovalOutcome::Approved {
-            workflow_id: workflow.id.clone(),
-        }
-    );
+        RuntimeMergeApprovalOutcome::Rejected { reason, .. }
+            if reason.contains("missing the authorized expected_base_ref")
+    ));
     let updated = store
         .get_instance(&workflow.id)
         .await?
         .expect("legacy merge workflow should remain persisted");
-    assert_eq!(updated.state, "merging");
+    assert_eq!(updated.state, "ready_to_merge");
     assert!(updated
         .data
         .get(crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD)
         .is_none());
     let commands = store.commands_for(&workflow.id).await?;
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].command.command["delete_branch"], false);
+    assert!(commands.is_empty());
     Ok(())
 }
 

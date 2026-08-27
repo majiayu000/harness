@@ -345,7 +345,7 @@ async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() 
 }
 
 #[tokio::test]
-async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Result<()> {
+async fn workflow_runtime_merge_endpoint_rejects_unenforceable_base_pin() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
@@ -373,6 +373,7 @@ async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Re
         "pr_number": 126,
         "pr_url": "https://github.com/owner/repo/pull/126",
         "pr_head_sha": "reviewed-head-126",
+        "expected_base_ref": "main",
         "task_id": "runtime-ready-task-54",
     }));
     workflow.set_data_field(
@@ -400,21 +401,19 @@ async fn workflow_runtime_merge_endpoint_approves_ready_workflow() -> anyhow::Re
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = response_json(response).await?;
-    assert_eq!(body["workflow_id"], "runtime-ready-54");
+    assert_eq!(body["error"], "workflow runtime merge approval rejected");
+    assert!(body["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("cannot atomically bind expected_base_ref")));
     let updated = store
         .get_instance("runtime-ready-54")
         .await?
         .expect("workflow should still exist");
-    assert_eq!(updated.state, "merging");
+    assert_eq!(updated.state, "ready_to_merge");
     let commands = store.commands_for("runtime-ready-54").await?;
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].command.activity_name(), Some("merge_pr"));
-    assert_eq!(
-        commands[0].command.command["expected_head_sha"],
-        "reviewed-head-126"
-    );
+    assert!(commands.is_empty());
     Ok(())
 }
 
