@@ -21,6 +21,7 @@ pub(super) const GITHUB_PR_SNAPSHOT_QUERY: &str = r#"
           baseRefOid
           headRefName
           headRefOid
+          isCrossRepository
           mergeCommit {
             oid
           }

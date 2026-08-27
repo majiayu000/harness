@@ -47,7 +47,7 @@ mod permission_profile;
 use permission_profile::RuntimePermissionProfile;
 mod spawn_env;
 use spawn_env::{correction_spawn_env_vars, isolation_spawn_env_vars};
-mod server_owned;
+pub(super) mod server_owned;
 #[cfg(test)]
 pub(in crate::workflow_runtime_worker) use server_owned::normalize_classifier_input;
 mod structured_output;
@@ -536,7 +536,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
     }
 }
 pub(super) fn is_internal_non_agent_activity(job: &RuntimeJob) -> bool {
-    is_builtin_lifecycle_activity(job) || is_server_owned_pr_feedback_inspection(job)
+    is_builtin_lifecycle_activity(job)
+        || is_server_owned_pr_feedback_inspection(job)
+        || job.runtime_profile.starts_with("server-owned-")
 }
 fn runtime_worker_disabled_result_for_config(
     activity: &str,
@@ -774,5 +776,8 @@ mod tests {
         assert!(!is_internal_non_agent_activity(&runtime_job(
             "implement_issue"
         )));
+        let mut merge = runtime_job("merge_pr");
+        merge.runtime_profile = "server-owned-merge".to_string();
+        assert!(is_internal_non_agent_activity(&merge));
     }
 }

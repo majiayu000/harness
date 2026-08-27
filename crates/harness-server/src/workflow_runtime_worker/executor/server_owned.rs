@@ -1,7 +1,73 @@
 use crate::http::AppState;
 use harness_core::config::workflow::WorkflowConfig;
-use harness_workflow::runtime::{ActivityErrorKind, ActivityResult, RuntimeJob, WorkflowInstance};
+use harness_workflow::runtime::{
+    ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, WorkflowCommandStatus,
+    WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
+};
 use std::sync::Arc;
+
+pub(in crate::workflow_runtime_worker) async fn current_merge_authorization(
+    state: &AppState,
+    job: &RuntimeJob,
+) -> Result<WorkflowInstance, String> {
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .ok_or_else(|| "workflow runtime store is unavailable".to_string())?;
+    let workflow_id = job
+        .input
+        .get("workflow_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "merge job is missing its workflow identity".to_string())?;
+    let workflow = store
+        .get_instance(workflow_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("workflow `{workflow_id}` no longer exists"))?;
+    if workflow.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID || workflow.state != "merging" {
+        return Err(format!(
+            "workflow `{workflow_id}` is no longer in the authorized merging state"
+        ));
+    }
+    let command = store
+        .get_command(&job.command_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("merge command `{}` no longer exists", job.command_id))?;
+    if command.workflow_id != workflow.id
+        || command.status != WorkflowCommandStatus::Dispatched
+        || command.superseded_by_command_id.is_some()
+        || command.command.activity_name() != Some("merge_pr")
+        || job.input.get("command") != Some(&command.command.command)
+    {
+        return Err(format!(
+            "merge command `{}` is stale, superseded, or does not match its immutable job envelope",
+            job.command_id
+        ));
+    }
+    let persisted_job = store
+        .get_runtime_job(&job.id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("merge job `{}` no longer exists", job.id))?;
+    if persisted_job.status != RuntimeJobStatus::Running
+        || persisted_job.command_id != job.command_id
+        || persisted_job.lease_generation != job.lease_generation
+        || persisted_job
+            .lease
+            .as_ref()
+            .map(|lease| lease.owner.as_str())
+            != job.lease.as_ref().map(|lease| lease.owner.as_str())
+    {
+        return Err(format!(
+            "merge job `{}` no longer owns its current execution lease",
+            job.id
+        ));
+    }
+    Ok(workflow)
+}
 
 pub(super) async fn prepare_classifier(
     state: &Arc<AppState>,

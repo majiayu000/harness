@@ -1,11 +1,14 @@
-use crate::github_pr_merge::{merge_pull_request, GitHubPrMergeError, GitHubPrMergeOptions};
+use crate::github_pr_merge::{
+    delete_pull_request_head_branch, merge_pull_request, GitHubPrMergeError, GitHubPrMergeOptions,
+};
 use crate::github_pr_snapshot::{
     fetch_github_pr_snapshot, value_string, GitHubPrSnapshotArtifacts, GitHubPrSnapshotTarget,
     GITHUB_PR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ERROR_ARTIFACT,
 };
 use crate::http::AppState;
+#[cfg(test)]
 use harness_core::config::intake::{
-    GitHubAutoMergeConfig, GitHubMergeExecution, GitHubMergeMethod, ResolvedGitHubAutoMergePolicy,
+    GitHubAutoMergeConfig, GitHubMergeExecution, GitHubMergeMethod,
 };
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, DataProvenance,
@@ -16,7 +19,7 @@ use serde_json::{json, Value};
 use super::data_helpers::activity_name;
 use super::merge_completion::{
     auto_merge_config, merge_activity_matches, merge_completion_verified, merge_execution_target,
-    snapshot_observes_merged,
+    server_merge_policy, snapshot_observes_merged,
 };
 
 const SERVER_MERGE_EXECUTION_ARTIFACT: &str = "server_merge_execution";
@@ -33,9 +36,26 @@ pub(super) fn server_merge_execution_enabled(
 pub(super) async fn execute_server_merge(
     state: &AppState,
     job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
+    _workflow: Option<&WorkflowInstance>,
 ) -> ActivityResult {
     let activity = activity_name(job);
+    let authorized_workflow =
+        match super::executor::server_owned::current_merge_authorization(state, job).await {
+            Ok(workflow) => workflow,
+            Err(error) => {
+                return server_merge_failed(
+                    activity,
+                    None,
+                    ActivityErrorKind::Fatal,
+                    "Server-side merge authorization is no longer current.",
+                    error,
+                    None,
+                    None,
+                    "authorization_stale",
+                );
+            }
+        };
+    let workflow = Some(&authorized_workflow);
     let target = match merge_execution_target(job, workflow) {
         Ok(target) => target,
         Err(error) => {
@@ -106,16 +126,6 @@ pub(super) async fn execute_server_merge(
             None,
         );
     }
-    if snapshot_observes_merged(&before_snapshot.normalized_snapshot) {
-        return server_merge_succeeded(
-            activity,
-            &target,
-            before_snapshot,
-            &expected_head_sha,
-            "already_merged_before_merge",
-            None,
-        );
-    }
     let config = auto_merge_config(state);
     let policy = match server_merge_policy(&config, job, workflow) {
         Ok(policy) => policy,
@@ -132,6 +142,19 @@ pub(super) async fn execute_server_merge(
             );
         }
     };
+    if snapshot_observes_merged(&before_snapshot.normalized_snapshot) {
+        return finish_server_merge(
+            activity,
+            &target,
+            before_snapshot,
+            &expected_head_sha,
+            "already_merged_before_merge",
+            None,
+            policy.delete_branch,
+            Some(github_token),
+        )
+        .await;
+    }
     let expected_base_ref = workflow.and_then(|workflow| {
         crate::http::auto_merge::expected_base_ref_from_workflow_data(&workflow.data)
     });
@@ -152,6 +175,33 @@ pub(super) async fn execute_server_merge(
             Some(before_snapshot),
             None,
             "gate_rejected",
+        );
+    }
+    let current_workflow =
+        match super::executor::server_owned::current_merge_authorization(state, job).await {
+            Ok(workflow) => workflow,
+            Err(error) => {
+                return server_merge_failed(
+                    activity,
+                    Some(&target),
+                    ActivityErrorKind::Fatal,
+                    "Server-side merge authorization changed before mutation.",
+                    error,
+                    Some(before_snapshot),
+                    None,
+                    "authorization_changed",
+                );
+            }
+        };
+    if required_expected_head_sha_for_merge(job, Some(&current_workflow)).as_deref()
+        != Ok(expected_head_sha.as_str())
+    {
+        return server_merge_head_mismatch(
+            activity,
+            &target,
+            before_snapshot,
+            &expected_head_sha,
+            None,
         );
     }
     let merge_call = match merge_pull_request(
@@ -191,14 +241,17 @@ pub(super) async fn execute_server_merge(
     };
     match fetch_github_pr_snapshot(&target, Some(github_token)).await {
         Ok(snapshot) if snapshot_observes_merged(&snapshot.normalized_snapshot) => {
-            server_merge_succeeded(
+            finish_server_merge(
                 activity,
                 &target,
                 snapshot,
                 &expected_head_sha,
                 "merged",
                 Some(merge_call),
+                policy.delete_branch,
+                Some(github_token),
             )
+            .await
         }
         Ok(snapshot) => server_merge_failed(
             activity,
@@ -221,6 +274,79 @@ pub(super) async fn execute_server_merge(
             &error,
         ),
     }
+}
+
+async fn finish_server_merge(
+    activity: String,
+    target: &GitHubPrSnapshotTarget,
+    snapshot: GitHubPrSnapshotArtifacts,
+    expected_head_sha: &str,
+    outcome: &str,
+    mut merge_call: Option<Value>,
+    delete_branch: bool,
+    github_token: Option<&str>,
+) -> ActivityResult {
+    if delete_branch {
+        let cleanup = match snapshot
+            .normalized_snapshot
+            .get("is_cross_repository")
+            .and_then(Value::as_bool)
+        {
+            Some(true) => json!({"status": "skipped_cross_repository"}),
+            Some(false) => {
+                let Some(head_ref) = value_string(snapshot.normalized_snapshot.get("head_ref"))
+                else {
+                    return server_merge_failed(
+                        activity,
+                        Some(target),
+                        ActivityErrorKind::Configuration,
+                        "Merged pull request branch cleanup could not resolve the head ref.",
+                        "server PR snapshot is missing head_ref",
+                        Some(snapshot),
+                        merge_call,
+                        "branch_cleanup_missing_head",
+                    );
+                };
+                match delete_pull_request_head_branch(target, github_token, &head_ref).await {
+                    Ok(cleanup) => cleanup,
+                    Err(error) => {
+                        return server_merge_failed(
+                            activity,
+                            Some(target),
+                            error.error_kind,
+                            "Merged pull request branch cleanup failed.",
+                            error.to_string(),
+                            Some(snapshot),
+                            merge_call,
+                            "branch_cleanup_failed",
+                        );
+                    }
+                }
+            }
+            None => {
+                return server_merge_failed(
+                    activity,
+                    Some(target),
+                    ActivityErrorKind::Configuration,
+                    "Merged pull request branch cleanup could not establish repository ownership.",
+                    "server PR snapshot is missing is_cross_repository",
+                    Some(snapshot),
+                    merge_call,
+                    "branch_cleanup_repository_unknown",
+                );
+            }
+        };
+        let details = merge_call.get_or_insert_with(|| json!({}));
+        details["branch_cleanup"] = cleanup;
+    }
+    server_merge_succeeded(
+        activity,
+        target,
+        snapshot,
+        expected_head_sha,
+        outcome,
+        merge_call,
+    )
 }
 
 async fn merge_error_result(
@@ -305,57 +431,18 @@ fn server_merge_head_mismatch(
     ))
 }
 
-fn server_merge_policy(
-    config: &GitHubAutoMergeConfig,
-    job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
-) -> Result<ResolvedGitHubAutoMergePolicy, String> {
-    Ok(ResolvedGitHubAutoMergePolicy {
-        enabled: true,
-        method: merge_method_for_activity(config, job, workflow)?,
-        delete_branch: activity_bool(job, workflow, "delete_branch")
-            .or_else(|| activity_bool(job, workflow, "merge_delete_branch"))
-            .unwrap_or(config.delete_branch),
-        require_review_threads_resolved: activity_bool(
-            job,
-            workflow,
-            "require_review_threads_resolved",
-        )
-        .or_else(|| activity_bool(job, workflow, "merge_require_review_threads_resolved"))
-        .unwrap_or(config.require_review_threads_resolved),
-        require_clean_merge_state: activity_bool(job, workflow, "require_clean_merge_state")
-            .or_else(|| activity_bool(job, workflow, "merge_require_clean_merge_state"))
-            .unwrap_or(config.require_clean_merge_state),
-        merge_execution: GitHubMergeExecution::Server,
-        verify_merge_completion: config.verify_merge_completion,
-    })
-}
-
-fn merge_method_for_activity(
-    config: &GitHubAutoMergeConfig,
-    job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
-) -> Result<GitHubMergeMethod, String> {
-    let Some(raw) = activity_string(job, workflow, "merge_method") else {
-        return Ok(config.method);
-    };
-    parse_merge_method(&raw).ok_or_else(|| format!("unsupported merge_method `{raw}`"))
-}
-
-fn parse_merge_method(raw: &str) -> Option<GitHubMergeMethod> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "squash" => Some(GitHubMergeMethod::Squash),
-        "merge" => Some(GitHubMergeMethod::Merge),
-        "rebase" => Some(GitHubMergeMethod::Rebase),
-        _ => None,
-    }
-}
-
 fn required_expected_head_sha_for_merge(
-    _job: &RuntimeJob,
+    job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
-) -> Result<String, &'static str> {
-    workflow
+) -> Result<String, String> {
+    let command_head = job
+        .input
+        .pointer("/command/expected_head_sha")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "merge_pr command is missing expected_head_sha".to_string())?;
+    let assessed_head = workflow
         .filter(|workflow| {
             workflow
                 .data_provenance
@@ -366,27 +453,15 @@ fn required_expected_head_sha_for_merge(
         .and_then(|workflow| value_string(workflow.data.get("scope_assessed_head_oid")))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or("merge_pr dispatch is missing a server-owned scope_assessed_head_oid")
-}
-
-fn activity_string(
-    job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
-    field: &str,
-) -> Option<String> {
-    value_string(job.input.get(field))
-        .or_else(|| workflow.and_then(|workflow| value_string(workflow.data.get(field))))
-}
-
-fn activity_bool(
-    job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
-    field: &str,
-) -> Option<bool> {
-    job.input
-        .get(field)
-        .and_then(Value::as_bool)
-        .or_else(|| workflow.and_then(|workflow| workflow.data.get(field).and_then(Value::as_bool)))
+        .ok_or_else(|| {
+            "merge_pr dispatch is missing a server-owned scope_assessed_head_oid".to_string()
+        })?;
+    if command_head != assessed_head {
+        return Err(format!(
+            "merge_pr command head `{command_head}` does not match scope-assessed head `{assessed_head}`"
+        ));
+    }
+    Ok(assessed_head)
 }
 
 fn snapshot_head_matches_expected(snapshot: &Value, expected_head_sha: &str) -> bool {
@@ -579,7 +654,12 @@ mod tests {
             "codex-default",
             json!({
                 "activity": "merge_pr",
-                "expected_head_sha": "head-sha",
+                "command": {
+                    "activity": "merge_pr",
+                    "expected_head_sha": "head-sha",
+                    "merge_method": "squash",
+                    "delete_branch": false,
+                },
             }),
         )
     }
@@ -682,16 +762,19 @@ mod tests {
     }
 
     #[test]
-    fn merge_prefers_scope_assessed_head_over_dispatch_head() {
-        let workflow = workflow().with_server_data(json!({
-            "scope_assessed_head_oid": "scope-head",
-            "pr_head_sha": "dispatch-head",
+    fn merge_requires_command_head_to_match_scope_assessment() {
+        let matching = workflow().with_server_data(json!({
+            "scope_assessed_head_oid": "head-sha",
         }));
 
         assert_eq!(
-            required_expected_head_sha_for_merge(&job(), Some(&workflow)).as_deref(),
-            Ok("scope-head")
+            required_expected_head_sha_for_merge(&job(), Some(&matching)).as_deref(),
+            Ok("head-sha")
         );
+        let mismatch = workflow().with_server_data(json!({
+            "scope_assessed_head_oid": "different-head",
+        }));
+        assert!(required_expected_head_sha_for_merge(&job(), Some(&mismatch)).is_err());
     }
 
     #[test]
@@ -706,7 +789,7 @@ mod tests {
             "command-blank",
             RuntimeKind::CodexExec,
             "codex-default",
-            json!({"activity": "merge_pr", "expected_head_sha": "  "}),
+            json!({"activity": "merge_pr", "command": {"expected_head_sha": "  "}}),
         );
 
         assert!(required_expected_head_sha_for_merge(&missing, None).is_err());

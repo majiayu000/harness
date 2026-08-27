@@ -74,6 +74,7 @@ fn ready_pr() -> Value {
         "baseRefOid": "base123",
         "headRefName": "feature",
         "headRefOid": "abc123",
+        "isCrossRepository": false,
         "isDraft": false,
         "mergeStateStatus": "CLEAN",
         "reviewDecision": "APPROVED",

@@ -3,7 +3,9 @@ use crate::github_pr_snapshot::{
     GitHubPrSnapshotTarget, GITHUB_PR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ERROR_ARTIFACT,
 };
 use crate::http::AppState;
-use harness_core::config::intake::GitHubAutoMergeConfig;
+use harness_core::config::intake::{
+    GitHubAutoMergeConfig, GitHubMergeExecution, GitHubMergeMethod, ResolvedGitHubAutoMergePolicy,
+};
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivityStatus, RuntimeJob,
     WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID, SERVER_PR_SNAPSHOT_ARTIFACT,
@@ -126,6 +128,70 @@ pub(super) fn auto_merge_config(state: &AppState) -> GitHubAutoMergeConfig {
         .unwrap_or_default()
 }
 
+pub(super) fn server_merge_policy(
+    config: &GitHubAutoMergeConfig,
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+) -> Result<ResolvedGitHubAutoMergePolicy, String> {
+    Ok(ResolvedGitHubAutoMergePolicy {
+        enabled: true,
+        method: merge_method_for_activity(config, job, workflow)?,
+        delete_branch: activity_bool(job, workflow, "delete_branch")
+            .or_else(|| activity_bool(job, workflow, "merge_delete_branch"))
+            .unwrap_or(config.delete_branch),
+        require_review_threads_resolved: activity_bool(
+            job,
+            workflow,
+            "require_review_threads_resolved",
+        )
+        .or_else(|| activity_bool(job, workflow, "merge_require_review_threads_resolved"))
+        .unwrap_or(config.require_review_threads_resolved),
+        require_clean_merge_state: activity_bool(job, workflow, "require_clean_merge_state")
+            .or_else(|| activity_bool(job, workflow, "merge_require_clean_merge_state"))
+            .unwrap_or(config.require_clean_merge_state),
+        merge_execution: GitHubMergeExecution::Server,
+        verify_merge_completion: config.verify_merge_completion,
+    })
+}
+
+fn merge_method_for_activity(
+    config: &GitHubAutoMergeConfig,
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+) -> Result<GitHubMergeMethod, String> {
+    let Some(raw) = activity_string(job, workflow, "merge_method") else {
+        return Ok(config.method);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "squash" => Ok(GitHubMergeMethod::Squash),
+        "merge" => Ok(GitHubMergeMethod::Merge),
+        "rebase" => Ok(GitHubMergeMethod::Rebase),
+        _ => Err(format!("unsupported merge_method `{raw}`")),
+    }
+}
+
+fn activity_string(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+    field: &str,
+) -> Option<String> {
+    value_string(job.input.pointer(&format!("/command/{field}")))
+        .or_else(|| value_string(job.input.get(field)))
+        .or_else(|| workflow.and_then(|workflow| value_string(workflow.data.get(field))))
+}
+
+fn activity_bool(
+    job: &RuntimeJob,
+    workflow: Option<&WorkflowInstance>,
+    field: &str,
+) -> Option<bool> {
+    job.input
+        .pointer(&format!("/command/{field}"))
+        .and_then(Value::as_bool)
+        .or_else(|| job.input.get(field).and_then(Value::as_bool))
+        .or_else(|| workflow.and_then(|workflow| workflow.data.get(field).and_then(Value::as_bool)))
+}
+
 fn merge_completion_needs_verification(
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
@@ -142,7 +208,10 @@ pub(super) fn merge_activity_matches(
 ) -> bool {
     activity_name(job) == "merge_pr"
         && workflow
-            .map(|workflow| workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID)
+            .map(|workflow| {
+                workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+                    && workflow.state == "merging"
+            })
             .unwrap_or(false)
 }
 
@@ -238,15 +307,6 @@ fn expected_head_sha_for_merge(
         .or_else(|| activity_string(job, workflow, "head_sha"))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn activity_string(
-    job: &RuntimeJob,
-    workflow: Option<&WorkflowInstance>,
-    field: &str,
-) -> Option<String> {
-    value_string(job.input.get(field))
-        .or_else(|| workflow.and_then(|workflow| value_string(workflow.data.get(field))))
 }
 
 fn snapshot_head_matches_expected(snapshot: &Value, expected_head_sha: &str) -> bool {

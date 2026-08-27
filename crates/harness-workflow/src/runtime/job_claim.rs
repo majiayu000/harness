@@ -102,6 +102,8 @@ impl WorkflowRuntimeStore {
                  )
              )
              AND job.data #> '{input,cancellation_requested}' IS NULL
+             AND command.status = 'dispatched'
+             AND command.superseded_by_command_id IS NULL
              AND ($1::text IS NULL OR job.runtime_kind = $1)
              AND ($2::text IS NULL OR job.runtime_kind <> $2)
              AND (
@@ -269,15 +271,7 @@ fn server_owned_job_kind(
     }
     registry
         .declarative_definition_for_instance(workflow)
-        .filter(|definition| {
-            definition.requires_server_classifier_assessment(&workflow.state)
-                && definition
-                    .policy()
-                    .states
-                    .get(&workflow.state)
-                    .and_then(|state| state.activity.as_deref())
-                    == Some(activity)
-        })
+        .filter(|definition| definition.classifier_activities().contains(activity))
         .map(|_| ServerOwnedJobKind::Classifier)
 }
 
@@ -333,4 +327,32 @@ async fn reroute_legacy_remote_server_owned_job(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn classifier_identity_does_not_depend_on_mutable_workflow_state() {
+        let registry = WorkflowDefinitionRegistry::with_builtins();
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "pr_open",
+            super::super::WorkflowSubject::new("issue", "issue:77"),
+        );
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::RemoteHost,
+            "remote",
+            json!({"activity": super::super::CHANGE_SCOPE_REVIEW_ACTIVITY}),
+        );
+
+        assert!(matches!(
+            server_owned_job_kind(&registry, &workflow, &job),
+            Some(ServerOwnedJobKind::Classifier)
+        ));
+    }
 }

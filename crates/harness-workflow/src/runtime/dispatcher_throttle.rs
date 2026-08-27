@@ -42,15 +42,7 @@ pub(super) fn force_server_owned_profile(
     let server_classifier = instance.is_some_and(|instance| {
         registry
             .declarative_definition_for_instance(instance)
-            .is_some_and(|definition| {
-                definition.requires_server_classifier_assessment(&instance.state)
-                    && definition
-                        .policy()
-                        .states
-                        .get(&instance.state)
-                        .and_then(|state| state.activity.as_deref())
-                        == Some(activity)
-            })
+            .is_some_and(|definition| definition.classifier_activities().contains(activity))
     });
     if server_classifier && profile.kind == RuntimeKind::RemoteHost {
         anyhow::bail!(

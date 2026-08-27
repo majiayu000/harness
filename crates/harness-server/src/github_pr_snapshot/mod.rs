@@ -227,6 +227,7 @@ fn normalize_github_pr_snapshot(
     let expected_base_ref = target.expected_base_ref.clone();
     let head_ref = value_string(pr.get("headRefName"));
     let head_oid = value_string(pr.get("headRefOid"));
+    let is_cross_repository = pr.get("isCrossRepository").and_then(Value::as_bool);
     let merge_commit_sha = pr
         .pointer("/mergeCommit/oid")
         .and_then(|value| value_string(Some(value)));
@@ -301,6 +302,7 @@ fn normalize_github_pr_snapshot(
     });
     snapshot["changed_files_count"] = json!(changed_files_count);
     snapshot["changed_files_connection_count"] = json!(changed_files_connection_count);
+    snapshot["is_cross_repository"] = json!(is_cross_repository);
     Ok(snapshot)
 }
 
