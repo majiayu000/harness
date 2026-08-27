@@ -630,7 +630,22 @@ mod declarative_pinning {
             "submission_id": "persisted-declarative-terminal",
             "definition_hash": definition.definition_hash(),
         }));
+        let legacy_issue = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "done",
+            WorkflowSubject::new("issue", "legacy-terminal-submission"),
+        )
+        .with_id("legacy-terminal-submission")
+        .with_server_data(json!({
+            "submission_id": "legacy-terminal-submission",
+            "issue_number": 1901,
+            "project_id": "/legacy/project",
+        }));
         store.force_upsert_lifecycle_state_for_test(&submission).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&legacy_issue)
+            .await?;
 
         let active = store
             .list_submission_instances_page(
@@ -672,7 +687,14 @@ mod declarative_pinning {
                 10,
             )
             .await?;
-        assert_eq!(done, vec![submission]);
+        assert_eq!(done.len(), 2);
+        assert!(done.contains(&submission));
+        assert!(done.contains(&legacy_issue));
+
+        let metrics = store
+            .submission_metrics_since(chrono::Utc::now() - chrono::Duration::minutes(1))
+            .await?;
+        assert_eq!(metrics.global_done, 2);
         Ok(())
     }
 

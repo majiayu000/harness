@@ -53,11 +53,14 @@ impl WorkflowRuntimeStore {
         limit: i64,
     ) -> anyhow::Result<Vec<WorkflowInstance>> {
         let limit = limit.max(1);
-        let (terminal_definition_ids, terminal_states, terminal_task_statuses) =
-            terminal_task_status_rows(&self.definition_registry);
+        let terminal = terminal_task_status_rows(&self.definition_registry);
         let rows: Vec<(String,)> = sqlx::query_as(
-            "WITH terminal_states(definition_id, state, task_status) AS (
-                 SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
+            "WITH terminal_states(
+                 definition_id, state, task_status, definition_version, definition_hash
+             ) AS (
+                 SELECT * FROM unnest(
+                     $1::text[], $2::text[], $3::text[], $18::bigint[], $19::text[]
+                 )
              ),
              persisted_terminal_states AS (
                  SELECT definitions.id AS definition_id,
@@ -107,6 +110,21 @@ impl WorkflowRuntimeStore {
                  LEFT JOIN terminal_states AS terminal
                    ON terminal.definition_id = workflow_instances.definition_id
                   AND terminal.state = workflow_instances.state
+                  AND (
+                      terminal.definition_version IS NULL
+                      OR (
+                          terminal.definition_version =
+                              (workflow_instances.data->>'definition_version')::bigint
+                          AND (
+                              (
+                                  terminal.definition_hash IS NULL
+                                  AND workflow_instances.data->'data'->>'definition_hash' IS NULL
+                              )
+                              OR terminal.definition_hash =
+                                  workflow_instances.data->'data'->>'definition_hash'
+                          )
+                      )
+                  )
                  LEFT JOIN persisted_terminal_states AS persisted_terminal
                    ON persisted_terminal.definition_id = workflow_instances.definition_id
                   AND persisted_terminal.definition_version =
@@ -180,9 +198,9 @@ impl WorkflowRuntimeStore {
                       ) DESC
              LIMIT $14",
         )
-        .bind(&terminal_definition_ids)
-        .bind(&terminal_states)
-        .bind(&terminal_task_statuses)
+        .bind(&terminal.definition_ids)
+        .bind(&terminal.states)
+        .bind(&terminal.task_statuses)
         .bind(filter.project_id.as_deref())
         .bind(cursor_created_at)
         .bind(cursor_id)
@@ -197,6 +215,8 @@ impl WorkflowRuntimeStore {
         .bind(DECLARATIVE_DEFINITION_METADATA_KIND)
         .bind(&filter.prompt_task_kinds)
         .bind(&filter.recognized_task_kinds)
+        .bind(&terminal.definition_versions)
+        .bind(&terminal.definition_hashes)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -210,13 +230,16 @@ impl WorkflowRuntimeStore {
         &self,
         since: DateTime<Utc>,
     ) -> anyhow::Result<WorkflowSubmissionMetrics> {
-        let (terminal_definition_ids, terminal_states, terminal_task_statuses) =
-            terminal_task_status_rows(&self.definition_registry);
+        let terminal = terminal_task_status_rows(&self.definition_registry);
         let stalled_reason = "round_budget_exhausted";
         let stalled_pattern = format!("%\"reason\":\"{stalled_reason}\"%");
         let rows = sqlx::query_as::<_, SubmissionMetricRow>(
-            "WITH terminal_states(definition_id, state, task_status) AS (
-                 SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
+            "WITH terminal_states(
+                 definition_id, state, task_status, definition_version, definition_hash
+             ) AS (
+                 SELECT * FROM unnest(
+                     $1::text[], $2::text[], $3::text[], $8::bigint[], $9::text[]
+                 )
              ),
              persisted_terminal_states AS (
                  SELECT definitions.id AS definition_id,
@@ -281,6 +304,21 @@ impl WorkflowRuntimeStore {
                  LEFT JOIN terminal_states AS terminal
                    ON terminal.definition_id = workflow_instances.definition_id
                   AND terminal.state = workflow_instances.state
+                  AND (
+                      terminal.definition_version IS NULL
+                      OR (
+                          terminal.definition_version =
+                              (workflow_instances.data->>'definition_version')::bigint
+                          AND (
+                              (
+                                  terminal.definition_hash IS NULL
+                                  AND workflow_instances.data->'data'->>'definition_hash' IS NULL
+                              )
+                              OR terminal.definition_hash =
+                                  workflow_instances.data->'data'->>'definition_hash'
+                          )
+                      )
+                  )
                  LEFT JOIN persisted_terminal_states AS persisted_terminal
                    ON persisted_terminal.definition_id = workflow_instances.definition_id
                   AND persisted_terminal.definition_version =
@@ -353,13 +391,15 @@ impl WorkflowRuntimeStore {
              FROM hourly_counts
              ORDER BY row_kind, project_id, hour NULLS FIRST",
         )
-        .bind(&terminal_definition_ids)
-        .bind(&terminal_states)
-        .bind(&terminal_task_statuses)
+        .bind(&terminal.definition_ids)
+        .bind(&terminal.states)
+        .bind(&terminal.task_statuses)
         .bind(DECLARATIVE_DEFINITION_METADATA_KIND)
         .bind(since)
         .bind(stalled_reason)
         .bind(stalled_pattern)
+        .bind(&terminal.definition_versions)
+        .bind(&terminal.definition_hashes)
         .fetch_all(&self.pool)
         .await?;
         submission_metrics_from_rows(rows)

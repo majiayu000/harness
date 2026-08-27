@@ -6,8 +6,8 @@ use chrono::{DateTime, Utc};
 
 /// Shared candidate-selection CTE for retention: terminal workflow root
 /// families older than the cutoff that are not depended on by any live
-/// workflow. Declarative terminal selectors include the exact version and
-/// content hash so a current definition cannot reclassify historical rows.
+/// workflow. Selectors can be unversioned, legacy version-only pins, or exact
+/// version-and-hash pins. A version-only pin matches only rows without a hash.
 const PRUNE_ELIGIBLE_ROOTS_CTE: &str = r#"WITH RECURSIVE terminal_states(
                  definition_id, definition_version, definition_hash, state
              ) AS (
@@ -28,8 +28,14 @@ const PRUNE_ELIGIBLE_ROOTS_CTE: &str = r#"WITH RECURSIVE terminal_states(
                              OR (
                                  terminal.definition_version =
                                      (root.data->>'definition_version')::bigint
-                                 AND terminal.definition_hash =
-                                     root.data->'data'->>'definition_hash'
+                                 AND (
+                                     (
+                                         terminal.definition_hash IS NULL
+                                         AND root.data->'data'->>'definition_hash' IS NULL
+                                     )
+                                     OR terminal.definition_hash =
+                                         root.data->'data'->>'definition_hash'
+                                 )
                              )
                          )
                    )
@@ -70,8 +76,14 @@ const PRUNE_ELIGIBLE_ROOTS_CTE: &str = r#"WITH RECURSIVE terminal_states(
                               OR (
                                   terminal.definition_version =
                                       (family.data->>'definition_version')::bigint
-                                  AND terminal.definition_hash =
-                                      family.data->'data'->>'definition_hash'
+                                  AND (
+                                      (
+                                          terminal.definition_hash IS NULL
+                                          AND family.data->'data'->>'definition_hash' IS NULL
+                                      )
+                                      OR terminal.definition_hash =
+                                          family.data->'data'->>'definition_hash'
+                                  )
                               )
                           )
                     ))
@@ -105,8 +117,15 @@ const PRUNE_ELIGIBLE_ROOTS_CTE: &str = r#"WITH RECURSIVE terminal_states(
                                     OR (
                                         dependent_terminal.definition_version =
                                             (dependent.data->>'definition_version')::bigint
-                                        AND dependent_terminal.definition_hash =
-                                            dependent.data->'data'->>'definition_hash'
+                                        AND (
+                                            (
+                                                dependent_terminal.definition_hash IS NULL
+                                                AND dependent.data->'data'->>'definition_hash'
+                                                    IS NULL
+                                            )
+                                            OR dependent_terminal.definition_hash =
+                                                dependent.data->'data'->>'definition_hash'
+                                        )
                                     )
                                 )
                           ) OR COALESCE(dependent.data->'data'->>'stop_reason_code',

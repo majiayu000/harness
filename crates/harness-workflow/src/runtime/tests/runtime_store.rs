@@ -730,10 +730,20 @@ async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
     let terminal_a = project_issue_instance("/project-a", 501, "done");
     let terminal_b = project_issue_instance("/project-a", 502, "done");
     let active = project_issue_instance("/project-a", 503, "done");
+    let legacy_with_hash = project_issue_instance("/project-a", 504, "done")
+        .with_server_data(json!({ "definition_hash": "sha256:not-a-legacy-pin" }));
+    let current_terminal = current_issue_instance("done").with_id("current-terminal-505");
     let active_child = quality_gate_instance("checking")
         .with_id("active-family-child-503")
         .with_parent(&active.id);
-    for instance in [&terminal_a, &terminal_b, &active, &active_child] {
+    for instance in [
+        &terminal_a,
+        &terminal_b,
+        &active,
+        &active_child,
+        &legacy_with_hash,
+        &current_terminal,
+    ] {
         store
             .force_upsert_lifecycle_state_for_test(instance)
             .await?;
@@ -744,6 +754,8 @@ async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
             terminal_b.id.clone(),
             active.id.clone(),
             active_child.id.clone(),
+            legacy_with_hash.id.clone(),
+            current_terminal.id.clone(),
         ])
         .bind(Utc::now() - Duration::days(45))
         .execute(store.pool())
@@ -752,7 +764,7 @@ async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
     let cutoff = Utc::now() - Duration::days(30);
     assert_eq!(
         store.count_terminal_history_candidates(cutoff, 100).await?,
-        2
+        3
     );
     assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
 
@@ -760,11 +772,13 @@ async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
     assert_eq!(summary.workflow_instances_deleted, 1);
     assert_eq!(
         store.count_terminal_history_candidates(cutoff, 100).await?,
-        1
+        2
     );
     assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
     assert!(store.get_instance(&terminal_a.id).await?.is_none());
     assert!(store.get_instance(&active.id).await?.is_some());
+    assert!(store.get_instance(&legacy_with_hash.id).await?.is_some());
+    assert!(store.get_instance(&current_terminal.id).await?.is_some());
     Ok(())
 }
 
