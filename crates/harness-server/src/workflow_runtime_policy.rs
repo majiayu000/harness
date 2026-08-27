@@ -9,8 +9,6 @@ pub(crate) fn pin_change_scope_classifier_policy(
     project_root: &Path,
     data: Value,
 ) -> anyhow::Result<Value> {
-    #[cfg(test)]
-    crate::test_helpers::ensure_test_workflow_base();
     let config =
         harness_core::config::workflow::load_workflow_config(project_root).with_context(|| {
             format!(
@@ -18,6 +16,33 @@ pub(crate) fn pin_change_scope_classifier_policy(
                 project_root.display()
             )
         })?;
+    #[cfg(test)]
+    let config = {
+        let mut config = config;
+        if !config
+            .activities
+            .contains_key(harness_workflow::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY)
+        {
+            // Production registers `config/WORKFLOW.md` as the central base at
+            // CLI startup. Server unit tests call these services without that
+            // startup path, so merge only the shipped classifier into this local
+            // config. Do not mutate the process-global workflow base: the server
+            // test binary runs unrelated workflow/profile fixtures concurrently.
+            let shipped_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+            let shipped = harness_core::config::workflow::load_workflow_config(&shipped_root)
+                .context(
+                    "shipped change-scope classifier policy could not load for server tests",
+                )?;
+            let activity = harness_workflow::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY;
+            let policy = shipped
+                .activities
+                .get(activity)
+                .cloned()
+                .context("shipped workflow is missing the required classifier policy")?;
+            config.activities.insert(activity.to_string(), policy);
+        }
+        config
+    };
     pin_change_scope_classifier_policy_from_config(&config, data)
 }
 
