@@ -86,6 +86,7 @@ mod runtime_job_queries;
 mod runtime_job_state;
 #[path = "store/runtime_job_terminal_fence.rs"]
 mod runtime_job_terminal_fence;
+pub use runtime_job_terminal_fence::RuntimeJobMutationFence;
 #[path = "store/runtime_jobs.rs"]
 mod runtime_jobs;
 #[path = "store/runtime_usage.rs"]

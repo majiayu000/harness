@@ -2,8 +2,8 @@ use crate::github_pr_snapshot::{GitHubPrSnapshotArtifacts, GitHubPrSnapshotTarge
 use crate::http::AppState;
 use harness_core::config::workflow::WorkflowConfig;
 use harness_workflow::runtime::{
-    ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobStatus, WorkflowCommandStatus,
-    WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
+    ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeJobMutationFence, RuntimeJobStatus,
+    WorkflowCommandRecord, WorkflowCommandStatus, WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -28,40 +28,97 @@ pub(in crate::workflow_runtime_worker) async fn current_merge_authorization(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("workflow `{workflow_id}` no longer exists"))?;
-    if workflow.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID || workflow.state != "merging" {
-        return Err(format!(
-            "workflow `{workflow_id}` is no longer in the authorized merging state"
-        ));
-    }
     let command = store
         .get_command(&job.command_id)
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("merge command `{}` no longer exists", job.command_id))?;
-    if command.workflow_id != workflow.id
-        || command.status != WorkflowCommandStatus::Dispatched
-        || command.superseded_by_command_id.is_some()
-        || command.command.activity_name() != Some("merge_pr")
-        || job.input.get("command") != Some(&command.command.command)
-    {
-        return Err(format!(
-            "merge command `{}` is stale, superseded, or does not match its immutable job envelope",
-            job.command_id
-        ));
-    }
     let persisted_job = store
         .get_runtime_job(&job.id)
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("merge job `{}` no longer exists", job.id))?;
-    if persisted_job.status != RuntimeJobStatus::Running
-        || persisted_job.command_id != job.command_id
-        || persisted_job.lease_generation != job.lease_generation
+    validate_merge_authorization(job, &workflow, &command, &persisted_job)?;
+    Ok(workflow)
+}
+
+pub(in crate::workflow_runtime_worker) async fn fenced_merge_authorization(
+    state: &AppState,
+    job: &RuntimeJob,
+) -> Result<RuntimeJobMutationFence, String> {
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .ok_or_else(|| "workflow runtime store is unavailable".to_string())?;
+    let fence = store
+        .fence_runtime_job_mutation(&job.id, &job.command_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = validate_fenced_merge_authorization(job, &fence) {
+        fence
+            .release()
+            .await
+            .map_err(|release_error| format!("{error}; fence release failed: {release_error}"))?;
+        return Err(error);
+    }
+    Ok(fence)
+}
+
+pub(in crate::workflow_runtime_worker) fn validate_fenced_merge_authorization(
+    expected_job: &RuntimeJob,
+    fence: &RuntimeJobMutationFence,
+) -> Result<(), String> {
+    validate_merge_authorization(expected_job, &fence.workflow, &fence.command, &fence.job)
+}
+
+fn validate_merge_authorization(
+    expected_job: &RuntimeJob,
+    workflow: &WorkflowInstance,
+    command: &WorkflowCommandRecord,
+    persisted_job: &RuntimeJob,
+) -> Result<(), String> {
+    let workflow_id = expected_job
+        .input
+        .get("workflow_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "merge job is missing its workflow identity".to_string())?;
+    if workflow.id != workflow_id
+        || workflow.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || workflow.state != "merging"
+    {
+        return Err(format!(
+            "workflow `{workflow_id}` is no longer in the authorized merging state"
+        ));
+    }
+    if command.workflow_id != workflow.id
+        || command.id != expected_job.command_id
+        || command.status != WorkflowCommandStatus::Dispatched
+        || command.superseded_by_command_id.is_some()
+        || command.command.activity_name() != Some("merge_pr")
+        || expected_job.input.get("command") != Some(&command.command.command)
+    {
+        return Err(format!(
+            "merge command `{}` is stale, superseded, or does not match its immutable job envelope",
+            expected_job.command_id
+        ));
+    }
+    if persisted_job.id != expected_job.id
+        || persisted_job.status != RuntimeJobStatus::Running
+        || persisted_job.command_id != expected_job.command_id
+        || persisted_job.lease_generation != expected_job.lease_generation
+        || persisted_job.input.get("workflow_id") != expected_job.input.get("workflow_id")
+        || persisted_job.input.get("command") != expected_job.input.get("command")
+        || persisted_job.input.get("cancellation_requested").is_some()
         || persisted_job
             .lease
             .as_ref()
             .map(|lease| lease.owner.as_str())
-            != job.lease.as_ref().map(|lease| lease.owner.as_str())
+            != expected_job
+                .lease
+                .as_ref()
+                .map(|lease| lease.owner.as_str())
         || persisted_job
             .lease
             .as_ref()
@@ -69,10 +126,10 @@ pub(in crate::workflow_runtime_worker) async fn current_merge_authorization(
     {
         return Err(format!(
             "merge job `{}` no longer owns its current execution lease",
-            job.id
+            expected_job.id
         ));
     }
-    Ok(workflow)
+    Ok(())
 }
 
 pub(in crate::workflow_runtime_worker) async fn finish_server_merge(
