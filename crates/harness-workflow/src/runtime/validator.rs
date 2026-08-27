@@ -215,6 +215,7 @@ impl TransitionAllowlist {
                 [EnqueueActivity, RecordPlanConcern, MarkBlocked, Wait],
             )
             .allow("replanning", "plan_scope_review", [EnqueueActivity])
+            .allow("replanning", "replanning", [EnqueueActivity])
             .allow("plan_scope_review", "implementing", [EnqueueActivity])
             .allow("implementing", "pr_scope_review", [BindPr, EnqueueActivity])
             .allow("pr_scope_review", "pr_open", [Wait])

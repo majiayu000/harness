@@ -48,6 +48,8 @@ use permission_profile::RuntimePermissionProfile;
 mod spawn_env;
 use spawn_env::{correction_spawn_env_vars, isolation_spawn_env_vars};
 mod server_owned;
+#[cfg(test)]
+pub(in crate::workflow_runtime_worker) use server_owned::normalize_classifier_input;
 mod structured_output;
 mod workspace_finalization;
 use structured_output::{
@@ -122,7 +124,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             harness_core::config::workflow::load_workflow_document(&source_project_root)?;
         server_owned::prepare_classifier(
             self.state,
-            &job,
+            &mut job,
             &mut workflow,
             &workflow_document.config,
         )

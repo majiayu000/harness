@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 pub(super) async fn prepare_classifier(
     state: &Arc<AppState>,
-    job: &RuntimeJob,
+    job: &mut RuntimeJob,
     workflow: &mut Option<WorkflowInstance>,
     config: &WorkflowConfig,
 ) -> anyhow::Result<()> {
+    normalize_classifier_input(job)?;
     let Some(current) = workflow.as_ref() else {
         return Ok(());
     };
@@ -55,6 +56,19 @@ pub(super) async fn prepare_classifier(
             )
             .await?,
     );
+    Ok(())
+}
+
+pub(in crate::workflow_runtime_worker) fn normalize_classifier_input(
+    job: &mut RuntimeJob,
+) -> anyhow::Result<()> {
+    let Some(scope_facts) = job.input.pointer("/command/scope_facts").cloned() else {
+        return Ok(());
+    };
+    job.input
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("classifier runtime job input must be an object"))?
+        .insert("scope_facts".to_string(), scope_facts);
     Ok(())
 }
 

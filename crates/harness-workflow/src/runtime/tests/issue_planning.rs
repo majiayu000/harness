@@ -325,6 +325,68 @@ fn candidate_fanout_issue_plan_completion_uses_persisted_metadata() -> anyhow::R
 }
 
 #[test]
+fn legacy_replan_completion_is_requeued_under_structured_contract() -> anyhow::Result<()> {
+    let instance = issue_instance("replanning");
+    let result =
+        ActivityResult::succeeded("replan_issue", "Legacy replan completed.").with_artifact(
+            ActivityArtifact::new("workflow_decision", json!({"decision": "continue"})),
+        );
+    let event = runtime_completion_event(&instance, "replan_issue", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)?
+        .ok_or_else(|| anyhow::anyhow!("legacy replan should be migrated"))?;
+
+    assert_eq!(decision.decision, "retry_replan_with_structured_contract");
+    assert_eq!(decision.next_state, "replanning");
+    assert_eq!(decision.commands[0].activity_name(), Some("replan_issue"));
+    assert_eq!(
+        decision.commands[0].command["structured_issue_plan_contract"],
+        true
+    );
+    DecisionValidator::github_issue_pr().validate(
+        &instance,
+        &decision,
+        &ValidationContext::new("runtime-1", Utc::now()),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn structured_replan_contract_failure_does_not_retry_forever() -> anyhow::Result<()> {
+    let instance = issue_instance("replanning");
+    let result =
+        ActivityResult::succeeded("replan_issue", "Invalid new-contract output.").with_artifact(
+            ActivityArtifact::new("workflow_decision", json!({"decision": "continue"})),
+        );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-2",
+        "command": WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "structured-replan",
+            json!({
+                "activity": "replan_issue",
+                "structured_issue_plan_contract": true,
+            }),
+        ),
+        "runtime_job_id": "job-2",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)?
+        .ok_or_else(|| anyhow::anyhow!("invalid structured replan should block"))?;
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+    Ok(())
+}
+
+#[test]
 fn submission_mode_deferred_survives_issue_plan_completion() {
     let instance = issue_instance("planning");
     let plan_payload = json!({

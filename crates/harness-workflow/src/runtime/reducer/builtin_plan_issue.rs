@@ -35,6 +35,29 @@ pub(super) fn issue_plan_decision_from_activity_result(
     }
 
     let Some(issue_plan) = issue_plan_payload(result) else {
+        if legacy_replan_completion_requires_retry(instance, event, result) {
+            let command_id =
+                event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+            return Some(
+                WorkflowDecision::new(
+                    &instance.id,
+                    &instance.state,
+                    "retry_replan_with_structured_contract",
+                    "replanning",
+                    "legacy replan completion used the retired workflow_decision contract; rerun once with the structured issue-plan contract",
+                )
+                .with_command(WorkflowCommand::new(
+                    WorkflowCommandType::EnqueueActivity,
+                    format!("legacy-replan-contract:{}:{command_id}", instance.id),
+                    json!({
+                        "activity": "replan_issue",
+                        "structured_issue_plan_contract": true,
+                    }),
+                ))
+                .with_evidence(runtime_completion_evidence(event, result))
+                .high_confidence(),
+            );
+        }
         let reason =
             "plan_issue succeeded without a valid issue_plan artifact or IssuePlanReady signal";
         return Some(invalid_agent_output_blocked_decision(
@@ -81,6 +104,23 @@ pub(super) fn issue_plan_decision_from_activity_result(
     .with_evidence(runtime_completion_evidence(event, result))
     .high_confidence();
     Some(decision.with_command(command))
+}
+
+fn legacy_replan_completion_requires_retry(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> bool {
+    instance.state == "replanning"
+        && result
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_type == "workflow_decision")
+        && event
+            .event
+            .pointer("/command/command/structured_issue_plan_contract")
+            .and_then(Value::as_bool)
+            != Some(true)
 }
 
 fn submission_mode_from_event(event: &WorkflowEvent) -> SubmissionMode {

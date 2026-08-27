@@ -483,6 +483,7 @@ mod tests {
         (Some("implementing"), "implementing", &[E, P, W]),
         (Some("implementing"), "replanning", &[E, P, MB, W]),
         (Some("replanning"), "plan_scope_review", &[E]),
+        (Some("replanning"), "replanning", &[E]),
         (Some("plan_scope_review"), "implementing", &[E]),
         (Some("implementing"), "pr_scope_review", &[B, E]),
         (Some("pr_scope_review"), "pr_open", &[W]),

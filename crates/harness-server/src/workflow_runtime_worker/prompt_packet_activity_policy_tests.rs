@@ -293,12 +293,21 @@ fn built_in_scope_review_requires_workflow_classifier_policy() {
         "plan_scope_review",
         WorkflowSubject::new("issue", "issue:42"),
     );
-    let job = RuntimeJob::pending(
+    let mut job = RuntimeJob::pending(
         "command-scope-review",
         RuntimeKind::CodexJsonrpc,
         "classifier-default",
-        json!({ "activity": harness_workflow::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY }),
+        json!({
+            "activity": harness_workflow::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY,
+            "command": {
+                "scope_facts": {
+                    "issue_plan": {"summary": "Keep the implementation scoped"}
+                }
+            }
+        }),
     );
+    super::super::executor::normalize_classifier_input(&mut job)
+        .expect("dispatcher command facts should normalize");
     let mut packet = json!({
         "activity_result_schema": {},
         "required_structured_output": {},
@@ -344,6 +353,36 @@ fn built_in_scope_review_requires_workflow_classifier_policy() {
         packet["activity_policy"]["classifier"]["verdicts"][0],
         "allow"
     );
+    assert_eq!(
+        packet["classifier_facts"]["facts"]["issue_plan"]["summary"],
+        "Keep the implementation scoped"
+    );
+}
+
+#[test]
+fn classifier_input_normalizes_dispatcher_envelopes_for_both_scope_gates() {
+    for scope_facts in [
+        json!({"issue_plan": {"summary": "Plan scope"}}),
+        json!({
+            "issue_plan": {"summary": "PR scope"},
+            "pull_request": {"pr_number": 77, "pr_url": "https://github.com/o/r/pull/77"}
+        }),
+    ] {
+        let mut job = RuntimeJob::pending(
+            "command-scope-review",
+            RuntimeKind::CodexJsonrpc,
+            "classifier-default",
+            json!({
+                "activity": harness_workflow::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY,
+                "command": {"scope_facts": scope_facts.clone()}
+            }),
+        );
+
+        super::super::executor::normalize_classifier_input(&mut job)
+            .expect("dispatcher command facts should normalize");
+
+        assert_eq!(job.input["scope_facts"], scope_facts);
+    }
 }
 
 #[test]
