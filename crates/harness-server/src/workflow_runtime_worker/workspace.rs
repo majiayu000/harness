@@ -49,6 +49,9 @@ pub(super) async fn prepare_runtime_workspace(
     workflow_document: &WorkflowDocument,
     execution_cancelled: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<PreparedRuntimeWorkspace> {
+    if let Some(workspace) = classifier_runtime_workspace(job, source_project_root) {
+        return Ok(workspace);
+    }
     validate_workspace_cleanup_policy(&workflow_document.config.workspace.cleanup)?;
     match workflow_document.config.workspace.strategy.as_str() {
         "worktree" => {}
@@ -233,6 +236,25 @@ pub(super) async fn prepare_runtime_workspace(
             workflow,
         ),
         repository_lease_lost: lease.repository_lease_lost,
+        _repository_write_lease: None,
+    })
+}
+
+fn classifier_runtime_workspace(
+    job: &RuntimeJob,
+    source_project_root: &Path,
+) -> Option<PreparedRuntimeWorkspace> {
+    job.input.get("classifier")?;
+    Some(PreparedRuntimeWorkspace {
+        run_project: source_project_root.to_path_buf(),
+        task_id: None,
+        acquisition_id: None,
+        execution_guard: None,
+        after_run_hook: None,
+        before_remove_hook: None,
+        hook_timeout_secs: 0,
+        finish_action: RuntimeWorkspaceFinishAction::Release,
+        repository_lease_lost: None,
         _repository_write_lease: None,
     })
 }
@@ -684,6 +706,23 @@ mod tests {
             runtime_workspace_finish_action("on_terminal", true, &job, Some(&workflow)),
             RuntimeWorkspaceFinishAction::Release
         );
+    }
+
+    #[test]
+    fn classifier_jobs_skip_repository_workspace_preparation() {
+        let job = RuntimeJob::pending(
+            "command-classifier",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({"classifier": {"schema": "harness.runtime.classifier_job.v1"}}),
+        );
+
+        let workspace = classifier_runtime_workspace(&job, Path::new("/source"))
+            .expect("classifier workspace should bypass repository setup");
+
+        assert_eq!(workspace.run_project, Path::new("/source"));
+        assert!(workspace.task_id.is_none());
+        assert!(workspace.repository_lease_lost.is_none());
     }
 
     #[test]

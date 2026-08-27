@@ -10,6 +10,7 @@ use harness_core::run_id::RunIdentity;
 use harness_core::types::{ExecutionPhase, TurnId};
 use harness_protocol::notifications::{Notification, RpcNotification};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -30,11 +31,16 @@ pub(crate) struct TurnLifecycleOptions {
     pub permission_mode: AgentPermissionMode,
     pub allowed_tools: Option<Vec<String>>,
     pub env_vars: HashMap<String, String>,
+    /// Optional isolated working directory for turns that must not observe the
+    /// registered project checkout, such as model-only classifier activities.
+    pub project_root_override: Option<PathBuf>,
     pub runtime_usage: Option<RuntimeUsageContext>,
     /// Set when the agent confirms that its first-party egress proxy was
     /// established before dispatch. The marker is consumed here and is not
     /// persisted as a transcript item.
     pub egress_verified_at_dispatch: Option<Arc<AtomicBool>>,
+    /// Backend-reported model identities captured for server attestation.
+    pub reported_models: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// Stateful lease-lost signal (watch channel): when the owning runtime
     /// job lease is lost mid-turn, the turn interrupts the agent so the
     /// child process terminates and the workspace cleanup can run (GH-1877).
@@ -51,13 +57,18 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     agent_name: String,
     mut options: TurnLifecycleOptions,
 ) {
-    let Some(project_root) = server.thread_manager.thread_project_root(&thread_id) else {
+    let Some(registered_project_root) = server.thread_manager.thread_project_root(&thread_id)
+    else {
         tracing::warn!(
             "run_turn_lifecycle skipped because thread {} no longer exists",
             thread_id
         );
         return;
     };
+    let project_root = options
+        .project_root_override
+        .clone()
+        .unwrap_or(registered_project_root);
     match RunIdentity::mint_nested_env_vars(&mut options.env_vars) {
         Ok(identity) => {
             if let Some(context) = options.runtime_usage.as_mut() {
@@ -257,6 +268,11 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     }
                     Some(item) => {
                         last_activity = Instant::now();
+                        if let StreamItem::ModelReported { model } = &item {
+                            if let Some(reported_models) = options.reported_models.as_ref() {
+                                reported_models.lock().unwrap().push(model.clone());
+                            }
+                        }
                         if let StreamItem::Error { message } = &item {
                             stream_error.get_or_insert_with(|| message.clone());
                         }

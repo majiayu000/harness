@@ -27,6 +27,21 @@ fn parse_assistant_message_content_blocks() {
 }
 
 #[test]
+fn parse_assistant_message_reports_provider_model() {
+    let line = r#"{"type":"assistant","message":{"model":"claude-test","content":[{"type":"text","text":"classified"}]}}"#;
+    let events = parse_stream_json_events(line);
+
+    assert!(matches!(
+        &events[0],
+        AgentEvent::ModelReported { model } if model == "claude-test"
+    ));
+    assert!(matches!(
+        &events[1],
+        AgentEvent::MessageDelta { text } if text == "classified"
+    ));
+}
+
+#[test]
 fn parse_tool_use() {
     let line = r#"{"type": "tool_use", "name": "Read", "input": {"path": "src/main.rs"}}"#;
     let event = parse_stream_json_line(line).unwrap();

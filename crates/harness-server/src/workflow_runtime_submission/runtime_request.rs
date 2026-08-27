@@ -2,6 +2,7 @@
 
 use harness_workflow::runtime::PromptContinuationPolicy;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use super::runtime_models::{TaskId, TaskKind};
@@ -16,6 +17,9 @@ pub struct CreateTaskRequest {
     /// Registered declarative workflow definition to submit.
     #[serde(default)]
     pub definition_id: Option<String>,
+    /// Opaque structured facts for a declarative classifier activity.
+    #[serde(default)]
+    pub classifier_input: Option<Value>,
     /// Free-text task description (prompt, issue URL, etc.).
     pub prompt: Option<String>,
     /// GitHub issue number to implement from.
@@ -264,6 +268,7 @@ impl Default for CreateTaskRequest {
     fn default() -> Self {
         Self {
             definition_id: None,
+            classifier_input: None,
             prompt: None,
             issue: None,
             skip_triage: false,

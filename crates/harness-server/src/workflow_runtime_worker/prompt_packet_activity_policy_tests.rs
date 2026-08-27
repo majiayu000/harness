@@ -76,6 +76,7 @@ fn declarative_activity_policy_binds_exactly_and_missing_policy_fails_closed() {
         WorkflowActivityPolicy {
             prompt: Some("Inspect only the declared repository surface.".to_string()),
             validation: vec!["cargo check -p harness-server --all-targets".to_string()],
+            classifier: None,
         },
     );
     let mut packet = json!({
@@ -141,6 +142,7 @@ fn built_in_or_unmatched_activity_does_not_bind_declarative_activity_policy() {
         WorkflowActivityPolicy {
             prompt: Some("Must not bind to built-in behavior.".to_string()),
             validation: vec!["false".to_string()],
+            classifier: None,
         },
     );
     let mut packet = json!({
@@ -228,4 +230,30 @@ fn runtime_prompt_packet_omits_duplicated_additional_prompt() {
         .pointer("/untrusted_command_input/external_fields/command/additional_prompt")
         .and_then(Value::as_str)
         .is_some_and(|value| value.contains("Inspect the existing pull request.")));
+}
+
+#[test]
+fn classifier_prompt_excludes_repository_and_free_form_prompt_context() {
+    let packet = json!({
+        "schema": "harness.runtime.classifier_prompt_packet.v1",
+        "runtime_job": {"id": "job-1", "activity": "classify"},
+        "classifier_input": {
+            "schema": "harness.runtime.classifier_input.v1",
+            "subject": {"kind": "test", "identity": "test:1"},
+            "facts": {"scope": "generic"},
+            "provenance": {"source": "caller"}
+        },
+        "classifier_policy": {
+            "verdicts": ["allow", "deny"],
+            "instructions": ["Judge only supplied facts."]
+        }
+    });
+
+    let prompt = build_runtime_job_prompt(&packet, Some("MUST_NOT_APPEAR"));
+
+    assert!(prompt.contains("Harness classifier activity"));
+    assert!(prompt.contains("Judge only supplied facts."));
+    assert!(!prompt.contains("MUST_NOT_APPEAR"));
+    assert!(!prompt.contains("perform repository and GitHub work"));
+    assert!(!prompt.contains("Project root:"));
 }

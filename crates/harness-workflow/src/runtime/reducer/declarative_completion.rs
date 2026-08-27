@@ -100,7 +100,26 @@ fn reduce_generic_declarative_completion(
     }
 
     let route = match result.status {
-        ActivityStatus::Succeeded => success_route(source, result),
+        ActivityStatus::Succeeded => {
+            if definition.requires_classifier_assessment(&instance.state) {
+                match crate::runtime::validated_classifier_verdict(
+                    definition,
+                    &instance.state,
+                    result,
+                ) {
+                    Ok(Some(verdict)) => source
+                        .on_signal
+                        .get(&verdict)
+                        .map(|target| (target.as_str(), format!("classifier verdict '{verdict}'"))),
+                    Ok(None) => None,
+                    Err(error) => {
+                        return invalid_completion(instance, event, result, error.to_string())
+                    }
+                }
+            } else {
+                success_route(source, result)
+            }
+        }
         ActivityStatus::Blocked | ActivityStatus::SucceededWithBlockers => {
             if let Some(target) = source.on_blocked.as_deref() {
                 Some((target, "on_blocked".to_string()))

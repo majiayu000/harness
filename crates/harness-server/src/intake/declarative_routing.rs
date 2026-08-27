@@ -197,6 +197,7 @@ async fn dispatch(
             definition_id,
             task_id: &task_id,
             prompt: &prompt,
+            classifier_input: None,
             depends_on: &[],
             serialization_depends_on: &[],
             source: Some(source.name()),

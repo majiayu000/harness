@@ -103,6 +103,7 @@ fn declarative_submission_instance_persists_runtime_retry_policy() -> anyhow::Re
         definition_id: PROJECT_DEFINITION_ID,
         task_id: &task_id,
         prompt: "perform the declared work",
+        classifier_input: None,
         depends_on: &[],
         serialization_depends_on: &[],
         source: Some("test"),

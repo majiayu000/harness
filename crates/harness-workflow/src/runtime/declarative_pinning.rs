@@ -12,8 +12,22 @@ const METADATA_SCHEMA_VERSION: u64 = 1;
 pub fn declarative_definition_identity(
     policy: &WorkflowDefinitionPolicy,
 ) -> anyhow::Result<(u32, String)> {
-    let policy_json = serde_json::to_value(policy)?;
-    let definition_hash = stable_remote_fact_hash(&policy_json);
+    declarative_definition_identity_with_classifier_policies(policy, &BTreeMap::new())
+}
+
+pub(super) fn declarative_definition_identity_with_classifier_policies(
+    policy: &WorkflowDefinitionPolicy,
+    classifier_activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
+) -> anyhow::Result<(u32, String)> {
+    let identity = if classifier_activity_policies.is_empty() {
+        serde_json::to_value(policy)?
+    } else {
+        serde_json::json!({
+            "policy": policy,
+            "classifier_activity_policies": classifier_activity_policies,
+        })
+    };
+    let definition_hash = stable_remote_fact_hash(&identity);
     let version_hex = definition_hash
         .get(definition_hash.len().saturating_sub(8)..)
         .ok_or_else(|| anyhow::anyhow!("declarative definition hash is too short"))?;
@@ -40,6 +54,7 @@ pub fn persisted_declarative_definition(
         "kind": DECLARATIVE_DEFINITION_METADATA_KIND,
         "schema_version": METADATA_SCHEMA_VERSION,
         "policy": definition.policy(),
+        "classifier_activity_policies": definition.classifier_activity_policies(),
     }));
     if let Some(source_path) = source_path {
         persisted = persisted.with_source_path(source_path);
@@ -59,12 +74,22 @@ pub fn hydrate_persisted_declarative_definition(
     definition: &DurableWorkflowDefinition,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
     let policy = persisted_declarative_policy(definition)?;
-    let activity_policies = policy
+    let mut activity_policies: BTreeMap<String, WorkflowActivityPolicy> = policy
         .states
         .values()
         .filter_map(|state| state.activity.as_ref())
         .map(|activity| (activity.clone(), WorkflowActivityPolicy::default()))
         .collect();
+    if let Some(policies) = definition
+        .metadata
+        .get("classifier_activity_policies")
+        .map(|value| {
+            serde_json::from_value::<BTreeMap<String, WorkflowActivityPolicy>>(value.clone())
+        })
+        .transpose()?
+    {
+        activity_policies.extend(policies);
+    }
     hydrate_declarative_definition_with_policy(definition, &policy, &activity_policies)
 }
 

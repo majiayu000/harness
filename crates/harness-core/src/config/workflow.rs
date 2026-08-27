@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 mod budget;
 mod candidates;
+mod classifier;
 mod defaults;
 mod intake_binding;
 mod reserved_keys;
@@ -12,6 +13,7 @@ mod runtime_completion;
 mod storage;
 pub use budget::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 pub use candidates::WorkflowCandidatesPolicy;
+pub use classifier::WorkflowClassifierPolicy;
 use defaults::*;
 pub use intake_binding::{IntakeFilterPolicy, WorkflowDefinitionIntakePolicy};
 pub use runtime_completion::RuntimeCompletionPolicy;
@@ -111,12 +113,14 @@ pub struct WorkflowHooksPolicy {
     pub timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowActivityPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     #[serde(default)]
     pub validation: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<WorkflowClassifierPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -682,6 +686,7 @@ pub(super) fn load_workflow_document_with_base(
     if let Some(definition) = &config.definition {
         definition.validate_identifiers()?;
     }
+    classifier::validate_classifier_activities(&config.activities)?;
     config.runtime_dispatch.apply_default_activity_profiles();
     config.runtime_budget_policy.validate()?;
     let defer_floor = config.runtime_dispatch.defer_backoff_secs;

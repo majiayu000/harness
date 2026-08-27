@@ -6,6 +6,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+const RECOVERABLE_SKILL_BUDGET_WARNING: &str =
+    "Skill descriptions were shortened to fit the skills context budget.";
+
 #[derive(Debug)]
 pub(crate) enum ParsedCodexExecEvent {
     MessageDelta { item_id: String, text: String },
@@ -48,6 +51,16 @@ pub(crate) fn parse_codex_item(item: &Value) -> Option<Item> {
                 .unwrap_or_default()
                 .to_string(),
             stderr: String::new(),
+        }),
+        "mcp_tool_call" | "mcpToolCall" | "web_search" | "webSearch" | "file_change"
+        | "fileChange" => Some(Item::ToolCall {
+            name: json_str_field(item, &["name", "tool", "type"])?.to_string(),
+            input: item
+                .get("arguments")
+                .or_else(|| item.get("input"))
+                .cloned()
+                .unwrap_or_else(|| item.clone()),
+            output: item.get("output").cloned(),
         }),
         _ => None,
     }
@@ -124,6 +137,9 @@ pub(crate) fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecE
                 return Some(ParsedCodexExecEvent::Ignore);
             };
             if let Some(message) = parse_codex_error_item_message(item_value) {
+                if message.starts_with(RECOVERABLE_SKILL_BUDGET_WARNING) {
+                    return Some(ParsedCodexExecEvent::Warning { message });
+                }
                 return Some(ParsedCodexExecEvent::Error { message });
             }
             let Some(item) = parse_codex_item(item_value) else {
@@ -303,6 +319,7 @@ pub(crate) async fn stream_codex_exec_output(
                 StreamItem::ItemCompleted { .. } => "item_completed",
                 StreamItem::ItemCompletedKind => "item_completed",
                 StreamItem::TokenUsage { .. } => "token_usage",
+                StreamItem::ModelReported { .. } => "model_reported",
                 StreamItem::Warning { .. } => "warning",
                 StreamItem::Diagnostic { .. } => "diagnostic",
                 StreamItem::TurnCancelled { .. } => "turn_cancelled",

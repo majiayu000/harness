@@ -61,6 +61,8 @@ pub(super) enum ResolvedApprovalPolicy {
 #[serde(rename_all = "snake_case")]
 pub(super) enum ToolAllowlistEnforcement {
     ClaudeCli,
+    AnthropicApiNoToolSurface,
+    CodexIsolatedReadOnly,
     NotEnforcedByHarness,
 }
 
@@ -68,11 +70,9 @@ impl ToolAllowlistEnforcement {
     fn for_runtime_kind(runtime_kind: RuntimeKind) -> Self {
         match runtime_kind {
             RuntimeKind::ClaudeCode => Self::ClaudeCli,
-            RuntimeKind::CodexExec
-            | RuntimeKind::CodexJsonrpc
-            | RuntimeKind::AnthropicApi
-            | RuntimeKind::RemoteHost
-            | RuntimeKind::OpenCode => Self::NotEnforcedByHarness,
+            RuntimeKind::AnthropicApi => Self::AnthropicApiNoToolSurface,
+            RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => Self::CodexIsolatedReadOnly,
+            RuntimeKind::RemoteHost | RuntimeKind::OpenCode => Self::NotEnforcedByHarness,
         }
     }
 }
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(resolved.permission_mode, AgentPermissionMode::Scoped);
         assert_eq!(
             resolved.tool_allowlist_enforcement,
-            ToolAllowlistEnforcement::NotEnforcedByHarness
+            ToolAllowlistEnforcement::CodexIsolatedReadOnly
         );
         assert_eq!(resolved.allowed_tools, CapabilityProfile::ReadOnly.tools());
 

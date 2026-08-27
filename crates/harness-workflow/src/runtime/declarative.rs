@@ -1,5 +1,5 @@
 use super::{
-    declarative_pinning::declarative_definition_identity,
+    declarative_pinning::declarative_definition_identity_with_classifier_policies,
     model::{ActivityArtifact, WorkflowCommandType, WorkflowEvidence},
     pr_feedback::PR_FEEDBACK_DEFINITION_ID,
     prompt_task::PROMPT_TASK_DEFINITION_ID,
@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub struct DeclarativeWorkflowDefinition {
     registered: RegisteredWorkflowDefinition,
     policy: WorkflowDefinitionPolicy,
+    classifier_activity_policies: BTreeMap<String, WorkflowActivityPolicy>,
     definition_version: u32,
     definition_hash: String,
 }
@@ -61,6 +62,22 @@ impl DeclarativeWorkflowDefinition {
         &self.definition_hash
     }
 
+    pub fn classifier_activity_policy(&self, activity: &str) -> Option<&WorkflowActivityPolicy> {
+        self.classifier_activity_policies.get(activity)
+    }
+
+    pub fn classifier_activity_policies(&self) -> &BTreeMap<String, WorkflowActivityPolicy> {
+        &self.classifier_activity_policies
+    }
+
+    pub fn requires_classifier_assessment(&self, state: &str) -> bool {
+        self.policy
+            .states
+            .get(state)
+            .and_then(|state| state.activity.as_deref())
+            .is_some_and(|activity| self.classifier_activity_policies.contains_key(activity))
+    }
+
     pub fn into_registered(self) -> RegisteredWorkflowDefinition {
         self.registered
     }
@@ -80,11 +97,21 @@ pub fn build_declarative_definition(
 
     let states = compile_states(policy, &terminal_states);
     let allowlist = compile_allowlist(policy, &terminal_states);
-    let (definition_version, definition_hash) = declarative_definition_identity(policy)?;
+    let classifier_activity_policies = activity_policies
+        .iter()
+        .filter(|(_, policy)| policy.classifier.is_some())
+        .map(|(activity, policy)| (activity.clone(), policy.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let (definition_version, definition_hash) =
+        declarative_definition_identity_with_classifier_policies(
+            policy,
+            &classifier_activity_policies,
+        )?;
 
     Ok(DeclarativeWorkflowDefinition {
         registered: RegisteredWorkflowDefinition::new(&policy.id, states, allowlist),
         policy: policy.clone(),
+        classifier_activity_policies,
         definition_version,
         definition_hash,
     })
@@ -106,6 +133,7 @@ pub(crate) fn build_builtin_declarative_definition(
     Ok(DeclarativeWorkflowDefinition {
         registered: RegisteredWorkflowDefinition::new(&policy.id, states, allowlist),
         policy: policy.clone(),
+        classifier_activity_policies: BTreeMap::new(),
         definition_version: 1,
         definition_hash: format!("builtin:{}:v1", policy.id),
     })
@@ -306,13 +334,22 @@ fn validate_active_states(
                     state_name
                 );
             }
-            if !activity_policies.contains_key(activity) {
+            let Some(activity_policy) = activity_policies.get(activity) else {
                 anyhow::bail!(
                     "declarative workflow definition '{}' active state '{}' references activity '{}' absent from the workflow activities policy map",
                     policy.id,
                     state_name,
                     activity
                 );
+            };
+            if let Some(classifier) = activity_policy.classifier.as_ref() {
+                classifier.validate(activity)?;
+                classifier.validate_routes(
+                    activity,
+                    state.on_success.as_deref(),
+                    state.on_failure.as_deref(),
+                    &state.on_signal,
+                )?;
             }
         }
         if let Some(signal_type) = state

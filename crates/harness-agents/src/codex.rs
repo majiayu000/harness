@@ -140,6 +140,17 @@ impl CodexAgent {
         req.sandbox_mode.unwrap_or(self.sandbox_mode)
     }
 
+    fn process_sandbox_mode(&self, req: &AgentRequest) -> SandboxMode {
+        if matches!(req.allowed_tools.as_deref(), Some([])) {
+            // Codex applies its own sandbox from `base_args`. Wrapping the
+            // Codex process in a second macOS seatbelt prevents Rust from
+            // allocating its stack guard page during startup.
+            SandboxMode::DangerFullAccess
+        } else {
+            self.effective_sandbox_mode(req)
+        }
+    }
+
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
         let model = req.model.as_deref().unwrap_or(&self.default_model);
         let reasoning_effort = self.effective_reasoning_effort(req);
@@ -155,8 +166,11 @@ impl CodexAgent {
             OsString::from("-c"),
             OsString::from(format!("model_reasoning_effort=\"{}\"", reasoning_effort)),
         ];
-        if let Some([]) = req.allowed_tools.as_deref() {
+        let deny_all_tools = matches!(req.allowed_tools.as_deref(), Some([]));
+        if deny_all_tools {
             args.push(OsString::from("--ignore-user-config"));
+            args.push(OsString::from("--ignore-rules"));
+            args.push(OsString::from("--ephemeral"));
         }
         push_codex_sandbox_args(&mut args, sandbox_mode);
         if let Some(approval_policy) = req.approval_policy.as_deref() {
@@ -173,7 +187,7 @@ impl CodexAgent {
             args.push(OsString::from(schema_path));
         }
 
-        if self.cloud.enabled {
+        if self.cloud.enabled && !deny_all_tools {
             args.push(OsString::from("--ephemeral"));
         }
 
@@ -473,12 +487,12 @@ impl CodeAgent for CodexAgent {
         self.run_setup_phase(&req).await?;
 
         let base_args = self.base_args(&req);
-        let sandbox_mode = self.effective_sandbox_mode(&req);
+        let process_sandbox_mode = self.process_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
+            SandboxSpec::new(process_sandbox_mode, &req.project_root)
                 .with_allowed_write_paths(token.allowed_write_paths.clone())
         } else {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
+            SandboxSpec::new(process_sandbox_mode, &req.project_root)
         };
         let mut spawn_env_vars = req.env_vars.clone();
         spawn_env_vars.remove(AGENT_OUTPUT_SCHEMA_PATH_ENV);
@@ -593,12 +607,12 @@ impl CodeAgent for CodexAgent {
         self.run_setup_phase(&req).await?;
 
         let base_args = self.base_args(&req);
-        let sandbox_mode = self.effective_sandbox_mode(&req);
+        let process_sandbox_mode = self.process_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
+            SandboxSpec::new(process_sandbox_mode, &req.project_root)
                 .with_allowed_write_paths(token.allowed_write_paths.clone())
         } else {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
+            SandboxSpec::new(process_sandbox_mode, &req.project_root)
         };
         let mut spawn_env_vars = req.env_vars.clone();
         spawn_env_vars.remove(AGENT_OUTPUT_SCHEMA_PATH_ENV);

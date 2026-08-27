@@ -11,6 +11,7 @@ use harness_workflow::runtime::{
     WorkflowSubmissionPromptPayload, DECLARATIVE_SUBMISSION_DECISION,
 };
 use serde_json::json;
+use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ pub(crate) struct DeclarativeSubmissionRuntimeContext<'a> {
     pub definition_id: &'a str,
     pub task_id: &'a TaskId,
     pub prompt: &'a str,
+    pub classifier_input: Option<&'a Value>,
     pub depends_on: &'a [TaskId],
     pub serialization_depends_on: &'a [TaskId],
     pub source: Option<&'a str>,
@@ -43,6 +45,22 @@ pub(crate) async fn record_declarative_submission(
         ctx.project_root,
         ctx.definition_id,
     )?;
+    if definition.classifier_activity_policies().is_empty() {
+        if ctx.classifier_input.is_some() {
+            anyhow::bail!(
+                "declarative workflow '{}' does not declare a classifier activity",
+                ctx.definition_id
+            );
+        }
+    } else {
+        let input = ctx.classifier_input.ok_or_else(|| {
+            anyhow::anyhow!(
+                "declarative workflow '{}' requires classifier_input",
+                ctx.definition_id
+            )
+        })?;
+        harness_workflow::runtime::validate_classifier_input(input)?;
+    }
 
     let project_id = ctx.project_root.to_string_lossy().into_owned();
     let workflow_id = declarative_workflow_id(
@@ -235,6 +253,7 @@ pub(super) fn submission_instance(
         "external_id": ctx.external_id,
         "repo": ctx.repo,
         "depends_on": [],
+        "classifier_input": ctx.classifier_input,
     });
     insert_author_trust_class(&mut data, ctx.author_trust_class);
     let data = crate::workflow_runtime_policy::merge_runtime_retry_policy(ctx.project_root, data);

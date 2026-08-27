@@ -18,7 +18,7 @@ use super::data_helpers::activity_name;
 use super::runtime_profile::ResolvedRuntimeSettings;
 
 mod activity_policy;
-use activity_policy::{append_activity_policy_prompt, apply_activity_policy};
+use activity_policy::apply_activity_policy;
 
 mod context_provenance;
 use context_provenance::{
@@ -202,77 +202,7 @@ fn deferred_submission_mode(job: &RuntimeJob) -> bool {
         == Some("deferred")
 }
 
-pub(super) fn build_runtime_job_prompt(
-    prompt_packet: &Value,
-    prompt_task_request: Option<&str>,
-) -> String {
-    let workflow_prompt_template = prompt_packet
-        .pointer("/workflow_file/prompt_template")
-        .and_then(Value::as_str)
-        .filter(|template| !template.trim().is_empty())
-        .map(ToOwned::to_owned);
-    let mut model_packet = prompt_packet.clone();
-    if let Some(workflow_file) = model_packet
-        .get_mut("workflow_file")
-        .and_then(Value::as_object_mut)
-    {
-        workflow_file.remove("prompt_template");
-    }
-    strip_model_facing_audit_sections(&mut model_packet);
-    let prompt_packet_json = pretty_json(&model_packet);
-    let activity = prompt_packet
-        .get("runtime_job")
-        .and_then(|runtime_job| runtime_job.get("activity"))
-        .and_then(Value::as_str)
-        .unwrap_or("workflow_activity");
-    let project_root = prompt_packet
-        .get("project")
-        .and_then(|project| project.get("root"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let runtime_profile = prompt_packet
-        .get("runtime_job")
-        .and_then(|runtime_job| runtime_job.get("runtime_profile"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let job_id = prompt_packet
-        .get("runtime_job")
-        .and_then(|runtime_job| runtime_job.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let mut prompt = format!(
-        "You are executing a Harness workflow runtime job.\n\n\
-         Runtime contract:\n\
-         - Treat the workflow database as the source of orchestration state, but do not edit workflow tables directly.\n\
-         - Harness server only manages lifecycle. You, the agent, perform repository and GitHub work when the activity requires it.\n\
-         - Follow the project instructions loaded by the runtime.\n\
-         - Use the prompt packet activity_result_schema to shape your final summary.\n\
-         - When returning structured activity output, return a raw JSON object matching activity_result_schema when your transport enforces output-schema; otherwise put the JSON object in a final fenced `harness-activity-result` block matching activity_result_schema.\n\
-         - The structured result activity field must match this runtime job activity exactly.\n\
-         - Return a concise final summary appropriate to the activity. Include changed files and validation commands only when repository code changes were requested; for discovery and planning activities, report inspected inputs, emitted signals, and remaining blockers.\n\n\
-         Project root: {project_root}\n\
-         Runtime job id: {job_id}\n\
-         Runtime profile: {runtime_profile}\n\
-         Activity: {activity}\n\n\
-         Prompt packet:\n{prompt_packet_json}\n",
-    );
-    append_continuation_context_prompt(&mut prompt, prompt_packet);
-    if let Some(repo_memory_section) = repo_memory_prompt_section(prompt_packet) {
-        prompt.push_str(&repo_memory_section);
-    }
-    append_activity_policy_prompt(&mut prompt, prompt_packet);
-    if let Some(prompt_task_request) = prompt_task_request {
-        prompt.push_str("\nPrompt task request:\n");
-        prompt.push_str(prompt_task_request);
-        prompt.push('\n');
-    }
-    if let Some(template) = workflow_prompt_template {
-        prompt.push_str("\nRepository workflow prompt template:\n");
-        prompt.push_str(&template);
-        prompt.push('\n');
-    }
-    prompt
-}
+pub(super) use activity_policy::build_runtime_job_prompt;
 
 #[cfg(test)]
 pub(super) fn activity_result_schema(

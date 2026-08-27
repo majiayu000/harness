@@ -10,6 +10,7 @@ pub(super) struct RuntimePermissionProfile {
     pub(super) allowed_tools: Option<Vec<String>>,
     tool_allowlist_enforcement: ToolAllowlistEnforcement,
     correction_only: bool,
+    classifier_only: bool,
 }
 
 impl RuntimePermissionProfile {
@@ -18,7 +19,20 @@ impl RuntimePermissionProfile {
         allowed_tools: Option<Vec<String>>,
         tool_allowlist_enforcement: ToolAllowlistEnforcement,
         correction_only: bool,
+        classifier_only: bool,
     ) -> Self {
+        if classifier_only {
+            return Self {
+                // Preserve provider egress. The explicit empty tool list and
+                // runtime-specific enforcement disable the model's tools;
+                // the CLI process still needs to reach its model provider.
+                permission_mode,
+                allowed_tools: Some(Vec::new()),
+                tool_allowlist_enforcement,
+                correction_only,
+                classifier_only,
+            };
+        }
         if correction_only {
             return Self {
                 // Keep the original mode for egress resolution. An explicit
@@ -27,7 +41,8 @@ impl RuntimePermissionProfile {
                 permission_mode,
                 allowed_tools: Some(Vec::new()),
                 tool_allowlist_enforcement,
-                correction_only: true,
+                correction_only,
+                classifier_only,
             };
         }
         Self {
@@ -35,6 +50,7 @@ impl RuntimePermissionProfile {
             allowed_tools,
             tool_allowlist_enforcement,
             correction_only: false,
+            classifier_only: false,
         }
     }
 
@@ -52,6 +68,7 @@ impl RuntimePermissionProfile {
                 "allowed_tools": self.allowed_tools,
                 "tool_allowlist_enforcement": self.tool_allowlist_enforcement,
                 "correction_only": self.correction_only,
+                "classifier_only": self.classifier_only,
             }),
         )
     }
@@ -68,6 +85,7 @@ mod tests {
             None,
             ToolAllowlistEnforcement::NotEnforcedByHarness,
             true,
+            false,
         );
 
         assert_eq!(profile.permission_mode, AgentPermissionMode::Full);
@@ -81,6 +99,7 @@ mod tests {
                 "allowed_tools": [],
                 "tool_allowlist_enforcement": "not_enforced_by_harness",
                 "correction_only": true,
+                "classifier_only": false,
             })
         );
     }
@@ -92,6 +111,7 @@ mod tests {
             AgentPermissionMode::Scoped,
             tools.clone(),
             ToolAllowlistEnforcement::ClaudeCli,
+            false,
             false,
         );
 
@@ -106,9 +126,26 @@ mod tests {
             Some(vec!["Read".to_string()]),
             ToolAllowlistEnforcement::ClaudeCli,
             true,
+            false,
         );
 
         assert_eq!(profile.permission_mode, AgentPermissionMode::Scoped);
         assert_eq!(profile.allowed_tools, Some(Vec::new()));
+        assert_eq!(profile.permission_mode, AgentPermissionMode::Full);
+    }
+
+    #[test]
+    fn classifier_turn_forces_an_empty_tool_allowlist() {
+        let profile = RuntimePermissionProfile::resolve(
+            AgentPermissionMode::Full,
+            None,
+            ToolAllowlistEnforcement::ClaudeCli,
+            false,
+            true,
+        );
+
+        assert_eq!(profile.allowed_tools, Some(Vec::new()));
+        assert!(profile.classifier_only);
+        assert!(!profile.correction_only);
     }
 }

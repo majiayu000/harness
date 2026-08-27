@@ -54,7 +54,7 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 10] = [
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 11] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
@@ -65,6 +65,7 @@ pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 10] = [
     ARTIFACT_VERIFIED_ISSUE_STATE,
     ARTIFACT_MERGE_COMPLETION_VERIFICATION,
     super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
+    super::CLASSIFIER_ASSESSMENT_ARTIFACT,
 ];
 
 pub fn downgrade_agent_authored_decision(mut decision: WorkflowDecision) -> WorkflowDecision {

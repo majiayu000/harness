@@ -9,6 +9,7 @@ mod candidate_fanout;
 mod candidate_promotion;
 mod candidate_selection;
 mod candidate_terminal;
+mod classifier;
 mod command_record;
 pub mod completion_evidence;
 pub mod data_provenance;
@@ -72,6 +73,11 @@ pub use candidate_selection::{
     select_candidate, CandidateCheckConclusion, CandidateDiffScope, CandidateEvidence,
     CandidateOutcome, CandidatePromotionRecord, CandidateRankingRecord, CandidateSelectionInput,
     CandidateSelectionRecord, CANDIDATE_SELECTION_RECORD_TYPE, CANDIDATE_SELECTION_SCHEMA,
+};
+pub use classifier::{
+    classifier_job_snapshot, validate_classifier_input, validated_classifier_verdict,
+    CLASSIFIER_ASSESSMENT_ARTIFACT, CLASSIFIER_ASSESSMENT_SCHEMA, CLASSIFIER_INPUT_SCHEMA,
+    CLASSIFIER_JOB_SCHEMA, CLASSIFIER_OUTPUT_ARTIFACT, CLASSIFIER_OUTPUT_SCHEMA,
 };
 pub use data_provenance::{
     workflow_data_pointer, DataProvenance, WorkflowDataProvenance, WORKFLOW_DATA_PROVENANCE_SCHEMA,

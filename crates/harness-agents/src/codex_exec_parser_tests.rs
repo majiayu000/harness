@@ -84,14 +84,29 @@ fn parse_exec_item_completed_error() {
 }
 
 #[test]
-fn parse_exec_unknown_item_events_are_ignored() {
-    for item_type in ["mcp_tool_call", "file_change", "todo_list"] {
+fn parse_exec_external_tool_items_are_auditable() {
+    for item_type in ["mcp_tool_call", "file_change", "web_search"] {
         let line =
             format!(r#"{{"type":"item.started","item":{{"id":"item_0","type":"{item_type}"}}}}"#);
         let event = parse_codex_exec_event_line(&line).expect("event should parse");
 
-        assert!(matches!(event, ParsedCodexExecEvent::Ignore));
+        assert!(matches!(
+            event,
+            ParsedCodexExecEvent::ItemStarted {
+                item: Item::ToolCall { .. }
+            }
+        ));
     }
+}
+
+#[test]
+fn parse_exec_skill_budget_notice_is_a_warning() {
+    let line = format!(
+        r#"{{"type":"item.completed","item":{{"id":"item_0","type":"error","message":"{RECOVERABLE_SKILL_BUDGET_WARNING} Codex can continue."}}}}"#
+    );
+    let event = parse_codex_exec_event_line(&line).expect("event should parse");
+
+    assert!(matches!(event, ParsedCodexExecEvent::Warning { .. }));
 }
 
 #[test]
@@ -106,10 +121,6 @@ fn parse_exec_output_surfaces_item_completed_error() {
 #[test]
 fn parse_exec_output_ignores_unknown_item_events() {
     let stdout = concat!(
-        r#"{"type":"item.started","item":{"id":"item_1","type":"mcp_tool_call","server":"github"}}"#,
-        "\n",
-        r#"{"type":"item.started","item":{"id":"item_2","type":"file_change","path":"src/lib.rs"}}"#,
-        "\n",
         r#"{"type":"item.started","item":{"id":"item_3","type":"todo_list","items":[]}}"#,
         "\n",
         r#"{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"done"}}"#,

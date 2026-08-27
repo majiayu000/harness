@@ -10,76 +10,9 @@ use harness_workflow::runtime::{
 use serde_json::json;
 use std::sync::Arc;
 
-/// Mid-turn budget stop (GH-1770 spec §4.3): the streamed usage that was just
-/// persisted put the workflow at or over its USD ceiling, so the in-flight
-/// turn must be interrupted rather than allowed to keep spending.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TurnBudgetStop {
-    pub(crate) workflow_id: String,
-    pub(crate) spent_usd: f64,
-    pub(crate) budget_usd: f64,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct StreamCompletionState {
-    output_buf: String,
-    emitted_agent_completion: bool,
-}
-
-impl StreamCompletionState {
-    pub(crate) fn normalize(&mut self, stream_item: StreamItem) -> Option<StreamItem> {
-        match stream_item {
-            StreamItem::MessageDelta { text } => {
-                self.output_buf.push_str(&text);
-                Some(StreamItem::MessageDelta { text })
-            }
-            StreamItem::ItemCompleted { item } => {
-                if let Item::AgentReasoning { content } = &item {
-                    self.output_buf.clear();
-                    self.output_buf.push_str(content);
-                    self.emitted_agent_completion = true;
-                }
-                Some(StreamItem::ItemCompleted { item })
-            }
-            // GH-1933: adapter diagnostics are non-terminal; log them and
-            // surface them to the turn as warnings.
-            StreamItem::Diagnostic { severity, message } => {
-                match severity {
-                    harness_core::agent::AgentDiagnosticSeverity::Warning => {
-                        tracing::warn!(agent_diagnostic = true, "{message}");
-                    }
-                    harness_core::agent::AgentDiagnosticSeverity::Error => {
-                        tracing::error!(
-                            agent_diagnostic = true,
-                            "non-terminal agent diagnostic: {message}"
-                        );
-                    }
-                }
-                Some(StreamItem::Warning { message })
-            }
-            StreamItem::TurnCompleted { output } => {
-                if self.emitted_agent_completion {
-                    self.output_buf.clear();
-                    return None;
-                }
-                let content = if output.is_empty() {
-                    std::mem::take(&mut self.output_buf)
-                } else {
-                    output
-                };
-                if content.is_empty() {
-                    None
-                } else {
-                    self.emitted_agent_completion = true;
-                    Some(StreamItem::ItemCompleted {
-                        item: Item::AgentReasoning { content },
-                    })
-                }
-            }
-            other => Some(other),
-        }
-    }
-}
+#[path = "helpers/stream_completion.rs"]
+mod stream_completion;
+pub(crate) use stream_completion::{StreamCompletionState, TurnBudgetStop};
 
 #[derive(Clone)]
 pub(crate) struct RuntimeUsageContext {
@@ -259,6 +192,7 @@ pub(crate) async fn process_stream_item(
     let mut budget_stop = None;
     match stream_item {
         StreamItem::EgressVerifiedAtDispatch => {}
+        StreamItem::ModelReported { .. } => {}
         StreamItem::ItemStarted { item } => {
             if let Err(err) = server
                 .thread_manager

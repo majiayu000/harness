@@ -197,6 +197,7 @@ impl DefaultExecutionService {
                         "declarative workflow submissions require a non-empty prompt".to_string(),
                     )
                 })?,
+                classifier_input: prepared.req.classifier_input.as_ref(),
                 depends_on: &prepared.req.depends_on,
                 serialization_depends_on: &prepared.req.serialization_depends_on,
                 source: prepared.req.source.as_deref(),

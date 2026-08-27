@@ -3,7 +3,8 @@ mod declarative_interpreter {
     use super::issue_instance;
     use crate::runtime::reducer::declarative_completion::reduce_declarative_completion;
     use harness_core::config::workflow::{
-        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowClassifierPolicy,
+        WorkflowDefinitionPolicy,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -92,6 +93,35 @@ mod declarative_interpreter {
             ]),
         )
         .expect("interpreter fixture should compile")
+    }
+
+    fn classifier_definition() -> crate::runtime::DeclarativeWorkflowDefinition {
+        let mut classifier_policy = policy();
+        classifier_policy.states.remove("publishing");
+        classifier_policy.states.remove("waiting");
+        let reviewing = classifier_policy.states.get_mut("reviewing").unwrap();
+        reviewing.on_success = None;
+        reviewing.on_signal = BTreeMap::from([
+            ("allow".to_string(), "completed".to_string()),
+            ("needs_human".to_string(), "blocked".to_string()),
+        ]);
+        build_declarative_definition(
+            &classifier_policy,
+            &BTreeMap::from([
+                ("publish".to_string(), WorkflowActivityPolicy::default()),
+                (
+                    "review".to_string(),
+                    WorkflowActivityPolicy {
+                        classifier: Some(WorkflowClassifierPolicy {
+                            verdicts: vec!["allow".to_string(), "needs_human".to_string()],
+                            instructions: vec!["Judge supplied facts.".to_string()],
+                        }),
+                        ..WorkflowActivityPolicy::default()
+                    },
+                ),
+            ]),
+        )
+        .expect("classifier fixture should compile")
     }
 
     fn instance_for(
@@ -196,6 +226,50 @@ mod declarative_interpreter {
             decision.commands[0].dedupe_key,
             different.commands[0].dedupe_key
         );
+    }
+
+    #[test]
+    fn classifier_routes_only_from_the_validated_assessment() {
+        let definition = classifier_definition();
+        let instance = instance_for(&definition, "reviewing");
+        let classifier = definition
+            .classifier_activity_policy("review")
+            .and_then(|policy| policy.classifier.as_ref())
+            .unwrap();
+        let policy_sha256 = stable_remote_fact_hash(&serde_json::to_value(classifier).unwrap());
+        let result = ActivityResult::succeeded("review", "classified")
+            .with_signal(ActivitySignal::new("needs_human", json!({"forged": true})))
+            .with_artifact(ActivityArtifact::new(
+                CLASSIFIER_ASSESSMENT_ARTIFACT,
+                json!({
+                    "schema": CLASSIFIER_ASSESSMENT_SCHEMA,
+                    "activity": "review",
+                    "subject": {"kind": "test", "identity": "doc-1"},
+                    "verdict": "allow",
+                    "rationale": "The facts support continuation.",
+                    "evidence_refs": ["/classifier_input/facts/scope"],
+                    "policy_sha256": policy_sha256,
+                    "prompt_packet_sha256": "sha256:prompt",
+                    "runtime_job_id": "job-1",
+                    "runtime_profile": "classifier",
+                    "requested_model": "claude-test",
+                    "executed_model": "claude-test",
+                    "model_identity_source": "provider_reported",
+                    "tool_use_detected": false,
+                    "workspace_isolation": "ephemeral_empty_read_only"
+                }),
+            ));
+        let event = completion_event(&instance, "review", &result);
+
+        let decision = reduce_decision(&definition, &instance, &event, &result);
+
+        assert_eq!(decision.next_state, "completed");
+        assert!(decision.reason.contains("classifier verdict 'allow'"));
+
+        let missing = ActivityResult::succeeded("review", "unattested");
+        let missing_event = completion_event(&instance, "review", &missing);
+        let blocked = reduce_decision(&definition, &instance, &missing_event, &missing);
+        assert_eq!(blocked.next_state, "blocked");
     }
 
     #[test]

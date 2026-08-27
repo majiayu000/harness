@@ -87,6 +87,41 @@ fn base_args_enable_structured_json_stdout() {
     assert!(args.windows(2).any(|window| window == ["--color", "never"]));
 }
 
+#[test]
+fn deny_all_request_pins_model_and_ignores_user_configuration() {
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::WorkspaceWrite);
+    let request = AgentRequest {
+        prompt: "classify".to_string(),
+        project_root: PathBuf::from("/tmp/empty-classifier"),
+        allowed_tools: Some(Vec::new()),
+        model: Some("gpt-5.6-sol".to_string()),
+        sandbox_mode: Some(SandboxMode::ReadOnly),
+        approval_policy: Some("never".to_string()),
+        ..Default::default()
+    };
+
+    let args = agent
+        .base_args(&request)
+        .iter()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+    assert!(args.iter().any(|arg| arg == "--ignore-rules"));
+    assert!(args.iter().any(|arg| arg == "--ephemeral"));
+    assert!(args
+        .windows(2)
+        .any(|window| window == ["-m", "gpt-5.6-sol"]));
+    assert!(args.windows(2).any(|window| window == ["-s", "read-only"]));
+    assert!(args
+        .windows(2)
+        .any(|window| window == ["-c", "approval_policy=\"never\""]));
+    assert_eq!(
+        agent.process_sandbox_mode(&request),
+        SandboxMode::DangerFullAccess
+    );
+}
+
 enum StreamObservation {
     Item(Option<StreamItem>),
     TaskFinished(Result<harness_core::error::Result<()>, tokio::task::JoinError>),
