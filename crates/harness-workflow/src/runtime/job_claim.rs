@@ -7,7 +7,6 @@ use super::store::{
 };
 use super::{
     RuntimeJob, RuntimeKind, WorkflowDefinitionRegistry, WorkflowInstance, WorkflowRuntimeStore,
-    GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use chrono::{DateTime, Utc};
 
@@ -346,7 +345,7 @@ fn server_owned_job_kind(
     let Some(activity) = job.input.get("activity").and_then(|value| value.as_str()) else {
         return Ok(None);
     };
-    if workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && activity == "merge_pr" {
+    if activity == "merge_pr" && super::scope_review::workflow_uses_server_merge(workflow) {
         return Ok(Some(ServerOwnedJobKind::Merge));
     }
     Ok(
@@ -426,7 +425,7 @@ mod tests {
     fn classifier_identity_does_not_depend_on_mutable_workflow_state() {
         let registry = WorkflowDefinitionRegistry::with_builtins();
         let workflow = WorkflowInstance::new(
-            GITHUB_ISSUE_PR_DEFINITION_ID,
+            super::super::GITHUB_ISSUE_PR_DEFINITION_ID,
             super::super::GITHUB_ISSUE_PR_DEFINITION_VERSION,
             "pr_open",
             super::super::WorkflowSubject::new("issue", "issue:77"),
@@ -444,6 +443,38 @@ mod tests {
         assert!(matches!(
             server_owned_job_kind(&registry, &workflow, &job),
             Ok(Some(ServerOwnedJobKind::Classifier))
+        ));
+    }
+
+    #[test]
+    fn merge_rerouting_honors_the_persisted_execution_mode() {
+        let registry = WorkflowDefinitionRegistry::with_builtins();
+        let job = RuntimeJob::pending(
+            "command-merge",
+            RuntimeKind::RemoteHost,
+            "remote",
+            json!({"activity": "merge_pr"}),
+        );
+        let workflow = |execution: &str| {
+            WorkflowInstance::new(
+                super::super::GITHUB_ISSUE_PR_DEFINITION_ID,
+                super::super::GITHUB_ISSUE_PR_DEFINITION_VERSION,
+                "merging",
+                super::super::WorkflowSubject::new("issue", "issue:78"),
+            )
+            .with_server_data(json!({
+                "definition_hash": super::super::github_issue_pr_definition_hash(),
+                "merge_execution": execution,
+            }))
+        };
+
+        assert!(matches!(
+            server_owned_job_kind(&registry, &workflow("server"), &job),
+            Ok(Some(ServerOwnedJobKind::Merge))
+        ));
+        assert!(matches!(
+            server_owned_job_kind(&registry, &workflow("agent"), &job),
+            Ok(None)
         ));
     }
 }

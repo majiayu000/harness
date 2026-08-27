@@ -1,7 +1,8 @@
 use super::completion_evidence::ARTIFACT_CLASSIFIER_ASSESSMENT;
 use super::{
-    ActivityResult, ActivityStatus, RuntimeJob, WorkflowCommand, WorkflowCommandType,
-    WorkflowDecision, WorkflowDefinitionRegistry, WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
+    ActivityResult, ActivityStatus, DataProvenance, RuntimeJob, WorkflowCommand,
+    WorkflowCommandType, WorkflowDecision, WorkflowDefinitionRegistry, WorkflowInstance,
+    GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 
@@ -84,10 +85,24 @@ pub(crate) fn runtime_job_requires_local_server(
     let Some(activity) = job.input.get("activity").and_then(Value::as_str) else {
         return Ok(false);
     };
-    if workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && activity == "merge_pr" {
+    if activity == "merge_pr" && workflow_uses_server_merge(workflow) {
         return Ok(true);
     }
     registry.instance_has_classifier_activity(workflow, activity)
+}
+
+pub fn workflow_uses_server_merge(workflow: &WorkflowInstance) -> bool {
+    workflow.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && workflow
+            .data
+            .get("merge_execution")
+            .and_then(Value::as_str)
+            .is_some_and(|execution| execution.eq_ignore_ascii_case("server"))
+        && workflow
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/merge_execution"))
+            == Some(DataProvenance::Server)
 }
 
 pub(crate) fn enqueue_pr_scope_review(
@@ -139,4 +154,56 @@ pub(crate) fn finish_candidate_pr_promotion(
     decision.with_command(enqueue_candidate_pr_scope_review(
         event_id, pr_number, pr_url,
     ))
+}
+
+#[cfg(test)]
+mod server_merge_tests {
+    use super::*;
+    use crate::runtime::{RuntimeKind, WorkflowSubject};
+
+    fn merge_job() -> RuntimeJob {
+        RuntimeJob::pending(
+            "command-merge",
+            RuntimeKind::RemoteHost,
+            "remote",
+            json!({"activity": "merge_pr"}),
+        )
+    }
+
+    fn workflow(execution: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            crate::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
+            "merging",
+            WorkflowSubject::new("issue", "issue:77"),
+        )
+        .with_server_data(json!({
+            "definition_hash": crate::runtime::github_issue_pr_definition_hash(),
+            "merge_execution": execution,
+        }))
+    }
+
+    #[test]
+    fn only_server_merge_jobs_require_the_local_server() {
+        let registry = WorkflowDefinitionRegistry::with_builtins();
+
+        assert_eq!(
+            runtime_job_requires_local_server(&registry, &workflow("server"), &merge_job()),
+            Ok(true)
+        );
+        assert_eq!(
+            runtime_job_requires_local_server(&registry, &workflow("agent"), &merge_job()),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn untrusted_server_merge_marker_is_not_authorization() {
+        let mut workflow = workflow("agent");
+        workflow
+            .set_data_field("merge_execution", json!("server"), DataProvenance::Agent)
+            .expect("classified test write");
+
+        assert!(!workflow_uses_server_merge(&workflow));
+    }
 }

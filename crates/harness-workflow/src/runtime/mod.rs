@@ -196,7 +196,10 @@ pub use repo_memory::{
     RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, REPO_MEMORY_CONFIG_ARTIFACT,
     REPO_MEMORY_DEGRADATION_ARTIFACT,
 };
-pub use scope_review::{CHANGE_SCOPE_REVIEW_ACTIVITY, PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD};
+pub use scope_review::{
+    workflow_uses_server_merge, CHANGE_SCOPE_REVIEW_ACTIVITY,
+    PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD,
+};
 pub use state_registry::{
     is_builtin_workflow_definition_id, DeclarativeDefinitionPinError,
     DeclarativeDefinitionResolution, RegisteredWorkflowDefinition, WorkflowDefinitionRegistry,

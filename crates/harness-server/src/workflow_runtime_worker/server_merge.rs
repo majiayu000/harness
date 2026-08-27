@@ -33,10 +33,7 @@ pub(super) fn server_merge_execution_enabled(
 }
 
 fn workflow_uses_server_merge(workflow: Option<&WorkflowInstance>) -> bool {
-    workflow
-        .and_then(|workflow| workflow.data.get("merge_execution"))
-        .and_then(Value::as_str)
-        .is_some_and(|execution| execution.eq_ignore_ascii_case("server"))
+    workflow.is_some_and(harness_workflow::runtime::workflow_uses_server_merge)
 }
 
 pub(super) async fn execute_server_merge(
