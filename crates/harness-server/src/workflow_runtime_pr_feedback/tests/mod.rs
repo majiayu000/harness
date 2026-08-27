@@ -814,5 +814,53 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn legacy_v1_merge_approval_keeps_the_legacy_transition_contract() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let workflow = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "ready_to_merge",
+        WorkflowSubject::new("issue", "legacy-merge-approval"),
+    )
+    .with_id("legacy-merge-approval")
+    .with_server_data(json!({
+        "project_id": "/legacy/project",
+        "repo": "owner/repo",
+        "issue_number": 1902,
+        "pr_number": 1902,
+        "pr_url": "https://github.com/owner/repo/pull/1902",
+        "pr_head_sha": "legacy-approved-head",
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow).await?;
+
+    let outcome = approve_runtime_merge_by_workflow_id(&store, &workflow.id).await?;
+
+    assert_eq!(
+        outcome,
+        RuntimeMergeApprovalOutcome::Approved {
+            workflow_id: workflow.id.clone(),
+        }
+    );
+    let updated = store
+        .get_instance(&workflow.id)
+        .await?
+        .expect("legacy merge workflow should remain persisted");
+    assert_eq!(updated.state, "merging");
+    assert!(updated
+        .data
+        .get(crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD)
+        .is_none());
+    Ok(())
+}
+
 mod restart_suppression;
 mod suppression;

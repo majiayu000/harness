@@ -473,6 +473,36 @@ async fn eval_isolation_command_policy_selects_remote_host_runtime_job() -> anyh
     Ok(())
 }
 
+#[test]
+fn legacy_auto_merge_uses_the_fresh_snapshot_head_without_v2_scope_recheck() -> anyhow::Result<()> {
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:legacy-80"),
+    )
+    .with_id("issue-legacy-80")
+    .with_server_data(serde_json::json!({
+        "repo": "owner/repo",
+        "issue_number": 80,
+        "pr_number": 80,
+        "pr_head_sha": "old-head",
+    }));
+
+    let outcome = super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+        &workflow,
+        &ready_auto_merge_snapshot("fresh-head"),
+        &auto_merge_policy(true, true),
+    )?;
+
+    let super::auto_merge::AutoMergeSnapshotGate::Ready(prepared) = outcome else {
+        panic!("legacy workflow should retain its pre-v2 snapshot gate");
+    };
+    assert_eq!(prepared.data["pr_head_sha"], "fresh-head");
+    assert_eq!(prepared.data["merge_attempted_head_sha"], "fresh-head");
+    Ok(())
+}
+
 #[tokio::test]
 async fn runtime_command_dispatch_tick_defers_malformed_workflow_config() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
@@ -1159,12 +1189,13 @@ fn auto_merge_policy(
 fn auto_merge_snapshot_gate_accepts_ready_matching_head() -> anyhow::Result<()> {
     let workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
-        1,
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "ready_to_merge",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:77"),
     )
     .with_id("issue-77")
     .with_server_data(serde_json::json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
         "repo": "owner/repo",
         "issue_number": 77,
         "pr_number": 77,
@@ -1203,12 +1234,13 @@ fn auto_merge_snapshot_gate_accepts_fresh_ready_head_when_stored_head_changed() 
 {
     let workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
-        1,
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "ready_to_merge",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:78"),
     )
     .with_id("issue-78")
     .with_server_data(serde_json::json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
         "repo": "owner/repo",
         "issue_number": 78,
         "pr_number": 78,
@@ -1235,12 +1267,13 @@ fn auto_merge_snapshot_gate_accepts_fresh_ready_head_when_stored_head_changed() 
 fn auto_merge_snapshot_gate_rejects_missing_scope_assessed_head() -> anyhow::Result<()> {
     let workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
-        1,
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "ready_to_merge",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:80"),
     )
     .with_id("issue-80")
     .with_server_data(serde_json::json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
         "repo": "owner/repo",
         "issue_number": 80,
         "pr_number": 80,
@@ -1265,12 +1298,13 @@ fn auto_merge_snapshot_gate_rejects_missing_scope_assessed_head() -> anyhow::Res
 fn auto_merge_snapshot_gate_honors_relaxed_policy_fields() -> anyhow::Result<()> {
     let workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
-        1,
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "ready_to_merge",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:79"),
     )
     .with_id("issue-79")
     .with_server_data(serde_json::json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
         "repo": "owner/repo",
         "issue_number": 79,
         "pr_number": 79,
@@ -1313,12 +1347,13 @@ fn auto_merge_snapshot_gate_honors_relaxed_policy_fields() -> anyhow::Result<()>
 fn auto_merge_snapshot_gate_rejects_wrong_base_ref() -> anyhow::Result<()> {
     let workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
-        1,
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "ready_to_merge",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:81"),
     )
     .with_id("issue-81")
     .with_server_data(serde_json::json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
         "repo": "owner/repo",
         "issue_number": 81,
         "pr_number": 81,
@@ -1347,12 +1382,13 @@ fn auto_merge_snapshot_gate_rejects_wrong_base_ref() -> anyhow::Result<()> {
 fn auto_merge_snapshot_gate_allows_unknown_expected_base() -> anyhow::Result<()> {
     let workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
-        1,
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "ready_to_merge",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:82"),
     )
     .with_id("issue-82")
     .with_server_data(serde_json::json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
         "repo": "owner/repo",
         "issue_number": 82,
         "pr_number": 82,

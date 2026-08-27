@@ -9,13 +9,13 @@ use harness_workflow::runtime::{
 use harness_workflow::runtime::{
     build_local_review_request_decision, build_pr_feedback_sweep_decision,
     build_pr_hygiene_repair_decision, github_issue_pr_definition_hash, DataProvenance,
-    DecisionValidator, LocalReviewDecisionInput, PrFeedbackSweepDecisionInput,
-    PrHygieneRepairDecisionInput, RemoteFactSnapshot, ValidationContext, WorkflowCommand,
-    WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord,
-    WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence, WorkflowInstance,
-    WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID, GITHUB_ISSUE_PR_DEFINITION_VERSION, LOCAL_REVIEW_ACTIVITY,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    LocalReviewDecisionInput, PrFeedbackSweepDecisionInput, PrHygieneRepairDecisionInput,
+    RemoteFactSnapshot, ValidationContext, WorkflowCommand, WorkflowCommandStatus,
+    WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord, WorkflowDecisionTransition,
+    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition,
+    WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    GITHUB_ISSUE_PR_DEFINITION_VERSION, LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
+    PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -41,7 +41,10 @@ use pr_lifecycle_persist::{
 use pr_lifecycle_persist::{
     set_pr_lifecycle_persist_test_failures, PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS,
 };
-pub(crate) use scope_recheck::requeue_runtime_pr_scope_review_after_head_change;
+use scope_recheck::trusted_merge_head_sha;
+pub(crate) use scope_recheck::{
+    requeue_runtime_pr_scope_review_after_head_change, uses_model_scope_review,
+};
 use submission_requests::*;
 use targets::*;
 
@@ -657,11 +660,11 @@ pub(crate) async fn approve_runtime_merge_by_workflow_id(
     let Some(instance) = store.get_instance(workflow_id).await? else {
         return Ok(RuntimeMergeApprovalOutcome::NotFound);
     };
-    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+    if uses_model_scope_review(&instance)
         && instance.state == "ready_to_merge"
         && trusted_merge_head_sha(&instance).is_none()
     {
-        if scope_recheck::requeue_legacy_runtime_pr_scope_review(store, instance).await? {
+        if scope_recheck::requeue_unassessed_runtime_pr_scope_review(store, instance).await? {
             return Ok(RuntimeMergeApprovalOutcome::NotReady {
                 workflow_id: workflow_id.to_string(),
                 state: "pr_scope_review".to_string(),

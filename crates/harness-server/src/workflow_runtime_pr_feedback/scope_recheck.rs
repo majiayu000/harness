@@ -2,6 +2,50 @@ use super::*;
 use anyhow::Context;
 use std::path::Path;
 
+pub(crate) fn uses_model_scope_review(instance: &WorkflowInstance) -> bool {
+    instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.definition_version == GITHUB_ISSUE_PR_DEFINITION_VERSION
+        && optional_string_field(&instance.data, "definition_hash").as_deref()
+            == Some(github_issue_pr_definition_hash().as_str())
+}
+
+pub(super) fn trusted_merge_head_sha(instance: &WorkflowInstance) -> Option<String> {
+    if uses_model_scope_review(instance) {
+        return trusted_string_field(
+            instance,
+            "scope_assessed_head_oid",
+            &[DataProvenance::Server],
+        );
+    }
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID || instance.definition_version != 1 {
+        return None;
+    }
+    ["pr_head_sha", "head_sha"].into_iter().find_map(|field| {
+        trusted_string_field(
+            instance,
+            field,
+            &[DataProvenance::Server, DataProvenance::External],
+        )
+    })
+}
+
+fn trusted_string_field(
+    instance: &WorkflowInstance,
+    field: &str,
+    allowed_provenance: &[DataProvenance],
+) -> Option<String> {
+    let provenance = instance
+        .data_provenance
+        .as_ref()?
+        .provenance_for(&format!("/{field}"))?;
+    if !allowed_provenance.contains(&provenance) {
+        return None;
+    }
+    optional_string_field(&instance.data, field)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub(crate) async fn requeue_runtime_pr_scope_review_after_head_change(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
@@ -10,7 +54,7 @@ pub(crate) async fn requeue_runtime_pr_scope_review_after_head_change(
     requeue_runtime_pr_scope_review(store, instance, Some(observed_head_oid)).await
 }
 
-pub(super) async fn requeue_legacy_runtime_pr_scope_review(
+pub(super) async fn requeue_unassessed_runtime_pr_scope_review(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
 ) -> anyhow::Result<bool> {
@@ -22,8 +66,7 @@ async fn requeue_runtime_pr_scope_review(
     instance: WorkflowInstance,
     observed_head_oid: Option<&str>,
 ) -> anyhow::Result<bool> {
-    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID || instance.state != "ready_to_merge"
-    {
+    if !uses_model_scope_review(&instance) || instance.state != "ready_to_merge" {
         return Ok(false);
     }
     let observed_head_oid = observed_head_oid
@@ -108,10 +151,13 @@ async fn requeue_runtime_pr_scope_review(
     }
 }
 
-pub(super) fn pin_legacy_classifier_policy(
+pub(super) fn ensure_current_classifier_policy_pin(
     instance: &WorkflowInstance,
     mut data: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
+    if !uses_model_scope_review(instance) {
+        return Ok(data);
+    }
     if data
         .get(crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD)
         .is_some()
@@ -139,6 +185,60 @@ pub(super) fn pin_legacy_classifier_policy(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .context("legacy workflow is missing project_id required to pin classifier policy")?;
+        .context("current workflow is missing project_id required to pin classifier policy")?;
     crate::workflow_runtime_policy::pin_change_scope_classifier_policy(Path::new(&project_id), data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workflow(version: u32, data: serde_json::Value) -> WorkflowInstance {
+        WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            version,
+            "ready_to_merge",
+            WorkflowSubject::new("issue", "scope-version-test"),
+        )
+        .with_server_data(data)
+    }
+
+    #[test]
+    fn model_scope_review_requires_the_exact_current_definition_pin() {
+        let current = workflow(
+            GITHUB_ISSUE_PR_DEFINITION_VERSION,
+            json!({ "definition_hash": github_issue_pr_definition_hash() }),
+        );
+        let legacy = workflow(1, json!({}));
+        let malformed_current = workflow(
+            GITHUB_ISSUE_PR_DEFINITION_VERSION,
+            json!({ "definition_hash": "sha256:wrong" }),
+        );
+
+        assert!(uses_model_scope_review(&current));
+        assert!(!uses_model_scope_review(&legacy));
+        assert!(!uses_model_scope_review(&malformed_current));
+    }
+
+    #[test]
+    fn trusted_merge_head_preserves_v1_and_fences_v2_to_scope_assessment() {
+        let legacy = workflow(1, json!({ "pr_head_sha": "legacy-head" }));
+        let current = workflow(
+            GITHUB_ISSUE_PR_DEFINITION_VERSION,
+            json!({
+                "definition_hash": github_issue_pr_definition_hash(),
+                "pr_head_sha": "unassessed-head",
+                "scope_assessed_head_oid": "assessed-head",
+            }),
+        );
+
+        assert_eq!(
+            trusted_merge_head_sha(&legacy).as_deref(),
+            Some("legacy-head")
+        );
+        assert_eq!(
+            trusted_merge_head_sha(&current).as_deref(),
+            Some("assessed-head")
+        );
+    }
 }

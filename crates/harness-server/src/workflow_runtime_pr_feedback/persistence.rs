@@ -655,20 +655,6 @@ pub(super) async fn approve_runtime_merge(
     }
 }
 
-pub(super) fn trusted_merge_head_sha(instance: &WorkflowInstance) -> Option<String> {
-    let field = "scope_assessed_head_oid";
-    let provenance = instance
-        .data_provenance
-        .as_ref()?
-        .provenance_for(&format!("/{field}"));
-    if provenance != Some(DataProvenance::Server) {
-        return None;
-    }
-    optional_string_field(&instance.data, field)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 pub(super) async fn commit_runtime_decision(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
@@ -680,7 +666,11 @@ pub(super) async fn commit_runtime_decision(
     accepted_data: serde_json::Value,
 ) -> anyhow::Result<RuntimeDecisionCommitOutcome> {
     let expected_state = instance.state.clone();
-    let validator = DecisionValidator::github_issue_pr();
+    let validator = store
+        .definition_registry()
+        .decision_validator_for_instance(&instance)
+        .map_err(|error| anyhow::anyhow!("invalid workflow definition pin: {error:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("workflow has no decision validator"))?;
     let validation = validator.validate(
         &instance,
         &decision,
@@ -709,7 +699,7 @@ pub(super) async fn commit_runtime_decision(
     final_instance.state = decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
     let accepted_data =
-        super::scope_recheck::pin_legacy_classifier_policy(&instance, accepted_data)?;
+        super::scope_recheck::ensure_current_classifier_policy_pin(&instance, accepted_data)?;
     let mut data = merge_last_decision(accepted_data, &decision.decision);
     preserve_classifier_policy_pin(&instance.data, &mut data);
     replace_pr_runtime_data(&mut final_instance, data)?;

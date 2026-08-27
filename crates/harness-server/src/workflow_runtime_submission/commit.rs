@@ -2,7 +2,7 @@ use super::{
     classify_submission_data, depends_on_strings, insert_author_trust_class, merge_last_decision,
     optional_string_field, string_field, IssueSubmissionRuntimeContext,
     PromptSubmissionRuntimeContext, WorkflowSubmissionRuntimeRecord,
-    EXECUTION_PATH_WORKFLOW_RUNTIME, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
+    EXECUTION_PATH_WORKFLOW_RUNTIME,
 };
 use super::{
     prompt_memory::{cache_prompt_submission_prompt, remove_prompt_submission_prompt},
@@ -22,21 +22,20 @@ pub(super) fn decision_validator_for_instance(
     store: &WorkflowRuntimeStore,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<DecisionValidator> {
-    match instance.definition_id.as_str() {
-        GITHUB_ISSUE_PR_DEFINITION_ID => Ok(DecisionValidator::github_issue_pr()),
-        PROMPT_TASK_DEFINITION_ID => Ok(DecisionValidator::prompt_task()),
-        other => store
-            .definition_registry()
-            .decision_validator_for_instance(instance)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "workflow definition `{other}` has an invalid definition pin: {error:?}"
-                )
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!("workflow definition `{other}` cannot be committed by submission")
-            }),
-    }
+    let definition_id = instance.definition_id.as_str();
+    store
+        .definition_registry()
+        .decision_validator_for_instance(instance)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "workflow definition `{definition_id}` has an invalid definition pin: {error:?}"
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "workflow definition `{definition_id}` cannot be committed by submission"
+            )
+        })
 }
 
 pub(super) async fn apply_decision<F, Fut>(
@@ -80,9 +79,11 @@ where
     }
 
     if existing_record.is_none() {
-        if let Err(error) =
-            DecisionValidator::github_issue_pr().validate(&instance, &decision, &validation_context)
-        {
+        if let Err(error) = decision_validator_for_instance(store, &instance)?.validate(
+            &instance,
+            &decision,
+            &validation_context,
+        ) {
             let reason = error.to_string();
             let rejected_instance = if new_instance {
                 Some(rejected_submission_instance(

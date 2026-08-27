@@ -27,17 +27,26 @@ pub(crate) fn prepare_auto_merge_workflow_from_snapshot(
     let Some(snapshot_head_sha) = value_string(snapshot.normalized_snapshot.get("head_oid")) else {
         return Ok(AutoMergeSnapshotGate::NotReady);
     };
-    let Some(assessed_head_sha) = server_owned_scope_assessed_head(workflow) else {
-        return Ok(AutoMergeSnapshotGate::ScopeChanged {
-            observed_head_oid: snapshot_head_sha,
-        });
-    };
-    if snapshot_head_sha != assessed_head_sha {
-        return Ok(AutoMergeSnapshotGate::ScopeChanged {
-            observed_head_oid: snapshot_head_sha,
-        });
-    }
-    let expected_head_sha = assessed_head_sha.as_str();
+    let expected_head_sha =
+        if crate::workflow_runtime_pr_feedback::uses_model_scope_review(workflow) {
+            let Some(assessed_head_sha) = server_owned_scope_assessed_head(workflow) else {
+                return Ok(AutoMergeSnapshotGate::ScopeChanged {
+                    observed_head_oid: snapshot_head_sha,
+                });
+            };
+            if snapshot_head_sha != assessed_head_sha {
+                return Ok(AutoMergeSnapshotGate::ScopeChanged {
+                    observed_head_oid: snapshot_head_sha,
+                });
+            }
+            assessed_head_sha
+        } else if workflow.definition_id == harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID
+            && workflow.definition_version == 1
+        {
+            snapshot_head_sha.clone()
+        } else {
+            return Ok(AutoMergeSnapshotGate::NotReady);
+        };
 
     let remote_fact = snapshot.remote_fact_snapshot()?;
     let mut workflow = workflow.clone();

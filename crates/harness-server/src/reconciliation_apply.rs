@@ -99,7 +99,21 @@ pub(super) async fn apply_loaded_runtime_workflow_transition(
         decision
     }
     .high_confidence();
-    let validator = DecisionValidator::github_issue_pr();
+    let validator = runtime_store
+        .definition_registry()
+        .decision_validator_for_instance(&instance)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "workflow '{}' has an invalid definition pin during reconciliation: {error:?}",
+                instance.id
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "workflow '{}' has no decision validator during reconciliation",
+                instance.id
+            )
+        })?;
     if let Err(error) = validator.validate(
         &instance,
         &decision,
