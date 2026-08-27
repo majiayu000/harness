@@ -1,12 +1,12 @@
 use super::*;
 
 #[test]
-fn auto_merge_defaults_to_atomic_server_options() {
+fn auto_merge_defaults_preserve_agent_compatibility() {
     let config = GitHubAutoMergeConfig::default();
 
     assert!(!config.enabled);
-    assert!(!config.delete_branch);
-    assert_eq!(config.merge_execution, GitHubMergeExecution::Server);
+    assert!(config.delete_branch);
+    assert_eq!(config.merge_execution, GitHubMergeExecution::Agent);
 }
 
 #[test]

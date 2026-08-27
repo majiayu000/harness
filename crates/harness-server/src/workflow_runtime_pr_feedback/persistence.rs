@@ -557,8 +557,17 @@ pub(super) async fn approve_runtime_merge(
     };
     let merge_method = optional_string_field(&instance.data, "merge_method")
         .unwrap_or_else(|| "squash".to_string());
-    let delete_branch = optional_bool_field(&instance.data, "merge_delete_branch").unwrap_or(false);
-    if delete_branch {
+    let merge_execution = optional_string_field(&instance.data, "merge_execution")
+        .unwrap_or_else(|| "agent".to_string())
+        .to_ascii_lowercase();
+    if !matches!(merge_execution.as_str(), "agent" | "server") {
+        return Ok(RuntimeMergeApprovalOutcome::Rejected {
+            workflow_id,
+            reason: format!("unsupported merge_execution `{merge_execution}`"),
+        });
+    }
+    let delete_branch = optional_bool_field(&instance.data, "merge_delete_branch").unwrap_or(true);
+    if merge_execution == "server" && delete_branch {
         return Ok(RuntimeMergeApprovalOutcome::Rejected {
             workflow_id,
             reason: "server-owned merge cannot safely delete the source branch atomically"
@@ -596,6 +605,7 @@ pub(super) async fn approve_runtime_merge(
             "pr_url": pr_url,
             "expected_head_sha": expected_head_sha,
             "merge_method": merge_method,
+            "merge_execution": merge_execution,
             "delete_branch": delete_branch,
             "require_review_threads_resolved": require_review_threads_resolved,
             "require_clean_merge_state": require_clean_merge_state,
@@ -626,6 +636,7 @@ pub(super) async fn approve_runtime_merge(
         "pr_url": pr_url,
         "expected_head_sha": expected_head_sha,
         "merge_method": merge_method,
+        "merge_execution": merge_execution,
         "delete_branch": delete_branch,
         "require_review_threads_resolved": require_review_threads_resolved,
         "require_clean_merge_state": require_clean_merge_state,

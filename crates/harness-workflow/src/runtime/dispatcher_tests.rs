@@ -75,7 +75,8 @@ fn remote_merge_profile_is_forced_onto_the_local_server_worker() -> anyhow::Resu
         crate::runtime::WorkflowSubject::new("issue", "issue:77"),
     )
     .with_server_data(json!({
-        "definition_hash": crate::runtime::github_issue_pr_definition_hash()
+        "definition_hash": crate::runtime::github_issue_pr_definition_hash(),
+        "merge_execution": "server"
     }));
     let mut profile = RuntimeProfile::new("remote-merge", RuntimeKind::RemoteHost);
     profile.model = Some("remote-model".to_string());
@@ -90,6 +91,32 @@ fn remote_merge_profile_is_forced_onto_the_local_server_worker() -> anyhow::Resu
     assert_eq!(profile.kind, RuntimeKind::CodexExec);
     assert_eq!(profile.name, "server-owned-merge");
     assert_eq!(profile.model, None);
+    Ok(())
+}
+
+#[test]
+fn agent_merge_profile_is_not_intercepted() -> anyhow::Result<()> {
+    let instance = WorkflowInstance::new(
+        crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+        crate::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
+        "merging",
+        crate::runtime::WorkflowSubject::new("issue", "issue:78"),
+    )
+    .with_server_data(json!({
+        "definition_hash": crate::runtime::github_issue_pr_definition_hash(),
+        "merge_execution": "agent"
+    }));
+    let mut profile = RuntimeProfile::new("remote-merge", RuntimeKind::RemoteHost);
+
+    super::super::dispatcher_throttle::force_server_owned_profile(
+        &crate::runtime::WorkflowDefinitionRegistry::default(),
+        Some(&instance),
+        "merge_pr",
+        &mut profile,
+    )?;
+
+    assert_eq!(profile.kind, RuntimeKind::RemoteHost);
+    assert_eq!(profile.name, "remote-merge");
     Ok(())
 }
 

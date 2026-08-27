@@ -187,6 +187,9 @@ pub(super) fn issue_submission_data(
     {
         data[crate::workflow_runtime_policy::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD] = policy;
     }
+    if let Some(definition_hash) = existing_data.get("definition_hash").cloned() {
+        data["definition_hash"] = definition_hash;
+    }
     insert_author_trust_class(&mut data, ctx.author_trust_class);
     crate::workflow_runtime_policy::merge_runtime_retry_policy(ctx.project_root, data)
 }

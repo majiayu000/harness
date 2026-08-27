@@ -95,6 +95,17 @@ fn server_merge_policy_uses_runtime_command_overrides() {
 }
 
 #[test]
+fn server_merge_interception_requires_explicit_server_execution() {
+    let mut server = current_workflow("head-sha");
+    server.data["merge_execution"] = json!("server");
+    let mut agent = server.clone();
+    agent.data["merge_execution"] = json!("agent");
+
+    assert!(workflow_uses_server_merge(Some(&server)));
+    assert!(!workflow_uses_server_merge(Some(&agent)));
+}
+
+#[test]
 fn server_merge_policy_rejects_non_atomic_branch_deletion() {
     let workflow = workflow();
     let mut job = job();

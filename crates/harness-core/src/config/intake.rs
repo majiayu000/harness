@@ -56,8 +56,8 @@ impl fmt::Display for GitHubMergeMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GitHubMergeExecution {
-    Agent,
     #[default]
+    Agent,
     Server,
 }
 
@@ -77,18 +77,15 @@ pub struct GitHubAutoMergeConfig {
     pub enabled: bool,
     #[serde(default)]
     pub method: GitHubMergeMethod,
-    /// Source branch deletion is disabled by default because server-owned
-    /// merges cannot compare-and-delete a Git ref atomically.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub delete_branch: bool,
     #[serde(default = "default_true")]
     pub require_review_threads_resolved: bool,
     #[serde(default = "default_true")]
     pub require_clean_merge_state: bool,
     /// Who executes the merge action once the server-side gate passes.
-    /// Workflow-runtime merges are always server-owned so the assessed head can
-    /// be checked atomically before mutation. This option remains for legacy
-    /// callers outside that workflow.
+    /// Agent execution remains the compatibility default. Server execution is
+    /// fail-closed when GitHub cannot provide the requested atomic preconditions.
     #[serde(default)]
     pub merge_execution: GitHubMergeExecution,
     /// Verify agent-reported merge completion with a server-side GitHub read.
@@ -413,10 +410,10 @@ impl Default for GitHubAutoMergeConfig {
         Self {
             enabled: false,
             method: GitHubMergeMethod::Squash,
-            delete_branch: false,
+            delete_branch: true,
             require_review_threads_resolved: true,
             require_clean_merge_state: true,
-            merge_execution: GitHubMergeExecution::Server,
+            merge_execution: GitHubMergeExecution::Agent,
             verify_merge_completion: true,
         }
     }

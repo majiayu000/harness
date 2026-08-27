@@ -29,7 +29,14 @@ pub(super) fn server_merge_execution_enabled(
     job: &RuntimeJob,
     workflow: Option<&WorkflowInstance>,
 ) -> bool {
-    merge_activity_matches(job, workflow)
+    merge_activity_matches(job, workflow) && workflow_uses_server_merge(workflow)
+}
+
+fn workflow_uses_server_merge(workflow: Option<&WorkflowInstance>) -> bool {
+    workflow
+        .and_then(|workflow| workflow.data.get("merge_execution"))
+        .and_then(Value::as_str)
+        .is_some_and(|execution| execution.eq_ignore_ascii_case("server"))
 }
 
 pub(super) async fn execute_server_merge(
@@ -141,7 +148,25 @@ pub(super) async fn execute_server_merge(
             );
         }
     };
+    let expected_base_ref = workflow.and_then(|workflow| {
+        crate::http::auto_merge::expected_base_ref_from_workflow_data(&workflow.data)
+    });
     if snapshot_observes_merged(&before_snapshot.normalized_snapshot) {
+        if !crate::http::auto_merge::snapshot_base_ref_matches_expected(
+            &before_snapshot.normalized_snapshot,
+            expected_base_ref.as_deref(),
+        ) {
+            return server_merge_failed(
+                activity,
+                Some(&target),
+                ActivityErrorKind::Fatal,
+                "Server-side merge observed the pull request on an unauthorized base branch.",
+                "the merged pull request base does not match expected_base_ref",
+                Some(before_snapshot),
+                None,
+                "merged_base_mismatch",
+            );
+        }
         return super::executor::server_owned::finish_server_merge(
             state,
             job,
@@ -156,9 +181,6 @@ pub(super) async fn execute_server_merge(
         )
         .await;
     }
-    let expected_base_ref = workflow.and_then(|workflow| {
-        crate::http::auto_merge::expected_base_ref_from_workflow_data(&workflow.data)
-    });
     if !crate::http::auto_merge::auto_merge_snapshot_satisfies_policy(
         &before_snapshot.normalized_snapshot,
         &policy,
@@ -176,6 +198,18 @@ pub(super) async fn execute_server_merge(
             Some(before_snapshot),
             None,
             "gate_rejected",
+        );
+    }
+    if expected_base_ref.is_some() {
+        return server_merge_failed(
+            activity,
+            Some(&target),
+            ActivityErrorKind::Configuration,
+            "Server-side merge cannot atomically bind the authorized base branch.",
+            "GitHub's pull request merge API accepts an expected head SHA but no expected base ref; use agent merge execution or remove the base-ref authorization requirement",
+            Some(before_snapshot),
+            None,
+            "atomic_base_precondition_unavailable",
         );
     }
     let mutation_fence =

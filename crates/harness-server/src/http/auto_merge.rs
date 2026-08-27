@@ -81,7 +81,7 @@ pub(crate) fn prepare_auto_merge_workflow_from_snapshot(
         ),
         WorkflowDataWrite::set(
             "merge_execution",
-            serde_json::json!("server"),
+            serde_json::json!(policy.merge_execution.to_string()),
             DataProvenance::Server,
         ),
         WorkflowDataWrite::set(
@@ -180,7 +180,10 @@ pub(crate) fn expected_base_ref_from_workflow_data(data: &Value) -> Option<Strin
         .find_map(|field| value_string(data.get(field)))
 }
 
-fn snapshot_base_ref_matches_expected(snapshot: &Value, expected_base_ref: Option<&str>) -> bool {
+pub(crate) fn snapshot_base_ref_matches_expected(
+    snapshot: &Value,
+    expected_base_ref: Option<&str>,
+) -> bool {
     let Some(expected_base_ref) = expected_base_ref else {
         return true;
     };

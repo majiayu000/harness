@@ -1217,7 +1217,7 @@ fn auto_merge_snapshot_gate_accepts_ready_matching_head() -> anyhow::Result<()> 
     assert_eq!(prepared.data["merge_delete_branch"], false);
     assert_eq!(prepared.data["merge_require_review_threads_resolved"], true);
     assert_eq!(prepared.data["merge_require_clean_merge_state"], true);
-    assert_eq!(prepared.data["merge_execution"], "server");
+    assert_eq!(prepared.data["merge_execution"], "agent");
     assert_eq!(prepared.data["verify_merge_completion"], true);
     assert_eq!(prepared.data["pr_head_sha"], "abc123");
     assert_eq!(prepared.data["merge_attempted_head_sha"], "abc123");

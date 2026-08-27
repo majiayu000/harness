@@ -366,7 +366,7 @@ repositories sharing the token until the safe retry time from `Retry-After`,
 |-------|---------|-------------|
 | `enabled` | `false` | Enables server-side auto-merge gating for configured GitHub issue workflows. |
 | `method` | `"squash"` | Merge method requested after the deterministic gate passes. |
-| `delete_branch` | `false` | Whether merge execution should request source branch cleanup. Workflow-runtime merges reject this option because GitHub does not provide atomic compare-and-delete for refs. |
+| `delete_branch` | `true` | Whether merge execution should request source branch cleanup. Server-owned workflow merges reject this option because GitHub does not provide atomic compare-and-delete for refs. |
 | `merge_execution` | `"agent"` | Selects the merge executor. `"agent"` keeps the current agent-executed merge path and requires server-side completion verification. `"server"` runs the merge through the GitHub REST API, then re-reads the pull request before terminal success. |
 | `verify_merge_completion` | `true` | When true, Harness re-reads GitHub before accepting an agent-reported `merge_pr` success. When false, merge completion fails closed while completion-evidence enforcement is active; the deployment-wide emergency kill switch restores claim-trusting behavior. |
 
