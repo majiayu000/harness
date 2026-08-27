@@ -38,6 +38,10 @@ async fn concurrent_github_state_server(
     format!("http://{addr}")
 }
 
+fn runtime_workflow_with_scope_classifier() -> &'static str {
+    "---\nactivities:\n  classify_change_scope:\n    classifier:\n      verdicts: [allow]\n      allow:\n        - Test admission remains in scope.\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n"
+}
+
 #[test]
 fn remote_subject_gate_accepts_only_open_state() {
     assert!(validate_remote_subject_open(
@@ -116,7 +120,7 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
     let dir = tempfile::tempdir()?;
     std::fs::write(
         dir.path().join("WORKFLOW.md"),
-        "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+        runtime_workflow_with_scope_classifier(),
     )?;
     let project_root = std::fs::canonicalize(dir.path())?;
     let store = Arc::new(
@@ -131,7 +135,7 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
 
     let api_base = crate::workspace::test_support::github_state_server(
         "/repos/owner/repo/issues/9",
-        r#"{"number":9,"repository_url":"https://api.github.test/repos/owner/repo","state":"closed","state_reason":"completed"}"#,
+        r#"{"number":9,"repository_url":"https://api.github.test/repos/owner/repo","html_url":"https://github.test/owner/repo/issues/9","state":"closed","state_reason":"completed"}"#,
     )
     .await;
     let api_guard =
@@ -145,7 +149,10 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
         })
         .await
         .expect_err("closed issue must be rejected before submission");
-    assert!(matches!(error, EnqueueTaskError::BadRequest(_)));
+    assert!(
+        matches!(error, EnqueueTaskError::BadRequest(_)),
+        "unexpected admission error: {error:?}"
+    );
     drop(api_guard);
 
     assert!(store
@@ -189,7 +196,7 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
         .await?;
     let api_base = crate::workspace::test_support::github_state_server(
         "/repos/owner/repo/issues/10",
-        r#"{"number":10,"repository_url":"https://api.github.test/repos/owner/repo","state":"closed","state_reason":"completed"}"#,
+        r#"{"number":10,"repository_url":"https://api.github.test/repos/owner/repo","html_url":"https://github.test/owner/repo/issues/10","state":"closed","state_reason":"completed"}"#,
     )
     .await;
     let api_guard =
@@ -216,7 +223,7 @@ async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Resul
         .await?;
     let api_base = crate::workspace::test_support::github_state_server(
         "/repos/owner/repo/issues/10",
-        r#"{"number":10,"repository_url":"https://api.github.test/repos/owner/repo","state":"open"}"#,
+        r#"{"number":10,"repository_url":"https://api.github.test/repos/owner/repo","html_url":"https://github.test/owner/repo/issues/10","state":"open"}"#,
     )
     .await;
     let api_guard =
@@ -293,7 +300,7 @@ async fn concurrent_remote_subject_admissions_return_one_issue_handle() -> anyho
     let dir = tempfile::tempdir()?;
     std::fs::write(
         dir.path().join("WORKFLOW.md"),
-        "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+        runtime_workflow_with_scope_classifier(),
     )?;
     let project_root = std::fs::canonicalize(dir.path())?;
     let store = Arc::new(
@@ -307,7 +314,7 @@ async fn concurrent_remote_subject_admissions_return_one_issue_handle() -> anyho
     );
     let api_base = concurrent_github_state_server(
         "/repos/owner/repo/issues/10",
-        r#"{"number":10,"repository_url":"https://api.github.test/repos/owner/repo","state":"open"}"#,
+        r#"{"number":10,"repository_url":"https://api.github.test/repos/owner/repo","html_url":"https://github.test/owner/repo/issues/10","state":"open"}"#,
         2,
     )
     .await;
@@ -344,7 +351,7 @@ async fn concurrent_remote_subject_admissions_return_one_pr_handle() -> anyhow::
     let dir = tempfile::tempdir()?;
     std::fs::write(
         dir.path().join("WORKFLOW.md"),
-        "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+        runtime_workflow_with_scope_classifier(),
     )?;
     let project_root = std::fs::canonicalize(dir.path())?;
     let store = Arc::new(
