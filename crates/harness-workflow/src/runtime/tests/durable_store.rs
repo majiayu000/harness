@@ -663,7 +663,7 @@ async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> an
     assert_eq!(jobs[0].status, RuntimeJobStatus::Succeeded);
     assert_eq!(store.events_for(&instance.id).await?.len(), 1);
     let decisions = store.decisions_for(&instance.id).await?;
-    assert_eq!(decisions.len(), 3);
+    assert_eq!(decisions.len(), 3, "{decisions:#?}");
     assert_eq!(
         decisions
             .iter()

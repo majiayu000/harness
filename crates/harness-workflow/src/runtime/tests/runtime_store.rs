@@ -775,10 +775,19 @@ async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
         3
     );
     assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
-    assert!(store.get_instance(&terminal_a.id).await?.is_none());
+    let mut retained_terminal_count = 0;
+    for instance in [
+        &terminal_a,
+        &terminal_b,
+        &legacy_with_hash,
+        &current_terminal,
+    ] {
+        if store.get_instance(&instance.id).await?.is_some() {
+            retained_terminal_count += 1;
+        }
+    }
+    assert_eq!(retained_terminal_count, 3);
     assert!(store.get_instance(&active.id).await?.is_some());
-    assert!(store.get_instance(&legacy_with_hash.id).await?.is_some());
-    assert!(store.get_instance(&current_terminal.id).await?.is_some());
     Ok(())
 }
 

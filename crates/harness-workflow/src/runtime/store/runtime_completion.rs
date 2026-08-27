@@ -167,11 +167,11 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         .await
         .map(Some);
     }
-    // Preserve the requested liveness rejection only when the reducer found no
-    // authoritative domain outcome and would apply its generic invalid-output policy.
-    // The separate blocked policy decision remains the committed outcome, so the
-    // completed driver cannot leave the workflow in an unowned progress state.
-    if is_generic_invalid_structured_fallback(&decision) {
+    // Preserve a rejected agent-authored liveness decision whenever the
+    // authoritative outcome is invalid output. The separate blocked policy
+    // decision remains the committed outcome, so the completed driver cannot
+    // leave the workflow in an unowned progress state.
+    if is_invalid_structured_output_decision(&decision) {
         if let Some(driverless_decision) = driverless_decision {
             let rejected = persist_runtime_completion_decision_tx(
                 tx,
@@ -314,11 +314,8 @@ fn declarative_decision_requires_blocked_fallback(
     )
 }
 
-fn is_generic_invalid_structured_fallback(decision: &WorkflowDecision) -> bool {
+fn is_invalid_structured_output_decision(decision: &WorkflowDecision) -> bool {
     decision.decision == "block_invalid_agent_output"
-        && decision
-            .reason
-            .contains("did not validate and no domain fallback was available")
 }
 
 fn driverless_structured_completion_decision(

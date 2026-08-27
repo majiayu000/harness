@@ -210,7 +210,11 @@ fn rejects_scheduled_pr_open_transition_without_bind_pr_command() {
         "issue-123-pr-open-wait",
     ));
 
-    let err = DecisionValidator::github_issue_pr()
+    let validator = super::WorkflowDefinitionRegistry::with_builtins()
+        .decision_validator_for_instance(&instance)
+        .expect("legacy definition should resolve")
+        .expect("legacy validator should exist");
+    let err = validator
         .validate(&instance, &decision, &validation_context())
         .expect_err("scheduled -> pr_open should require BindPr");
 

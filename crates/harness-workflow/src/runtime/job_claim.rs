@@ -147,6 +147,7 @@ impl WorkflowRuntimeStore {
         let excluded_runtime_kind = excluded_runtime_kind
             .map(|runtime_kind| enum_str(&runtime_kind))
             .transpose()?;
+        let mut inspected_ids = Vec::<String>::new();
         loop {
             let mut tx = self.pool.begin().await?;
             // Claimers participate in the terminal-transition lock order by
@@ -169,8 +170,6 @@ impl WorkflowRuntimeStore {
                  )
              )
              AND job.data #> '{input,cancellation_requested}' IS NULL
-             AND command.status = 'dispatched'
-             AND command.superseded_by_command_id IS NULL
              AND ($1::text IS NULL OR job.runtime_kind = $1)
              AND ($2::text IS NULL OR job.runtime_kind <> $2)
              AND (
@@ -195,6 +194,7 @@ impl WorkflowRuntimeStore {
                      )
                  )
              )
+             AND NOT (job.id = ANY($5::text[]))
              ORDER BY
                  CASE
                      WHEN COALESCE(job.data #>> '{input,activity}', '') IN (
@@ -213,6 +213,7 @@ impl WorkflowRuntimeStore {
             .bind(excluded_runtime_kind.as_deref())
             .bind(supports_eval_resource_limits)
             .bind(supports_trusted_eval_verifier)
+            .bind(&inspected_ids)
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -262,6 +263,7 @@ impl WorkflowRuntimeStore {
             .await?;
             let Some((data,)) = row else {
                 tx.commit().await?;
+                inspected_ids.push(id);
                 continue;
             };
 
