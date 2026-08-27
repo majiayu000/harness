@@ -38,7 +38,7 @@ async fn pr_detected_persists_pr_open_state() -> anyhow::Result<()> {
         .get_instance(&workflow_id)
         .await?
         .expect("workflow instance should be persisted");
-    assert_eq!(instance.state, "pr_open");
+    assert_eq!(instance.state, "pr_scope_review");
     assert_eq!(
         store.events_for(&workflow_id).await?[0].event_type,
         "PrDetected"
@@ -84,7 +84,7 @@ async fn transient_pr_lifecycle_persist_failure_is_retried_and_converges() -> an
     let Some(instance) = instance else {
         anyhow::bail!("workflow instance should be persisted after retry");
     };
-    assert_eq!(instance.state, "pr_open");
+    assert_eq!(instance.state, "pr_scope_review");
     let events = store.events_for(&workflow_id).await?;
     assert!(events.iter().any(|event| event.event_type == "PrDetected"));
     assert!(!events

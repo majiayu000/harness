@@ -915,7 +915,7 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
     assert_eq!(body["summary"]["workflow_active_buckets"]["running"], 2);
     assert_eq!(body["summary"]["total_commands"], 2);
     assert_eq!(body["summary"]["total_runtime_jobs"], 2);
-    assert_eq!(body["summary"]["command_statuses"]["pending"], 2);
+    assert_eq!(body["summary"]["command_statuses"]["dispatched"], 2);
     assert_eq!(body["summary"]["runtime_job_statuses"]["pending"], 2);
     assert_eq!(body["summary"]["jobs_without_activity_envelope"], 2);
     Ok(())

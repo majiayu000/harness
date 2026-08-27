@@ -31,14 +31,6 @@ impl crate::intake::IntakeSource for DummyGithubPoller {
     }
 }
 
-fn write_runtime_scope_classifier(project_root: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::write(
-        project_root.join("WORKFLOW.md"),
-        "---\nactivities:\n  classify_change_scope:\n    classifier:\n      verdicts: [allow]\n      allow:\n        - Test intake dispatch remains in scope.\n---\n",
-    )?;
-    Ok(())
-}
-
 #[tokio::test]
 async fn intake_status_returns_three_channels() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -317,7 +309,6 @@ async fn intake_status_includes_runtime_github_issue_dispatches() -> anyhow::Res
     let project_root = dir.path().join("project");
     std::fs::create_dir_all(&project_root)?;
     init_fake_git_repo(&project_root)?;
-    write_runtime_scope_classifier(&project_root)?;
     let mut config = harness_core::config::HarnessConfig::default();
     config.intake.github = Some(harness_core::config::intake::GitHubIntakeConfig {
         enabled: true,
@@ -396,7 +387,6 @@ async fn intake_status_merges_runtime_dispatches_by_recency_before_limit() -> an
     let project_root = dir.path().join("project");
     std::fs::create_dir_all(&project_root)?;
     init_fake_git_repo(&project_root)?;
-    write_runtime_scope_classifier(&project_root)?;
     let state = make_test_state_with_workflow_runtime_and_registry(
         dir.path(),
         &project_root,

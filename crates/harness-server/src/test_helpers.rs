@@ -64,6 +64,47 @@ pub static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 static DB_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
 static TEST_DATABASE_URL: OnceLock<String> = OnceLock::new();
 static TEST_PG_POOL_CONFIGURED: OnceLock<()> = OnceLock::new();
+static TEST_WORKFLOW_BASE_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+/// Mirror CLI startup for unit tests that invoke workflow services directly.
+///
+/// Production registers `config/WORKFLOW.md` as the central base before the
+/// server starts. Server unit tests bypass that CLI path, so install a minimal
+/// base containing the shipped scope-classifier policy. Extracting the policy
+/// from the real repository workflow keeps the fixture declarative and avoids
+/// duplicating its decision rules in Rust.
+pub fn ensure_test_workflow_base() {
+    TEST_WORKFLOW_BASE_DIR.get_or_init(|| {
+        let repository_root =
+            std::fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+                .expect("resolve repository root for the test workflow base");
+        let config = harness_core::config::workflow::load_workflow_config(&repository_root)
+            .expect("load the shipped workflow classifier for server tests");
+        let activity = harness_workflow::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY;
+        let policy = config
+            .activities
+            .get(activity)
+            .cloned()
+            .expect("shipped workflow must declare the change-scope classifier");
+        let mut activities = serde_json::Map::new();
+        activities.insert(
+            activity.to_string(),
+            serde_json::to_value(policy).expect("serialize the test classifier policy"),
+        );
+        let yaml = serde_json::to_string(&serde_json::json!({
+            "activities": activities,
+        }))
+        .expect("serialize the minimal test workflow base");
+        let dir = tempfile::Builder::new()
+            .prefix("harness-test-workflow-base-")
+            .tempdir()
+            .expect("create the test workflow base directory");
+        let path = dir.path().join("WORKFLOW.md");
+        std::fs::write(&path, format!("---\n{yaml}\n---\n")).expect("write the test workflow base");
+        harness_core::config::workflow::set_workflow_base_path(path);
+        dir
+    });
+}
 
 pub fn configure_test_pg_pool_defaults() {
     TEST_PG_POOL_CONFIGURED.get_or_init(|| {

@@ -50,6 +50,15 @@ fn build_packet_for_job(workflow: &WorkflowInstance, job: &RuntimeJob) -> anyhow
     )
 }
 
+fn prompt_task_job() -> RuntimeJob {
+    RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "implement_prompt" }),
+    )
+}
+
 #[test]
 fn workflow_data_agent_and_external_fields_render_only_in_untrusted_section() {
     let mut workflow = WorkflowInstance::new(
@@ -240,7 +249,8 @@ fn empty_classified_workflow_data_object_is_valid() {
     );
     workflow.data_provenance = Some(WorkflowDataProvenance::new());
 
-    let packet = build_packet(&workflow).expect("empty classified data should render");
+    let packet = build_packet_for_job(&workflow, &prompt_task_job())
+        .expect("empty classified data should render");
 
     assert!(packet["workflow"]["data"]
         .as_object()
@@ -372,7 +382,8 @@ fn continuation_context_is_fenced_in_packet_and_rendered_prompt() {
     workflow.data_provenance =
         Some(WorkflowDataProvenance::new().with_entry("/continuation", DataProvenance::Agent));
 
-    let packet = build_packet(&workflow).expect("continuation packet should build");
+    let packet = build_packet_for_job(&workflow, &prompt_task_job())
+        .expect("continuation packet should build");
     let context = &packet["continuation_context"];
 
     assert_eq!(context["preamble"], REPO_MEMORY_PROMPT_PREAMBLE);

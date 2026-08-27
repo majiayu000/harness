@@ -1,8 +1,8 @@
 use super::*;
 use harness_workflow::runtime::{
     ActivityResult, RuntimeJobStatus, RuntimeKind, RuntimeProfile, RuntimeTranscriptRead,
-    WorkflowCommand, WorkflowInstance, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
-    PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    WorkflowCommand, WorkflowInstance, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_VERSION,
+    PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 
 #[tokio::test]
@@ -39,13 +39,14 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         .expect("workflow runtime store should be configured");
     let workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
-        1,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "implementing",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:124"),
     )
     .with_id("issue-124")
     .with_classified_data(
         serde_json::json!({
+            "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
             "project_id": project_root,
             "repo": "owner/repo",
             "issue_number": 124,
@@ -138,7 +139,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(
         prompt_event.event["prompt_packet"]["resolved_runtime_settings"]
             ["tool_allowlist_enforcement"],
-        "not_enforced_by_harness"
+        "codex_cli_feature_denylist"
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["required_structured_output"]["validation_commands"],
@@ -163,7 +164,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["transition_contract"]
             ["on_succeeded"]["reducer_next_state"],
-        "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked"
+        "pr_scope_review_with_verified_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked"
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["activity_result_schema"]["agent_summary_contract"]
@@ -193,7 +194,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         .as_array()
         .expect("allowed transitions should be an array")
         .iter()
-        .any(|transition| transition["next_state"] == "pr_open"));
+        .any(|transition| transition["next_state"] == "pr_scope_review"));
     let prompt_packet_digest = prompt_event.event["prompt_packet_digest"]
         .as_str()
         .expect("prompt packet digest should be recorded");
@@ -221,7 +222,8 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
             "configured_capability_profile": "standard",
             "permission_mode": "scoped",
             "allowed_tools": ["Read", "Write", "Edit", "Bash"],
-            "tool_allowlist_enforcement": "not_enforced_by_harness",
+            "tool_allowlist_enforcement": "codex_cli_feature_denylist",
+            "classifier_only": false,
             "correction_only": false,
         })
     );

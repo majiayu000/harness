@@ -4,10 +4,11 @@ use harness_workflow::runtime::{
     DataProvenance, RegisteredWorkflowDefinition, RepoMemoryKind, RepoMemoryOutcome,
     RepoMemoryRecord, RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
     WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowRuntimeRecoveryAction,
-    WorkflowRuntimeStore, WorkflowStateDefinition, WorkflowSubject, ISSUE_PLAN_ACTIVITY,
-    ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, LOCAL_REVIEW_ACTIVITY,
-    LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
-    PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
+    WorkflowRuntimeStore, WorkflowStateDefinition, WorkflowSubject,
+    GITHUB_ISSUE_PR_DEFINITION_VERSION, ISSUE_PLAN_ACTIVITY, ISSUE_PLAN_ARTIFACT,
+    ISSUE_PLAN_READY_SIGNAL, LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL,
+    LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 
 fn resolved_settings_for_tests(profile: &RuntimeProfile) -> ResolvedRuntimeSettings {
@@ -37,17 +38,20 @@ fn activity_result_schema_describes_issue_implementation_terminal_evidence_contr
     );
     let workflow = WorkflowInstance::new(
         "github_issue_pr",
-        1,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "implementing",
         WorkflowSubject::new("issue", "issue:123"),
     )
-    .with_id("issue-123");
+    .with_id("issue-123")
+    .with_server_data(json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
+    }));
 
     let schema = activity_result_schema(&job, Some(&workflow));
 
     assert_eq!(
         schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
-        "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked"
+        "pr_scope_review_with_verified_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked"
     );
     assert_eq!(
         schema["activity_contract"]["accepted_signals"][0],
@@ -206,17 +210,20 @@ fn activity_result_schema_describes_issue_planning_contract() {
     );
     let workflow = WorkflowInstance::new(
         "github_issue_pr",
-        1,
+        GITHUB_ISSUE_PR_DEFINITION_VERSION,
         "planning",
         WorkflowSubject::new("issue", "issue:123"),
     )
-    .with_id("issue-123");
+    .with_id("issue-123")
+    .with_server_data(json!({
+        "definition_hash": harness_workflow::runtime::github_issue_pr_definition_hash(),
+    }));
 
     let schema = activity_result_schema(&job, Some(&workflow));
 
     assert_eq!(
         schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
-        "implementing"
+        "plan_scope_review"
     );
     assert_eq!(
         schema["transition_contract"]["on_succeeded"]["accepted_artifacts"][0],

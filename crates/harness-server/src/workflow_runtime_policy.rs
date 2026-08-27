@@ -7,8 +7,10 @@ pub(crate) const PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD: &str =
 
 pub(crate) fn pin_change_scope_classifier_policy(
     project_root: &Path,
-    mut data: Value,
+    data: Value,
 ) -> anyhow::Result<Value> {
+    #[cfg(test)]
+    crate::test_helpers::ensure_test_workflow_base();
     let config =
         harness_core::config::workflow::load_workflow_config(project_root).with_context(|| {
             format!(
@@ -16,6 +18,13 @@ pub(crate) fn pin_change_scope_classifier_policy(
                 project_root.display()
             )
         })?;
+    pin_change_scope_classifier_policy_from_config(&config, data)
+}
+
+fn pin_change_scope_classifier_policy_from_config(
+    config: &harness_core::config::workflow::WorkflowConfig,
+    mut data: Value,
+) -> anyhow::Result<Value> {
     let object = data
         .as_object_mut()
         .context("change-scope classifier policy requires object workflow data")?;
@@ -98,14 +107,11 @@ mod tests {
 
     #[test]
     fn missing_classifier_policy_fails_instead_of_returning_unpinned_data() -> anyhow::Result<()> {
-        let project = tempfile::tempdir()?;
-        std::fs::write(
-            project.path().join("WORKFLOW.md"),
-            "---\nactivities: {}\n---\n",
-        )?;
-
-        let error = pin_change_scope_classifier_policy(project.path(), json!({}))
-            .expect_err("missing required classifier policy must fail closed");
+        let error = pin_change_scope_classifier_policy_from_config(
+            &harness_core::config::workflow::WorkflowConfig::default(),
+            json!({}),
+        )
+        .expect_err("missing required classifier policy must fail closed");
 
         assert!(error.to_string().contains("required classify_change_scope"));
         Ok(())
