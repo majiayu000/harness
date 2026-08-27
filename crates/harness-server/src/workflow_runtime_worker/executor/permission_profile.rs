@@ -131,7 +131,6 @@ mod tests {
 
         assert_eq!(profile.permission_mode, AgentPermissionMode::Scoped);
         assert_eq!(profile.allowed_tools, Some(Vec::new()));
-        assert_eq!(profile.permission_mode, AgentPermissionMode::Full);
     }
 
     #[test]
@@ -144,6 +143,7 @@ mod tests {
             true,
         );
 
+        assert_eq!(profile.permission_mode, AgentPermissionMode::Full);
         assert_eq!(profile.allowed_tools, Some(Vec::new()));
         assert!(profile.classifier_only);
         assert!(!profile.correction_only);
