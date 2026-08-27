@@ -201,4 +201,35 @@ mod tests {
         assert!(!unversioned_ids.iter().any(|id| id == definition_id));
         Ok(())
     }
+
+    #[test]
+    fn github_progress_rows_separate_legacy_version_from_current_pin() {
+        let rows = progress_state_selector_rows(
+            &WorkflowDefinitionRegistry::with_builtins(),
+            crate::runtime::WorkflowProgressMode::CommandDriven,
+        );
+        let github_rows = rows
+            .definition_ids
+            .iter()
+            .zip(&rows.definition_versions)
+            .zip(&rows.definition_hashes)
+            .zip(&rows.states)
+            .filter(|(((id, _), _), _)| id.as_str() == "github_issue_pr")
+            .collect::<Vec<_>>();
+
+        assert!(github_rows
+            .iter()
+            .any(|(((_, version), hash), _)| **version == Some(1) && hash.is_none()));
+        assert!(github_rows.iter().any(|(((_, version), hash), _)| {
+            **version
+                == Some(i64::from(
+                    crate::runtime::GITHUB_ISSUE_PR_DEFINITION_VERSION,
+                ))
+                && hash.as_deref()
+                    == Some(crate::runtime::github_issue_pr_definition_hash().as_str())
+        }));
+        assert!(github_rows
+            .iter()
+            .all(|(((_, version), _), _)| version.is_some()));
+    }
 }

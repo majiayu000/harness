@@ -60,7 +60,7 @@ impl WorkflowRuntimeStore {
                     && definition.definition_version() == 1;
                 selectors.insert(
                     definition.registered().id.clone(),
-                    (!unpinned_legacy_builtin).then(|| i64::from(definition.definition_version())),
+                    Some(i64::from(definition.definition_version())),
                     (!unpinned_legacy_builtin).then(|| definition.definition_hash().to_string()),
                     state.key.state.to_string(),
                 );
@@ -89,6 +89,12 @@ impl WorkflowRuntimeStore {
                   AND (
                       (registered.definition_version IS NULL
                        AND registered.definition_hash IS NULL)
+                      OR (
+                          registered.definition_version =
+                              (instance.data->>'definition_version')::bigint
+                          AND registered.definition_hash IS NULL
+                          AND instance.data->'data'->>'definition_hash' IS NULL
+                      )
                       OR (
                           registered.definition_version =
                               (instance.data->>'definition_version')::bigint

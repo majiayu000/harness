@@ -208,7 +208,7 @@ fn github_builtin_selectors_keep_v1_unpinned_and_v2_exactly_pinned() {
     let terminal = registry.terminal_state_selectors(GITHUB_ISSUE_PR_DEFINITION_ID);
     assert!(terminal.iter().any(|selector| {
         selector.state == "done"
-            && selector.definition_version.is_none()
+            && selector.definition_version == Some(1)
             && selector.definition_hash.is_none()
     }));
     assert!(terminal.iter().any(|selector| {
@@ -224,7 +224,7 @@ fn github_builtin_selectors_keep_v1_unpinned_and_v2_exactly_pinned() {
     );
     assert!(progress.iter().any(|selector| {
         selector.state == "awaiting_feedback"
-            && selector.definition_version.is_none()
+            && selector.definition_version == Some(1)
             && selector.definition_hash.is_none()
     }));
     assert!(progress.iter().any(|selector| {

@@ -428,12 +428,15 @@ impl WorkflowDefinitionRegistry {
             .filter(|((registered_id, _), _)| registered_id == definition_id)
             .flat_map(|((_, definition_version), definition)| {
                 definition.registered().states.iter().filter_map(|state| {
-                    let unpinned_legacy_builtin =
+                    let legacy_github_builtin =
+                        definition_id == GITHUB_ISSUE_PR_DEFINITION_ID && *definition_version == 1;
+                    let unpinned_builtin =
                         is_builtin_definition_id(definition_id) && *definition_version == 1;
                     Some(WorkflowTerminalStateSelector {
-                        definition_version: (!unpinned_legacy_builtin)
-                            .then_some(*definition_version),
-                        definition_hash: (!unpinned_legacy_builtin)
+                        definition_version: legacy_github_builtin
+                            .then_some(*definition_version)
+                            .or_else(|| (!unpinned_builtin).then_some(*definition_version)),
+                        definition_hash: (!unpinned_builtin)
                             .then(|| definition.definition_hash().to_string()),
                         state: state.key.state.to_string(),
                         terminal_state: state.terminal_state?,
@@ -477,12 +480,15 @@ impl WorkflowDefinitionRegistry {
                     .iter()
                     .filter(|state| state.progress_mode == Some(progress_mode))
                     .map(|state| {
-                        let unpinned_legacy_builtin =
+                        let legacy_github_builtin = definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+                            && *definition_version == 1;
+                        let unpinned_builtin =
                             is_builtin_definition_id(definition_id) && *definition_version == 1;
                         WorkflowProgressStateSelector {
-                            definition_version: (!unpinned_legacy_builtin)
-                                .then_some(*definition_version),
-                            definition_hash: (!unpinned_legacy_builtin)
+                            definition_version: legacy_github_builtin
+                                .then_some(*definition_version)
+                                .or_else(|| (!unpinned_builtin).then_some(*definition_version)),
+                            definition_hash: (!unpinned_builtin)
                                 .then(|| definition.definition_hash().to_string()),
                             state: state.key.state.to_string(),
                         }

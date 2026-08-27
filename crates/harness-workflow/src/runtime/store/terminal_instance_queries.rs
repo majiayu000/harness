@@ -7,6 +7,8 @@ use chrono::{DateTime, Utc};
 
 struct TerminalSelectorQueryParts {
     unversioned_states: Vec<String>,
+    legacy_definition_versions: Vec<i64>,
+    legacy_states: Vec<String>,
     definition_versions: Vec<i64>,
     definition_hashes: Vec<String>,
     versioned_states: Vec<String>,
@@ -23,7 +25,10 @@ impl WorkflowRuntimeStore {
             .definition_registry
             .progress_state_selectors(definition_id, progress_mode);
         let query = progress_selector_query_parts(&selectors)?;
-        if query.unversioned_states.is_empty() && query.versioned_states.is_empty() {
+        if query.unversioned_states.is_empty()
+            && query.legacy_states.is_empty()
+            && query.versioned_states.is_empty()
+        {
             return Ok(Vec::new());
         }
         let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
@@ -33,7 +38,15 @@ impl WorkflowRuntimeStore {
                    state = ANY($2::text[])
                    OR EXISTS (
                        SELECT 1
-                       FROM unnest($3::bigint[], $4::text[], $5::text[])
+                       FROM unnest($3::bigint[], $4::text[])
+                           AS legacy(definition_version, state)
+                       WHERE legacy.definition_version = (data->>'definition_version')::bigint
+                         AND data->'data'->>'definition_hash' IS NULL
+                         AND legacy.state = workflow_instances.state
+                   )
+                   OR EXISTS (
+                       SELECT 1
+                       FROM unnest($5::bigint[], $6::text[], $7::text[])
                            AS progress(definition_version, definition_hash, state)
                        WHERE progress.definition_version = (data->>'definition_version')::bigint
                          AND progress.definition_hash = data->'data'->>'definition_hash'
@@ -41,10 +54,12 @@ impl WorkflowRuntimeStore {
                    )
                )
              ORDER BY updated_at DESC
-             LIMIT $6",
+             LIMIT $8",
         )
         .bind(definition_id)
         .bind(&query.unversioned_states)
+        .bind(&query.legacy_definition_versions)
+        .bind(&query.legacy_states)
         .bind(&query.definition_versions)
         .bind(&query.definition_hashes)
         .bind(&query.versioned_states)
@@ -70,7 +85,10 @@ impl WorkflowRuntimeStore {
             .filter(|selector| selector.terminal_state == terminal_state)
             .collect::<Vec<_>>();
         let query = terminal_selector_query_parts(&selectors)?;
-        if query.unversioned_states.is_empty() && query.versioned_states.is_empty() {
+        if query.unversioned_states.is_empty()
+            && query.legacy_states.is_empty()
+            && query.versioned_states.is_empty()
+        {
             return Ok(Vec::new());
         }
         let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
@@ -80,7 +98,15 @@ impl WorkflowRuntimeStore {
                    state = ANY($2::text[])
                    OR EXISTS (
                        SELECT 1
-                       FROM unnest($3::bigint[], $4::text[], $5::text[])
+                       FROM unnest($3::bigint[], $4::text[])
+                           AS legacy(definition_version, state)
+                       WHERE legacy.definition_version = (data->>'definition_version')::bigint
+                         AND data->'data'->>'definition_hash' IS NULL
+                         AND legacy.state = workflow_instances.state
+                   )
+                   OR EXISTS (
+                       SELECT 1
+                       FROM unnest($5::bigint[], $6::text[], $7::text[])
                            AS terminal(definition_version, definition_hash, state)
                        WHERE terminal.definition_version = (data->>'definition_version')::bigint
                          AND terminal.definition_hash = data->'data'->>'definition_hash'
@@ -88,10 +114,12 @@ impl WorkflowRuntimeStore {
                    )
                )
              ORDER BY updated_at DESC
-             LIMIT $6",
+             LIMIT $8",
         )
         .bind(definition_id)
         .bind(&query.unversioned_states)
+        .bind(&query.legacy_definition_versions)
+        .bind(&query.legacy_states)
         .bind(&query.definition_versions)
         .bind(&query.definition_hashes)
         .bind(&query.versioned_states)
@@ -121,7 +149,15 @@ impl WorkflowRuntimeStore {
                    state = ANY($3::text[])
                    OR EXISTS (
                        SELECT 1
-                       FROM unnest($4::bigint[], $5::text[], $6::text[])
+                       FROM unnest($4::bigint[], $5::text[])
+                           AS legacy(definition_version, state)
+                       WHERE legacy.definition_version = (data->>'definition_version')::bigint
+                         AND data->'data'->>'definition_hash' IS NULL
+                         AND legacy.state = workflow_instances.state
+                   )
+                   OR EXISTS (
+                       SELECT 1
+                       FROM unnest($6::bigint[], $7::text[], $8::text[])
                            AS terminal(definition_version, definition_hash, state)
                        WHERE terminal.definition_version = (data->>'definition_version')::bigint
                          AND terminal.definition_hash = data->'data'->>'definition_hash'
@@ -130,11 +166,13 @@ impl WorkflowRuntimeStore {
                )
                AND ($2::text IS NULL OR data->'data'->>'project_id' = $2)
              ORDER BY updated_at DESC
-             LIMIT COALESCE($7, 2147483647)",
+             LIMIT COALESCE($9, 2147483647)",
         )
         .bind(definition_id)
         .bind(project_id)
         .bind(&query.unversioned_states)
+        .bind(&query.legacy_definition_versions)
+        .bind(&query.legacy_states)
         .bind(&query.definition_versions)
         .bind(&query.definition_hashes)
         .bind(&query.versioned_states)
@@ -152,6 +190,8 @@ fn progress_selector_query_parts(
 ) -> anyhow::Result<TerminalSelectorQueryParts> {
     let mut query = TerminalSelectorQueryParts {
         unversioned_states: Vec::new(),
+        legacy_definition_versions: Vec::new(),
+        legacy_states: Vec::new(),
         definition_versions: Vec::new(),
         definition_hashes: Vec::new(),
         versioned_states: Vec::new(),
@@ -165,9 +205,15 @@ fn progress_selector_query_parts(
                 query.definition_hashes.push(definition_hash.clone());
                 query.versioned_states.push(selector.state.clone());
             }
+            (Some(definition_version), None) => {
+                query
+                    .legacy_definition_versions
+                    .push(i64::from(definition_version));
+                query.legacy_states.push(selector.state.clone());
+            }
             (None, None) => query.unversioned_states.push(selector.state.clone()),
-            _ => anyhow::bail!(
-                "progress state selector '{}' must include both definition version and hash",
+            (None, Some(_)) => anyhow::bail!(
+                "progress state selector '{}' cannot include a hash without a definition version",
                 selector.state
             ),
         }
@@ -180,6 +226,8 @@ fn terminal_selector_query_parts(
 ) -> anyhow::Result<TerminalSelectorQueryParts> {
     let mut query = TerminalSelectorQueryParts {
         unversioned_states: Vec::new(),
+        legacy_definition_versions: Vec::new(),
+        legacy_states: Vec::new(),
         definition_versions: Vec::new(),
         definition_hashes: Vec::new(),
         versioned_states: Vec::new(),
@@ -193,9 +241,15 @@ fn terminal_selector_query_parts(
                 query.definition_hashes.push(definition_hash.clone());
                 query.versioned_states.push(selector.state.clone());
             }
+            (Some(definition_version), None) => {
+                query
+                    .legacy_definition_versions
+                    .push(i64::from(definition_version));
+                query.legacy_states.push(selector.state.clone());
+            }
             (None, None) => query.unversioned_states.push(selector.state.clone()),
-            _ => anyhow::bail!(
-                "terminal state selector '{}' must include both definition version and hash",
+            (None, Some(_)) => anyhow::bail!(
+                "terminal state selector '{}' cannot include a hash without a definition version",
                 selector.state
             ),
         }
@@ -208,10 +262,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn query_parts_accept_unpinned_legacy_and_exact_versioned_selectors() -> anyhow::Result<()> {
+    fn query_parts_separate_version_only_legacy_from_exact_pins() -> anyhow::Result<()> {
         let progress = progress_selector_query_parts(&[
             WorkflowProgressStateSelector {
-                definition_version: None,
+                definition_version: Some(1),
                 definition_hash: None,
                 state: "awaiting_feedback".to_string(),
             },
@@ -221,13 +275,15 @@ mod tests {
                 state: "awaiting_feedback".to_string(),
             },
         ])?;
-        assert_eq!(progress.unversioned_states, ["awaiting_feedback"]);
+        assert!(progress.unversioned_states.is_empty());
+        assert_eq!(progress.legacy_definition_versions, [1]);
+        assert_eq!(progress.legacy_states, ["awaiting_feedback"]);
         assert_eq!(progress.definition_versions, [2]);
         assert_eq!(progress.definition_hashes, ["sha256:current"]);
 
         let terminal = terminal_selector_query_parts(&[
             WorkflowTerminalStateSelector {
-                definition_version: None,
+                definition_version: Some(1),
                 definition_hash: None,
                 state: "done".to_string(),
                 terminal_state: WorkflowTerminalState::Succeeded,
@@ -239,7 +295,9 @@ mod tests {
                 terminal_state: WorkflowTerminalState::Succeeded,
             },
         ])?;
-        assert_eq!(terminal.unversioned_states, ["done"]);
+        assert!(terminal.unversioned_states.is_empty());
+        assert_eq!(terminal.legacy_definition_versions, [1]);
+        assert_eq!(terminal.legacy_states, ["done"]);
         assert_eq!(terminal.definition_versions, [2]);
         assert_eq!(terminal.definition_hashes, ["sha256:current"]);
         Ok(())
