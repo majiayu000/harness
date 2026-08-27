@@ -43,7 +43,19 @@ impl WorkflowRuntimeStore {
         }
         target.apply_data_writes([WorkflowDataWrite::set(field, value, DataProvenance::Server)])?;
         target.version = target.version.saturating_add(1);
-        commit_same_state_instance_tx(&mut tx, &current, &target).await?;
+        // This is the only permitted missing-to-present identity migration.
+        // Compare through the ordinary strict writer after constructing the
+        // exact policy-bearing current identity; substitutions still fail.
+        let mut migrated_identity = current.clone();
+        if !migrated_identity.data.is_object() {
+            migrated_identity.replace_classified_data(json!({}), DataProvenance::Server);
+        }
+        migrated_identity.apply_data_writes([WorkflowDataWrite::set(
+            field,
+            target.data[field].clone(),
+            DataProvenance::Server,
+        )])?;
+        commit_same_state_instance_tx(&mut tx, &migrated_identity, &target).await?;
         insert_event_tx_with_id(
             &mut tx,
             workflow_id,

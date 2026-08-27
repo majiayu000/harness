@@ -385,6 +385,8 @@ async fn runtime_dispatch_profile_selector_for_command(
                 &execution_policy,
             )
             .map_err(RuntimeDispatchProfileSelectionError::Other)?;
+            super::validate_classifier_runtime_profile(activity, &profile)
+                .map_err(RuntimeDispatchProfileSelectionError::Other)?;
             profile_selector = profile_selector.with_workflow_activity_profile(
                 instance.definition_id,
                 activity,

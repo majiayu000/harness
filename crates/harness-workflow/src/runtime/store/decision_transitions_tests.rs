@@ -18,6 +18,35 @@ fn instance(id: &str, state: &str) -> WorkflowInstance {
     .with_server_data(json!({ "project_id": "/project-a", "pr_number": 4242 }))
 }
 
+#[test]
+fn protected_fields_reject_classifier_policy_pin_changes() -> anyhow::Result<()> {
+    let field = crate::runtime::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD;
+    let mut current = instance("classifier-policy-identity", "planning");
+    current.set_data_field(
+        field,
+        json!({"classifier": {"verdicts": ["allow"]}}),
+        crate::runtime::DataProvenance::Server,
+    )?;
+
+    let mut substituted = current.clone();
+    substituted.set_data_field(
+        field,
+        json!({"classifier": {"verdicts": ["needs_human"]}}),
+        crate::runtime::DataProvenance::Server,
+    )?;
+    let error = ensure_protected_instance_fields_match(&current, &substituted)
+        .expect_err("classifier policy substitution must fail closed");
+    assert!(error
+        .to_string()
+        .contains("data.pinned_change_scope_classifier_policy"));
+
+    let mut removed = current.clone();
+    removed.remove_data_field(field, crate::runtime::DataProvenance::Server)?;
+    assert!(ensure_protected_instance_fields_match(&current, &removed).is_err());
+    assert!(ensure_protected_instance_fields_match(&removed, &current).is_err());
+    Ok(())
+}
+
 /// `implementing -> ready_to_merge` is absent from the github_issue_pr
 /// allowlist, so the decision must be recorded as rejected and the caller's
 /// `final_instance` must not be persisted.

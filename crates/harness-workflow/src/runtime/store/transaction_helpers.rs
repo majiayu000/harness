@@ -518,6 +518,11 @@ fn ensure_instance_identity_fields_match(
     {
         changed_fields.push("data.definition_hash");
     }
+    if super::decision_transitions::classifier_policy_pin(current)
+        != super::decision_transitions::classifier_policy_pin(target)
+    {
+        changed_fields.push("data.pinned_change_scope_classifier_policy");
+    }
     if current.subject != target.subject {
         changed_fields.push("subject");
     }

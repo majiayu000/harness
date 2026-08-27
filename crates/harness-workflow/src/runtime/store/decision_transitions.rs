@@ -29,6 +29,12 @@ pub(super) fn definition_hash_pin(instance: &WorkflowInstance) -> Option<&serde_
     instance.data.get("definition_hash")
 }
 
+pub(super) fn classifier_policy_pin(instance: &WorkflowInstance) -> Option<&serde_json::Value> {
+    instance
+        .data
+        .get(crate::runtime::PINNED_CHANGE_SCOPE_CLASSIFIER_POLICY_FIELD)
+}
+
 pub(super) fn ensure_protected_instance_fields_match(
     current: &WorkflowInstance,
     final_instance: &WorkflowInstance,
@@ -45,6 +51,9 @@ pub(super) fn ensure_protected_instance_fields_match(
     // definition than the one it was validated against.
     if definition_hash_pin(current) != definition_hash_pin(final_instance) {
         changed_fields.push("data.definition_hash");
+    }
+    if classifier_policy_pin(current) != classifier_policy_pin(final_instance) {
+        changed_fields.push("data.pinned_change_scope_classifier_policy");
     }
     if current.subject != final_instance.subject {
         changed_fields.push("subject");

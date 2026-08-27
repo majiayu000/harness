@@ -630,6 +630,11 @@ fn ensure_public_upsert_preserves_instance_boundary(
     {
         changed_fields.push("data.definition_hash");
     }
+    if super::decision_transitions::classifier_policy_pin(current)
+        != super::decision_transitions::classifier_policy_pin(target)
+    {
+        changed_fields.push("data.pinned_change_scope_classifier_policy");
+    }
     if current.state != target.state {
         changed_fields.push("state");
     }

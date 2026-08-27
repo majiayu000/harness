@@ -238,6 +238,7 @@ fn resolve_runtime_dispatch_profiles(
     for (activity, override_policy) in &policy.activity_profiles {
         let profile =
             apply_runtime_dispatch_profile_override(config, &default_profile, override_policy)?;
+        validate_classifier_runtime_profile(activity, &profile)?;
         activity_profiles.insert(activity.clone(), profile);
     }
     let mut workflow_activity_profiles = std::collections::BTreeMap::new();
@@ -249,6 +250,7 @@ fn resolve_runtime_dispatch_profiles(
                 .unwrap_or(&default_profile);
             let profile =
                 apply_runtime_dispatch_profile_override(config, base_profile, override_policy)?;
+            validate_classifier_runtime_profile(activity, &profile)?;
             workflow_activity_profiles
                 .entry(definition_id.clone())
                 .or_insert_with(std::collections::BTreeMap::new)
@@ -261,6 +263,25 @@ fn resolve_runtime_dispatch_profiles(
         activity_profiles,
         workflow_activity_profiles,
     })
+}
+
+pub(super) fn validate_classifier_runtime_profile(
+    activity: &str,
+    profile: &RuntimeProfile,
+) -> anyhow::Result<()> {
+    if activity == harness_workflow::runtime::CHANGE_SCOPE_REVIEW_ACTIVITY
+        && !matches!(
+            profile.kind,
+            RuntimeKind::ClaudeCode | RuntimeKind::AnthropicApi
+        )
+    {
+        anyhow::bail!(
+            "classify_change_scope runtime profile `{}` uses `{}`, which cannot enforce classifier isolation and report the provider model identity",
+            profile.name,
+            profile.kind.as_str()
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn runtime_dispatch_profile_selector(
@@ -571,5 +592,24 @@ mod tests {
         let error = apply_runtime_dispatch_profile_override(&config, &inherited, &override_policy)
             .expect_err("activity override unknown runtime kind must fail closed");
         assert!(error.to_string().contains("claude_typo"));
+    }
+
+    #[test]
+    fn runtime_dispatch_rejects_codex_scope_classifier_profile() {
+        let config = harness_core::config::HarnessConfig::default();
+        let inherited = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+        let policy = dispatch_policy(serde_json::json!({
+            "activity_profiles": {
+                "classify_change_scope": {
+                    "runtime_kind": "codex_exec",
+                    "runtime_profile": "classifier-codex"
+                }
+            }
+        }));
+
+        let error = runtime_dispatch_profile_selector(&config, &policy, &inherited)
+            .expect_err("Codex cannot provide classifier model attestation");
+        assert!(error.to_string().contains("classify_change_scope"));
+        assert!(error.to_string().contains("provider model identity"));
     }
 }

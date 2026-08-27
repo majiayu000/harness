@@ -566,6 +566,13 @@ pub(super) async fn approve_runtime_merge(
             reason: format!("unsupported merge_execution `{merge_execution}`"),
         });
     }
+    if crate::http::auto_merge::expected_base_ref_from_workflow_data(&instance.data).is_some() {
+        return Ok(RuntimeMergeApprovalOutcome::Rejected {
+            workflow_id,
+            reason: "automated merge cannot atomically bind expected_base_ref because GitHub's pull request merge API only accepts an expected head SHA"
+                .to_string(),
+        });
+    }
     let delete_branch = optional_bool_field(&instance.data, "merge_delete_branch").unwrap_or(true);
     if merge_execution == "server" && delete_branch {
         return Ok(RuntimeMergeApprovalOutcome::Rejected {

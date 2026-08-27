@@ -113,6 +113,26 @@ fn verify_merge_completion_snapshot(
             Some(snapshot),
         );
     }
+    if !crate::http::auto_merge::snapshot_base_ref_matches_expected(
+        &snapshot.normalized_snapshot,
+        target.expected_base_ref.as_deref(),
+    ) {
+        let observed_base_ref = value_string(snapshot.normalized_snapshot.get("base_ref"))
+            .unwrap_or_else(|| "<missing>".to_string());
+        return merge_completion_failed(
+            result,
+            ActivityErrorKind::Fatal,
+            "Server-side merge completion verification rejected an unauthorized base branch.",
+            &format!(
+                "agent reported merged=true for PR #{} in {}, but GitHub base {} did not match expected_base_ref {}",
+                target.pr_number,
+                target.repo_slug,
+                observed_base_ref,
+                target.expected_base_ref.as_deref().unwrap_or("<missing>")
+            ),
+            Some(snapshot),
+        );
+    }
     merge_completion_verified(result, target, snapshot)
 }
 
@@ -550,6 +570,7 @@ mod tests {
             "pr_url": "https://github.com/owner/repo/pull/77",
             "observed_at": "2026-07-02T10:00:00Z",
             "head_oid": "server-head",
+            "base_ref": "main",
             "merge_commit_sha": if merged { json!("merge-sha") } else { Value::Null },
         });
         GitHubPrSnapshotArtifacts {
@@ -681,6 +702,26 @@ mod tests {
             artifact.artifact_type == MERGE_COMPLETION_VERIFICATION_ARTIFACT
                 && artifact.artifact["verified"] == true
         }));
+    }
+
+    #[test]
+    fn merged_snapshot_rejects_an_unauthorized_base_branch() {
+        let target = target().with_expected_base_ref("release");
+        let result = verify_merge_completion_snapshot(
+            &job_with_expected_head(Some("server-head")),
+            None,
+            activity_result(),
+            &target,
+            snapshot("MERGED", true),
+        );
+
+        assert_eq!(result.status, ActivityStatus::Failed);
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Fatal));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("did not match expected_base_ref release"));
     }
 
     #[test]

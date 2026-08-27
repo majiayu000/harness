@@ -203,7 +203,7 @@ pub(super) async fn execute_server_merge(
             Some(&target),
             ActivityErrorKind::Configuration,
             "Server-side merge cannot atomically bind the authorized base branch.",
-            "GitHub's pull request merge API accepts an expected head SHA but no expected base ref; use agent merge execution or remove the base-ref authorization requirement",
+            "GitHub's pull request merge API accepts an expected head SHA but no expected base ref; automated merge is disabled while this authorization is pinned",
             Some(before_snapshot),
             None,
             "atomic_base_precondition_unavailable",
