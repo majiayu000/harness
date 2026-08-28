@@ -11,7 +11,19 @@ use super::model::{WorkflowCommand, WorkflowCommandType};
 use harness_core::config::workflow::{
     DeclaredState, WorkflowActivityPolicy, WorkflowAgentContract, WorkflowDefinitionPolicy,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// One activity's complete pinned agent execution policy: the contract plus
+/// the effective prompt. Both participate in the definition identity and the
+/// persisted metadata, so execution never rereads the mutable `WORKFLOW.md`
+/// for a pinned instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedAgentContractActivity {
+    pub prompt: String,
+    pub contract: WorkflowAgentContract,
+}
 
 /// Validates and pins the agent contracts of every activity the definition
 /// references. Contracts on unreferenced activities are ignored so an
@@ -20,23 +32,49 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) fn resolve_referenced_agent_contracts(
     policy: &WorkflowDefinitionPolicy,
     activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
-) -> anyhow::Result<BTreeMap<String, WorkflowAgentContract>> {
+) -> anyhow::Result<BTreeMap<String, PinnedAgentContractActivity>> {
     let mut contracts = BTreeMap::new();
     for (state_name, state) in &policy.states {
         let Some(activity) = state.activity.as_deref() else {
             continue;
         };
-        let Some(contract) = activity_policies
-            .get(activity)
-            .and_then(|activity_policy| activity_policy.agent_contract.as_ref())
-        else {
+        let Some(activity_policy) = activity_policies.get(activity) else {
+            continue;
+        };
+        let Some(contract) = activity_policy.agent_contract.as_ref() else {
             continue;
         };
         contract.validate(activity).map_err(|error| {
             anyhow::anyhow!("declarative workflow definition '{}': {error}", policy.id)
         })?;
+        if !activity_policy.validation.is_empty() {
+            anyhow::bail!(
+                "declarative workflow definition '{}' activity '{}' declares an agent_contract with tools: none but also {} validation command(s); a no-tool activity cannot run validation commands",
+                policy.id,
+                activity,
+                activity_policy.validation.len()
+            );
+        }
+        let prompt = activity_policy
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "declarative workflow definition '{}' activity '{}' declares an agent_contract but no prompt; the effective prompt must be pinned with the contract",
+                    policy.id,
+                    activity
+                )
+            })?;
         validate_agent_contract_routes(policy, state_name, state, activity, contract)?;
-        contracts.insert(activity.to_string(), contract.clone());
+        contracts.insert(
+            activity.to_string(),
+            PinnedAgentContractActivity {
+                prompt: prompt.to_string(),
+                contract: contract.clone(),
+            },
+        );
     }
     Ok(contracts)
 }
@@ -104,12 +142,13 @@ pub(crate) fn declarative_enqueue_activity_command(
     dedupe_key: String,
 ) -> WorkflowCommand {
     match definition.agent_contract(activity) {
-        Some(contract) => WorkflowCommand::new(
+        Some(pinned) => WorkflowCommand::new(
             WorkflowCommandType::EnqueueActivity,
             dedupe_key,
             serde_json::json!({
                 "activity": activity,
-                "agent_contract": contract,
+                "agent_contract": pinned.contract,
+                "prompt": pinned.prompt,
                 "definition_hash": definition.definition_hash(),
             }),
         ),

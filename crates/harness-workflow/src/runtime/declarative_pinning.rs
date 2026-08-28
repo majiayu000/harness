@@ -1,11 +1,10 @@
+use super::declarative_agent_contract::PinnedAgentContractActivity;
 use super::{
     declarative::{build_declarative_definition, DeclarativeWorkflowDefinition},
     model::WorkflowDefinition as DurableWorkflowDefinition,
     remote_facts::stable_remote_fact_hash,
 };
-use harness_core::config::workflow::{
-    WorkflowActivityPolicy, WorkflowAgentContract, WorkflowDefinitionPolicy,
-};
+use harness_core::config::workflow::{WorkflowActivityPolicy, WorkflowDefinitionPolicy};
 use std::collections::BTreeMap;
 
 pub(super) const DECLARATIVE_DEFINITION_METADATA_KIND: &str = "declarative_workflow";
@@ -19,7 +18,7 @@ const METADATA_SCHEMA_VERSION_V2: u64 = 2;
 
 pub fn declarative_definition_identity(
     policy: &WorkflowDefinitionPolicy,
-    activity_contracts: &BTreeMap<String, WorkflowAgentContract>,
+    activity_contracts: &BTreeMap<String, PinnedAgentContractActivity>,
 ) -> anyhow::Result<(u32, String)> {
     // Definitions without agent contracts keep the original policy-only hash
     // so every existing pinned instance and persisted definition stays valid.
@@ -94,8 +93,10 @@ pub fn hydrate_persisted_declarative_definition(
         .values()
         .filter_map(|state| state.activity.as_ref())
         .map(|activity| {
+            let pinned = persisted.agent_contracts.get(activity);
             let activity_policy = WorkflowActivityPolicy {
-                agent_contract: persisted.agent_contracts.get(activity).cloned(),
+                prompt: pinned.map(|pinned| pinned.prompt.clone()),
+                agent_contract: pinned.map(|pinned| pinned.contract.clone()),
                 ..WorkflowActivityPolicy::default()
             };
             (activity.clone(), activity_policy)
@@ -106,7 +107,7 @@ pub fn hydrate_persisted_declarative_definition(
 
 struct PersistedDeclarativePolicy {
     policy: WorkflowDefinitionPolicy,
-    agent_contracts: BTreeMap<String, WorkflowAgentContract>,
+    agent_contracts: BTreeMap<String, PinnedAgentContractActivity>,
 }
 
 fn persisted_declarative_policy(

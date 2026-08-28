@@ -79,6 +79,7 @@ pub use data_provenance::{
 };
 pub use data_write::WorkflowDataWrite;
 pub use declarative::{build_declarative_definition, DeclarativeWorkflowDefinition};
+pub use declarative_agent_contract::PinnedAgentContractActivity;
 pub use declarative_interpreter::{
     build_declarative_submission_decision, DECLARATIVE_SUBMISSION_DECISION,
 };

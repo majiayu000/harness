@@ -1,5 +1,5 @@
 use super::{
-    declarative_agent_contract::resolve_referenced_agent_contracts,
+    declarative_agent_contract::{resolve_referenced_agent_contracts, PinnedAgentContractActivity},
     declarative_pinning::declarative_definition_identity,
     model::{ActivityArtifact, WorkflowCommandType, WorkflowEvidence},
     pr_feedback::PR_FEEDBACK_DEFINITION_ID,
@@ -13,8 +13,7 @@ use super::{
     validator::{TransitionAllowlist, TransitionRule},
 };
 use harness_core::config::workflow::{
-    DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowAgentContract,
-    WorkflowDefinitionPolicy,
+    DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -42,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub struct DeclarativeWorkflowDefinition {
     registered: RegisteredWorkflowDefinition,
     policy: WorkflowDefinitionPolicy,
-    activity_contracts: BTreeMap<String, WorkflowAgentContract>,
+    activity_contracts: BTreeMap<String, PinnedAgentContractActivity>,
     definition_version: u32,
     definition_hash: String,
 }
@@ -56,13 +55,14 @@ impl DeclarativeWorkflowDefinition {
         &self.policy
     }
 
-    /// Resolved agent contracts for activities referenced by this definition,
-    /// pinned at compile time and included in the definition identity.
-    pub fn activity_contracts(&self) -> &BTreeMap<String, WorkflowAgentContract> {
+    /// Resolved agent contracts (with their pinned effective prompts) for
+    /// activities referenced by this definition, resolved at compile time and
+    /// included in the definition identity.
+    pub fn activity_contracts(&self) -> &BTreeMap<String, PinnedAgentContractActivity> {
         &self.activity_contracts
     }
 
-    pub fn agent_contract(&self, activity: &str) -> Option<&WorkflowAgentContract> {
+    pub fn agent_contract(&self, activity: &str) -> Option<&PinnedAgentContractActivity> {
         self.activity_contracts.get(activity)
     }
 
