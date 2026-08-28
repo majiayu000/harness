@@ -1,5 +1,11 @@
 # WORKFLOW.md: Declarative Definitions and Continuation Policies
 
+> Architecture relationship (2026-08-28): this document remains the executable reference for the
+> currently shipped schema. Proposed vNext ownership, compiled-bundle, Evidence, authorization, and
+> decomposition contracts are in `docs/workflow-first-autonomous-change-rfc.md`; they are not yet
+> owner-approved and do not supersede this page. Runtime incompatibility and physical cutover are
+> separated in `docs/workflow-vnext-cutover-rfc.md`.
+
 This page documents the two WORKFLOW.md features that let a repository
 define workflow behavior without Rust changes:
 
