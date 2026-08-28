@@ -404,7 +404,11 @@ fn cloud_setup_env_removals(cloud: &CodexCloudConfig) -> Vec<String> {
 }
 
 fn codex_structured_error_from_stdout(stdout: &str) -> Option<String> {
-    parse_codex_exec_output(stdout).ok()?.structured_error
+    let parsed = parse_codex_exec_output(stdout).ok()?;
+    parsed
+        .explicit_failure
+        .then_some(parsed.structured_error)
+        .flatten()
 }
 
 fn codex_structured_error(message: impl Into<String>) -> harness_core::error::HarnessError {
@@ -738,11 +742,11 @@ impl CodeAgent for CodexAgent {
         };
         if !status.success() {
             let stderr = captured_stderr_tail(&stderr_capture);
-            return Err(codex_nonzero_exit_error(
-                status,
-                &stderr,
-                parsed.structured_error.as_deref(),
-            ));
+            let structured_error = parsed
+                .structured_error
+                .as_deref()
+                .filter(|_| parsed.explicit_failure);
+            return Err(codex_nonzero_exit_error(status, &stderr, structured_error));
         }
         if let Some(message) = parsed.structured_error {
             return Err(codex_structured_error(message));

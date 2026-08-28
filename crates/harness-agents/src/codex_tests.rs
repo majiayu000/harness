@@ -6,6 +6,9 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio::time::timeout;
 
+const COMPLETED_EXEC_EVENT: &str =
+    r#"{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}"#;
+
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -166,11 +169,13 @@ async fn assert_path_observed_before_task_exit<T: std::fmt::Debug>(
 
 #[tokio::test]
 async fn execute_stream_returns_error_when_channel_closed() {
-    let agent = CodexAgent::new(
-        PathBuf::from("/usr/bin/true"),
-        SandboxMode::DangerFullAccess,
-    );
-    let request = AgentRequest::default();
+    let (dir, script) =
+        write_executable_script(&format!("printf '%s\\n' '{COMPLETED_EXEC_EVENT}'"));
+    let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
+    let request = AgentRequest {
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     drop(rx);
 
@@ -564,11 +569,9 @@ async fn cloud_setup_phase_uses_cache_within_ttl() -> anyhow::Result<()> {
         setup_secret_env: Vec::new(),
     };
 
-    let agent = CodexAgent::with_cloud(
-        PathBuf::from("/usr/bin/true"),
-        cloud,
-        SandboxMode::DangerFullAccess,
-    );
+    let (_script_dir, script) =
+        write_executable_script(&format!("printf '%s\\n' '{COMPLETED_EXEC_EVENT}'"));
+    let agent = CodexAgent::with_cloud(script, cloud, SandboxMode::DangerFullAccess);
     let request = AgentRequest {
         prompt: "ping".to_string(),
         project_root: dir.path().to_path_buf(),
@@ -596,7 +599,11 @@ async fn setup_secret_is_available_in_setup_but_removed_for_agent_phase() -> any
 
     fs::write(
         &cli_script,
-        format!("#!/bin/sh\nenv > \"{}\"\nexit 0\n", agent_capture.display()),
+        format!(
+            "#!/bin/sh\nenv > \"{}\"\nprintf '%s\\n' '{}'\n",
+            agent_capture.display(),
+            COMPLETED_EXEC_EVENT
+        ),
     )?;
     #[cfg(unix)]
     {
@@ -657,7 +664,11 @@ async fn execute_removes_claude_code_env_vars() -> anyhow::Result<()> {
 
     fs::write(
         &cli_script,
-        format!("#!/bin/sh\nenv > \"{}\"\nexit 0\n", agent_capture.display()),
+        format!(
+            "#!/bin/sh\nenv > \"{}\"\nprintf '%s\\n' '{}'\n",
+            agent_capture.display(),
+            COMPLETED_EXEC_EVENT
+        ),
     )?;
     #[cfg(unix)]
     {
@@ -705,7 +716,11 @@ async fn execute_stream_removes_claude_code_env_vars() -> anyhow::Result<()> {
 
     fs::write(
         &cli_script,
-        format!("#!/bin/sh\nenv > \"{}\"\nexit 0\n", agent_capture.display()),
+        format!(
+            "#!/bin/sh\nenv > \"{}\"\nprintf '%s\\n' '{}'\n",
+            agent_capture.display(),
+            COMPLETED_EXEC_EVENT
+        ),
     )?;
     #[cfg(unix)]
     {
@@ -758,7 +773,11 @@ async fn run_id_execute_exports_agent_run_id_after_claude_env_strip() -> anyhow:
     let cli_script = dir.path().join("capture-run-id-env.sh");
     fs::write(
         &cli_script,
-        format!("#!/bin/sh\nenv > \"{}\"\nexit 0\n", agent_capture.display()),
+        format!(
+            "#!/bin/sh\nenv > \"{}\"\nprintf '%s\\n' '{}'\n",
+            agent_capture.display(),
+            COMPLETED_EXEC_EVENT
+        ),
     )?;
     #[cfg(unix)]
     {

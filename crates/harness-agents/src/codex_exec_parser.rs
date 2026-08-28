@@ -1,4 +1,8 @@
 use crate::streaming::send_stream_item;
+use crate::{
+    codex_turn_semantics::{CodexTurnFact, CodexTurnSemantics, CodexTurnTerminal},
+    turn_reducer::AgentTurnReducer,
+};
 use harness_core::agent::StreamItem;
 use harness_core::types::{Item, TokenUsage};
 use serde_json::Value;
@@ -12,9 +16,10 @@ pub(crate) enum ParsedCodexExecEvent {
     ToolOutputDelta { item_id: String, text: String },
     ItemStarted { item: Item },
     ItemCompleted { item_id: String, item: Item },
-    TokenUsage { usage: TokenUsage },
     Warning { message: String },
     Error { message: String },
+    TurnCompleted { usage: Option<TokenUsage> },
+    TurnFailed { message: String },
     Ignore,
 }
 
@@ -25,6 +30,7 @@ pub(crate) struct ParsedCodexExecOutput {
     pub(crate) token_usage: TokenUsage,
     pub(crate) warnings: Vec<String>,
     pub(crate) structured_error: Option<String>,
+    pub(crate) explicit_failure: bool,
 }
 
 fn json_str_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -114,11 +120,19 @@ pub(crate) fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecE
                 .unwrap_or("unknown error")
                 .to_string(),
         }),
-        "turn.completed" => value
-            .get("usage")
-            .and_then(parse_codex_token_usage)
-            .map(|usage| ParsedCodexExecEvent::TokenUsage { usage })
-            .or(Some(ParsedCodexExecEvent::Ignore)),
+        "turn.completed" => Some(ParsedCodexExecEvent::TurnCompleted {
+            usage: value.get("usage").and_then(parse_codex_token_usage),
+        }),
+        "turn.failed" => Some(ParsedCodexExecEvent::TurnFailed {
+            message: json_str_field(&value, &["message"])
+                .or_else(|| {
+                    value
+                        .get("error")
+                        .and_then(|error| json_str_field(error, &["message"]))
+                })
+                .unwrap_or("codex turn failed")
+                .to_string(),
+        }),
         "item.started" | "item.completed" => {
             let Some(item_value) = value.get("item") else {
                 return Some(ParsedCodexExecEvent::Ignore);
@@ -161,6 +175,8 @@ fn apply_codex_exec_event(
     seen_message_deltas: &mut HashSet<String>,
     event: ParsedCodexExecEvent,
     emitted_items: &mut Vec<StreamItem>,
+    semantics: &mut CodexTurnSemantics,
+    reducer: &mut AgentTurnReducer,
 ) {
     match event {
         ParsedCodexExecEvent::MessageDelta { item_id, text } => {
@@ -187,20 +203,57 @@ fn apply_codex_exec_event(
             }
             emitted_items.push(StreamItem::ItemCompleted { item });
         }
-        ParsedCodexExecEvent::TokenUsage { usage } => {
-            parsed.token_usage = usage.clone();
-            emitted_items.push(StreamItem::TokenUsage { usage });
-        }
         ParsedCodexExecEvent::Warning { message } => {
             parsed.warnings.push(message.clone());
             emitted_items.push(StreamItem::Warning { message });
         }
         ParsedCodexExecEvent::Error { message } => {
-            parsed.structured_error = Some(message.clone());
-            emitted_items.push(StreamItem::Error { message });
+            apply_codex_turn_fact(
+                CodexTurnFact::FailureObserved { message },
+                emitted_items,
+                semantics,
+                reducer,
+            );
+        }
+        ParsedCodexExecEvent::TurnCompleted { usage } => {
+            apply_codex_turn_fact(
+                CodexTurnFact::Terminal(CodexTurnTerminal::Completed {
+                    output: parsed.output.clone(),
+                    usage,
+                }),
+                emitted_items,
+                semantics,
+                reducer,
+            );
+        }
+        ParsedCodexExecEvent::TurnFailed { message } => {
+            apply_codex_turn_fact(
+                CodexTurnFact::Terminal(CodexTurnTerminal::Failed { message }),
+                emitted_items,
+                semantics,
+                reducer,
+            );
         }
         ParsedCodexExecEvent::Ignore => {}
     }
+}
+
+fn apply_codex_turn_fact(
+    fact: CodexTurnFact,
+    emitted_items: &mut Vec<StreamItem>,
+    semantics: &mut CodexTurnSemantics,
+    reducer: &mut AgentTurnReducer,
+) {
+    for signal in semantics.interpret(fact) {
+        emitted_items.extend(reducer.apply(signal));
+    }
+}
+
+fn finish_codex_exec_output(parsed: &mut ParsedCodexExecOutput, reducer: AgentTurnReducer) {
+    let report = reducer.finish();
+    parsed.structured_error = report.failure_message().map(ToString::to_string);
+    parsed.explicit_failure = report.has_explicit_failure();
+    parsed.token_usage = report.token_usage;
 }
 
 pub(crate) fn parse_codex_exec_output(
@@ -208,6 +261,8 @@ pub(crate) fn parse_codex_exec_output(
 ) -> harness_core::error::Result<ParsedCodexExecOutput> {
     let mut parsed = ParsedCodexExecOutput::default();
     let mut seen_message_deltas = HashSet::new();
+    let mut semantics = CodexTurnSemantics;
+    let mut reducer = AgentTurnReducer::default();
 
     for line in stdout.lines() {
         if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
@@ -219,8 +274,17 @@ pub(crate) fn parse_codex_exec_output(
             ))
         })?;
         let mut ignored = Vec::new();
-        apply_codex_exec_event(&mut parsed, &mut seen_message_deltas, event, &mut ignored);
+        apply_codex_exec_event(
+            &mut parsed,
+            &mut seen_message_deltas,
+            event,
+            &mut ignored,
+            &mut semantics,
+            &mut reducer,
+        );
     }
+
+    finish_codex_exec_output(&mut parsed, reducer);
 
     Ok(parsed)
 }
@@ -237,6 +301,8 @@ pub(crate) async fn stream_codex_exec_output(
     let mut lines = BufReader::new(stdout).lines();
     let mut parsed = ParsedCodexExecOutput::default();
     let mut seen_message_deltas = HashSet::new();
+    let mut semantics = CodexTurnSemantics;
+    let mut reducer = AgentTurnReducer::default();
     let mut container_egress_verified = !await_container_egress_canary;
 
     loop {
@@ -290,6 +356,8 @@ pub(crate) async fn stream_codex_exec_output(
             &mut seen_message_deltas,
             event,
             &mut emitted_items,
+            &mut semantics,
+            &mut reducer,
         );
         for item in emitted_items {
             let item_label = match &item {
@@ -320,6 +388,8 @@ pub(crate) async fn stream_codex_exec_output(
             "codex exited before the container egress canary reported success".into(),
         ));
     }
+
+    finish_codex_exec_output(&mut parsed, reducer);
 
     Ok(parsed)
 }
