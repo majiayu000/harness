@@ -14,6 +14,7 @@ pub mod completion_evidence;
 pub mod data_provenance;
 mod data_write;
 pub mod declarative;
+mod declarative_agent_contract;
 mod declarative_interpreter;
 mod declarative_pinning;
 mod dispatch_barrier;

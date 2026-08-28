@@ -76,6 +76,7 @@ fn declarative_activity_policy_binds_exactly_and_missing_policy_fails_closed() {
         WorkflowActivityPolicy {
             prompt: Some("Inspect only the declared repository surface.".to_string()),
             validation: vec!["cargo check -p harness-server --all-targets".to_string()],
+            agent_contract: None,
         },
     );
     let mut packet = json!({
@@ -141,6 +142,7 @@ fn built_in_or_unmatched_activity_does_not_bind_declarative_activity_policy() {
         WorkflowActivityPolicy {
             prompt: Some("Must not bind to built-in behavior.".to_string()),
             validation: vec!["false".to_string()],
+            agent_contract: None,
         },
     );
     let mut packet = json!({
