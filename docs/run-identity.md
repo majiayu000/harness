@@ -1,5 +1,11 @@
 # Agent Run Identity
 
+> Architecture relationship (2026-08-28): this run ID remains an observability and correlation
+> identity. `docs/workflow-first-autonomous-change-rfc.md` proposes using it as one input to an
+> immutable ActorAssignment/AgentExecutionIdentity; that proposal is not yet approved. The run ID is
+> not, by itself, proof of reviewer independence, runtime capability, provider identity, or
+> authorization.
+
 Harness assigns one local run id to each agent process it starts so observability tools can join Harness events, native CLI sessions, cost rows, and memory provenance without a daemon or network service.
 
 ## Environment Contract
