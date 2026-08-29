@@ -120,6 +120,17 @@ fn parse_assistant_events(message: &Value) -> Vec<AgentEvent> {
     };
 
     let mut events = Vec::new();
+    if let Some(model) = message
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        events.push(AgentEvent::ModelReported {
+            model: model.to_string(),
+            source: harness_core::agent::ModelIdentitySource::ProviderReported,
+        });
+    }
     let mut text_buf = String::new();
     for block in content {
         match block.get("type").and_then(Value::as_str) {

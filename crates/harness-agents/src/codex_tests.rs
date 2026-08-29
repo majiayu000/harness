@@ -1,5 +1,8 @@
 use super::*;
 use harness_core::types::Item;
+
+#[path = "codex_contract_launch_tests.rs"]
+mod codex_contract_launch_tests;
 use std::fs;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -423,10 +426,25 @@ sleep 30
     )
     .await
     {
-        assert!(
-            matches!(item, StreamItem::MessageDelta { .. }),
-            "expected first event to be delta, got {item:?}"
-        );
+        // The stream opens with the launch-derived model identity observation;
+        // the first content event after it must be the delta.
+        let item = if matches!(item, StreamItem::ModelReported { .. }) {
+            wait_for_stream_item_or_task_exit(
+                &mut rx,
+                &mut handle,
+                Duration::from_secs(20),
+                "first content stream item",
+            )
+            .await
+        } else {
+            Some(item)
+        };
+        if let Some(item) = item {
+            assert!(
+                matches!(item, StreamItem::MessageDelta { .. }),
+                "expected first content event to be delta, got {item:?}"
+            );
+        }
     }
 
     drop(rx);

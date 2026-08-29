@@ -183,3 +183,23 @@ fn agent_contract_validate_rejects_inherited_context_and_bad_budgets() {
     too_many_corrections.max_corrections = AGENT_CONTRACT_MAX_CORRECTIONS_CEILING + 1;
     assert!(too_many_corrections.validate("classify").is_err());
 }
+
+#[test]
+fn every_registered_schema_id_resolves_to_a_parseable_document() {
+    for schema_id in SUPPORTED_AGENT_CONTRACT_INPUT_SCHEMAS {
+        let document = agent_contract_input_schema_document(schema_id)
+            .unwrap_or_else(|| panic!("registered input schema '{schema_id}' has no document"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(document).expect("input schema document is valid JSON");
+        assert_eq!(parsed["title"], *schema_id);
+    }
+    for schema_id in SUPPORTED_AGENT_CONTRACT_OUTPUT_SCHEMAS {
+        let document = agent_contract_output_schema_document(schema_id)
+            .unwrap_or_else(|| panic!("registered output schema '{schema_id}' has no document"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(document).expect("output schema document is valid JSON");
+        assert_eq!(parsed["title"], *schema_id);
+    }
+    assert!(agent_contract_input_schema_document("harness.unknown.v1").is_none());
+    assert!(agent_contract_output_schema_document("harness.unknown.v1").is_none());
+}

@@ -1,6 +1,8 @@
 mod activity_contract;
 mod activity_result;
 mod activity_status_contract;
+mod agent_contract_attempt;
+mod agent_contract_enforcement;
 mod child_workflow;
 mod child_workflow_non_issue;
 mod child_workflow_replay;
