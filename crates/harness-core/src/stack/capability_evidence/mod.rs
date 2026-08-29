@@ -25,15 +25,22 @@ pub struct AgentStackCapabilityDefinition {
     pub summary: &'static str,
 }
 
+const fn capability_definition(capability: AgentStackCapability) -> AgentStackCapabilityDefinition {
+    AgentStackCapabilityDefinition {
+        capability,
+        summary: capability.definition(),
+    }
+}
+
 #[rustfmt::skip]
 pub const AGENT_STACK_CAPABILITY_DEFINITIONS: &[AgentStackCapabilityDefinition] = &[
-    AgentStackCapabilityDefinition { capability: AgentStackCapability::Destructive, summary: "May delete, overwrite, or irreversibly mutate local or remote state." },
-    AgentStackCapabilityDefinition { capability: AgentStackCapability::SecretRead, summary: "May read credentials, tokens, private configuration, or sensitive material." },
-    AgentStackCapabilityDefinition { capability: AgentStackCapability::Network, summary: "May initiate outbound network calls or access remote resources." },
-    AgentStackCapabilityDefinition { capability: AgentStackCapability::Privileged, summary: "May bypass normal sandbox, permission, or isolation boundaries." },
-    AgentStackCapabilityDefinition { capability: AgentStackCapability::ProductionWrite, summary: "May write to production infrastructure, deployments, or customer-affecting systems." },
-    AgentStackCapabilityDefinition { capability: AgentStackCapability::Shell, summary: "May execute shell commands or arbitrary local programs." },
-    AgentStackCapabilityDefinition { capability: AgentStackCapability::FileWrite, summary: "May create, modify, or delete filesystem content." },
+    capability_definition(AgentStackCapability::Destructive),
+    capability_definition(AgentStackCapability::SecretRead),
+    capability_definition(AgentStackCapability::Network),
+    capability_definition(AgentStackCapability::Privileged),
+    capability_definition(AgentStackCapability::ProductionWrite),
+    capability_definition(AgentStackCapability::Shell),
+    capability_definition(AgentStackCapability::FileWrite),
 ];
 
 impl AgentStackCapability {

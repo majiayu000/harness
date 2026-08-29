@@ -92,13 +92,17 @@ fn assert_grants(
 
 #[test]
 fn capability_evidence_defines_complete_initial_vocabulary() {
-    let defined = AGENT_STACK_CAPABILITY_DEFINITIONS
+    assert_eq!(
+        AGENT_STACK_CAPABILITY_DEFINITIONS.len(),
+        AgentStackCapability::ALL.len()
+    );
+    for (definition, capability) in AGENT_STACK_CAPABILITY_DEFINITIONS
         .iter()
-        .map(|definition| definition.capability)
-        .collect::<Vec<_>>();
-    assert_eq!(defined, AgentStackCapability::ALL);
-    for capability in AgentStackCapability::ALL {
-        assert!(!capability.definition().is_empty());
+        .zip(AgentStackCapability::ALL)
+    {
+        assert_eq!(definition.capability, *capability);
+        assert_eq!(definition.summary, capability.definition());
+        assert!(!definition.summary.is_empty());
     }
 }
 
