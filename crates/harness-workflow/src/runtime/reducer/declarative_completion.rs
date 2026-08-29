@@ -255,7 +255,7 @@ fn transition_decision(
             )
         })?;
         if let Some(activity) = state.activity.as_deref() {
-            classifier_continuation_command(instance, event, result, target, activity)?
+            classifier_continuation_command(definition, instance, event, result, target, activity)?
         } else {
             let command = match state.progress {
                 Some(DeclaredProgressMode::CommandDriven) => anyhow::bail!(
@@ -318,6 +318,7 @@ fn transition_decision(
 }
 
 fn classifier_continuation_command(
+    definition: &DeclarativeWorkflowDefinition,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -327,7 +328,9 @@ fn classifier_continuation_command(
     let dedupe_key = event_dedupe_key(instance, target, event);
     if !crate::runtime::scope_review::has_server_classifier_assessment(result) {
         return Ok((
-            WorkflowCommand::enqueue_activity(activity, dedupe_key),
+            crate::runtime::declarative_agent_contract::declarative_enqueue_activity_command(
+                definition, activity, dedupe_key,
+            ),
             false,
         ));
     }
@@ -340,7 +343,9 @@ fn classifier_continuation_command(
         .cloned()
     else {
         return Ok((
-            WorkflowCommand::enqueue_activity(activity, dedupe_key),
+            crate::runtime::declarative_agent_contract::declarative_enqueue_activity_command(
+                definition, activity, dedupe_key,
+            ),
             false,
         ));
     };

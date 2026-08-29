@@ -104,6 +104,55 @@ fn parse_exec_output_surfaces_item_completed_error() {
 }
 
 #[test]
+fn explicit_completion_outweighs_preceding_structured_error() {
+    let stdout = concat!(
+        r#"{"type":"error","message":"structured output schema rejected"}"#,
+        "\n",
+        r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"recovered"}}"#,
+        "\n",
+        r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    );
+
+    let parsed = parse_codex_exec_output(stdout).expect("stdout should parse");
+
+    assert_eq!(parsed.output, "recovered");
+    assert_eq!(
+        parsed.structured_error.as_deref(),
+        Some("structured output schema rejected")
+    );
+    assert!(!parsed.explicit_failure);
+}
+
+#[test]
+fn missing_terminal_fails_with_preceding_error_evidence() {
+    let parsed = parse_codex_exec_output(r#"{"type":"error","message":"authentication failed"}"#)
+        .expect("stdout should parse");
+
+    assert!(parsed.explicit_failure);
+    assert_eq!(
+        parsed.structured_error.as_deref(),
+        Some("authentication failed")
+    );
+}
+
+#[test]
+fn contradictory_terminal_events_fail_closed() {
+    let stdout = concat!(
+        r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        "\n",
+        r#"{"type":"turn.failed","message":"late failure"}"#,
+    );
+
+    let parsed = parse_codex_exec_output(stdout).expect("stdout should parse");
+
+    assert!(parsed.explicit_failure);
+    assert_eq!(
+        parsed.structured_error.as_deref(),
+        Some("codex emitted contradictory terminal events")
+    );
+}
+
+#[test]
 fn parse_exec_output_ignores_unknown_item_events() {
     let stdout = concat!(
         r#"{"type":"item.started","item":{"id":"item_1","type":"mcp_tool_call","server":"github"}}"#,
@@ -128,7 +177,7 @@ fn parse_exec_turn_completed_usage() {
     let line = r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":3,"reasoning_output_tokens":2}}"#;
     let event = parse_codex_exec_event_line(line).expect("event should parse");
     match event {
-        ParsedCodexExecEvent::TokenUsage { usage } => {
+        ParsedCodexExecEvent::TurnCompleted { usage: Some(usage) } => {
             assert_eq!(
                 usage,
                 TokenUsage {
@@ -139,7 +188,7 @@ fn parse_exec_turn_completed_usage() {
                 }
             );
         }
-        other => panic!("expected token usage, got {other:?}"),
+        other => panic!("expected completed turn usage, got {other:?}"),
     }
 }
 

@@ -128,8 +128,8 @@ fn declarative_recovery_builds_exact_progress_driver_and_preserves_evidence() {
             .expect("plan should build")
             .expect("target should have a driver");
         assert!(matches!(
-            plan.command_source,
-            RecoveryDispatchCommandSource::DeclarativeProgress(command_type) if command_type == expected
+            &plan.command_source,
+            RecoveryDispatchCommandSource::DeclarativeProgress(command) if command.command_type == expected
         ));
         let command = recovery_dispatch_command(
             &instance,

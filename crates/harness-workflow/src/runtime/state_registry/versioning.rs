@@ -4,7 +4,7 @@ use super::{
     GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use crate::runtime::declarative::build_builtin_declarative_definition;
-use crate::runtime::declarative_pinning::declarative_definition_identity_with_classifier_policies;
+use crate::runtime::declarative_pinning::declarative_definition_identity;
 use crate::runtime::model::WorkflowInstance;
 use crate::runtime::plan_issue::ISSUE_PLAN_ACTIVITY;
 use crate::runtime::pr_feedback::LOCAL_REVIEW_ACTIVITY;
@@ -112,11 +112,11 @@ impl WorkflowDefinitionRegistry {
             );
         }
         if !is_builtin_definition_id(&definition.policy().id) {
-            let (expected_version, expected_hash) =
-                declarative_definition_identity_with_classifier_policies(
-                    definition.policy(),
-                    definition.classifier_activity_policies(),
-                )?;
+            let (expected_version, expected_hash) = declarative_definition_identity(
+                definition.policy(),
+                definition.activity_contracts(),
+                definition.classifier_activity_policies(),
+            )?;
             if definition.definition_version() != expected_version
                 || definition.definition_hash() != expected_hash
             {

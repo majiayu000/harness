@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod agent_contract;
 mod budget;
 mod candidates;
 mod classifier;
@@ -12,6 +13,12 @@ mod reserved_keys;
 mod runtime_completion;
 mod runtime_dispatch;
 mod storage;
+pub use agent_contract::{
+    AgentContractMutationPolicy, AgentContractToolPolicy, AgentContractWorkspacePolicy,
+    WorkflowAgentContract, AGENT_CONTRACT_MAX_CORRECTIONS_CEILING,
+    AGENT_CONTRACT_MAX_PRIMARY_ATTEMPTS_CEILING, SUPPORTED_AGENT_CONTRACT_INPUT_SCHEMAS,
+    SUPPORTED_AGENT_CONTRACT_OUTPUT_SCHEMAS,
+};
 pub use budget::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 pub use candidates::WorkflowCandidatesPolicy;
 pub use classifier::WorkflowClassifierPolicy;
@@ -122,6 +129,12 @@ pub struct WorkflowActivityPolicy {
     pub validation: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classifier: Option<WorkflowClassifierPolicy>,
+    /// Generic agent execution contract (semantic classification and other
+    /// bounded no-tool judgments). Validated when a declarative definition
+    /// references the activity; the resolved contract participates in the
+    /// pinned definition identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_contract: Option<WorkflowAgentContract>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -765,6 +778,10 @@ mod tests;
 #[cfg(test)]
 #[path = "workflow_shipped_profile_tests.rs"]
 mod shipped_profile_tests;
+
+#[cfg(test)]
+#[path = "workflow_agent_contract_tests.rs"]
+mod agent_contract_tests;
 
 #[cfg(test)]
 #[path = "workflow_intake_binding_tests.rs"]

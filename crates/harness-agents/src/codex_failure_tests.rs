@@ -34,6 +34,33 @@ exit 1
 }
 
 #[tokio::test]
+async fn execute_preserves_quota_evidence_when_completion_precedes_nonzero_exit() {
+    let (dir, script) = write_executable_script(
+        r#"
+printf '%s\n' '{"type":"error","message":"usage limit reached; try again later"}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+exit 1
+"#,
+    );
+    let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
+    let request = AgentRequest {
+        prompt: "ignored".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+
+    let err = agent
+        .execute(request)
+        .await
+        .expect_err("nonzero execution should fail");
+
+    assert!(
+        matches!(err, harness_core::error::HarnessError::QuotaExhausted(_)),
+        "expected preceding diagnostic evidence to preserve quota classification, got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn execute_stream_classifies_quota_failure_from_stdout_json_error() {
     let (dir, script) = write_executable_script(
         r#"

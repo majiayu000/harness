@@ -17,7 +17,6 @@ use crate::runtime::pr_feedback::{
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::state_registry::{
     DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, WorkflowDefinitionRegistry,
-    WorkflowProgressMode,
 };
 use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::ValidationContext;
@@ -31,6 +30,9 @@ mod recovery_validation;
 use recovery_definition::{
     custom_declarative_definition, declarative_recovery_rejection, is_builtin_definition_id,
 };
+#[path = "recovery_declarative_plan.rs"]
+mod recovery_declarative_plan;
+use recovery_declarative_plan::declarative_recovery_dispatch_plan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowRuntimeRecoveryAction {
@@ -94,7 +96,11 @@ struct RecoveryDispatchPlan { target: RecoveryDispatchTarget, command_source: Re
 enum RecoveryDispatchCommandSource {
     Replay(WorkflowCommand),
     LegacyFallback,
-    DeclarativeProgress(WorkflowCommandType),
+    /// Fully built progress command for a declarative recovery target, built
+    /// through the pinned-command path so an agent-contract activity keeps its
+    /// contract, prompt, and definition hash; only the dedupe key is assigned
+    /// at dispatch time.
+    DeclarativeProgress(WorkflowCommand),
 }
 
 impl WorkflowRuntimeStore {
@@ -377,41 +383,6 @@ async fn recovery_dispatch_plan_tx(
     }))
 }
 
-fn declarative_recovery_dispatch_plan(
-    request: &WorkflowRuntimeRecoveryRequest<'_>,
-    definition: &crate::runtime::declarative::DeclarativeWorkflowDefinition,
-) -> anyhow::Result<Result<RecoveryDispatchPlan, Option<String>>> {
-    let target = request
-        .target_state
-        .unwrap_or_else(|| definition.policy().recovery_targets[0].as_str());
-    let state = &definition.policy().states[target];
-    let target = RecoveryDispatchTarget {
-        state: target.to_string(),
-        activity: state.activity.clone(),
-    };
-    let command_type = if state.activity.is_some() {
-        WorkflowCommandType::EnqueueActivity
-    } else {
-        match definition
-            .registered()
-            .states
-            .iter()
-            .find(|candidate| candidate.key.state.as_ref() == target.state)
-            .and_then(|candidate| candidate.progress_mode)
-        {
-            Some(WorkflowProgressMode::ExternalWait) => WorkflowCommandType::Wait,
-            Some(WorkflowProgressMode::OperatorGate) => {
-                WorkflowCommandType::RequestOperatorAttention
-            }
-            _ => return Ok(Err(None)),
-        }
-    };
-    Ok(Ok(RecoveryDispatchPlan {
-        target,
-        command_source: RecoveryDispatchCommandSource::DeclarativeProgress(command_type),
-    }))
-}
-
 fn recovery_dispatch_target(
     data: &Value,
     activity_name: Option<&str>,
@@ -669,21 +640,12 @@ fn recovery_dispatch_command(
         instance.id,
         event_id
     );
-    if let RecoveryDispatchCommandSource::Replay(command) = &plan.command_source {
+    if let RecoveryDispatchCommandSource::Replay(command)
+    | RecoveryDispatchCommandSource::DeclarativeProgress(command) = &plan.command_source
+    {
         let mut command = command.clone();
         command.dedupe_key = dedupe_key;
         return command;
-    }
-    if let RecoveryDispatchCommandSource::DeclarativeProgress(command_type) = plan.command_source {
-        return WorkflowCommand::new(
-            command_type,
-            dedupe_key,
-            json!({
-                "reason": reason,
-                "recovery_target": plan.target.state,
-                "activity": plan.target.activity,
-            }),
-        );
     }
 
     let remote_fact_hash = optional_string_field(&instance.data, "last_remote_fact_hash");

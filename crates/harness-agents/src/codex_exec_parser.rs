@@ -1,5 +1,5 @@
 use crate::streaming::send_stream_item;
-use harness_core::agent::StreamItem;
+use harness_core::agent::{AgentDiagnosticSeverity, StreamItem};
 use harness_core::types::{Item, TokenUsage};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -12,9 +12,10 @@ pub(crate) enum ParsedCodexExecEvent {
     ToolOutputDelta { item_id: String, text: String },
     ItemStarted { item: Item },
     ItemCompleted { item_id: String, item: Item },
-    TokenUsage { usage: TokenUsage },
     Warning { message: String },
     Error { message: String },
+    TurnCompleted { usage: Option<TokenUsage> },
+    TurnFailed { message: String },
     Ignore,
 }
 
@@ -25,6 +26,15 @@ pub(crate) struct ParsedCodexExecOutput {
     pub(crate) token_usage: TokenUsage,
     pub(crate) warnings: Vec<String>,
     pub(crate) structured_error: Option<String>,
+    pub(crate) explicit_failure: bool,
+}
+
+#[derive(Debug, Default)]
+enum CodexExecTerminal {
+    #[default]
+    Pending,
+    Completed,
+    Failed,
 }
 
 fn json_str_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -114,11 +124,19 @@ pub(crate) fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecE
                 .unwrap_or("unknown error")
                 .to_string(),
         }),
-        "turn.completed" => value
-            .get("usage")
-            .and_then(parse_codex_token_usage)
-            .map(|usage| ParsedCodexExecEvent::TokenUsage { usage })
-            .or(Some(ParsedCodexExecEvent::Ignore)),
+        "turn.completed" => Some(ParsedCodexExecEvent::TurnCompleted {
+            usage: value.get("usage").and_then(parse_codex_token_usage),
+        }),
+        "turn.failed" => Some(ParsedCodexExecEvent::TurnFailed {
+            message: json_str_field(&value, &["message"])
+                .or_else(|| {
+                    value
+                        .get("error")
+                        .and_then(|error| json_str_field(error, &["message"]))
+                })
+                .unwrap_or("codex turn failed")
+                .to_string(),
+        }),
         "item.started" | "item.completed" => {
             let Some(item_value) = value.get("item") else {
                 return Some(ParsedCodexExecEvent::Ignore);
@@ -161,6 +179,7 @@ fn apply_codex_exec_event(
     seen_message_deltas: &mut HashSet<String>,
     event: ParsedCodexExecEvent,
     emitted_items: &mut Vec<StreamItem>,
+    terminal: &mut CodexExecTerminal,
 ) {
     match event {
         ParsedCodexExecEvent::MessageDelta { item_id, text } => {
@@ -187,19 +206,65 @@ fn apply_codex_exec_event(
             }
             emitted_items.push(StreamItem::ItemCompleted { item });
         }
-        ParsedCodexExecEvent::TokenUsage { usage } => {
-            parsed.token_usage = usage.clone();
-            emitted_items.push(StreamItem::TokenUsage { usage });
-        }
         ParsedCodexExecEvent::Warning { message } => {
             parsed.warnings.push(message.clone());
             emitted_items.push(StreamItem::Warning { message });
         }
         ParsedCodexExecEvent::Error { message } => {
             parsed.structured_error = Some(message.clone());
-            emitted_items.push(StreamItem::Error { message });
+            emitted_items.push(StreamItem::Diagnostic {
+                severity: AgentDiagnosticSeverity::Error,
+                message,
+            });
+        }
+        ParsedCodexExecEvent::TurnCompleted { usage } => {
+            if let Some(usage) = usage {
+                parsed.token_usage = usage.clone();
+                emitted_items.push(StreamItem::TokenUsage { usage });
+            }
+            apply_codex_terminal(
+                parsed,
+                emitted_items,
+                terminal,
+                CodexExecTerminal::Completed,
+            );
+        }
+        ParsedCodexExecEvent::TurnFailed { message } => {
+            parsed.structured_error = Some(message);
+            apply_codex_terminal(parsed, emitted_items, terminal, CodexExecTerminal::Failed);
         }
         ParsedCodexExecEvent::Ignore => {}
+    }
+}
+
+fn apply_codex_terminal(
+    parsed: &mut ParsedCodexExecOutput,
+    emitted_items: &mut Vec<StreamItem>,
+    terminal: &mut CodexExecTerminal,
+    next: CodexExecTerminal,
+) {
+    if matches!(terminal, CodexExecTerminal::Pending) {
+        *terminal = next;
+        return;
+    }
+
+    let message = "codex emitted contradictory terminal events".to_string();
+    parsed.structured_error = Some(message.clone());
+    parsed.explicit_failure = true;
+    *terminal = CodexExecTerminal::Failed;
+    emitted_items.push(StreamItem::Error { message });
+}
+
+fn finish_codex_exec_output(parsed: &mut ParsedCodexExecOutput, terminal: CodexExecTerminal) {
+    match terminal {
+        CodexExecTerminal::Pending => {
+            parsed.explicit_failure = true;
+            parsed.structured_error.get_or_insert_with(|| {
+                "codex stream ended without an authoritative terminal event".to_string()
+            });
+        }
+        CodexExecTerminal::Completed => parsed.explicit_failure = false,
+        CodexExecTerminal::Failed => parsed.explicit_failure = true,
     }
 }
 
@@ -208,6 +273,7 @@ pub(crate) fn parse_codex_exec_output(
 ) -> harness_core::error::Result<ParsedCodexExecOutput> {
     let mut parsed = ParsedCodexExecOutput::default();
     let mut seen_message_deltas = HashSet::new();
+    let mut terminal = CodexExecTerminal::default();
 
     for line in stdout.lines() {
         if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
@@ -219,8 +285,16 @@ pub(crate) fn parse_codex_exec_output(
             ))
         })?;
         let mut ignored = Vec::new();
-        apply_codex_exec_event(&mut parsed, &mut seen_message_deltas, event, &mut ignored);
+        apply_codex_exec_event(
+            &mut parsed,
+            &mut seen_message_deltas,
+            event,
+            &mut ignored,
+            &mut terminal,
+        );
     }
+
+    finish_codex_exec_output(&mut parsed, terminal);
 
     Ok(parsed)
 }
@@ -237,11 +311,23 @@ pub(crate) async fn stream_codex_exec_output(
     let mut lines = BufReader::new(stdout).lines();
     let mut parsed = ParsedCodexExecOutput::default();
     let mut seen_message_deltas = HashSet::new();
+    let mut terminal = CodexExecTerminal::default();
     let mut container_egress_verified = !await_container_egress_canary;
+    enum StreamRead {
+        Line(std::io::Result<Option<String>>),
+        Exited(std::io::Result<std::process::ExitStatus>),
+    }
 
     loop {
-        let maybe_line = if let Some(duration) = idle_timeout {
-            tokio::time::timeout(duration, lines.next_line())
+        let read_or_exit = async {
+            tokio::select! {
+                biased;
+                line = lines.next_line() => StreamRead::Line(line),
+                status = child.wait() => StreamRead::Exited(status),
+            }
+        };
+        let read = if let Some(duration) = idle_timeout {
+            tokio::time::timeout(duration, read_or_exit)
                 .await
                 .map_err(|_| {
                     #[cfg(unix)]
@@ -251,17 +337,25 @@ pub(crate) async fn stream_codex_exec_output(
                         duration.as_secs()
                     ))
                 })?
-                .map_err(|error| {
-                    harness_core::error::HarnessError::AgentExecution(format!(
-                        "failed reading codex stdout: {error}"
-                    ))
-                })?
         } else {
-            lines.next_line().await.map_err(|error| {
+            read_or_exit.await
+        };
+        let maybe_line = match read {
+            StreamRead::Line(line) => line.map_err(|error| {
                 harness_core::error::HarnessError::AgentExecution(format!(
                     "failed reading codex stdout: {error}"
                 ))
-            })?
+            })?,
+            StreamRead::Exited(status) => {
+                status.map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "failed waiting for codex process: {error}"
+                    ))
+                })?;
+                #[cfg(unix)]
+                crate::kill_process_group(child);
+                break;
+            }
         };
         let Some(line) = maybe_line else {
             break;
@@ -290,6 +384,7 @@ pub(crate) async fn stream_codex_exec_output(
             &mut seen_message_deltas,
             event,
             &mut emitted_items,
+            &mut terminal,
         );
         for item in emitted_items {
             let item_label = match &item {
@@ -321,6 +416,8 @@ pub(crate) async fn stream_codex_exec_output(
             "codex exited before the container egress canary reported success".into(),
         ));
     }
+
+    finish_codex_exec_output(&mut parsed, terminal);
 
     Ok(parsed)
 }

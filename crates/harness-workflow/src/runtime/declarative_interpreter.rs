@@ -62,9 +62,11 @@ fn commands_for_target(
     }
     if let Some(state) = definition.policy().states.get(target) {
         if let Some(activity) = state.activity.as_deref() {
-            return Ok(vec![WorkflowCommand::enqueue_activity(
-                activity, dedupe_key,
-            )]);
+            return Ok(vec![
+                super::declarative_agent_contract::declarative_enqueue_activity_command(
+                    definition, activity, dedupe_key,
+                ),
+            ]);
         }
         return match state.progress {
             Some(DeclaredProgressMode::CommandDriven) => anyhow::bail!(
