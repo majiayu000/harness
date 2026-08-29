@@ -12,21 +12,8 @@ use replacements::{
     replacement_assignments, replacement_candidates, CandidateMode, ReplacementAssignmentIndex,
     ReplacementCandidateConflicts, ReplacementStateConflicts, RoleReplacementCoverage,
 };
-macro_rules! closed_enum {
-    ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        pub enum $name { $($variant),+ }
-        impl $name {
-            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
-            pub const fn as_str(&self) -> &'static str {
-                match self { $(Self::$variant => $wire),+ }
-            }
-        }
-    };
-}
 #[rustfmt::skip]
-closed_enum!(AgentStackProtectionRole {
+stack_wire_enum!(with_all AgentStackProtectionRole {
     Policy => "policy",
     Hook => "hook",
     Validation => "validation",
@@ -34,7 +21,7 @@ closed_enum!(AgentStackProtectionRole {
     Check => "check",
 });
 #[rustfmt::skip]
-closed_enum!(AgentStackProtectionDiffKind {
+stack_wire_enum!(with_all AgentStackProtectionDiffKind {
     Removed => "removed",
     Disabled => "disabled",
     ScopeReduced => "scope_reduced",
@@ -42,25 +29,25 @@ closed_enum!(AgentStackProtectionDiffKind {
     AmbiguousReviewEvidence => "ambiguous_review_evidence",
 });
 #[rustfmt::skip]
-closed_enum!(AgentStackProtectionConfidence {
+stack_wire_enum!(with_all AgentStackProtectionConfidence {
     Low => "low",
     Medium => "medium",
     High => "high",
 });
 #[rustfmt::skip]
-closed_enum!(AgentStackProtectionFailureMode {
+stack_wire_enum!(with_all AgentStackProtectionFailureMode {
     FailOpen => "fail_open",
     FailClosed => "fail_closed",
 });
 #[rustfmt::skip]
-closed_enum!(AgentStackProtectionScope {
+stack_wire_enum!(with_all AgentStackProtectionScope {
     Advisory => "advisory",
     Partial => "partial",
     Required => "required",
     Comprehensive => "comprehensive",
 });
 #[rustfmt::skip]
-closed_enum!(AgentStackProtectionControlReason {
+stack_wire_enum!(with_all AgentStackProtectionControlReason {
     RemovedWithoutEquivalent => "removed_without_equivalent",
     ExplicitlyDisabled => "explicitly_disabled",
     RoleSetReduced => "role_set_reduced",

@@ -63,18 +63,10 @@ pub enum AgentStackCapabilityExtractionError {
     Inventory(#[source] AgentStackInventoryError),
 }
 
-macro_rules! wire_enum {
-    ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        pub enum $name { $($variant),+ }
-        impl $name { pub const fn as_str(self) -> &'static str { match self { $(Self::$variant => $wire),+ } } }
-    };
-}
 #[rustfmt::skip]
-wire_enum!(AgentStackCapabilityExtractionConfidence { Low => "low", Medium => "medium", High => "high" });
+stack_wire_enum!(AgentStackCapabilityExtractionConfidence { Low => "low", Medium => "medium", High => "high" });
 #[rustfmt::skip]
-wire_enum!(AgentStackCapabilityExtractionFailureKind { ReadFailed => "read_failed", LimitExceeded => "limit_exceeded", ParseFailed => "parse_failed", InvalidDeclaration => "invalid_declaration", EvidenceValidation => "evidence_validation" });
+stack_wire_enum!(AgentStackCapabilityExtractionFailureKind { ReadFailed => "read_failed", LimitExceeded => "limit_exceeded", ParseFailed => "parse_failed", InvalidDeclaration => "invalid_declaration", EvidenceValidation => "evidence_validation" });
 
 #[rustfmt::skip]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

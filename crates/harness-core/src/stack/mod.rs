@@ -4,6 +4,32 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::Path;
 use thiserror::Error;
+
+macro_rules! stack_wire_enum {
+    (with_all $name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name { $($variant),+ }
+        impl $name {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub const fn as_str(&self) -> &'static str {
+                match self { $(Self::$variant => $wire),+ }
+            }
+        }
+    };
+    ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name { $($variant),+ }
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $wire),+ }
+            }
+        }
+    };
+}
+
 pub mod capability_evidence;
 pub mod capability_extraction;
 pub mod inventory;
@@ -42,35 +68,22 @@ use source_locator::{
 pub use source_locator::{resolve_xdg_config_harness_root, select_user_global_root};
 pub const AGENT_STACK_COMPONENT_SCHEMA_VERSION: &str = "agent-stack-component/v0.1";
 
-macro_rules! closed_enum {
-    ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        pub enum $name { $($variant),+ }
-        impl $name {
-            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
-            pub const fn as_str(&self) -> &'static str {
-                match self { $(Self::$variant => $wire),+ }
-            }
-        }
-    };
-}
 #[rustfmt::skip]
-closed_enum!(AgentStackComponentKind { Instructions => "instructions", Skill => "skill", McpServer => "mcp_server", McpTool => "mcp_tool", Hook => "hook", Memory => "memory", Policy => "policy", Workflow => "workflow", Validation => "validation", AgentRuntime => "agent_runtime" });
+stack_wire_enum!(with_all AgentStackComponentKind { Instructions => "instructions", Skill => "skill", McpServer => "mcp_server", McpTool => "mcp_tool", Hook => "hook", Memory => "memory", Policy => "policy", Workflow => "workflow", Validation => "validation", AgentRuntime => "agent_runtime" });
 #[rustfmt::skip]
-closed_enum!(AgentStackSourceScope { Repository => "repository", UserGlobal => "user_global", Admin => "admin", System => "system", Runtime => "runtime", Runner => "runner" });
+stack_wire_enum!(with_all AgentStackSourceScope { Repository => "repository", UserGlobal => "user_global", Admin => "admin", System => "system", Runtime => "runtime", Runner => "runner" });
 #[rustfmt::skip]
-closed_enum!(AgentStackUserGlobalRoot { HomeHarness => "home_harness", XdgConfigHarness => "xdg_config_harness", PlatformConfigHarness => "platform_config_harness", ConfiguredUser => "configured_user" });
+stack_wire_enum!(with_all AgentStackUserGlobalRoot { HomeHarness => "home_harness", XdgConfigHarness => "xdg_config_harness", PlatformConfigHarness => "platform_config_harness", ConfiguredUser => "configured_user" });
 #[rustfmt::skip]
-closed_enum!(AgentStackObservationClass { RepositoryObserved => "repository_observed", RuntimeObserved => "runtime_observed", RunnerObserved => "runner_observed" });
+stack_wire_enum!(with_all AgentStackObservationClass { RepositoryObserved => "repository_observed", RuntimeObserved => "runtime_observed", RunnerObserved => "runner_observed" });
 #[rustfmt::skip]
-closed_enum!(AgentStackSelectionState { Discovered => "discovered", Eligible => "eligible", Selected => "selected", Loaded => "loaded", Observed => "observed" });
+stack_wire_enum!(with_all AgentStackSelectionState { Discovered => "discovered", Eligible => "eligible", Selected => "selected", Loaded => "loaded", Observed => "observed" });
 #[rustfmt::skip]
-closed_enum!(AgentStackCapability { Destructive => "destructive", SecretRead => "secret_read", Network => "network", Privileged => "privileged", ProductionWrite => "production_write", Shell => "shell", FileWrite => "file_write" });
+stack_wire_enum!(with_all AgentStackCapability { Destructive => "destructive", SecretRead => "secret_read", Network => "network", Privileged => "privileged", ProductionWrite => "production_write", Shell => "shell", FileWrite => "file_write" });
 #[rustfmt::skip]
-closed_enum!(AgentStackTrustLevel { SelfDeclared => "self_declared", RepositoryObserved => "repository_observed", RuntimeObserved => "runtime_observed", RunnerObserved => "runner_observed" });
+stack_wire_enum!(with_all AgentStackTrustLevel { SelfDeclared => "self_declared", RepositoryObserved => "repository_observed", RuntimeObserved => "runtime_observed", RunnerObserved => "runner_observed" });
 #[rustfmt::skip]
-closed_enum!(AgentStackFreshness { Unknown => "unknown", Fresh => "fresh", Stale => "stale", Expired => "expired" });
+stack_wire_enum!(with_all AgentStackFreshness { Unknown => "unknown", Fresh => "fresh", Stale => "stale", Expired => "expired" });
 macro_rules! string_newtype {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
