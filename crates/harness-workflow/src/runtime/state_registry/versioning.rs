@@ -104,8 +104,10 @@ impl WorkflowDefinitionRegistry {
             );
         }
         if !is_builtin_definition_id(&definition.policy().id) {
-            let (expected_version, expected_hash) =
-                declarative_definition_identity(definition.policy())?;
+            let (expected_version, expected_hash) = declarative_definition_identity(
+                definition.policy(),
+                definition.activity_contracts(),
+            )?;
             if definition.definition_version() != expected_version
                 || definition.definition_hash() != expected_hash
             {

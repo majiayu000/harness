@@ -1,11 +1,10 @@
-use harness_core::config::workflow::{WorkflowActivityPolicy, WorkflowDefinitionPolicy};
+use harness_core::config::workflow::WorkflowDefinitionPolicy;
 use harness_workflow::runtime::{
-    build_declarative_definition, DecisionValidator, DeclarativeDefinitionResolution,
+    hydrate_persisted_declarative_definition, DecisionValidator, DeclarativeDefinitionResolution,
     WorkflowCancellationCleanupOutcome, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState, PROMPT_TASK_DEFINITION_ID,
 };
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::fmt;
 
 use super::prompt_memory::remove_prompt_submission_prompt_durable;
@@ -299,22 +298,10 @@ async fn resolve_declarative_cancellation(
     {
         return Ok(None);
     }
-    let policy: WorkflowDefinitionPolicy =
-        serde_json::from_value(persisted.metadata.get("policy").cloned().ok_or_else(|| {
-            RuntimeSubmissionCancelError::Store(anyhow::anyhow!(
-                "persisted declarative workflow '{}@{}' is missing policy metadata",
-                instance.definition_id,
-                instance.definition_version
-            ))
-        })?)
-        .map_err(anyhow::Error::from)?;
-    let activity_policies = policy
-        .states
-        .values()
-        .filter_map(|state| state.activity.as_ref())
-        .map(|activity| (activity.clone(), WorkflowActivityPolicy::default()))
-        .collect::<BTreeMap<_, _>>();
-    let definition = build_declarative_definition(&policy, &activity_policies)?;
+    // Rehydrate through the pinning module so persisted agent contracts
+    // participate in the recomputed identity; rebuilding with default activity
+    // policies would produce a contract-free hash that can never match.
+    let definition = hydrate_persisted_declarative_definition(&persisted)?;
     let expected_hash = instance
         .data
         .get("definition_hash")
@@ -335,7 +322,7 @@ async fn resolve_declarative_cancellation(
         )));
     }
     Ok(Some(DeclarativeCancellation {
-        target_state: cancelled_state(&policy, instance)?,
+        target_state: cancelled_state(definition.policy(), instance)?,
         current_terminal_state: definition
             .registered()
             .states
