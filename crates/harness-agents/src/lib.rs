@@ -6,7 +6,6 @@ pub mod claude_stream_json;
 mod cloud_setup;
 pub mod codex;
 pub mod codex_adapter;
-mod codex_turn_semantics;
 pub mod compress_model;
 pub mod docker_reconciliation;
 pub mod opencode;
@@ -19,7 +18,6 @@ pub mod scoped_token;
 mod spawn_contract;
 mod spawn_supervisor;
 mod streaming;
-mod turn_reducer;
 
 use harness_core::run_id::RunIdentity;
 #[cfg(test)]

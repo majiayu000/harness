@@ -1,4 +1,4 @@
-use crate::{codex_turn_semantics::CodexTurnSession, streaming::capture_agent_stderr_diagnostics};
+use crate::streaming::capture_agent_stderr_diagnostics;
 use async_trait::async_trait;
 use harness_core::agent::{
     AgentAdapter, AgentDiagnosticSeverity, AgentEvent, AgentRequest, ApprovalDecision,
@@ -586,10 +586,9 @@ impl AgentAdapter for CodexAdapter {
         let mut turn_completed = false;
         let mut receiver_closed = false;
         let mut stdout_closed = false;
-        let mut turn_session = CodexTurnSession::default();
         let stall_timeout = app_server_stall_timeout(&req);
         let read_result = async {
-            'messages: while let Some(message) =
+            while let Some(message) =
                 Self::read_next_message_with_timeout(&mut lines, stall_timeout, "turn").await?
             {
                 match message {
@@ -607,15 +606,20 @@ impl AgentAdapter for CodexAdapter {
                     }
                     ParsedCodexMessage::Response { .. } | ParsedCodexMessage::Ignore => {}
                     ParsedCodexMessage::Event(event) => {
-                        let (events, is_terminal) = turn_session.project_app_server_event(event);
-                        for event in events {
-                            if tx.send(event).await.is_err() {
-                                receiver_closed = true;
-                                break 'messages;
-                            }
-                        }
+                        let is_terminal = matches!(
+                            event,
+                            AgentEvent::TurnCompleted { .. }
+                                | AgentEvent::TurnCancelled { .. }
+                                | AgentEvent::Error { .. }
+                        );
                         if is_terminal {
                             self.clear_active_turn_id().await;
+                        }
+                        if tx.send(event).await.is_err() {
+                            receiver_closed = true;
+                            break;
+                        }
+                        if is_terminal {
                             turn_completed = true;
                             break;
                         }

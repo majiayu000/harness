@@ -1,9 +1,5 @@
 use crate::streaming::send_stream_item;
-use crate::{
-    codex_turn_semantics::{CodexTurnFact, CodexTurnSemantics, CodexTurnTerminal},
-    turn_reducer::AgentTurnReducer,
-};
-use harness_core::agent::StreamItem;
+use harness_core::agent::{AgentDiagnosticSeverity, StreamItem};
 use harness_core::types::{Item, TokenUsage};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -31,6 +27,14 @@ pub(crate) struct ParsedCodexExecOutput {
     pub(crate) warnings: Vec<String>,
     pub(crate) structured_error: Option<String>,
     pub(crate) explicit_failure: bool,
+}
+
+#[derive(Debug, Default)]
+enum CodexExecTerminal {
+    #[default]
+    Pending,
+    Completed,
+    Failed,
 }
 
 fn json_str_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -175,8 +179,7 @@ fn apply_codex_exec_event(
     seen_message_deltas: &mut HashSet<String>,
     event: ParsedCodexExecEvent,
     emitted_items: &mut Vec<StreamItem>,
-    semantics: &mut CodexTurnSemantics,
-    reducer: &mut AgentTurnReducer,
+    terminal: &mut CodexExecTerminal,
 ) {
     match event {
         ParsedCodexExecEvent::MessageDelta { item_id, text } => {
@@ -208,52 +211,61 @@ fn apply_codex_exec_event(
             emitted_items.push(StreamItem::Warning { message });
         }
         ParsedCodexExecEvent::Error { message } => {
-            apply_codex_turn_fact(
-                CodexTurnFact::FailureObserved { message },
-                emitted_items,
-                semantics,
-                reducer,
-            );
+            parsed.structured_error = Some(message.clone());
+            emitted_items.push(StreamItem::Diagnostic {
+                severity: AgentDiagnosticSeverity::Error,
+                message,
+            });
         }
         ParsedCodexExecEvent::TurnCompleted { usage } => {
-            apply_codex_turn_fact(
-                CodexTurnFact::Terminal(CodexTurnTerminal::Completed {
-                    output: parsed.output.clone(),
-                    usage,
-                }),
+            if let Some(usage) = usage {
+                parsed.token_usage = usage.clone();
+                emitted_items.push(StreamItem::TokenUsage { usage });
+            }
+            apply_codex_terminal(
+                parsed,
                 emitted_items,
-                semantics,
-                reducer,
+                terminal,
+                CodexExecTerminal::Completed,
             );
         }
         ParsedCodexExecEvent::TurnFailed { message } => {
-            apply_codex_turn_fact(
-                CodexTurnFact::Terminal(CodexTurnTerminal::Failed { message }),
-                emitted_items,
-                semantics,
-                reducer,
-            );
+            parsed.structured_error = Some(message);
+            apply_codex_terminal(parsed, emitted_items, terminal, CodexExecTerminal::Failed);
         }
         ParsedCodexExecEvent::Ignore => {}
     }
 }
 
-fn apply_codex_turn_fact(
-    fact: CodexTurnFact,
+fn apply_codex_terminal(
+    parsed: &mut ParsedCodexExecOutput,
     emitted_items: &mut Vec<StreamItem>,
-    semantics: &mut CodexTurnSemantics,
-    reducer: &mut AgentTurnReducer,
+    terminal: &mut CodexExecTerminal,
+    next: CodexExecTerminal,
 ) {
-    for signal in semantics.interpret(fact) {
-        emitted_items.extend(reducer.apply(signal));
+    if matches!(terminal, CodexExecTerminal::Pending) {
+        *terminal = next;
+        return;
     }
+
+    let message = "codex emitted contradictory terminal events".to_string();
+    parsed.structured_error = Some(message.clone());
+    parsed.explicit_failure = true;
+    *terminal = CodexExecTerminal::Failed;
+    emitted_items.push(StreamItem::Error { message });
 }
 
-fn finish_codex_exec_output(parsed: &mut ParsedCodexExecOutput, reducer: AgentTurnReducer) {
-    let report = reducer.finish();
-    parsed.structured_error = report.failure_message().map(ToString::to_string);
-    parsed.explicit_failure = report.has_explicit_failure();
-    parsed.token_usage = report.token_usage;
+fn finish_codex_exec_output(parsed: &mut ParsedCodexExecOutput, terminal: CodexExecTerminal) {
+    match terminal {
+        CodexExecTerminal::Pending => {
+            parsed.explicit_failure = true;
+            parsed.structured_error.get_or_insert_with(|| {
+                "codex stream ended without an authoritative terminal event".to_string()
+            });
+        }
+        CodexExecTerminal::Completed => parsed.explicit_failure = false,
+        CodexExecTerminal::Failed => parsed.explicit_failure = true,
+    }
 }
 
 pub(crate) fn parse_codex_exec_output(
@@ -261,8 +273,7 @@ pub(crate) fn parse_codex_exec_output(
 ) -> harness_core::error::Result<ParsedCodexExecOutput> {
     let mut parsed = ParsedCodexExecOutput::default();
     let mut seen_message_deltas = HashSet::new();
-    let mut semantics = CodexTurnSemantics;
-    let mut reducer = AgentTurnReducer::default();
+    let mut terminal = CodexExecTerminal::default();
 
     for line in stdout.lines() {
         if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
@@ -279,12 +290,11 @@ pub(crate) fn parse_codex_exec_output(
             &mut seen_message_deltas,
             event,
             &mut ignored,
-            &mut semantics,
-            &mut reducer,
+            &mut terminal,
         );
     }
 
-    finish_codex_exec_output(&mut parsed, reducer);
+    finish_codex_exec_output(&mut parsed, terminal);
 
     Ok(parsed)
 }
@@ -301,8 +311,7 @@ pub(crate) async fn stream_codex_exec_output(
     let mut lines = BufReader::new(stdout).lines();
     let mut parsed = ParsedCodexExecOutput::default();
     let mut seen_message_deltas = HashSet::new();
-    let mut semantics = CodexTurnSemantics;
-    let mut reducer = AgentTurnReducer::default();
+    let mut terminal = CodexExecTerminal::default();
     let mut container_egress_verified = !await_container_egress_canary;
     enum StreamRead {
         Line(std::io::Result<Option<String>>),
@@ -375,8 +384,7 @@ pub(crate) async fn stream_codex_exec_output(
             &mut seen_message_deltas,
             event,
             &mut emitted_items,
-            &mut semantics,
-            &mut reducer,
+            &mut terminal,
         );
         for item in emitted_items {
             let item_label = match &item {
@@ -408,7 +416,7 @@ pub(crate) async fn stream_codex_exec_output(
         ));
     }
 
-    finish_codex_exec_output(&mut parsed, reducer);
+    finish_codex_exec_output(&mut parsed, terminal);
 
     Ok(parsed)
 }

@@ -404,11 +404,7 @@ fn cloud_setup_env_removals(cloud: &CodexCloudConfig) -> Vec<String> {
 }
 
 fn codex_structured_error_from_stdout(stdout: &str) -> Option<String> {
-    let parsed = parse_codex_exec_output(stdout).ok()?;
-    parsed
-        .explicit_failure
-        .then_some(parsed.structured_error)
-        .flatten()
+    parse_codex_exec_output(stdout).ok()?.structured_error
 }
 
 fn codex_structured_error(message: impl Into<String>) -> harness_core::error::HarnessError {
@@ -427,6 +423,17 @@ fn codex_nonzero_exit_error(
     stderr: &str,
     structured_error: Option<&str>,
 ) -> harness_core::error::HarnessError {
+    if harness_core::error::is_billing_failure_message(stderr) {
+        return harness_core::error::HarnessError::BillingFailed(format!(
+            "codex billing failure (exit {status}): {stderr}"
+        ));
+    }
+    if harness_core::error::is_quota_failure_message(stderr) {
+        return harness_core::error::HarnessError::QuotaExhausted(format!(
+            "codex quota exhausted (exit {status}): {stderr}"
+        ));
+    }
+
     if let Some(message) = structured_error {
         let mut error = codex_structured_error(format!("exit {status}: {message}"));
         if matches!(error, harness_core::error::HarnessError::AgentExecution(_))
@@ -439,16 +446,6 @@ fn codex_nonzero_exit_error(
         return error;
     }
 
-    if harness_core::error::is_billing_failure_message(stderr) {
-        return harness_core::error::HarnessError::BillingFailed(format!(
-            "codex billing failure (exit {status}): {stderr}"
-        ));
-    }
-    if harness_core::error::is_quota_failure_message(stderr) {
-        return harness_core::error::HarnessError::QuotaExhausted(format!(
-            "codex quota exhausted (exit {status}): {stderr}"
-        ));
-    }
     harness_core::error::HarnessError::AgentExecution(format!(
         "codex exited with {status}: {stderr}"
     ))
@@ -563,8 +560,18 @@ impl CodeAgent for CodexAgent {
         }
 
         let parsed = parse_codex_exec_output(&stdout)?;
-        if let Some(message) = parsed.structured_error {
-            return Err(codex_structured_error(message));
+        if parsed.explicit_failure {
+            return Err(codex_structured_error(
+                parsed
+                    .structured_error
+                    .unwrap_or_else(|| "codex turn failed".to_string()),
+            ));
+        }
+        if let Some(message) = parsed.structured_error.as_deref() {
+            tracing::error!(
+                agent = self.name(),
+                "non-terminal Codex diagnostic: {message}"
+            );
         }
         for warning in &parsed.warnings {
             tracing::warn!(agent = self.name(), "{warning}");
@@ -742,14 +749,18 @@ impl CodeAgent for CodexAgent {
         };
         if !status.success() {
             let stderr = captured_stderr_tail(&stderr_capture);
-            let structured_error = parsed
-                .structured_error
-                .as_deref()
-                .filter(|_| parsed.explicit_failure);
-            return Err(codex_nonzero_exit_error(status, &stderr, structured_error));
+            return Err(codex_nonzero_exit_error(
+                status,
+                &stderr,
+                parsed.structured_error.as_deref(),
+            ));
         }
-        if let Some(message) = parsed.structured_error {
-            return Err(codex_structured_error(message));
+        if parsed.explicit_failure {
+            return Err(codex_structured_error(
+                parsed
+                    .structured_error
+                    .unwrap_or_else(|| "codex turn failed".to_string()),
+            ));
         }
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())

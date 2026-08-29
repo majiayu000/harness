@@ -116,7 +116,40 @@ fn explicit_completion_outweighs_preceding_structured_error() {
     let parsed = parse_codex_exec_output(stdout).expect("stdout should parse");
 
     assert_eq!(parsed.output, "recovered");
-    assert_eq!(parsed.structured_error, None);
+    assert_eq!(
+        parsed.structured_error.as_deref(),
+        Some("structured output schema rejected")
+    );
+    assert!(!parsed.explicit_failure);
+}
+
+#[test]
+fn missing_terminal_fails_with_preceding_error_evidence() {
+    let parsed = parse_codex_exec_output(r#"{"type":"error","message":"authentication failed"}"#)
+        .expect("stdout should parse");
+
+    assert!(parsed.explicit_failure);
+    assert_eq!(
+        parsed.structured_error.as_deref(),
+        Some("authentication failed")
+    );
+}
+
+#[test]
+fn contradictory_terminal_events_fail_closed() {
+    let stdout = concat!(
+        r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        "\n",
+        r#"{"type":"turn.failed","message":"late failure"}"#,
+    );
+
+    let parsed = parse_codex_exec_output(stdout).expect("stdout should parse");
+
+    assert!(parsed.explicit_failure);
+    assert_eq!(
+        parsed.structured_error.as_deref(),
+        Some("codex emitted contradictory terminal events")
+    );
 }
 
 #[test]
