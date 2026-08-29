@@ -683,13 +683,25 @@ impl CodeAgent for CodexAgent {
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
         let await_container_egress_canary = child.awaits_container_egress_canary();
-        let stream_result = stream_codex_exec_output(
-            child.inner_mut(),
-            &tx,
-            idle_timeout,
-            await_container_egress_canary,
-        )
-        .await;
+        let stdout = child.inner_mut().stdout.take().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution("codex stdout unavailable".into())
+        })?;
+        let stream_output =
+            stream_codex_exec_output(stdout, &tx, idle_timeout, await_container_egress_canary);
+        tokio::pin!(stream_output);
+        let mut root_status = None;
+        let stream_result = loop {
+            tokio::select! {
+                result = &mut stream_output => break result,
+                result = child.wait_and_cleanup_descendants(), if root_status.is_none() => {
+                    root_status = Some(result.map_err(|error| {
+                        harness_core::error::HarnessError::AgentExecution(format!(
+                            "failed waiting for codex process: {error}"
+                        ))
+                    })?);
+                }
+            }
+        };
         let stream_send_failed = matches!(
             &stream_result,
             Err(harness_core::error::HarnessError::AgentExecution(message))
@@ -700,17 +712,21 @@ impl CodeAgent for CodexAgent {
             Err(harness_core::error::HarnessError::AgentExecution(message))
                 if message.contains("codex exited with")
         );
-        if stream_result.is_err() && !stream_process_exited {
+        if stream_result.is_err() && !stream_process_exited && root_status.is_none() {
             child.terminate_now();
         }
-        let status = child
-            .wait_and_cleanup_descendants()
-            .await
-            .map_err(|error| {
-                harness_core::error::HarnessError::AgentExecution(format!(
-                    "failed waiting for codex process: {error}"
-                ))
-            })?;
+        let status = if let Some(status) = root_status {
+            status
+        } else {
+            child
+                .wait_and_cleanup_descendants()
+                .await
+                .map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "failed waiting for codex process: {error}"
+                    ))
+                })?
+        };
         if stream_send_failed {
             return Err(stream_result.expect_err("stream send failures return an error"));
         }

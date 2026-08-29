@@ -226,14 +226,11 @@ pub(crate) fn parse_codex_exec_output(
 }
 
 pub(crate) async fn stream_codex_exec_output(
-    child: &mut tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
     tx: &tokio::sync::mpsc::Sender<StreamItem>,
     idle_timeout: Option<Duration>,
     await_container_egress_canary: bool,
 ) -> harness_core::error::Result<ParsedCodexExecOutput> {
-    let stdout = child.stdout.take().ok_or_else(|| {
-        harness_core::error::HarnessError::AgentExecution("codex stdout unavailable".into())
-    })?;
     let mut lines = BufReader::new(stdout).lines();
     let mut parsed = ParsedCodexExecOutput::default();
     let mut seen_message_deltas = HashSet::new();
@@ -244,8 +241,6 @@ pub(crate) async fn stream_codex_exec_output(
             tokio::time::timeout(duration, lines.next_line())
                 .await
                 .map_err(|_| {
-                    #[cfg(unix)]
-                    crate::kill_process_group(child);
                     harness_core::error::HarnessError::AgentExecution(format!(
                         "codex stream idle timeout after {}s: zombie connection terminated",
                         duration.as_secs()

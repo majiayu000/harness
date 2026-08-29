@@ -21,10 +21,10 @@ async fn codex_waits_for_container_canary_marker() -> anyhow::Result<()> {
         .stdout(Stdio::piped())
         .spawn()?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let stdout = child.stdout.take().expect("codex stdout should be piped");
 
     let parsed =
-        crate::codex::codex_exec_parser::stream_codex_exec_output(&mut child, &tx, None, true)
-            .await?;
+        crate::codex::codex_exec_parser::stream_codex_exec_output(stdout, &tx, None, true).await?;
 
     assert!(matches!(
         rx.recv().await,
@@ -43,11 +43,11 @@ async fn codex_rejects_missing_container_canary_marker() -> anyhow::Result<()> {
         .stdout(Stdio::piped())
         .spawn()?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let stdout = child.stdout.take().expect("codex stdout should be piped");
 
-    let error =
-        crate::codex::codex_exec_parser::stream_codex_exec_output(&mut child, &tx, None, true)
-            .await
-            .expect_err("missing canary marker must fail");
+    let error = crate::codex::codex_exec_parser::stream_codex_exec_output(stdout, &tx, None, true)
+        .await
+        .expect_err("missing canary marker must fail");
 
     assert!(error
         .to_string()
