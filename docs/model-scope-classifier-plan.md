@@ -69,12 +69,15 @@ Non-goals:
 Goals:
 
 - Register `github_issue_pr@2` with one PR-scope classifier state.
-- Keep existing v1 instances on the historical graph.
+- Make `github_issue_pr@2` the current graph for newly created unversioned
+  workflows while preserving existing v1 instances on the historical graph.
 - Collect an authoritative Issue snapshot and complete head-bound PR facts.
-- Trigger scope review after PR binding and whenever the PR head changes.
+- Trigger scope review after PR binding and whenever the issue snapshot, PR
+  head, base, or effective diff changes.
 - Continue only on `allow`; persist and expose all other verdicts as an
   operator-visible blocked outcome.
-- Bind the accepted assessment to the observed PR head.
+- Bind the accepted assessment to the observed issue revision and PR comparison
+  identity.
 
 Non-goals:
 
@@ -158,7 +161,10 @@ outputs. Model-authored workflow signals are not trusted.
 {
   "schema": "harness.runtime.classifier_assessment.v1",
   "activity": "classify_example",
-  "subject": {},
+  "subject": {
+    "kind": "caller_defined",
+    "identity": "opaque stable identity"
+  },
   "verdict": "allow",
   "rationale": "...",
   "evidence_refs": [],
@@ -172,8 +178,9 @@ outputs. Model-authored workflow signals are not trusted.
 ```
 
 The assessment is authored by Harness after validation and stored with the
-activity result. The workflow transition consumes this assessment, not raw
-model signals.
+activity result. The persisted `subject` is copied from the validated input
+envelope. The workflow transition consumes this assessment, not raw model
+signals.
 
 ### Policy pinning
 
@@ -192,22 +199,30 @@ model signals.
 - The backend must report the executed model identity.
 - If either guarantee is unavailable, dispatch fails clearly before model
   execution.
+- The prompt packet must render the entire input envelope behind the existing
+  untrusted-data fence so contributor-controlled facts cannot issue routing
+  instructions.
+- Add an injection-focused verdict test that proves malicious issue, PR, or diff
+  text is treated only as classifier evidence.
 - Remote hosts are unsupported until they can attest the same guarantees.
 
 ## PR 3 GitHub Facts Contract
 
 The GitHub integration prepares the generic input envelope with:
 
-- authoritative issue identity, title, body, labels, state, and URL;
-- authoritative PR identity, base branch, head OID, title, body, and state;
+- authoritative issue identity, revision or content digest, title, body, labels,
+  state, and URL;
+- authoritative PR identity, base branch, base OID or merge-base/diff digest,
+  head OID, title, body, and state;
 - the complete changed-file set;
 - complete diff content or an explicit unavailable/incomplete result;
 - additions, deletions, renames, and binary-file metadata;
 - observed head OID before and after collection.
 
 The integration fails before model dispatch when identity conflicts, paging is
-incomplete, or the head changes during collection. The generic classifier
-driver does not know these rules.
+incomplete, textual diff content is incomplete or unavailable for a non-binary
+file, or the head changes during collection. The generic classifier driver does
+not know these rules.
 
 ## Workflow Semantics
 
@@ -216,12 +231,12 @@ implementing
   -> PR bound
   -> pr_scope_review
       -> allow          -> pr_open
-      -> revise/split   -> blocked + assessment
+      -> split_required -> blocked + assessment
       -> needs_human    -> blocked + assessment
       -> execution fail -> blocked + explicit error
 
-pr_open / awaiting_feedback / addressing_feedback
-  -> PR head changed
+any nonterminal post-binding state
+  -> issue snapshot, PR head, base, or effective diff changed
   -> pr_scope_review
 ```
 
