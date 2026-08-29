@@ -7,24 +7,21 @@ use thiserror::Error;
 
 macro_rules! stack_wire_enum {
     (with_all $name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        pub enum $name { $($variant),+ }
+        stack_wire_enum!(@define (&self) self $name { $($variant => $wire),+ });
         impl $name {
             pub const ALL: &'static [Self] = &[$(Self::$variant),+];
-
-            pub const fn as_str(&self) -> &'static str {
-                match self { $(Self::$variant => $wire),+ }
-            }
         }
     };
     ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        stack_wire_enum!(@define (self) self $name { $($variant => $wire),+ });
+    };
+    (@define ($($receiver:tt)+) $value:ident $name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         pub enum $name { $($variant),+ }
         impl $name {
-            pub const fn as_str(self) -> &'static str {
-                match self { $(Self::$variant => $wire),+ }
+            pub const fn as_str($($receiver)+) -> &'static str {
+                match $value { $(Self::$variant => $wire),+ }
             }
         }
     };
