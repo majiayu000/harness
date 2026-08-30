@@ -1,5 +1,8 @@
 use super::*;
 use harness_core::types::Item;
+
+#[path = "codex_contract_launch_tests.rs"]
+mod codex_contract_launch_tests;
 use std::fs;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -236,6 +239,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
         .iter()
         .position(|item| matches!(item, StreamItem::ItemCompleted { .. }))
         .expect("expected item completed event");
+    let turn_completed = events
+        .iter()
+        .position(|item| matches!(item, StreamItem::TurnCompleted { .. }))
+        .expect("expected turn completed event with the final structured reply");
     let done = events
         .iter()
         .position(|item| matches!(item, StreamItem::Done))
@@ -245,8 +252,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
         "delta must precede item completed: {events:?}"
     );
     assert!(
-        completed < done,
-        "item completed must precede done: {events:?}"
+        completed < turn_completed && turn_completed < done,
+        "item completion and final reply must precede done: {events:?}"
     );
 
     match &events[completed] {
@@ -260,6 +267,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
         }
         other => panic!("unexpected completed event payload: {other:?}"),
     }
+    assert!(
+        matches!(
+            &events[turn_completed],
+            StreamItem::TurnCompleted { output } if output == "hello world"
+        ),
+        "turn completion must carry the parsed final reply: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -423,10 +437,25 @@ sleep 30
     )
     .await
     {
-        assert!(
-            matches!(item, StreamItem::MessageDelta { .. }),
-            "expected first event to be delta, got {item:?}"
-        );
+        // The stream opens with the launch-derived model identity observation;
+        // the first content event after it must be the delta.
+        let item = if matches!(item, StreamItem::ModelReported { .. }) {
+            wait_for_stream_item_or_task_exit(
+                &mut rx,
+                &mut handle,
+                Duration::from_secs(20),
+                "first content stream item",
+            )
+            .await
+        } else {
+            Some(item)
+        };
+        if let Some(item) = item {
+            assert!(
+                matches!(item, StreamItem::MessageDelta { .. }),
+                "expected first content event to be delta, got {item:?}"
+            );
+        }
     }
 
     drop(rx);

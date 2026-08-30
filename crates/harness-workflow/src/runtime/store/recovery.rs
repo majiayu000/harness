@@ -351,7 +351,7 @@ async fn recovery_dispatch_plan_tx(
     request: &WorkflowRuntimeRecoveryRequest<'_>,
 ) -> anyhow::Result<Result<RecoveryDispatchPlan, Option<String>>> {
     if let Some(Ok(definition)) = custom_declarative_definition(registry, instance) {
-        return declarative_recovery_dispatch_plan(request, &definition);
+        return declarative_recovery_dispatch_plan(request, &definition, instance);
     }
     validate_stopped_metadata(&instance.data)?;
     let activity = stopped_activity(&instance.data)?;

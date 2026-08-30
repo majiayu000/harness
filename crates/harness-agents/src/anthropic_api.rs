@@ -181,6 +181,16 @@ impl CodeAgent for AnthropicApiAgent {
         .await?;
         crate::streaming::send_stream_item(
             &tx,
+            StreamItem::ModelReported {
+                model: resp.model,
+                source: harness_core::agent::ModelIdentitySource::ProviderReported,
+            },
+            self.name(),
+            "model_reported",
+        )
+        .await?;
+        crate::streaming::send_stream_item(
+            &tx,
             StreamItem::TokenUsage {
                 usage: resp.token_usage,
             },

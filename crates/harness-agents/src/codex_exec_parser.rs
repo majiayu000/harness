@@ -8,14 +8,38 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Debug)]
 pub(crate) enum ParsedCodexExecEvent {
-    MessageDelta { item_id: String, text: String },
-    ToolOutputDelta { item_id: String, text: String },
-    ItemStarted { item: Item },
-    ItemCompleted { item_id: String, item: Item },
-    Warning { message: String },
-    Error { message: String },
-    TurnCompleted { usage: Option<TokenUsage> },
-    TurnFailed { message: String },
+    MessageDelta {
+        item_id: String,
+        text: String,
+    },
+    ToolOutputDelta {
+        item_id: String,
+        text: String,
+    },
+    ItemStarted {
+        item: Item,
+    },
+    ItemCompleted {
+        item_id: String,
+        item: Item,
+    },
+    /// Item kind the parser has no mapping for. Surfaced instead of ignored so
+    /// enforcement-sensitive consumers can fail closed on unknown activity.
+    UnknownItemKind {
+        item_type: String,
+    },
+    Warning {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+    TurnCompleted {
+        usage: Option<TokenUsage>,
+    },
+    TurnFailed {
+        message: String,
+    },
     Ignore,
 }
 
@@ -58,6 +82,16 @@ pub(crate) fn parse_codex_item(item: &Value) -> Option<Item> {
                 .unwrap_or_default()
                 .to_string(),
             stderr: String::new(),
+        }),
+        "mcp_tool_call" | "mcpToolCall" | "web_search" | "webSearch" | "file_change"
+        | "fileChange" => Some(Item::ToolCall {
+            name: json_str_field(item, &["name", "tool", "type"])?.to_string(),
+            input: item
+                .get("arguments")
+                .or_else(|| item.get("input"))
+                .cloned()
+                .unwrap_or_else(|| item.clone()),
+            output: item.get("output").cloned(),
         }),
         _ => None,
     }
@@ -139,13 +173,24 @@ pub(crate) fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecE
         }),
         "item.started" | "item.completed" => {
             let Some(item_value) = value.get("item") else {
-                return Some(ParsedCodexExecEvent::Ignore);
+                return Some(ParsedCodexExecEvent::UnknownItemKind {
+                    item_type: "missing_item".to_string(),
+                });
             };
             if let Some(message) = parse_codex_error_item_message(item_value) {
                 return Some(ParsedCodexExecEvent::Error { message });
             }
             let Some(item) = parse_codex_item(item_value) else {
-                return Some(ParsedCodexExecEvent::Ignore);
+                // Unknown kinds surface so enforcement observers never treat
+                // "the parser did not recognize it" as "nothing happened".
+                return Some(match json_str_field(item_value, &["type"]) {
+                    Some(item_type) => ParsedCodexExecEvent::UnknownItemKind {
+                        item_type: item_type.to_string(),
+                    },
+                    None => ParsedCodexExecEvent::UnknownItemKind {
+                        item_type: "missing_item_type".to_string(),
+                    },
+                });
             };
             if event_type == "item.started" {
                 Some(ParsedCodexExecEvent::ItemStarted { item })
@@ -170,7 +215,9 @@ pub(crate) fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecE
             item_id: json_str_field(&value, &["item_id", "itemId"])?.to_string(),
             text: json_str_field(&value, &["delta", "text"])?.to_string(),
         }),
-        _ => Some(ParsedCodexExecEvent::Ignore),
+        _ => Some(ParsedCodexExecEvent::UnknownItemKind {
+            item_type: format!("codex_event:{event_type}"),
+        }),
     }
 }
 
@@ -192,6 +239,9 @@ fn apply_codex_exec_event(
         }
         ParsedCodexExecEvent::ItemStarted { item } => {
             emitted_items.push(StreamItem::ItemStarted { item });
+        }
+        ParsedCodexExecEvent::UnknownItemKind { item_type } => {
+            emitted_items.push(StreamItem::ItemStartedKind { item_type });
         }
         ParsedCodexExecEvent::ItemCompleted { item_id, item } => {
             if let Item::AgentReasoning { content } = &item {
@@ -398,6 +448,7 @@ pub(crate) async fn stream_codex_exec_output(
                 StreamItem::ItemCompleted { .. } => "item_completed",
                 StreamItem::ItemCompletedKind => "item_completed",
                 StreamItem::TokenUsage { .. } => "token_usage",
+                StreamItem::ModelReported { .. } => "model_reported",
                 StreamItem::Warning { .. } => "warning",
                 StreamItem::Diagnostic { .. } => "diagnostic",
                 StreamItem::TurnCancelled { .. } => "turn_cancelled",

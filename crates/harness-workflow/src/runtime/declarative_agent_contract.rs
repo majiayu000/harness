@@ -7,7 +7,7 @@
 //! carries the exact contract the instance was pinned to.
 
 use super::declarative::DeclarativeWorkflowDefinition;
-use super::model::{WorkflowCommand, WorkflowCommandType};
+use super::model::{WorkflowCommand, WorkflowCommandType, WorkflowInstance};
 use harness_core::config::workflow::{
     DeclaredState, WorkflowActivityPolicy, WorkflowAgentContract, WorkflowDefinitionPolicy,
 };
@@ -138,20 +138,41 @@ fn validate_agent_contract_routes(
 /// snapshot always carries the exact contract the instance was pinned to.
 pub(crate) fn declarative_enqueue_activity_command(
     definition: &DeclarativeWorkflowDefinition,
+    instance: &WorkflowInstance,
     activity: &str,
     dedupe_key: String,
-) -> WorkflowCommand {
+) -> anyhow::Result<WorkflowCommand> {
     match definition.agent_contract(activity) {
-        Some(pinned) => WorkflowCommand::new(
-            WorkflowCommandType::EnqueueActivity,
-            dedupe_key,
-            serde_json::json!({
-                "activity": activity,
-                "agent_contract": pinned.contract,
-                "prompt": pinned.prompt,
-                "definition_hash": definition.definition_hash(),
-            }),
-        ),
-        None => WorkflowCommand::enqueue_activity(activity, dedupe_key),
+        Some(pinned) => {
+            let provenance = instance.data_provenance.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workflow '{}' cannot pin agent contract input without data provenance",
+                    instance.id
+                )
+            })?;
+            let contract_value = serde_json::to_value(&pinned.contract)?;
+            let contract_hash = super::remote_facts::stable_remote_fact_hash(&contract_value);
+            Ok(WorkflowCommand::new(
+                WorkflowCommandType::EnqueueActivity,
+                dedupe_key,
+                serde_json::json!({
+                    "activity": activity,
+                    "agent_contract": contract_value,
+                    "prompt": pinned.prompt,
+                    "definition_hash": definition.definition_hash(),
+                    "agent_contract_input": {
+                        "schema": pinned.contract.input_schema,
+                        "subject": {
+                            "kind": instance.subject.subject_type,
+                            "identity": instance.subject.subject_key,
+                        },
+                        "facts": instance.data,
+                        "provenance": provenance,
+                        "contract_hash": contract_hash,
+                    },
+                }),
+            ))
+        }
+        None => Ok(WorkflowCommand::enqueue_activity(activity, dedupe_key)),
     }
 }

@@ -27,6 +27,7 @@ pub fn build_declarative_submission_decision(
     }
     let commands = commands_for_target(
         definition,
+        instance,
         initial,
         format!("{}:{}:submit", instance.id, initial),
     )?;
@@ -44,6 +45,7 @@ pub fn build_declarative_submission_decision(
 
 fn commands_for_target(
     definition: &DeclarativeWorkflowDefinition,
+    instance: &WorkflowInstance,
     target: &str,
     dedupe_key: String,
 ) -> anyhow::Result<Vec<WorkflowCommand>> {
@@ -64,8 +66,8 @@ fn commands_for_target(
         if let Some(activity) = state.activity.as_deref() {
             return Ok(vec![
                 super::declarative_agent_contract::declarative_enqueue_activity_command(
-                    definition, activity, dedupe_key,
-                ),
+                    definition, instance, activity, dedupe_key,
+                )?,
             ]);
         }
         return match state.progress {

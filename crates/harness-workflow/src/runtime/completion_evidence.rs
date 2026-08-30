@@ -41,6 +41,9 @@ pub const ARTIFACT_RUNTIME_HOST_USAGE: &str = "server_runtime_host_usage";
 pub const ARTIFACT_EVAL_ISOLATION_CLEANUP: &str = "server_eval_isolation_cleanup";
 pub const ARTIFACT_VERIFIED_ISSUE_STATE: &str = "verified_issue_state";
 pub const ARTIFACT_MERGE_COMPLETION_VERIFICATION: &str = "merge_completion_verification";
+/// Server-observed per-attempt stream/tool/model observations for one runtime
+/// turn. Authored only by the runtime worker from its own event stream.
+pub const ARTIFACT_RUNTIME_TURN_OBSERVATIONS: &str = "server_runtime_turn_observations";
 pub const MERGE_COMPLETION_VERIFICATION_SCHEMA: &str =
     "harness.github.merge_completion_verification.v1";
 
@@ -54,7 +57,7 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 10] = [
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 11] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
@@ -64,6 +67,7 @@ pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 10] = [
     ARTIFACT_EVAL_ISOLATION_CLEANUP,
     ARTIFACT_VERIFIED_ISSUE_STATE,
     ARTIFACT_MERGE_COMPLETION_VERIFICATION,
+    ARTIFACT_RUNTIME_TURN_OBSERVATIONS,
     super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
 ];
 

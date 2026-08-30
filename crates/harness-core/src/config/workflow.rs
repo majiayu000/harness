@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 mod agent_contract;
+mod agent_contract_schemas;
 mod budget;
 mod candidates;
 mod defaults;
@@ -16,6 +17,10 @@ pub use agent_contract::{
     WorkflowAgentContract, AGENT_CONTRACT_MAX_CORRECTIONS_CEILING,
     AGENT_CONTRACT_MAX_PRIMARY_ATTEMPTS_CEILING, SUPPORTED_AGENT_CONTRACT_INPUT_SCHEMAS,
     SUPPORTED_AGENT_CONTRACT_OUTPUT_SCHEMAS,
+};
+pub use agent_contract_schemas::{
+    agent_contract_input_schema_document, agent_contract_output_schema_document,
+    validate_agent_contract_input, validate_agent_contract_output,
 };
 pub use budget::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 pub use candidates::WorkflowCandidatesPolicy;
