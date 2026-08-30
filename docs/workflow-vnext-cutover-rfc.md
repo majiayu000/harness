@@ -170,6 +170,22 @@ verified records into vNext `provider_intake_fences` before writing the vNext ep
 listener remains disabled until the installed fence digest matches the manifest, so schema
 replacement cannot erase the boundary.
 
+### 7.1 Rollback boundary
+
+Full rollback is available only during the pre-provider-dispatch observation window. Before
+restoring the archived database and old deployment, the operator must stop vNext intake and
+provider dispatch, revoke vNext provider credentials, verify zero vNext provider writers, and prove
+from the server-owned outbox and reconciliation records that no vNext provider action ever entered
+`dispatched`, `in_flight`, `succeeded`, or `unknown`. Missing or incomplete proof refuses rollback.
+
+The first vNext provider action that enters dispatch closes the rollback window before any remote
+effect can occur. After that boundary, the archived database remains available for audit and
+isolated restoration, but it MUST NOT be restored as the production runtime: provider writes cannot
+be undone by database rollback, and the old runtime lacks their vNext reconciliation history. An
+incident after the boundary quiesces vNext and uses forward recovery or explicit operator
+reconciliation. This proposal does not introduce a reverse provider fence or a dual-runtime
+compatibility path.
+
 ## 8. Alternatives
 
 ### A. Mandatory archive plus one-way runtime cutover — recommended proposal
@@ -179,7 +195,7 @@ Pros:
 - preserves the no-runtime-compatibility constraint;
 - retains auditable history;
 - keeps vNext free of legacy readers; and
-- supports full rollback and incident investigation.
+- supports full rollback before vNext provider dispatch and incident investigation afterward.
 
 Cons:
 
@@ -242,7 +258,7 @@ Decision: rejected.
 | Shared task rows are over-deleted | Critical | Fixed predicates, locked counts, cleanup preconditions, preservation tests |
 | Old provider object re-enters as new work | High | Provider intake fences and fail-closed unverifiable bindings |
 | Archive becomes an accidental runtime dependency | High | No vNext archive reader; offline tooling and isolated restore only |
-| Rollback crosses incompatible credentials/data | Critical | Restore rehearsal covering database, old credential, deployment, and traffic routing |
+| Rollback crosses incompatible credentials/data or remote side effects | Critical | Permit restore only before any vNext provider dispatch; otherwise quiesce and recover forward |
 
 ## 10. Approval Gates
 
@@ -255,7 +271,7 @@ This RFC cannot move to `Approved` until all of the following exist:
 - a tested old-role/session fencing procedure;
 - a tested provider-writer drain, credential revocation, and zero-writer verification procedure;
 - provider-fence conformance tests for poll, webhook, and direct submission;
-- a rollback rehearsal; and
+- a rollback rehearsal that proves pre-dispatch restore and post-dispatch refusal; and
 - an independent operational/database review.
 
 Approval of the umbrella Workflow architecture does not imply approval of this cutover RFC.

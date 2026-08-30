@@ -984,6 +984,9 @@ a destructive transition:
   zero-provider-writer proof succeeds;
 - provider subjects created or changed during drain are recorded at or before the final fence and
   remain quarantined from automatic vNext intake;
+- rollback succeeds only before any vNext provider action enters dispatch, after vNext intake and
+  provider writers are fenced; missing eligibility proof or any dispatched/in-flight/succeeded/
+  unknown vNext provider action refuses production restore and requires forward recovery;
 - the vNext HTTP listener never binds when runtime storage or epoch verification fails;
 - interrupted cutover either commits the complete new epoch or restores/fails closed;
 - a fresh vNext Work Item restarts from its complete `bundle:v2`; and
