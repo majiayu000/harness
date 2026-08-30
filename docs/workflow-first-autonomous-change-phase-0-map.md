@@ -45,9 +45,10 @@ The durable pieces to preserve are:
 - atomic completion and terminal fencing;
 - the existing `AgentBackend` abstraction;
 - prompt-packet capture and structured activity results;
-- server-owned remote fact collectors;
+- server-owned validation and Evidence folding for runtime-captured provider transport receipts;
 - workspace and runtime-host lease primitives; and
-- current provider-side merge verification.
+- current merge-verification semantics, with provider transport moved behind constrained
+  AgentBackend prompts.
 
 The missing architecture is not another scheduler. It is a typed contract layer above those
 primitives:
@@ -197,9 +198,10 @@ assessment can lose the first observation. The same loss applies to approval, ne
 mutation observations.
 
 **Decision.** Add `workflow_activity_attempts`, one row per actual Agent invocation, including
-correction/repair turns. Every attempt produces an immutable `RuntimeCapabilitySnapshot`. Activity
-completion folds all attempts with monotonic-denial semantics: any forbidden observation makes the
-activity ineligible for a success decision.
+correction/repair turns. Every attempt produces an immutable `RuntimeCapabilitySnapshot` and binds
+the same pinned input-envelope hash across primary/correction requests even though their prompt
+packets differ. Activity completion folds all attempts with monotonic-denial semantics: any
+forbidden observation makes the activity ineligible for a success decision.
 
 ### F0-06 — `WorkItem` exists only as loosely typed JSON and hard-coded projections
 
@@ -353,6 +355,7 @@ workflow_activity_attempts
   agent_run_id
   actor_assignment_id
   input_evidence_ids jsonb
+  input_envelope_hash
   lease_generation
   runtime_profile_snapshot jsonb
   capability_snapshot jsonb
@@ -668,7 +671,8 @@ CompiledActivity
   requested_action?          # typed authorization action ID
   reconciliation_contract?
   binding_transition_contract? # expected pointer, successor kind, pointer update, CAS mode
-  provider_precondition_contract? # expected provider version, cardinality, atomic stale refusal
+  provider_precondition_contract? # expected absence/version, cardinality, atomic stale refusal
+  action_agent_contract?       # registry-resolved and pinned for provider_action only
   retry_policy
   repair_policy
   budget_policy
@@ -676,14 +680,14 @@ CompiledActivity
   prompt_template
 ```
 
-Both optional contracts are linked and included in canonical bundle hashing. For every authority
+These optional contracts are linked and included in canonical bundle hashing. For every authority
 evaluator and authorized mutation target, the compiler requires `requested_action` and proves that
 an automatic target and any `await_human` operator gate, or a human-only gate and its authorized
-target, consume the same typed action. For a binding
-transition, the compiler validates the expected pointer, produced successor Evidence kind, pointer
-update, and `compare_and_swap` mode against the registered server contract. Unknown actions,
-unlinked targets, mismatched human gates, unsupported concurrency modes, or registry mismatches fail
-definition compilation.
+target, consume the same typed action. For a binding transition, the compiler validates the expected
+pointer, produced successor Evidence kind, pointer update, and `compare_and_swap` mode against the
+registered server contract or the server-owned completion fold of a provider-action descriptor.
+Unknown actions, unlinked targets, mismatched human gates, unsupported concurrency modes, or
+registry mismatches fail definition compilation.
 
 `executor: agent` never names Codex, Claude, OpenCode, or a model. Runtime profiles advertise
 capabilities; the dispatcher chooses an eligible profile using operator configuration. Model choice
@@ -693,12 +697,44 @@ is a runtime-profile concern and is snapshotted, not part of workflow state logi
 floor evaluation. The compiler checks that the contract exists and that its declared input/output
 schemas and producer classes match.
 
-`executor: provider_action` is a registered server contract with external side effects. It always
-requires explicit idempotency, authority, provider-precondition, and reconciliation contracts. The
-compiler links the provider precondition to accepted gate Evidence carrying expected absence or an
-exact provider version and verifies that the registry supports atomic conditional writes for its
-single-subject or per-entry cardinality. Local pointer CAS and reconciliation do not satisfy this
-contract.
+`executor: provider_action` is a server-orchestrated outbox contract whose external step executes
+only through a constrained, action-specific AgentBackend prompt. The registry descriptor supplies
+that prompt contract and the server-owned completion/reconciliation fold; the resolved descriptor is
+pinned in the compiled bundle rather than repeated in each Workflow activity. Harness validates the
+authority, Evidence, current binding, expected provider precondition (absence or exact version), and
+idempotency key before dispatch,
+but no Harness crate invokes `gh`, `git`, or a mutating provider SDK. The action turn receives an
+allowlist containing exactly the typed `requested_action`; scoped credentials come from its runtime
+profile, never from prompt or Evidence. Its response is a candidate until the server validates a
+provider-authenticated webhook or runtime-captured provider transport receipt and reconciles remote
+truth.
+
+The compiler still requires explicit idempotency, authority, provider-precondition, and
+reconciliation contracts. It links the provider precondition to accepted gate Evidence carrying
+expected absence or an exact provider version and verifies that the registered AgentBackend path can
+invoke a provider-native atomic conditional write for its single-subject or per-entry cardinality.
+Prompted check-then-write, local pointer CAS, and reconciliation do not satisfy this contract.
+Per-entry stack publication retains separate versions/idempotency keys and reconciles partial
+success without replaying completed entries. Read-only registered contracts that collect provider
+facts also use constrained AgentBackend prompts; registered server code owns validation and folding,
+not provider transport.
+
+Before provider I/O, the constrained tool channel must compare its operation, subject, typed action,
+idempotency key, and expected absence/version with the pinned action request. Omission or mismatch
+fails without network dispatch, and no unconditional primitive for the same mutation is exposed. A
+path that can validate these values only after a write cannot register as a provider action.
+
+The transport receipt is an immutable `workflow_evidence` row with the
+`provider-transport-receipt.v1` payload schema, `runtime_enforcement` producer class, and the attempt
+ID in its trusted envelope. Runtime enforcement appends it from the actual constrained provider tool
+event before model summarization. The payload binds lease generation/tool-event ID, registered
+contract, repository/subject, an `operation_id` required for every request, mutation-only
+`requested_action`, idempotency key and expected absence-or-version, credential/profile identity,
+request/raw-response digests, provider request ID/status when available, exit status, timestamp, and
+immutable raw-response artifact. The provider-action or read-only provider-fact descriptor declares
+that enforcement output. Unrestricted shell output or Agent prose is ineligible. Only the server
+validator may derive `remote_provider` or `server_fact_collector` Evidence from that receipt; the
+Agent cannot select or inherit either producer class.
 
 ### 7.4 Progress modes
 
@@ -957,6 +993,8 @@ Disposition vocabulary:
 |---|---|
 | `"classifier": null` triggers workspace bypass | Typed activity execution mode; no presence-based semantic flags; profile eligibility before workspace preparation |
 | Tool use checked only on the last correction turn | Explicit attempt rows and monotonic attempt-wide capability fold |
+| Stateless correction lacks the original facts | Every correction reuses the pinned prompt, immutable input envelope, output schema, and input-envelope hash |
+| Non-empty semantic facts have empty or partial provenance | One trusted-boundary coverage/digest validation using current non-legacy `WorkflowDataProvenance` before dispatch |
 | Intake passes `classifier_input: None` | Compiled input contract plus typed intake Evidence construction |
 | Every configured classifier activity is collected | Link only activities referenced by the selected compiled definition and route |
 | Classifier input errors become internal errors | Typed boundary errors: malformed/missing caller input is 4xx; server/registry inconsistency is 5xx |
@@ -994,6 +1032,10 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - assignment schema, issuer, role, scope, actor, permission, context, and code identity mismatch each
   reject receipt Evidence;
 - first attempt uses forbidden tool, correction attempt is clean, final result rejected;
+- stateless correction receives the exact primary prompt, input envelope, output schema, and matching
+  input-envelope hash plus only the prior output and structured validation error;
+- non-empty facts with empty, partial, orphaned, legacy, ambiguous, or digest-mismatched provenance
+  reject before dispatch; valid ancestor coverage, child override, and empty-facts/empty-sidecar pass;
 - stale worker observation/completion after lease reassignment is rejected;
 - model identity missing/mismatched on a required-model-observation activity; and
 - unknown security-relevant adapter event rejects attestation.
@@ -1121,6 +1163,13 @@ a destructive transition:
 - both existing-PR ingress outcomes run current-risk validation and Harness review before repair or
   merge; provider `repair_required` facts cannot enter generic planning or authorize mutation;
 - issue-first publish retries resolve to one remote change binding and one provider object;
+- Agent prose or a structured provider candidate without a matching runtime-captured transport
+  receipt cannot mint provider/server-fact Evidence; request, subject, operation, mutation action,
+  expected-absence-or-version,
+  credential/profile, raw-response digest, or immutable-artifact mismatch rejects the receipt;
+- a provider tool request that omits or changes the pinned operation, subject, mutation action,
+  idempotency key, or expected absence/version is rejected before network I/O, and no unconditional
+  mutation primitive is available to that action profile;
 - direct and integrated publication declare a nullable-current binding CAS: null creates one initial
   binding, while a bound PR creates or reuses one successor for the same provider object; ambiguous
   completion and a lost CAS reconcile without repeating the provider write;
@@ -1136,7 +1185,7 @@ a destructive transition:
 - current remote facts, CI, threads, review, base, mergeability, risk, and authority are all required;
 - direct and stack merge provider actions reject a missing or stale current binding, gate result, or
   action-specific authorization receipt before external dispatch;
-- every publication or merge provider action rejects a stale expected provider version before
+- every publication or merge provider action rejects a stale expected absence/version before
   mutation; stack republication checks the condition separately and atomically for every entry;
 - provider reports merged but follow-up snapshot is stale/missing, so Work Item does not close;
 - crash after provider merge but before local commit reconciles to one terminal event; and

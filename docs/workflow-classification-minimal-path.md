@@ -104,6 +104,8 @@ The exact field names remain proposed, but these ownership rules are required:
 - the runtime enforces tools, mutation, workspace, freshness, attempts, and structured output;
 - the selected backend and model live in runtime-profile configuration, never Workflow state logic;
 - the input envelope contains only persisted facts and provenance, not mutable request reconstruction;
+- the runtime validates the persisted provenance sidecar against the facts exactly once before
+  accepting the pinned envelope, and every attempt consumes that validated envelope;
 - the complete resolved contract participates in the pinned definition/job identity; and
 - completion uses one server-authored assessment, not an agent-authored approval artifact.
 
@@ -119,11 +121,23 @@ Minimum input envelope:
 {
   "schema": "harness.semantic_activity_input.v1",
   "subject": {"kind": "task", "identity": "submission:..."},
-  "facts": {},
-  "provenance": {},
+  "facts": {"changed_files": ["src/lib.rs"]},
+  "provenance": {
+    "schema": "harness.workflow.data_provenance.v1",
+    "entries": {"/changed_files": "server"},
+    "value_digests": {"/changed_files": "sha256:..."}
+  },
   "contract_hash": "sha256:..."
 }
 ```
+
+`provenance` uses the existing `WorkflowDataProvenance` pointer, nearest-ancestor coverage, and
+value-digest rules against the `facts` object. Empty facts may use an empty current-schema sidecar.
+For non-empty facts, every leaf must have exactly one unambiguous exact-or-nearest-ancestor
+classification, every pointer and digest must resolve, and orphan or `legacy_entries` coverage is
+invalid for a semantic activity. This relationship is validated once when the runtime job accepts
+the pinned envelope, before any backend dispatch; primary and correction attempts consume the same
+opaque validated envelope and hash rather than repeating or bypassing that check.
 
 Minimum model output:
 
@@ -140,18 +154,20 @@ The server-authored assessment additionally binds:
 
 - workflow, command, runtime job, and attempt identity;
 - pinned definition and activity-contract hashes;
-- input-fact digest;
+- canonical digest covering the complete input envelope, including its schema, subject, facts,
+  provenance, and contract hash;
 - runtime profile and observed model identity/source;
 - observed tool, approval, network, and mutation events across primary and correction attempts;
 - output digest and accepted outcome; and
 - final validation result.
 
-Unknown fields, missing provenance, an outcome outside the allowlist, evidence references outside
-the input envelope, any model-initiated tool, approval, external-data/network, or mutation
-observation, unverifiable model identity when required, or a contract/hash mismatch fail the
-activity explicitly. Provider transport egress to the selected model endpoint is required to run
-the attempt and is not model-visible network permission; `tools: none` forbids model-initiated web
-search or other network tools.
+Unknown fields, incomplete, orphaned, legacy, ambiguous, or digest-mismatched fact provenance, an
+outcome outside the allowlist, evidence references outside a provenance-covered `/facts/...` path,
+any model-initiated tool, approval, external-data/network, or mutation observation, unverifiable
+model identity when required, or a contract/hash mismatch fail the activity explicitly. Provider
+transport egress to the selected model endpoint is required to run the attempt and is not
+model-visible network permission; `tools: none` forbids model-initiated web search or other network
+tools.
 
 ## 6. Attempt and Correction Semantics
 
@@ -160,8 +176,12 @@ new vNext attempt table, provided it can reconstruct one immutable attempt asses
 
 All observations from the primary turn and the optional structured-output correction turn are
 folded together. A correction cannot erase a tool call, approval, mutation, or model mismatch from
-the primary turn. The correction receives only the prior textual output and validation error; it has
-the same no-tool/non-mutating contract.
+the primary turn. Every correction is a fresh-context request containing the exact primary prompt,
+the same pinned immutable input envelope and output schema, plus the prior raw output and the
+server-authored structured validation error. It binds the primary attempt ID, correction ordinal,
+and unchanged input-envelope hash; it never relies on backend conversation history or reconstructs
+facts from current Workflow data. It has the same no-tool/non-mutating contract and does not refresh
+facts, contract identity, or the correction budget.
 
 This is the smallest forward-compatible bridge to a future typed `ActivityAttempt`. It must not
 pretend the current persistence model already implements the full vNext Evidence system.
@@ -292,6 +312,8 @@ Decision: retained as a cheap separate heuristic, not a substitute.
 | Claude credential dependency | 0 | Sanitized dogfood environment |
 | Undeclared outcome accepted | 0 | Contract tests |
 | Tool/mutation observation accepted | 0 | Primary and correction-attempt tests |
+| Invalid fact provenance accepted | 0 | Empty, partial, orphaned, legacy, ambiguous, and digest-mismatch boundary tests |
+| Stateless correction missing pinned primary inputs | 0 | Correction request capture tests |
 | Model redispatch during replay | 0 | Restart/replay test |
 | Classifier-specific state-machine branches | 0 | Static search and review |
 | Ordinary activity regressions | 0 | Focused existing runtime tests |
