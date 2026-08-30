@@ -1,6 +1,6 @@
 # Technical Design: Minimal Workflow Classification Path
 
-Status: Proposed — owner approval pending
+Status: Approved current-runtime path — Slices A and B merged; Slices C and D pending
 
 Date: 2026-08-28
 
@@ -25,6 +25,9 @@ structured-output, enforcement, and replay contracts that a future Workflow arch
 - The current runtime already pins declarative definition identity, persists runtime jobs, records
   runtime events, supports structured `ActivityResult`, and runs Codex through both oneshot and
   per-turn `AgentBackend` surfaces.
+- Slice A merged in PR #2020: generic declaration, validation, persistence, and contract pinning.
+- Slice B merged in PR #2025: constrained and observable `AgentBackend` execution. The production
+  dispatcher remains fail-closed until Slice C supplies assessment, routing, budgets, and replay.
 - PR #2010 proves a Codex-backed, no-tool classifier can execute, but its two commits touch 43 files
   with approximately 1,854 insertions and 429 deletions.
 - PR #2010 also introduces a classifier-specific config type and cross-layer routing. That shape is
@@ -76,6 +79,7 @@ activities:
       output_schema: harness.semantic_verdict.v1
       allowed_outcomes: [small, medium, large, blocked]
       tools: none
+      network: none
       mutation: forbidden
       workspace: ephemeral_empty
       fresh_context: true
@@ -143,8 +147,8 @@ The server-authored assessment additionally binds:
 - final validation result.
 
 Unknown fields, missing provenance, an outcome outside the allowlist, evidence references outside
-the input envelope, any tool/mutation observation, unverifiable model identity when required, or a
-contract/hash mismatch fail the activity explicitly.
+the input envelope, any tool, approval, network, or mutation observation, unverifiable model
+identity when required, or a contract/hash mismatch fail the activity explicitly.
 
 ## 6. Attempt and Correction Semantics
 
@@ -211,12 +215,16 @@ not a reason to keep code.
 
 ### Slice A — Generic declaration and pinning
 
+Status: merged in PR #2020.
+
 - add the generic `agent_contract` activity policy;
 - validate schemas, allowed outcomes, no-tool/mutation/workspace constraints, and exact routes;
 - include the resolved contract in definition identity and runtime-job snapshot; and
 - add parser/compiler/pinning tests.
 
 ### Slice B — Backend enforcement and structured output
+
+Status: merged in PR #2025. The dispatcher barrier remains closed by design.
 
 - pass the pinned output schema through `AgentBackend` capabilities;
 - make Codex the first conforming runtime;
@@ -225,6 +233,8 @@ not a reason to keep code.
 
 ### Slice C — Assessment, routing, and replay
 
+Status: not implemented.
+
 - validate one candidate output;
 - persist one server-authored assessment;
 - emit one allowed Workflow signal;
@@ -232,6 +242,8 @@ not a reason to keep code.
 - expose operator-visible failure reasons.
 
 ### Slice D — Dogfood
+
+Status: not implemented.
 
 - run a real classification through the Workflow runtime submission API using Codex;
 - prove operation with no Claude credentials;

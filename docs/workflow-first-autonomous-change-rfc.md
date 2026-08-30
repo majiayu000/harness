@@ -481,7 +481,9 @@ hash. `source_identity` binds external facts to provider, object ID, observation
 version when available.
 
 Evidence is invalid when its schema is unknown, content hash mismatches, producer is unauthorized,
-required code identity is absent, or freshness requirements are not met.
+required code identity is absent, or freshness requirements are not met. Trusted Evidence payload
+schemas are closed: validation rejects unknown fields and requires the exact fields declared by the
+pinned schema version.
 
 `ReviewReceipt` and `AuthorizationReceipt` are specialized, versioned Evidence payloads. Their
 Evidence rows are the only authorization truth consumed by reducers and merge gates. Any dedicated
@@ -519,6 +521,7 @@ Agents MAY propose decisions permitted by an activity contract. Reducers MUST in
 - the decision cannot bypass a higher-priority deterministic gate.
 
 Invalid candidate decisions become explicit contract failures. They never fall through to success.
+Transition paths without an active production caller and focused contract test remain fail-closed.
 
 ### 9.6 `ChildWorkItem`
 
@@ -880,7 +883,7 @@ activities:
   collect_change_facts:
     executor: registered_server
     contract: registered.change_fact_collection.v1
-    produces: [remote_subject_snapshot, code_change_snapshot]
+    produces: [intake_subject_snapshot, code_change_snapshot]
 
   assess_risk:
     executor: agent
@@ -924,6 +927,7 @@ activities:
       cancellation: true
     permissions:
       tools: [read, edit, command]
+      writable_scope: plan_authorized
     produces: [change_set, validation_report]
 
   select_landing_path:
@@ -937,7 +941,9 @@ activities:
     requires:
       structured_output: true
       filesystem: read_only
+      network: none
       fresh_context: true
+    permissions: {tools: [read], provider_actions: []}
     produces: [review_receipt]
 
   integrate_children:
@@ -954,19 +960,23 @@ activities:
     requires:
       structured_output: true
       filesystem: read_only
+      network: none
       fresh_context: true
+    permissions: {tools: [read], provider_actions: []}
     produces: [integration_review_receipt]
 
   review_independent_set:
     executor: agent
     role: independent_reviewer
-    requires: {structured_output: true, filesystem: read_only, fresh_context: true}
+    requires: {structured_output: true, filesystem: read_only, network: none, fresh_context: true}
+    permissions: {tools: [read], provider_actions: []}
     produces: [independent_set_review_receipt]
 
   review_stack:
     executor: agent
     role: independent_reviewer
-    requires: {structured_output: true, filesystem: read_only, fresh_context: true}
+    requires: {structured_output: true, filesystem: read_only, network: none, fresh_context: true}
+    permissions: {tools: [read], provider_actions: []}
     produces: [stack_review_receipt]
 
   release_independent_children:
@@ -993,6 +1003,7 @@ activities:
   merge_change:
     executor: provider_action
     contract: registered.provider_merge.v1
+    idempotency: required
     produces: [merge_attempt_receipt]
 
   evaluate_stack_entry_gate:
@@ -1003,6 +1014,7 @@ activities:
   merge_stack_entry:
     executor: provider_action
     contract: registered.provider_stack_entry_merge.v1
+    idempotency: required
     produces: [merge_attempt_receipt]
 
   reconcile_stack_entry:
@@ -1053,8 +1065,8 @@ evidence:
   code_change_snapshot:
     payload_schema: .harness/schemas/code-change-snapshot.v1.json
     allowed_producers: [server_fact_collector]
-  remote_subject_snapshot:
-    payload_schema: .harness/schemas/remote-pr-snapshot.v1.json
+  intake_subject_snapshot:
+    payload_schema: .harness/schemas/intake-subject-snapshot.v1.json
     allowed_producers: [server_fact_collector]
   decomposition_validation:
     payload_schema: .harness/schemas/decomposition-validation.v1.json
@@ -1065,6 +1077,9 @@ evidence:
   authorization_receipt:
     payload_schema: .harness/schemas/authorization-receipt.v1.json
     allowed_producers: [server_policy_engine, human_operator]
+  operator_recovery_receipt:
+    payload_schema: .harness/schemas/operator-recovery-receipt.v1.json
+    allowed_producers: [human_operator]
   landing_path_selection:
     payload_schema: .harness/schemas/landing-path-selection.v1.json
     allowed_producers: [server_policy_engine]
@@ -1333,8 +1348,10 @@ review, or merge-gate evaluation. Any new push invalidates prior code-bound revi
 
 High-risk work may collect facts, run semantic assessment, and produce a plan. Before a mutating
 activity is dispatched, Harness requires an execution authorization receipt scoped to the exact
-Work Item, Workflow hash, risk assessment, and plan revision. Merge remains human-only even after
-implementation and review.
+Work Item, Workflow hash, risk assessment, plan revision, and authorized writable scope. Runtime
+workspace enforcement MUST reject an attempted write outside that scope before mutation and return
+the Work Item to authorization rather than relying on a later publication gate. Merge remains
+human-only even after implementation and review.
 
 ## 13. Risk and Authorization
 
@@ -1476,7 +1493,9 @@ Harness MUST reject a proposal when:
 - the proposal is based on stale code or fact identity; or
 - it duplicates active or completed work without an explicit replacement relation.
 
-Materialization of children and the parent barrier command MUST commit atomically.
+Materialization of the complete candidate batch and the parent barrier command MUST commit
+atomically. Any illegal candidate aborts the transaction; a database test MUST prove that no child
+is skipped or partially committed.
 
 ### 14.5 Revision
 
@@ -1698,6 +1717,8 @@ authorization or policy denial.
 - Retryability is classified before success-only attestations that could overwrite the original
   transient failure.
 - Every retry has a stable reservation/idempotency identity.
+- Provider actions reconcile an ambiguous remote result before retrying and never repeat an
+  externally confirmed write.
 - Retries preserve enforcement history relevant to the final acceptance decision.
 - Repeated identical contract failures trigger suppression or operator attention.
 - A terminal Work Item never reopens in place; retry creates a new run or an explicit recovery run.
