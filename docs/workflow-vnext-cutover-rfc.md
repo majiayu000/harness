@@ -48,7 +48,10 @@ Use an offline, one-way runtime cutover with a mandatory immutable audit archive
 7. verify an exact, versioned source manifest;
 8. replace only the manifest-owned runtime objects and exact shared rows;
 9. install the verified provider fences and then the vNext epoch; and
-10. start vNext only after its critical storage/epoch handshake succeeds.
+10. start vNext only after its critical storage/epoch handshake succeeds, with production intake
+    and provider dispatch still closed; and
+11. after the observation checks pass, require an explicit operator activation that atomically
+    forfeits production rollback before opening intake or enabling vNext provider credentials.
 
 vNext never reads the audit archive. Audit inspection uses an offline export reader or an isolated
 restoration environment. This preserves the no-compatibility boundary without deleting the only
@@ -66,7 +69,9 @@ flowchart LR
     Verify --> Manifest[Validate scoped source manifest]
     Manifest --> Replace[Transactional runtime replacement]
     Replace --> Epoch[Write vNext epoch last]
-    Epoch --> New[vNext runtime]
+    Epoch --> Observe[Start vNext with production intake closed]
+    Observe --> Activate[Explicitly forfeit rollback]
+    Activate --> New[Open intake and provider dispatch]
     Export -. offline only .-> Audit[Audit reader / isolated restore]
     Audit -. no runtime import .-> New
 ```
@@ -172,19 +177,20 @@ replacement cannot erase the boundary.
 
 ### 7.1 Rollback boundary
 
-Full rollback is available only during the pre-provider-dispatch observation window. Before
-restoring the archived database and old deployment, the operator must stop vNext intake and
-provider dispatch, revoke vNext provider credentials, verify zero vNext provider writers, and prove
-from the server-owned outbox and reconciliation records that no vNext provider action ever entered
-`dispatched`, `in_flight`, `succeeded`, or `unknown`. Missing or incomplete proof refuses rollback.
+Full rollback is available only during a pre-activation observation window in which vNext accepts
+no production submissions and has no enabled provider credentials. Before restoring the archived
+database and old deployment, the operator must verify that intake and provider dispatch remained
+closed, verify zero vNext provider writers, and prove from the server-owned outbox and
+reconciliation records that no vNext provider action ever entered `dispatched`, `in_flight`,
+`succeeded`, or `unknown`. Missing or incomplete proof refuses rollback.
 
-The first vNext provider action that enters dispatch closes the rollback window before any remote
-effect can occur. After that boundary, the archived database remains available for audit and
-isolated restoration, but it MUST NOT be restored as the production runtime: provider writes cannot
-be undone by database rollback, and the old runtime lacks their vNext reconciliation history. An
-incident after the boundary quiesces vNext and uses forward recovery or explicit operator
-reconciliation. This proposal does not introduce a reverse provider fence or a dual-runtime
-compatibility path.
+The explicit activation transaction closes the rollback window before production intake opens or
+provider credentials become usable. After that boundary, the archived database remains available
+for audit and isolated restoration, but it MUST NOT be restored as the production runtime: accepted
+submissions and provider writes cannot be preserved or undone by database rollback, and the old
+runtime lacks their vNext history. An incident after activation quiesces vNext and uses forward
+recovery or explicit operator reconciliation. This proposal does not introduce a replay bridge,
+reverse provider fence, or dual-runtime compatibility path.
 
 ## 8. Alternatives
 
@@ -195,7 +201,7 @@ Pros:
 - preserves the no-runtime-compatibility constraint;
 - retains auditable history;
 - keeps vNext free of legacy readers; and
-- supports full rollback before vNext provider dispatch and incident investigation afterward.
+- supports full rollback before production activation and incident investigation afterward.
 
 Cons:
 
@@ -271,7 +277,8 @@ This RFC cannot move to `Approved` until all of the following exist:
 - a tested old-role/session fencing procedure;
 - a tested provider-writer drain, credential revocation, and zero-writer verification procedure;
 - provider-fence conformance tests for poll, webhook, and direct submission;
-- a rollback rehearsal that proves pre-dispatch restore and post-dispatch refusal; and
+- a rollback rehearsal that proves intake remains closed before activation, pre-activation restore,
+  and post-activation refusal; and
 - an independent operational/database review.
 
 Approval of the umbrella Workflow architecture does not imply approval of this cutover RFC.
