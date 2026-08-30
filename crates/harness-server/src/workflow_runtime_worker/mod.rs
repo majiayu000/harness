@@ -34,6 +34,9 @@ mod server_merge;
 mod server_validation;
 mod transcript_durability;
 pub(crate) mod turn_engine;
+#[cfg(test)]
+#[path = "worker_tick_tests.rs"]
+mod worker_tick_tests;
 mod workspace;
 
 pub(crate) use workspace::cleanup_terminal_runtime_workspace_if_uncontended;
@@ -99,10 +102,6 @@ pub(crate) struct RuntimeJobWorkerTick {
 
 impl RuntimeJobWorkerTick {
     fn from_completed_job(job: Option<RuntimeJob>) -> Self {
-        if job.as_ref().is_some_and(|job| job.status.is_active()) {
-            return Self::default();
-        }
-
         match job.map(|job| job.status) {
             Some(RuntimeJobStatus::Succeeded) => Self {
                 succeeded: 1,
@@ -120,7 +119,7 @@ impl RuntimeJobWorkerTick {
                 idle: true,
                 ..Self::default()
             },
-            Some(_) => Self::default(),
+            Some(RuntimeJobStatus::Pending | RuntimeJobStatus::Running) => Self::default(),
         }
     }
 

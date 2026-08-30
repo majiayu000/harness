@@ -450,7 +450,7 @@ fn runtime_job_terminal_state(job: &RuntimeJob) -> Option<&'static str> {
         RuntimeJobStatus::Succeeded => Some("succeeded"),
         RuntimeJobStatus::Failed => Some("failed"),
         RuntimeJobStatus::Cancelled => Some("cancelled"),
-        _ => None,
+        RuntimeJobStatus::Pending | RuntimeJobStatus::Running => None,
     }
 }
 
