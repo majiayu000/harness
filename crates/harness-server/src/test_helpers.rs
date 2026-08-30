@@ -259,6 +259,15 @@ pub async fn make_test_state_with_registry(
     make_state_inner(dir, dir, agent_registry, HarnessConfig::default()).await
 }
 
+#[cfg(test)]
+pub async fn make_test_state_with_project_root_and_registry(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    agent_registry: AgentRegistry,
+) -> anyhow::Result<AppState> {
+    make_state_inner(dir, project_root, agent_registry, HarnessConfig::default()).await
+}
+
 /// Build a test `AppState` wrapped in `Arc`, using separate data and project-root directories.
 ///
 /// Use this when the test needs to assert that the server uses the configured

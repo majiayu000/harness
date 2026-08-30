@@ -897,5 +897,4 @@ async fn pr_feedback_dispatcher_partitions_agent_summary_and_external_attack() -
     Ok(())
 }
 
-mod agent_contract;
 mod child_workflows;

@@ -3,7 +3,7 @@ use harness_core::agent::AGENT_OUTPUT_SCHEMA_PATH_ENV;
 use harness_core::config::workflow::WorkflowConfig;
 use harness_core::types::AgentId;
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityResult, RuntimeJob, WorkflowInstance, WorkflowTerminalState,
+    ActivityResult, RuntimeJob, WorkflowInstance, WorkflowTerminalState,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -43,6 +43,8 @@ use super::workspace::{
 };
 mod runtime_timeout;
 use runtime_timeout::runtime_profile_with_timeout_fallback;
+mod finalization;
+use finalization::combine_activity_result_with_runtime_workspace_finalization;
 mod egress_evidence;
 use egress_evidence::AgentEgressEvidence;
 mod permission_profile;
@@ -127,8 +129,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         if let Some(pinned) =
             super::agent_contract_enforcement::pinned_agent_contract_for_job(&job)?
         {
-            return super::agent_contract_attempt::execute_contract_job(self.state, &job, pinned)
-                .await;
+            return super::agent_contract_job::execute_contract_job(self.state, &job, pinned).await;
         }
         let source_project_root =
             super::job_context::project_root_for_job(self.state, &job, workflow.as_ref())?;
@@ -548,43 +549,143 @@ fn runtime_worker_disabled_result_for_config(
         ),
     ))
 }
-fn combine_activity_result_with_runtime_workspace_finalization(
-    activity_result: anyhow::Result<ActivityResult>,
-    finish_result: anyhow::Result<()>,
-) -> anyhow::Result<ActivityResult> {
-    match (activity_result, finish_result) {
-        (Ok(result), Err(error)) => {
-            if result.status == harness_workflow::runtime::ActivityStatus::Succeeded {
-                Ok(activity_result_failed_by_runtime_workspace_finalization(
-                    result, &error,
-                ))
-            } else {
-                Ok(result.with_artifact(runtime_workspace_finalization_warning_artifact(&error)))
-            }
-        }
-        (Ok(result), Ok(())) => Ok(result),
-        (Err(error), Err(finish_error)) => Err(error.context(format!(
-            "runtime workspace finalization also failed: {finish_error}"
-        ))),
-        (Err(error), Ok(())) => Err(error),
+#[cfg(test)]
+mod tests {
+    use super::runtime_timeout::runtime_timeout_fallback;
+    use super::*;
+    use harness_core::config::workflow::RuntimeDispatchProfileOverride;
+    use harness_workflow::runtime::{RuntimeKind, RuntimeProfile, WorkflowSubject};
+    use serde_json::json;
+    fn runtime_job(activity: &str) -> RuntimeJob {
+        RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": activity }),
+        )
+    }
+    fn workflow(definition_id: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            definition_id,
+            1,
+            "running",
+            WorkflowSubject::new("issue", "issue-1"),
+        )
+    }
+    #[test]
+    fn runtime_timeout_fallback_prefers_workflow_activity_profile() {
+        let mut config = WorkflowConfig::default();
+        config.runtime_dispatch.timeout_secs = Some(900);
+        config.runtime_dispatch.activity_profiles.insert(
+            "inspect_pr_feedback".to_string(),
+            RuntimeDispatchProfileOverride {
+                timeout_secs: Some(1800),
+                ..RuntimeDispatchProfileOverride::default()
+            },
+        );
+        config.runtime_dispatch.workflow_profiles.insert(
+            "pr_feedback".to_string(),
+            RuntimeDispatchProfileOverride {
+                timeout_secs: Some(240),
+                ..RuntimeDispatchProfileOverride::default()
+            },
+        );
+        config
+            .runtime_dispatch
+            .workflow_activity_profiles
+            .entry("pr_feedback".to_string())
+            .or_default()
+            .insert(
+                "inspect_pr_feedback".to_string(),
+                RuntimeDispatchProfileOverride {
+                    timeout_secs: Some(120),
+                    ..RuntimeDispatchProfileOverride::default()
+                },
+            );
+        assert_eq!(
+            runtime_timeout_fallback(
+                &config,
+                Some(&workflow("pr_feedback")),
+                &runtime_job("inspect_pr_feedback"),
+            ),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn runtime_profile_with_timeout_fallback_preserves_embedded_timeout() {
+        let mut config = WorkflowConfig::default();
+        config.runtime_dispatch.timeout_secs = Some(900);
+        let mut profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+        profile.timeout_secs = Some(42);
+        let profile = runtime_profile_with_timeout_fallback(
+            profile,
+            &config,
+            Some(&workflow("pr_feedback")),
+            &runtime_job("inspect_pr_feedback"),
+        );
+
+        assert_eq!(profile.timeout_secs, Some(42));
+    }
+
+    #[test]
+    fn runtime_timeout_fallback_has_global_activity_defaults() {
+        let config = WorkflowConfig::default();
+        assert_eq!(
+            runtime_timeout_fallback(
+                &config,
+                Some(&workflow("pr_feedback")),
+                &runtime_job("inspect_pr_feedback")
+            ),
+            Some(3600)
+        );
+        assert_eq!(
+            runtime_timeout_fallback(&config, None, &runtime_job("implement_issue")),
+            Some(3600)
+        );
+    }
+
+    #[test]
+    fn runtime_worker_disabled_result_for_config_cancels_agent_work() {
+        let mut config = WorkflowConfig::default();
+        config.runtime_worker.enabled = false;
+        let Some(result) = runtime_worker_disabled_result_for_config(
+            "implement_issue",
+            Path::new("/tmp/project"),
+            &config,
+        ) else {
+            panic!("disabled runtime worker should produce a preflight result");
+        };
+
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Cancelled
+        );
+        assert_eq!(result.activity, "implement_issue");
+        assert!(result
+            .summary
+            .contains("Runtime worker is disabled for project /tmp/project"));
+    }
+
+    #[test]
+    fn runtime_worker_disabled_result_for_config_allows_enabled_project() {
+        let config = WorkflowConfig::default();
+
+        assert!(runtime_worker_disabled_result_for_config(
+            "implement_issue",
+            Path::new("/tmp/project"),
+            &config,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn internal_non_agent_activity_includes_server_owned_pr_inspection() {
+        assert!(is_internal_non_agent_activity(&runtime_job(
+            "inspect_pr_feedback"
+        )));
+        assert!(!is_internal_non_agent_activity(&runtime_job(
+            "implement_issue"
+        )));
     }
 }
-fn activity_result_failed_by_runtime_workspace_finalization(
-    mut result: ActivityResult,
-    error: &anyhow::Error,
-) -> ActivityResult {
-    result.status = harness_workflow::runtime::ActivityStatus::Failed;
-    result.summary =
-        "Runtime workspace finalization failed after the activity completed.".to_string();
-    result.error = Some(format!("runtime workspace finalization failed: {error}"));
-    result.error_kind = Some(harness_workflow::runtime::ActivityErrorKind::Retryable);
-    result.with_artifact(runtime_workspace_finalization_warning_artifact(error))
-}
-fn runtime_workspace_finalization_warning_artifact(error: &anyhow::Error) -> ActivityArtifact {
-    ActivityArtifact::new(
-        "runtime_workspace_finalization_warning",
-        json!({ "error": error.to_string() }),
-    )
-}
-
-include!("mod_tests.rs");
