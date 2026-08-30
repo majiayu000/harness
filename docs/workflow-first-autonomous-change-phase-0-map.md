@@ -666,6 +666,7 @@ CompiledActivity
   requested_action?          # typed authorization action ID
   reconciliation_contract?
   binding_transition_contract? # expected pointer, successor kind, pointer update, CAS mode
+  provider_precondition_contract? # expected provider version, cardinality, atomic stale refusal
   retry_policy
   repair_policy
   budget_policy
@@ -691,7 +692,11 @@ floor evaluation. The compiler checks that the contract exists and that its decl
 schemas and producer classes match.
 
 `executor: provider_action` is a registered server contract with external side effects. It always
-requires explicit idempotency, authority, and reconciliation contracts.
+requires explicit idempotency, authority, provider-precondition, and reconciliation contracts. The
+compiler links the provider precondition to accepted gate Evidence carrying expected absence or an
+exact provider version and verifies that the registry supports atomic conditional writes for its
+single-subject or per-entry cardinality. Local pointer CAS and reconciliation do not satisfy this
+contract.
 
 ### 7.4 Progress modes
 
@@ -1104,6 +1109,8 @@ a destructive transition:
 - current remote facts, CI, threads, review, base, mergeability, risk, and authority are all required;
 - direct and stack merge provider actions reject a missing or stale current binding, gate result, or
   action-specific authorization receipt before external dispatch;
+- every publication or merge provider action rejects a stale expected provider version before
+  mutation; stack republication checks the condition separately and atomically for every entry;
 - provider reports merged but follow-up snapshot is stale/missing, so Work Item does not close;
 - crash after provider merge but before local commit reconciles to one terminal event; and
 - an out-of-scope Agent write produces no accepted partial result, routes to `blocked`, and can resume

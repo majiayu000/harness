@@ -403,6 +403,7 @@ Activity
   requested_action?
   reconciliation_contract?
   binding_transition_contract?
+  provider_precondition_contract?
   retry_policy
   repair_policy
   budget
@@ -419,7 +420,13 @@ evaluator, gate, and target all name the same action.
 successor Evidence kind, pointer update, and concurrency mode. v1 permits only
 `compare_and_swap`. It is valid only for a registered server contract whose registry descriptor
 declares the same inputs, output, and atomic pointer transition; the compiler rejects any mismatch.
-Both optional fields are canonicalized and hashed with the activity.
+
+`provider_precondition_contract` is mandatory for `provider_action`. It names the Evidence carrying
+the provider subject and either expected absence or an exact observed provider version, declares
+single-subject or per-entry cardinality, and requires an atomic provider conditional write. A stale
+precondition fails before mutation; local binding compare-and-swap and later reconciliation cannot
+substitute for it. A provider contract that cannot enforce the declared condition is not registered
+for that action. These optional fields are canonicalized and hashed with the activity.
 
 An `ActivityAttempt` binds the abstract activity to one execution:
 
@@ -1639,6 +1646,11 @@ activities:
     authority: execution_authorization
     requested_action: publish_change
     required_evidence: [change_set, validation_report, authorization_gate_result, authorization_receipt]
+    provider_precondition_contract:
+      expected_versions_from: authorization_gate_result
+      cardinality: single_subject
+      enforcement: atomic_conditional_write
+      on_stale: fail_before_mutation
     binding_transition_contract:
       expected_current_ref: work_item.remote_change_binding_id
       successor_output: remote_change_binding
@@ -1654,6 +1666,11 @@ activities:
     authority: execution_authorization
     requested_action: publish_integrated_change
     required_evidence: [integrated_change_set, validation_report, authorization_gate_result, authorization_receipt]
+    provider_precondition_contract:
+      expected_versions_from: authorization_gate_result
+      cardinality: single_subject
+      enforcement: atomic_conditional_write
+      on_stale: fail_before_mutation
     binding_transition_contract:
       expected_current_ref: work_item.remote_change_binding_id
       successor_output: remote_change_binding
@@ -1682,6 +1699,11 @@ activities:
     authority: merge_authorization
     requested_action: merge_current_subject
     required_evidence: [remote_change_binding, merge_gate_result, authorization_receipt]
+    provider_precondition_contract:
+      expected_versions_from: merge_gate_result
+      cardinality: single_subject
+      enforcement: atomic_conditional_write
+      on_stale: fail_before_mutation
     reconciliation: registered.remote_reconciliation.v1
     produces: [merge_attempt_receipt]
 
@@ -1706,6 +1728,11 @@ activities:
     authority: stack_entry_merge_authorization
     requested_action: merge_current_stack_entry
     required_evidence: [remote_change_binding, merge_gate_result, authorization_receipt]
+    provider_precondition_contract:
+      expected_versions_from: merge_gate_result
+      cardinality: single_subject
+      enforcement: atomic_conditional_write
+      on_stale: fail_before_mutation
     reconciliation: registered.stack_entry_reconciliation.v1
     produces: [merge_attempt_receipt]
 
@@ -1756,6 +1783,11 @@ activities:
     authority: stack_republication_authorization
     requested_action: republish_rebased_stack
     required_evidence: [stack_rebase_context, change_set, validation_report, authorization_gate_result, authorization_receipt]
+    provider_precondition_contract:
+      expected_versions_from: authorization_gate_result
+      cardinality: per_stack_entry
+      enforcement: atomic_conditional_write
+      on_stale: fail_before_mutation
     reconciliation: registered.stack_republication_reconciliation.v1
     produces: [stack_republication_receipt, stack_review_refresh_context]
 
@@ -1902,12 +1934,14 @@ decomposition:
       landing_path_signal: independent_child
       child_review_target: awaiting_parent_handoff
       landing_owner: child
+      completion_milestone: ready_for_parent_review
       parent_release_signal: release_independent
       parent_completion: all_remote_merges_confirmed
     stacked_prs:
       landing_path_signal: stacked_child
       child_review_target: awaiting_parent_handoff
       landing_owner: parent
+      completion_milestone: ready_for_parent_review
       parent_completion_signal: stack_entry_landed
       parent_merge_subject: ordered_child_bindings
       parent_completion: stack_remote_merges_confirmed
@@ -1996,6 +2030,7 @@ stateDiagram-v2
     authorizing_children --> awaiting_child_execution_authorization: human required
     awaiting_direct_execution_authorization --> implementing: direct plan approved
     awaiting_direct_repair_authorization --> repairing_direct_change: repair approved
+    repairing_direct_change --> collecting_implemented_change_facts: repaired code recorded
     awaiting_child_execution_authorization --> materializing_children: child plan approved
     materializing_children --> executing_children: batch committed
     executing_children --> preparing_independent_set_review: independent children ready
@@ -2027,6 +2062,7 @@ stateDiagram-v2
     stack_merge_gate --> awaiting_stack_facts: facts unavailable
     stack_merge_gate --> requesting_stack_child_reviews: review stale
     stack_merge_gate --> stack_rebase_gate: rebase required
+    stack_merge_gate --> reconciling_child_set: stack already complete
     landing_stack_entry --> reconciling_stack_entry
     reconciling_stack_entry --> stack_rebase_gate: more entries
     reconciling_stack_entry --> reconciling_child_set: stack complete
@@ -2562,7 +2598,11 @@ Agent mutation activities never receive provider credentials or provider-action 
 contracts require `network: none` and `provider_actions: []`, while command access remains confined
 to the authorized local workspace. Any attempted external write fails the activity. Publishing,
 updating, or merging a remote object is possible only through a registered `provider_action` with
-its own authority, idempotency, outbox, and reconciliation contracts.
+its own authority, idempotency, outbox, provider-precondition, and reconciliation contracts. The
+outbox command carries expected absence or an exact provider version for every mutated subject from
+its accepted gate result. The provider adapter enforces that condition atomically with the write and
+returns stale without mutation on mismatch. A local binding compare-and-swap or post-write
+reconciliation is never treated as equivalent.
 
 Unknown events in an enforcement-sensitive mode MUST be handled according to a declared safe-event
 policy. For a no-tool classifier, an unknown action-like event cannot be silently ignored and then
@@ -2619,8 +2659,11 @@ binds either one exact local change set/remote binding or a canonical complete c
 including base/head/tree/diff identities and observation revisions. Publication results,
 registered landing-path selection for an unpublished integration child, refreshed provider facts,
 and registered parent-review materialization may produce it. The parent materializer consumes the
-frozen child graph and every required terminal child outcome; for a stack, membership order and
-expected-parent identities are part of the snapshot hash. A missing member, superseded identity,
+frozen child graph and one current strategy-declared milestone-or-terminal `ChildOutcome` for every
+required relation, all bound to the pinned decomposition revision. Independent and stacked children
+use `ready_for_parent_review`; integration children use `ready_for_integration`. A terminal outcome
+is acceptable only when it remains current for that same revision. For a stack, membership order
+and expected-parent identities are part of the snapshot hash. A missing member, superseded identity,
 or identity mismatch cannot create an assignment or receipt.
 
 ### 18.2 Review receipt

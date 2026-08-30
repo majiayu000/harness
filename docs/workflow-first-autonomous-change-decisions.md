@@ -183,17 +183,20 @@ base/head identity, and risk constraints before materializing the plan.
 ### D-010 — Require child-level and parent-level independent review
 
 Every code-producing child receives a fresh-context review by a reviewer identity distinct from the
-author identity. After children complete, the parent receives an integration review that checks
-requirement coverage and cross-child behavior.
+author identity. After children reach their strategy-declared readiness milestone, the parent
+receives a composition review that checks requirement coverage and cross-child behavior.
 
 Child approval proves local correctness. Parent approval proves composition. Neither substitutes
 for the other. Workflow policy may require additional reviewers or specialist roles for higher
 risk, but may not weaken the universal identity-separation and current-head rules.
 
 Before a parent composition review, a registered server materializes a canonical current review
-subject from the complete frozen child graph and all required terminal child outcomes. The parent
-assignment and receipt reference that immutable snapshot Evidence ID and aggregate hash; a list of
-individually approved children is not itself a parent review subject.
+subject from the complete frozen child graph and one current strategy-declared milestone-or-terminal
+outcome for every required relation. Every outcome is bound to the pinned decomposition revision;
+independent and stacked children use `ready_for_parent_review`, while integration children use
+`ready_for_integration`. The parent assignment and receipt reference that immutable snapshot
+Evidence ID and aggregate hash; a list of individually approved children is not itself a parent
+review subject.
 
 ### D-011 — Use a dual-truth reconciliation model
 
