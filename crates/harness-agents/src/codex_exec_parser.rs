@@ -213,7 +213,9 @@ pub(crate) fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecE
             item_id: json_str_field(&value, &["item_id", "itemId"])?.to_string(),
             text: json_str_field(&value, &["delta", "text"])?.to_string(),
         }),
-        _ => Some(ParsedCodexExecEvent::Ignore),
+        _ => Some(ParsedCodexExecEvent::UnknownItemKind {
+            item_type: format!("codex_event:{event_type}"),
+        }),
     }
 }
 

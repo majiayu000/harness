@@ -281,6 +281,12 @@ pub(super) fn contract_violations(attempt: &ContractAttempt) -> Vec<String> {
             attempt.observations.approval_requests
         ));
     }
+    if attempt.observations.tool_output_deltas > 0 {
+        violations.insert(format!(
+            "{} tool output delta(s)",
+            attempt.observations.tool_output_deltas
+        ));
+    }
     violations.into_iter().collect()
 }
 

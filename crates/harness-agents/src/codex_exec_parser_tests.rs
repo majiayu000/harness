@@ -280,3 +280,16 @@ fn parse_exec_unknown_item_kind_surfaces_instead_of_being_ignored() {
         other => panic!("typeless items must surface, got {other:?}"),
     }
 }
+
+#[test]
+fn parse_exec_unknown_top_level_event_surfaces_instead_of_being_ignored() {
+    let line = r#"{"type":"turn.novel_side_effect"}"#;
+    let event = parse_codex_exec_event_line(line).expect("event should parse");
+
+    match event {
+        ParsedCodexExecEvent::UnknownItemKind { item_type } => {
+            assert_eq!(item_type, "codex_event:turn.novel_side_effect");
+        }
+        other => panic!("unknown top-level events must surface, got {other:?}"),
+    }
+}

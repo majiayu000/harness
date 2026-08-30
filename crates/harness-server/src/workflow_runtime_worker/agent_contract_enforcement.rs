@@ -119,6 +119,7 @@ pub(crate) struct TurnStreamObservations {
     pub(crate) started_item_kinds: Vec<String>,
     pub(crate) unknown_item_kinds: Vec<String>,
     pub(crate) approval_requests: u32,
+    pub(crate) tool_output_deltas: u32,
 }
 
 /// Item kinds the runtime recognizes as carrying no tool or mutation surface.
@@ -143,6 +144,9 @@ impl TurnStreamObservations {
             }
             AgentEvent::ApprovalRequest { .. } => {
                 self.approval_requests = self.approval_requests.saturating_add(1);
+            }
+            AgentEvent::ToolOutputDelta { .. } => {
+                self.tool_output_deltas = self.tool_output_deltas.saturating_add(1);
             }
             _ => {}
         }
@@ -202,6 +206,7 @@ pub(super) fn turn_observation_artifact(
             "started_item_kinds": observations.started_item_kinds,
             "unknown_item_kinds": observations.unknown_item_kinds,
             "approval_requests": observations.approval_requests,
+            "tool_output_deltas": observations.tool_output_deltas,
             "reported_models": observations
                 .reported_models
                 .iter()
@@ -214,6 +219,9 @@ pub(super) fn turn_observation_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow_runtime_worker::agent_contract_attempt::{
+        contract_violations, ContractAttempt,
+    };
     use harness_workflow::runtime::RuntimeKind;
 
     fn contract_value() -> Value {
@@ -430,5 +438,26 @@ mod tests {
             artifact.artifact["unknown_item_kinds"],
             json!(["novel_side_effect"])
         );
+    }
+
+    #[test]
+    fn tool_output_deltas_are_contract_violations_and_artifacted() {
+        let mut observations = TurnStreamObservations::default();
+        observations.record_stream_item(&AgentEvent::ToolOutputDelta {
+            item_id: "item-1".to_string(),
+            text: "command output".to_string(),
+        });
+        let attempt = ContractAttempt {
+            output: "{}".to_string(),
+            items: Vec::new(),
+            observations,
+        };
+
+        assert_eq!(
+            contract_violations(&attempt),
+            vec!["1 tool output delta(s)"]
+        );
+        let artifact = turn_observation_artifact(1, &attempt.items, &attempt.observations);
+        assert_eq!(artifact.artifact["tool_output_deltas"], 1);
     }
 }
