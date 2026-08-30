@@ -932,6 +932,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 
 - semantic risk may raise but not lower deterministic floor;
 - missing fact forces abstention/escalation;
+- review-ready existing PR cannot enter review or merge authorization without current semantic
+  risk, and a head refresh invalidates and recomputes that risk before re-review;
 - medium merge lacks receipt and waits;
 - low automatic merge has a current server-policy receipt bound to the exact eligible gate inputs;
 - low automatic stack-entry merge additionally binds integration generation, landing cursor,
@@ -976,6 +978,12 @@ a destructive transition:
 - a held old-worker transaction is rolled back when its exclusive old role is revoked and its
   session terminated; reconnect with that credential fails;
 - a shared database role refuses cutover;
+- final provider-fence capture refuses while any old provider action lacks a reconciled terminal
+  outcome;
+- final provider-fence capture refuses until old provider credentials are revoked and the
+  zero-provider-writer proof succeeds;
+- provider subjects created or changed during drain are recorded at or before the final fence and
+  remain quarantined from automatic vNext intake;
 - the vNext HTTP listener never binds when runtime storage or epoch verification fails;
 - interrupted cutover either commits the complete new epoch or restores/fails closed;
 - a fresh vNext Work Item restarts from its complete `bundle:v2`; and
