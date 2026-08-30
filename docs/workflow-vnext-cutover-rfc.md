@@ -200,12 +200,15 @@ closed, verify zero vNext provider writers, and prove from the server-owned outb
 reconciliation records that no vNext provider action ever entered `dispatched`, `in_flight`,
 `succeeded`, or `unknown`. Missing or incomplete proof refuses rollback.
 
-Rollback never revives the runtime-host authority epoch or credentials revoked by the forward
+Rollback never revives any database, provider, or runtime-host credential revoked by the forward
 fence. After the eligible database and deployment restore, the secret manager mints a distinct
-rollback authority epoch, and every restored host must explicitly re-register under that epoch
-before it can heartbeat or claim work. The listener and intake remain closed until the restored
-runtime verifies the rollback epoch and rejects both the revoked pre-cutover epoch and the abandoned
-vNext epoch.
+rollback database-writer role credential, provider-writer credential set, and runtime-host authority
+epoch and binds all three to the restored deployment. Every restored host must explicitly
+re-register under the rollback epoch before it can heartbeat or claim work. The listener, intake,
+and provider dispatch remain closed until the restored runtime proves database writes under only
+the rollback role, provider access under only the rollback credential set, and rejection of the
+revoked pre-cutover and abandoned vNext credentials and epochs. A rollback credential is never
+shared with or made usable by either fenced deployment.
 
 The explicit activation transaction closes the rollback window before production intake opens or
 provider credentials become usable. After that boundary, the archived database remains available
@@ -288,7 +291,7 @@ Decision: rejected.
 | Shared task rows are over-deleted | Critical | Fixed predicates, locked counts, cleanup preconditions, preservation tests |
 | Old provider object re-enters as new work | High | Provider intake fences and fail-closed unverifiable bindings |
 | Archive becomes an accidental runtime dependency | High | No vNext archive reader; offline tooling and isolated restore only |
-| Rollback crosses incompatible credentials/data or remote side effects | Critical | Permit restore only before any vNext provider dispatch; otherwise quiesce and recover forward |
+| Rollback crosses incompatible credentials/data or remote side effects | Critical | Permit restore only before any vNext provider dispatch; mint rollback-only database/provider/host credentials and bind them to the restored deployment; otherwise quiesce and recover forward |
 
 ## 10. Approval Gates
 
@@ -302,7 +305,8 @@ This RFC cannot move to `Approved` until all of the following exist:
 - a tested provider-writer drain, credential revocation, and zero-writer verification procedure;
 - provider-fence conformance tests for poll, webhook, and direct submission;
 - a rollback rehearsal that proves intake remains closed before activation, pre-activation restore,
-  issuance of a distinct rollback host authority epoch, rejection of both superseded epochs, and
+  issuance and restored-deployment binding of distinct rollback database-writer, provider-writer,
+  and host-authority credentials, rejection of every superseded credential and epoch, and
   post-activation refusal; and
 - a runtime-host fence rehearsal proving scoped snapshot reset, unrelated-store preservation, and
   rejection of old-epoch heartbeats; and
