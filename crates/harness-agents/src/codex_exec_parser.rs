@@ -173,7 +173,9 @@ pub(crate) fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecE
         }),
         "item.started" | "item.completed" => {
             let Some(item_value) = value.get("item") else {
-                return Some(ParsedCodexExecEvent::Ignore);
+                return Some(ParsedCodexExecEvent::UnknownItemKind {
+                    item_type: "missing_item".to_string(),
+                });
             };
             if let Some(message) = parse_codex_error_item_message(item_value) {
                 return Some(ParsedCodexExecEvent::Error { message });

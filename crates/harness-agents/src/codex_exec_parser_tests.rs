@@ -282,6 +282,23 @@ fn parse_exec_unknown_item_kind_surfaces_instead_of_being_ignored() {
 }
 
 #[test]
+fn parse_exec_item_lifecycle_without_item_surfaces_instead_of_being_ignored() {
+    for event_type in ["item.started", "item.completed"] {
+        let line = format!(r#"{{"type":"{event_type}"}}"#);
+        let event = parse_codex_exec_event_line(&line).expect("event should parse");
+
+        assert!(
+            matches!(
+                event,
+                ParsedCodexExecEvent::UnknownItemKind { ref item_type }
+                    if item_type == "missing_item"
+            ),
+            "item lifecycle events without an item must surface, got {event:?}"
+        );
+    }
+}
+
+#[test]
 fn parse_exec_unknown_top_level_event_surfaces_instead_of_being_ignored() {
     let line = r#"{"type":"turn.novel_side_effect"}"#;
     let event = parse_codex_exec_event_line(line).expect("event should parse");
