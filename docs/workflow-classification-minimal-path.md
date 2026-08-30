@@ -21,7 +21,8 @@ structured-output, enforcement, and replay contracts that a future Workflow arch
 
 - The current server already exposes a lexical `complexity_router`; that is not the semantic
   Workflow classifier proposed here.
-- The current `WorkflowActivityPolicy` contains only `prompt` and repository `validation` commands.
+- At the proposal baseline, `WorkflowActivityPolicy` contained only `prompt` and repository
+  `validation` commands. PR #2020 added the strict generic `agent_contract` surface.
 - The current runtime already pins declarative definition identity, persists runtime jobs, records
   runtime events, supports structured `ActivityResult`, and runs Codex through both oneshot and
   per-turn `AgentBackend` surfaces.
@@ -79,7 +80,6 @@ activities:
       output_schema: harness.semantic_verdict.v1
       allowed_outcomes: [small, medium, large, blocked]
       tools: none
-      network: none
       mutation: forbidden
       workspace: ephemeral_empty
       fresh_context: true
@@ -147,8 +147,11 @@ The server-authored assessment additionally binds:
 - final validation result.
 
 Unknown fields, missing provenance, an outcome outside the allowlist, evidence references outside
-the input envelope, any tool, approval, network, or mutation observation, unverifiable model
-identity when required, or a contract/hash mismatch fail the activity explicitly.
+the input envelope, any model-initiated tool, approval, external-data/network, or mutation
+observation, unverifiable model identity when required, or a contract/hash mismatch fail the
+activity explicitly. Provider transport egress to the selected model endpoint is required to run
+the attempt and is not model-visible network permission; `tools: none` forbids model-initiated web
+search or other network tools.
 
 ## 6. Attempt and Correction Semantics
 

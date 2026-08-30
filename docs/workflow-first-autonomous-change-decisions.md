@@ -190,6 +190,11 @@ Child approval proves local correctness. Parent approval proves composition. Nei
 for the other. Workflow policy may require additional reviewers or specialist roles for higher
 risk, but may not weaken the universal identity-separation and current-head rules.
 
+Before a parent composition review, a registered server materializes a canonical current review
+subject from the complete frozen child graph and all required terminal child outcomes. The parent
+assignment and receipt reference that immutable snapshot Evidence ID and aggregate hash; a list of
+individually approved children is not itself a parent review subject.
+
 ### D-011 — Use a dual-truth reconciliation model
 
 - The Harness event log is authoritative for internal execution history, decisions, authorization,
@@ -205,21 +210,26 @@ whose safety depends on current remote state.
 ### D-012 — Use a trusted Evidence envelope with Workflow-defined payloads
 
 The core fixes the evidence envelope fields needed for identity and integrity. Workflow definitions
-provide versioned schemas for domain-specific payloads.
+provide versioned schemas for domain-specific payloads. The fields below use the normative envelope
+refined by the umbrella RFC; they supersede the earlier conceptual names in this decision record.
 
 ```text
 Evidence
-  schema
   evidence_id
+  envelope_schema
   evidence_kind
-  producer
+  payload_schema
+  producer_id
+  producer_class
   producer_role
   subject
-  workflow_instance_id
+  work_item_id
   workflow_definition_hash
-  activity_attempt_id
-  head_sha
-  created_at
+  activity_attempt_id?
+  code_identity?
+  source_identity?
+  observed_at
+  expires_at?
   content_hash
   payload
 ```

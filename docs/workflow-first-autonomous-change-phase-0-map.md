@@ -114,7 +114,8 @@ state.
 
 Severity: Critical
 
-**Fact.** The current compiler validates active states, targets, reachability, terminal mapping, and
+**Baseline fact.** At PR #2019 creation, the compiler validated active states, targets,
+reachability, terminal mapping, and
 activity references (`crates/harness-workflow/src/runtime/declarative.rs:69-90`). The pin hash is
 computed from `WorkflowDefinitionPolicy` only
 (`crates/harness-workflow/src/runtime/declarative_pinning.rs:12-26`). Persisted metadata stores that
@@ -122,6 +123,11 @@ policy but not the complete activity execution contract
 (`crates/harness-workflow/src/runtime/declarative_pinning.rs:29-47`). Historical hydration recreates
 referenced activities as default policies
 (`crates/harness-workflow/src/runtime/declarative_pinning.rs:58-68`).
+
+**Current-head update.** PR #2020 added `declarative_workflow_identity.v2`, which hashes, persists,
+and hydrates the resolved agent-contract map. The remaining vNext gap is the complete compiled
+bundle outside that narrow contract family: evidence, risk, decomposition, review, authorization,
+retry, budget, and recovery policy are not yet pinned together.
 
 **Inference.** Prompt, validation, capability, evidence, retry, review, or authorization changes can
 currently sit outside the canonical pinned bundle. Replay can therefore reconstruct the state graph
@@ -136,8 +142,8 @@ Dispatch must consume only this pinned bundle, not reinterpret the current files
 
 Severity: High
 
-**Fact.** `WorkflowActivityPolicy` currently declares only `prompt` and `validation`
-(`crates/harness-core/src/config/workflow.rs:114-120`). Separately, the server hard-codes accepted
+**Baseline fact.** At PR #2019 creation, `WorkflowActivityPolicy` declared only `prompt` and
+`validation`. PR #2020 added the strict generic `agent_contract`, but the server still hard-codes accepted
 signals, artifacts, no-op signals, and success requirements by workflow and activity name
 (`crates/harness-server/src/workflow_runtime_worker/activity_contract.rs:13-173`). Runtime profile
 selection is held in separate global/workflow/activity override maps
@@ -261,8 +267,9 @@ Severity: High
 stream, interrupt, terminate, steer, and approval operations
 (`crates/harness-core/src/agent.rs:38-127`). `AgentRequest` carries permissions, allowed tools,
 model, reasoning effort, sandbox, approval policy, timeout, and capability token
-(`crates/harness-core/src/agent.rs:129-181`). Backend `capabilities()` currently returns a flat list
-of `Capability` values (`crates/harness-core/src/agent.rs:53-55`).
+(`crates/harness-core/src/agent.rs:129-181`). PR #2025 added fail-closed
+`AgentContractCapabilities` for the pinned semantic-attempt path. The general `capabilities()`
+surface remains a flat list and does not describe the full vNext enforcement profile.
 
 **Inference.** No new `AgentRuntime` trait is required. What is missing is a trusted, structured
 capability descriptor and execution observation contract.
@@ -490,6 +497,10 @@ workflow_integration_progress
   unique(workflow_id, decomposition_revision)
 ```
 
+`provider_intake_fences` is seeded from the verified immutable cutover manifest before the vNext
+epoch is installed. The source fence records live outside the runtime schema being replaced, and
+the vNext listener cannot start until the installed records match that manifest.
+
 The first implementation may store dependency/evidence ID arrays as JSONB, but validation and
 foreign ownership checks remain typed application contracts. A later normalized join table is
 permitted only when query or referential-integrity requirements justify it.
@@ -555,8 +566,8 @@ version and this table must change together; unknown or missing owned objects fa
 | `${workflow_namespace}_runtime` | Migration ledger variant `schema_migrations` or `workflow_runtime_schema_migrations`, applied versions `1..32`; tables `workflow_definitions`, `workflow_instances`, `workflow_events`, `workflow_decisions`, `workflow_commands`, `runtime_jobs`, `runtime_events`, `workflow_artifacts`, `workflow_prompt_payloads`, `remote_fact_snapshots`, `workflow_repo_memory`, `runtime_usage_events`, `runtime_job_lease_renewal_receipts`, `workflow_artifact_dependencies`, `runtime_job_completions_dlq`, `workflow_run_evidence`, `runtime_job_lease_issuances`; functions `enforce_remote_lease_proof_writer()` and `record_runtime_job_lease_issuance()`; triggers `trg_enforce_remote_lease_proof_writer` and `trg_runtime_job_lease_issuance` on `runtime_jobs` | Count every table under lock, fingerprint the whole dedicated schema, then drop/recreate it for vNext | The `pg_catalog` digest must exactly cover relations, columns, constraints, indexes, functions, and triggers. No unlisted object may be dropped. |
 | `${workflow_namespace}_issue` | Ledger variant `schema_migrations` or `issue_workflow_schema_migrations`, applied versions `1..6`; table `issue_workflows` and its indexes/constraints | Count and fingerprint, then drop the superseded dedicated schema | No row is imported. |
 | `${workflow_namespace}_project` | Ledger `schema_migrations`, applied versions `1..4`; table `project_workflows` and its indexes/constraints | Count and fingerprint, then drop the superseded dedicated schema | No row is imported. |
-| `task_db.workspace_cleanup_targets` | Task migration ledger through version 29; rows whose fixed predicate is `runtime_workflow_id IS NOT NULL` | Complete fenced workspace/process cleanup first; assert the locked count is zero; retain the shared table | Never delete a workspace bookkeeping row merely to make cutover pass. Active cleanup must finish or cutover refuses. |
-| `task_db.workspace_leases` | Rows whose fixed predicate is `runtime_workflow_id IS NOT NULL` | Refuse while any matching row is `leased` or has a live process; after normal fenced cleanup, delete only matching released rows | Preserve every row with `runtime_workflow_id IS NULL`; never drop the shared table. |
+| `task_db.workspace_cleanup_targets` | Task migration ledger through version 29; rows whose fixed predicate is `store_key = <configured task-store identity> AND runtime_workflow_id IS NOT NULL` | Complete fenced workspace/process cleanup first; assert the locked count is zero; retain the shared table | Never cross a `store_key` boundary or delete a workspace bookkeeping row merely to make cutover pass. Active cleanup must finish or cutover refuses. |
+| `task_db.workspace_leases` | Rows whose fixed predicate is `store_key = <configured task-store identity> AND runtime_workflow_id IS NOT NULL` | Refuse while any matching row is `leased` or has a live process; after normal fenced cleanup, delete only matching released rows | Preserve every row for another `store_key` and every in-scope row with `runtime_workflow_id IS NULL`; never drop the shared table. |
 
 Configured schema identifiers are validated and quoted; they are not interpolated from unchecked
 input. Dedicated table counts use the manifest's fixed identifiers. Shared-table mutations use fixed,
@@ -622,6 +633,9 @@ CompiledActivity
   required_evidence_rules
   produced_evidence_rules
   allowed_decisions
+  idempotency_contract?
+  authority_contract?
+  reconciliation_contract?
   retry_policy
   repair_policy
   budget_policy
@@ -649,11 +663,18 @@ The compiled core vocabulary is:
   command;
 - `operator_gate`: progresses only from a validated operator action/receipt;
 - `parent_handoff`: child waits for a parent command;
-- `child_barrier`: parent waits for typed child outcomes; and
+- `child_barrier`: parent waits for typed child outcomes;
+- `review_barrier`: waits for the declared quorum of distinct immutable reviewer assignments; and
 - terminal mapping to `succeeded`, `failed`, or `cancelled`.
 
-`child_barrier` is the only required addition to the current progress-mode enum. It is not a general
-DAG executor; graph shape lives in validated child relations.
+`child_barrier` and `review_barrier` are the only required additions to the current progress-mode
+enum. Neither is a general DAG executor: graph shape lives in validated child relations, while
+review quorum lives in compiled review policy and immutable actor assignments.
+
+Entering `review_barrier` atomically creates the declared number of distinct reviewer assignments
+and their review commands for one code identity. Recovery treats the barrier as healthy only when
+every outstanding assignment has exactly one active command or terminal receipt. A changed code
+identity revokes the assignments and receipts; only a complete eligible quorum emits `approved`.
 
 Entering `external_wait` atomically creates a `workflow_external_waits` record, reserves its retry
 budget, and enqueues a delayed idempotent refresh command. Webhook facts and refresh results compare
@@ -667,7 +688,8 @@ Entering `operator_gate` atomically creates a `workflow_operator_gates` record f
 state declaration. It binds the requested action, prerequisite fact/plan/code Evidence, accepted
 receipt kind, and finite signal-to-route map. A receipt can emit only the matching declared signal;
 direct execution, child execution, direct/integration merge, and stack-entry merge are distinct
-actions. Replay uses the gate record and receipt Evidence, never an API hard-coded resume target.
+actions; stack rebase and stack republication are also distinct from each other and from merge.
+Replay uses the gate record and receipt Evidence, never an API hard-coded resume target.
 
 The integration strategy is frozen into child relations and `workflow_integration_progress` before
 children dispatch. A registered server activity deterministically selects the post-implementation
