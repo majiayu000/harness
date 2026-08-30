@@ -27,6 +27,10 @@ This is not an implementation patch. No Rust behavior is authorized by this docu
 reviews have checked internal consistency and repository facts, but the architecture remains
 `Proposed` until the owner approves it.
 
+Current-runtime delivery has advanced independently of this vNext proposal: Slice A merged in PR
+#2020 and Slice B merged in PR #2025. Slice C (assessment, routing, budgets, and replay) and Slice D
+(production Codex-only dogfood) are not implemented. No vNext phase is authorized by those merges.
+
 ## 2. Executive Decision
 
 Harness already has a viable orchestration kernel. The target architecture should extend that
@@ -227,8 +231,9 @@ typed terminal outcome.
 
 **Decision.** Preserve child-start provenance and transaction logic as the low-level primitive. Add
 `workflow_child_relations` and an atomic batch materialization transaction for a validated
-`DecompositionProposal`. Replace definition-specific completion propagation with a generic
-`ChildOutcome` envelope and Workflow-declared parent barrier.
+`DecompositionProposal`. Any illegal candidate aborts the complete batch, and a database test must
+prove that no child is skipped or partially committed. Replace definition-specific completion
+propagation with a generic `ChildOutcome` envelope and Workflow-declared parent barrier.
 
 ### F0-08 — Risk, authorization, and review are not first-class closed-loop contracts
 
@@ -550,9 +555,8 @@ version and this table must change together; unknown or missing owned objects fa
 | `${workflow_namespace}_runtime` | Migration ledger variant `schema_migrations` or `workflow_runtime_schema_migrations`, applied versions `1..32`; tables `workflow_definitions`, `workflow_instances`, `workflow_events`, `workflow_decisions`, `workflow_commands`, `runtime_jobs`, `runtime_events`, `workflow_artifacts`, `workflow_prompt_payloads`, `remote_fact_snapshots`, `workflow_repo_memory`, `runtime_usage_events`, `runtime_job_lease_renewal_receipts`, `workflow_artifact_dependencies`, `runtime_job_completions_dlq`, `workflow_run_evidence`, `runtime_job_lease_issuances`; functions `enforce_remote_lease_proof_writer()` and `record_runtime_job_lease_issuance()`; triggers `trg_enforce_remote_lease_proof_writer` and `trg_runtime_job_lease_issuance` on `runtime_jobs` | Count every table under lock, fingerprint the whole dedicated schema, then drop/recreate it for vNext | The `pg_catalog` digest must exactly cover relations, columns, constraints, indexes, functions, and triggers. No unlisted object may be dropped. |
 | `${workflow_namespace}_issue` | Ledger variant `schema_migrations` or `issue_workflow_schema_migrations`, applied versions `1..6`; table `issue_workflows` and its indexes/constraints | Count and fingerprint, then drop the superseded dedicated schema | No row is imported. |
 | `${workflow_namespace}_project` | Ledger `schema_migrations`, applied versions `1..4`; table `project_workflows` and its indexes/constraints | Count and fingerprint, then drop the superseded dedicated schema | No row is imported. |
-| `task_db.workspace_cleanup_targets_v2` | Rows whose fixed predicate is `runtime_workflow_id IS NOT NULL` | Complete fenced workspace/process cleanup first; assert the locked count is zero; retain the shared table | Never delete a workspace bookkeeping row merely to make cutover pass. Active cleanup must finish or cutover refuses. |
+| `task_db.workspace_cleanup_targets` | Task migration ledger through version 29; rows whose fixed predicate is `runtime_workflow_id IS NOT NULL` | Complete fenced workspace/process cleanup first; assert the locked count is zero; retain the shared table | Never delete a workspace bookkeeping row merely to make cutover pass. Active cleanup must finish or cutover refuses. |
 | `task_db.workspace_leases` | Rows whose fixed predicate is `runtime_workflow_id IS NOT NULL` | Refuse while any matching row is `leased` or has a live process; after normal fenced cleanup, delete only matching released rows | Preserve every row with `runtime_workflow_id IS NULL`; never drop the shared table. |
-| `task_db.workspace_cleanup_targets` compatibility view and `task_db.reject_legacy_workspace_cleanup_targets()` function | Task migration 31 compatibility surface | Drop through a normal new `task_db` migration in the cutover release | Retain the shared `task_db.schema_migrations` ledger and all unrelated task tables/rows. |
 
 Configured schema identifiers are validated and quoted; they are not interpolated from unchecked
 input. Dedicated table counts use the manifest's fixed identifiers. Shared-table mutations use fixed,

@@ -36,14 +36,13 @@ real deployment or a current production clone.
 
 Use an offline, one-way runtime cutover with a mandatory immutable audit archive:
 
-1. stop pre-vNext intake and writers;
-2. create and verify a versioned audit archive;
-3. capture provider intake fences;
-4. fence old database credentials and sessions;
-5. verify an exact, versioned source manifest;
-6. replace only the manifest-owned runtime objects and exact shared rows;
-7. install the vNext epoch last; and
-8. start vNext only after its critical storage/epoch handshake succeeds.
+1. atomically stop pre-vNext intake and capture provider intake fences;
+2. revoke old database-writer access, terminate its sessions, and verify zero remaining writers;
+3. create and verify a versioned audit archive from the fenced source;
+4. verify an exact, versioned source manifest;
+5. replace only the manifest-owned runtime objects and exact shared rows;
+6. install the vNext epoch last; and
+7. start vNext only after its critical storage/epoch handshake succeeds.
 
 vNext never reads the audit archive. Audit inspection uses an offline export reader or an isolated
 restoration environment. This preserves the no-compatibility boundary without deleting the only
@@ -51,11 +50,11 @@ auditable record of earlier decisions.
 
 ```mermaid
 flowchart LR
-    Old[Pre-vNext runtime] --> Stop[Stop intake and writers]
-    Stop --> Export[Create immutable audit archive]
+    Old[Pre-vNext runtime] --> Stop[Stop intake and capture provider fence]
+    Stop --> Fence[Revoke old DB role and terminate sessions]
+    Fence --> Export[Create immutable audit archive]
     Export --> Verify[Verify digest and restore drill]
-    Verify --> Fence[Capture provider fences and revoke old DB role]
-    Fence --> Manifest[Validate scoped source manifest]
+    Verify --> Manifest[Validate scoped source manifest]
     Manifest --> Replace[Transactional runtime replacement]
     Replace --> Epoch[Write vNext epoch last]
     Epoch --> New[vNext runtime]
@@ -65,7 +64,8 @@ flowchart LR
 
 ## 4. Mandatory Audit Archive
 
-The archive MUST be created before destructive mutation and MUST contain:
+The archive MUST be created after the old writer fence and before destructive data mutation. It
+MUST contain:
 
 - manifest version and configured schema names;
 - source schema epoch and applied migration-ledger variants;
@@ -133,15 +133,17 @@ evidence.
 
 ## 7. Writer and Provider Fencing
 
-An advisory lock is not sufficient to fence already-connected writers. A future approved cutover
-must use a Harness-exclusive old database role, revoke its login/privileges, terminate its sessions,
-verify zero remaining sessions, and provision a distinct vNext role. If the role is shared with a
-non-Harness client, cutover refuses.
+An advisory lock is not sufficient to fence already-connected writers. Before the archive snapshot,
+a future approved cutover must use a Harness-exclusive old database role, revoke its
+login/privileges, terminate its sessions, verify zero remaining sessions, and provision a distinct
+vNext role. If the role is shared with a non-Harness client, cutover refuses.
 
-Provider intake fences prevent pre-cutover issues or pull requests from being rediscovered as new
-vNext Work Items. An unverifiable provider boundary disables automatic intake for that binding.
-Explicit adoption requires a human authorization receipt and creates new vNext identities; it does
-not import old Harness runtime state.
+The provider boundary is captured atomically with stopping pre-vNext intake. Subjects at or before
+the boundary remain fenced from vNext rediscovery; subjects created after it are preserved for
+normal vNext intake and are not suppressed merely because they arrived during archive or restore
+work. An unverifiable boundary disables automatic intake for that binding. Explicit adoption
+requires a human authorization receipt and creates new vNext identities; it does not import old
+Harness runtime state.
 
 ## 8. Alternatives
 
