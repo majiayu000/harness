@@ -38,10 +38,16 @@ impl WorkflowCommandStatus {
     }
 
     pub fn is_active(self) -> bool {
-        matches!(
-            self,
-            Self::Pending | Self::Dispatching | Self::Deferred | Self::Dispatched
-        )
+        match self {
+            Self::Pending | Self::Dispatching | Self::Deferred | Self::Dispatched => true,
+            Self::HandledInline
+            | Self::Completed
+            | Self::Failed
+            | Self::Blocked
+            | Self::Cancelled
+            | Self::Skipped
+            | Self::Superseded => false,
+        }
     }
 }
 

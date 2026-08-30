@@ -510,7 +510,10 @@ pub enum RuntimeJobStatus {
 
 impl RuntimeJobStatus {
     pub fn is_active(self) -> bool {
-        matches!(self, Self::Pending | Self::Running)
+        match self {
+            Self::Pending | Self::Running => true,
+            Self::Succeeded | Self::Failed | Self::Cancelled => false,
+        }
     }
 }
 
