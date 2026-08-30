@@ -482,6 +482,10 @@ workflow_external_waits
   state_id
   wait_kind
   subject jsonb
+  bound_evidence_ids jsonb
+  wait_snapshot_evidence_id foreign key workflow_evidence(id)
+  invalidation_evidence_id nullable foreign key workflow_evidence(id)
+  invalidation_mode nullable       # fenced_open | quarantined_closed_unmerged | violated
   last_fact_identity jsonb nullable
   refresh_contract_id
   refresh_command_id nullable
@@ -523,6 +527,8 @@ workflow_control_continuations
   driver_deadline_at nullable
   driver_budget_reservation_id nullable
   driver_dedupe_identity
+  overlay_evidence_ids jsonb
+  overlay_status jsonb         # pending | routed_to_reconciliation | consumed
   status                    # active | restored | invalidated | failed
   created_at
   completed_at nullable
@@ -567,6 +573,16 @@ commands. Invalidation locks the same rows, compare-and-swaps that pointer to nu
 accepted generation invalidated, and commits sibling fences/commands atomically. The partial unique
 constraint prevents two current generations; replay or a losing concurrent invalidation reloads
 the accepted row rather than selecting a snapshot by time.
+
+If an affected child has an active cancellation continuation, the same invalidation transaction
+locks that row, appends the invalidation Evidence as a pending overlay, and fences the preserved
+driver generation. Cancellation denial atomically consumes the overlay into handoff only when
+neither a provider attempt nor an external-merge wait exists. A possible provider outcome enters
+reconciliation; an external-merge wait returns in fenced invalidation mode and schedules an
+immediate refresh. It cannot restore the invalidated merge driver. Authorization retains the
+overlay while the dedicated cancellation fact-collection step binds the continuation driver,
+external wait snapshot when present, invalidation Evidence when present, and a fresh remote
+confirmation before admission. Recovery never infers or drops an overlay from event timing.
 
 `provider_intake_fences` is seeded from the verified immutable cutover manifest before the vNext
 epoch is installed. The source fence records live outside the runtime schema being replaced, and
@@ -722,8 +738,9 @@ CompiledActivity
   requested_action?          # typed authorization action ID
   reconciliation_contract?
   binding_transition_contract? # expected pointer, successor kind, pointer update, CAS mode
-  provider_precondition_contract? # expected absence/version, cardinality, atomic stale refusal
-  action_agent_contract?       # registry-resolved and pinned for provider_action only
+  provider_precondition_contract? # publication version or full merge predicate, cardinality, atomic refusal
+  provider_implementation_policy? # capability, resolving gate, closed missing route
+  action_agent_contract?       # provider-specific; instance-pinned when implementation exists
   retry_policy
   repair_policy
   budget_policy
@@ -740,10 +757,23 @@ registered server contract or the server-owned completion fold of a provider-act
 Unknown actions, unlinked targets, mismatched human gates, unsupported concurrency modes, or
 registry mismatches fail definition compilation.
 
+For a provider implementation policy, the compiler resolves the provider-neutral contract and
+proves that the named gate activity declares the missing-capability signal in every applicable
+state. Instance intake resolves and pins the subject provider's executable descriptor or that exact
+route. A missing provider implementation is never treated as an unknown abstract contract or a
+dispatch-time fallback.
+
 `required_evidence_rules` use a closed all-of form with exhaustive server-owned selectors such as
 the current landing relation or whether a current remote binding exists. Compilation rejects an
 unknown selector or missing case. Runtime resolution pins the selected Evidence IDs and digests;
 an Agent cannot select a case and undeclared mutable state cannot satisfy a requirement.
+
+Stack-entry merge gates explicitly consume the complete child outcomes, aggregate review subject,
+aggregate semantic risk, current stack review receipt, and current remote binding. Revalidation and
+the provider target preserve that declared Evidence chain. Each evaluation materializes a trusted
+stack-entry gate snapshot from the locked integration generation/cursor, and downstream activities
+consume the exact snapshot bound by the gate result; no gate may reconstruct it from a mutable
+projection.
 
 `executor: agent` never names Codex, Claude, OpenCode, or a model. Runtime profiles advertise
 capabilities; the dispatcher chooses an eligible profile using operator configuration. Model choice
@@ -755,10 +785,12 @@ schemas and producer classes match.
 
 `executor: provider_action` is a server-orchestrated outbox contract whose external step executes
 only through a constrained, action-specific AgentBackend prompt. The registry descriptor supplies
-that prompt contract and the server-owned completion/reconciliation fold; the resolved descriptor is
-pinned in the compiled bundle rather than repeated in each Workflow activity. Harness validates the
-authority, Evidence, current binding, expected provider precondition (absence or exact version), and
-idempotency key before dispatch,
+the provider-neutral schema/fold/capability contract. Compilation pins it plus a closed missing-
+implementation route; instance intake pins either the subject provider's executable prompt
+descriptor or that route. Unknown neutral contracts fail compilation, while a known provider such
+as GitHub may deliberately lack a merge implementation without making the external-observation
+profile uncompilable. Harness validates the authority, Evidence, current binding, and the
+action-specific provider precondition before dispatch,
 but no Harness crate invokes `gh`, `git`, or a mutating provider SDK. The action turn receives an
 allowlist containing exactly the typed `requested_action`; scoped credentials come from its runtime
 profile, never from prompt or Evidence. Its response is a candidate until the server validates a
@@ -766,10 +798,11 @@ provider-authenticated webhook or runtime-captured provider transport receipt an
 truth.
 
 The compiler still requires explicit idempotency, authority, provider-precondition, and
-reconciliation contracts. It links the provider precondition to accepted gate Evidence carrying
-expected absence or an exact provider version and verifies that the registered AgentBackend path can
-invoke a provider-native atomic conditional write for its single-subject or per-entry cardinality.
-Prompted check-then-write, local pointer CAS, and reconciliation do not satisfy this contract.
+reconciliation contracts. For publication it links accepted gate Evidence carrying expected absence
+or an exact provider version. For merge it links the complete trusted gate-fact snapshot and requires
+the `atomic_full_merge_predicate` capability. The registered AgentBackend path must invoke the
+corresponding provider-native atomic primitive for its cardinality. Prompted check-then-write, local
+pointer CAS, and reconciliation do not satisfy this contract.
 Per-entry stack publication retains separate versions/idempotency keys and reconciles partial
 success without replaying completed entries. Each completed entry produces a successor immutable
 remote binding and compare-and-swaps that child's exact current binding pointer before advancing the
@@ -782,10 +815,17 @@ snapshot. An unbound case pins expected absence; an already-bound PR pins both t
 binding and exact provider version. Any mismatch before mutation is stale rather than an implicit
 refresh or replacement publication.
 
+Merge provider actions require an `atomic_full_merge_predicate` capability that covers the complete
+trusted gate-fact snapshot in one provider-native operation. GitHub v1 does not advertise it because
+the documented merge endpoint conditions only on head SHA. Direct and stack GitHub gates therefore
+route to external-merge waits and accept only authenticated remote confirmation; Harness never
+dispatches a GitHub merge action at any risk tier.
+
 Before provider I/O, the constrained tool channel must compare its operation, subject, typed action,
-idempotency key, and expected absence/version with the pinned action request. Omission or mismatch
-fails without network dispatch, and no unconditional primitive for the same mutation is exposed. A
-path that can validate these values only after a write cannot register as a provider action.
+idempotency key, and action-specific publication/merge precondition with the pinned action request.
+Omission or mismatch fails without network dispatch, and no unconditional primitive for the same
+mutation is exposed. A path that can validate these values only after a write cannot register as a
+provider action.
 
 The transport receipt is an immutable `workflow_evidence` row with the
 `provider-transport-receipt.v1` payload schema, `runtime_enforcement` producer class, and the attempt
@@ -831,9 +871,21 @@ backoff and cumulative attempt count. A changed but still nonterminal fact updat
 record without consuming a refresh attempt and never recreates its deadline or budget reservation.
 Only eligible/failed terminal facts,
 remote failure, the original deadline, or cumulative budget exhaustion follow declared routes.
-Completion cancels or supersedes the pending refresh command. Recovery accepts an active wait as
-healthy only when its original deadline, reservation, cumulative attempts, and next refresh command
-are all present.
+Completion cancels or supersedes the pending refresh command. An invalidated external-merge wait is
+not complete merely because one refresh observes an open, unmerged subject: it keeps the same wait,
+webhook identity, deadline, budget, and refresh schedule until the exact remote subject is proven
+closed unmerged, a post-invalidation merge or identity drift blocks, or an ordinary wait failure
+blocks. Recovery accepts an active wait as healthy only when its original deadline, reservation,
+cumulative attempts, and next refresh command are all present.
+
+An external-merge wait also persists one immutable wait snapshot containing every bound gate,
+binding, review, risk, authorization, and stack-progress Evidence ID. Its confirmation can dispatch
+only the dedicated external reconciliation contract. Independent-release invalidation stores its
+Evidence on the same wait, switches it to fenced invalidation mode, and schedules an immediate
+reconciliation refresh. The parent cannot create a later release while that quarantine remains
+open. Only a provider-confirmed closed-unmerged subject releases the child to parent handoff; a
+post-invalidation merge is reported as a policy violation rather than accepted against the old
+generation.
 
 Waits entered after a human merge receipt are distinct compiled states from pre-authorization
 waits. They persist the receipt-bearing continuation and return only to the matching deterministic
@@ -1286,6 +1338,18 @@ a destructive transition:
 - independent release invalidation has an exhaustive non-cancellation state set; queued writes are
   fenced, while running/returned/ambiguous provider outcomes retain reconciliation until remote
   truth proves merge or absence, without discarding an active control continuation;
+- if cancellation already owns the child state, release invalidation atomically attaches a durable
+  overlay to the preserved continuation and fences its driver; denial consumes the overlay into
+  handoff or reconciliation instead of restoring the invalidated merge generation;
+- stack-entry gate, revalidation, and provider dispatch reject missing/stale child outcomes,
+  aggregate risk, aggregate subject, stack review receipt, merge facts, or remote binding;
+- GitHub direct and stack gates never emit a Harness merge command: low risk waits externally, and
+  medium/high enter that wait only after human authorization plus revalidation;
+- every external-merge wait persists an immutable snapshot of its binding, gate facts/result,
+  authorization, review/risk inputs, and stack generation/cursor when applicable; confirmation is
+  consumed only by its dedicated reconciliation activity;
+- independent release invalidation switches an external-merge wait to fenced invalidation mode and
+  immediately refreshes it; a later merge blocks as a policy violation instead of satisfying the child;
 - direct and stack merge provider actions reject a missing or stale current binding, gate result, or
   action-specific authorization receipt before external dispatch;
 - every publication or merge provider action rejects a stale expected absence/version before
