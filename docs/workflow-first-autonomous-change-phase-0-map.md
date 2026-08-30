@@ -940,7 +940,10 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - low automatic stack-entry merge additionally binds integration generation, landing cursor,
   current binding/code identity, and `merge_current_stack_entry`;
 - high mutation lacks plan receipt and waits;
-- expired/revoked/wrong-scope receipt rejected; and
+- expired/revoked/wrong-scope receipt rejected;
+- stack rebase follows execution risk tiers and binds its current context and output scope, while
+  every stack republication requires a human receipt derived from the validated rewrite and bound
+  to the exact pre/post identities; and
 - human risk override is reasoned, scoped, expiring, and auditable.
 - risk override invalidates on fact, definition, scope, plan, code, expiry, or revocation change.
 
@@ -987,9 +990,10 @@ a destructive transition:
   zero-provider-writer proof succeeds;
 - provider subjects created or changed during drain are recorded at or before the final fence and
   remain quarantined from automatic vNext intake;
-- rollback succeeds only before any vNext provider action enters dispatch, after vNext intake and
-  provider writers are fenced; missing eligibility proof or any dispatched/in-flight/succeeded/
-  unknown vNext provider action refuses production restore and requires forward recovery;
+- vNext accepts no production submission and enables no provider credential before explicit
+  activation atomically forfeits rollback; restore succeeds only before activation, while missing
+  eligibility proof or any post-activation state refuses production restore and requires forward
+  recovery;
 - the vNext HTTP listener never binds when runtime storage or epoch verification fails;
 - interrupted cutover either commits the complete new epoch or restores/fails closed;
 - a fresh vNext Work Item restarts from its complete `bundle:v2`; and
@@ -1000,6 +1004,8 @@ a destructive transition:
 - author/reviewer assignment or run collision rejects approval;
 - inherited author context rejects fresh-context claim;
 - head change invalidates receipt;
+- every `changes_requested` route supplies the current findings-bearing receipt to its distinct
+  repair planning or mutation activity;
 - issue-first publish retries resolve to one remote change binding and one provider object;
 - CI pending enters external wait, unavailable retries within budget, failed follows repair/block,
   and only eligible reaches authorization;

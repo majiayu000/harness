@@ -626,6 +626,24 @@ definition:
         high: leaf_review_direct
         abstain: blocked
       on_failure: blocked
+    collecting_direct_repair_facts:
+      activity: collect_change_facts
+      on_success: assessing_direct_repair_risk
+      on_failure: blocked
+    assessing_direct_repair_risk:
+      activity: assess_risk
+      on_signal:
+        low: planning_direct_repair
+        medium: planning_direct_repair
+        high: planning_direct_repair
+        abstain: blocked
+      on_failure: blocked
+    planning_direct_repair:
+      activity: plan_direct_repair
+      on_signal:
+        direct: authorizing_direct
+        decompose: validating_decomposition
+        abstain: blocked
     planning:
       activity: plan_change
       on_signal:
@@ -687,8 +705,14 @@ definition:
       activity: review_independent_set
       on_signal:
         approved: releasing_independent_children
-        changes_requested: planning
+        changes_requested: planning_independent_set_repair
         blocked: blocked
+    planning_independent_set_repair:
+      activity: plan_independent_set_repair
+      on_signal:
+        direct: authorizing_direct
+        decompose: validating_decomposition
+        abstain: blocked
     preparing_stack_review:
       activity: materialize_parent_review_subject
       on_success: reviewing_stack
@@ -716,14 +740,28 @@ definition:
       activity: review_stack
       on_signal:
         approved: stack_merge_gate
-        changes_requested: planning
+        changes_requested: planning_stack_repair
         blocked: blocked
+    planning_stack_repair:
+      activity: plan_stack_repair
+      on_signal:
+        direct: authorizing_direct
+        decompose: validating_decomposition
+        abstain: blocked
     integrating:
       activity: integrate_children
       on_success: publishing_integrated_change
       on_failure: blocked
+    repairing_integration:
+      activity: repair_integration
+      on_success: publishing_integrated_change
+      on_failure: blocked
     implementing:
       activity: implement_change
+      on_success: routing_implemented_change
+      on_failure: blocked
+    repairing_child_change:
+      activity: repair_child_change
       on_success: routing_implemented_change
       on_failure: blocked
     routing_implemented_change:
@@ -750,14 +788,14 @@ definition:
       activity: review_change
       on_signal:
         approved: merge_gate
-        changes_requested: collecting_facts
+        changes_requested: collecting_direct_repair_facts
         blocked: blocked
       on_failure: blocked
     leaf_review_child:
       activity: review_change
       on_signal:
         approved: awaiting_parent_handoff
-        changes_requested: implementing
+        changes_requested: repairing_child_change
         blocked: blocked
       on_failure: blocked
     awaiting_parent_handoff:
@@ -776,7 +814,7 @@ definition:
         quorum_policy: integration
       on_signal:
         approved: merge_gate
-        changes_requested: integrating
+        changes_requested: repairing_integration
         blocked: blocked
       on_failure: blocked
     merge_gate:
@@ -1043,6 +1081,33 @@ activities:
     retry:
       max_attempts: 2
 
+  plan_direct_repair:
+    executor: agent
+    requires: {structured_output: true, filesystem: read_only, network: none, tools: [read]}
+    input_schema: change_plan_input.v1
+    output_schema: change_plan_output.v1
+    required_evidence: [intake_subject_snapshot, semantic_risk_assessment, review_receipt]
+    allowed_decisions: [direct, decompose, abstain]
+    produces: [implementation_plan, decomposition_proposal]
+
+  plan_independent_set_repair:
+    executor: agent
+    requires: {structured_output: true, filesystem: read_only, network: none, tools: [read]}
+    input_schema: change_plan_input.v1
+    output_schema: change_plan_output.v1
+    required_evidence: [intake_subject_snapshot, semantic_risk_assessment, independent_set_review_receipt]
+    allowed_decisions: [direct, decompose, abstain]
+    produces: [implementation_plan, decomposition_proposal]
+
+  plan_stack_repair:
+    executor: agent
+    requires: {structured_output: true, filesystem: read_only, network: none, tools: [read]}
+    input_schema: change_plan_input.v1
+    output_schema: change_plan_output.v1
+    required_evidence: [intake_subject_snapshot, semantic_risk_assessment, stack_review_receipt]
+    allowed_decisions: [direct, decompose, abstain]
+    produces: [implementation_plan, decomposition_proposal]
+
   validate_decomposition:
     executor: registered_server
     contract: registered.decomposition_validation.v1
@@ -1081,6 +1146,23 @@ activities:
     allowed_decisions: []
     produces: [change_set, validation_report]
 
+  repair_child_change:
+    executor: agent
+    requires:
+      structured_output: true
+      filesystem: isolated_write
+      network: none
+      cancellation: true
+    permissions:
+      tools: [read, edit, command]
+      provider_actions: []
+      writable_scope: plan_authorized
+    input_schema: change_implementation_input.v1
+    output_schema: change_implementation_output.v1
+    required_evidence: [implementation_plan, authorization_gate_result, review_receipt]
+    allowed_decisions: []
+    produces: [change_set, validation_report]
+
   select_landing_path:
     executor: registered_server
     contract: registered.landing_path_selection.v1
@@ -1115,6 +1197,23 @@ activities:
     input_schema: child_integration_input.v1
     output_schema: child_integration_output.v1
     required_evidence: [decomposition_validation, child_materialization, child_outcome, authorization_gate_result]
+    allowed_decisions: []
+    produces: [integrated_change_set, validation_report]
+
+  repair_integration:
+    executor: agent
+    requires:
+      structured_output: true
+      filesystem: isolated_write
+      network: none
+      cancellation: true
+    permissions:
+      tools: [read, edit, command]
+      provider_actions: []
+      writable_scope: plan_authorized
+    input_schema: child_integration_input.v1
+    output_schema: child_integration_output.v1
+    required_evidence: [decomposition_validation, child_materialization, child_outcome, authorization_gate_result, integration_review_receipt]
     allowed_decisions: []
     produces: [integrated_change_set, validation_report]
 
@@ -1219,6 +1318,8 @@ activities:
   evaluate_stack_rebase_authority:
     executor: registered_server
     contract: registered.stack_rebase_authority_gate.v1
+    authority: stack_rebase_authorization
+    required_evidence: [stack_rebase_context]
     produces: [authorization_gate_result, authorization_receipt]
 
   rebase_remaining_stack:
@@ -1242,6 +1343,8 @@ activities:
   evaluate_stack_republication_authority:
     executor: registered_server
     contract: registered.stack_republication_authority_gate.v1
+    authority: stack_republication_authorization
+    required_evidence: [stack_rebase_context, change_set, validation_report]
     produces: [authorization_gate_result, authorization_receipt]
 
   publish_rebased_stack:
@@ -1249,6 +1352,7 @@ activities:
     contract: registered.provider_stack_republish.v1
     idempotency: required
     authority: stack_republication_authorization
+    required_evidence: [change_set, validation_report, authorization_receipt]
     reconciliation: registered.remote_binding_reconciliation.v1
     produces: [stack_republication_receipt, remote_change_binding]
 
@@ -1425,6 +1529,14 @@ authorization:
     low: automatic
     medium: human
     high: human_only
+  stack_rebase_authorization:
+    low: automatic
+    medium: automatic
+    high: human
+  stack_republication_authorization:
+    low: human_only
+    medium: human_only
+    high: human_only
 ```
 
 ### 10.1 Declaration versus reality
@@ -1447,6 +1559,10 @@ stateDiagram-v2
     collecting_facts --> assessing_review_risk: existing PR review-ready
     assessing_risk --> planning
     assessing_review_risk --> leaf_review_direct: risk classified
+    collecting_direct_repair_facts --> assessing_direct_repair_risk: facts refreshed
+    assessing_direct_repair_risk --> planning_direct_repair: risk classified
+    planning_direct_repair --> authorizing_direct: direct repair plan
+    planning_direct_repair --> validating_decomposition: repair decomposition proposed
     planning --> authorizing_direct: direct plan
     planning --> validating_decomposition: decomposition proposed
     validating_decomposition --> authorizing_children: valid
@@ -1463,14 +1579,18 @@ stateDiagram-v2
     preparing_stack_review --> reviewing_stack: ordered identity materialized
     executing_children --> integrating: integration inputs ready
     reviewing_independent_set --> releasing_independent_children: approved
-    reviewing_independent_set --> planning: changes requested
+    reviewing_independent_set --> planning_independent_set_repair: changes requested
+    planning_independent_set_repair --> authorizing_direct: direct repair plan
+    planning_independent_set_repair --> validating_decomposition: repair decomposition proposed
     releasing_independent_children --> awaiting_independent_landing
     awaiting_independent_landing --> reconciling_child_set: all remotely merged
     awaiting_independent_landing --> awaiting_independent_re_reviews: child review stale
     awaiting_independent_re_reviews --> preparing_independent_set_review: child reviews current
     reconciling_child_set --> done
     reviewing_stack --> stack_merge_gate: approved
-    reviewing_stack --> planning: changes requested
+    reviewing_stack --> planning_stack_repair: changes requested
+    planning_stack_repair --> authorizing_direct: direct repair plan
+    planning_stack_repair --> validating_decomposition: repair decomposition proposed
     stack_merge_gate --> landing_stack_entry: entry eligible
     stack_merge_gate --> awaiting_stack_merge_authorization: human required
     stack_merge_gate --> awaiting_stack_checks: checks pending
@@ -1494,21 +1614,23 @@ stateDiagram-v2
     awaiting_stack_child_reviews --> preparing_stack_review: all leaf reviews current
     awaiting_parent_handoff --> refreshing_child_review_facts: re-review required
     implementing --> routing_implemented_change
+    repairing_child_change --> routing_implemented_change
     routing_implemented_change --> publishing_direct_change: direct
     routing_implemented_change --> publishing_child_change: independent or stacked child
     routing_implemented_change --> leaf_review_child: integration child
     publishing_direct_change --> leaf_review_direct: bound
     publishing_child_change --> leaf_review_child: bound
-    leaf_review_direct --> collecting_facts: changes requested
+    leaf_review_direct --> collecting_direct_repair_facts: changes requested
     leaf_review_direct --> merge_gate: approved
-    leaf_review_child --> implementing: changes requested
+    leaf_review_child --> repairing_child_change: changes requested
     leaf_review_child --> awaiting_parent_handoff: approved
     awaiting_parent_handoff --> merge_gate: independent released
     awaiting_parent_handoff --> reconciling: stack entry landed
     awaiting_parent_handoff --> done: integration contribution accepted
     integrating --> publishing_integrated_change
+    repairing_integration --> publishing_integrated_change
     publishing_integrated_change --> integration_review: bound
-    integration_review --> integrating: changes requested
+    integration_review --> repairing_integration: changes requested
     integration_review --> merge_gate: approved
     merge_gate --> merging: low risk auto-authorized
     merge_gate --> awaiting_merge_authorization: medium/high
@@ -1537,6 +1659,9 @@ stateDiagram-v2
     collecting_facts --> blocked
     assessing_risk --> blocked
     assessing_review_risk --> blocked
+    collecting_direct_repair_facts --> blocked
+    assessing_direct_repair_risk --> blocked
+    planning_direct_repair --> blocked
     planning --> blocked
     validating_decomposition --> blocked
     authorizing_direct --> blocked
@@ -1547,13 +1672,16 @@ stateDiagram-v2
     executing_children --> blocked
     preparing_independent_set_review --> blocked
     reviewing_independent_set --> blocked
+    planning_independent_set_repair --> blocked
     releasing_independent_children --> blocked
     awaiting_independent_landing --> blocked
     awaiting_independent_re_reviews --> blocked
     reconciling_child_set --> blocked
     preparing_stack_review --> blocked
     reviewing_stack --> blocked
+    planning_stack_repair --> blocked
     implementing --> blocked
+    repairing_child_change --> blocked
     routing_implemented_change --> blocked
     publishing_direct_change --> blocked
     publishing_child_change --> blocked
@@ -1562,6 +1690,7 @@ stateDiagram-v2
     leaf_review_child --> blocked
     awaiting_parent_handoff --> blocked
     integrating --> blocked
+    repairing_integration --> blocked
     integration_review --> blocked
     merge_gate --> blocked
     awaiting_remote_checks --> blocked
@@ -1649,8 +1778,9 @@ newly ingested PR has a current `SemanticRiskAssessment` and Harness `ReviewRece
 merge gate; provider review status cannot bypass either requirement. Missing, malformed, stale, or
 abstaining semantic output routes to `blocked`, never to review or merge authorization. An Agent
 cannot self-select a later state. If that review requests changes, the Work Item returns to
-`collecting_facts`; the registered collector emits `repair_required`, and risk assessment,
-planning, and execution authorization run before any repair mutation.
+`collecting_direct_repair_facts`; current facts and risk are refreshed, and
+`plan_direct_repair` consumes the exact findings-bearing `ReviewReceipt` before execution
+authorization and any repair mutation.
 
 ### 12.3 High-risk flow
 
@@ -1751,6 +1881,16 @@ bound to current fact Evidence, risk, action, definition, and code identity. Hum
 cannot receive a policy receipt. A gate result is never implicitly treated as authorization.
 For a stack entry, the policy receipt additionally binds the integration-progress generation,
 landing cursor, current remote binding, and `merge_current_stack_entry` action.
+
+Stack rewrite policy is Workflow-owned rather than inferred by the compiler.
+`stack_rebase_authorization` uses the execution tiers: low and medium may receive current
+server-policy receipts, while high requires a human receipt. `stack_republication_authorization`
+is human-only at every risk tier because it rewrites remote heads. The rebase receipt binds the
+exact ordered bindings, landing cursor, pre-rewrite code identities, authorized output scope, and
+`rebase_remaining_stack` action. After the rebase, the republication gate consumes that context,
+the produced `change_set`, and its `validation_report`; its receipt binds the pre/post rewrite code
+identities and `republish_rebased_stack` action before any remote publication. An execution, merge,
+or rebase receipt cannot substitute for republication authority.
 
 ## 14. Layered Planning and Decomposition
 
@@ -2034,6 +2174,16 @@ registered validation against the refreshed head, and only then re-enter integra
 independent child refreshes its own leaf review and invalidates the parent set outcome. The stack
 gate refreshes affected child leaf reviews before rematerializing the ordered aggregate. None of
 these routes can reuse stale risk, validation, or review evidence or jump directly to merge.
+
+### 18.6 Findings-driven repair
+
+Every accepted `changes_requested` verdict enters a repair-specific state, never the initial
+planning or mutation activity. `plan_direct_repair`, `repair_child_change`,
+`repair_integration`, `plan_independent_set_repair`, and `plan_stack_repair` require the exact
+current findings-bearing receipt for their review scope. The dispatcher includes that immutable
+receipt in the new attempt input; a missing, stale, wrong-subject, or non-`changes_requested`
+receipt fails activity validation. Repair remains bounded by the existing plan authorization,
+writable scope, and repair budget; findings do not grant new mutation authority.
 
 ## 19. CI and Merge Gate
 
