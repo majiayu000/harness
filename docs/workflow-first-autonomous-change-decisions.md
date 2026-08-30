@@ -251,14 +251,20 @@ Alternatives rejected:
 ### D-013 — Bind every mergeable Work Item to a durable remote change
 
 Issue-first work does not begin with a PR or merge-request identity. Before provider review, CI, or
-merge gates can run, a server-owned provider action must idempotently create or bind the remote
-change and persist a `RemoteChangeBinding`. Existing-PR intake creates the same binding during
+merge gates can run, a server-orchestrated provider action must idempotently create or bind the
+remote change and persist a `RemoteChangeBinding`. Existing-PR intake creates the same binding during
 normalization.
 
 The binding is a supporting record, not a seventh orchestration aggregate. It records provider,
 repository, remote object ID, base/head references, current code identity, publication idempotency
 key, reconciliation state, and observation identity. Workflow still owns when publication occurs;
-the provider adapter owns how it is performed and reconciled.
+the provider-action registry owns the constrained AgentBackend prompt contract used to perform it.
+Harness owns authority checks, the transactional outbox, and the completion/reconciliation fold,
+but Harness crates never execute `gh`, `git`, or mutating provider SDK calls. The Agent result is a
+candidate until the server validates a provider-authenticated webhook or a runtime-enforcement
+receipt captured from the constrained provider tool request/response. Agent prose cannot acquire a
+trusted provider producer class; only after receipt-bound reconciliation may the server persist the
+binding.
 
 ### D-014 — Receipts are typed Evidence, not a second authority
 

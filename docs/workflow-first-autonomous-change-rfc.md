@@ -183,6 +183,7 @@ flowchart TD
     S[Issue / PR / API Source]
     H[Harness Workflow Runtime]
     C[Code Agent Runtime]
+    A[Constrained Provider AgentBackend]
     G[GitHub / Tracker / CI]
     P[(Workflow Event Store)]
 
@@ -190,8 +191,10 @@ flowchart TD
     S -->|Normalized intake| H
     H -->|Activity contract and facts| C
     C -->|Candidate evidence, decisions, plans| H
-    H -->|Read facts / execute authorized writes| G
-    G -->|Current external facts| H
+    H -->|Pinned fact or authorized action prompt| A
+    A -->|Read facts / execute scoped provider action| G
+    G -->|Provider response| A
+    A -->|Structured candidate observation or result| H
     H -->|Events, commands, receipts| P
     P -->|Replay| H
 ```
@@ -206,15 +209,19 @@ flowchart TD
     WL[Workflow Loader and Compiler] --> DR[Definition Registry]
     DR --> WR
 
-    FC[Deterministic Fact Collectors] --> ES[Evidence Service]
+    FV[Provider Observation Validator] --> ES[Evidence Service]
     ES --> WR
 
     WR --> PG[Policy and Risk Gate]
     PG --> D[Dispatcher]
     D --> AR[Agent Runtime Adapter]
     AR --> X[Code Agent]
+    AR --> PA[Constrained Provider AgentBackend]
+    PA --> G[Remote Provider]
+    G -->|Raw provider response| AR
     X --> AR
     AR --> RV[Result Validator]
+    AR --> FV
     RV --> WR
 
     WR --> DV[Decomposition Validator]
@@ -223,11 +230,12 @@ flowchart TD
 
     WR --> RG[Review Gate]
     RG --> MG[Merge Gate]
-    MG --> RP[Remote Provider Adapter]
+    MG --> EV
 
     WR --> EV[(Event Log and Command Outbox)]
+    EV --> D
     EV --> RC[Reconciler]
-    RP --> RC
+    FV --> RC
     RC --> WR
 ```
 
@@ -237,10 +245,11 @@ flowchart TD
 |---|---|---|
 | Ingress adapter | Provider normalization and source identity | Workflow transitions |
 | Workflow compiler | Definition validation, schema compilation, content hash | Runtime state |
-| Fact collector | Deterministic external observations | Semantic verdicts |
+| Provider observation validator | Validate runtime-captured transport receipts or authenticated webhooks and author external-fact Evidence | Provider I/O or semantic verdicts |
 | Policy/risk gate | Risk floor and authority ceiling | Agent implementation plan |
 | Dispatcher | Capability matching, lease-safe job creation | Product routing judgment |
-| Agent adapter | Protocol translation and verified execution properties | Workflow state |
+| Agent adapter | Protocol translation, verified execution properties, and runtime-captured provider transport receipts | Workflow state or provider truth inferred from Agent prose |
+| Constrained provider AgentBackend | Prompt-directed provider interaction within one typed action/fact contract | Evidence authorship or Workflow persistence |
 | Result validator | Envelope, schema, authorship, and activity-contract validation | Inventing missing facts |
 | Reducer | Deterministic state transition and command production | External side effects |
 | Decomposition validator | Graph safety and proposal bounds | Creating unvalidated children |
@@ -408,6 +417,7 @@ Activity
   reconciliation_contract?
   binding_transition_contract?
   provider_precondition_contract?
+  action_agent_contract?          # resolved from provider-action registry only
   retry_policy
   repair_policy
   budget
@@ -422,8 +432,9 @@ evaluator, gate, and target all name the same action.
 
 `binding_transition_contract`, when present, is a typed tuple of expected current pointer,
 successor Evidence kind, pointer update, and concurrency mode. v1 permits only
-`compare_and_swap`. It is valid only for a registered server contract whose registry descriptor
-declares the same inputs, output, and atomic pointer transition; the compiler rejects any mismatch.
+`compare_and_swap`. It is valid only for a registered server contract or provider-action descriptor
+whose server-owned completion fold declares the same inputs, output, and atomic pointer transition;
+the compiler rejects any mismatch. A provider-action Agent can never write Workflow persistence.
 
 `provider_precondition_contract` is mandatory for `provider_action`. It names the Evidence carrying
 the provider subject and either expected absence or an exact observed provider version, declares
@@ -448,6 +459,7 @@ ActivityAttempt
   runtime_profile_snapshot
   capability_snapshot
   prompt_packet_hash
+  input_envelope_hash
   input_evidence_ids
   attempt_number
   lease_generation
@@ -459,11 +471,26 @@ ActivityAttempt
 Required invariants:
 
 - the prompt packet and runtime profile are snapshotted before execution;
+- every primary/correction attempt binds the same pinned input-envelope hash even though its prompt
+  packet differs;
 - all attempts, including structured-output correction attempts, contribute to enforcement evidence;
 - a retry never erases tool use, approval, network, mutation, or model-identity observations from a
   previous attempt in the same activity execution;
 - result validation occurs before the reducer sees a candidate decision; and
 - a completed process is not equivalent to a successful activity.
+
+A provider transport receipt is immutable `workflow_evidence` with payload schema
+`provider-transport-receipt.v1`, `producer_class: runtime_enforcement`, and the attempt ID in its
+trusted Evidence envelope; it is not Agent output. Its payload binds lease generation and tool-event
+ID, the registered action/fact contract, repository and subject, an `operation_id` required for every
+request, `requested_action` plus idempotency key and expected provider precondition (absence or exact
+version) for mutations, scoped credential/profile identity, request and raw-response digests,
+provider request ID/status when exposed, exit status, timestamp, and immutable raw-response artifact
+reference. The runtime appends this Evidence from the actual constrained provider tool event before
+the model can summarize the response. The registered provider-action or read-only provider-fact
+descriptor declares this runtime-enforcement output; it is not an Agent-produced business artifact.
+A backend profile that exposes only an unrestricted shell or final Agent prose and cannot attest the
+invoked provider primitive and captured response is ineligible for provider facts or actions.
 
 ### 9.4 `Evidence`
 
@@ -503,6 +530,12 @@ Evidence
 
 An Agent MUST NOT choose its producer class. The runtime derives it from the authenticated attempt
 and role assignment.
+
+`remote_provider` is assigned only to a provider-authenticated webhook or to Evidence derived by the
+server validator from a valid `provider_transport_receipt` Evidence row.
+`server_fact_collector` denotes the server-authored validation/fold of those inputs; it does not
+perform provider I/O. Agent candidate output, an Agent-selected producer label, or an unobserved
+shell transcript can never acquire either class.
 
 `code_identity` is a tagged union. `single` binds one repository, base ref, head SHA, and optional
 tree/diff hash. `aggregate` binds the integration strategy, decomposition revision, canonical
@@ -1961,6 +1994,9 @@ evidence:
   validation_report:
     payload_schema: .harness/schemas/validation-report.v1.json
     allowed_producers: [agent_author, server_policy_engine]
+  provider_transport_receipt:
+    payload_schema: .harness/schemas/provider-transport-receipt.v1.json
+    allowed_producers: [runtime_enforcement]
   integrated_change_set:
     payload_schema: .harness/schemas/integrated-change-set.v1.json
     allowed_producers: [agent_author]
@@ -2449,25 +2485,45 @@ sequenceDiagram
     participant Harness
     participant Facts
     participant Agent
+    participant ProviderAgent
     participant Reviewer
     participant GitHub
 
     Source->>Harness: Submit Issue or task
-    Harness->>Facts: Collect deterministic facts
+    Harness->>ProviderAgent: Dispatch read-only fact prompt
+    ProviderAgent->>GitHub: Collect deterministic facts
+    GitHub-->>ProviderAgent: Provider response
+    ProviderAgent-->>Harness: Candidate plus runtime-captured receipt
+    Harness->>Facts: Validate receipt and author Evidence
     Facts-->>Harness: Evidence snapshots
     Harness->>Harness: Compute risk floor = low
     Harness->>Agent: Plan and implement in isolated workspace
     Agent-->>Harness: Change and validation evidence
-    Harness->>GitHub: Idempotently publish or bind remote change
-    GitHub-->>Harness: Durable remote change identity and current head
+    Harness->>ProviderAgent: Dispatch authorized publish action
+    ProviderAgent->>GitHub: Idempotently publish or bind remote change
+    GitHub-->>ProviderAgent: Candidate remote identity and current head
+    ProviderAgent-->>Harness: Candidate plus runtime-captured receipt
+    Harness->>Facts: Validate receipt and reconcile binding
+    Facts-->>Harness: Current RemoteChangeBinding Evidence
     Harness->>Reviewer: Fresh-context leaf review
     Reviewer-->>Harness: Head-bound approval receipt evidence
-    Harness->>GitHub: Refresh PR facts and required checks
-    GitHub-->>Harness: Pending, unavailable, failed, or current eligible head
+    Harness->>ProviderAgent: Dispatch read-only refresh prompt
+    ProviderAgent->>GitHub: Refresh PR facts and required checks
+    GitHub-->>ProviderAgent: Pending, unavailable, failed, or current eligible head
+    ProviderAgent-->>Harness: Candidate plus runtime-captured receipt
+    Harness->>Facts: Validate receipt and author current fact Evidence
+    Facts-->>Harness: Current PR and check Evidence
     Harness->>Harness: External wait while facts are pending/unavailable
-    Harness->>GitHub: Squash merge
-    Harness->>GitHub: Re-fetch merged state
-    GitHub-->>Harness: Merge confirmed
+    Harness->>ProviderAgent: Dispatch authorized squash-merge action
+    ProviderAgent->>GitHub: Conditional squash merge
+    GitHub-->>ProviderAgent: Candidate mutation result
+    ProviderAgent-->>Harness: Candidate plus runtime-captured action receipt
+    Harness->>ProviderAgent: Dispatch read-only reconciliation prompt
+    ProviderAgent->>GitHub: Re-fetch merged state
+    GitHub-->>ProviderAgent: Merge observation
+    ProviderAgent-->>Harness: Candidate plus runtime-captured receipt
+    Harness->>Facts: Validate receipt and reconcile merge truth
+    Facts-->>Harness: RemoteMergeConfirmation Evidence
     Harness->>Harness: Mark done
 ```
 
@@ -2769,15 +2825,47 @@ Capabilities are not trusted merely because an Agent claims them. A configured a
 host establish what can be enforced. `RuntimeCapabilitySnapshot` records the effective profile and
 attempt-level enforcement evidence.
 
-Agent mutation activities never receive provider credentials or provider-action authority. Their
-contracts require `network: none` and `provider_actions: []`, while command access remains confined
-to the authorized local workspace. Any attempted external write fails the activity. Publishing,
-updating, or merging a remote object is possible only through a registered `provider_action` with
-its own authority, idempotency, outbox, provider-precondition, and reconciliation contracts. The
-outbox command carries expected absence or an exact provider version for every mutated subject from
-its accepted gate result. The provider adapter enforces that condition atomically with the write and
-returns stale without mutation on mismatch. A local binding compare-and-swap or post-write
-reconciliation is never treated as equivalent.
+Ordinary Agent mutation activities never receive provider credentials or provider-action authority.
+Their contracts require `network: none` and `provider_actions: []`, while command access remains
+confined to the authorized local workspace. Any attempted external write fails the activity.
+
+`executor: provider_action` remains a server-owned authority, idempotency, transactional-outbox,
+provider-precondition, and reconciliation boundary, but it is not a server-side GitHub/git client.
+Its registry descriptor resolves and pins an action-specific AgentBackend prompt contract into the
+compiled bundle. Before dispatch, the server validates the gate, receipt, current binding, action,
+and expected provider precondition (absence or exact version) and persists one immutable action
+request and idempotency key. The
+prompt packet binds those values and accepted Evidence IDs/digests; action-scoped credentials are
+injected by the eligible backend profile and never stored in prompts or Evidence. Only that
+constrained AgentBackend turn may perform the actual `gh`, `git`, or provider mutation, with an
+allowlist containing exactly the requested typed action. Harness crates do not spawn `gh`/`git` or
+invoke a mutating provider SDK.
+
+The Agent response is only a candidate result. The server-owned completion fold accepts success
+Evidence or a `RemoteChangeBinding` only from a validated provider-authenticated webhook or a
+runtime-captured provider transport receipt from the constrained action/read-only reconciliation
+turn. The validator checks the receipt against the pinned request, raw response artifact, subject,
+action, credential/profile identity, and expected absence-or-version before assigning
+`remote_provider` or
+authoring `server_fact_collector` Evidence. Agent prose or structured candidate fields cannot
+establish remote truth. Registered server contracts that need provider facts use the same
+prompt-triggered, runtime-observed transport; they do not call `gh`, `git`, or a provider API from
+Harness code.
+
+The remote operation invoked by the action prompt must enforce expected absence or the exact
+provider version atomically and return stale without mutation on mismatch; prompted
+check-then-write, local pointer CAS, and post-write reconciliation are not substitutes. A
+registry/backend pair that cannot invoke such a provider-native conditional primitive and emit its
+runtime-attested request/response receipt is ineligible for that action. Ambiguous results reconcile
+before retry. Per-stack-entry actions preserve a distinct expected version and idempotency identity
+for each entry and reconcile partial success without replaying completed entries.
+
+Before any provider I/O, the constrained tool channel compares the requested provider operation,
+subject, typed action, idempotency key, and expected absence/version with the pinned action request.
+Any omission or mismatch fails locally without network dispatch, and the profile does not expose an
+unconditional primitive for the same mutation. A registry/backend path that cannot enforce this
+pre-dispatch parameter binding is not registrable; receipt validation after a write cannot repair
+that deficiency.
 
 Unknown events in an enforcement-sensitive mode MUST be handled according to a declared safe-event
 policy. For a no-tool classifier, an unknown action-like event cannot be silently ignored and then
@@ -3433,7 +3521,7 @@ normative only where they do not conflict with it.
 |---|---|---|
 | `workflow-declarative-definitions.md` | Extend | Preserve structural validation, blocked fallback, intake bindings, and definition pinning; add capability, evidence, risk, decomposition, review, authorization, and budget policy. |
 | `prompt-workflow-contract-long-term-design.md` | Incorporate | Preserve compiled prompt packets, activity contracts, bounded repair, and typed results; place them under the Evidence and Activity contracts in this RFC. |
-| `autonomous-github-intake-merge-spec.md` | Revise and incorporate | Preserve server-owned GitHub facts, fact-hash dispatch gates, quiescent ready state, and external merge confirmation; replace any Agent-authored fact or merge proof with provider-adapter evidence and tiered authorization. |
+| `autonomous-github-intake-merge-spec.md` | Revise and incorporate | Preserve server-authored GitHub Evidence, fact-hash dispatch gates, quiescent ready state, and external merge confirmation; derive remote facts only from validated webhooks or runtime-captured provider transport receipts, never Agent claims. |
 | `workflow-runtime-v2-state-machine-spec.md` | Extend with explicit supersession | Preserve workflow runtime ownership, atomic completion, outbox, recovery, and projections. Supersede the fixed list of permitted long-lived definitions where validated Child Work Items require additional instances. |
 | `workflow-runtime-hardening-design.md` | Preserve | Its fail-closed output, reducer, retry, lease, and observability invariants become core conformance requirements. |
 | `references/review-integrity.md` | Incorporate | Adopt fail-closed reviewer protocol, explicit independence identity, current-head receipts, and durable escalation evidence. |
@@ -3446,7 +3534,8 @@ normative only where they do not conflict with it.
 - event-sourced reducers and command outbox direction;
 - declarative definition validation and per-instance pinning;
 - submission/workflow/run identity separation;
-- deterministic server-owned GitHub facts and merge predicates;
+- deterministic server-authored GitHub Evidence and merge predicates derived from authenticated
+  webhooks or runtime-captured provider transport receipts;
 - prompt packet compilation and activity result validation direction;
 - workspace leases and runtime host model; and
 - head-bound merge verification.
@@ -3463,7 +3552,8 @@ normative only where they do not conflict with it.
 
 ### 29.3 Replace or retire
 
-- prompt-only facts used where server-owned facts exist;
+- Agent prose or prompt-only claims used without an authenticated webhook or runtime-captured
+  provider transport receipt;
 - runtime-kind-specific classifier routing in core workflow logic;
 - arbitrary artifact kinds satisfying terminal evidence;
 - mutable or implicit Workflow reinterpretation;
