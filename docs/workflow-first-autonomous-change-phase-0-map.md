@@ -930,7 +930,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 
 ### Risk and authority
 
-- semantic risk may raise but not lower deterministic floor;
+- semantic risk may raise but not lower deterministic floor and consumes the trusted current-code
+  snapshot or an explicit no-code snapshot;
 - missing fact forces abstention/escalation;
 - review-ready existing PR cannot enter review or merge authorization without current semantic
   risk, and a head refresh invalidates and recomputes that risk before re-review;
@@ -957,6 +958,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
   repeating a confirmed remote write;
 - rebased stack entries are idempotently republished, remote identities refreshed, and freshly
   reviewed before the next entry gate;
+- independent or stacked child head change invalidates its risk, validation, review, and
+  `ChildOutcome`; all three current-head gates rerun before a new outcome reaches the parent;
 - integration children cannot publish/merge and the parent alone publishes the integrated binding;
   and
 - integration PR requires child and parent review receipts.

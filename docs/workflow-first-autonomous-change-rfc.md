@@ -766,7 +766,7 @@ definition:
         release_independent: merge_gate
         stack_entry_landed: reconciling
         integration_contribution_accepted: done
-        re_review_required: leaf_review_child
+        re_review_required: refreshing_child_review_facts
         parent_failed: blocked
     integration_review:
       progress: review_barrier
@@ -843,6 +843,22 @@ definition:
       on_failure: blocked
     requesting_independent_child_review:
       activity: request_independent_child_review
+      on_success: assessing_refreshed_child_risk
+      on_failure: blocked
+    refreshing_child_review_facts:
+      activity: collect_change_facts
+      on_success: assessing_refreshed_child_risk
+      on_failure: blocked
+    assessing_refreshed_child_risk:
+      activity: assess_risk
+      on_signal:
+        low: validating_refreshed_child
+        medium: validating_refreshed_child
+        high: validating_refreshed_child
+        abstain: blocked
+      on_failure: blocked
+    validating_refreshed_child:
+      activity: validate_child_head
       on_success: leaf_review_child
       on_failure: blocked
     awaiting_merge_authorization:
@@ -1008,7 +1024,7 @@ activities:
       tools: forbidden
     input_schema: semantic_risk_input.v1
     output_schema: semantic_risk_output.v1
-    required_evidence: [intake_subject_snapshot]
+    required_evidence: [intake_subject_snapshot, code_change_snapshot]
     allowed_decisions: [low, medium, high, abstain]
     produces: [semantic_risk_assessment]
 
@@ -1121,6 +1137,12 @@ activities:
     executor: registered_server
     contract: registered.integration_head_validation.v1
     required_evidence: [integrated_change_set, remote_change_binding, review_subject_snapshot, semantic_risk_assessment]
+    produces: [validation_report]
+
+  validate_child_head:
+    executor: registered_server
+    contract: registered.child_head_validation.v1
+    required_evidence: [remote_change_binding, code_change_snapshot, review_subject_snapshot, semantic_risk_assessment]
     produces: [validation_report]
 
   review_independent_set:
@@ -1470,7 +1492,7 @@ stateDiagram-v2
     refreshing_rebased_stack_facts --> requesting_stack_child_reviews: remote identities confirmed
     requesting_stack_child_reviews --> awaiting_stack_child_reviews: child commands committed
     awaiting_stack_child_reviews --> preparing_stack_review: all leaf reviews current
-    awaiting_parent_handoff --> leaf_review_child: re-review required
+    awaiting_parent_handoff --> refreshing_child_review_facts: re-review required
     implementing --> routing_implemented_change
     routing_implemented_change --> publishing_direct_change: direct
     routing_implemented_change --> publishing_child_change: independent or stacked child
@@ -1503,7 +1525,10 @@ stateDiagram-v2
     assessing_refreshed_integration_risk --> validating_refreshed_integration: risk classified
     validating_refreshed_integration --> integration_review: current head validated
     refreshing_independent_child_review_facts --> requesting_independent_child_review: current identity collected
-    requesting_independent_child_review --> leaf_review_child: parent notified
+    requesting_independent_child_review --> assessing_refreshed_child_risk: parent notified
+    refreshing_child_review_facts --> assessing_refreshed_child_risk: current identity collected
+    assessing_refreshed_child_risk --> validating_refreshed_child: risk classified
+    validating_refreshed_child --> leaf_review_child: current head validated
     awaiting_merge_authorization --> merge_gate: authorization received; refresh facts
     awaiting_stack_merge_authorization --> stack_merge_gate: authorization received; refresh facts
     merging --> reconciling
@@ -1547,6 +1572,9 @@ stateDiagram-v2
     validating_refreshed_integration --> blocked
     refreshing_independent_child_review_facts --> blocked
     requesting_independent_child_review --> blocked
+    refreshing_child_review_facts --> blocked
+    assessing_refreshed_child_risk --> blocked
+    validating_refreshed_child --> blocked
     stack_merge_gate --> blocked
     awaiting_stack_merge_authorization --> blocked
     awaiting_stack_checks --> blocked
@@ -1660,6 +1688,13 @@ effective_risk = max(server_universal_floor,
 A classifier may return `low`, `medium`, `high`, or `abstain`. `abstain`, missing output, malformed
 output, unsupported execution enforcement, or stale inputs MUST NOT reduce risk. The Workflow
 declares the fail-closed route, subject to server minimums.
+
+`registered.change_fact_collection.v1` always emits a trusted `CodeChangeSnapshot`. Existing code
+uses a current single or aggregate `code_identity`; work with no code uses an explicit tagged
+`absent` payload rather than omitting the Evidence. `assess_risk` consumes both the intake and code
+snapshots and copies the observed code identity into its result. A later head or effective-diff
+change therefore invalidates the semantic assessment; an `absent` snapshot permits intake-only
+classification but cannot authorize review or merge of code.
 
 A human risk override substitutes only for `project_assessment`; it never lowers the universal or
 operator floor and never cancels an explicit operator escalation. It is valid only when bound to
@@ -1953,15 +1988,19 @@ For a stack rebase or stale stack receipt, fresh provider facts feed
 `registered.stack_child_review_refresh.v1`. It atomically invalidates affected child outcomes,
 materializes one child-owned, single-tagged `review_subject_snapshot` per affected Work Item from
 its current remote binding, and enqueues `re_review_required` commands. Each child returns from
-`parent_handoff` to `leaf_review_child`; only a new current leaf receipt regenerates its
-`ChildOutcome`. The parent waits at `awaiting_stack_child_reviews` and cannot rematerialize the
-stack review subject until every affected outcome is current.
+`parent_handoff` through `refreshing_child_review_facts`, `assessing_refreshed_child_risk`, and
+`validating_refreshed_child` before `leaf_review_child`. Runtime enforcement regenerates its
+`ChildOutcome` only when the new semantic risk assessment, validation report, and leaf review
+receipt are all bound to the same current child code identity. The parent waits at
+`awaiting_stack_child_reviews` and cannot rematerialize the stack review subject until every
+affected outcome is current.
 
 For an independently released child whose merge gate detects stale review evidence,
 `registered.independent_child_review_refresh.v1` performs the same child-owned snapshot and outcome
-invalidation, notifies the parent with `child_review_stale`, and sends the child back to leaf
-review. The parent waits at `awaiting_independent_re_reviews`, rematerializes the complete set only
-after current child outcomes arrive, obtains a new parent review, and releases the set again.
+invalidation, notifies the parent with `child_review_stale`, and routes the child through current
+code risk, validation, and leaf review. The parent waits at `awaiting_independent_re_reviews`,
+rematerializes the complete set only after current child outcomes arrive, obtains a new parent
+review, and releases the set again.
 
 ### 18.4 Integration review
 
