@@ -693,6 +693,12 @@ definition:
       progress: child_barrier
       on_signal:
         all_landed: reconciling_child_set
+        child_review_stale: awaiting_independent_re_reviews
+        child_failed: blocked
+    awaiting_independent_re_reviews:
+      progress: child_barrier
+      on_signal:
+        reviews_current: preparing_independent_set_review
         child_failed: blocked
     reconciling_child_set:
       activity: reconcile_child_set
@@ -736,7 +742,7 @@ definition:
       activity: review_change
       on_signal:
         approved: merge_gate
-        changes_requested: implementing
+        changes_requested: collecting_facts
         blocked: blocked
       on_failure: blocked
     leaf_review_child:
@@ -772,6 +778,9 @@ definition:
         await_human: awaiting_merge_authorization
         checks_pending: awaiting_remote_checks
         facts_unavailable: awaiting_remote_facts
+        direct_review_stale: refreshing_direct_review_facts
+        integration_review_stale: refreshing_integration_review_facts
+        independent_child_review_stale: refreshing_independent_child_review_facts
         checks_failed: blocked
         deny: blocked
     awaiting_remote_checks:
@@ -800,6 +809,22 @@ definition:
         remote_failed: blocked
         deadline_exceeded: blocked
         budget_exhausted: blocked
+    refreshing_direct_review_facts:
+      activity: collect_change_facts
+      on_success: leaf_review_direct
+      on_failure: blocked
+    refreshing_integration_review_facts:
+      activity: collect_change_facts
+      on_success: integration_review
+      on_failure: blocked
+    refreshing_independent_child_review_facts:
+      activity: collect_change_facts
+      on_success: requesting_independent_child_review
+      on_failure: blocked
+    requesting_independent_child_review:
+      activity: request_independent_child_review
+      on_success: leaf_review_child
+      on_failure: blocked
     awaiting_merge_authorization:
       progress: operator_gate
       gate:
@@ -816,6 +841,7 @@ definition:
         await_human: awaiting_stack_merge_authorization
         checks_pending: awaiting_stack_checks
         facts_unavailable: awaiting_stack_facts
+        review_stale: refreshing_stale_stack_facts
         rebase_required: stack_rebase_gate
         checks_failed: blocked
         stack_complete: reconciling_child_set
@@ -855,6 +881,10 @@ definition:
         remote_failed: blocked
         deadline_exceeded: blocked
         budget_exhausted: blocked
+    refreshing_stale_stack_facts:
+      activity: collect_change_facts
+      on_success: requesting_stack_child_reviews
+      on_failure: blocked
     landing_stack_entry:
       activity: merge_stack_entry
       on_success: reconciling_stack_entry
@@ -906,13 +936,13 @@ definition:
       on_failure: blocked
     refreshing_rebased_stack_facts:
       activity: collect_change_facts
-      on_success: requesting_rebased_child_reviews
+      on_success: requesting_stack_child_reviews
       on_failure: blocked
-    requesting_rebased_child_reviews:
-      activity: request_rebased_child_reviews
-      on_success: awaiting_rebased_child_reviews
+    requesting_stack_child_reviews:
+      activity: request_stack_child_reviews
+      on_success: awaiting_stack_child_reviews
       on_failure: blocked
-    awaiting_rebased_child_reviews:
+    awaiting_stack_child_reviews:
       progress: child_barrier
       on_signal:
         reviews_current: preparing_stack_review
@@ -1003,9 +1033,11 @@ activities:
     requires:
       structured_output: true
       filesystem: isolated_write
+      network: none
       cancellation: true
     permissions:
       tools: [read, edit, command]
+      provider_actions: []
       writable_scope: plan_authorized
     input_schema: change_implementation_input.v1
     output_schema: change_implementation_output.v1
@@ -1038,9 +1070,11 @@ activities:
     requires:
       structured_output: true
       filesystem: isolated_write
+      network: none
       cancellation: true
     permissions:
       tools: [read, edit, command]
+      provider_actions: []
       writable_scope: plan_authorized
     input_schema: child_integration_input.v1
     output_schema: child_integration_output.v1
@@ -1144,9 +1178,11 @@ activities:
     requires:
       structured_output: true
       filesystem: isolated_write
+      network: none
       cancellation: true
     permissions:
       tools: [read, edit, command]
+      provider_actions: []
       writable_scope: plan_authorized
     input_schema: stack_rebase_input.v1
     output_schema: stack_rebase_output.v1
@@ -1168,10 +1204,16 @@ activities:
     reconciliation: registered.remote_binding_reconciliation.v1
     produces: [stack_republication_receipt, remote_change_binding]
 
-  request_rebased_child_reviews:
+  request_stack_child_reviews:
     executor: registered_server
-    contract: registered.rebased_child_review_refresh.v1
-    required_evidence: [child_materialization, child_outcome, stack_republication_receipt, remote_change_binding, review_subject_snapshot]
+    contract: registered.stack_child_review_refresh.v1
+    required_evidence: [child_materialization, child_outcome, remote_change_binding, review_subject_snapshot]
+    produces: [child_review_refresh, review_subject_snapshot]
+
+  request_independent_child_review:
+    executor: registered_server
+    contract: registered.independent_child_review_refresh.v1
+    required_evidence: [child_materialization, child_outcome, remote_change_binding, review_subject_snapshot]
     produces: [child_review_refresh, review_subject_snapshot]
 
   reconcile_remote_state:
@@ -1375,6 +1417,8 @@ stateDiagram-v2
     reviewing_independent_set --> planning: changes requested
     releasing_independent_children --> awaiting_independent_landing
     awaiting_independent_landing --> reconciling_child_set: all remotely merged
+    awaiting_independent_landing --> awaiting_independent_re_reviews: child review stale
+    awaiting_independent_re_reviews --> preparing_independent_set_review: child reviews current
     reconciling_child_set --> done
     reviewing_stack --> stack_merge_gate: approved
     reviewing_stack --> planning: changes requested
@@ -1382,7 +1426,9 @@ stateDiagram-v2
     stack_merge_gate --> awaiting_stack_merge_authorization: human required
     stack_merge_gate --> awaiting_stack_checks: checks pending
     stack_merge_gate --> awaiting_stack_facts: facts unavailable
+    stack_merge_gate --> refreshing_stale_stack_facts: review stale
     stack_merge_gate --> stack_rebase_gate: rebase required
+    refreshing_stale_stack_facts --> requesting_stack_child_reviews: current identities collected
     landing_stack_entry --> reconciling_stack_entry
     reconciling_stack_entry --> stack_rebase_gate: more entries
     reconciling_stack_entry --> reconciling_child_set: stack complete
@@ -1394,9 +1440,9 @@ stateDiagram-v2
     stack_republication_gate --> awaiting_stack_republication_authorization: human required
     awaiting_stack_republication_authorization --> stack_republication_gate: authorization received
     publishing_rebased_stack --> refreshing_rebased_stack_facts: bindings superseded
-    refreshing_rebased_stack_facts --> requesting_rebased_child_reviews: remote identities confirmed
-    requesting_rebased_child_reviews --> awaiting_rebased_child_reviews: child commands committed
-    awaiting_rebased_child_reviews --> preparing_stack_review: all leaf reviews current
+    refreshing_rebased_stack_facts --> requesting_stack_child_reviews: remote identities confirmed
+    requesting_stack_child_reviews --> awaiting_stack_child_reviews: child commands committed
+    awaiting_stack_child_reviews --> preparing_stack_review: all leaf reviews current
     awaiting_parent_handoff --> leaf_review_child: re-review required
     implementing --> routing_implemented_change
     routing_implemented_change --> publishing_direct_change: direct
@@ -1404,7 +1450,7 @@ stateDiagram-v2
     routing_implemented_change --> leaf_review_child: integration child
     publishing_direct_change --> leaf_review_direct: bound
     publishing_child_change --> leaf_review_child: bound
-    leaf_review_direct --> implementing: changes requested
+    leaf_review_direct --> collecting_facts: changes requested
     leaf_review_direct --> merge_gate: approved
     leaf_review_child --> implementing: changes requested
     leaf_review_child --> awaiting_parent_handoff: approved
@@ -1419,9 +1465,16 @@ stateDiagram-v2
     merge_gate --> awaiting_merge_authorization: medium/high
     merge_gate --> awaiting_remote_checks: checks pending
     merge_gate --> awaiting_remote_facts: facts unavailable
+    merge_gate --> refreshing_direct_review_facts: direct review stale
+    merge_gate --> refreshing_integration_review_facts: integration review stale
+    merge_gate --> refreshing_independent_child_review_facts: child review stale
     merge_gate --> blocked: checks failed or denied
     awaiting_remote_checks --> merge_gate: fact changed
     awaiting_remote_facts --> merge_gate: fact refresh
+    refreshing_direct_review_facts --> leaf_review_direct: current identity collected
+    refreshing_integration_review_facts --> integration_review: current identity collected
+    refreshing_independent_child_review_facts --> requesting_independent_child_review: current identity collected
+    requesting_independent_child_review --> leaf_review_child: parent notified
     awaiting_merge_authorization --> merge_gate: authorization received; refresh facts
     awaiting_stack_merge_authorization --> stack_merge_gate: authorization received; refresh facts
     merging --> reconciling
@@ -1441,6 +1494,7 @@ stateDiagram-v2
     reviewing_independent_set --> blocked
     releasing_independent_children --> blocked
     awaiting_independent_landing --> blocked
+    awaiting_independent_re_reviews --> blocked
     reconciling_child_set --> blocked
     preparing_stack_review --> blocked
     reviewing_stack --> blocked
@@ -1457,10 +1511,15 @@ stateDiagram-v2
     merge_gate --> blocked
     awaiting_remote_checks --> blocked
     awaiting_remote_facts --> blocked
+    refreshing_direct_review_facts --> blocked
+    refreshing_integration_review_facts --> blocked
+    refreshing_independent_child_review_facts --> blocked
+    requesting_independent_child_review --> blocked
     stack_merge_gate --> blocked
     awaiting_stack_merge_authorization --> blocked
     awaiting_stack_checks --> blocked
     awaiting_stack_facts --> blocked
+    refreshing_stale_stack_facts --> blocked
     landing_stack_entry --> blocked
     reconciling_stack_entry --> blocked
     stack_rebase_gate --> blocked
@@ -1470,8 +1529,8 @@ stateDiagram-v2
     awaiting_stack_republication_authorization --> blocked
     publishing_rebased_stack --> blocked
     refreshing_rebased_stack_facts --> blocked
-    requesting_rebased_child_reviews --> blocked
-    awaiting_rebased_child_reviews --> blocked
+    requesting_stack_child_reviews --> blocked
+    awaiting_stack_child_reviews --> blocked
     merging --> blocked
     reconciling --> blocked
     blocked --> collecting_facts: authorized replan
@@ -1527,7 +1586,9 @@ The registered fact collector is the sole author of these routes: task/issue ing
 `implementation_required`; existing PR ingress emits `repair_required` or `review_ready` from
 trusted provider facts. A newly ingested PR always obtains a Harness `ReviewReceipt` before the
 merge gate; provider review status cannot bypass that review. An Agent cannot self-select a later
-state.
+state. If that review requests changes, the Work Item returns to `collecting_facts`; the registered
+collector emits `repair_required`, and risk assessment, planning, and execution authorization run
+before any repair mutation.
 
 ### 12.3 High-risk flow
 
@@ -1751,6 +1812,12 @@ Capabilities are not trusted merely because an Agent claims them. A configured a
 host establish what can be enforced. `RuntimeCapabilitySnapshot` records the effective profile and
 attempt-level enforcement evidence.
 
+Agent mutation activities never receive provider credentials or provider-action authority. Their
+contracts require `network: none` and `provider_actions: []`, while command access remains confined
+to the authorized local workspace. Any attempted external write fails the activity. Publishing,
+updating, or merging a remote object is possible only through a registered `provider_action` with
+its own authority, idempotency, outbox, and reconciliation contracts.
+
 Unknown events in an enforcement-sensitive mode MUST be handled according to a declared safe-event
 policy. For a no-tool classifier, an unknown action-like event cannot be silently ignored and then
 used as proof that no tools were used.
@@ -1848,14 +1915,19 @@ membership from receipt prose.
 Every code-producing child requires an eligible current-head receipt before it can contribute a
 successful child outcome.
 
-After a stack rebase is published and remote identities are refreshed,
-`registered.rebased_child_review_refresh.v1` atomically invalidates affected child outcomes and
+For a stack rebase or stale stack receipt, fresh provider facts feed
+`registered.stack_child_review_refresh.v1`. It atomically invalidates affected child outcomes,
 materializes one child-owned, single-tagged `review_subject_snapshot` per affected Work Item from
-its new remote binding. In that same transaction it enqueues `re_review_required` commands for
-those child Work Items. Each child returns from `parent_handoff` to `leaf_review_child` with its new
-snapshot; only a new current leaf receipt regenerates its `ChildOutcome`. The parent waits at
-`awaiting_rebased_child_reviews` and cannot rematerialize the stack review subject until every
-affected outcome is current.
+its current remote binding, and enqueues `re_review_required` commands. Each child returns from
+`parent_handoff` to `leaf_review_child`; only a new current leaf receipt regenerates its
+`ChildOutcome`. The parent waits at `awaiting_stack_child_reviews` and cannot rematerialize the
+stack review subject until every affected outcome is current.
+
+For an independently released child whose merge gate detects stale review evidence,
+`registered.independent_child_review_refresh.v1` performs the same child-owned snapshot and outcome
+invalidation, notifies the parent with `child_review_stale`, and sends the child back to leaf
+review. The parent waits at `awaiting_independent_re_reviews`, rematerializes the complete set only
+after current child outcomes arrive, obtains a new parent review, and releases the set again.
 
 ### 18.4 Integration review
 
@@ -1876,6 +1948,12 @@ barrier emits `approved` only after both eligible receipts approve the same inte
 
 A code-bound receipt is invalid when head SHA or effective diff changes. A Workflow may permit a
 documented metadata-only exception, but the merge gate never infers that exception from prose.
+
+The merge gate classifies stale review evidence from persisted subject/landing identity rather than
+using one ambiguous retry edge. Direct and integration subjects refresh provider facts before their
+respective review states. An independent child refreshes its own leaf review and invalidates the
+parent set outcome. The stack gate refreshes affected child leaf reviews before rematerializing the
+ordered aggregate. None of these routes can reuse a stale receipt or jump directly to merge.
 
 ## 19. CI and Merge Gate
 
@@ -1916,6 +1994,11 @@ Remote checks and facts have four distinct outcomes: `pending`, `unavailable`, `
 gate when a new accepted fact arrives. `failed` follows the Workflow's repair/block route. Only
 `eligible` may proceed to risk/authorization evaluation. None of these states is inferred as human
 authorization or policy denial.
+
+Review freshness is a separate gate outcome. `evaluate_merge_gate` emits exactly one of
+`direct_review_stale`, `integration_review_stale`, or `independent_child_review_stale` from the
+pinned landing relation. `evaluate_stack_entry_gate` emits `review_stale`. Each signal follows the
+declared refresh and re-review path before risk or merge authorization is evaluated again.
 
 ## 20. Failure, Retry, and Recovery
 

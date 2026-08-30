@@ -36,17 +36,19 @@ real deployment or a current production clone.
 
 Use an offline, one-way runtime cutover with a mandatory immutable audit archive:
 
-1. atomically stop pre-vNext intake and write provider intake fences to an immutable cutover
-   manifest outside the runtime schema being replaced;
-2. cancel or drain active provider-action outbox work, revoke old provider credentials, and verify
-   zero pre-vNext provider writers;
-3. revoke old database-writer access, terminate its sessions, and verify zero remaining database
+1. atomically stop pre-vNext intake and prevent dispatch of new provider actions;
+2. cancel active provider actions or drain them to reconciled terminal outcomes, recording every
+   remote object created or changed during the drain;
+3. revoke old provider credentials and verify zero pre-vNext provider writers;
+4. only then capture the final provider intake fences in an immutable cutover manifest outside the
+   runtime schema being replaced;
+5. revoke old database-writer access, terminate its sessions, and verify zero remaining database
    writers;
-4. create and verify a versioned audit archive from the fenced source;
-5. verify an exact, versioned source manifest;
-6. replace only the manifest-owned runtime objects and exact shared rows;
-7. install the verified provider fences and then the vNext epoch; and
-8. start vNext only after its critical storage/epoch handshake succeeds.
+6. create and verify a versioned audit archive from the fenced source;
+7. verify an exact, versioned source manifest;
+8. replace only the manifest-owned runtime objects and exact shared rows;
+9. install the verified provider fences and then the vNext epoch; and
+10. start vNext only after its critical storage/epoch handshake succeeds.
 
 vNext never reads the audit archive. Audit inspection uses an offline export reader or an isolated
 restoration environment. This preserves the no-compatibility boundary without deleting the only
@@ -54,9 +56,11 @@ auditable record of earlier decisions.
 
 ```mermaid
 flowchart LR
-    Old[Pre-vNext runtime] --> Stop[Stop intake and capture provider fence]
-    Stop --> ProviderFence[Drain provider outbox and revoke provider writers]
-    ProviderFence --> DbFence[Revoke old DB role and terminate sessions]
+    Old[Pre-vNext runtime] --> Stop[Stop intake and new provider dispatch]
+    Stop --> Drain[Cancel or reconcile active provider actions]
+    Drain --> ProviderFence[Revoke credentials and verify zero provider writers]
+    ProviderFence --> Capture[Capture final provider fence manifest]
+    Capture --> DbFence[Revoke old DB role and terminate sessions]
     DbFence --> Export[Create immutable audit archive]
     Export --> Verify[Verify digest and restore drill]
     Verify --> Manifest[Validate scoped source manifest]
@@ -69,8 +73,8 @@ flowchart LR
 
 ## 4. Mandatory Audit Archive
 
-The archive MUST be created after the old writer fence and before destructive data mutation. It
-MUST contain:
+The archive MUST be created after both provider and database writer fences and before destructive
+data mutation. It MUST contain:
 
 - manifest version and configured schema names;
 - source schema epoch and applied migration-ledger variants;
@@ -146,17 +150,19 @@ a future approved cutover must use a Harness-exclusive old database role, revoke
 login/privileges, terminate its sessions, verify zero remaining sessions, and provision a distinct
 vNext role. If the role is shared with a non-Harness client, cutover refuses.
 
-The provider side is a separate write surface. Before the archive snapshot, cutover must stop
-provider intake, cancel or drain every active provider-action outbox item and attempt, revoke the
-old provider credentials, and verify that no pre-vNext worker can publish, update, or merge remote
-objects. A database writer fence does not prove this condition.
+The provider side is a separate write surface. Cutover first stops intake and new provider-action
+dispatch. It then either cancels each active provider action or drains it to a reconciled terminal
+outcome, recording every remote object created or changed. Only after revoking old provider
+credentials and verifying zero pre-vNext provider writers may cutover capture the provider
+boundary. A database writer fence does not prove this condition.
 
-The provider boundary is captured atomically with stopping pre-vNext intake. Subjects at or before
-the boundary remain fenced from vNext rediscovery; subjects created after it are preserved for
-normal vNext intake and are not suppressed merely because they arrived during archive or restore
-work. An unverifiable boundary disables automatic intake for that binding. Explicit adoption
-requires a human authorization receipt and creates new vNext identities; it does not import old
-Harness runtime state.
+The final boundary includes every subject observed through the drain, so an object created by an
+old runtime action cannot re-enter as vNext work. Subjects at or before that boundary remain fenced
+from automatic vNext rediscovery; objects created by other actors during the maintenance window
+also require explicit human-authorized adoption. Subjects created after the final boundary are
+eligible for normal vNext intake because no pre-vNext provider writer remains. An unverifiable
+boundary disables automatic intake for that binding. Adoption creates new vNext identities and
+does not import old Harness runtime state.
 
 The captured provider fence records and their digest are stored in the immutable cutover manifest,
 outside the runtime schema that will be replaced. The replacement transaction installs those exact
