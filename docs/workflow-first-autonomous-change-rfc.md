@@ -430,11 +430,22 @@ canonical compiled bundle. The compiler links an automatic target and any `await
 gate, or a human-only gate and its authorized target, and rejects the definition unless the
 evaluator, gate, and target all name the same action.
 
+An array-valued `required_evidence` is shorthand for an all-of rule. The fixture also uses the
+closed `all` plus `by_subject` or `by_binding` form where one registered activity serves several
+known Work Item shapes. The compiler requires every subject/binding case to be exhaustive, derives
+the discriminator only from the server-owned Work Item relation/current binding, and pins the
+selected Evidence IDs and digests in the attempt and result. Agent output cannot select a case, and
+the runtime cannot read undeclared implicit state to fill one.
+
 `binding_transition_contract`, when present, is a typed tuple of expected current pointer,
 successor Evidence kind, pointer update, and concurrency mode. v1 permits only
 `compare_and_swap`. It is valid only for a registered server contract or provider-action descriptor
 whose server-owned completion fold declares the same inputs, output, and atomic pointer transition;
 the compiler rejects any mismatch. A provider-action Agent can never write Workflow persistence.
+For `cardinality: per_stack_entry`, the descriptor expands the same tuple over the exact ordered
+bindings in the pinned stack context: each entry names its expected current child pointer, one
+successor Evidence row, and one child-pointer CAS. Missing, duplicate, reordered, or mixed-success
+entries remain in reconciliation and cannot produce an aggregate success context.
 
 `provider_precondition_contract` is mandatory for `provider_action`. It names the Evidence carrying
 the provider subject and either expected absence or an exact observed provider version, declares
@@ -629,6 +640,9 @@ The following supporting objects are required but are not separate business root
 - `RemoteChangeBinding`: immutable versioned provider/repository/change-request identity,
   base/head references, publication idempotency key, current code identity, reconciliation state,
   and an optional link to the binding version it supersedes.
+- `ParentRelease`: immutable independent-set release generation, aggregate identity/risk/review
+  snapshot, released child set, and current/invalidated status. The parent Work Item stores its exact
+  current release ID and monotonically increasing generation.
 - `ProviderIntakeFence`: immutable cutover boundary per provider, repository, and subject type,
   containing the maximum trustworthy monotonic identity, snapshot source/hash, cutover time, and
   whether automatic intake is enabled or disabled as unverifiable.
@@ -685,6 +699,14 @@ definition:
       required_evidence: [child_cancellation_request, cancellation_receipt]
       target: reconciling_cancellation
       terminal_fold_produces: [child_cancellation_acknowledgement, child_outcome]
+    invalidate_independent_release:
+      source: parent_command
+      allowed_from: [merge_gate, awaiting_merge_authorization, awaiting_remote_checks, awaiting_remote_facts, revalidating_merge_authorization, awaiting_revalidated_remote_checks, awaiting_revalidated_remote_facts, merging, reconciling]
+      required_evidence: [parent_release_invalidation]
+      target: awaiting_parent_handoff
+      on_queued_provider_action: fence_then_target
+      on_running_or_ambiguous_provider_outcome: reconciling
+      on_confirmed_merge: reconciling
 
   states:
     collecting_facts:
@@ -1086,7 +1108,7 @@ definition:
         facts_unavailable: awaiting_remote_facts
         direct_review_stale: refreshing_direct_review_facts
         integration_review_stale: refreshing_integration_review_facts
-        independent_child_review_stale: refreshing_independent_child_review_facts
+        independent_child_review_stale: fencing_independent_release
         checks_failed: blocked
         deny: blocked
     awaiting_remote_checks:
@@ -1140,6 +1162,10 @@ definition:
       activity: refresh_remote_change_binding
       on_success: requesting_independent_child_review
       on_failure: blocked
+    fencing_independent_release:
+      activity: invalidate_independent_release
+      on_success: refreshing_independent_child_review_facts
+      on_failure: blocked
     requesting_independent_child_review:
       activity: request_independent_child_review
       on_success: assessing_refreshed_child_risk
@@ -1177,7 +1203,7 @@ definition:
         facts_unavailable: awaiting_revalidated_remote_facts
         direct_review_stale: refreshing_direct_review_facts
         integration_review_stale: refreshing_integration_review_facts
-        independent_child_review_stale: refreshing_independent_child_review_facts
+        independent_child_review_stale: fencing_independent_release
         checks_failed: blocked
         deny: blocked
       on_failure: blocked
@@ -1341,7 +1367,13 @@ definition:
         denied: blocked
     publishing_rebased_stack:
       activity: publish_rebased_stack
-      on_success: requesting_republished_stack_child_reviews
+      on_signal:
+        complete: requesting_republished_stack_child_reviews
+        partial_progress: preparing_stack_republication_resume
+      on_failure: blocked
+    preparing_stack_republication_resume:
+      activity: prepare_stack_republication_resume
+      on_success: stack_republication_gate
       on_failure: blocked
     requesting_stack_child_reviews:
       activity: request_stack_child_reviews
@@ -1360,12 +1392,17 @@ definition:
     merging:
       activity: merge_change
       on_success: reconciling
+      on_signal:
+        independent_child_precondition_stale: fencing_independent_release
       on_failure: blocked
     reconciling:
       activity: reconcile_remote_state
       on_signal:
         subject_merged: done
         integration_parent_merged: releasing_integration_children
+        independent_child_identity_drift: fencing_independent_release
+        independent_release_invalidated_unmerged: awaiting_parent_handoff
+        independent_release_invalidated_identity_drift: refreshing_child_review_facts
         divergence: blocked
       on_failure: blocked
     releasing_integration_children:
@@ -1447,7 +1484,7 @@ activities:
   collect_change_facts:
     executor: registered_server
     contract: registered.change_fact_collection.v1
-    produces: [intake_subject_snapshot, code_change_snapshot, review_subject_snapshot]
+    produces: [intake_subject_snapshot, code_change_snapshot, review_subject_snapshot, publication_subject_snapshot]
 
   refresh_remote_change_binding:
     executor: registered_server
@@ -1458,7 +1495,7 @@ activities:
       successor_output: remote_change_binding
       update_current_ref: work_item.remote_change_binding_id
       concurrency: compare_and_swap
-    produces: [remote_change_binding, intake_subject_snapshot, code_change_snapshot, review_subject_snapshot]
+    produces: [remote_change_binding, intake_subject_snapshot, code_change_snapshot, review_subject_snapshot, publication_subject_snapshot]
 
   collect_parent_composition_facts:
     executor: registered_server
@@ -1595,7 +1632,11 @@ activities:
     contract: registered.execution_authority_gate.v1
     authority: execution
     requested_action: publish_change
-    required_evidence: [implementation_plan, change_set, validation_report, semantic_risk_assessment]
+    required_evidence:
+      all: [implementation_plan, change_set, validation_report, semantic_risk_assessment, publication_subject_snapshot]
+      by_binding:
+        unbound: []
+        bound: [remote_change_binding]
     produces: [authorization_gate_result, authorization_receipt]
 
   evaluate_integration_publication_authority:
@@ -1603,7 +1644,11 @@ activities:
     contract: registered.execution_authority_gate.v1
     authority: execution
     requested_action: publish_integrated_change
-    required_evidence: [decomposition_validation, child_materialization, child_outcome, integrated_change_set, validation_report, semantic_risk_assessment]
+    required_evidence:
+      all: [decomposition_validation, child_materialization, child_outcome, integrated_change_set, validation_report, semantic_risk_assessment, publication_subject_snapshot]
+      by_binding:
+        unbound: []
+        bound: [remote_change_binding]
     produces: [authorization_gate_result, authorization_receipt]
 
   implement_change:
@@ -1779,7 +1824,14 @@ activities:
   release_independent_children:
     executor: registered_server
     contract: registered.parent_handoff_release.v1
-    produces: [parent_handoff_receipt]
+    required_evidence: [child_materialization, child_outcome, semantic_risk_assessment, independent_set_review_receipt]
+    produces: [parent_release_snapshot, parent_handoff_receipt]
+
+  invalidate_independent_release:
+    executor: registered_server
+    contract: registered.parent_handoff_invalidation.v1
+    required_evidence: [parent_release_snapshot, parent_handoff_receipt, merge_gate_result]
+    produces: [parent_release_invalidation]
 
   release_integration_children:
     executor: registered_server
@@ -1818,7 +1870,11 @@ activities:
     idempotency: required
     authority: execution_authorization
     requested_action: publish_change
-    required_evidence: [change_set, validation_report, authorization_gate_result, authorization_receipt]
+    required_evidence:
+      all: [change_set, validation_report, publication_subject_snapshot, authorization_gate_result, authorization_receipt]
+      by_binding:
+        unbound: []
+        bound: [remote_change_binding]
     provider_precondition_contract:
       expected_versions_from: authorization_gate_result
       cardinality: single_subject
@@ -1838,7 +1894,11 @@ activities:
     idempotency: required
     authority: execution_authorization
     requested_action: publish_integrated_change
-    required_evidence: [integrated_change_set, validation_report, authorization_gate_result, authorization_receipt]
+    required_evidence:
+      all: [integrated_change_set, validation_report, publication_subject_snapshot, authorization_gate_result, authorization_receipt]
+      by_binding:
+        unbound: []
+        bound: [remote_change_binding]
     provider_precondition_contract:
       expected_versions_from: authorization_gate_result
       cardinality: single_subject
@@ -1856,14 +1916,25 @@ activities:
     executor: registered_server
     contract: registered.merge_gate.v1
     requested_action: merge_current_subject
-    produces: [merge_gate_result, authorization_receipt]
+    required_evidence:
+      all: [remote_change_binding, semantic_risk_assessment, validation_report, review_subject_snapshot]
+      by_subject:
+        direct: [review_receipt]
+        independent_child: [review_receipt, parent_release_snapshot, parent_handoff_receipt]
+        integration_parent: [integration_review_receipt]
+    produces: [merge_fact_snapshot, merge_gate_result, authorization_receipt]
 
   revalidate_merge_authorization:
     executor: registered_server
     contract: registered.merge_gate.v1
     requested_action: merge_current_subject
-    required_evidence: [remote_change_binding, merge_gate_result, authorization_receipt]
-    produces: [merge_gate_result]
+    required_evidence:
+      all: [remote_change_binding, merge_gate_result, authorization_receipt]
+      by_subject:
+        direct: []
+        independent_child: [parent_release_snapshot, parent_handoff_receipt]
+        integration_parent: []
+    produces: [merge_fact_snapshot, merge_gate_result]
 
   merge_change:
     executor: provider_action
@@ -1871,13 +1942,23 @@ activities:
     idempotency: required
     authority: merge_authorization
     requested_action: merge_current_subject
-    required_evidence: [remote_change_binding, merge_gate_result, authorization_receipt]
+    required_evidence:
+      all: [remote_change_binding, merge_gate_result, authorization_receipt]
+      by_subject:
+        direct: []
+        independent_child: [parent_release_snapshot, parent_handoff_receipt]
+        integration_parent: []
     provider_precondition_contract:
       expected_versions_from: merge_gate_result
       cardinality: single_subject
       enforcement: atomic_conditional_write
       on_stale: fail_before_mutation
+      subject_signal:
+        independent_child: independent_child_precondition_stale
     reconciliation: registered.remote_reconciliation.v1
+    reconciliation_signal:
+      confirmed_unmerged_identity_drift:
+        independent_child: independent_child_identity_drift
     produces: [merge_attempt_receipt]
 
   evaluate_stack_entry_gate:
@@ -1961,8 +2042,20 @@ activities:
       cardinality: per_stack_entry
       enforcement: atomic_conditional_write
       on_stale: fail_before_mutation
+    binding_transition_contract:
+      cardinality: per_stack_entry
+      expected_current_refs_from: stack_rebase_context.remaining_ordered_bindings
+      successor_output: remote_change_binding
+      update_current_refs: child_work_items.remote_change_binding_id
+      concurrency: compare_and_swap
     reconciliation: registered.stack_republication_reconciliation.v1
-    produces: [stack_republication_receipt, stack_review_refresh_context]
+    produces: [remote_change_binding, stack_republication_receipt, stack_review_refresh_context]
+
+  prepare_stack_republication_resume:
+    executor: registered_server
+    contract: registered.stack_republication_resume.v1
+    required_evidence: [stack_rebase_context, stack_republication_receipt, remote_change_binding]
+    produces: [stack_rebase_context]
 
   request_stack_child_reviews:
     executor: registered_server
@@ -2018,6 +2111,9 @@ evidence:
   intake_subject_snapshot:
     payload_schema: .harness/schemas/intake-subject-snapshot.v1.json
     allowed_producers: [server_fact_collector]
+  publication_subject_snapshot:
+    payload_schema: .harness/schemas/publication-subject-snapshot.v1.json
+    allowed_producers: [server_fact_collector]
   decomposition_validation:
     payload_schema: .harness/schemas/decomposition-validation.v1.json
     allowed_producers: [server_policy_engine]
@@ -2057,6 +2153,12 @@ evidence:
   parent_handoff_receipt:
     payload_schema: .harness/schemas/parent-handoff-receipt.v1.json
     allowed_producers: [server_policy_engine]
+  parent_release_snapshot:
+    payload_schema: .harness/schemas/parent-release-snapshot.v1.json
+    allowed_producers: [server_policy_engine]
+  parent_release_invalidation:
+    payload_schema: .harness/schemas/parent-release-invalidation.v1.json
+    allowed_producers: [server_policy_engine]
   child_set_reconciliation:
     payload_schema: .harness/schemas/child-set-reconciliation.v1.json
     allowed_producers: [server_policy_engine]
@@ -2090,6 +2192,9 @@ evidence:
   merge_gate_result:
     payload_schema: .harness/schemas/merge-gate-result.v1.json
     allowed_producers: [server_policy_engine]
+  merge_fact_snapshot:
+    payload_schema: .harness/schemas/merge-fact-snapshot.v1.json
+    allowed_producers: [server_fact_collector]
   merge_attempt_receipt:
     payload_schema: .harness/schemas/merge-attempt-receipt.v1.json
     allowed_producers: [remote_provider]
@@ -2260,7 +2365,9 @@ stateDiagram-v2
     rebasing_stack --> stack_republication_gate: local identities changed
     stack_republication_gate --> awaiting_stack_republication_authorization: human required
     awaiting_stack_republication_authorization --> publishing_rebased_stack: authorization received
-    publishing_rebased_stack --> requesting_republished_stack_child_reviews: provider outcomes recorded
+    publishing_rebased_stack --> requesting_republished_stack_child_reviews: all provider outcomes recorded
+    publishing_rebased_stack --> preparing_stack_republication_resume: partial progress recorded
+    preparing_stack_republication_resume --> stack_republication_gate: successor context materialized
     requesting_stack_child_reviews --> awaiting_stack_child_reviews: child commands committed
     requesting_republished_stack_child_reviews --> awaiting_stack_child_reviews: child commands committed
     awaiting_stack_child_reviews --> preparing_stack_review: all leaf reviews current
@@ -2311,7 +2418,7 @@ stateDiagram-v2
     merge_gate --> awaiting_remote_facts: facts unavailable
     merge_gate --> refreshing_direct_review_facts: direct review stale
     merge_gate --> refreshing_integration_review_facts: integration review stale
-    merge_gate --> refreshing_independent_child_review_facts: child review stale
+    merge_gate --> fencing_independent_release: child review stale
     merge_gate --> blocked: checks failed or denied
     awaiting_remote_checks --> merge_gate: checks eligible
     awaiting_remote_facts --> merge_gate: facts available
@@ -2319,6 +2426,7 @@ stateDiagram-v2
     refreshing_integration_review_facts --> assessing_refreshed_integration_risk: current identity collected
     assessing_refreshed_integration_risk --> validating_refreshed_integration: risk classified
     validating_refreshed_integration --> integration_review: current head validated
+    fencing_independent_release --> refreshing_independent_child_review_facts: release invalidated and siblings fenced
     refreshing_independent_child_review_facts --> requesting_independent_child_review: current identity collected
     requesting_independent_child_review --> assessing_refreshed_child_risk: parent notified
     refreshing_child_review_facts --> assessing_refreshed_child_risk: current identity collected
@@ -2332,7 +2440,7 @@ stateDiagram-v2
     awaiting_revalidated_remote_facts --> revalidating_merge_authorization: facts available
     revalidating_merge_authorization --> refreshing_direct_review_facts: direct review stale
     revalidating_merge_authorization --> refreshing_integration_review_facts: integration review stale
-    revalidating_merge_authorization --> refreshing_independent_child_review_facts: child review stale
+    revalidating_merge_authorization --> fencing_independent_release: child review stale
     awaiting_stack_merge_authorization --> revalidating_stack_merge_authorization: authorization received
     revalidating_stack_merge_authorization --> landing_stack_entry: current gate eligible
     revalidating_stack_merge_authorization --> awaiting_revalidated_stack_checks: checks pending
@@ -2345,6 +2453,10 @@ stateDiagram-v2
     awaiting_stack_checks --> stack_merge_gate: checks eligible
     awaiting_stack_facts --> stack_merge_gate: facts available
     merging --> reconciling
+    merging --> fencing_independent_release: independent child precondition stale
+    reconciling --> fencing_independent_release: independent child identity drift while unmerged
+    reconciling --> awaiting_parent_handoff: invalidated release and merge proven absent
+    reconciling --> refreshing_child_review_facts: invalidated release with unmerged identity drift
     reconciling --> done: ordinary subject merge confirmed
     reconciling --> releasing_integration_children: integration parent merge confirmed
     releasing_integration_children --> awaiting_integration_child_acknowledgements: releases committed
@@ -2422,6 +2534,7 @@ stateDiagram-v2
     refreshing_integration_review_facts --> blocked
     assessing_refreshed_integration_risk --> blocked
     validating_refreshed_integration --> blocked
+    fencing_independent_release --> blocked
     refreshing_independent_child_review_facts --> blocked
     requesting_independent_child_review --> blocked
     refreshing_child_review_facts --> blocked
@@ -2442,6 +2555,7 @@ stateDiagram-v2
     stack_republication_gate --> blocked
     awaiting_stack_republication_authorization --> blocked
     publishing_rebased_stack --> blocked
+    preparing_stack_republication_resume --> blocked
     requesting_stack_child_reviews --> blocked
     requesting_republished_stack_child_reviews --> blocked
     awaiting_stack_child_reviews --> blocked
@@ -2687,6 +2801,22 @@ plan or decomposition revision, risk, scope, code identity when present, expiry,
 exact activity action. A receipt for one mutation cannot authorize another, and neither a gate
 result alone nor an older receipt is usable. Publication receives a separate receipt after local
 code facts and semantic risk are current; an implementation or integration receipt cannot publish.
+A trusted `publication_subject_snapshot` supplies either expected absence for an unbound subject or
+the exact current provider version for a bound subject. The publication authority result and target
+action consume the same snapshot ID/digest; a bound case additionally consumes the matching current
+`RemoteChangeBinding`. A provider observation or binding change between gate and dispatch is stale
+before mutation and cannot be recovered by reading implicit current state.
+
+The merge gate consumes its declared current binding, semantic risk, validation report, review
+subject snapshot, and subject-specific receipt set. Direct work requires its leaf receipt,
+integration requires the integration receipt, and an independently released child requires both its
+leaf receipt and the parent handoff receipt. During that registered evaluation, its constrained
+provider fact read creates one trusted `merge_fact_snapshot` covering the current open/draft,
+repository/base, head, required-check, unresolved-thread, provider-review, mergeability, and
+provider-version facts. The gate result and any policy authorization receipt bind the exact input
+Evidence IDs/digests and that snapshot ID/digest in the same server-owned completion transaction;
+replay cannot reconstruct them from a mutable projection. A provider fact read or snapshot
+materialization failure emits no eligible result.
 
 Stack rewrite policy is Workflow-owned rather than inferred by the compiler.
 `stack_rebase_authorization` uses the execution tiers: low and medium may receive current
@@ -2983,6 +3113,36 @@ by its implementation attempt. The review-result validator rejects `approved` wh
 missing, stale, bound to another subject, or records any required validation as failed or
 unavailable.
 
+Releasing an approved independent set consumes the aggregate semantic risk assessment and aggregate
+review receipt, advances the server-owned parent release generation, and atomically installs one
+current `parent_release_snapshot`. The snapshot binds the complete aggregate identity, decomposition
+revision, review/risk IDs and digests, risk floor, and released child set. Each child-specific
+`parent_handoff_receipt` binds that snapshot and release generation. The child merge gate computes
+`effective_risk = max(current_child_risk, released_aggregate_risk_floor)` and validates that the
+snapshot is still the parent's exact current release pointer. The revalidation activity and provider
+merge dispatcher repeat that pointer/generation check before external I/O.
+
+When any released child or aggregate identity becomes stale, the child first enters
+`fencing_independent_release`. Its registered activity locks the parent and current `ParentRelease`,
+compare-and-swaps the parent's release pointer to null, marks that generation invalidated, fences
+merge dispatch for every released but unmerged sibling, and atomically emits the invalidation,
+parent notification, and child commands before any refresh begins. Concurrent stale children reuse
+the accepted invalidation rather than creating another generation. Each sibling command uses the
+declared `invalidate_independent_release` control route: unstarted work returns to
+`awaiting_parent_handoff`, while a running action, returned completion candidate, or existing
+`reconciling` state retains/enters reconciliation with the invalidation Evidence attached. The
+reconciler routes a proven unmerged unchanged subject to `awaiting_parent_handoff`, a proven
+unmerged identity drift through child fact/risk/validation/review refresh, and a committed merge
+through truthful completion. The route's `allowed_from` list is exhaustive and excludes every
+cancellation/control-return state, so it cannot discard an active control continuation. A later
+parent release creates a new generation and receipts. A medium or high aggregate therefore cannot
+be lowered by individually low-risk children, and no receipt from an invalidated generation can
+authorize merge.
+The independent-child provider merge descriptor also emits the same fence route when its atomic
+precondition rejects a stale provider version before mutation, or when reconciliation proves an
+identity drift and proves that no merge committed. These outcomes never fall through the generic
+`on_failure: blocked` edge while the old release generation remains current.
+
 ### 18.3 Child review
 
 Every code-producing child requires an eligible current-head receipt before it can contribute a
@@ -3264,9 +3424,12 @@ authorization receipts are typed Evidence payloads in that table. Dedicated rece
 indexes are derived from Evidence IDs and are rebuildable. Artifacts and evaluation tables never
 become an alternate Evidence source.
 
-Actor assignments and remote change bindings are immutable/versioned supporting records. An
-attempt references its assignment and lease generation. Attempt observations and terminal folds
-MUST verify the current lease generation; attempt numbers are allocated atomically per runtime job.
+Actor assignments, remote change bindings, and parent releases are immutable/versioned supporting
+records. The parent Work Item's current-release ID and generation are the only current-release
+authority; release and invalidation compare-and-swap those fields in the same transaction as
+snapshot Evidence, child commands, and status changes. An attempt references its assignment and
+lease generation. Attempt observations and terminal folds MUST verify the current lease generation;
+attempt numbers are allocated atomically per runtime job.
 
 Entering an external wait atomically persists its wait identity, fact subject/cursor, refresh
 contract, next delayed refresh command, bounded backoff, deadline, and budget reservation. A webhook
@@ -3312,9 +3475,18 @@ that entry, and advances the cursor. Before rebasing remaining entries, an actio
 authorizes the new expected-parent identity and writable scope; the rebase invalidates old
 code-bound review Evidence. A second action-specific gate binds the resulting code identity before
 an idempotent provider republication. Each successful update creates a superseding remote binding,
-and a fact collector confirms the remote code identities before fresh review. Crash recovery
-resumes from the persisted rebase/publish/landing cursors and remote facts; it never repeats an
-externally confirmed write or treats a partial stack as complete.
+and the server completion fold compare-and-swaps that successor into the corresponding child Work
+Item before the post-republication refresh context can name it. A fact collector confirms the remote
+code identities before fresh review. Per-entry partial success persists one reconciled successor and
+advances the publish cursor without replaying it. It emits `partial_progress`, never aggregate
+success. The registered resume activity locks current integration progress, verifies every completed
+successor/CAS, and creates a successor `stack_rebase_context` for only the remaining entries with the
+new generation, publish cursor, and current ordered bindings. That context returns through
+`stack_republication_gate`, so the remainder receives a new action-specific human authorization;
+the old gate result and receipt cannot be reused. Missing or failed successor CAS keeps the aggregate
+action nonterminal and blocks review dispatch. Crash recovery reconciles remote facts into the same
+complete-or-partial signal and resumes from persisted cursors; it never repeats an externally
+confirmed write or treats a partial stack as complete.
 
 The same progress record persists cumulative stack-review rounds and stale-review rounds at the
 current landing cursor. Review dispatch atomically consumes those counters: the standard profile

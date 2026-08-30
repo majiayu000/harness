@@ -316,8 +316,8 @@ compare-and-swaps that pointer in the same transaction as successor insertion.
 
 Supporting records do not expand the six orchestration objects. `ActorAssignment` establishes who
 may act under which role and permissions; `RemoteChangeBinding` identifies the provider-owned
-change; the separate cutover proposal uses `ProviderIntakeFence`; receipts are typed Evidence
-payloads.
+change; `ParentRelease` fences one current independent-set release generation; the separate cutover
+proposal uses `ProviderIntakeFence`; receipts are typed Evidence payloads.
 
 ## 6. Exact Persistence Decisions
 
@@ -342,6 +342,10 @@ decisions:
 
 The target requires these records. Names are normative for design but may be adjusted in a schema
 review if they collide with existing schema conventions.
+
+The vNext `workflow_instances` row adds nullable `current_parent_release_id` and monotonic
+`parent_release_generation` fields. They are the Work Item's current-release authority and are
+updated only by the parent-release transactions below.
 
 ```text
 workflow_activity_attempts
@@ -401,6 +405,23 @@ workflow_child_relations
   required_output_evidence jsonb
   status
   unique(parent_workflow_id, child_workflow_id)
+
+workflow_parent_releases
+  id primary key
+  schema_version
+  parent_workflow_id foreign key
+  workflow_definition_hash
+  decomposition_revision
+  release_generation bigint not null
+  snapshot_evidence_id foreign key workflow_evidence(id)
+  aggregate_code_identity jsonb
+  aggregate_risk_level
+  released_child_ids jsonb
+  status                    # current | invalidated | completed
+  created_at
+  invalidated_at nullable
+  unique(parent_workflow_id, decomposition_revision, release_generation)
+  unique(parent_workflow_id) where status = current
 
 workflow_actor_assignments
   id primary key
@@ -539,6 +560,14 @@ advance the row. Entering stack review atomically increments `review_rounds`; a 
 also increments `stale_review_rounds_at_cursor`, and only a successful landing-cursor advance resets
 that per-cursor count. Recovery never reconstructs either counter from review receipts.
 
+Creating an independent release locks the parent instance, increments
+`parent_release_generation`, inserts the immutable `workflow_parent_releases` row and snapshot
+Evidence, and compare-and-swaps `current_parent_release_id` in the same transaction as child handoff
+commands. Invalidation locks the same rows, compare-and-swaps that pointer to null, marks the
+accepted generation invalidated, and commits sibling fences/commands atomically. The partial unique
+constraint prevents two current generations; replay or a losing concurrent invalidation reloads
+the accepted row rather than selecting a snapshot by time.
+
 `provider_intake_fences` is seeded from the verified immutable cutover manifest before the vNext
 epoch is installed. The source fence records live outside the runtime schema being replaced, and
 the vNext listener cannot start until the installed records match that manifest.
@@ -568,6 +597,8 @@ assignment schema version is interpreted by its versioned reader; unknown versio
 - `RuntimeCapabilitySnapshot` is immutable attempt data.
 - `ActorAssignment` and `RemoteChangeBinding` are immutable supporting records, not orchestration
   aggregates.
+- `ParentRelease` is an immutable generation plus a parent-owned current pointer, not a child-owned
+  authority or a second parent lifecycle.
 - `ProviderIntakeFence` is immutable cutover support state, not a Work Item or Workflow lifecycle.
 - `ExternalWait` is a durable progress/fencing record backed by scheduled outbox commands, not a
   second workflow state machine.
@@ -709,6 +740,11 @@ registered server contract or the server-owned completion fold of a provider-act
 Unknown actions, unlinked targets, mismatched human gates, unsupported concurrency modes, or
 registry mismatches fail definition compilation.
 
+`required_evidence_rules` use a closed all-of form with exhaustive server-owned selectors such as
+the current landing relation or whether a current remote binding exists. Compilation rejects an
+unknown selector or missing case. Runtime resolution pins the selected Evidence IDs and digests;
+an Agent cannot select a case and undeclared mutable state cannot satisfy a requirement.
+
 `executor: agent` never names Codex, Claude, OpenCode, or a model. Runtime profiles advertise
 capabilities; the dispatcher chooses an eligible profile using operator configuration. Model choice
 is a runtime-profile concern and is snapshotted, not part of workflow state logic.
@@ -735,9 +771,16 @@ expected absence or an exact provider version and verifies that the registered A
 invoke a provider-native atomic conditional write for its single-subject or per-entry cardinality.
 Prompted check-then-write, local pointer CAS, and reconciliation do not satisfy this contract.
 Per-entry stack publication retains separate versions/idempotency keys and reconciles partial
-success without replaying completed entries. Read-only registered contracts that collect provider
-facts also use constrained AgentBackend prompts; registered server code owns validation and folding,
-not provider transport.
+success without replaying completed entries. Each completed entry produces a successor immutable
+remote binding and compare-and-swaps that child's exact current binding pointer before advancing the
+publication cursor; partial success persists completed successors and never reports aggregate
+success. Read-only registered contracts that collect provider facts also use constrained
+AgentBackend prompts; registered server code owns validation and folding, not provider transport.
+
+Publication authority and its provider target consume the same trusted publication-subject
+snapshot. An unbound case pins expected absence; an already-bound PR pins both the current remote
+binding and exact provider version. Any mismatch before mutation is stale rather than an implicit
+refresh or replacement publication.
 
 Before provider I/O, the constrained tool channel must compare its operation, subject, typed action,
 idempotency key, and expected absence/version with the pinned action request. Omission or mismatch
@@ -1102,6 +1145,10 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - low automatic merge has a current server-policy receipt bound to the exact eligible gate inputs;
 - low automatic stack-entry merge additionally binds integration generation, landing cursor,
   current binding/code identity, and `merge_current_stack_entry`;
+- release of independent children carries the aggregate review identity and aggregate semantic-risk
+  floor into every child handoff, so child merge policy uses the maximum of child and aggregate risk;
+- independent release advances one parent-owned generation and current snapshot; aggregate change
+  clears that pointer and fences every released but unmerged sibling before parent re-review;
 - high mutation lacks plan receipt and waits;
 - every direct, direct-repair, child-materialization, child-repair, integration, and
   integration-repair mutation
@@ -1130,6 +1177,10 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
   repeating a confirmed remote write;
 - rebased stack entries are idempotently republished, remote identities refreshed, and freshly
   reviewed before the next entry gate;
+- each rebased stack entry creates one successor binding and compare-and-swaps the corresponding
+  child pointer; partial publication preserves successful successors and blocks aggregate success;
+- partial stack republication materializes a successor context from the persisted cursor/current
+  bindings and requires a new human republication receipt before dispatching remaining entries;
 - independent or stacked child head change invalidates its risk, validation, review, and
   `ChildOutcome`; all three current-head gates rerun before a new outcome reaches the parent;
 - independent-set and stack aggregate subjects derive identity-bound semantic risk before their
@@ -1225,10 +1276,22 @@ a destructive transition:
   count, and budget reservation without consuming refresh attempts until eligible, failed, expired,
   or exhausted;
 - current remote facts, CI, threads, review, base, mergeability, risk, and authority are all required;
+- merge-gate evaluation consumes the current binding, risk, validation, review subject, and the
+  landing-relation-specific receipt set, then atomically binds a fresh trusted checks/thread fact
+  snapshot into its result and any automatic policy receipt;
+- independent-child merge evaluation, human revalidation, and provider dispatch each reject a
+  parent release snapshot/receipt whose generation is no longer the parent's current pointer;
+- an independent-child provider precondition stale or confirmed-unmerged reconciliation drift runs
+  the same parent release invalidation/fence transaction before refresh or blocking;
+- independent release invalidation has an exhaustive non-cancellation state set; queued writes are
+  fenced, while running/returned/ambiguous provider outcomes retain reconciliation until remote
+  truth proves merge or absence, without discarding an active control continuation;
 - direct and stack merge provider actions reject a missing or stale current binding, gate result, or
   action-specific authorization receipt before external dispatch;
 - every publication or merge provider action rejects a stale expected absence/version before
   mutation; stack republication checks the condition separately and atomically for every entry;
+- direct and integrated publication authority and targets reject a missing or mismatched trusted
+  publication-subject snapshot; bound repair also requires the matching current binding/version;
 - provider reports merged but follow-up snapshot is stale/missing, so Work Item does not close;
 - crash after provider merge but before local commit reconciles to one terminal event; and
 - an out-of-scope Agent write produces no accepted partial result, routes to `blocked`, and can resume
