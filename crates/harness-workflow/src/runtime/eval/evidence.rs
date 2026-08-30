@@ -418,7 +418,7 @@ fn runtime_job_snapshot(job: &RuntimeJob) -> RuntimeJobSnapshot {
                     .collect()
             })
             .unwrap_or_default(),
-        terminal_state: runtime_job_terminal_state(job),
+        terminal_state: runtime_job_terminal_state(job).map(ToOwned::to_owned),
         error_kind: result
             .as_ref()
             .and_then(|result| result.error_kind.map(runtime_error_kind)),
@@ -445,15 +445,11 @@ pub(super) fn activity_result_from_job(job: &RuntimeJob) -> Option<ActivityResul
     }
 }
 
-fn runtime_job_terminal_state(job: &RuntimeJob) -> Option<String> {
-    if job.status.is_active() {
-        return None;
-    }
-
+fn runtime_job_terminal_state(job: &RuntimeJob) -> Option<&'static str> {
     match job.status {
-        RuntimeJobStatus::Succeeded | RuntimeJobStatus::Failed | RuntimeJobStatus::Cancelled => {
-            Some(eval_runtime_job_status(job.status).to_string())
-        }
+        RuntimeJobStatus::Succeeded => Some("succeeded"),
+        RuntimeJobStatus::Failed => Some("failed"),
+        RuntimeJobStatus::Cancelled => Some("cancelled"),
         _ => None,
     }
 }

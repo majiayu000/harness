@@ -212,31 +212,29 @@ pub(crate) async fn record_runtime_circuit_breaker_completion(
     if job.status == RuntimeJobStatus::Failed && runtime_job_is_transcript_preflight_failure(job) {
         return Ok(());
     }
-    let events = if job.status == RuntimeJobStatus::Cancelled || job.status.is_active() {
-        Vec::new()
-    } else {
-        match job.status {
-            RuntimeJobStatus::Succeeded => state.runtime_circuit_breakers.record_success(
+    let events = match job.status {
+        RuntimeJobStatus::Succeeded => state.runtime_circuit_breakers.record_success(
+            &job.runtime_profile,
+            &job.id,
+            chrono::Utc::now(),
+        ),
+        RuntimeJobStatus::Failed => {
+            let failure_class = runtime_job_failure_class(job);
+            if let Some(updated) = store
+                .record_runtime_job_failure_class(&job.id, failure_class.as_str())
+                .await?
+            {
+                *job = updated;
+            }
+            state.runtime_circuit_breakers.record_failure(
                 &job.runtime_profile,
                 &job.id,
+                failure_class,
                 chrono::Utc::now(),
-            ),
-            RuntimeJobStatus::Failed => {
-                let failure_class = runtime_job_failure_class(job);
-                if let Some(updated) = store
-                    .record_runtime_job_failure_class(&job.id, failure_class.as_str())
-                    .await?
-                {
-                    *job = updated;
-                }
-                state.runtime_circuit_breakers.record_failure(
-                    &job.runtime_profile,
-                    &job.id,
-                    failure_class,
-                    chrono::Utc::now(),
-                )
-            }
-            _ => Vec::new(),
+            )
+        }
+        RuntimeJobStatus::Cancelled | RuntimeJobStatus::Pending | RuntimeJobStatus::Running => {
+            Vec::new()
         }
     };
     circuit_breaker_events::emit_circuit_breaker_events(state, events).await;
