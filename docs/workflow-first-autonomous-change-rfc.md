@@ -354,6 +354,7 @@ WorkflowDefinition
   semantic_version
   content_hash
   intake_bindings
+  control_routes
   states
   terminal_mapping
   activities
@@ -377,6 +378,9 @@ Required invariants:
 - every route is reachable or explicitly reserved for failure/recovery;
 - limits may be stricter than server limits, never looser;
 - unknown required capabilities fail validation;
+- control routes are closed, server-authenticated preemption contracts rather than implicit
+  transitions; their sources, allowed lifecycle scope, Evidence, handler, and terminal fold are
+  compiled and pinned;
 - semantic changes produce a different content hash; and
 - active instances retain the compiled bundle needed for replay.
 
@@ -626,6 +630,24 @@ definition:
   version: 1
   initial: collecting_facts
 
+  control_routes:
+    request_cancellation:
+      source: operator
+      requested_action: cancel_work_item
+      allowed_from: nonterminal_except_cancellation_flow
+      excluded_states: [awaiting_cancellation_authorization, reconciling_cancellation, reconciling_cancellation_external_outcome, reconciling_cancellation_stack_entry, cancelling_child_set, awaiting_child_cancellations]
+      on_duplicate: retain_current_cancellation_state
+      target: awaiting_cancellation_authorization
+    cancel_child_work_item:
+      source: parent_command
+      requested_action: cancel_work_item
+      allowed_from: nonterminal_except_cancellation_flow
+      excluded_states: [awaiting_cancellation_authorization, reconciling_cancellation, reconciling_cancellation_external_outcome, reconciling_cancellation_stack_entry, cancelling_child_set, awaiting_child_cancellations]
+      on_duplicate: retain_current_cancellation_state
+      required_evidence: [child_cancellation_request, cancellation_receipt]
+      target: reconciling_cancellation
+      terminal_fold_produces: [child_cancellation_acknowledgement, child_outcome]
+
   states:
     collecting_facts:
       activity: collect_change_facts
@@ -708,7 +730,6 @@ definition:
         authorized: implementing
         expired: authorizing_direct
         denied: blocked
-        cancelled: cancelled
     awaiting_direct_repair_authorization:
       progress: operator_gate
       gate:
@@ -718,7 +739,6 @@ definition:
         authorized: repairing_direct_change
         expired: authorizing_direct_repair
         denied: blocked
-        cancelled: cancelled
     awaiting_child_execution_authorization:
       progress: operator_gate
       gate:
@@ -728,7 +748,6 @@ definition:
         authorized: materializing_children
         expired: authorizing_children
         denied: blocked
-        cancelled: cancelled
     materializing_children:
       activity: materialize_children
       on_success: executing_children
@@ -836,7 +855,6 @@ definition:
         authorized: integrating
         expired: authorizing_integration
         denied: blocked
-        cancelled: cancelled
     integrating:
       activity: integrate_children
       on_success: collecting_integrated_change_facts
@@ -856,7 +874,6 @@ definition:
         authorized: repairing_integration
         expired: authorizing_integration_repair
         denied: blocked
-        cancelled: cancelled
     repairing_integration:
       activity: repair_integration
       on_success: collecting_integrated_change_facts
@@ -888,7 +905,6 @@ definition:
         authorized: publishing_integrated_change
         expired: authorizing_integration_publication
         denied: blocked
-        cancelled: cancelled
     implementing:
       activity: implement_change
       on_success: collecting_implemented_change_facts
@@ -916,7 +932,6 @@ definition:
         authorized: repairing_child_change
         expired: authorizing_child_repair
         denied: blocked
-        cancelled: cancelled
     collecting_implemented_change_facts:
       activity: collect_change_facts
       on_success: assessing_implemented_change_risk
@@ -952,7 +967,6 @@ definition:
         authorized: publishing_direct_change
         expired: authorizing_direct_publication
         denied: blocked
-        cancelled: cancelled
     authorizing_child_publication:
       activity: evaluate_change_publication_authority
       on_signal:
@@ -968,7 +982,6 @@ definition:
         authorized: publishing_child_change
         expired: authorizing_child_publication
         denied: blocked
-        cancelled: cancelled
     collecting_local_child_review_facts:
       activity: collect_change_facts
       on_success: assessing_local_child_review_risk
@@ -1122,14 +1135,41 @@ definition:
       activity: revalidate_merge_authorization
       on_signal:
         authorized: merging
-        checks_pending: awaiting_remote_checks
-        facts_unavailable: awaiting_remote_facts
+        checks_pending: awaiting_revalidated_remote_checks
+        facts_unavailable: awaiting_revalidated_remote_facts
         direct_review_stale: refreshing_direct_review_facts
         integration_review_stale: refreshing_integration_review_facts
         independent_child_review_stale: refreshing_independent_child_review_facts
         checks_failed: blocked
         deny: blocked
       on_failure: blocked
+    awaiting_revalidated_remote_checks:
+      progress: external_wait
+      wait:
+        fact_kind: required_checks
+        refresh_contract: registered.change_fact_collection.v1
+        max_refreshes: 20
+        deadline: 2h
+        backoff: {initial: 15s, maximum: 5m, multiplier: 2}
+      on_signal:
+        checks_eligible: revalidating_merge_authorization
+        checks_failed: blocked
+        remote_failed: blocked
+        deadline_exceeded: blocked
+        budget_exhausted: blocked
+    awaiting_revalidated_remote_facts:
+      progress: external_wait
+      wait:
+        fact_kind: remote_subject
+        refresh_contract: registered.change_fact_collection.v1
+        max_refreshes: 12
+        deadline: 1h
+        backoff: {initial: 15s, maximum: 5m, multiplier: 2}
+      on_signal:
+        facts_available: revalidating_merge_authorization
+        remote_failed: blocked
+        deadline_exceeded: blocked
+        budget_exhausted: blocked
     stack_merge_gate:
       activity: evaluate_stack_entry_gate
       on_signal:
@@ -1155,14 +1195,41 @@ definition:
       activity: revalidate_stack_merge_authorization
       on_signal:
         authorized: landing_stack_entry
-        checks_pending: awaiting_stack_checks
-        facts_unavailable: awaiting_stack_facts
+        checks_pending: awaiting_revalidated_stack_checks
+        facts_unavailable: awaiting_revalidated_stack_facts
         review_stale: requesting_stack_child_reviews
         rebase_required: stack_rebase_gate
         checks_failed: blocked
         stack_complete: reconciling_child_set
         deny: blocked
       on_failure: blocked
+    awaiting_revalidated_stack_checks:
+      progress: external_wait
+      wait:
+        fact_kind: required_checks
+        refresh_contract: registered.change_fact_collection.v1
+        max_refreshes: 20
+        deadline: 2h
+        backoff: {initial: 15s, maximum: 5m, multiplier: 2}
+      on_signal:
+        checks_eligible: revalidating_stack_merge_authorization
+        checks_failed: blocked
+        remote_failed: blocked
+        deadline_exceeded: blocked
+        budget_exhausted: blocked
+    awaiting_revalidated_stack_facts:
+      progress: external_wait
+      wait:
+        fact_kind: remote_subject
+        refresh_contract: registered.change_fact_collection.v1
+        max_refreshes: 12
+        deadline: 1h
+        backoff: {initial: 15s, maximum: 5m, multiplier: 2}
+      on_signal:
+        facts_available: revalidating_stack_merge_authorization
+        remote_failed: blocked
+        deadline_exceeded: blocked
+        budget_exhausted: blocked
     awaiting_stack_checks:
       progress: external_wait
       wait:
@@ -1280,7 +1347,51 @@ definition:
         requested_action: recover_blocked_work_item
       on_signal:
         replan: collecting_facts
-        cancel: cancelled
+    awaiting_cancellation_authorization:
+      progress: operator_gate
+      gate:
+        evidence_kind: cancellation_receipt
+        requested_action: cancel_work_item
+      on_signal:
+        authorized: reconciling_cancellation
+        denied: blocked
+    reconciling_cancellation:
+      activity: evaluate_cancellation_admission
+      on_signal:
+        safe_to_cancel: cancelling_child_set
+        external_action_committed: reconciling_cancellation_external_outcome
+        facts_unavailable: blocked
+        ambiguous: blocked
+      on_failure: blocked
+    reconciling_cancellation_external_outcome:
+      activity: reconcile_cancellation_external_outcome
+      on_signal:
+        subject_succeeded: done
+        integration_parent_merged: releasing_integration_children
+        stack_entry_merged: reconciling_cancellation_stack_entry
+        continuation_required: blocked
+        facts_unavailable: blocked
+        divergence: blocked
+      on_failure: blocked
+    reconciling_cancellation_stack_entry:
+      activity: reconcile_stack_entry
+      on_signal:
+        more_entries: cancelling_child_set
+        stack_complete: reconciling_child_set
+        divergence: blocked
+      on_failure: blocked
+    cancelling_child_set:
+      activity: cancel_child_set
+      on_signal:
+        no_active_children: cancelled
+        cancellations_enqueued: awaiting_child_cancellations
+      on_failure: blocked
+    awaiting_child_cancellations:
+      progress: child_barrier
+      on_signal:
+        all_terminal: cancelled
+        cancellation_failed: blocked
+      on_failure: blocked
 
   recovery_targets:
     - collecting_facts
@@ -1639,6 +1750,26 @@ activities:
     contract: registered.child_set_reconciliation.v1
     produces: [child_set_reconciliation]
 
+  cancel_child_set:
+    executor: registered_server
+    contract: registered.child_set_cancellation.v1
+    requested_action: cancel_work_item
+    required_evidence: [cancellation_receipt]
+    produces: [child_cancellation_request, cancellation_receipt]
+
+  evaluate_cancellation_admission:
+    executor: registered_server
+    contract: registered.cancellation_admission.v1
+    requested_action: cancel_work_item
+    required_evidence: [cancellation_receipt]
+    produces: [cancellation_reconciliation]
+
+  reconcile_cancellation_external_outcome:
+    executor: registered_server
+    contract: registered.cancellation_external_reconciliation.v1
+    required_evidence: [cancellation_receipt, cancellation_reconciliation]
+    produces: [remote_merge_confirmation]
+
   publish_change:
     executor: provider_action
     contract: registered.provider_change_publish_or_bind.v1
@@ -1860,6 +1991,9 @@ evidence:
   operator_recovery_receipt:
     payload_schema: .harness/schemas/operator-recovery-receipt.v1.json
     allowed_producers: [human_operator]
+  cancellation_receipt:
+    payload_schema: .harness/schemas/cancellation-receipt.v1.json
+    allowed_producers: [human_operator, server_policy_engine]
   landing_path_selection:
     payload_schema: .harness/schemas/landing-path-selection.v1.json
     allowed_producers: [server_policy_engine]
@@ -1880,6 +2014,15 @@ evidence:
     allowed_producers: [server_policy_engine]
   child_set_reconciliation:
     payload_schema: .harness/schemas/child-set-reconciliation.v1.json
+    allowed_producers: [server_policy_engine]
+  child_cancellation_request:
+    payload_schema: .harness/schemas/child-cancellation-request.v1.json
+    allowed_producers: [server_policy_engine]
+  child_cancellation_acknowledgement:
+    payload_schema: .harness/schemas/child-cancellation-acknowledgement.v1.json
+    allowed_producers: [runtime_enforcement]
+  cancellation_reconciliation:
+    payload_schema: .harness/schemas/cancellation-reconciliation.v1.json
     allowed_producers: [server_policy_engine]
   stack_entry_reconciliation:
     payload_schema: .harness/schemas/stack-entry-reconciliation.v1.json
@@ -2138,15 +2281,19 @@ stateDiagram-v2
     validating_refreshed_child --> leaf_review_child: current head validated
     awaiting_merge_authorization --> revalidating_merge_authorization: authorization received
     revalidating_merge_authorization --> merging: current gate eligible
-    revalidating_merge_authorization --> awaiting_remote_checks: checks pending
-    revalidating_merge_authorization --> awaiting_remote_facts: facts unavailable
+    revalidating_merge_authorization --> awaiting_revalidated_remote_checks: checks pending
+    revalidating_merge_authorization --> awaiting_revalidated_remote_facts: facts unavailable
+    awaiting_revalidated_remote_checks --> revalidating_merge_authorization: checks eligible
+    awaiting_revalidated_remote_facts --> revalidating_merge_authorization: facts available
     revalidating_merge_authorization --> refreshing_direct_review_facts: direct review stale
     revalidating_merge_authorization --> refreshing_integration_review_facts: integration review stale
     revalidating_merge_authorization --> refreshing_independent_child_review_facts: child review stale
     awaiting_stack_merge_authorization --> revalidating_stack_merge_authorization: authorization received
     revalidating_stack_merge_authorization --> landing_stack_entry: current gate eligible
-    revalidating_stack_merge_authorization --> awaiting_stack_checks: checks pending
-    revalidating_stack_merge_authorization --> awaiting_stack_facts: facts unavailable
+    revalidating_stack_merge_authorization --> awaiting_revalidated_stack_checks: checks pending
+    revalidating_stack_merge_authorization --> awaiting_revalidated_stack_facts: facts unavailable
+    awaiting_revalidated_stack_checks --> revalidating_stack_merge_authorization: checks eligible
+    awaiting_revalidated_stack_facts --> revalidating_stack_merge_authorization: facts available
     revalidating_stack_merge_authorization --> requesting_stack_child_reviews: review stale
     revalidating_stack_merge_authorization --> stack_rebase_gate: rebase required
     revalidating_stack_merge_authorization --> reconciling_child_set: stack complete
@@ -2222,6 +2369,8 @@ stateDiagram-v2
     integration_review --> blocked
     merge_gate --> blocked
     revalidating_merge_authorization --> blocked
+    awaiting_revalidated_remote_checks --> blocked
+    awaiting_revalidated_remote_facts --> blocked
     awaiting_remote_checks --> blocked
     awaiting_remote_facts --> blocked
     refreshing_direct_review_facts --> blocked
@@ -2236,6 +2385,8 @@ stateDiagram-v2
     stack_merge_gate --> blocked
     awaiting_stack_merge_authorization --> blocked
     revalidating_stack_merge_authorization --> blocked
+    awaiting_revalidated_stack_checks --> blocked
+    awaiting_revalidated_stack_facts --> blocked
     awaiting_stack_checks --> blocked
     awaiting_stack_facts --> blocked
     landing_stack_entry --> blocked
@@ -2254,9 +2405,33 @@ stateDiagram-v2
     releasing_integration_children --> blocked
     awaiting_integration_child_acknowledgements --> blocked
     blocked --> collecting_facts: authorized replan
-    blocked --> cancelled: cancel
+    awaiting_cancellation_authorization --> reconciling_cancellation: cancellation authorized
+    reconciling_cancellation --> cancelling_child_set: no external write committed
+    reconciling_cancellation --> reconciling_cancellation_external_outcome: external write committed
+    reconciling_cancellation_external_outcome --> done: subject completed
+    reconciling_cancellation_external_outcome --> releasing_integration_children: integration parent merged
+    reconciling_cancellation_external_outcome --> reconciling_cancellation_stack_entry: stack entry merged
+    reconciling_cancellation_stack_entry --> cancelling_child_set: entries remain
+    reconciling_cancellation_stack_entry --> reconciling_child_set: stack complete
+    cancelling_child_set --> cancelled: no active children
+    cancelling_child_set --> awaiting_child_cancellations: cancellation commands committed
+    awaiting_child_cancellations --> cancelled: all children terminal
+    cancelling_child_set --> blocked
+    awaiting_child_cancellations --> blocked
+    awaiting_cancellation_authorization --> blocked
+    reconciling_cancellation --> blocked
+    reconciling_cancellation_external_outcome --> blocked
+    reconciling_cancellation_stack_entry --> blocked
     done --> [*]
 ```
+
+The compiled `request_cancellation` control route can enter
+`awaiting_cancellation_authorization` from any nonterminal state outside the cancellation flow; the
+diagram does not duplicate that same control edge beside every active state. A duplicate operator
+request or parent command retains the current cancellation gate, reconciliation, stack-entry
+reconciliation, or child barrier.
+The parent-issued `cancel_child_work_item` control enters `reconciling_cancellation` directly with
+its server-derived child receipt rather than requiring a second human gate.
 
 `failed` and `cancelled` are terminal classes. `blocked` is operator-owned and non-terminal. A
 Workflow may define additional states, but every active state MUST have an activity, a child
@@ -2895,6 +3070,33 @@ An operator recovery receipt may retry only a declared failed gate or authorize 
 returns to `collecting_facts`, where server-owned facts and risk are recomputed before any later
 state. Recovery never jumps directly from `blocked` to implementation, review, or merge.
 
+Cancellation uses its own `cancel_work_item` action and `cancellation_receipt`; an operator recovery
+receipt cannot authorize it. The compiled `request_cancellation` control may preempt any
+nonterminal logical state outside the cancellation flow but first enters
+`awaiting_cancellation_authorization`. Repeated requests while a cancellation gate,
+reconciliation, or child barrier is active are idempotent and retain that state.
+
+After human authorization, and immediately for a parent-issued child command,
+`evaluate_cancellation_admission` first fences new dispatch for the current Work Item, interrupts or
+cancels local jobs, and reconciles its own in-flight provider action. Only `safe_to_cancel` reaches
+`cancel_child_set`. A confirmed direct merge follows the truthful success route, a confirmed
+integration-parent merge releases and awaits its children, and a confirmed stack-entry merge enters
+`reconciling_cancellation_stack_entry`. That cancellation-aware reconciliation records the landed
+entry without returning to rebase or landing: a complete stack follows normal successful child-set
+reconciliation, while remaining entries proceed directly to cancellation fan-out. A committed
+nonterminal mutation, unavailable fact, ambiguity, or divergence remains nonterminal and routes to
+`blocked`; none is labelled cancelled.
+
+`cancel_child_set` then locks the pinned child set and atomically enqueues one idempotent
+`cancel_child_work_item` command plus a server-derived, child-specific cancellation receipt for
+every nonterminal child. Each child enters the same admission and descendant barrier recursively,
+so a depth-two relation cannot acknowledge upstream while its own descendant remains active. With
+no active children the current Work Item may emit `no_active_children`; otherwise it waits at
+`awaiting_child_cancellations`. A child terminal fold emits both a
+`child_cancellation_acknowledgement` and terminal `ChildOutcome` bound to the upstream request and
+pinned relation, releasing its reservation. Failure or incomplete acknowledgement returns the
+parent to operator-owned `blocked`, never to `cancelled`.
+
 ## 21. Workspace and Concurrency
 
 - Every mutating activity executes in a leased isolated workspace unless a stricter Workflow policy
@@ -2964,6 +3166,9 @@ facts. Human authorization for direct/integration or stack-entry merge routes fi
 `revalidate_merge_authorization` or `revalidate_stack_merge_authorization` activity. Those
 activities rerun the registered gate against current provider facts and the persisted receipt;
 pending, unavailable, stale, failed, or denied results follow their declared non-mutation routes.
+Pending checks or unavailable facts after human authorization enter dedicated revalidated wait
+states that retain the receipt and return only to the same revalidation activity. They never resume
+through the initial merge gate or emit a second human prompt for the unchanged action.
 The stack gate contract also loads the current `IntegrationProgress` supporting record and fences
 the evaluation on its generation, landing cursor, and current binding. Its declared `produces` list
 is the set of possible signal-bound outputs: `stack_rebase_context` exists only for

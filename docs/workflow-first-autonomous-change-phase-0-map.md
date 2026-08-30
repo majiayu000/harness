@@ -134,8 +134,9 @@ currently sit outside the canonical pinned bundle. Replay can therefore reconstr
 without reconstructing the exact execution policy.
 
 **Decision.** The hash and persisted metadata must cover one canonical
-`CompiledWorkflowBundle`: states, routes, terminal classes, activities, schemas, intake bindings,
-risk, decomposition, integration, review, authorization, retry, budget, and recovery policy.
+`CompiledWorkflowBundle`: states, routes, control routes, terminal classes, activities, schemas,
+intake bindings, risk, decomposition, integration, review, authorization, retry, budget, and
+recovery policy.
 Dispatch must consume only this pinned bundle, not reinterpret the current filesystem document.
 
 ### F0-03 — Activity policy is split between Workflow and hard-coded server matches
@@ -305,7 +306,7 @@ compare-and-swaps that pointer in the same transaction as successor insertion.
 | RFC object | Current source of truth | Reuse | Required extension | Explicitly avoid |
 |---|---|---|---|---|
 | `WorkItem` | `WorkflowInstance` + runtime projection + prompt payload | Instance ID, state, subject, parent, definition pin, timestamps, event history | Typed `WorkItemSnapshot`; lifecycle class; risk/authority/budget/integration links; code identity | A second task/work-item state store |
-| `WorkflowDefinition` | `WorkflowDefinitionPolicy`, registry, `workflow_definitions` | Structural compiler, reachability, terminal mapping, registry freeze, version pin | Full compiled bundle, schema registry, policy sections, complete hash | Hashing only the state graph or reading mutable policy at dispatch |
+| `WorkflowDefinition` | `WorkflowDefinitionPolicy`, registry, `workflow_definitions` | Structural compiler, reachability, terminal mapping, registry freeze, version pin | Full compiled bundle, closed control routes, schema registry, policy sections, complete hash | Hashing only the state graph or reading mutable policy at dispatch |
 | `Activity` | `WorkflowActivityPolicy`, server `ActivityContract`, `RuntimeJob`, prompt packet | Runtime job/outbox, prompt/result capture, leases, structured result | Unified declaration; executor contract; attempts; capabilities; decisions; evidence allowlists | Classifier-specific activity type or workflow/activity match arms |
 | `Evidence` | `WorkflowEvidence`, artifacts, remote facts, run evidence | Provenance proof types, remote collectors, content hashing, server-reserved concept | Universal envelope/table; producer classes; schemas; subject/code/source identity; freshness | Treating every artifact as evidence or ordinal trust as authority |
 | `Decision` | `WorkflowDecision`, `WorkflowDecisionRecord`, `DecisionValidator` | Candidate/record split, rejection record, append-only persistence, current-state validation | Decision kind, definition hash, policy rule, input evidence IDs, authority receipt, validation result | Agent-selected authority or silent invalid-output fallback |
@@ -600,8 +601,9 @@ project-cache snapshot remains audit-only. Activation requires an empty current 
 runtime-host authority epoch; replay, startup restoration, and heartbeats carrying the old epoch are
 rejected rather than adopted into vNext. An eligible pre-activation rollback never restores that
 revoked authority: after restoring the old database and deployment, the secret manager issues a
-distinct rollback epoch and every restored host explicitly re-registers before the listener or
-intake can open.
+distinct rollback database-writer credential, provider-writer credential set, and host-authority
+epoch. The restored deployment proves that only those rollback identities can write, and every
+restored host explicitly re-registers before the listener, intake, or provider dispatch can open.
 
 ## 7. vNext Workflow Compiler Contract
 
@@ -622,10 +624,10 @@ compiled once and pinned.
    resolve defaults, canonical names, schema references, ordered maps
 
 3. Link
-   states -> activities -> schemas -> routes -> registered server contracts
+   states -> activities -> schemas -> routes/control routes -> registered server contracts
 
 4. Validate
-   reachability, progress, capabilities, evidence producers, decisions,
+   reachability including control targets, progress, capabilities, evidence producers, decisions,
    risk monotonicity, graph bounds, review/authorization gates, server ceilings
 
 5. Canonicalize
@@ -730,6 +732,28 @@ remote failure, the original deadline, or cumulative budget exhaustion follow de
 Completion cancels or supersedes the pending refresh command. Recovery accepts an active wait as
 healthy only when its original deadline, reservation, cumulative attempts, and next refresh command
 are all present.
+
+Waits entered after a human merge receipt are distinct compiled states from pre-authorization
+waits. They persist the receipt-bearing continuation and return only to the matching deterministic
+revalidation activity; a pending check or temporarily unavailable fact cannot route back to an
+initial gate and request the same authorization again.
+
+Cancellation is a compiled control route with its own `cancel_work_item` action and
+`cancellation_receipt`, not an operator-recovery signal. An operator may request it from any
+nonterminal state outside an existing cancellation flow, but the Work Item first enters its
+cancellation gate; duplicates retain the current gate or barrier. After authorization, the runtime
+fences the current Work Item, interrupts local work, and reconciles its own in-flight provider action.
+Only a safe admission may begin child fan-out. Confirmed external completion follows its truthful
+direct, integration, or cancellation-aware stack reconciliation route. A landed stack entry is
+recorded without resuming rebase or landing: a complete stack succeeds, while remaining entries
+proceed to cancellation fan-out. Ambiguity or a committed nonterminal mutation remains blocked
+rather than becoming cancelled.
+
+Cancelling a decomposed Work Item is recursive: a registered server activity issues idempotent
+commands and derived child-specific receipts for every active relation. Each child uses the same
+admission and descendant barrier before acknowledging upstream. The parent becomes `cancelled` only
+after every descendant has acknowledged and released its reservation, or immediately when the
+locked child set has no active relation.
 
 Entering `operator_gate` atomically creates a `workflow_operator_gates` record from the compiled
 state declaration. It binds the requested action, prerequisite fact/plan/code Evidence, accepted
@@ -1061,9 +1085,10 @@ a destructive transition:
   zero-provider-writer proof succeeds;
 - runtime-state reset archives only the configured store key, preserves unrelated keys and the
   legacy-backfill fence, starts with empty host/cache state, and rejects old-epoch heartbeats;
-- pre-activation rollback restores no revoked host credential, mints a distinct rollback authority
-  epoch, and rejects both the pre-cutover and abandoned vNext epochs before restored hosts
-  re-register;
+- pre-activation rollback restores no revoked credential, mints distinct rollback database-writer,
+  provider-writer, and host-authority identities bound only to the restored deployment, and rejects
+  all pre-cutover and abandoned vNext identities before any listener, intake, provider dispatch, or
+  restored host registration opens;
 - provider subjects created or changed during drain are recorded at or before the final fence and
   remain quarantined from automatic vNext intake;
 - vNext accepts no production submission and enables no provider credential before explicit
@@ -1101,6 +1126,8 @@ a destructive transition:
   completion and a lost CAS reconcile without repeating the provider write;
 - CI pending enters external wait, unavailable retries within budget, failed follows repair/block,
   and only eligible reaches authorization;
+- checks or facts that remain pending after human merge authorization preserve that receipt and
+  resume the matching revalidation activity without a duplicate operator prompt;
 - restart reconstructs exactly one external wait refresh command; webhook/refresh races dedupe by
   wait and fact identity; deadline and budget exhaustion take distinct routes;
 - repeated queued/running check updates preserve one wait ID, original deadline, cumulative refresh
@@ -1114,7 +1141,17 @@ a destructive transition:
 - provider reports merged but follow-up snapshot is stale/missing, so Work Item does not close;
 - crash after provider merge but before local commit reconciles to one terminal event; and
 - an out-of-scope Agent write produces no accepted partial result, routes to `blocked`, and can resume
-  only through operator replan, refreshed risk, and new action-specific authorization.
+  only through operator replan, refreshed risk, and new action-specific authorization;
+- cancelling a blocked decomposed parent fences and cancels every active child, waits for terminal
+  child acknowledgements, and releases reservations before the parent becomes `cancelled`;
+- cancellation requested from an integration authorization, repair, publication, or other
+  nonterminal state follows the same action-specific gate and child barrier; an operator recovery
+  receipt cannot authorize cancellation, repeated requests retain the current cancellation flow,
+  and a depth-two child cannot acknowledge while a descendant remains active;
+- cancellation first reconciles the current Work Item's own provider action: committed merge truth
+  follows its truthful completion route; a partially landed stack records that entry and cancels
+  the remainder without rebase or further landing, while unavailable, ambiguous, divergent, or
+  nonterminal committed outcomes remain nonterminal and never fold to `cancelled`.
 
 ### Code-Agent substitution
 
