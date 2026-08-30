@@ -608,7 +608,7 @@ definition:
       on_signal:
         implementation_required: assessing_risk
         repair_required: assessing_risk
-        review_ready: leaf_review_direct
+        review_ready: assessing_review_risk
       on_failure: blocked
     assessing_risk:
       activity: assess_risk
@@ -616,6 +616,14 @@ definition:
         low: planning
         medium: planning
         high: planning
+        abstain: blocked
+      on_failure: blocked
+    assessing_review_risk:
+      activity: assess_risk
+      on_signal:
+        low: leaf_review_direct
+        medium: leaf_review_direct
+        high: leaf_review_direct
         abstain: blocked
       on_failure: blocked
     planning:
@@ -811,10 +819,22 @@ definition:
         budget_exhausted: blocked
     refreshing_direct_review_facts:
       activity: collect_change_facts
-      on_success: leaf_review_direct
+      on_success: assessing_review_risk
       on_failure: blocked
     refreshing_integration_review_facts:
       activity: collect_change_facts
+      on_success: assessing_refreshed_integration_risk
+      on_failure: blocked
+    assessing_refreshed_integration_risk:
+      activity: assess_risk
+      on_signal:
+        low: validating_refreshed_integration
+        medium: validating_refreshed_integration
+        high: validating_refreshed_integration
+        abstain: blocked
+      on_failure: blocked
+    validating_refreshed_integration:
+      activity: validate_integration_head
       on_success: integration_review
       on_failure: blocked
     refreshing_independent_child_review_facts:
@@ -1093,9 +1113,15 @@ activities:
     permissions: {tools: [read], provider_actions: []}
     input_schema: integration_review_input.v1
     output_schema: code_review_output.v1
-    required_evidence: [integrated_change_set, review_subject_snapshot]
+    required_evidence: [integrated_change_set, validation_report, review_subject_snapshot, semantic_risk_assessment]
     allowed_decisions: [approved, changes_requested, blocked]
     produces: [integration_review_receipt]
+
+  validate_integration_head:
+    executor: registered_server
+    contract: registered.integration_head_validation.v1
+    required_evidence: [integrated_change_set, remote_change_binding, review_subject_snapshot, semantic_risk_assessment]
+    produces: [validation_report]
 
   review_independent_set:
     executor: agent
@@ -1236,7 +1262,7 @@ evidence:
     allowed_producers: [agent_author]
   validation_report:
     payload_schema: .harness/schemas/validation-report.v1.json
-    allowed_producers: [agent_author]
+    allowed_producers: [agent_author, server_policy_engine]
   integrated_change_set:
     payload_schema: .harness/schemas/integrated-change-set.v1.json
     allowed_producers: [agent_author]
@@ -1396,8 +1422,9 @@ The core does not require the following logical state names. The standard
 stateDiagram-v2
     [*] --> collecting_facts
     collecting_facts --> assessing_risk: implementation or repair required
-    collecting_facts --> leaf_review_direct: existing PR review-ready
+    collecting_facts --> assessing_review_risk: existing PR review-ready
     assessing_risk --> planning
+    assessing_review_risk --> leaf_review_direct: risk classified
     planning --> authorizing_direct: direct plan
     planning --> validating_decomposition: decomposition proposed
     validating_decomposition --> authorizing_children: valid
@@ -1471,8 +1498,10 @@ stateDiagram-v2
     merge_gate --> blocked: checks failed or denied
     awaiting_remote_checks --> merge_gate: fact changed
     awaiting_remote_facts --> merge_gate: fact refresh
-    refreshing_direct_review_facts --> leaf_review_direct: current identity collected
-    refreshing_integration_review_facts --> integration_review: current identity collected
+    refreshing_direct_review_facts --> assessing_review_risk: current identity collected
+    refreshing_integration_review_facts --> assessing_refreshed_integration_risk: current identity collected
+    assessing_refreshed_integration_risk --> validating_refreshed_integration: risk classified
+    validating_refreshed_integration --> integration_review: current head validated
     refreshing_independent_child_review_facts --> requesting_independent_child_review: current identity collected
     requesting_independent_child_review --> leaf_review_child: parent notified
     awaiting_merge_authorization --> merge_gate: authorization received; refresh facts
@@ -1482,6 +1511,7 @@ stateDiagram-v2
     state blocked
     collecting_facts --> blocked
     assessing_risk --> blocked
+    assessing_review_risk --> blocked
     planning --> blocked
     validating_decomposition --> blocked
     authorizing_direct --> blocked
@@ -1513,6 +1543,8 @@ stateDiagram-v2
     awaiting_remote_facts --> blocked
     refreshing_direct_review_facts --> blocked
     refreshing_integration_review_facts --> blocked
+    assessing_refreshed_integration_risk --> blocked
+    validating_refreshed_integration --> blocked
     refreshing_independent_child_review_facts --> blocked
     requesting_independent_child_review --> blocked
     stack_merge_gate --> blocked
@@ -1584,11 +1616,13 @@ never directly to merge-gate evaluation. Any new push invalidates prior code-bou
 evidence.
 The registered fact collector is the sole author of these routes: task/issue ingress emits
 `implementation_required`; existing PR ingress emits `repair_required` or `review_ready` from
-trusted provider facts. A newly ingested PR always obtains a Harness `ReviewReceipt` before the
-merge gate; provider review status cannot bypass that review. An Agent cannot self-select a later
-state. If that review requests changes, the Work Item returns to `collecting_facts`; the registered
-collector emits `repair_required`, and risk assessment, planning, and execution authorization run
-before any repair mutation.
+trusted provider facts. A `review_ready` PR still passes through `assessing_review_risk`, so every
+newly ingested PR has a current `SemanticRiskAssessment` and Harness `ReviewReceipt` before the
+merge gate; provider review status cannot bypass either requirement. Missing, malformed, stale, or
+abstaining semantic output routes to `blocked`, never to review or merge authorization. An Agent
+cannot self-select a later state. If that review requests changes, the Work Item returns to
+`collecting_facts`; the registered collector emits `repair_required`, and risk assessment,
+planning, and execution authorization run before any repair mutation.
 
 ### 12.3 High-risk flow
 
@@ -1943,6 +1977,11 @@ The parent reviewer checks:
 For the standard high-risk profile, `integration_review` uses a review barrier with two distinct
 immutable reviewer assignments. Each assignment produces its own head-bound receipt, and the
 barrier emits `approved` only after both eligible receipts approve the same integrated head.
+`review_integration` also requires a `validation_report` bound to the same current integrated head
+as its `review_subject_snapshot`. When provider facts reveal a changed integration head,
+`registered.integration_head_validation.v1` reruns the declared validation against that head before
+the review barrier can be entered. The merge gate rejects an integration receipt whose validation
+or review subject does not match the current remote binding.
 
 ### 18.5 Invalidation
 
@@ -1950,10 +1989,12 @@ A code-bound receipt is invalid when head SHA or effective diff changes. A Workf
 documented metadata-only exception, but the merge gate never infers that exception from prose.
 
 The merge gate classifies stale review evidence from persisted subject/landing identity rather than
-using one ambiguous retry edge. Direct and integration subjects refresh provider facts before their
-respective review states. An independent child refreshes its own leaf review and invalidates the
-parent set outcome. The stack gate refreshes affected child leaf reviews before rematerializing the
-ordered aggregate. None of these routes can reuse a stale receipt or jump directly to merge.
+using one ambiguous retry edge. Direct subjects refresh provider facts and rerun semantic risk
+assessment before review. Integration subjects refresh provider facts, rerun semantic risk and
+registered validation against the refreshed head, and only then re-enter integration review. An
+independent child refreshes its own leaf review and invalidates the parent set outcome. The stack
+gate refreshes affected child leaf reviews before rematerializing the ordered aggregate. None of
+these routes can reuse stale risk, validation, or review evidence or jump directly to merge.
 
 ## 19. CI and Merge Gate
 
@@ -2301,9 +2342,11 @@ revoked and their sessions are terminated; a shared role refuses cutover; unknow
 refuse cutover; shared task rows outside the exact workflow predicate survive; the vNext listener
 does not bind when runtime storage fails; a fresh vNext instance restarts from its compiled bundle;
 and a stale worker cannot complete after lease reassignment. Provider fixtures MUST also prove that
-every poll, webhook, and submission path quarantines pre-cutover objects, an unverifiable provider
-boundary disables automatic intake, and explicit human-authorized adoption creates only new vNext
-identities.
+final fence capture is refused until every active provider action is reconciled to a terminal
+outcome and old provider credentials are revoked with zero writers verified; objects observed or
+changed during drain fall at or before the final fence; every poll, webhook, and submission path
+quarantines those pre-cutover objects; an unverifiable provider boundary disables automatic intake;
+and explicit human-authorized adoption creates only new vNext identities.
 
 ### 28.7 Real dogfood profiles
 
