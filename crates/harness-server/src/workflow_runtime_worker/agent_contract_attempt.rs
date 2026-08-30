@@ -9,8 +9,8 @@
 //! Enforcement model: a conforming backend cannot switch its tool surface off
 //! (codex-cli has no such flag), so the contract is enforced by construction
 //! plus observation —
-//! - the launch input is the pinned prompt alone: no prompt packet, no repo
-//!   memory, no workflow document, no user config or rule files;
+//! - the launch input is the pinned prompt plus pinned semantic input envelope:
+//!   no prompt packet, repo memory, workflow document, user config, or rule files;
 //! - the workspace is a fresh empty temp directory with no repository
 //!   checkout (`workspace: ephemeral_empty`);
 //! - the launch is deny-all-tools (`allowed_tools = []`), read-only sandbox,
@@ -24,7 +24,8 @@ use crate::http::AppState;
 use harness_core::agent::{AgentBackend, AgentEvent, AgentRequest, AGENT_OUTPUT_SCHEMA_PATH_ENV};
 use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::workflow::{
-    agent_contract_output_schema_document, WorkflowAgentContract,
+    agent_contract_output_schema_document, validate_agent_contract_input,
+    validate_agent_contract_output, WorkflowAgentContract,
 };
 use harness_core::types::Item;
 use harness_workflow::runtime::{ActivityErrorKind, ActivityResult, RuntimeJob};
@@ -90,11 +91,19 @@ pub(super) async fn execute_contract_job(
         ));
     }
     let profile = runtime_profile_for_job(job)?;
+    let Some(timeout_secs) = profile.timeout_secs.filter(|timeout| *timeout > 0) else {
+        return Ok(contract_preflight_failure(
+            job,
+            &activity,
+            "the pinned runtime profile has no positive timeout_secs",
+        ));
+    };
     let attempt = execute_agent_contract_attempt(
         backend,
         &pinned,
         profile.model.clone(),
         profile.reasoning_effort.clone(),
+        timeout_secs,
     )
     .await?;
     Ok(contract_attempt_activity_result(
@@ -122,7 +131,11 @@ pub(super) async fn execute_agent_contract_attempt(
     pinned: &PinnedJobAgentContract,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    timeout_secs: u64,
 ) -> anyhow::Result<ContractAttempt> {
+    if timeout_secs == 0 {
+        anyhow::bail!("agent contract attempt timeout_secs must be positive");
+    }
     ensure_backend_can_enforce_contract(backend.as_ref())?;
     let schema_document = agent_contract_output_schema_document(&pinned.contract.output_schema)
         .ok_or_else(|| {
@@ -131,6 +144,7 @@ pub(super) async fn execute_agent_contract_attempt(
                 pinned.contract.output_schema
             )
         })?;
+    let prompt = contract_attempt_prompt(pinned)?;
 
     // The workspace stays literally empty: the schema file lives in its own
     // temp directory so nothing but the pinned prompt reaches the attempt.
@@ -144,14 +158,19 @@ pub(super) async fn execute_agent_contract_attempt(
     std::fs::write(&schema_path, schema_document)?;
 
     let request = AgentRequest {
-        prompt: pinned.prompt.clone(),
+        prompt,
         project_root: workspace.path().to_path_buf(),
-        permission_mode: AgentPermissionMode::Scoped,
+        // The Codex process needs provider network access even though the
+        // model-facing tool allowlist is empty. `Full` controls host egress
+        // resolution here; the explicit read-only sandbox, approvals=never,
+        // empty tool declaration, and attempt observations remain pinned.
+        permission_mode: AgentPermissionMode::Full,
         allowed_tools: Some(Vec::new()),
         sandbox_mode: Some(SandboxMode::ReadOnly),
         approval_policy: Some("never".to_string()),
         model,
         reasoning_effort,
+        timeout_secs: Some(timeout_secs),
         env_vars: std::iter::once((
             AGENT_OUTPUT_SCHEMA_PATH_ENV.to_string(),
             schema_path.display().to_string(),
@@ -167,12 +186,39 @@ pub(super) async fn execute_agent_contract_attempt(
     let mut observations = TurnStreamObservations::default();
     let mut items = Vec::new();
     let mut output = String::new();
-    while let Some(event) = rx.recv().await {
-        observations.record_stream_item(&event);
-        match event {
-            AgentEvent::ItemCompleted { item } => items.push(item),
-            AgentEvent::TurnCompleted { output: reply } => output = reply,
-            _ => {}
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                observations.record_stream_item(&event);
+                match event {
+                    AgentEvent::ItemCompleted { item } => items.push(item),
+                    AgentEvent::TurnCompleted { output: reply } => output = reply,
+                    _ => {}
+                }
+            }
+            _ = &mut deadline => {
+                stream.abort();
+                match stream.await {
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        anyhow::bail!(
+                            "agent contract attempt timed out after {timeout_secs}s and its stream task failed during cancellation: {error}"
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        anyhow::bail!(
+                            "agent contract attempt timed out after {timeout_secs}s while its stream failed: {error}"
+                        );
+                    }
+                    Ok(Ok(())) => {}
+                }
+                anyhow::bail!("agent contract attempt timed out after {timeout_secs}s");
+            }
         }
     }
     stream
@@ -185,6 +231,37 @@ pub(super) async fn execute_agent_contract_attempt(
         items,
         observations,
     })
+}
+
+/// Builds the only model-visible input for a contract attempt. The static
+/// pinned instruction and the immutable input envelope are serialized into a
+/// single prompt; no workflow document, repository state, or live request is
+/// consulted here.
+fn contract_attempt_prompt(pinned: &PinnedJobAgentContract) -> anyhow::Result<String> {
+    validate_contract_input(pinned)?;
+    Ok(format!(
+        "{}\n\nAgent contract input (JSON):\n{}",
+        pinned.prompt,
+        serde_json::to_string_pretty(&pinned.input)?
+    ))
+}
+
+fn validate_contract_input(pinned: &PinnedJobAgentContract) -> anyhow::Result<()> {
+    validate_agent_contract_input(&pinned.contract.input_schema, &pinned.input)
+        .map_err(anyhow::Error::msg)?;
+    let contract_hash = pinned
+        .input
+        .get("contract_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("validated input is missing a string contract_hash"))?;
+    let contract_value = serde_json::to_value(&pinned.contract)?;
+    let expected_hash = harness_workflow::runtime::stable_remote_fact_hash(&contract_value);
+    if contract_hash != expected_hash {
+        anyhow::bail!(
+            "agent contract input hash `{contract_hash}` does not match pinned contract hash `{expected_hash}`"
+        );
+    }
+    Ok(())
 }
 
 /// Converts an observed attempt into the job's `ActivityResult`: violations
@@ -285,22 +362,11 @@ pub(super) fn parse_contract_verdict(
 ) -> Result<ContractVerdict, String> {
     let raw: Value = serde_json::from_str(output.trim())
         .map_err(|error| format!("reply is not valid JSON: {error}"))?;
-    let schema = raw
-        .get("schema")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "reply is missing its `schema` field".to_string())?;
-    if schema != contract.output_schema {
-        return Err(format!(
-            "reply names schema `{schema}` instead of the pinned `{}`",
-            contract.output_schema
-        ));
-    }
+    validate_agent_contract_output(&contract.output_schema, &raw)?;
     let outcome = raw
         .get("outcome")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|outcome| !outcome.is_empty())
-        .ok_or_else(|| "reply is missing a non-empty `outcome`".to_string())?;
+        .ok_or_else(|| "validated reply is missing a string outcome".to_string())?;
     if !contract
         .allowed_outcomes
         .iter()
@@ -311,15 +377,6 @@ pub(super) fn parse_contract_verdict(
             contract.allowed_outcomes.join(", ")
         ));
     }
-    if raw
-        .get("rationale")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|rationale| !rationale.is_empty())
-        .is_none()
-    {
-        return Err("reply is missing a non-empty `rationale`".to_string());
-    }
     Ok(ContractVerdict {
         outcome: outcome.to_string(),
         raw,
@@ -329,3 +386,7 @@ pub(super) fn parse_contract_verdict(
 #[cfg(test)]
 #[path = "agent_contract_attempt_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "agent_contract_dogfood_tests.rs"]
+mod dogfood_tests;

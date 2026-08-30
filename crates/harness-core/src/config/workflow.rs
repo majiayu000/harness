@@ -20,6 +20,7 @@ pub use agent_contract::{
 };
 pub use agent_contract_schemas::{
     agent_contract_input_schema_document, agent_contract_output_schema_document,
+    validate_agent_contract_input, validate_agent_contract_output,
 };
 pub use budget::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 pub use candidates::WorkflowCandidatesPolicy;

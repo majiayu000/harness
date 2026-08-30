@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 pub(super) struct PinnedJobAgentContract {
     pub(super) contract: WorkflowAgentContract,
     pub(super) prompt: String,
+    pub(super) input: Value,
     pub(super) definition_hash: String,
 }
 
@@ -73,9 +74,19 @@ pub(super) fn pinned_agent_contract_for_job(
                 job.id
             )
         })?;
+    let input = command
+        .and_then(|command| command.get("agent_contract_input"))
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime job {} carries an agent_contract without its pinned input envelope",
+                job.id
+            )
+        })?;
     Ok(Some(PinnedJobAgentContract {
         contract,
         prompt: prompt.to_string(),
+        input,
         definition_hash: definition_hash.to_string(),
     }))
 }
@@ -126,6 +137,9 @@ impl TurnStreamObservations {
             }
             AgentEvent::ItemStarted { item } => {
                 self.started_item_kinds.push(item_kind_label(item));
+            }
+            AgentEvent::ToolCall { name, .. } => {
+                self.started_item_kinds.push(format!("tool_call:{name}"));
             }
             AgentEvent::ApprovalRequest { .. } => {
                 self.approval_requests = self.approval_requests.saturating_add(1);
@@ -214,6 +228,16 @@ mod tests {
         })
     }
 
+    fn contract_input_value() -> Value {
+        json!({
+            "schema": "harness.semantic_activity_input.v1",
+            "subject": {"kind": "issue", "identity": "owner/repo#126"},
+            "facts": {"changed_files": ["src/lib.rs"]},
+            "provenance": {"/changed_files": "server"},
+            "contract_hash": "sha256:contract",
+        })
+    }
+
     fn contract_job(command: Value) -> RuntimeJob {
         RuntimeJob::pending(
             "command-1",
@@ -248,11 +272,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_prompt_or_definition_hash_fails() {
+    fn missing_prompt_definition_hash_or_input_fails() {
         let without_prompt = contract_job(json!({
             "activity": "classify_scope",
             "agent_contract": contract_value(),
             "definition_hash": "sha256:abc",
+            "agent_contract_input": contract_input_value(),
         }));
         assert!(pinned_agent_contract_for_job(&without_prompt).is_err());
 
@@ -260,8 +285,17 @@ mod tests {
             "activity": "classify_scope",
             "agent_contract": contract_value(),
             "prompt": "Classify only the supplied facts.",
+            "agent_contract_input": contract_input_value(),
         }));
         assert!(pinned_agent_contract_for_job(&without_hash).is_err());
+
+        let without_input = contract_job(json!({
+            "activity": "classify_scope",
+            "agent_contract": contract_value(),
+            "prompt": "Classify only the supplied facts.",
+            "definition_hash": "sha256:abc",
+        }));
+        assert!(pinned_agent_contract_for_job(&without_input).is_err());
     }
 
     #[test]
@@ -271,6 +305,7 @@ mod tests {
             "agent_contract": contract_value(),
             "prompt": "Classify only the supplied facts.",
             "definition_hash": "sha256:abc",
+            "agent_contract_input": contract_input_value(),
         }));
         let pinned = pinned_agent_contract_for_job(&job)
             .expect("valid contract extracts")

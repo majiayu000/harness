@@ -16,19 +16,19 @@ pub const SEMANTIC_ACTIVITY_INPUT_SCHEMA_V1: &str = r#"{
   "additionalProperties": false,
   "required": ["schema", "subject", "facts", "provenance", "contract_hash"],
   "properties": {
-    "schema": {"const": "harness.semantic_activity_input.v1"},
+    "schema": {"type": "string", "const": "harness.semantic_activity_input.v1"},
     "subject": {
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "identity"],
       "properties": {
-        "kind": {"type": "string", "minLength": 1},
-        "identity": {"type": "string", "minLength": 1}
+        "kind": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "identity": {"type": "string", "minLength": 1, "pattern": "\\S"}
       }
     },
     "facts": {"type": "object"},
     "provenance": {"type": "object"},
-    "contract_hash": {"type": "string", "minLength": 1}
+    "contract_hash": {"type": "string", "minLength": 1, "pattern": "\\S"}
   }
 }"#;
 
@@ -41,14 +41,14 @@ pub const SEMANTIC_VERDICT_SCHEMA_V1: &str = r#"{
   "title": "harness.semantic_verdict.v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "outcome", "rationale"],
+  "required": ["schema", "outcome", "rationale", "evidence_refs"],
   "properties": {
-    "schema": {"const": "harness.semantic_verdict.v1"},
+    "schema": {"type": "string", "const": "harness.semantic_verdict.v1"},
     "outcome": {"type": "string", "minLength": 1, "pattern": "^\\S+$"},
-    "rationale": {"type": "string", "minLength": 1},
+    "rationale": {"type": "string", "minLength": 1, "pattern": "\\S"},
     "evidence_refs": {
       "type": "array",
-      "items": {"type": "string", "minLength": 1}
+      "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
     }
   }
 }"#;
@@ -66,5 +66,56 @@ pub fn agent_contract_output_schema_document(schema_id: &str) -> Option<&'static
     match schema_id {
         "harness.semantic_verdict.v1" => Some(SEMANTIC_VERDICT_SCHEMA_V1),
         _ => None,
+    }
+}
+
+/// Validates a pinned semantic-activity input against the same canonical JSON
+/// Schema document handed to agent backends.
+pub fn validate_agent_contract_input(
+    schema_id: &str,
+    input: &serde_json::Value,
+) -> Result<(), String> {
+    validate_schema_document(
+        schema_id,
+        agent_contract_input_schema_document(schema_id),
+        input,
+    )
+}
+
+/// Validates an agent reply against the same canonical JSON Schema document
+/// handed to the backend's structured-output channel.
+pub fn validate_agent_contract_output(
+    schema_id: &str,
+    output: &serde_json::Value,
+) -> Result<(), String> {
+    validate_schema_document(
+        schema_id,
+        agent_contract_output_schema_document(schema_id),
+        output,
+    )
+}
+
+fn validate_schema_document(
+    schema_id: &str,
+    document: Option<&str>,
+    instance: &serde_json::Value,
+) -> Result<(), String> {
+    let document =
+        document.ok_or_else(|| format!("schema `{schema_id}` has no canonical schema document"))?;
+    let schema: serde_json::Value = serde_json::from_str(document)
+        .map_err(|error| format!("schema `{schema_id}` is invalid JSON: {error}"))?;
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|error| format!("schema `{schema_id}` cannot be compiled: {error}"))?;
+    let errors = validator
+        .iter_errors(instance)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "value does not match schema `{schema_id}`: {}",
+            errors.join("; ")
+        ))
     }
 }

@@ -59,9 +59,8 @@ impl CodeAgent for ContractStreamAgent {
 }
 
 fn contract_command_payload() -> serde_json::Value {
-    serde_json::json!({
-        "activity": "classify_scope",
-        "agent_contract": {
+    let contract: harness_core::config::workflow::WorkflowAgentContract =
+        serde_json::from_value(serde_json::json!({
             "input_schema": "harness.semantic_activity_input.v1",
             "output_schema": "harness.semantic_verdict.v1",
             "allowed_outcomes": ["small", "large"],
@@ -69,8 +68,21 @@ fn contract_command_payload() -> serde_json::Value {
             "mutation": "forbidden",
             "workspace": "ephemeral_empty",
             "fresh_context": true,
-        },
+        }))
+        .expect("contract fixture should deserialize");
+    let contract = serde_json::to_value(contract).expect("contract fixture should serialize");
+    let contract_hash = harness_workflow::runtime::stable_remote_fact_hash(&contract);
+    serde_json::json!({
+        "activity": "classify_scope",
+        "agent_contract": contract,
         "prompt": "Classify only the supplied facts.",
+        "agent_contract_input": {
+            "schema": "harness.semantic_activity_input.v1",
+            "subject": {"kind": "issue", "identity": "owner/repo#126"},
+            "facts": {"changed_files": ["src/lib.rs"]},
+            "provenance": {"/changed_files": "server"},
+            "contract_hash": contract_hash,
+        },
         "definition_hash": "sha256:pinned",
     })
 }
@@ -80,6 +92,7 @@ fn valid_verdict_reply() -> String {
         "schema": "harness.semantic_verdict.v1",
         "outcome": "small",
         "rationale": "Touches a single function.",
+        "evidence_refs": [],
     })
     .to_string()
 }
@@ -111,6 +124,11 @@ async fn enqueue_contract_job(
         command_payload.clone(),
     );
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-default",
+        harness_workflow::runtime::RuntimeKind::CodexExec,
+    );
+    runtime_profile.timeout_secs = Some(30);
     store
         .enqueue_runtime_job(
             &command_id,
@@ -123,10 +141,7 @@ async fn enqueue_contract_job(
                 "dedupe_key": command.dedupe_key,
                 "command": command_payload,
                 "activity": "classify_scope",
-                "runtime_profile": harness_workflow::runtime::RuntimeProfile::new(
-                    "codex-default",
-                    harness_workflow::runtime::RuntimeKind::CodexExec,
-                ),
+                "runtime_profile": runtime_profile,
             }),
         )
         .await
@@ -191,7 +206,7 @@ async fn contract_job_on_unclaiming_backend_fails_without_spawning() -> anyhow::
 }
 
 /// A contract job on a conforming backend executes the real attempt: pinned
-/// prompt only, deny-all launch, empty ephemeral workspace outside the
+/// pinned prompt and input only, deny-all launch, empty ephemeral workspace outside the
 /// repository, pinned schema document handed to the backend, and a structured
 /// verdict recorded on the succeeded result.
 #[tokio::test]
@@ -224,15 +239,26 @@ async fn contract_job_executes_pinned_attempt_on_conforming_backend() -> anyhow:
         chrono::Duration::minutes(5),
     )
     .await?;
-    assert_eq!(tick.succeeded, 1, "clean contract attempt must succeed");
+    let completed = store
+        .get_runtime_job(&runtime_job.id)
+        .await?
+        .expect("runtime job should exist");
+    assert_eq!(
+        tick.succeeded, 1,
+        "clean contract attempt must succeed; persisted status={:?}, output={:?}",
+        completed.status, completed.output
+    );
 
     let requests = agent.requests.lock().await;
     assert_eq!(requests.len(), 1, "exactly one attempt launch");
     let request = &requests[0];
-    assert_eq!(
-        request.prompt, "Classify only the supplied facts.",
-        "the launch input is the pinned prompt alone"
+    let payload = contract_command_payload();
+    let expected_prompt = format!(
+        "Classify only the supplied facts.\n\nAgent contract input (JSON):\n{}",
+        serde_json::to_string_pretty(&payload["agent_contract_input"])?
     );
+    assert_eq!(request.prompt, expected_prompt);
+    assert_eq!(request.timeout_secs, Some(30));
     assert_eq!(
         request.allowed_tools.as_deref(),
         Some(&[][..]),
@@ -257,10 +283,6 @@ async fn contract_job_executes_pinned_attempt_on_conforming_backend() -> anyhow:
         "the pinned output schema is handed to the backend"
     );
 
-    let completed = store
-        .get_runtime_job(&runtime_job.id)
-        .await?
-        .expect("runtime job should exist");
     assert_eq!(
         completed.status,
         harness_workflow::runtime::RuntimeJobStatus::Succeeded

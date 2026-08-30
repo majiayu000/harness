@@ -3,7 +3,7 @@
 
 use super::super::CodexAgent;
 use harness_core::agent::AgentRequest;
-use harness_core::config::agents::SandboxMode;
+use harness_core::config::agents::{CodexCloudConfig, SandboxMode};
 use std::path::PathBuf;
 
 fn deny_all_request() -> AgentRequest {
@@ -71,6 +71,28 @@ fn codex_exec_backend_claims_every_contract_capability() {
     assert!(
         capabilities.missing_for_enforcement().is_empty(),
         "codex exec is the first conforming backend: {capabilities:?}"
+    );
+}
+
+#[test]
+fn cloud_codex_does_not_claim_prompt_only_contract_launch() {
+    use harness_core::agent::AgentBackend;
+    let agent = CodexAgent::with_cloud(
+        PathBuf::from("codex"),
+        CodexCloudConfig {
+            enabled: true,
+            setup_commands: vec!["prepare mutable container state".to_string()],
+            ..CodexCloudConfig::default()
+        },
+        SandboxMode::WorkspaceWrite,
+    );
+
+    assert!(
+        agent
+            .agent_contract_capabilities()
+            .missing_for_enforcement()
+            .contains(&"prompt_only_launch"),
+        "a cloud-enabled backend runs setup and applies container state before launch, so it cannot claim a prompt-only attempt"
     );
 }
 

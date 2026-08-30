@@ -239,6 +239,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
         .iter()
         .position(|item| matches!(item, StreamItem::ItemCompleted { .. }))
         .expect("expected item completed event");
+    let turn_completed = events
+        .iter()
+        .position(|item| matches!(item, StreamItem::TurnCompleted { .. }))
+        .expect("expected turn completed event with the final structured reply");
     let done = events
         .iter()
         .position(|item| matches!(item, StreamItem::Done))
@@ -248,8 +252,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
         "delta must precede item completed: {events:?}"
     );
     assert!(
-        completed < done,
-        "item completed must precede done: {events:?}"
+        completed < turn_completed && turn_completed < done,
+        "item completion and final reply must precede done: {events:?}"
     );
 
     match &events[completed] {
@@ -263,6 +267,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
         }
         other => panic!("unexpected completed event payload: {other:?}"),
     }
+    assert!(
+        matches!(
+            &events[turn_completed],
+            StreamItem::TurnCompleted { output } if output == "hello world"
+        ),
+        "turn completion must carry the parsed final reply: {events:?}"
+    );
 }
 
 #[tokio::test]

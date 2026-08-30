@@ -498,11 +498,13 @@ impl CodeAgent for CodexAgent {
     /// --ephemeral` on deny-all requests, `pinned_output_schema` via
     /// `--output-schema`, and `attempt_observation_stream` because the exec
     /// JSON stream maps every item kind and surfaces unmapped kinds instead
-    /// of dropping them. Deny-all does NOT disable codex's tools (no such
-    /// CLI flag exists); enforcement relies on observing the stream.
+    /// of dropping them. A cloud-enabled instance cannot claim prompt-only
+    /// launch because it runs setup and applies container state first.
+    /// Deny-all does NOT disable codex's tools (no such CLI flag exists);
+    /// enforcement relies on observing the stream.
     fn agent_contract_capabilities(&self) -> harness_core::agent::AgentContractCapabilities {
         harness_core::agent::AgentContractCapabilities {
-            prompt_only_launch: true,
+            prompt_only_launch: !self.cloud.enabled,
             pinned_output_schema: true,
             attempt_observation_stream: true,
         }
@@ -822,6 +824,15 @@ impl CodeAgent for CodexAgent {
                     .unwrap_or_else(|| "codex turn failed".to_string()),
             ));
         }
+        send_stream_item(
+            &tx,
+            StreamItem::TurnCompleted {
+                output: parsed.output,
+            },
+            self.name(),
+            "turn_completed",
+        )
+        .await?;
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
     }

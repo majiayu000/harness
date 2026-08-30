@@ -1,6 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use harness_workflow::runtime::ActivityStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 fn pinned_contract() -> PinnedJobAgentContract {
@@ -14,9 +15,19 @@ fn pinned_contract() -> PinnedJobAgentContract {
         "fresh_context": true,
     }))
     .expect("valid contract");
+    let contract_hash = harness_workflow::runtime::stable_remote_fact_hash(
+        &serde_json::to_value(&contract).expect("serialize contract"),
+    );
     PinnedJobAgentContract {
         contract,
         prompt: "Classify only the supplied facts.".to_string(),
+        input: json!({
+            "schema": "harness.semantic_activity_input.v1",
+            "subject": {"kind": "issue", "identity": "owner/repo#126"},
+            "facts": {"changed_files": ["src/lib.rs"]},
+            "provenance": {"/changed_files": "server"},
+            "contract_hash": contract_hash,
+        }),
         definition_hash: "sha256:pinned".to_string(),
     }
 }
@@ -26,6 +37,7 @@ fn valid_verdict_reply() -> String {
         "schema": "harness.semantic_verdict.v1",
         "outcome": "small",
         "rationale": "Touches a single function.",
+        "evidence_refs": [],
     })
     .to_string()
 }
@@ -102,7 +114,7 @@ impl AgentBackend for ScriptedBackend {
 #[tokio::test]
 async fn attempt_rejects_backend_without_capability_claims() {
     let backend = ScriptedBackend::without_claims();
-    let error = execute_agent_contract_attempt(backend.clone(), &pinned_contract(), None, None)
+    let error = execute_agent_contract_attempt(backend.clone(), &pinned_contract(), None, None, 30)
         .await
         .expect_err("a backend claiming nothing must be rejected before launch");
     assert!(error.to_string().contains("cannot enforce"), "{error}");
@@ -114,14 +126,16 @@ async fn attempt_rejects_backend_without_capability_claims() {
 
 #[tokio::test]
 async fn attempt_launches_pinned_deny_all_request_in_empty_workspace() {
+    let pinned = pinned_contract();
     let backend = ScriptedBackend::conforming(vec![AgentEvent::TurnCompleted {
         output: valid_verdict_reply(),
     }]);
     let attempt = execute_agent_contract_attempt(
         backend.clone(),
-        &pinned_contract(),
+        &pinned,
         Some("gpt-5.4".to_string()),
         Some("high".to_string()),
+        30,
     )
     .await
     .expect("scripted attempt succeeds");
@@ -129,8 +143,11 @@ async fn attempt_launches_pinned_deny_all_request_in_empty_workspace() {
     let requests = backend.requests.lock().expect("lock");
     assert_eq!(requests.len(), 1, "exactly one launch");
     let request = &requests[0];
-    assert_eq!(request.prompt, "Classify only the supplied facts.");
+    assert_eq!(request.prompt, contract_attempt_prompt(&pinned).unwrap());
+    assert!(request.prompt_layers.is_none());
+    assert!(request.context.is_empty());
     assert_eq!(request.allowed_tools.as_deref(), Some(&[][..]));
+    assert_eq!(request.permission_mode, AgentPermissionMode::Full);
     assert_eq!(request.sandbox_mode, Some(SandboxMode::ReadOnly));
     assert_eq!(request.approval_policy.as_deref(), Some("never"));
     assert_eq!(request.model.as_deref(), Some("gpt-5.4"));
@@ -191,7 +208,7 @@ async fn attempt_schema_file_carries_the_canonical_document() {
         }]),
         schema_contents: Mutex::new(Vec::new()),
     });
-    execute_agent_contract_attempt(recording.clone(), &pinned_contract(), None, None)
+    execute_agent_contract_attempt(recording.clone(), &pinned_contract(), None, None, 30)
         .await
         .expect("scripted attempt succeeds");
     assert_eq!(
@@ -209,6 +226,10 @@ async fn attempt_records_stream_observations_and_items() {
             model: "gpt-5.2-codex".to_string(),
             source: harness_core::agent::ModelIdentitySource::LaunchDerived,
         },
+        AgentEvent::ToolCall {
+            name: "direct_tool".to_string(),
+            input: json!({"argument": true}),
+        },
         AgentEvent::ItemCompleted {
             item: Item::ShellCommand {
                 command: "cat /etc/passwd".to_string(),
@@ -221,7 +242,7 @@ async fn attempt_records_stream_observations_and_items() {
             output: valid_verdict_reply(),
         },
     ]);
-    let attempt = execute_agent_contract_attempt(backend, &pinned_contract(), None, None)
+    let attempt = execute_agent_contract_attempt(backend, &pinned_contract(), None, None, 30)
         .await
         .expect("scripted attempt succeeds");
     assert_eq!(attempt.items.len(), 1);
@@ -233,7 +254,61 @@ async fn attempt_records_stream_observations_and_items() {
         )]
     );
     let violations = contract_violations(&attempt);
-    assert_eq!(violations, vec!["shell_command `cat /etc/passwd`"]);
+    assert_eq!(
+        violations,
+        vec![
+            "shell_command `cat /etc/passwd`",
+            "started item of kind `tool_call:direct_tool`",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn attempt_timeout_cancels_the_backend_stream() {
+    struct CancellationMarker(Arc<AtomicBool>);
+    impl Drop for CancellationMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    struct HangingBackend {
+        cancelled: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl AgentBackend for HangingBackend {
+        fn name(&self) -> &str {
+            "hanging-contract-backend"
+        }
+        fn agent_contract_capabilities(&self) -> harness_core::agent::AgentContractCapabilities {
+            harness_core::agent::AgentContractCapabilities {
+                prompt_only_launch: true,
+                pinned_output_schema: true,
+                attempt_observation_stream: true,
+            }
+        }
+        async fn execute_stream(
+            &self,
+            _req: AgentRequest,
+            _tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> harness_core::error::Result<()> {
+            let _marker = CancellationMarker(Arc::clone(&self.cancelled));
+            std::future::pending().await
+        }
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let backend = Arc::new(HangingBackend {
+        cancelled: Arc::clone(&cancelled),
+    });
+    let error = execute_agent_contract_attempt(backend, &pinned_contract(), None, None, 1)
+        .await
+        .expect_err("a hung backend must hit the pinned wall-clock boundary");
+
+    assert!(error.to_string().contains("timed out after 1s"), "{error}");
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "the timed-out stream task must be cancelled before returning"
+    );
 }
 
 #[test]
@@ -289,17 +364,48 @@ fn off_vocabulary_or_malformed_verdicts_fail() {
     for (reply, expected) in [
         ("not json".to_string(), "not valid JSON"),
         (
-            json!({"schema": "harness.semantic_verdict.v1", "outcome": "medium", "rationale": "x"})
+            json!({"schema": "harness.semantic_verdict.v1", "outcome": "medium", "rationale": "x", "evidence_refs": []})
                 .to_string(),
             "not in the pinned allowed_outcomes",
         ),
         (
-            json!({"schema": "other.schema.v1", "outcome": "small", "rationale": "x"}).to_string(),
-            "instead of the pinned",
+            json!({"schema": "other.schema.v1", "outcome": "small", "rationale": "x", "evidence_refs": []}).to_string(),
+            "does not match schema",
         ),
         (
             json!({"schema": "harness.semantic_verdict.v1", "outcome": "small"}).to_string(),
-            "rationale",
+            "does not match schema",
+        ),
+        (
+            json!({
+                "schema": "harness.semantic_verdict.v1",
+                "outcome": "small",
+                "rationale": "x",
+                "evidence_refs": [],
+                "unexpected": true,
+            })
+            .to_string(),
+            "does not match schema",
+        ),
+        (
+            json!({
+                "schema": "harness.semantic_verdict.v1",
+                "outcome": "small",
+                "rationale": "x",
+                "evidence_refs": "not-an-array",
+            })
+            .to_string(),
+            "does not match schema",
+        ),
+        (
+            json!({
+                "schema": "harness.semantic_verdict.v1",
+                "outcome": "small",
+                "rationale": "x",
+                "evidence_refs": [""],
+            })
+            .to_string(),
+            "does not match schema",
         ),
     ] {
         let attempt = ContractAttempt {

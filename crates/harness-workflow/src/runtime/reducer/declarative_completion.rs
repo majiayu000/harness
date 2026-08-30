@@ -220,9 +220,10 @@ fn transition_decision(
         if let Some(activity) = state.activity.as_deref() {
             crate::runtime::declarative_agent_contract::declarative_enqueue_activity_command(
                 definition,
+                instance,
                 activity,
                 event_dedupe_key(instance, target, event),
-            )
+            )?
         } else {
             match state.progress {
                 Some(DeclaredProgressMode::CommandDriven) => anyhow::bail!(

@@ -203,3 +203,77 @@ fn every_registered_schema_id_resolves_to_a_parseable_document() {
     assert!(agent_contract_input_schema_document("harness.unknown.v1").is_none());
     assert!(agent_contract_output_schema_document("harness.unknown.v1").is_none());
 }
+
+#[test]
+fn canonical_schema_documents_are_the_runtime_validation_source() {
+    let valid_input = serde_json::json!({
+        "schema": "harness.semantic_activity_input.v1",
+        "subject": {"kind": "issue", "identity": "owner/repo#1"},
+        "facts": {},
+        "provenance": {},
+        "contract_hash": "sha256:contract",
+    });
+    assert!(
+        validate_agent_contract_input("harness.semantic_activity_input.v1", &valid_input).is_ok()
+    );
+    let mut invalid_input = valid_input;
+    invalid_input["unexpected"] = serde_json::json!(true);
+    assert!(
+        validate_agent_contract_input("harness.semantic_activity_input.v1", &invalid_input)
+            .is_err()
+    );
+
+    let valid_output = serde_json::json!({
+        "schema": "harness.semantic_verdict.v1",
+        "outcome": "small",
+        "rationale": "Bounded change.",
+        "evidence_refs": ["/facts/changed_files"],
+    });
+    assert!(validate_agent_contract_output("harness.semantic_verdict.v1", &valid_output).is_ok());
+    let mut invalid_output = valid_output;
+    invalid_output["evidence_refs"] = serde_json::json!("not-an-array");
+    assert!(
+        validate_agent_contract_output("harness.semantic_verdict.v1", &invalid_output).is_err()
+    );
+}
+
+#[test]
+fn canonical_schemas_reject_whitespace_only_semantic_strings() {
+    let valid_input = serde_json::json!({
+        "schema": "harness.semantic_activity_input.v1",
+        "subject": {"kind": "issue", "identity": "owner/repo#1"},
+        "facts": {},
+        "provenance": {},
+        "contract_hash": "sha256:contract",
+    });
+    for pointer in ["/subject/kind", "/subject/identity", "/contract_hash"] {
+        let mut invalid = valid_input.clone();
+        *invalid
+            .pointer_mut(pointer)
+            .expect("fixture pointer must resolve") = serde_json::json!(" \t");
+        assert!(
+            validate_agent_contract_input("harness.semantic_activity_input.v1", &invalid).is_err(),
+            "whitespace-only input at {pointer} must fail"
+        );
+    }
+
+    for invalid in [
+        serde_json::json!({
+            "schema": "harness.semantic_verdict.v1",
+            "outcome": "small",
+            "rationale": " \t",
+            "evidence_refs": [],
+        }),
+        serde_json::json!({
+            "schema": "harness.semantic_verdict.v1",
+            "outcome": "small",
+            "rationale": "bounded",
+            "evidence_refs": [" \t"],
+        }),
+    ] {
+        assert!(
+            validate_agent_contract_output("harness.semantic_verdict.v1", &invalid).is_err(),
+            "whitespace-only output strings must fail: {invalid}"
+        );
+    }
+}

@@ -303,6 +303,33 @@ mod declarative_agent_contract_tests {
             command.command.get("definition_hash").and_then(|v| v.as_str()),
             Some(definition.definition_hash())
         );
+        let input = command
+            .command
+            .get("agent_contract_input")
+            .expect("submission must pin the semantic input envelope");
+        assert_eq!(
+            input.get("schema").and_then(|value| value.as_str()),
+            Some("harness.semantic_activity_input.v1")
+        );
+        assert_eq!(input["subject"]["kind"], "test");
+        assert_eq!(input["subject"]["identity"], "submission");
+        assert_eq!(input.get("facts"), Some(&instance.data));
+        assert_eq!(
+            input.get("provenance"),
+            Some(&serde_json::to_value(
+                instance
+                    .data_provenance
+                    .as_ref()
+                    .expect("server data has provenance")
+            )?)
+        );
+        assert_eq!(
+            input.get("contract_hash").and_then(|value| value.as_str()),
+            Some(
+                crate::runtime::stable_remote_fact_hash(&serde_json::to_value(contract())?)
+                    .as_str()
+            )
+        );
         Ok(())
     }
 
@@ -335,9 +362,10 @@ mod declarative_agent_contract_tests {
         let command =
             crate::runtime::declarative_agent_contract::declarative_enqueue_activity_command(
                 &definition,
+                &instance,
                 "classify_scope",
                 "agent-contract-defer-1".to_string(),
-            );
+            )?;
         let decision = WorkflowDecision::new(
             instance.id.clone(),
             "classifying",
