@@ -400,12 +400,25 @@ Activity
   allowed_decisions
   idempotency_contract?
   authority_contract?
+  requested_action?
   reconciliation_contract?
+  binding_transition_contract?
   retry_policy
   repair_policy
   budget
   prompt_template
 ```
+
+`requested_action` is a typed authorization action identifier, not an activity-name convention. It
+is required for an automatic authority evaluator and is included in the canonical compiled bundle.
+The compiler links its `authorized` target activity and optional `await_human` operator gate, and
+rejects the definition unless every path names the same action consumed by that target.
+
+`binding_transition_contract`, when present, is a typed tuple of expected current pointer,
+successor Evidence kind, pointer update, and concurrency mode. v1 permits only
+`compare_and_swap`. It is valid only for a registered server contract whose registry descriptor
+declares the same inputs, output, and atomic pointer transition; the compiler rejects any mismatch.
+Both optional fields are canonicalized and hashed with the activity.
 
 An `ActivityAttempt` binds the abstract activity to one execution:
 
@@ -567,8 +580,9 @@ The following supporting objects are required but are not separate business root
 - `ActorAssignment`: immutable server-issued role, scope, author set, protocol, context generation,
   and permission grant used to authenticate an attempt.
 - `RemoteFactSnapshot`: current external facts with subject and observation identity.
-- `RemoteChangeBinding`: durable provider/repository/change-request identity, base/head references,
-  publication idempotency key, current code identity, and reconciliation state.
+- `RemoteChangeBinding`: immutable versioned provider/repository/change-request identity,
+  base/head references, publication idempotency key, current code identity, reconciliation state,
+  and an optional link to the binding version it supersedes.
 - `ProviderIntakeFence`: immutable cutover boundary per provider, repository, and subject type,
   containing the maximum trustworthy monotonic identity, snapshot source/hash, cutover time, and
   whether automatic intake is enabled or disabled as unverifiable.
@@ -659,13 +673,13 @@ definition:
       on_success: authorizing_children
       on_failure: blocked
     authorizing_direct:
-      activity: evaluate_execution_authority
+      activity: evaluate_direct_execution_authority
       on_signal:
         authorized: implementing
         await_human: awaiting_direct_execution_authorization
         deny: blocked
     authorizing_children:
-      activity: evaluate_execution_authority
+      activity: evaluate_child_execution_authority
       on_signal:
         authorized: materializing_children
         await_human: awaiting_child_execution_authorization
@@ -674,7 +688,7 @@ definition:
       progress: operator_gate
       gate:
         evidence_kind: authorization_receipt
-        requested_action: authorize_direct_execution
+        requested_action: implement_change
       on_signal:
         authorized: implementing
         expired: authorizing_direct
@@ -684,7 +698,7 @@ definition:
       progress: operator_gate
       gate:
         evidence_kind: authorization_receipt
-        requested_action: authorize_child_execution
+        requested_action: materialize_children
       on_signal:
         authorized: materializing_children
         expired: authorizing_children
@@ -699,14 +713,30 @@ definition:
       on_signal:
         independent_ready: preparing_independent_set_review
         stacked_ready: preparing_stack_review
-        integration_ready: integrating
+        integration_ready: authorizing_integration
         child_failed: blocked
     preparing_independent_set_review:
       activity: materialize_parent_review_subject
-      on_success: reviewing_independent_set
+      on_success: collecting_independent_set_review_facts
+      on_failure: blocked
+    collecting_independent_set_review_facts:
+      activity: collect_parent_composition_facts
+      on_success: assessing_independent_set_review_risk
+      on_failure: blocked
+    assessing_independent_set_review_risk:
+      activity: assess_risk
+      on_signal:
+        low: reviewing_independent_set
+        medium: reviewing_independent_set
+        high: reviewing_independent_set
+        abstain: blocked
       on_failure: blocked
     reviewing_independent_set:
-      activity: review_independent_set
+      progress: review_barrier
+      review:
+        activity: review_independent_set
+        distinct_assignments: true
+        quorum_policy: parent_composition
       on_signal:
         approved: releasing_independent_children
         changes_requested: planning_independent_set_repair
@@ -714,12 +744,23 @@ definition:
     planning_independent_set_repair:
       activity: plan_independent_set_repair
       on_signal:
-        direct: authorizing_direct
         decompose: validating_decomposition
         abstain: blocked
     preparing_stack_review:
       activity: materialize_parent_review_subject
-      on_success: reviewing_stack
+      on_success: collecting_stack_review_facts
+      on_failure: blocked
+    collecting_stack_review_facts:
+      activity: collect_parent_composition_facts
+      on_success: assessing_stack_review_risk
+      on_failure: blocked
+    assessing_stack_review_risk:
+      activity: assess_risk
+      on_signal:
+        low: reviewing_stack
+        medium: reviewing_stack
+        high: reviewing_stack
+        abstain: blocked
       on_failure: blocked
     releasing_independent_children:
       activity: release_independent_children
@@ -741,7 +782,11 @@ definition:
       on_success: done
       on_failure: blocked
     reviewing_stack:
-      activity: review_stack
+      progress: review_barrier
+      review:
+        activity: review_stack
+        distinct_assignments: true
+        quorum_policy: parent_composition
       on_signal:
         approved: stack_merge_gate
         changes_requested: planning_stack_repair
@@ -749,33 +794,152 @@ definition:
     planning_stack_repair:
       activity: plan_stack_repair
       on_signal:
-        direct: authorizing_direct
         decompose: validating_decomposition
         abstain: blocked
+    authorizing_integration:
+      activity: evaluate_integration_execution_authority
+      on_signal:
+        authorized: integrating
+        await_human: awaiting_integration_execution_authorization
+        deny: blocked
+    awaiting_integration_execution_authorization:
+      progress: operator_gate
+      gate:
+        evidence_kind: authorization_receipt
+        requested_action: integrate_children
+      on_signal:
+        authorized: integrating
+        expired: authorizing_integration
+        denied: blocked
+        cancelled: cancelled
     integrating:
       activity: integrate_children
-      on_success: publishing_integrated_change
+      on_success: collecting_integrated_change_facts
       on_failure: blocked
+    authorizing_integration_repair:
+      activity: evaluate_integration_repair_authority
+      on_signal:
+        authorized: repairing_integration
+        await_human: awaiting_integration_repair_authorization
+        deny: blocked
+    awaiting_integration_repair_authorization:
+      progress: operator_gate
+      gate:
+        evidence_kind: authorization_receipt
+        requested_action: repair_integration
+      on_signal:
+        authorized: repairing_integration
+        expired: authorizing_integration_repair
+        denied: blocked
+        cancelled: cancelled
     repairing_integration:
       activity: repair_integration
-      on_success: publishing_integrated_change
+      on_success: collecting_integrated_change_facts
       on_failure: blocked
+    collecting_integrated_change_facts:
+      activity: collect_change_facts
+      on_success: assessing_integrated_change_risk
+      on_failure: blocked
+    assessing_integrated_change_risk:
+      activity: assess_risk
+      on_signal:
+        low: authorizing_integration_publication
+        medium: authorizing_integration_publication
+        high: authorizing_integration_publication
+        abstain: blocked
+      on_failure: blocked
+    authorizing_integration_publication:
+      activity: evaluate_integration_publication_authority
+      on_signal:
+        authorized: publishing_integrated_change
+        await_human: awaiting_integration_publication_authorization
+        deny: blocked
+    awaiting_integration_publication_authorization:
+      progress: operator_gate
+      gate:
+        evidence_kind: authorization_receipt
+        requested_action: publish_integrated_change
+      on_signal:
+        authorized: publishing_integrated_change
+        expired: authorizing_integration_publication
+        denied: blocked
+        cancelled: cancelled
     implementing:
       activity: implement_change
-      on_success: routing_implemented_change
+      on_success: collecting_implemented_change_facts
       on_failure: blocked
     repairing_child_change:
       activity: repair_child_change
-      on_success: routing_implemented_change
+      on_success: collecting_implemented_change_facts
+      on_failure: blocked
+    authorizing_child_repair:
+      activity: evaluate_child_repair_authority
+      on_signal:
+        authorized: repairing_child_change
+        await_human: awaiting_child_repair_authorization
+        deny: blocked
+    awaiting_child_repair_authorization:
+      progress: operator_gate
+      gate:
+        evidence_kind: authorization_receipt
+        requested_action: repair_child_change
+      on_signal:
+        authorized: repairing_child_change
+        expired: authorizing_child_repair
+        denied: blocked
+        cancelled: cancelled
+    collecting_implemented_change_facts:
+      activity: collect_change_facts
+      on_success: assessing_implemented_change_risk
+      on_failure: blocked
+    assessing_implemented_change_risk:
+      activity: assess_risk
+      on_signal:
+        low: routing_implemented_change
+        medium: routing_implemented_change
+        high: routing_implemented_change
+        abstain: blocked
       on_failure: blocked
     routing_implemented_change:
       activity: select_landing_path
       on_signal:
-        direct: publishing_direct_change
-        independent_child: publishing_child_change
-        stacked_child: publishing_child_change
+        direct: authorizing_direct_publication
+        independent_child: authorizing_child_publication
+        stacked_child: authorizing_child_publication
         integration_child: collecting_local_child_review_facts
         invalid: blocked
+    authorizing_direct_publication:
+      activity: evaluate_change_publication_authority
+      on_signal:
+        authorized: publishing_direct_change
+        await_human: awaiting_direct_publication_authorization
+        deny: blocked
+    awaiting_direct_publication_authorization:
+      progress: operator_gate
+      gate:
+        evidence_kind: authorization_receipt
+        requested_action: publish_change
+      on_signal:
+        authorized: publishing_direct_change
+        expired: authorizing_direct_publication
+        denied: blocked
+        cancelled: cancelled
+    authorizing_child_publication:
+      activity: evaluate_change_publication_authority
+      on_signal:
+        authorized: publishing_child_change
+        await_human: awaiting_child_publication_authorization
+        deny: blocked
+    awaiting_child_publication_authorization:
+      progress: operator_gate
+      gate:
+        evidence_kind: authorization_receipt
+        requested_action: publish_change
+      on_signal:
+        authorized: publishing_child_change
+        expired: authorizing_child_publication
+        denied: blocked
+        cancelled: cancelled
     collecting_local_child_review_facts:
       activity: collect_change_facts
       on_success: assessing_local_child_review_risk
@@ -789,15 +953,15 @@ definition:
         abstain: blocked
       on_failure: blocked
     publishing_direct_change:
-      activity: publish_or_bind_change
+      activity: publish_change
       on_success: refreshing_direct_review_facts
       on_failure: blocked
     publishing_child_change:
-      activity: publish_or_bind_change
+      activity: publish_change
       on_success: refreshing_child_review_facts
       on_failure: blocked
     publishing_integrated_change:
-      activity: publish_or_bind_change
+      activity: publish_integrated_change
       on_success: refreshing_integration_review_facts
       on_failure: blocked
     leaf_review_direct:
@@ -811,7 +975,7 @@ definition:
       activity: review_change
       on_signal:
         approved: awaiting_parent_handoff
-        changes_requested: repairing_child_change
+        changes_requested: authorizing_child_repair
         blocked: blocked
       on_failure: blocked
     awaiting_parent_handoff:
@@ -830,7 +994,7 @@ definition:
         quorum_policy: integration
       on_signal:
         approved: merge_gate
-        changes_requested: repairing_integration
+        changes_requested: authorizing_integration_repair
         blocked: blocked
       on_failure: blocked
     merge_gate:
@@ -872,11 +1036,11 @@ definition:
         deadline_exceeded: blocked
         budget_exhausted: blocked
     refreshing_direct_review_facts:
-      activity: collect_change_facts
+      activity: refresh_remote_change_binding
       on_success: assessing_review_risk
       on_failure: blocked
     refreshing_integration_review_facts:
-      activity: collect_change_facts
+      activity: refresh_remote_change_binding
       on_success: assessing_refreshed_integration_risk
       on_failure: blocked
     assessing_refreshed_integration_risk:
@@ -892,7 +1056,7 @@ definition:
       on_success: integration_review
       on_failure: blocked
     refreshing_independent_child_review_facts:
-      activity: collect_change_facts
+      activity: refresh_remote_change_binding
       on_success: requesting_independent_child_review
       on_failure: blocked
     requesting_independent_child_review:
@@ -900,7 +1064,7 @@ definition:
       on_success: assessing_refreshed_child_risk
       on_failure: blocked
     refreshing_child_review_facts:
-      activity: collect_change_facts
+      activity: refresh_remote_change_binding
       on_success: assessing_refreshed_child_risk
       on_failure: blocked
     assessing_refreshed_child_risk:
@@ -972,7 +1136,7 @@ definition:
         deadline_exceeded: blocked
         budget_exhausted: blocked
     refreshing_stale_stack_facts:
-      activity: collect_change_facts
+      activity: refresh_remote_change_binding
       on_success: requesting_stack_child_reviews
       on_failure: blocked
     landing_stack_entry:
@@ -1025,7 +1189,7 @@ definition:
       on_success: refreshing_rebased_stack_facts
       on_failure: blocked
     refreshing_rebased_stack_facts:
-      activity: collect_change_facts
+      activity: refresh_remote_change_binding
       on_success: requesting_stack_child_reviews
       on_failure: blocked
     requesting_stack_child_reviews:
@@ -1069,6 +1233,23 @@ activities:
     contract: registered.change_fact_collection.v1
     produces: [intake_subject_snapshot, code_change_snapshot, review_subject_snapshot]
 
+  refresh_remote_change_binding:
+    executor: registered_server
+    contract: registered.remote_change_binding_refresh.v1
+    required_evidence: [remote_change_binding]
+    binding_transition_contract:
+      expected_current_ref: work_item.remote_change_binding_id
+      successor_output: remote_change_binding
+      update_current_ref: work_item.remote_change_binding_id
+      concurrency: compare_and_swap
+    produces: [remote_change_binding, intake_subject_snapshot, code_change_snapshot, review_subject_snapshot]
+
+  collect_parent_composition_facts:
+    executor: registered_server
+    contract: registered.parent_composition_fact_collection.v1
+    required_evidence: [child_materialization, child_outcome, review_subject_snapshot]
+    produces: [intake_subject_snapshot, code_change_snapshot]
+
   assess_risk:
     executor: agent
     requires:
@@ -1111,8 +1292,8 @@ activities:
     requires: {structured_output: true, filesystem: read_only, network: none, tools: [read]}
     input_schema: change_plan_input.v1
     output_schema: change_plan_output.v1
-    required_evidence: [intake_subject_snapshot, semantic_risk_assessment, independent_set_review_receipt]
-    allowed_decisions: [direct, decompose, abstain]
+    required_evidence: [intake_subject_snapshot, semantic_risk_assessment, decomposition_validation, child_materialization, child_outcome, independent_set_review_receipt]
+    allowed_decisions: [decompose, abstain]
     produces: [implementation_plan, decomposition_proposal]
 
   plan_stack_repair:
@@ -1120,8 +1301,8 @@ activities:
     requires: {structured_output: true, filesystem: read_only, network: none, tools: [read]}
     input_schema: change_plan_input.v1
     output_schema: change_plan_output.v1
-    required_evidence: [intake_subject_snapshot, semantic_risk_assessment, stack_review_receipt]
-    allowed_decisions: [direct, decompose, abstain]
+    required_evidence: [intake_subject_snapshot, semantic_risk_assessment, decomposition_validation, child_materialization, child_outcome, stack_review_receipt]
+    allowed_decisions: [decompose, abstain]
     produces: [implementation_plan, decomposition_proposal]
 
   validate_decomposition:
@@ -1132,6 +1313,8 @@ activities:
   materialize_children:
     executor: registered_server
     contract: registered.decomposition_materialization.v1
+    authority: execution_authorization
+    required_evidence: [decomposition_validation, authorization_gate_result, authorization_receipt]
     produces: [child_materialization]
 
   materialize_parent_review_subject:
@@ -1140,9 +1323,60 @@ activities:
     required_evidence: [child_materialization, child_outcome]
     produces: [review_subject_snapshot]
 
-  evaluate_execution_authority:
+  evaluate_direct_execution_authority:
     executor: registered_server
     contract: registered.execution_authority_gate.v1
+    authority: execution
+    requested_action: implement_change
+    required_evidence: [implementation_plan, semantic_risk_assessment]
+    produces: [authorization_gate_result, authorization_receipt]
+
+  evaluate_child_execution_authority:
+    executor: registered_server
+    contract: registered.execution_authority_gate.v1
+    authority: execution
+    requested_action: materialize_children
+    required_evidence: [decomposition_validation, semantic_risk_assessment]
+    produces: [authorization_gate_result, authorization_receipt]
+
+  evaluate_child_repair_authority:
+    executor: registered_server
+    contract: registered.execution_authority_gate.v1
+    authority: execution
+    requested_action: repair_child_change
+    required_evidence: [implementation_plan, semantic_risk_assessment, review_receipt]
+    produces: [authorization_gate_result, authorization_receipt]
+
+  evaluate_integration_execution_authority:
+    executor: registered_server
+    contract: registered.execution_authority_gate.v1
+    authority: execution
+    requested_action: integrate_children
+    required_evidence: [decomposition_validation, child_materialization, child_outcome, semantic_risk_assessment]
+    produces: [authorization_gate_result, authorization_receipt]
+
+  evaluate_integration_repair_authority:
+    executor: registered_server
+    contract: registered.execution_authority_gate.v1
+    authority: execution
+    requested_action: repair_integration
+    required_evidence: [decomposition_validation, child_materialization, child_outcome, semantic_risk_assessment, integration_review_receipt]
+    produces: [authorization_gate_result, authorization_receipt]
+
+  evaluate_change_publication_authority:
+    executor: registered_server
+    contract: registered.execution_authority_gate.v1
+    authority: execution
+    requested_action: publish_change
+    required_evidence: [implementation_plan, change_set, validation_report, semantic_risk_assessment]
+    produces: [authorization_gate_result, authorization_receipt]
+
+  evaluate_integration_publication_authority:
+    executor: registered_server
+    contract: registered.execution_authority_gate.v1
+    authority: execution
+    requested_action: publish_integrated_change
+    required_evidence: [decomposition_validation, child_materialization, child_outcome, integrated_change_set, validation_report, semantic_risk_assessment]
     produces: [authorization_gate_result, authorization_receipt]
 
   implement_change:
@@ -1158,7 +1392,8 @@ activities:
       writable_scope: plan_authorized
     input_schema: change_implementation_input.v1
     output_schema: change_implementation_output.v1
-    required_evidence: [implementation_plan, authorization_gate_result]
+    authority: execution_authorization
+    required_evidence: [implementation_plan, authorization_gate_result, authorization_receipt]
     allowed_decisions: []
     produces: [change_set, validation_report]
 
@@ -1175,7 +1410,8 @@ activities:
       writable_scope: plan_authorized
     input_schema: change_implementation_input.v1
     output_schema: change_implementation_output.v1
-    required_evidence: [implementation_plan, authorization_gate_result, review_receipt]
+    authority: execution_authorization
+    required_evidence: [implementation_plan, authorization_gate_result, authorization_receipt, review_receipt]
     allowed_decisions: []
     produces: [change_set, validation_report]
 
@@ -1212,7 +1448,8 @@ activities:
       writable_scope: plan_authorized
     input_schema: child_integration_input.v1
     output_schema: child_integration_output.v1
-    required_evidence: [decomposition_validation, child_materialization, child_outcome, authorization_gate_result]
+    authority: execution_authorization
+    required_evidence: [decomposition_validation, child_materialization, child_outcome, authorization_gate_result, authorization_receipt]
     allowed_decisions: []
     produces: [integrated_change_set, validation_report]
 
@@ -1229,7 +1466,8 @@ activities:
       writable_scope: plan_authorized
     input_schema: child_integration_input.v1
     output_schema: child_integration_output.v1
-    required_evidence: [decomposition_validation, child_materialization, child_outcome, authorization_gate_result, integration_review_receipt]
+    authority: execution_authorization
+    required_evidence: [decomposition_validation, child_materialization, child_outcome, authorization_gate_result, authorization_receipt, integration_review_receipt]
     allowed_decisions: []
     produces: [integrated_change_set, validation_report]
 
@@ -1273,7 +1511,7 @@ activities:
     permissions: {tools: [read], provider_actions: []}
     input_schema: child_set_review_input.v1
     output_schema: code_review_output.v1
-    required_evidence: [child_materialization, child_outcome, review_subject_snapshot]
+    required_evidence: [child_materialization, child_outcome, review_subject_snapshot, semantic_risk_assessment]
     allowed_decisions: [approved, changes_requested, blocked]
     produces: [independent_set_review_receipt]
 
@@ -1284,7 +1522,7 @@ activities:
     permissions: {tools: [read], provider_actions: []}
     input_schema: stack_review_input.v1
     output_schema: code_review_output.v1
-    required_evidence: [child_materialization, child_outcome, review_subject_snapshot]
+    required_evidence: [child_materialization, child_outcome, review_subject_snapshot, semantic_risk_assessment]
     allowed_decisions: [approved, changes_requested, blocked]
     produces: [stack_review_receipt]
 
@@ -1298,11 +1536,21 @@ activities:
     contract: registered.child_set_reconciliation.v1
     produces: [child_set_reconciliation]
 
-  publish_or_bind_change:
+  publish_change:
     executor: provider_action
     contract: registered.provider_change_publish_or_bind.v1
     idempotency: required
     authority: execution_authorization
+    required_evidence: [change_set, validation_report, authorization_gate_result, authorization_receipt]
+    reconciliation: registered.remote_binding_reconciliation.v1
+    produces: [remote_change_binding, review_subject_snapshot]
+
+  publish_integrated_change:
+    executor: provider_action
+    contract: registered.provider_change_publish_or_bind.v1
+    idempotency: required
+    authority: execution_authorization
+    required_evidence: [integrated_change_set, validation_report, authorization_gate_result, authorization_receipt]
     reconciliation: registered.remote_binding_reconciliation.v1
     produces: [remote_change_binding, review_subject_snapshot]
 
@@ -1476,7 +1724,7 @@ evidence:
     allowed_producers: [server_policy_engine]
   remote_change_binding:
     payload_schema: .harness/schemas/remote-change-binding.v1.json
-    allowed_producers: [remote_provider]
+    allowed_producers: [remote_provider, server_fact_collector]
   merge_gate_result:
     payload_schema: .harness/schemas/merge-gate-result.v1.json
     allowed_producers: [server_policy_engine]
@@ -1534,9 +1782,18 @@ review:
     fresh_context: true
     author_reviewer_separation: true
     quorum: 1
+  parent_composition:
+    fresh_context: true
+    author_reviewer_separation: true
+    risk_evidence: semantic_risk_assessment
+    quorum_by_risk:
+      low: 1
+      medium: 1
+      high: 2
   integration:
     fresh_context: true
     author_reviewer_separation: true
+    risk_evidence: semantic_risk_assessment
     quorum_by_risk:
       low: 1
       medium: 1
@@ -1597,13 +1854,19 @@ stateDiagram-v2
     awaiting_child_execution_authorization --> materializing_children: child plan approved
     materializing_children --> executing_children: batch committed
     executing_children --> preparing_independent_set_review: independent children ready
-    preparing_independent_set_review --> reviewing_independent_set: aggregate identity materialized
+    preparing_independent_set_review --> collecting_independent_set_review_facts: aggregate identity materialized
+    collecting_independent_set_review_facts --> assessing_independent_set_review_risk: aggregate facts collected
+    assessing_independent_set_review_risk --> reviewing_independent_set: aggregate risk classified
     executing_children --> preparing_stack_review: stack ready
-    preparing_stack_review --> reviewing_stack: ordered identity materialized
-    executing_children --> integrating: integration inputs ready
+    preparing_stack_review --> collecting_stack_review_facts: ordered identity materialized
+    collecting_stack_review_facts --> assessing_stack_review_risk: aggregate facts collected
+    assessing_stack_review_risk --> reviewing_stack: aggregate risk classified
+    executing_children --> authorizing_integration: integration inputs ready
+    authorizing_integration --> integrating: execution authorized
+    authorizing_integration --> awaiting_integration_execution_authorization: human required
+    awaiting_integration_execution_authorization --> integrating: integration approved
     reviewing_independent_set --> releasing_independent_children: approved
     reviewing_independent_set --> planning_independent_set_repair: changes requested
-    planning_independent_set_repair --> authorizing_direct: direct repair plan
     planning_independent_set_repair --> validating_decomposition: repair decomposition proposed
     releasing_independent_children --> awaiting_independent_landing
     awaiting_independent_landing --> reconciling_child_set: all remotely merged
@@ -1612,7 +1875,6 @@ stateDiagram-v2
     reconciling_child_set --> done
     reviewing_stack --> stack_merge_gate: approved
     reviewing_stack --> planning_stack_repair: changes requested
-    planning_stack_repair --> authorizing_direct: direct repair plan
     planning_stack_repair --> validating_decomposition: repair decomposition proposed
     stack_merge_gate --> landing_stack_entry: entry eligible
     stack_merge_gate --> awaiting_stack_merge_authorization: human required
@@ -1636,26 +1898,45 @@ stateDiagram-v2
     requesting_stack_child_reviews --> awaiting_stack_child_reviews: child commands committed
     awaiting_stack_child_reviews --> preparing_stack_review: all leaf reviews current
     awaiting_parent_handoff --> refreshing_child_review_facts: re-review required
-    implementing --> routing_implemented_change
-    repairing_child_change --> routing_implemented_change
-    routing_implemented_change --> publishing_direct_change: direct
-    routing_implemented_change --> publishing_child_change: independent or stacked child
+    implementing --> collecting_implemented_change_facts
+    repairing_child_change --> collecting_implemented_change_facts
+    collecting_implemented_change_facts --> assessing_implemented_change_risk: local code facts collected
+    assessing_implemented_change_risk --> routing_implemented_change: local risk classified
+    routing_implemented_change --> authorizing_direct_publication: direct
+    routing_implemented_change --> authorizing_child_publication: independent or stacked child
     routing_implemented_change --> collecting_local_child_review_facts: integration child
+    authorizing_direct_publication --> publishing_direct_change: publication authorized
+    authorizing_direct_publication --> awaiting_direct_publication_authorization: human required
+    awaiting_direct_publication_authorization --> publishing_direct_change: publication approved
+    authorizing_child_publication --> publishing_child_change: publication authorized
+    authorizing_child_publication --> awaiting_child_publication_authorization: human required
+    awaiting_child_publication_authorization --> publishing_child_change: publication approved
     collecting_local_child_review_facts --> assessing_local_child_review_risk: local identity collected
     assessing_local_child_review_risk --> leaf_review_child: risk classified
     publishing_direct_change --> refreshing_direct_review_facts: remote identity bound
     publishing_child_change --> refreshing_child_review_facts: remote identity bound
     leaf_review_direct --> collecting_direct_repair_facts: changes requested
     leaf_review_direct --> merge_gate: approved
-    leaf_review_child --> repairing_child_change: changes requested
+    leaf_review_child --> authorizing_child_repair: changes requested
+    authorizing_child_repair --> repairing_child_change: repair authorized
+    authorizing_child_repair --> awaiting_child_repair_authorization: human required
+    awaiting_child_repair_authorization --> repairing_child_change: repair approved
     leaf_review_child --> awaiting_parent_handoff: approved
     awaiting_parent_handoff --> merge_gate: independent released
     awaiting_parent_handoff --> reconciling: stack entry landed
     awaiting_parent_handoff --> done: integration contribution accepted
-    integrating --> publishing_integrated_change
-    repairing_integration --> publishing_integrated_change
+    integrating --> collecting_integrated_change_facts
+    repairing_integration --> collecting_integrated_change_facts
+    collecting_integrated_change_facts --> assessing_integrated_change_risk: integrated facts collected
+    assessing_integrated_change_risk --> authorizing_integration_publication: integrated risk classified
+    authorizing_integration_publication --> publishing_integrated_change: publication authorized
+    authorizing_integration_publication --> awaiting_integration_publication_authorization: human required
+    awaiting_integration_publication_authorization --> publishing_integrated_change: publication approved
     publishing_integrated_change --> refreshing_integration_review_facts: remote identity bound
-    integration_review --> repairing_integration: changes requested
+    integration_review --> authorizing_integration_repair: changes requested
+    authorizing_integration_repair --> repairing_integration: repair authorized
+    authorizing_integration_repair --> awaiting_integration_repair_authorization: human required
+    awaiting_integration_repair_authorization --> repairing_integration: repair approved
     integration_review --> merge_gate: approved
     merge_gate --> merging: low risk auto-authorized
     merge_gate --> awaiting_merge_authorization: medium/high
@@ -1697,6 +1978,8 @@ stateDiagram-v2
     materializing_children --> blocked
     executing_children --> blocked
     preparing_independent_set_review --> blocked
+    collecting_independent_set_review_facts --> blocked
+    assessing_independent_set_review_risk --> blocked
     reviewing_independent_set --> blocked
     planning_independent_set_repair --> blocked
     releasing_independent_children --> blocked
@@ -1704,11 +1987,23 @@ stateDiagram-v2
     awaiting_independent_re_reviews --> blocked
     reconciling_child_set --> blocked
     preparing_stack_review --> blocked
+    collecting_stack_review_facts --> blocked
+    assessing_stack_review_risk --> blocked
     reviewing_stack --> blocked
     planning_stack_repair --> blocked
+    authorizing_integration --> blocked
+    awaiting_integration_execution_authorization --> blocked
     implementing --> blocked
+    authorizing_child_repair --> blocked
+    awaiting_child_repair_authorization --> blocked
     repairing_child_change --> blocked
+    collecting_implemented_change_facts --> blocked
+    assessing_implemented_change_risk --> blocked
     routing_implemented_change --> blocked
+    authorizing_direct_publication --> blocked
+    awaiting_direct_publication_authorization --> blocked
+    authorizing_child_publication --> blocked
+    awaiting_child_publication_authorization --> blocked
     collecting_local_child_review_facts --> blocked
     assessing_local_child_review_risk --> blocked
     publishing_direct_change --> blocked
@@ -1718,7 +2013,13 @@ stateDiagram-v2
     leaf_review_child --> blocked
     awaiting_parent_handoff --> blocked
     integrating --> blocked
+    authorizing_integration_repair --> blocked
+    awaiting_integration_repair_authorization --> blocked
     repairing_integration --> blocked
+    collecting_integrated_change_facts --> blocked
+    assessing_integrated_change_risk --> blocked
+    authorizing_integration_publication --> blocked
+    awaiting_integration_publication_authorization --> blocked
     integration_review --> blocked
     merge_gate --> blocked
     awaiting_remote_checks --> blocked
@@ -1917,6 +2218,16 @@ cannot receive a policy receipt. A gate result is never implicitly treated as au
 For a stack entry, the policy receipt additionally binds the integration-progress generation,
 landing cursor, current remote binding, and `merge_current_stack_entry` action.
 
+Every mutation governed by execution policy declares `authority: execution_authorization` and
+requires both the accepted `authorization_gate_result` and its current `authorization_receipt`.
+Direct implementation, child materialization, child repair, integration, integration repair, and
+provider publication use explicit `requested_action` values. A human operator gate persists the
+matching receipt before routing to the mutation; the dispatcher then revalidates its definition,
+plan or decomposition revision, risk, scope, code identity when present, expiry, revocation, and
+exact activity action. A receipt for one mutation cannot authorize another, and neither a gate
+result alone nor an older receipt is usable. Publication receives a separate receipt after local
+code facts and semantic risk are current; an implementation or integration receipt cannot publish.
+
 Stack rewrite policy is Workflow-owned rather than inferred by the compiler.
 `stack_rebase_authorization` uses the execution tiers: low and medium may receive current
 server-policy receipts, while high requires a human receipt. `stack_republication_authorization`
@@ -2030,6 +2341,13 @@ publish or merge independently.
 Changing strategy after child execution begins requires a new decomposition revision and explicit
 validation. Changing from separate landing to atomic integration, or the reverse, invalidates
 affected integration and merge receipts.
+
+An independent-set or stack parent review that requests changes cannot fall through to direct
+parent implementation. Its repair planner consumes the current materialized graph, child outcomes,
+decomposition validation, and findings-bearing aggregate receipt, and may only abstain or propose a
+new decomposition revision. Validation and atomic materialization then preserve, replace, or cancel
+children through explicit revision relations before the parent rejoins its strategy-specific
+barrier.
 
 ## 16. Code Agent Runtime Contract
 
@@ -2185,6 +2503,14 @@ code risk, validation, and leaf review. The parent waits at `awaiting_independen
 rematerializes the complete set only after current child outcomes arrive, obtains a new parent
 review, and releases the set again.
 
+Independent-set, stacked-set, and integrated-parent reviews all use `review_barrier` with immutable
+distinct assignments and the `parent_composition` or `integration` quorum policy. At high risk each
+policy requires two eligible reviewers of the same aggregate subject; no single activity result can
+emit the barrier's `approved` signal. Before an independent-set or stack barrier opens, the
+registered parent-composition collector derives a `CodeChangeSnapshot` from the exact materialized
+aggregate subject and `assess_risk` binds its result to that aggregate identity. The barrier and
+each review activity consume that assessment, so quorum never falls back to the pre-child risk.
+
 ### 18.4 Integration review
 
 The parent reviewer checks:
@@ -2218,6 +2544,21 @@ independent child refreshes its own leaf review and invalidates the parent set o
 gate refreshes affected child leaf reviews before rematerializing the ordered aggregate. None of
 these routes can reuse stale risk, validation, or review evidence or jump directly to merge.
 
+Every remote refresh first runs `registered.remote_change_binding_refresh.v1`. From authenticated
+provider facts it either reuses the current immutable binding when base/head/code identity are
+unchanged or atomically creates a superseding binding version and the matching fact/review
+snapshots. Subsequent risk, validation, review, stack, and merge inputs reference that current
+version. A changed external head can therefore never be validated against the prior immutable
+binding, and a missing or ambiguous provider identity blocks the refresh.
+
+The refresh contract locks the Work Item's `remote_change_binding_id`, treats it as the expected
+input, inserts at most one successor with `binding_version + 1`, and compare-and-swaps the Work Item
+pointer in the same transaction. The table uniquely constrains both `(workflow_id,
+binding_version)` and a non-null predecessor reference. Concurrent or replayed refreshes that lose
+the compare-and-swap reload the accepted pointer; they cannot fork the binding chain. Required
+`remote_change_binding` Evidence for the next command resolves to that exact persisted pointer, not
+to an arbitrary or latest-by-time record.
+
 ### 18.6 Findings-driven repair
 
 Every accepted `changes_requested` verdict enters a repair-specific state, never the initial
@@ -2227,6 +2568,9 @@ current findings-bearing receipt for their review scope. The dispatcher includes
 receipt in the new attempt input; a missing, stale, wrong-subject, or non-`changes_requested`
 receipt fails activity validation. Repair remains bounded by the existing plan authorization,
 writable scope, and repair budget; findings do not grant new mutation authority.
+Child and integration repair also pass through their action-specific execution-authority gates.
+Aggregate independent-set and stack repair cannot select direct implementation; it must submit a
+validated decomposition revision or abstain.
 
 ## 19. CI and Merge Gate
 
@@ -2372,10 +2716,12 @@ budget exhaustion are distinct declared routes. Recovery treats a wait as health
 deadline, reservation, and scheduled refresh command are present.
 
 Entering an operator gate atomically persists its requested action, prerequisite Evidence IDs,
-accepted receipt kind, and compiled signal-to-route map. Direct execution, child execution,
+accepted receipt kind, and compiled signal-to-route map. Direct implementation, child
+materialization, child repair, integration, integration repair, provider publication,
 direct/integration merge, stack-entry merge, stack rebase, and stack republication are distinct
-actions. A validated receipt may emit only the matching declared signal; the API and reducer do not
-infer a resume target from a state name.
+actions. Automatic authority activities declare the same `requested_action` used by their human
+gate counterpart. A validated receipt may emit only the matching declared signal; the API and
+reducer do not infer an action or resume target from a state name.
 
 Stack landing persists an `IntegrationProgress` cursor before its first gate. Each entry refreshes
 facts and authorization against its current code identity, records the provider result, reconciles

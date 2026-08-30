@@ -294,7 +294,11 @@ for provider reconciliation and code-identity invalidation.
 **Decision.** Add `workflow_remote_change_bindings` as an immutable/versioned supporting record and
 a Workflow-declared `provider_action` for idempotent publish-or-bind. This is not a seventh domain
 aggregate: the Work Item remains the lifecycle authority, and the binding records the external
-object on which provider facts, review, CI, and merge operate.
+object on which provider facts, review, CI, and merge operate. Existing-PR intake and publication
+create the initial version. A registered read-only provider reconciliation creates a new version
+that points to the prior binding whenever trusted base/head/code identity changes; it never mutates
+the old identity in place. The Work Item stores the exact current binding ID; refresh locks and
+compare-and-swaps that pointer in the same transaction as successor insertion.
 
 ## 5. Six Domain Objects: Brownfield Mapping
 
@@ -414,7 +418,10 @@ workflow_actor_assignments
 
 workflow_remote_change_bindings
   id primary key
+  schema_version
   workflow_id foreign key
+  binding_version
+  supersedes_binding_id nullable foreign key workflow_remote_change_bindings(id)
   provider
   repository_identity jsonb
   remote_object_identity jsonb
@@ -425,7 +432,8 @@ workflow_remote_change_bindings
   reconciliation_state
   source_identity jsonb
   created_at
-  superseded_at nullable
+  unique(workflow_id, binding_version)
+  unique(supersedes_binding_id) where supersedes_binding_id is not null
 
 provider_intake_fences
   id primary key
@@ -635,13 +643,23 @@ CompiledActivity
   allowed_decisions
   idempotency_contract?
   authority_contract?
+  requested_action?          # typed authorization action ID
   reconciliation_contract?
+  binding_transition_contract? # expected pointer, successor kind, pointer update, CAS mode
   retry_policy
   repair_policy
   budget_policy
   role
   prompt_template
 ```
+
+Both optional contracts are linked and included in canonical bundle hashing. For an automatic
+authority evaluator, the compiler requires `requested_action` and proves that its `authorized`
+target activity and any `await_human` operator gate consume the same typed action. For a binding
+transition, the compiler validates the expected pointer, produced successor Evidence kind, pointer
+update, and `compare_and_swap` mode against the registered server contract. Unknown actions,
+unlinked targets, mismatched human gates, unsupported concurrency modes, or registry mismatches fail
+definition compilation.
 
 `executor: agent` never names Codex, Claude, OpenCode, or a model. Runtime profiles advertise
 capabilities; the dispatcher chooses an eligible profile using operator configuration. Model choice
@@ -687,7 +705,8 @@ deadline, reservation, and next refresh command are all present.
 Entering `operator_gate` atomically creates a `workflow_operator_gates` record from the compiled
 state declaration. It binds the requested action, prerequisite fact/plan/code Evidence, accepted
 receipt kind, and finite signal-to-route map. A receipt can emit only the matching declared signal;
-direct execution, child execution, direct/integration merge, and stack-entry merge are distinct
+direct execution, child materialization, child repair, integration, integration repair,
+provider publication, direct/integration merge, and stack-entry merge are distinct
 actions; stack rebase and stack republication are also distinct from each other and from merge.
 Replay uses the gate record and receipt Evidence, never an API hard-coded resume target.
 
@@ -904,6 +923,9 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - invalid unknown capability, schema, producer, decision, registered contract, and route fixtures;
 - unreachable state and unbounded retry/graph fixtures; and
 - canonical hash stability plus one-field semantic hash-change fixtures;
+- automatic authority action missing/mismatched with its target activity or human gate rejects;
+- binding-transition pointer/output/CAS mismatch with the registered contract rejects, and either
+  typed field changes the canonical definition hash;
 - unreferenced global activity policy does not change a definition hash or input contract; and
 - route/verdict whitespace is normalized once before validation and comparison.
 
@@ -937,11 +959,15 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
   risk, and a head refresh invalidates and recomputes that risk before re-review;
 - every newly published direct, child, or integrated head refreshes current code facts and semantic
   risk before review; an unpublished integration child does the same against its local change;
+- every code-producing activity refreshes local code risk before a distinct publication authority
+  gate can issue the exact `publish_change` or `publish_integrated_change` receipt;
 - medium merge lacks receipt and waits;
 - low automatic merge has a current server-policy receipt bound to the exact eligible gate inputs;
 - low automatic stack-entry merge additionally binds integration generation, landing cursor,
   current binding/code identity, and `merge_current_stack_entry`;
 - high mutation lacks plan receipt and waits;
+- every direct, child-materialization, child-repair, integration, and integration-repair mutation
+  rejects a missing, stale, or wrong-action execution receipt even when a gate result exists;
 - expired/revoked/wrong-scope receipt rejected;
 - stack rebase follows execution risk tiers and binds its current context and output scope, while
   every stack republication requires a human receipt derived from the validated rewrite and bound
@@ -954,6 +980,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - valid two-child non-overlapping proposal materializes atomically;
 - cycle, depth, child-count, budget, acceptance-gap, and scope-overlap failures create no children;
 - one failed child prevents parent barrier success;
+- independent-set and stack aggregate repair cannot become direct parent implementation and must
+  validate a new decomposition revision before materialization;
 - typed child outcome drives the parent without definition-specific code;
 - stacked rebase invalidates code-bound evidence; and
 - independent children stop at parent handoff, receive one release, merge through their own gates,
@@ -965,6 +993,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
   reviewed before the next entry gate;
 - independent or stacked child head change invalidates its risk, validation, review, and
   `ChildOutcome`; all three current-head gates rerun before a new outcome reaches the parent;
+- independent-set and stack aggregate subjects derive identity-bound semantic risk before their
+  quorum-bearing parent review barriers open;
 - integration children cannot publish/merge and the parent alone publishes the integrated binding;
   and
 - integration PR requires child and parent review receipts.
@@ -1006,7 +1036,13 @@ a destructive transition:
 - author/reviewer assignment or run collision rejects approval;
 - inherited author context rejects fresh-context claim;
 - head change invalidates receipt;
+- a trusted external head change creates a superseding immutable remote binding version, and risk,
+  validation, review, and merge consume only that current version;
+- concurrent/replayed binding refreshes cannot fork successors and must compare-and-swap the Work
+  Item's exact current binding pointer before downstream dispatch;
 - leaf review rejects a missing, stale, wrong-subject, or non-passing validation report;
+- high-risk independent-set, stack, and integration parent review requires two distinct eligible
+  assignments for the same aggregate subject;
 - every `changes_requested` route supplies the current findings-bearing receipt to its distinct
   repair planning or mutation activity;
 - issue-first publish retries resolve to one remote change binding and one provider object;
