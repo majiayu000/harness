@@ -621,10 +621,14 @@ definition:
     assessing_review_risk:
       activity: assess_risk
       on_signal:
-        low: leaf_review_direct
-        medium: leaf_review_direct
-        high: leaf_review_direct
+        low: validating_direct_head
+        medium: validating_direct_head
+        high: validating_direct_head
         abstain: blocked
+      on_failure: blocked
+    validating_direct_head:
+      activity: validate_direct_head
+      on_success: leaf_review_direct
       on_failure: blocked
     collecting_direct_repair_facts:
       activity: collect_change_facts
@@ -770,19 +774,31 @@ definition:
         direct: publishing_direct_change
         independent_child: publishing_child_change
         stacked_child: publishing_child_change
-        integration_child: leaf_review_child
+        integration_child: collecting_local_child_review_facts
         invalid: blocked
+    collecting_local_child_review_facts:
+      activity: collect_change_facts
+      on_success: assessing_local_child_review_risk
+      on_failure: blocked
+    assessing_local_child_review_risk:
+      activity: assess_risk
+      on_signal:
+        low: leaf_review_child
+        medium: leaf_review_child
+        high: leaf_review_child
+        abstain: blocked
+      on_failure: blocked
     publishing_direct_change:
       activity: publish_or_bind_change
-      on_success: leaf_review_direct
+      on_success: refreshing_direct_review_facts
       on_failure: blocked
     publishing_child_change:
       activity: publish_or_bind_change
-      on_success: leaf_review_child
+      on_success: refreshing_child_review_facts
       on_failure: blocked
     publishing_integrated_change:
       activity: publish_or_bind_change
-      on_success: integration_review
+      on_success: refreshing_integration_review_facts
       on_failure: blocked
     leaf_review_direct:
       activity: review_change
@@ -1179,7 +1195,7 @@ activities:
     permissions: {tools: [read], provider_actions: []}
     input_schema: code_review_input.v1
     output_schema: code_review_output.v1
-    required_evidence: [review_subject_snapshot]
+    required_evidence: [review_subject_snapshot, validation_report]
     allowed_decisions: [approved, changes_requested, blocked]
     produces: [review_receipt]
 
@@ -1236,6 +1252,12 @@ activities:
     executor: registered_server
     contract: registered.integration_head_validation.v1
     required_evidence: [integrated_change_set, remote_change_binding, review_subject_snapshot, semantic_risk_assessment]
+    produces: [validation_report]
+
+  validate_direct_head:
+    executor: registered_server
+    contract: registered.direct_head_validation.v1
+    required_evidence: [remote_change_binding, code_change_snapshot, review_subject_snapshot, semantic_risk_assessment]
     produces: [validation_report]
 
   validate_child_head:
@@ -1558,7 +1580,8 @@ stateDiagram-v2
     collecting_facts --> assessing_risk: implementation or repair required
     collecting_facts --> assessing_review_risk: existing PR review-ready
     assessing_risk --> planning
-    assessing_review_risk --> leaf_review_direct: risk classified
+    assessing_review_risk --> validating_direct_head: risk classified
+    validating_direct_head --> leaf_review_direct: current head validated
     collecting_direct_repair_facts --> assessing_direct_repair_risk: facts refreshed
     assessing_direct_repair_risk --> planning_direct_repair: risk classified
     planning_direct_repair --> authorizing_direct: direct repair plan
@@ -1617,9 +1640,11 @@ stateDiagram-v2
     repairing_child_change --> routing_implemented_change
     routing_implemented_change --> publishing_direct_change: direct
     routing_implemented_change --> publishing_child_change: independent or stacked child
-    routing_implemented_change --> leaf_review_child: integration child
-    publishing_direct_change --> leaf_review_direct: bound
-    publishing_child_change --> leaf_review_child: bound
+    routing_implemented_change --> collecting_local_child_review_facts: integration child
+    collecting_local_child_review_facts --> assessing_local_child_review_risk: local identity collected
+    assessing_local_child_review_risk --> leaf_review_child: risk classified
+    publishing_direct_change --> refreshing_direct_review_facts: remote identity bound
+    publishing_child_change --> refreshing_child_review_facts: remote identity bound
     leaf_review_direct --> collecting_direct_repair_facts: changes requested
     leaf_review_direct --> merge_gate: approved
     leaf_review_child --> repairing_child_change: changes requested
@@ -1629,7 +1654,7 @@ stateDiagram-v2
     awaiting_parent_handoff --> done: integration contribution accepted
     integrating --> publishing_integrated_change
     repairing_integration --> publishing_integrated_change
-    publishing_integrated_change --> integration_review: bound
+    publishing_integrated_change --> refreshing_integration_review_facts: remote identity bound
     integration_review --> repairing_integration: changes requested
     integration_review --> merge_gate: approved
     merge_gate --> merging: low risk auto-authorized
@@ -1659,6 +1684,7 @@ stateDiagram-v2
     collecting_facts --> blocked
     assessing_risk --> blocked
     assessing_review_risk --> blocked
+    validating_direct_head --> blocked
     collecting_direct_repair_facts --> blocked
     assessing_direct_repair_risk --> blocked
     planning_direct_repair --> blocked
@@ -1683,6 +1709,8 @@ stateDiagram-v2
     implementing --> blocked
     repairing_child_change --> blocked
     routing_implemented_change --> blocked
+    collecting_local_child_review_facts --> blocked
+    assessing_local_child_review_risk --> blocked
     publishing_direct_change --> blocked
     publishing_child_change --> blocked
     publishing_integrated_change --> blocked
@@ -1825,6 +1853,13 @@ uses a current single or aggregate `code_identity`; work with no code uses an ex
 snapshots and copies the observed code identity into its result. A later head or effective-diff
 change therefore invalidates the semantic assessment; an `absent` snapshot permits intake-only
 classification but cannot authorize review or merge of code.
+
+A code-producing path cannot carry that intake-only assessment into review. After a direct,
+independent-child, stacked-child, or integrated change is published, the Workflow collects the
+bound remote code facts, reassesses semantic risk, validates that current head, and only then
+dispatches review. An integration child that is not published performs the same fact and risk
+refresh against its local change before leaf review. A publication whose reconciled code identity
+differs from the produced change invalidates the prior Evidence and cannot advance to review.
 
 A human risk override substitutes only for `project_assessment`; it never lowers the universal or
 operator floor and never cancels an explicit operator escalation. It is valid only when bound to
@@ -2118,6 +2153,14 @@ also repeat their single base/head/diff fields for indexing. Composition receipt
 single-head fields and bind the snapshot's tagged aggregate `code_identity` through
 `review_subject_hash`; reducers validate the immutable referenced Evidence rather than reconstruct
 membership from receipt prose.
+
+Every leaf review consumes a `validation_report` bound to the same code identity as its
+`review_subject_snapshot`. Initial or refreshed direct heads use
+`registered.direct_head_validation.v1`; refreshed remote child heads use
+`registered.child_head_validation.v1`; an unpublished integration child uses the report produced
+by its implementation attempt. The review-result validator rejects `approved` when the report is
+missing, stale, bound to another subject, or records any required validation as failed or
+unavailable.
 
 ### 18.3 Child review
 

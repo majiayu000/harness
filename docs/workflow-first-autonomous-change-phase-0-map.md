@@ -935,6 +935,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - missing fact forces abstention/escalation;
 - review-ready existing PR cannot enter review or merge authorization without current semantic
   risk, and a head refresh invalidates and recomputes that risk before re-review;
+- every newly published direct, child, or integrated head refreshes current code facts and semantic
+  risk before review; an unpublished integration child does the same against its local change;
 - medium merge lacks receipt and waits;
 - low automatic merge has a current server-policy receipt bound to the exact eligible gate inputs;
 - low automatic stack-entry merge additionally binds integration generation, landing cursor,
@@ -1004,6 +1006,7 @@ a destructive transition:
 - author/reviewer assignment or run collision rejects approval;
 - inherited author context rejects fresh-context claim;
 - head change invalidates receipt;
+- leaf review rejects a missing, stale, wrong-subject, or non-passing validation report;
 - every `changes_requested` route supplies the current findings-bearing receipt to its distinct
   repair planning or mutation activity;
 - issue-first publish retries resolve to one remote change binding and one provider object;
