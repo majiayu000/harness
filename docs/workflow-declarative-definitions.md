@@ -1,7 +1,9 @@
 # WORKFLOW.md: Declarative Definitions and Continuation Policies
 
-> Architecture relationship (2026-08-28): this document remains the executable reference for the
-> currently shipped schema. Proposed vNext ownership, compiled-bundle, Evidence, authorization, and
+> Architecture relationship (updated 2026-08-30): the examples below remain the executable
+> reference for shipped definition and continuation behavior. The shipped strict `agent_contract`
+> activity policy is documented in `docs/workflow-classification-minimal-path.md`; this page does
+> not claim to enumerate every activity-policy field. Proposed vNext ownership, compiled-bundle, Evidence, authorization, and
 > decomposition contracts are in `docs/workflow-first-autonomous-change-rfc.md`; they are not yet
 > owner-approved and do not supersede this page. Runtime incompatibility and physical cutover are
 > separated in `docs/workflow-vnext-cutover-rfc.md`.
