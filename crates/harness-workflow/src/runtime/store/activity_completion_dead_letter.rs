@@ -247,7 +247,7 @@ async fn current_remote_eval_cancellation_matches_lease_tx(
     if current.status != RuntimeJobStatus::Running
         || current.runtime_kind != RuntimeKind::RemoteHost
         || current.input.get("cancellation_requested").is_none()
-        || (current.input.get("eval").is_none() && current.input.pointer("/command/eval").is_none())
+        || !current.is_eval_job()
         || !matches_current_owner
     {
         return Ok(false);

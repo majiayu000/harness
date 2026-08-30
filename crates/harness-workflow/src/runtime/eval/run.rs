@@ -5,11 +5,10 @@ use super::{
     trusted_verifier::{is_trusted_eval_verifier_argv, TRUSTED_EVAL_VERIFIER_V1_CAPABILITY},
 };
 use crate::runtime::{
-    build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeJobStatus,
-    RuntimeProfile, SubmissionMode, ValidationContext, WorkflowCommand, WorkflowCommandStatus,
-    WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition,
-    WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID,
+    build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeProfile, SubmissionMode,
+    ValidationContext, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
+    WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence,
+    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -272,7 +271,7 @@ pub async fn cleanup_cancelled_eval_run(
             }
         };
         for command in commands {
-            if !active_command_status(command.status) {
+            if !command.status.is_active() {
                 continue;
             }
             match store
@@ -440,34 +439,17 @@ async fn collect_remaining_eval_resources(
     let commands = store.commands_for(workflow_id).await?;
     let mut jobs_by_command = super::cleanup::runtime_jobs_by_command_id(store, &commands).await?;
     for command in commands {
-        if active_command_status(command.status) {
+        if command.status.is_active() {
             summary.active_commands += 1;
         }
         for job in jobs_by_command.remove(&command.id).unwrap_or_default() {
-            if active_runtime_job_status(job.status) {
+            if job.status.is_active() {
                 summary.active_runtime_jobs += 1;
             }
         }
     }
 
     Ok(())
-}
-
-fn active_command_status(status: WorkflowCommandStatus) -> bool {
-    matches!(
-        status,
-        WorkflowCommandStatus::Pending
-            | WorkflowCommandStatus::Dispatching
-            | WorkflowCommandStatus::Deferred
-            | WorkflowCommandStatus::Dispatched
-    )
-}
-
-fn active_runtime_job_status(status: RuntimeJobStatus) -> bool {
-    matches!(
-        status,
-        RuntimeJobStatus::Pending | RuntimeJobStatus::Running
-    )
 }
 
 pub(super) fn eval_case_initial_instance(

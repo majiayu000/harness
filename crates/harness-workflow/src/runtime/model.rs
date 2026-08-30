@@ -508,6 +508,12 @@ pub enum RuntimeJobStatus {
     Cancelled,
 }
 
+impl RuntimeJobStatus {
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Pending | Self::Running)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeJob {
     pub id: String,
@@ -572,6 +578,10 @@ impl RuntimeJob {
     pub fn with_not_before(mut self, not_before: DateTime<Utc>) -> Self {
         self.not_before = Some(not_before);
         self
+    }
+
+    pub fn is_eval_job(&self) -> bool {
+        self.input.get("eval").is_some() || self.input.pointer("/command/eval").is_some()
     }
 
     pub fn claim(&mut self, owner: impl Into<String>, expires_at: DateTime<Utc>) {

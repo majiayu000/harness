@@ -242,7 +242,7 @@ pub(crate) fn default_plain_env_allowlist() -> Vec<String> {
 pub(crate) fn eval_credential_environment_for_job(
     job: &RuntimeJob,
 ) -> Result<Option<EvalCredentialEnvironment>, EvalCredentialEnvironmentError> {
-    if !is_eval_runtime_job(job) {
+    if !job.is_eval_job() {
         return Ok(None);
     }
     let ambient = ambient_env_utf8();
@@ -349,7 +349,7 @@ pub(crate) fn build_eval_credential_environment(
 pub(crate) fn runtime_host_eval_environment(
     job: &RuntimeJob,
 ) -> Result<Option<EvalCredentialEnvironment>, EvalCredentialEnvironmentError> {
-    if !is_eval_runtime_job(job) {
+    if !job.is_eval_job() {
         return Ok(None);
     }
     eval_credential_environment_for_job_with_ambient(job, &HashMap::new()).map(Some)
@@ -560,10 +560,6 @@ fn is_credential_path_env(key: &str) -> bool {
             | "DOCKER_CONFIG"
             | "KUBECONFIG"
     )
-}
-
-fn is_eval_runtime_job(job: &RuntimeJob) -> bool {
-    job.input.get("eval").is_some() || job.input.pointer("/command/eval").is_some()
 }
 
 fn plain_env_allowlist_from_job_input(input: &Value) -> Option<Vec<String>> {

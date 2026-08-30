@@ -446,11 +446,15 @@ pub(super) fn activity_result_from_job(job: &RuntimeJob) -> Option<ActivityResul
 }
 
 fn runtime_job_terminal_state(job: &RuntimeJob) -> Option<String> {
+    if job.status.is_active() {
+        return None;
+    }
+
     match job.status {
         RuntimeJobStatus::Succeeded | RuntimeJobStatus::Failed | RuntimeJobStatus::Cancelled => {
             Some(eval_runtime_job_status(job.status).to_string())
         }
-        RuntimeJobStatus::Pending | RuntimeJobStatus::Running => None,
+        _ => None,
     }
 }
 

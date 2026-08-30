@@ -36,6 +36,13 @@ impl WorkflowCommandStatus {
             Self::Superseded => "superseded",
         }
     }
+
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Dispatching | Self::Deferred | Self::Dispatched
+        )
+    }
 }
 
 impl fmt::Display for WorkflowCommandStatus {
@@ -67,6 +74,35 @@ impl TryFrom<&str> for WorkflowCommandStatus {
             "skipped" => Ok(Self::Skipped),
             "superseded" => Ok(Self::Superseded),
             other => anyhow::bail!("unknown workflow command status: {other}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkflowCommandStatus;
+
+    #[test]
+    fn workflow_command_status_active_classification_matches_runtime_states() {
+        for status in [
+            WorkflowCommandStatus::Pending,
+            WorkflowCommandStatus::Dispatching,
+            WorkflowCommandStatus::Deferred,
+            WorkflowCommandStatus::Dispatched,
+        ] {
+            assert!(status.is_active(), "{status:?} should be active");
+        }
+
+        for status in [
+            WorkflowCommandStatus::HandledInline,
+            WorkflowCommandStatus::Completed,
+            WorkflowCommandStatus::Failed,
+            WorkflowCommandStatus::Blocked,
+            WorkflowCommandStatus::Cancelled,
+            WorkflowCommandStatus::Skipped,
+            WorkflowCommandStatus::Superseded,
+        ] {
+            assert!(!status.is_active(), "{status:?} should be terminal");
         }
     }
 }

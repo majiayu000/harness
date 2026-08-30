@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn is_eval_cancellation_ack(job: &RuntimeJob, result: &ActivityResult) -> bool {
     result.status == harness_workflow::runtime::ActivityStatus::Cancelled
         && job.input.get("cancellation_requested").is_some()
-        && (job.input.get("eval").is_some() || job.input.pointer("/command/eval").is_some())
+        && job.is_eval_job()
 }
 
 pub(super) fn attach_eval_cancellation_cleanup_evidence(

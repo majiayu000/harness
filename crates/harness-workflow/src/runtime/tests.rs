@@ -43,6 +43,7 @@ include!("tests/prompt_continuation_reducer.rs");
 include!("tests/completion_reducer_quality.rs");
 include!("tests/completion_reducer_quality_gate.rs");
 include!("tests/runtime_failure_classification.rs");
+include!("tests/runtime_job_predicates.rs");
 include!("tests/decision_validator.rs");
 include!("tests/command_bus.rs");
 include!("tests/worker_lifecycle.rs");

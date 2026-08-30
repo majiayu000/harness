@@ -1,6 +1,6 @@
 use super::{data::eval_cleanup_data, transition_outcome::accepted_transition_record};
 use crate::runtime::{
-    DataProvenance, RuntimeJobStatus, ValidationContext, WorkflowCommand, WorkflowCommandRecord,
+    DataProvenance, ValidationContext, WorkflowCommand, WorkflowCommandRecord,
     WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition,
     WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore,
 };
@@ -262,13 +262,7 @@ async fn ensure_cancelled_workflow_family_clean(
         .collect();
     let mut jobs_by_command = runtime_jobs_by_command_id(store, &commands).await?;
     for command in commands {
-        if matches!(
-            command.status,
-            WorkflowCommandStatus::Pending
-                | WorkflowCommandStatus::Dispatching
-                | WorkflowCommandStatus::Deferred
-                | WorkflowCommandStatus::Dispatched
-        ) {
+        if command.status.is_active() {
             anyhow::bail!(
                 "workflow family still has active command {} ({})",
                 command.id,
@@ -276,10 +270,7 @@ async fn ensure_cancelled_workflow_family_clean(
             );
         }
         for job in jobs_by_command.remove(&command.id).unwrap_or_default() {
-            if matches!(
-                job.status,
-                RuntimeJobStatus::Pending | RuntimeJobStatus::Running
-            ) {
+            if job.status.is_active() {
                 anyhow::bail!(
                     "workflow family still has active runtime job {} ({})",
                     job.id,
@@ -339,7 +330,7 @@ async fn ensure_completed_workflow_family_clean(
 fn eval_job_requires_cleanup_proof(job: &crate::runtime::RuntimeJob) -> bool {
     job.runtime_kind == crate::runtime::RuntimeKind::RemoteHost
         && job.lease_generation > 0
-        && (job.input.get("eval").is_some() || job.input.pointer("/command/eval").is_some())
+        && job.is_eval_job()
 }
 
 fn runtime_job_has_cleanup_proof(job: &crate::runtime::RuntimeJob) -> bool {
@@ -395,13 +386,7 @@ async fn ensure_no_active_work(
         .collect();
     let mut jobs_by_command = runtime_jobs_by_command_id(store, &commands).await?;
     for command in commands {
-        if matches!(
-            command.status,
-            WorkflowCommandStatus::Pending
-                | WorkflowCommandStatus::Dispatching
-                | WorkflowCommandStatus::Deferred
-                | WorkflowCommandStatus::Dispatched
-        ) {
+        if command.status.is_active() {
             anyhow::bail!(
                 "workflow family still has active command {} ({})",
                 command.id,
@@ -409,10 +394,7 @@ async fn ensure_no_active_work(
             );
         }
         for job in jobs_by_command.remove(&command.id).unwrap_or_default() {
-            if matches!(
-                job.status,
-                RuntimeJobStatus::Pending | RuntimeJobStatus::Running
-            ) {
+            if job.status.is_active() {
                 anyhow::bail!(
                     "workflow family still has active runtime job {} ({:?})",
                     job.id,

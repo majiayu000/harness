@@ -99,6 +99,10 @@ pub(crate) struct RuntimeJobWorkerTick {
 
 impl RuntimeJobWorkerTick {
     fn from_completed_job(job: Option<RuntimeJob>) -> Self {
+        if job.as_ref().is_some_and(|job| job.status.is_active()) {
+            return Self::default();
+        }
+
         match job.map(|job| job.status) {
             Some(RuntimeJobStatus::Succeeded) => Self {
                 succeeded: 1,
@@ -112,11 +116,11 @@ impl RuntimeJobWorkerTick {
                 cancelled: 1,
                 ..Self::default()
             },
-            Some(RuntimeJobStatus::Pending | RuntimeJobStatus::Running) => Self::default(),
             None => Self {
                 idle: true,
                 ..Self::default()
             },
+            Some(_) => Self::default(),
         }
     }
 
@@ -208,29 +212,31 @@ pub(crate) async fn record_runtime_circuit_breaker_completion(
     if job.status == RuntimeJobStatus::Failed && runtime_job_is_transcript_preflight_failure(job) {
         return Ok(());
     }
-    let events = match job.status {
-        RuntimeJobStatus::Succeeded => state.runtime_circuit_breakers.record_success(
-            &job.runtime_profile,
-            &job.id,
-            chrono::Utc::now(),
-        ),
-        RuntimeJobStatus::Failed => {
-            let failure_class = runtime_job_failure_class(job);
-            if let Some(updated) = store
-                .record_runtime_job_failure_class(&job.id, failure_class.as_str())
-                .await?
-            {
-                *job = updated;
-            }
-            state.runtime_circuit_breakers.record_failure(
+    let events = if job.status == RuntimeJobStatus::Cancelled || job.status.is_active() {
+        Vec::new()
+    } else {
+        match job.status {
+            RuntimeJobStatus::Succeeded => state.runtime_circuit_breakers.record_success(
                 &job.runtime_profile,
                 &job.id,
-                failure_class,
                 chrono::Utc::now(),
-            )
-        }
-        RuntimeJobStatus::Cancelled | RuntimeJobStatus::Pending | RuntimeJobStatus::Running => {
-            Vec::new()
+            ),
+            RuntimeJobStatus::Failed => {
+                let failure_class = runtime_job_failure_class(job);
+                if let Some(updated) = store
+                    .record_runtime_job_failure_class(&job.id, failure_class.as_str())
+                    .await?
+                {
+                    *job = updated;
+                }
+                state.runtime_circuit_breakers.record_failure(
+                    &job.runtime_profile,
+                    &job.id,
+                    failure_class,
+                    chrono::Utc::now(),
+                )
+            }
+            _ => Vec::new(),
         }
     };
     circuit_breaker_events::emit_circuit_breaker_events(state, events).await;
