@@ -488,6 +488,7 @@ workflow_integration_progress
   schema_version
   workflow_id foreign key
   workflow_definition_hash
+  generation bigint not null
   decomposition_revision
   integration_strategy
   ordered_binding_ids jsonb
@@ -497,6 +498,8 @@ workflow_integration_progress
   landed_binding_ids jsonb
   pending_code_identities jsonb
   published_code_identities jsonb
+  review_rounds
+  stale_review_rounds_at_cursor
   expected_parent_code_identity jsonb nullable
   current_entry_code_identity jsonb nullable
   status
@@ -504,6 +507,13 @@ workflow_integration_progress
   updated_at
   unique(workflow_id, decomposition_revision)
 ```
+
+Every landing, rebase, or publish cursor transition compares the expected `generation` and advances
+it atomically with the cursor and code-identity updates. Stack authorization receipts and
+`stack_rebase_context` bind that exact generation; a stale concurrent update or replay cannot
+advance the row. Entering stack review atomically increments `review_rounds`; a stale-fact re-review
+also increments `stale_review_rounds_at_cursor`, and only a successful landing-cursor advance resets
+that per-cursor count. Recovery never reconstructs either counter from review receipts.
 
 `provider_intake_fences` is seeded from the verified immutable cutover manifest before the vNext
 epoch is installed. The source fence records live outside the runtime schema being replaced, and
@@ -698,7 +708,8 @@ Entering `external_wait` atomically creates a `workflow_external_waits` record, 
 budget, and enqueues a delayed idempotent refresh command. Webhook facts and refresh results compare
 against the wait's subject and last fact identity. Each unsuccessful refresh advances persisted
 backoff and cumulative attempt count. A changed but still nonterminal fact updates that same wait
-record and never recreates its deadline or budget reservation. Only eligible/failed terminal facts,
+record without consuming a refresh attempt and never recreates its deadline or budget reservation.
+Only eligible/failed terminal facts,
 remote failure, the original deadline, or cumulative budget exhaustion follow declared routes.
 Completion cancels or supersedes the pending refresh command. Recovery accepts an active wait as
 healthy only when its original deadline, reservation, cumulative attempts, and next refresh command
@@ -707,7 +718,7 @@ are all present.
 Entering `operator_gate` atomically creates a `workflow_operator_gates` record from the compiled
 state declaration. It binds the requested action, prerequisite fact/plan/code Evidence, accepted
 receipt kind, and finite signal-to-route map. A receipt can emit only the matching declared signal;
-direct execution, child materialization, child repair, integration, integration repair,
+direct execution, direct repair, child materialization, child repair, integration, integration repair,
 provider publication, direct/integration merge, and stack-entry merge are distinct
 actions; stack rebase and stack republication are also distinct from each other and from merge.
 Replay uses the gate record and receipt Evidence, never an API hard-coded resume target.
@@ -809,8 +820,11 @@ approval. Low-risk non-expanding revisions may proceed automatically within Work
   idempotent;
 - maximum structured-output correction attempts: `1` per primary attempt;
 - maximum repair cycles: `2` per activity state;
-- maximum child review cycles: `3`;
-- maximum integration review cycles: `3`; and
+- maximum findings-driven child review cycles: `3` per child Work Item;
+- maximum findings-driven integration review cycles: `3` per integration Work Item;
+- maximum stack review rounds: `32` per decomposition revision: at most `8` initial or
+  landing-cursor-advancing rounds and at most `3` stale-fact re-review rounds at each landing cursor;
+  every round increments the persisted integration-progress counters before review dispatch; and
 - maximum graph revisions: `3`.
 
 Server ceilings are equal or stricter and cannot be raised by Workflow. Exhaustion becomes an
@@ -968,7 +982,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - low automatic stack-entry merge additionally binds integration generation, landing cursor,
   current binding/code identity, and `merge_current_stack_entry`;
 - high mutation lacks plan receipt and waits;
-- every direct, child-materialization, child-repair, integration, and integration-repair mutation
+- every direct, direct-repair, child-materialization, child-repair, integration, and
+  integration-repair mutation
   rejects a missing, stale, or wrong-action execution receipt even when a gate result exists;
 - expired/revoked/wrong-scope receipt rejected;
 - stack rebase follows execution risk tiers and binds its current context and output scope, while
@@ -1047,13 +1062,16 @@ a destructive transition:
   assignments for the same aggregate subject;
 - every `changes_requested` route supplies the current findings-bearing receipt to its distinct
   repair planning or mutation activity;
+- direct repair uses its own `repair_direct_change` action, authority gate, operator gate, and
+  mutation activity rather than returning to initial direct implementation;
 - issue-first publish retries resolve to one remote change binding and one provider object;
 - CI pending enters external wait, unavailable retries within budget, failed follows repair/block,
   and only eligible reaches authorization;
 - restart reconstructs exactly one external wait refresh command; webhook/refresh races dedupe by
   wait and fact identity; deadline and budget exhaustion take distinct routes;
 - repeated queued/running check updates preserve one wait ID, original deadline, cumulative refresh
-  count, and budget reservation until eligible, failed, expired, or exhausted;
+  count, and budget reservation without consuming refresh attempts until eligible, failed, expired,
+  or exhausted;
 - current remote facts, CI, threads, review, base, mergeability, risk, and authority are all required;
 - provider reports merged but follow-up snapshot is stale/missing, so Work Item does not close; and
 - crash after provider merge but before local commit reconciles to one terminal event.

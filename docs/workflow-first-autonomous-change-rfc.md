@@ -659,7 +659,7 @@ definition:
     planning_direct_repair:
       activity: plan_direct_repair
       on_signal:
-        direct: authorizing_direct
+        direct: authorizing_direct_repair
         decompose: validating_decomposition
         abstain: blocked
     planning:
@@ -678,6 +678,12 @@ definition:
         authorized: implementing
         await_human: awaiting_direct_execution_authorization
         deny: blocked
+    authorizing_direct_repair:
+      activity: evaluate_direct_repair_authority
+      on_signal:
+        authorized: repairing_direct_change
+        await_human: awaiting_direct_repair_authorization
+        deny: blocked
     authorizing_children:
       activity: evaluate_child_execution_authority
       on_signal:
@@ -692,6 +698,16 @@ definition:
       on_signal:
         authorized: implementing
         expired: authorizing_direct
+        denied: blocked
+        cancelled: cancelled
+    awaiting_direct_repair_authorization:
+      progress: operator_gate
+      gate:
+        evidence_kind: authorization_receipt
+        requested_action: repair_direct_change
+      on_signal:
+        authorized: repairing_direct_change
+        expired: authorizing_direct_repair
         denied: blocked
         cancelled: cancelled
     awaiting_child_execution_authorization:
@@ -866,6 +882,10 @@ definition:
         cancelled: cancelled
     implementing:
       activity: implement_change
+      on_success: collecting_implemented_change_facts
+      on_failure: blocked
+    repairing_direct_change:
+      activity: repair_direct_change
       on_success: collecting_implemented_change_facts
       on_failure: blocked
     repairing_child_change:
@@ -1333,6 +1353,14 @@ activities:
     required_evidence: [implementation_plan, semantic_risk_assessment]
     produces: [authorization_gate_result, authorization_receipt]
 
+  evaluate_direct_repair_authority:
+    executor: registered_server
+    contract: registered.execution_authority_gate.v1
+    authority: execution
+    requested_action: repair_direct_change
+    required_evidence: [implementation_plan, semantic_risk_assessment, review_receipt]
+    produces: [authorization_gate_result, authorization_receipt]
+
   evaluate_child_execution_authority:
     executor: registered_server
     contract: registered.execution_authority_gate.v1
@@ -1396,6 +1424,24 @@ activities:
     output_schema: change_implementation_output.v1
     authority: execution_authorization
     required_evidence: [implementation_plan, authorization_gate_result, authorization_receipt]
+    allowed_decisions: []
+    produces: [change_set, validation_report]
+
+  repair_direct_change:
+    executor: agent
+    requires:
+      structured_output: true
+      filesystem: isolated_write
+      network: none
+      cancellation: true
+    permissions:
+      tools: [read, edit, command]
+      provider_actions: []
+      writable_scope: plan_authorized
+    input_schema: change_implementation_input.v1
+    output_schema: change_implementation_output.v1
+    authority: execution_authorization
+    required_evidence: [implementation_plan, authorization_gate_result, authorization_receipt, review_receipt]
     allowed_decisions: []
     produces: [change_set, validation_report]
 
@@ -1559,6 +1605,7 @@ activities:
   evaluate_merge_gate:
     executor: registered_server
     contract: registered.merge_gate.v1
+    requested_action: merge_current_subject
     produces: [merge_gate_result, authorization_receipt]
 
   merge_change:
@@ -1572,6 +1619,7 @@ activities:
   evaluate_stack_entry_gate:
     executor: registered_server
     contract: registered.stack_entry_merge_gate.v1
+    requested_action: merge_current_stack_entry
     produces: [merge_gate_result, stack_rebase_context, authorization_receipt]
 
   merge_stack_entry:
@@ -1591,6 +1639,7 @@ activities:
     executor: registered_server
     contract: registered.stack_rebase_authority_gate.v1
     authority: stack_rebase_authorization
+    requested_action: rebase_remaining_stack
     required_evidence: [stack_rebase_context]
     produces: [authorization_gate_result, authorization_receipt]
 
@@ -1616,6 +1665,7 @@ activities:
     executor: registered_server
     contract: registered.stack_republication_authority_gate.v1
     authority: stack_republication_authorization
+    requested_action: republish_rebased_stack
     required_evidence: [stack_rebase_context, change_set, validation_report]
     produces: [authorization_gate_result, authorization_receipt]
 
@@ -1843,16 +1893,19 @@ stateDiagram-v2
     validating_direct_head --> leaf_review_direct: current head validated
     collecting_direct_repair_facts --> assessing_direct_repair_risk: facts refreshed
     assessing_direct_repair_risk --> planning_direct_repair: risk classified
-    planning_direct_repair --> authorizing_direct: direct repair plan
+    planning_direct_repair --> authorizing_direct_repair: direct repair plan
     planning_direct_repair --> validating_decomposition: repair decomposition proposed
     planning --> authorizing_direct: direct plan
     planning --> validating_decomposition: decomposition proposed
     validating_decomposition --> authorizing_children: valid
     authorizing_direct --> implementing: execution authorized
+    authorizing_direct_repair --> repairing_direct_change: repair authorized
     authorizing_children --> materializing_children: execution authorized
     authorizing_direct --> awaiting_direct_execution_authorization: human required
+    authorizing_direct_repair --> awaiting_direct_repair_authorization: human required
     authorizing_children --> awaiting_child_execution_authorization: human required
     awaiting_direct_execution_authorization --> implementing: direct plan approved
+    awaiting_direct_repair_authorization --> repairing_direct_change: repair approved
     awaiting_child_execution_authorization --> materializing_children: child plan approved
     materializing_children --> executing_children: batch committed
     executing_children --> preparing_independent_set_review: independent children ready
@@ -1976,8 +2029,11 @@ stateDiagram-v2
     planning --> blocked
     validating_decomposition --> blocked
     authorizing_direct --> blocked
+    authorizing_direct_repair --> blocked
     authorizing_children --> blocked
     awaiting_direct_execution_authorization --> blocked
+    awaiting_direct_repair_authorization --> blocked
+    repairing_direct_change --> blocked
     awaiting_child_execution_authorization --> blocked
     materializing_children --> blocked
     executing_children --> blocked
@@ -2224,8 +2280,9 @@ landing cursor, current remote binding, and `merge_current_stack_entry` action.
 
 Every mutation governed by execution policy declares `authority: execution_authorization` and
 requires both the accepted `authorization_gate_result` and its current `authorization_receipt`.
-Direct implementation, child materialization, child repair, integration, integration repair, and
-provider publication use explicit `requested_action` values. A human operator gate persists the
+Direct implementation, direct repair, child materialization, child repair, integration, integration
+repair, and provider publication use explicit `requested_action` values. A human operator gate
+persists the
 matching receipt before routing to the mutation; the dispatcher then revalidates its definition,
 plan or decomposition revision, risk, scope, code identity when present, expiry, revocation, and
 exact activity action. A receipt for one mutation cannot authorize another, and neither a gate
@@ -2566,13 +2623,14 @@ to an arbitrary or latest-by-time record.
 ### 18.6 Findings-driven repair
 
 Every accepted `changes_requested` verdict enters a repair-specific state, never the initial
-planning or mutation activity. `plan_direct_repair`, `repair_child_change`,
+planning or mutation activity. `plan_direct_repair`, `repair_direct_change`, `repair_child_change`,
 `repair_integration`, `plan_independent_set_repair`, and `plan_stack_repair` require the exact
 current findings-bearing receipt for their review scope. The dispatcher includes that immutable
 receipt in the new attempt input; a missing, stale, wrong-subject, or non-`changes_requested`
 receipt fails activity validation. Repair remains bounded by the existing plan authorization,
 writable scope, and repair budget; findings do not grant new mutation authority.
-Child and integration repair also pass through their action-specific execution-authority gates.
+Direct, child, and integration repair also pass through their action-specific execution-authority
+gates.
 Aggregate independent-set and stack repair cannot select direct implementation; it must submit a
 validated decomposition revision or abstain.
 
@@ -2714,15 +2772,17 @@ MUST verify the current lease generation; attempt numbers are allocated atomical
 
 Entering an external wait atomically persists its wait identity, fact subject/cursor, refresh
 contract, next delayed refresh command, bounded backoff, deadline, and budget reservation. A webhook
-fact or refresh result may route the Workflow only after matching that identity. A nonterminal fact
-update, such as `queued` to `running`, updates the same wait's fact cursor and cumulative attempt
-count without leaving the state, replacing its deadline, or reserving a new budget. Only an eligible
+fact or refresh result may route the Workflow only after matching that identity. A nonterminal
+webhook fact update, such as `queued` to `running`, updates the same wait's fact cursor without
+leaving the state, incrementing its refresh-attempt count, replacing its deadline, or reserving a
+new budget. Only an unsuccessful execution of the persisted refresh command increments the
+cumulative refresh-attempt count. Only an eligible
 or failed terminal fact, remote failure, original deadline expiry, or cumulative budget exhaustion
 emits a declared route. Recovery treats a wait as healthy only when its original deadline,
 reservation, cumulative attempts, and scheduled refresh command are present.
 
 Entering an operator gate atomically persists its requested action, prerequisite Evidence IDs,
-accepted receipt kind, and compiled signal-to-route map. Direct implementation, child
+accepted receipt kind, and compiled signal-to-route map. Direct implementation, direct repair, child
 materialization, child repair, integration, integration repair, provider publication,
 direct/integration merge, stack-entry merge, stack rebase, and stack republication are distinct
 actions. Automatic authority activities declare the same `requested_action` used by their human
@@ -2738,6 +2798,13 @@ an idempotent provider republication. Each successful update creates a supersedi
 and a fact collector confirms the remote code identities before fresh review. Crash recovery
 resumes from the persisted rebase/publish/landing cursors and remote facts; it never repeats an
 externally confirmed write or treats a partial stack as complete.
+
+The same progress record persists cumulative stack-review rounds and stale-review rounds at the
+current landing cursor. Review dispatch atomically consumes those counters: the standard profile
+allows at most 32 rounds per decomposition revision, comprising at most eight initial or
+cursor-advancing rounds and at most three stale-fact re-review rounds at each cursor. Advancing the
+landing cursor resets only the per-cursor stale count; recovery and replay preserve the cumulative
+count.
 
 `stack_rebase_context` normalizes the two legal rebase triggers: current merge-gate base drift and
 post-landing advancement to remaining entries. It binds the integration-progress generation,
@@ -3180,8 +3247,10 @@ The Phase 0 map records the complete rationale. The normative outcomes are:
 5. Graph revisions invalidate affected evidence; medium risk requires human approval for expansion,
    while high risk requires it for every post-mutation revision.
 6. Standard defaults are depth 2, 8 children per revision, 20 descendants, 2 primary attempts, 1
-   correction per primary attempt, 2 repair cycles, 3 child and integration review cycles, and 3
-   graph revisions, all capped by server ceilings.
+   correction per primary attempt, 2 repair cycles, 3 findings-driven child and integration review
+   cycles per Work Item, 32 persisted stack review rounds per decomposition revision (at most 8
+   initial/cursor-advancing rounds and 3 stale-fact rounds per cursor), and 3 graph revisions, all
+   capped by server ceilings.
 7. Stack code identity binds repository, target, stack revision/position, expected parent, head,
    tree, and diff; rebasing creates a new identity.
 8. This RFC owns architecture; future machine schemas own syntax. Older documents remain normative
