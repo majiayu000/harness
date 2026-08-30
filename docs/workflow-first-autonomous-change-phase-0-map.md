@@ -551,7 +551,8 @@ assignment schema version is interpreted by its versioned reader; unknown versio
   cannot invent a transition from the current state name.
 - `IntegrationProgress` is a fenced cursor/read-write support record for one validated strategy and
   decomposition revision, not an independently mutable graph.
-- `ChildOutcome` is typed Evidence plus a terminal child relation state.
+- `ChildOutcome` is typed Evidence for a declared readiness milestone or terminal child relation
+  state; only the terminal outcome releases the child budget reservation.
 - `RemoteFactSnapshot` remains the provider cache and emits or links accepted Evidence.
 - `DecompositionProposal` is candidate Evidence; only the validated materialization transaction
   changes the child graph.
@@ -584,6 +585,7 @@ version and this table must change together; unknown or missing owned objects fa
 | `${workflow_namespace}_runtime` | Migration ledger variant `schema_migrations` or `workflow_runtime_schema_migrations`, applied versions `1..32`; tables `workflow_definitions`, `workflow_instances`, `workflow_events`, `workflow_decisions`, `workflow_commands`, `runtime_jobs`, `runtime_events`, `workflow_artifacts`, `workflow_prompt_payloads`, `remote_fact_snapshots`, `workflow_repo_memory`, `runtime_usage_events`, `runtime_job_lease_renewal_receipts`, `workflow_artifact_dependencies`, `runtime_job_completions_dlq`, `workflow_run_evidence`, `runtime_job_lease_issuances`; functions `enforce_remote_lease_proof_writer()` and `record_runtime_job_lease_issuance()`; triggers `trg_enforce_remote_lease_proof_writer` and `trg_runtime_job_lease_issuance` on `runtime_jobs` | Count every table under lock, fingerprint the whole dedicated schema, then drop/recreate it for vNext | The `pg_catalog` digest must exactly cover relations, columns, constraints, indexes, functions, and triggers. No unlisted object may be dropped. |
 | `${workflow_namespace}_issue` | Ledger variant `schema_migrations` or `issue_workflow_schema_migrations`, applied versions `1..6`; table `issue_workflows` and its indexes/constraints | Count and fingerprint, then drop the superseded dedicated schema | No row is imported. |
 | `${workflow_namespace}_project` | Ledger `schema_migrations`, applied versions `1..4`; table `project_workflows` and its indexes/constraints | Count and fingerprint, then drop the superseded dedicated schema | No row is imported. |
+| `runtime_state_store` | Shared ledger `schema_migrations`, applied versions `1..4`; tables `runtime_state` and `runtime_state_store_legacy_backfills`; rows selected by the exact configured `store_key = RuntimeStateStore::store_key_for_data_dir(<configured data dir>)` | Count, fingerprint, and archive all matching rows; delete only the matching `runtime_state` snapshot before activation; retain the shared schema, both tables, unrelated store keys, and the matching legacy-backfill markers as a fence against re-import | Rotate the runtime-host registration/heartbeat epoch and verify zero accepted old-epoch hosts before the reset. vNext starts with no restored hosts or project caches; an old host cannot re-register or claim work with pre-vNext authority. |
 | `task_db.workspace_cleanup_targets` | Task migration ledger through version 29; rows whose fixed predicate is `store_key = <configured task-store identity> AND runtime_workflow_id IS NOT NULL` | Complete fenced workspace/process cleanup first; assert the locked count is zero; retain the shared table | Never cross a `store_key` boundary or delete a workspace bookkeeping row merely to make cutover pass. Active cleanup must finish or cutover refuses. |
 | `task_db.workspace_leases` | Rows whose fixed predicate is `store_key = <configured task-store identity> AND runtime_workflow_id IS NOT NULL` | Refuse while any matching row is `leased` or has a live process; after normal fenced cleanup, delete only matching released rows | Preserve every row for another `store_key` and every in-scope row with `runtime_workflow_id IS NULL`; never drop the shared table. |
 
@@ -592,6 +594,14 @@ input. Dedicated table counts use the manifest's fixed identifiers. Shared-table
 parameterized predicates. The source fingerprint includes configured schema names, the accepted
 ledger-table variant and applied versions, and the canonical `pg_catalog` digest. The operator's
 data-loss acknowledgement is valid for one fingerprint/count snapshot only.
+
+The runtime-state reset is operational fencing, not Workflow-data migration. The archived host and
+project-cache snapshot remains audit-only. Activation requires an empty current snapshot plus a new
+runtime-host authority epoch; replay, startup restoration, and heartbeats carrying the old epoch are
+rejected rather than adopted into vNext. An eligible pre-activation rollback never restores that
+revoked authority: after restoring the old database and deployment, the secret manager issues a
+distinct rollback epoch and every restored host explicitly re-registers before the listener or
+intake can open.
 
 ## 7. vNext Workflow Compiler Contract
 
@@ -663,9 +673,10 @@ CompiledActivity
   prompt_template
 ```
 
-Both optional contracts are linked and included in canonical bundle hashing. For an automatic
-authority evaluator, the compiler requires `requested_action` and proves that its `authorized`
-target activity and any `await_human` operator gate consume the same typed action. For a binding
+Both optional contracts are linked and included in canonical bundle hashing. For every authority
+evaluator and authorized mutation target, the compiler requires `requested_action` and proves that
+an automatic target and any `await_human` operator gate, or a human-only gate and its authorized
+target, consume the same typed action. For a binding
 transition, the compiler validates the expected pointer, produced successor Evidence kind, pointer
 update, and `compare_and_swap` mode against the registered server contract. Unknown actions,
 unlinked targets, mismatched human gates, unsupported concurrency modes, or registry mismatches fail
@@ -970,6 +981,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 
 - semantic risk may raise but not lower deterministic floor and consumes the trusted current-code
   snapshot or an explicit no-code snapshot;
+- semantic risk rejects inherited author/session context and runs from a fresh assignment bound only
+  to its declared Evidence;
 - missing fact forces abstention/escalation;
 - review-ready existing PR cannot enter review or merge authorization without current semantic
   risk, and a head refresh invalidates and recomputes that risk before re-review;
@@ -985,6 +998,7 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - every direct, direct-repair, child-materialization, child-repair, integration, and
   integration-repair mutation
   rejects a missing, stale, or wrong-action execution receipt even when a gate result exists;
+- every evaluator, operator gate, and authorized mutation target declares the same typed action;
 - expired/revoked/wrong-scope receipt rejected;
 - stack rebase follows execution risk tiers and binds its current context and output scope, while
   every stack republication requires a human receipt derived from the validated rewrite and bound
@@ -1013,7 +1027,10 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - independent-set and stack aggregate subjects derive identity-bound semantic risk before their
   quorum-bearing parent review barriers open;
 - integration children cannot publish/merge and the parent alone publishes the integrated binding;
-  and
+- an integration parent releases children only after its remote merge is reconciled and reaches
+  `done` only after every pinned child records the terminal contribution acknowledgement;
+- a stack stale/republication refresh dispatches child-owned re-review commands so every child CAS
+  refreshes its own binding; no parent-level singular binding refresh can mix stack identities; and
 - integration PR requires child and parent review receipts.
 
 ### Candidate cutover conformance for the separate RFC
@@ -1037,6 +1054,11 @@ a destructive transition:
   outcome;
 - final provider-fence capture refuses until old provider credentials are revoked and the
   zero-provider-writer proof succeeds;
+- runtime-state reset archives only the configured store key, preserves unrelated keys and the
+  legacy-backfill fence, starts with empty host/cache state, and rejects old-epoch heartbeats;
+- pre-activation rollback restores no revoked host credential, mints a distinct rollback authority
+  epoch, and rejects both the pre-cutover and abandoned vNext epochs before restored hosts
+  re-register;
 - provider subjects created or changed during drain are recorded at or before the final fence and
   remain quarantined from automatic vNext intake;
 - vNext accepts no production submission and enables no provider credential before explicit
@@ -1069,6 +1091,9 @@ a destructive transition:
 - both existing-PR ingress outcomes run current-risk validation and Harness review before repair or
   merge; provider `repair_required` facts cannot enter generic planning or authorize mutation;
 - issue-first publish retries resolve to one remote change binding and one provider object;
+- direct and integrated publication declare a nullable-current binding CAS: null creates one initial
+  binding, while a bound PR creates or reuses one successor for the same provider object; ambiguous
+  completion and a lost CAS reconcile without repeating the provider write;
 - CI pending enters external wait, unavailable retries within budget, failed follows repair/block,
   and only eligible reaches authorization;
 - restart reconstructs exactly one external wait refresh command; webhook/refresh races dedupe by
@@ -1077,8 +1102,12 @@ a destructive transition:
   count, and budget reservation without consuming refresh attempts until eligible, failed, expired,
   or exhausted;
 - current remote facts, CI, threads, review, base, mergeability, risk, and authority are all required;
-- provider reports merged but follow-up snapshot is stale/missing, so Work Item does not close; and
-- crash after provider merge but before local commit reconciles to one terminal event.
+- direct and stack merge provider actions reject a missing or stale current binding, gate result, or
+  action-specific authorization receipt before external dispatch;
+- provider reports merged but follow-up snapshot is stale/missing, so Work Item does not close;
+- crash after provider merge but before local commit reconciles to one terminal event; and
+- an out-of-scope Agent write produces no accepted partial result, routes to `blocked`, and can resume
+  only through operator replan, refreshed risk, and new action-specific authorization.
 
 ### Code-Agent substitution
 

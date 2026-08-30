@@ -40,17 +40,20 @@ Use an offline, one-way runtime cutover with a mandatory immutable audit archive
 2. cancel active provider actions or drain them to reconciled terminal outcomes, recording every
    remote object created or changed during the drain;
 3. revoke old provider credentials and verify zero pre-vNext provider writers;
-4. only then capture the final provider intake fences in an immutable cutover manifest outside the
+4. revoke the pre-vNext runtime-host registration/heartbeat epoch and verify zero accepted old-epoch
+   hosts;
+5. only then capture the final provider intake fences in an immutable cutover manifest outside the
    runtime schema being replaced;
-5. revoke old database-writer access, terminate its sessions, and verify zero remaining database
+6. revoke old database-writer access, terminate its sessions, and verify zero remaining database
    writers;
-6. create and verify a versioned audit archive from the fenced source;
-7. verify an exact, versioned source manifest;
-8. replace only the manifest-owned runtime objects and exact shared rows;
-9. install the verified provider fences and then the vNext epoch; and
-10. start vNext only after its critical storage/epoch handshake succeeds, with production intake
+7. create and verify a versioned audit archive from the fenced source;
+8. verify an exact, versioned source manifest;
+9. replace only the manifest-owned runtime objects and exact shared rows, including resetting the
+   current store key's runtime-host/project-cache snapshot;
+10. install the verified provider fences and then the vNext epoch; and
+11. start vNext only after its critical storage/epoch handshake succeeds, with production intake
     and provider dispatch still closed; and
-11. after the observation checks pass, require an explicit operator activation that atomically
+12. after the observation checks pass, require an explicit operator activation that atomically
     forfeits production rollback before opening intake or enabling vNext provider credentials.
 
 vNext never reads the audit archive. Audit inspection uses an offline export reader or an isolated
@@ -62,7 +65,8 @@ flowchart LR
     Old[Pre-vNext runtime] --> Stop[Stop intake and new provider dispatch]
     Stop --> Drain[Cancel or reconcile active provider actions]
     Drain --> ProviderFence[Revoke credentials and verify zero provider writers]
-    ProviderFence --> Capture[Capture final provider fence manifest]
+    ProviderFence --> HostFence[Revoke runtime-host epoch and verify zero old hosts]
+    HostFence --> Capture[Capture final provider fence manifest]
     Capture --> DbFence[Revoke old DB role and terminate sessions]
     DbFence --> Export[Create immutable audit archive]
     Export --> Verify[Verify digest and restore drill]
@@ -89,6 +93,7 @@ data mutation. It MUST contain:
   artifacts, prompt payloads, remote fact snapshots, run evidence, and usage/lease records;
 - issue/project lifecycle rows owned by the superseded stores;
 - exact exported shared rows selected by the Workflow ownership predicates;
+- the configured runtime-state store key's host/project-cache snapshot and legacy-backfill markers;
 - provider/repository/subject bindings needed to identify remote branches, issues, and pull
   requests;
 - export tool version, start/end timestamps, database identity, and operator identity; and
@@ -112,7 +117,7 @@ against a current production clone or, with operator approval, production itself
 
 The dry-run MUST:
 
-- query only the configured runtime, issue, project, and shared task schemas;
+- query only the configured runtime, issue, project, shared task, and shared runtime-state schemas;
 - parameterize schema names and fixed shared-row predicates;
 - inventory relations, columns, constraints, indexes, functions, triggers, and migration ledgers;
 - report missing and unknown objects without mutating them;
@@ -139,10 +144,13 @@ must be attached before this RFC can be approved.
 The current candidate source inventory is maintained in
 `docs/workflow-first-autonomous-change-phase-0-map.md` section 6.5. It currently describes runtime
 migrations `1..32`, 17 runtime tables, two functions, two triggers, issue migrations `1..6`, project
-migrations `1..4`, accepted ledger variants, and exact shared task predicates.
+migrations `1..4`, runtime-state migrations `1..4` with two shared tables, accepted ledger variants,
+and exact shared task/runtime-state predicates.
 
 Each shared task predicate binds both `store_key = <configured task-store identity>` and
 `runtime_workflow_id IS NOT NULL`; neither column alone proves ownership.
+The runtime-state predicate is separately fixed to the configured data directory's exact
+`RuntimeStateStore::store_key_for_data_dir` value; it never selects another store key.
 
 That inventory is a review input, not an executable authorization. Any intervening source migration
 changes the manifest version and invalidates prior counts, fingerprints, approvals, and dry-run
@@ -160,6 +168,14 @@ dispatch. It then either cancels each active provider action or drains it to a r
 outcome, recording every remote object created or changed. Only after revoking old provider
 credentials and verifying zero pre-vNext provider writers may cutover capture the provider
 boundary. A database writer fence does not prove this condition.
+
+Runtime hosts are a third authority surface. Before archiving or resetting their persisted support
+state, cutover revokes the pre-vNext registration/heartbeat epoch and verifies that no old-epoch host
+is accepted. The archive includes the configured store key's snapshot and backfill markers. The
+replacement step deletes only that store key's `runtime_state` snapshot, preserves both shared
+tables, unrelated store keys, and the matching legacy-backfill fence, and starts vNext with empty
+host/project-cache managers. Registration and heartbeat carrying the old epoch are rejected, so a
+restored pre-vNext host cannot claim vNext work.
 
 The final boundary includes every subject observed through the drain, so an object created by an
 old runtime action cannot re-enter as vNext work. Subjects at or before that boundary remain fenced
@@ -183,6 +199,13 @@ database and old deployment, the operator must verify that intake and provider d
 closed, verify zero vNext provider writers, and prove from the server-owned outbox and
 reconciliation records that no vNext provider action ever entered `dispatched`, `in_flight`,
 `succeeded`, or `unknown`. Missing or incomplete proof refuses rollback.
+
+Rollback never revives the runtime-host authority epoch or credentials revoked by the forward
+fence. After the eligible database and deployment restore, the secret manager mints a distinct
+rollback authority epoch, and every restored host must explicitly re-register under that epoch
+before it can heartbeat or claim work. The listener and intake remain closed until the restored
+runtime verifies the rollback epoch and rejects both the revoked pre-cutover epoch and the abandoned
+vNext epoch.
 
 The explicit activation transaction closes the rollback window before production intake opens or
 provider credentials become usable. After that boundary, the archived database remains available
@@ -261,6 +284,7 @@ Decision: rejected.
 | Catalog inspection is infeasible on the real database | High | Read-only scoped benchmark before implementation; redesign on threshold failure |
 | Old process writes during cutover | Critical | Exclusive role, credential revocation, session termination, zero-session verification |
 | Old provider writer mutates remote state after archive | Critical | Drain provider outbox/attempts, revoke credentials, and verify zero provider writers before archive |
+| Old runtime host is restored or resumes heartbeats | Critical | Archive then reset only the configured runtime-state snapshot, rotate the host authority epoch, reject old-epoch registration/heartbeat, and verify empty vNext host/cache state |
 | Shared task rows are over-deleted | Critical | Fixed predicates, locked counts, cleanup preconditions, preservation tests |
 | Old provider object re-enters as new work | High | Provider intake fences and fail-closed unverifiable bindings |
 | Archive becomes an accidental runtime dependency | High | No vNext archive reader; offline tooling and isolated restore only |
@@ -278,7 +302,10 @@ This RFC cannot move to `Approved` until all of the following exist:
 - a tested provider-writer drain, credential revocation, and zero-writer verification procedure;
 - provider-fence conformance tests for poll, webhook, and direct submission;
 - a rollback rehearsal that proves intake remains closed before activation, pre-activation restore,
-  and post-activation refusal; and
+  issuance of a distinct rollback host authority epoch, rejection of both superseded epochs, and
+  post-activation refusal; and
+- a runtime-host fence rehearsal proving scoped snapshot reset, unrelated-store preservation, and
+  rejection of old-epoch heartbeats; and
 - an independent operational/database review.
 
 Approval of the umbrella Workflow architecture does not imply approval of this cutover RFC.
