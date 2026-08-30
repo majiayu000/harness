@@ -24,6 +24,17 @@ pub(super) fn codex_nonzero_exit_error(
     stderr: &str,
     structured_error: Option<&str>,
 ) -> harness_core::error::HarnessError {
+    if harness_core::error::is_billing_failure_message(stderr) {
+        return harness_core::error::HarnessError::BillingFailed(format!(
+            "codex billing failure (exit {status}): {stderr}"
+        ));
+    }
+    if harness_core::error::is_quota_failure_message(stderr) {
+        return harness_core::error::HarnessError::QuotaExhausted(format!(
+            "codex quota exhausted (exit {status}): {stderr}"
+        ));
+    }
+
     if let Some(message) = structured_error {
         let mut error = codex_structured_error(format!("exit {status}: {message}"));
         if matches!(error, harness_core::error::HarnessError::AgentExecution(_))
@@ -36,16 +47,6 @@ pub(super) fn codex_nonzero_exit_error(
         return error;
     }
 
-    if harness_core::error::is_billing_failure_message(stderr) {
-        return harness_core::error::HarnessError::BillingFailed(format!(
-            "codex billing failure (exit {status}): {stderr}"
-        ));
-    }
-    if harness_core::error::is_quota_failure_message(stderr) {
-        return harness_core::error::HarnessError::QuotaExhausted(format!(
-            "codex quota exhausted (exit {status}): {stderr}"
-        ));
-    }
     harness_core::error::HarnessError::AgentExecution(format!(
         "codex exited with {status}: {stderr}"
     ))
