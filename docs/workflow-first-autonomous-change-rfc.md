@@ -621,7 +621,7 @@ definition:
       activity: collect_change_facts
       on_signal:
         implementation_required: assessing_risk
-        repair_required: assessing_risk
+        repair_required: assessing_review_risk
         review_ready: assessing_review_risk
       on_failure: blocked
     assessing_risk:
@@ -660,7 +660,6 @@ definition:
       activity: plan_direct_repair
       on_signal:
         direct: authorizing_direct_repair
-        decompose: validating_decomposition
         abstain: blocked
     planning:
       activity: plan_change
@@ -1306,8 +1305,8 @@ activities:
     input_schema: change_plan_input.v1
     output_schema: change_plan_output.v1
     required_evidence: [intake_subject_snapshot, semantic_risk_assessment, review_receipt]
-    allowed_decisions: [direct, decompose, abstain]
-    produces: [implementation_plan, decomposition_proposal]
+    allowed_decisions: [direct, abstain]
+    produces: [implementation_plan]
 
   plan_independent_set_repair:
     executor: agent
@@ -1330,6 +1329,7 @@ activities:
   validate_decomposition:
     executor: registered_server
     contract: registered.decomposition_validation.v1
+    required_evidence: [decomposition_proposal]
     produces: [decomposition_validation]
 
   materialize_children:
@@ -1886,15 +1886,14 @@ The core does not require the following logical state names. The standard
 ```mermaid
 stateDiagram-v2
     [*] --> collecting_facts
-    collecting_facts --> assessing_risk: implementation or repair required
-    collecting_facts --> assessing_review_risk: existing PR review-ready
+    collecting_facts --> assessing_risk: task implementation required
+    collecting_facts --> assessing_review_risk: existing PR repair or review required
     assessing_risk --> planning
     assessing_review_risk --> validating_direct_head: risk classified
     validating_direct_head --> leaf_review_direct: current head validated
     collecting_direct_repair_facts --> assessing_direct_repair_risk: facts refreshed
     assessing_direct_repair_risk --> planning_direct_repair: risk classified
     planning_direct_repair --> authorizing_direct_repair: direct repair plan
-    planning_direct_repair --> validating_decomposition: repair decomposition proposed
     planning --> authorizing_direct: direct plan
     planning --> validating_decomposition: decomposition proposed
     validating_decomposition --> authorizing_children: valid
@@ -2118,8 +2117,9 @@ stateDiagram-v2
 
 `failed` and `cancelled` are terminal classes. `blocked` is operator-owned and non-terminal. A
 Workflow may define additional states, but every active state MUST have an activity, a child
-barrier, a review barrier, an external wait, or an operator gate. A review barrier owns immutable,
-distinct reviewer assignments and does not emit `approved` until its declared quorum is satisfied.
+barrier, a review barrier, an external wait, an operator gate, or a parent handoff. A review barrier
+owns immutable, distinct reviewer assignments and does not emit `approved` until its declared quorum
+is satisfied.
 
 ## 12. End-to-End Flow
 
@@ -2157,19 +2157,22 @@ sequenceDiagram
 
 An existing PR ingress creates a `WorkItem` bound to the observed repository, PR number, base ref,
 and head SHA through the same `RemoteChangeBinding` used by issue-first publication. Fact
-collection runs before any Agent. The Workflow may route directly to repair or Harness review, but
-never directly to merge-gate evaluation. Any new push invalidates prior code-bound review and gate
-evidence.
+collection runs before any Agent. The bound PR always passes through current-risk assessment,
+head validation, and Harness review before any repair or merge-gate evaluation. Any new push
+invalidates prior code-bound review and gate evidence.
 The registered fact collector is the sole author of these routes: task/issue ingress emits
 `implementation_required`; existing PR ingress emits `repair_required` or `review_ready` from
-trusted provider facts. A `review_ready` PR still passes through `assessing_review_risk`, so every
-newly ingested PR has a current `SemanticRiskAssessment` and Harness `ReviewReceipt` before the
-merge gate; provider review status cannot bypass either requirement. Missing, malformed, stale, or
-abstaining semantic output routes to `blocked`, never to review or merge authorization. An Agent
+trusted provider facts. Both existing-PR signals pass through `assessing_review_risk`; provider
+repair facts inform the Harness review but never authorize mutation directly. Every newly ingested
+PR therefore has a current `SemanticRiskAssessment` and Harness `ReviewReceipt` before repair or
+the merge gate; provider review status cannot bypass either requirement. Missing, malformed, stale,
+or abstaining semantic output routes to `blocked`, never to review or merge authorization. An Agent
 cannot self-select a later state. If that review requests changes, the Work Item returns to
 `collecting_direct_repair_facts`; current facts and risk are refreshed, and
 `plan_direct_repair` consumes the exact findings-bearing `ReviewReceipt` before execution
-authorization and any repair mutation.
+authorization and any repair mutation. Because the Work Item is already bound to that PR, this
+planner may choose only direct repair or abstention; it cannot decompose into replacement child PRs
+and leave the original binding unresolved.
 
 ### 12.3 High-risk flow
 

@@ -1064,6 +1064,10 @@ a destructive transition:
   repair planning or mutation activity;
 - direct repair uses its own `repair_direct_change` action, authority gate, operator gate, and
   mutation activity rather than returning to initial direct implementation;
+- repair of an already-bound PR permits only direct repair or abstention, so success cannot strand
+  the original binding behind replacement child PRs;
+- both existing-PR ingress outcomes run current-risk validation and Harness review before repair or
+  merge; provider `repair_required` facts cannot enter generic planning or authorize mutation;
 - issue-first publish retries resolve to one remote change binding and one provider object;
 - CI pending enters external wait, unavailable retries within budget, failed follows repair/block,
   and only eligible reaches authorization;
