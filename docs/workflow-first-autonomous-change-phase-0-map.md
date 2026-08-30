@@ -887,6 +887,11 @@ open. Only a provider-confirmed closed-unmerged subject releases the child to pa
 post-invalidation merge is reported as a policy violation rather than accepted against the old
 generation.
 
+An integration-child outcome change likewise switches the same external wait to a fenced mode
+without replacing its webhook identity, deadline, or budget. The open PR remains monitored until it
+is provider-confirmed closed unmerged and the integration review chain can restart; a merge observed
+after the child change is reconciled against the current child set and blocks.
+
 Waits entered after a human merge receipt are distinct compiled states from pre-authorization
 waits. They persist the receipt-bearing continuation and return only to the matching deterministic
 revalidation activity; a pending check or temporarily unavailable fact cannot route back to an
@@ -1207,7 +1212,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
   rejects a missing, stale, or wrong-action execution receipt even when a gate result exists;
 - every evaluator, operator gate, and authorized mutation target declares the same typed action;
 - expired/revoked/wrong-scope receipt rejected;
-- stack rebase follows execution risk tiers and binds its current context and output scope, while
+- stack rebase follows execution risk tiers and binds its current aggregate semantic risk, context,
+  and output scope, while
   every stack republication requires a human receipt derived from the validated rewrite and bound
   to the exact pre/post identities; and
 - human risk override is reasoned, scoped, expiring, and auditable.
@@ -1221,6 +1227,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - independent-set and stack aggregate repair cannot become direct parent implementation and must
   validate a new decomposition revision before materialization;
 - typed child outcome drives the parent without definition-specific code;
+- blocked-parent replan locks and reconciles an existing child graph and cannot return to fact
+  collection while any earlier child is active, at parent handoff, or outcome-ambiguous;
 - stacked rebase invalidates code-bound evidence; and
 - independent children stop at parent handoff, receive one release, merge through their own gates,
   and do not create a parent integration binding;
@@ -1238,6 +1246,8 @@ Phase 0 is not complete until fixture formats are accepted. The fixture set must
 - independent-set and stack aggregate subjects derive identity-bound semantic risk before their
   quorum-bearing parent review barriers open;
 - integration children cannot publish/merge and the parent alone publishes the integrated binding;
+- integration-parent gate, revalidation, external wait, and merge consume the complete current
+  terminal-success child outcome set; child cancellation or supersession invalidates that chain;
 - an integration parent releases children only after its remote merge is reconciled and reaches
   `done` only after every pinned child records the terminal contribution acknowledgement;
 - a stack stale/republication refresh dispatches child-owned re-review commands so every child CAS
@@ -1263,6 +1273,8 @@ a destructive transition:
 - a shared database role refuses cutover;
 - final provider-fence capture refuses while any old provider action lacks a reconciled terminal
   outcome;
+- every new command/job claim is fenced before authority revocation; all claimed non-provider jobs,
+  completion candidates, agent processes, and runtime-owned workspace leases must drain to zero;
 - final provider-fence capture refuses until old provider credentials are revoked and the
   zero-provider-writer proof succeeds;
 - runtime-state reset archives only the configured store key, preserves unrelated keys and the

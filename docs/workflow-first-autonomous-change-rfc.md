@@ -433,8 +433,9 @@ gate, or a human-only gate and its authorized target, and rejects the definition
 evaluator, gate, and target all name the same action.
 
 An array-valued `required_evidence` is shorthand for an all-of rule. The fixture also uses the
-closed `all` plus `by_subject`, `by_binding`, `by_wait_mode`, `by_continuation_driver`, or
-`by_overlay` form where one registered activity serves several known Work Item shapes. The compiler
+closed `all` plus `by_subject`, `by_binding`, `by_wait_mode`, `by_child_graph`,
+`by_continuation_driver`, or `by_overlay` form where one registered activity serves several known
+Work Item shapes. The compiler
 requires every case in each declared discriminator dimension to be exhaustive, derives the
 discriminators only from server-owned Work Item relations, current bindings, and persisted control
 continuations, and pins the selected Evidence IDs and digests in the attempt and result. Agent
@@ -1124,6 +1125,7 @@ definition:
         facts_unavailable: awaiting_remote_facts
         direct_review_stale: refreshing_direct_review_facts
         integration_review_stale: refreshing_integration_review_facts
+        integration_child_outcome_stale: refreshing_integration_review_facts
         independent_child_review_stale: fencing_independent_release
         external_merge_required: awaiting_external_merge
         checks_failed: blocked
@@ -1220,6 +1222,7 @@ definition:
         facts_unavailable: awaiting_revalidated_remote_facts
         direct_review_stale: refreshing_direct_review_facts
         integration_review_stale: refreshing_integration_review_facts
+        integration_child_outcome_stale: refreshing_integration_review_facts
         independent_child_review_stale: fencing_independent_release
         external_merge_required: awaiting_external_merge
         checks_failed: blocked
@@ -1259,12 +1262,13 @@ definition:
         by_subject:
           direct: [review_receipt]
           independent_child: [review_receipt, parent_release_snapshot, parent_handoff_receipt]
-          integration_parent: [integration_review_receipt]
+          integration_parent: [integration_review_receipt, child_materialization, child_outcome]
       produces: [external_merge_wait_snapshot]
       wait:
         fact_kind: external_merge
         refresh_contract: registered.remote_reconciliation.v1
-        nonterminal_facts: [invalidated_release_open_unmerged]
+        nonterminal_facts: [invalidated_release_open_unmerged, integration_child_outcome_stale]
+        preserve_wait_identity_on: [integration_child_outcome_stale]
         max_refreshes: 120
         deadline: 24h
         backoff: {initial: 30s, maximum: 10m, multiplier: 2}
@@ -1272,6 +1276,9 @@ definition:
         merged: reconciling_external_merge
         direct_review_stale: refreshing_direct_review_facts
         integration_review_stale: refreshing_integration_review_facts
+        integration_child_outcome_stale: awaiting_external_merge
+        integration_outcome_quarantined: refreshing_integration_review_facts
+        merge_after_integration_outcome_stale: reconciling_external_merge
         independent_child_review_stale: fencing_independent_release
         invalidated_release_quarantined: awaiting_parent_handoff
         invalidated_release_identity_drift: blocked
@@ -1285,6 +1292,8 @@ definition:
         direct_merged: done
         integration_parent_merged: releasing_integration_children
         independent_child_merged: done
+        integration_child_outcome_stale: blocked
+        merge_after_integration_outcome_stale: blocked
         invalidated_release_quarantined: awaiting_parent_handoff
         invalidated_release_identity_drift: blocked
         merge_after_invalidation: blocked
@@ -1476,12 +1485,14 @@ definition:
       on_success: reconciling
       on_signal:
         independent_child_precondition_stale: fencing_independent_release
+        integration_child_outcome_stale: refreshing_integration_review_facts
       on_failure: blocked
     reconciling:
       activity: reconcile_remote_state
       on_signal:
         subject_merged: done
         integration_parent_merged: releasing_integration_children
+        integration_child_outcome_stale: blocked
         independent_child_identity_drift: fencing_independent_release
         independent_release_invalidated_unmerged: awaiting_parent_handoff
         independent_release_invalidated_identity_drift: refreshing_child_review_facts
@@ -1503,7 +1514,14 @@ definition:
         evidence_kind: operator_recovery_receipt
         requested_action: recover_blocked_work_item
       on_signal:
-        replan: collecting_facts
+        replan: evaluating_replan_safety
+    evaluating_replan_safety:
+      activity: evaluate_replan_safety
+      on_signal:
+        safe_to_replan: collecting_facts
+        active_children: blocked
+        ambiguous_child_outcome: blocked
+      on_failure: blocked
     awaiting_cancellation_authorization:
       progress: operator_gate
       gate:
@@ -1939,6 +1957,17 @@ activities:
     required_evidence: [cancellation_receipt]
     produces: [child_cancellation_request, cancellation_receipt]
 
+  evaluate_replan_safety:
+    executor: registered_server
+    contract: registered.replan_safety.v1
+    requested_action: recover_blocked_work_item
+    required_evidence:
+      all: [operator_recovery_receipt]
+      by_child_graph:
+        none: []
+        existing: [child_materialization]
+    produces: [replan_safety_snapshot]
+
   collect_cancellation_admission_facts:
     executor: registered_server
     contract: registered.cancellation_admission_fact_collection.v1
@@ -2029,7 +2058,7 @@ activities:
       by_subject:
         direct: [review_receipt]
         independent_child: [review_receipt, parent_release_snapshot, parent_handoff_receipt]
-        integration_parent: [integration_review_receipt]
+        integration_parent: [integration_review_receipt, child_materialization, child_outcome]
     produces: [merge_fact_snapshot, merge_gate_result, authorization_receipt]
 
   revalidate_merge_authorization:
@@ -2041,7 +2070,7 @@ activities:
       by_subject:
         direct: []
         independent_child: [parent_release_snapshot, parent_handoff_receipt]
-        integration_parent: []
+        integration_parent: [child_materialization, child_outcome]
     produces: [merge_fact_snapshot, merge_gate_result]
 
   merge_change:
@@ -2061,7 +2090,7 @@ activities:
       by_subject:
         direct: []
         independent_child: [parent_release_snapshot, parent_handoff_receipt]
-        integration_parent: []
+        integration_parent: [child_materialization, child_outcome]
     provider_precondition_contract:
       expected_versions_from: merge_gate_result
       hard_predicates_from: merge_fact_snapshot
@@ -2070,6 +2099,7 @@ activities:
       on_stale: fail_before_mutation
       subject_signal:
         independent_child: independent_child_precondition_stale
+        integration_parent: integration_child_outcome_stale
     reconciliation: registered.remote_reconciliation.v1
     reconciliation_signal:
       confirmed_unmerged_identity_drift:
@@ -2125,6 +2155,10 @@ activities:
       by_wait_mode:
         current: []
         release_invalidated: [parent_release_invalidation]
+      by_subject:
+        direct: []
+        independent_child: []
+        integration_parent: [child_materialization, child_outcome]
 
   reconcile_external_stack_entry:
     executor: registered_server
@@ -2137,7 +2171,7 @@ activities:
     contract: registered.stack_rebase_authority_gate.v1
     authority: stack_rebase_authorization
     requested_action: rebase_remaining_stack
-    required_evidence: [stack_rebase_context]
+    required_evidence: [stack_rebase_context, semantic_risk_assessment]
     produces: [authorization_gate_result, authorization_receipt]
 
   rebase_remaining_stack:
@@ -2215,6 +2249,12 @@ activities:
   reconcile_remote_state:
     executor: registered_server
     contract: registered.remote_reconciliation.v1
+    required_evidence:
+      all: []
+      by_subject:
+        direct: []
+        independent_child: []
+        integration_parent: [child_materialization, child_outcome]
     produces: [remote_merge_confirmation]
 
 evidence:
@@ -2269,6 +2309,9 @@ evidence:
   operator_recovery_receipt:
     payload_schema: .harness/schemas/operator-recovery-receipt.v1.json
     allowed_producers: [human_operator]
+  replan_safety_snapshot:
+    payload_schema: .harness/schemas/replan-safety-snapshot.v1.json
+    allowed_producers: [server_policy_engine]
   cancellation_receipt:
     payload_schema: .harness/schemas/cancellation-receipt.v1.json
     allowed_producers: [human_operator, server_policy_engine]
@@ -2593,17 +2636,23 @@ stateDiagram-v2
     awaiting_revalidated_remote_facts --> revalidating_merge_authorization: facts available
     revalidating_merge_authorization --> refreshing_direct_review_facts: direct review stale
     revalidating_merge_authorization --> refreshing_integration_review_facts: integration review stale
+    revalidating_merge_authorization --> refreshing_integration_review_facts: integration child outcome stale
     revalidating_merge_authorization --> fencing_independent_release: child review stale
     revalidating_merge_authorization --> awaiting_external_merge: provider merge action unavailable
     awaiting_external_merge --> reconciling_external_merge: external merge confirmed
     awaiting_external_merge --> refreshing_direct_review_facts: direct review stale
     awaiting_external_merge --> refreshing_integration_review_facts: integration review stale
+    awaiting_external_merge --> awaiting_external_merge: integration child outcome stale; preserve wait identity
+    awaiting_external_merge --> refreshing_integration_review_facts: invalidated integration PR closed unmerged
+    awaiting_external_merge --> reconciling_external_merge: merge after integration child outcome stale
     awaiting_external_merge --> fencing_independent_release: child review stale
     awaiting_external_merge --> awaiting_parent_handoff: invalidated remote change is closed unmerged
     awaiting_external_merge --> blocked: invalidated release identity drift
     awaiting_external_merge --> reconciling_external_merge: merge observed after invalidation
     reconciling_external_merge --> done: direct or independent child merge confirmed
     reconciling_external_merge --> releasing_integration_children: integration parent merge confirmed
+    reconciling_external_merge --> blocked: integration child outcome stale
+    reconciling_external_merge --> blocked: merge after integration child outcome stale
     reconciling_external_merge --> awaiting_parent_handoff: invalidated remote change is closed unmerged
     reconciling_external_merge --> blocked: invalidated release identity drift
     reconciling_external_merge --> blocked: merge occurred after release invalidation
@@ -2621,7 +2670,9 @@ stateDiagram-v2
     awaiting_stack_facts --> stack_merge_gate: facts available
     merging --> reconciling
     merging --> fencing_independent_release: independent child precondition stale
+    merging --> refreshing_integration_review_facts: integration child outcome stale before mutation
     reconciling --> fencing_independent_release: independent child identity drift while unmerged
+    reconciling --> blocked: integration child outcome stale after mutation may have committed
     reconciling --> awaiting_parent_handoff: invalidated release and merge proven absent
     reconciling --> refreshing_child_review_facts: invalidated release with unmerged identity drift
     reconciling --> done: ordinary subject merge confirmed
@@ -2734,7 +2785,9 @@ stateDiagram-v2
     reconciling --> blocked
     releasing_integration_children --> blocked
     awaiting_integration_child_acknowledgements --> blocked
-    blocked --> collecting_facts: authorized replan
+    blocked --> evaluating_replan_safety: authorized replan
+    evaluating_replan_safety --> collecting_facts: no active child graph
+    evaluating_replan_safety --> blocked: active or ambiguous child outcome
     awaiting_cancellation_authorization --> refreshing_cancellation_admission_facts: cancellation authorized
     awaiting_cancellation_authorization --> resuming_denied_cancellation: cancellation denied
     state "persisted source state and progress driver" as cancellation_continuation
@@ -3008,7 +3061,9 @@ only authenticated merge confirmation reaches reconciliation.
 
 Stack rewrite policy is Workflow-owned rather than inferred by the compiler.
 `stack_rebase_authorization` uses the execution tiers: low and medium may receive current
-server-policy receipts, while high requires a human receipt. `stack_republication_authorization`
+server-policy receipts, while high requires a human receipt. Its evaluator consumes the current
+aggregate `semantic_risk_assessment` alongside the exact `stack_rebase_context`; neither the Agent
+nor the context trigger can select or lower the tier. `stack_republication_authorization`
 is human-only at every risk tier because it rewrites remote heads. The rebase receipt binds the
 exact ordered bindings, landing cursor, pre-rewrite code identities, authorized output scope, and
 `rebase_remaining_stack` action. After the rebase, the republication gate consumes that context,
@@ -3404,7 +3459,11 @@ barrier emits `approved` only after both eligible receipts approve the same inte
 as its `review_subject_snapshot`. When provider facts reveal a changed integration head,
 `registered.integration_head_validation.v1` reruns the declared validation against that head before
 the review barrier can be entered. The merge gate rejects an integration receipt whose validation
-or review subject does not match the current remote binding.
+or review subject does not match the current remote binding. The integration-parent gate,
+authorization revalidation, external-merge wait, and any executable provider merge contract also
+consume the complete current `child_materialization` and current terminal-success `child_outcome`
+set. Cancellation, failure, supersession, or identity change of any child invalidates that chain and
+returns through integration review; it cannot merge the previously reviewed aggregate.
 
 ### 18.5 Invalidation
 
@@ -3548,8 +3607,13 @@ route to cancellation reconciliation atomically before any driver fence. Replay 
 transition is a no-op; it cannot restore and invalidate the same continuation.
 
 An operator recovery receipt may retry only a declared failed gate or authorize `replan`. `replan`
-returns to `collecting_facts`, where server-owned facts and risk are recomputed before any later
-state. Recovery never jumps directly from `blocked` to implementation, review, or merge.
+first enters `evaluating_replan_safety`. Its registered server activity locks the current child
+relation, reconciles every existing child to current terminal truth, and emits `safe_to_replan` only
+when no child remains active, waiting at parent handoff, externally mutable, or outcome-ambiguous.
+Otherwise it returns to `blocked` with `replan_safety_snapshot`; it never discards a child barrier or
+starts a direct/new decomposition beside an earlier revision. Only the safe signal returns to
+`collecting_facts`, where server-owned facts and risk are recomputed. Recovery never jumps directly
+from `blocked` to implementation, review, or merge.
 
 Cancellation uses its own `cancel_work_item` action and `cancellation_receipt`; an operator recovery
 receipt cannot authorize it. The compiled `request_cancellation` control may preempt any
@@ -3690,6 +3754,14 @@ confirmation routes through the dedicated external reconciliation contract; a me
 invalidation is a policy violation and blocks rather than minting a successful child outcome.
 Deadline, remote failure, or budget exhaustion also block, so monitoring is never silently
 discarded.
+
+An integration-child outcome change uses the same durable-wait rule. The child event switches the
+existing external-merge wait to integration-invalidated mode without changing its identity and
+schedules an immediate refresh. While the integration PR remains open, the wait continues to
+observe it and no prior authorization can be reused. Exact closed-unmerged provider facts discharge
+the quarantine into integration fact/risk/validation/review refresh. A merge observed after the
+child outcome changed is reconciled with the current child set and blocks as a policy violation;
+leaving the wait cannot make that merge invisible.
 
 Entering an operator gate atomically persists its requested action, prerequisite Evidence IDs,
 accepted receipt kind, and compiled signal-to-route map. Direct implementation, direct repair, child
@@ -3934,6 +4006,11 @@ Required metrics include:
 - unresolved current review thread blocks merge;
 - missing required check blocks merge;
 - medium/high merge lacks automatic authorization;
+- stack rebase authorization rejects missing or stale aggregate semantic risk Evidence;
+- integration merge/revalidation/external wait rejects a cancelled, failed, superseded, missing, or
+  otherwise non-current child outcome;
+- blocked-parent replan cannot reach fact collection while an earlier child graph remains active or
+  outcome-ambiguous;
 - a GitHub external merge wait remains quarantined after release invalidation while its remote
   change is open and unmerged, and a later merge is observed and blocked;
 - only an exact closed-unmerged provider confirmation releases that quarantine to parent handoff;
@@ -3954,7 +4031,10 @@ server and a worker holding an old database connection lose access when their ex
 revoked and their sessions are terminated; a shared role refuses cutover; unknown catalog objects
 refuse cutover; shared task rows outside the exact workflow predicate survive; the vNext listener
 does not bind when runtime storage fails; a fresh vNext instance restarts from its compiled bundle;
-and a stale worker cannot complete after lease reassignment. Provider fixtures MUST also prove that
+and a stale worker cannot complete after lease reassignment. Cutover fixtures MUST prove that all
+new command/job claims are fenced; every claimed non-provider job is cancelled or drained; every
+completion candidate is reconciled; and zero runtime-owned agent processes or workspace leases
+remain before provider or database authority is revoked. Provider fixtures MUST also prove that
 final fence capture is refused until every active provider action is reconciled to a terminal
 outcome and old provider credentials are revoked with zero writers verified; objects observed or
 changed during drain fall at or before the final fence; every poll, webhook, and submission path

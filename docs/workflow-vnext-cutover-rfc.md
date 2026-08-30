@@ -36,24 +36,26 @@ real deployment or a current production clone.
 
 Use an offline, one-way runtime cutover with a mandatory immutable audit archive:
 
-1. atomically stop pre-vNext intake and prevent dispatch of new provider actions;
-2. cancel active provider actions or drain them to reconciled terminal outcomes, recording every
+1. atomically stop pre-vNext intake and fence every new command/job claim or dispatch;
+2. cancel or drain all active non-provider runtime jobs, terminate their agent processes, reconcile
+   their completion candidates, and verify zero live workspace leases or owned processes;
+3. cancel active provider actions or drain them to reconciled terminal outcomes, recording every
    remote object created or changed during the drain;
-3. revoke old provider credentials and verify zero pre-vNext provider writers;
-4. revoke the pre-vNext runtime-host registration/heartbeat epoch and verify zero accepted old-epoch
+4. revoke old provider credentials and verify zero pre-vNext provider writers;
+5. revoke the pre-vNext runtime-host registration/heartbeat epoch and verify zero accepted old-epoch
    hosts;
-5. only then capture the final provider intake fences in an immutable cutover manifest outside the
+6. only then capture the final provider intake fences in an immutable cutover manifest outside the
    runtime schema being replaced;
-6. revoke old database-writer access, terminate its sessions, and verify zero remaining database
+7. revoke old database-writer access, terminate its sessions, and verify zero remaining database
    writers;
-7. create and verify a versioned audit archive from the fenced source;
-8. verify an exact, versioned source manifest;
-9. replace only the manifest-owned runtime objects and exact shared rows, including resetting the
+8. create and verify a versioned audit archive from the fenced source;
+9. verify an exact, versioned source manifest;
+10. replace only the manifest-owned runtime objects and exact shared rows, including resetting the
    current store key's runtime-host/project-cache snapshot;
-10. install the verified provider fences and then the vNext epoch; and
-11. start vNext only after its critical storage/epoch handshake succeeds, with production intake
+11. install the verified provider fences and then the vNext epoch; and
+12. start vNext only after its critical storage/epoch handshake succeeds, with production intake
     and provider dispatch still closed; and
-12. after the observation checks pass, require an explicit operator activation that atomically
+13. after the observation checks pass, require an explicit operator activation that atomically
     forfeits production rollback before opening intake or enabling vNext provider credentials.
 
 vNext never reads the audit archive. Audit inspection uses an offline export reader or an isolated
@@ -62,8 +64,9 @@ auditable record of earlier decisions.
 
 ```mermaid
 flowchart LR
-    Old[Pre-vNext runtime] --> Stop[Stop intake and new provider dispatch]
-    Stop --> Drain[Cancel or reconcile active provider actions]
+    Old[Pre-vNext runtime] --> Stop[Stop intake and all command/job claims]
+    Stop --> RuntimeDrain[Drain jobs, processes, and workspace leases]
+    RuntimeDrain --> Drain[Cancel or reconcile active provider actions]
     Drain --> ProviderFence[Revoke credentials and verify zero provider writers]
     ProviderFence --> HostFence[Revoke runtime-host epoch and verify zero old hosts]
     HostFence --> Capture[Capture final provider fence manifest]
@@ -163,9 +166,16 @@ a future approved cutover must use a Harness-exclusive old database role, revoke
 login/privileges, terminate its sessions, verify zero remaining sessions, and provision a distinct
 vNext role. If the role is shared with a non-Harness client, cutover refuses.
 
-The provider side is a separate write surface. Cutover first stops intake and new provider-action
-dispatch. It then either cancels each active provider action or drains it to a reconciled terminal
-outcome, recording every remote object created or changed. Only after revoking old provider
+Runtime execution is a separate authority surface from the provider outbox. Cutover first fences
+all new command and job claims, including ordinary Agent activities, waits for claimed jobs to stop
+or records and reconciles their terminal candidates, terminates their process groups, and verifies
+that no runtime-owned workspace lease or process remains. A claimed ordinary job may not survive
+until database-role revocation, and workspace cleanup is never used as a substitute for process
+termination and reconciliation.
+
+The provider side is another write surface. After the runtime drain, cutover either cancels each
+active provider action or drains it to a reconciled terminal outcome, recording every remote object
+created or changed. Only after revoking old provider
 credentials and verifying zero pre-vNext provider writers may cutover capture the provider
 boundary. A database writer fence does not prove this condition.
 
@@ -286,6 +296,7 @@ Decision: rejected.
 | Archive is incomplete or corrupt | Critical | Root digest, locked counts, representative queries, mandatory restore drill |
 | Catalog inspection is infeasible on the real database | High | Read-only scoped benchmark before implementation; redesign on threshold failure |
 | Old process writes during cutover | Critical | Exclusive role, credential revocation, session termination, zero-session verification |
+| Ordinary runtime job or agent process survives the fence | Critical | Fence every command/job claim, drain or cancel claimed work, reconcile completion candidates, terminate process groups, and verify zero workspace leases/processes before provider or database revocation |
 | Old provider writer mutates remote state after archive | Critical | Drain provider outbox/attempts, revoke credentials, and verify zero provider writers before archive |
 | Old runtime host is restored or resumes heartbeats | Critical | Archive then reset only the configured runtime-state snapshot, rotate the host authority epoch, reject old-epoch registration/heartbeat, and verify empty vNext host/cache state |
 | Shared task rows are over-deleted | Critical | Fixed predicates, locked counts, cleanup preconditions, preservation tests |
@@ -302,6 +313,8 @@ This RFC cannot move to `Approved` until all of the following exist:
 - an exact reviewed manifest version;
 - a versioned archive format and successful restore drill;
 - a tested old-role/session fencing procedure;
+- a tested all-job claim fence and runtime drain proving zero claimed jobs, live agent processes,
+  completion candidates awaiting reconciliation, and runtime-owned workspace leases;
 - a tested provider-writer drain, credential revocation, and zero-writer verification procedure;
 - provider-fence conformance tests for poll, webhook, and direct submission;
 - a rollback rehearsal that proves intake remains closed before activation, pre-activation restore,
