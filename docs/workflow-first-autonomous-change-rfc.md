@@ -636,6 +636,10 @@ The following supporting objects are required but are not separate business root
   backoff, deadline, budget reservation, and terminal route status.
 - `OperatorGate`: persisted requested action, prerequisite identities, accepted receipt kind, and
   finite signal-to-route map for one operator-owned state.
+- `ControlContinuation`: persisted control-route source state/generation and exact progress-driver,
+  mode-specific context, lease, deadline, budget, and dedupe identities, consumed once by denial or
+  invalidated by authorization. A parent-handoff driver binds the child relation, decomposition
+  revision, expected parent command/signal set, and dedupe scope even when no command exists yet.
 - `IntegrationProgress`: validated strategy/revision, ordered remote bindings, fenced landing cursor,
   landed entries, and current code identities.
 - `ChildOutcome`: typed milestone or terminal result returned to the parent and bound to the child
@@ -668,14 +672,15 @@ definition:
       source: operator
       requested_action: cancel_work_item
       allowed_from: nonterminal_except_cancellation_flow
-      excluded_states: [awaiting_cancellation_authorization, reconciling_cancellation, reconciling_cancellation_external_outcome, reconciling_cancellation_stack_entry, cancelling_child_set, awaiting_child_cancellations]
+      excluded_states: [awaiting_cancellation_authorization, resuming_denied_cancellation, reconciling_cancellation, reconciling_cancellation_external_outcome, reconciling_cancellation_stack_entry, cancelling_child_set, awaiting_child_cancellations]
+      continuation: persist_source_state_and_driver
       on_duplicate: retain_current_cancellation_state
       target: awaiting_cancellation_authorization
     cancel_child_work_item:
       source: parent_command
       requested_action: cancel_work_item
       allowed_from: nonterminal_except_cancellation_flow
-      excluded_states: [awaiting_cancellation_authorization, reconciling_cancellation, reconciling_cancellation_external_outcome, reconciling_cancellation_stack_entry, cancelling_child_set, awaiting_child_cancellations]
+      excluded_states: [awaiting_cancellation_authorization, resuming_denied_cancellation, reconciling_cancellation, reconciling_cancellation_external_outcome, reconciling_cancellation_stack_entry, cancelling_child_set, awaiting_child_cancellations]
       on_duplicate: retain_current_cancellation_state
       required_evidence: [child_cancellation_request, cancellation_receipt]
       target: reconciling_cancellation
@@ -1387,7 +1392,11 @@ definition:
         requested_action: cancel_work_item
       on_signal:
         authorized: reconciling_cancellation
-        denied: blocked
+        denied: resuming_denied_cancellation
+    resuming_denied_cancellation:
+      progress: control_return
+      control_route: request_cancellation
+      on_failure: blocked
     reconciling_cancellation:
       activity: evaluate_cancellation_admission
       on_signal:
@@ -1853,7 +1862,7 @@ activities:
     executor: registered_server
     contract: registered.merge_gate.v1
     requested_action: merge_current_subject
-    required_evidence: [remote_change_binding, authorization_receipt]
+    required_evidence: [remote_change_binding, merge_gate_result, authorization_receipt]
     produces: [merge_gate_result]
 
   merge_change:
@@ -2442,6 +2451,9 @@ stateDiagram-v2
     awaiting_integration_child_acknowledgements --> blocked
     blocked --> collecting_facts: authorized replan
     awaiting_cancellation_authorization --> reconciling_cancellation: cancellation authorized
+    awaiting_cancellation_authorization --> resuming_denied_cancellation: cancellation denied
+    state "persisted source state and progress driver" as cancellation_continuation
+    resuming_denied_cancellation --> cancellation_continuation: restore exactly once
     reconciling_cancellation --> cancelling_child_set: no external write committed
     reconciling_cancellation --> reconciling_cancellation_external_outcome: external write committed
     reconciling_cancellation_external_outcome --> done: subject completed
@@ -2455,6 +2467,7 @@ stateDiagram-v2
     cancelling_child_set --> blocked
     awaiting_child_cancellations --> blocked
     awaiting_cancellation_authorization --> blocked
+    resuming_denied_cancellation --> blocked
     reconciling_cancellation --> blocked
     reconciling_cancellation_external_outcome --> blocked
     reconciling_cancellation_stack_entry --> blocked
@@ -2471,9 +2484,9 @@ its server-derived child receipt rather than requiring a second human gate.
 
 `failed` and `cancelled` are terminal classes. `blocked` is operator-owned and non-terminal. A
 Workflow may define additional states, but every active state MUST have an activity, a child
-barrier, a review barrier, an external wait, an operator gate, or a parent handoff. A review barrier
-owns immutable, distinct reviewer assignments and does not emit `approved` until its declared quorum
-is satisfied.
+barrier, a review barrier, an external wait, an operator gate, a parent handoff, or a compiled
+control return. A review barrier owns immutable, distinct reviewer assignments and does not emit
+`approved` until its declared quorum is satisfied.
 
 ## 12. End-to-End Flow
 
@@ -3149,10 +3162,19 @@ After restart:
 2. rebuild projections;
 3. fence expired leases and orphaned attempts;
 4. identify active states without an active command, job, wait, child barrier, review barrier,
-   parent handoff, or operator gate;
+   parent handoff, operator gate, or control continuation/control-return driver;
 5. refresh external facts needed for reconciliation;
 6. emit repair commands or block with evidence; and
 7. never silently rewrite logical state to make projections look healthy.
+
+Recovery accepts a cancellation authorization gate or `control_return` state as healthy only when
+exactly one active `workflow_control_continuations` row matches the Workflow, compiled control route,
+source state generation, and persisted driver identities. Missing, duplicate, mismatched, or already
+consumed continuations fail closed before accepting authorization or restoring work. Denial commits
+the `active -> restored` continuation transition, source-state return, and driver reattachment or
+buffered-completion consumption atomically. Authorization commits `active -> invalidated` and the
+route to cancellation reconciliation atomically before any driver fence. Replay of either committed
+transition is a no-op; it cannot restore and invalidate the same continuation.
 
 An operator recovery receipt may retry only a declared failed gate or authorize `replan`. `replan`
 returns to `collecting_facts`, where server-owned facts and risk are recomputed before any later
@@ -3163,6 +3185,22 @@ receipt cannot authorize it. The compiled `request_cancellation` control may pre
 nonterminal logical state outside the cancellation flow but first enters
 `awaiting_cancellation_authorization`. Repeated requests while a cancellation gate,
 reconciliation, or child barrier is active are idempotent and retain that state.
+
+The request transition atomically persists one control continuation containing the exact source
+state, source state generation, active command/job/wait/gate/barrier/parent-handoff identity, lease
+generation, deadline, budget reservation, and dedupe identity. A `parent_handoff` is itself a
+driver: its continuation records the child relation, decomposition revision, expected parent
+command/signals, and dedupe scope rather than requiring a pre-existing command. The request suspends
+source-state reduction and new dispatch without fencing or cancelling the underlying driver. Driver
+completion that arrives while authorization is pending is durably recorded but not reduced through
+either state. If cancellation
+is denied, `resuming_denied_cancellation` uses the compiled `control_return` primitive to restore the
+same state and driver exactly once: it reattaches a live driver, applies one buffered completion, or
+reconstructs only a provably missing driver with the original identities and remaining deadline and
+budget. It never recollects facts, resets a wait, consumes a new attempt, or routes through
+`collecting_facts`. If restoration cannot prove the continuation, it fails to `blocked`. If
+cancellation is authorized, the runtime atomically invalidates the continuation before fencing and
+reconciling the current work.
 
 After human authorization, and immediately for a parent-issued child command,
 `evaluate_cancellation_admission` first fences new dispatch for the current Work Item, interrupts or

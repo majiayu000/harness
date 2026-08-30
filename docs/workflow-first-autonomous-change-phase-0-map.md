@@ -487,6 +487,26 @@ workflow_operator_gates
   created_at
   completed_at nullable
 
+workflow_control_continuations
+  id primary key
+  schema_version
+  workflow_id foreign key
+  workflow_definition_hash
+  control_route_id
+  source_state_id
+  source_state_generation
+  driver_kind
+  driver_id
+  driver_context jsonb       # mode-specific wait/gate/barrier/parent-handoff identity
+  driver_lease_generation nullable
+  driver_deadline_at nullable
+  driver_budget_reservation_id nullable
+  driver_dedupe_identity
+  status                    # active | restored | invalidated | failed
+  created_at
+  completed_at nullable
+  unique(workflow_id) where status = active
+
 workflow_integration_progress
   id primary key
   schema_version
@@ -746,12 +766,15 @@ The compiled core vocabulary is:
 - `operator_gate`: progresses only from a validated operator action/receipt;
 - `parent_handoff`: child waits for a parent command;
 - `child_barrier`: parent waits for typed child outcomes;
-- `review_barrier`: waits for the declared quorum of distinct immutable reviewer assignments; and
+- `review_barrier`: waits for the declared quorum of distinct immutable reviewer assignments;
+- `control_return`: restores the exact persisted source state and driver after a denied control
+  request; and
 - terminal mapping to `succeeded`, `failed`, or `cancelled`.
 
-`child_barrier` and `review_barrier` are the only required additions to the current progress-mode
-enum. Neither is a general DAG executor: graph shape lives in validated child relations, while
-review quorum lives in compiled review policy and immutable actor assignments.
+`child_barrier`, `review_barrier`, and `control_return` are the required additions to the current
+progress-mode enum. None is a general DAG executor: graph shape lives in validated child relations,
+review quorum lives in compiled review policy and immutable actor assignments, and a control return
+can target only the source state captured by its named compiled control route.
 
 Entering `review_barrier` atomically creates the declared number of distinct reviewer assignments
 and their review commands for one code identity. Recovery treats the barrier as healthy only when
@@ -777,8 +800,22 @@ initial gate and request the same authorization again.
 Cancellation is a compiled control route with its own `cancel_work_item` action and
 `cancellation_receipt`, not an operator-recovery signal. An operator may request it from any
 nonterminal state outside an existing cancellation flow, but the Work Item first enters its
-cancellation gate; duplicates retain the current gate or barrier. After authorization, the runtime
-fences the current Work Item, interrupts local work, and reconciles its own in-flight provider action.
+cancellation gate; duplicates retain the current gate or barrier. The transition atomically stores
+the source state/generation and exact command, job, wait, gate, barrier, or parent-handoff driver with
+its mode-specific context, lease, deadline, budget, and dedupe identities, and suspends
+reduction/new dispatch without cancelling that driver. A parent handoff binds its child relation,
+decomposition revision, expected parent command/signals, and dedupe scope even when no command exists
+yet. Denial uses `control_return` to restore or consume that exact continuation once; it cannot
+recollect facts, reset budgets/deadlines, or create a duplicate attempt, and an unprovable restore
+blocks. Authorization invalidates the saved continuation before the runtime fences the current Work
+Item, interrupts local work, and reconciles its own in-flight provider action.
+
+Recovery treats the cancellation gate and `control_return` as driven only when exactly one active
+continuation matches Workflow, compiled control route, source generation, and driver identities.
+Missing, duplicate, mismatched, or consumed rows fail closed before authorization or restoration.
+Denial atomically commits `active -> restored`, source-state return, and exact driver
+reattachment/buffered completion; authorization atomically commits `active -> invalidated` and the
+cancellation-reconciliation route before fencing. Replay cannot perform both terminal transitions.
 Only a safe admission may begin child fan-out. Confirmed external completion follows its truthful
 direct, integration, or cancellation-aware stack reconciliation route. A landed stack entry is
 recorded without resuming rebase or landing: a complete stack succeeds, while remaining entries
@@ -1177,6 +1214,11 @@ a destructive transition:
   and only eligible reaches authorization;
 - checks or facts that remain pending after human merge authorization preserve that receipt and
   resume the matching revalidation activity without a duplicate operator prompt;
+- denied cancellation restores the exact source state and active/buffered progress driver once with
+  its original lease, deadline, budget, and dedupe identities; restart during the gate or return
+  cannot duplicate work or strand the continuation;
+- denied cancellation from `parent_handoff` restores the same child relation, decomposition
+  revision, expected parent command/signals, and dedupe scope without inventing a driver command;
 - restart reconstructs exactly one external wait refresh command; webhook/refresh races dedupe by
   wait and fact identity; deadline and budget exhaustion take distinct routes;
 - repeated queued/running check updates preserve one wait ID, original deadline, cumulative refresh
