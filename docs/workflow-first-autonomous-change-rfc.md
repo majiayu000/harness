@@ -1018,7 +1018,8 @@ definition:
         deadline: 2h
         backoff: {initial: 15s, maximum: 5m, multiplier: 2}
       on_signal:
-        fact_changed: merge_gate
+        checks_eligible: merge_gate
+        checks_failed: blocked
         remote_failed: blocked
         deadline_exceeded: blocked
         budget_exhausted: blocked
@@ -1031,7 +1032,7 @@ definition:
         deadline: 1h
         backoff: {initial: 15s, maximum: 5m, multiplier: 2}
       on_signal:
-        fact_changed: merge_gate
+        facts_available: merge_gate
         remote_failed: blocked
         deadline_exceeded: blocked
         budget_exhausted: blocked
@@ -1118,7 +1119,8 @@ definition:
         deadline: 2h
         backoff: {initial: 15s, maximum: 5m, multiplier: 2}
       on_signal:
-        fact_changed: stack_merge_gate
+        checks_eligible: stack_merge_gate
+        checks_failed: blocked
         remote_failed: blocked
         deadline_exceeded: blocked
         budget_exhausted: blocked
@@ -1131,7 +1133,7 @@ definition:
         deadline: 1h
         backoff: {initial: 15s, maximum: 5m, multiplier: 2}
       on_signal:
-        fact_changed: stack_merge_gate
+        facts_available: stack_merge_gate
         remote_failed: blocked
         deadline_exceeded: blocked
         budget_exhausted: blocked
@@ -1946,8 +1948,8 @@ stateDiagram-v2
     merge_gate --> refreshing_integration_review_facts: integration review stale
     merge_gate --> refreshing_independent_child_review_facts: child review stale
     merge_gate --> blocked: checks failed or denied
-    awaiting_remote_checks --> merge_gate: fact changed
-    awaiting_remote_facts --> merge_gate: fact refresh
+    awaiting_remote_checks --> merge_gate: checks eligible
+    awaiting_remote_facts --> merge_gate: facts available
     refreshing_direct_review_facts --> assessing_review_risk: current identity collected
     refreshing_integration_review_facts --> assessing_refreshed_integration_risk: current identity collected
     assessing_refreshed_integration_risk --> validating_refreshed_integration: risk classified
@@ -1959,6 +1961,8 @@ stateDiagram-v2
     validating_refreshed_child --> leaf_review_child: current head validated
     awaiting_merge_authorization --> merge_gate: authorization received; refresh facts
     awaiting_stack_merge_authorization --> stack_merge_gate: authorization received; refresh facts
+    awaiting_stack_checks --> stack_merge_gate: checks eligible
+    awaiting_stack_facts --> stack_merge_gate: facts available
     merging --> reconciling
     reconciling --> done: remote confirms merge
     state blocked
@@ -2710,10 +2714,12 @@ MUST verify the current lease generation; attempt numbers are allocated atomical
 
 Entering an external wait atomically persists its wait identity, fact subject/cursor, refresh
 contract, next delayed refresh command, bounded backoff, deadline, and budget reservation. A webhook
-fact or refresh result may route the Workflow only after matching that identity. Each retry updates
-the durable attempt count and schedules the next command. Remote failure, deadline expiry, and
-budget exhaustion are distinct declared routes. Recovery treats a wait as healthy only when its
-deadline, reservation, and scheduled refresh command are present.
+fact or refresh result may route the Workflow only after matching that identity. A nonterminal fact
+update, such as `queued` to `running`, updates the same wait's fact cursor and cumulative attempt
+count without leaving the state, replacing its deadline, or reserving a new budget. Only an eligible
+or failed terminal fact, remote failure, original deadline expiry, or cumulative budget exhaustion
+emits a declared route. Recovery treats a wait as healthy only when its original deadline,
+reservation, cumulative attempts, and scheduled refresh command are present.
 
 Entering an operator gate atomically persists its requested action, prerequisite Evidence IDs,
 accepted receipt kind, and compiled signal-to-route map. Direct implementation, child

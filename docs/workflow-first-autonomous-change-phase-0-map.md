@@ -697,10 +697,12 @@ identity revokes the assignments and receipts; only a complete eligible quorum e
 Entering `external_wait` atomically creates a `workflow_external_waits` record, reserves its retry
 budget, and enqueues a delayed idempotent refresh command. Webhook facts and refresh results compare
 against the wait's subject and last fact identity. Each unsuccessful refresh advances persisted
-backoff and attempt count. Fact change routes back to the declared gate; remote failure,
-deadline expiry, and budget exhaustion follow separate declared routes. Completion cancels or
-supersedes the pending refresh command. Recovery accepts an active wait as healthy only when its
-deadline, reservation, and next refresh command are all present.
+backoff and cumulative attempt count. A changed but still nonterminal fact updates that same wait
+record and never recreates its deadline or budget reservation. Only eligible/failed terminal facts,
+remote failure, the original deadline, or cumulative budget exhaustion follow declared routes.
+Completion cancels or supersedes the pending refresh command. Recovery accepts an active wait as
+healthy only when its original deadline, reservation, cumulative attempts, and next refresh command
+are all present.
 
 Entering `operator_gate` atomically creates a `workflow_operator_gates` record from the compiled
 state declaration. It binds the requested action, prerequisite fact/plan/code Evidence, accepted
@@ -1050,6 +1052,8 @@ a destructive transition:
   and only eligible reaches authorization;
 - restart reconstructs exactly one external wait refresh command; webhook/refresh races dedupe by
   wait and fact identity; deadline and budget exhaustion take distinct routes;
+- repeated queued/running check updates preserve one wait ID, original deadline, cumulative refresh
+  count, and budget reservation until eligible, failed, expired, or exhausted;
 - current remote facts, CI, threads, review, base, mergeability, risk, and authority are all required;
 - provider reports merged but follow-up snapshot is stale/missing, so Work Item does not close; and
 - crash after provider merge but before local commit reconciles to one terminal event.
