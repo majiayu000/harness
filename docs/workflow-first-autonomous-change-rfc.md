@@ -410,9 +410,10 @@ Activity
 ```
 
 `requested_action` is a typed authorization action identifier, not an activity-name convention. It
-is required for an automatic authority evaluator and is included in the canonical compiled bundle.
-The compiler links its `authorized` target activity and optional `await_human` operator gate, and
-rejects the definition unless every path names the same action consumed by that target.
+is required for every authority evaluator and authorized mutation target and is included in the
+canonical compiled bundle. The compiler links an automatic target and any `await_human` operator
+gate, or a human-only gate and its authorized target, and rejects the definition unless the
+evaluator, gate, and target all name the same action.
 
 `binding_transition_contract`, when present, is a typed tuple of expected current pointer,
 successor Evidence kind, pointer update, and concurrency mode. v1 permits only
@@ -564,9 +565,10 @@ ChildWorkItemRelation
   status
 ```
 
-Children have their own workflow state, workspace, attempts, evidence, review receipts, and terminal
-outcome. Parent completion consumes typed child outcomes rather than inferring completion from prose
-or branch existence.
+Children have their own workflow state, workspace, attempts, evidence, review receipts, and outcomes.
+A `ChildOutcome` may record the relation's declared readiness milestone without terminalizing the
+child; budget reservation returns only after a later terminal outcome. Parent progress consumes
+typed milestone or terminal outcomes rather than inferring completion from prose or branch existence.
 
 ### 9.7 Supporting objects
 
@@ -592,7 +594,8 @@ The following supporting objects are required but are not separate business root
   finite signal-to-route map for one operator-owned state.
 - `IntegrationProgress`: validated strategy/revision, ordered remote bindings, fenced landing cursor,
   landed entries, and current code identities.
-- `ChildOutcome`: typed terminal result returned to the parent.
+- `ChildOutcome`: typed milestone or terminal result returned to the parent and bound to the child
+  relation, decomposition revision, current risk, validation, and review evidence.
 
 `Budget` is a supporting value object attached to a Work Item and allocated to attempts and
 children. It records limits, reservations, and consumption for turns, tokens, wall time, retries,
@@ -1105,9 +1108,21 @@ definition:
         evidence_kind: authorization_receipt
         requested_action: merge_current_subject
       on_signal:
-        authorized: merge_gate
+        authorized: revalidating_merge_authorization
         expired: merge_gate
         denied: blocked
+    revalidating_merge_authorization:
+      activity: revalidate_merge_authorization
+      on_signal:
+        authorized: merging
+        checks_pending: awaiting_remote_checks
+        facts_unavailable: awaiting_remote_facts
+        direct_review_stale: refreshing_direct_review_facts
+        integration_review_stale: refreshing_integration_review_facts
+        independent_child_review_stale: refreshing_independent_child_review_facts
+        checks_failed: blocked
+        deny: blocked
+      on_failure: blocked
     stack_merge_gate:
       activity: evaluate_stack_entry_gate
       on_signal:
@@ -1115,7 +1130,7 @@ definition:
         await_human: awaiting_stack_merge_authorization
         checks_pending: awaiting_stack_checks
         facts_unavailable: awaiting_stack_facts
-        review_stale: refreshing_stale_stack_facts
+        review_stale: requesting_stack_child_reviews
         rebase_required: stack_rebase_gate
         checks_failed: blocked
         stack_complete: reconciling_child_set
@@ -1126,9 +1141,21 @@ definition:
         evidence_kind: authorization_receipt
         requested_action: merge_current_stack_entry
       on_signal:
-        authorized: stack_merge_gate
+        authorized: revalidating_stack_merge_authorization
         expired: stack_merge_gate
         denied: blocked
+    revalidating_stack_merge_authorization:
+      activity: revalidate_stack_merge_authorization
+      on_signal:
+        authorized: landing_stack_entry
+        checks_pending: awaiting_stack_checks
+        facts_unavailable: awaiting_stack_facts
+        review_stale: requesting_stack_child_reviews
+        rebase_required: stack_rebase_gate
+        checks_failed: blocked
+        stack_complete: reconciling_child_set
+        deny: blocked
+      on_failure: blocked
     awaiting_stack_checks:
       progress: external_wait
       wait:
@@ -1156,10 +1183,6 @@ definition:
         remote_failed: blocked
         deadline_exceeded: blocked
         budget_exhausted: blocked
-    refreshing_stale_stack_facts:
-      activity: refresh_remote_change_binding
-      on_success: requesting_stack_child_reviews
-      on_failure: blocked
     landing_stack_entry:
       activity: merge_stack_entry
       on_success: reconciling_stack_entry
@@ -1183,7 +1206,7 @@ definition:
         evidence_kind: authorization_receipt
         requested_action: rebase_remaining_stack
       on_signal:
-        authorized: stack_rebase_gate
+        authorized: rebasing_stack
         expired: stack_rebase_gate
         denied: blocked
     rebasing_stack:
@@ -1193,7 +1216,6 @@ definition:
     stack_republication_gate:
       activity: evaluate_stack_republication_authority
       on_signal:
-        authorized: publishing_rebased_stack
         await_human: awaiting_stack_republication_authorization
         deny: blocked
     awaiting_stack_republication_authorization:
@@ -1202,19 +1224,19 @@ definition:
         evidence_kind: authorization_receipt
         requested_action: republish_rebased_stack
       on_signal:
-        authorized: stack_republication_gate
+        authorized: publishing_rebased_stack
         expired: stack_republication_gate
         denied: blocked
     publishing_rebased_stack:
       activity: publish_rebased_stack
-      on_success: refreshing_rebased_stack_facts
-      on_failure: blocked
-    refreshing_rebased_stack_facts:
-      activity: refresh_remote_change_binding
-      on_success: requesting_stack_child_reviews
+      on_success: requesting_republished_stack_child_reviews
       on_failure: blocked
     requesting_stack_child_reviews:
       activity: request_stack_child_reviews
+      on_success: awaiting_stack_child_reviews
+      on_failure: blocked
+    requesting_republished_stack_child_reviews:
+      activity: request_republished_stack_child_reviews
       on_success: awaiting_stack_child_reviews
       on_failure: blocked
     awaiting_stack_child_reviews:
@@ -1229,7 +1251,20 @@ definition:
       on_failure: blocked
     reconciling:
       activity: reconcile_remote_state
-      on_success: done
+      on_signal:
+        subject_merged: done
+        integration_parent_merged: releasing_integration_children
+        divergence: blocked
+      on_failure: blocked
+    releasing_integration_children:
+      activity: release_integration_children
+      on_success: awaiting_integration_child_acknowledgements
+      on_failure: blocked
+    awaiting_integration_child_acknowledgements:
+      progress: child_barrier
+      on_signal:
+        all_acknowledged: done
+        child_failed: blocked
       on_failure: blocked
     blocked:
       progress: operator_gate
@@ -1278,6 +1313,7 @@ activities:
       filesystem: none
       network: none
       tools: forbidden
+      fresh_context: true
     input_schema: semantic_risk_input.v1
     output_schema: semantic_risk_output.v1
     required_evidence: [intake_subject_snapshot, code_change_snapshot]
@@ -1336,6 +1372,7 @@ activities:
     executor: registered_server
     contract: registered.decomposition_materialization.v1
     authority: execution_authorization
+    requested_action: materialize_children
     required_evidence: [decomposition_validation, authorization_gate_result, authorization_receipt]
     produces: [child_materialization]
 
@@ -1423,6 +1460,7 @@ activities:
     input_schema: change_implementation_input.v1
     output_schema: change_implementation_output.v1
     authority: execution_authorization
+    requested_action: implement_change
     required_evidence: [implementation_plan, authorization_gate_result, authorization_receipt]
     allowed_decisions: []
     produces: [change_set, validation_report]
@@ -1441,6 +1479,7 @@ activities:
     input_schema: change_implementation_input.v1
     output_schema: change_implementation_output.v1
     authority: execution_authorization
+    requested_action: repair_direct_change
     required_evidence: [implementation_plan, authorization_gate_result, authorization_receipt, review_receipt]
     allowed_decisions: []
     produces: [change_set, validation_report]
@@ -1459,6 +1498,7 @@ activities:
     input_schema: change_implementation_input.v1
     output_schema: change_implementation_output.v1
     authority: execution_authorization
+    requested_action: repair_child_change
     required_evidence: [implementation_plan, authorization_gate_result, authorization_receipt, review_receipt]
     allowed_decisions: []
     produces: [change_set, validation_report]
@@ -1497,6 +1537,7 @@ activities:
     input_schema: child_integration_input.v1
     output_schema: child_integration_output.v1
     authority: execution_authorization
+    requested_action: integrate_children
     required_evidence: [decomposition_validation, child_materialization, child_outcome, authorization_gate_result, authorization_receipt]
     allowed_decisions: []
     produces: [integrated_change_set, validation_report]
@@ -1515,6 +1556,7 @@ activities:
     input_schema: child_integration_input.v1
     output_schema: child_integration_output.v1
     authority: execution_authorization
+    requested_action: repair_integration
     required_evidence: [decomposition_validation, child_materialization, child_outcome, authorization_gate_result, authorization_receipt, integration_review_receipt]
     allowed_decisions: []
     produces: [integrated_change_set, validation_report]
@@ -1579,6 +1621,12 @@ activities:
     contract: registered.parent_handoff_release.v1
     produces: [parent_handoff_receipt]
 
+  release_integration_children:
+    executor: registered_server
+    contract: registered.integration_child_handoff_release.v1
+    required_evidence: [child_materialization, child_outcome, remote_merge_confirmation]
+    produces: [parent_handoff_receipt]
+
   reconcile_child_set:
     executor: registered_server
     contract: registered.child_set_reconciliation.v1
@@ -1589,7 +1637,13 @@ activities:
     contract: registered.provider_change_publish_or_bind.v1
     idempotency: required
     authority: execution_authorization
+    requested_action: publish_change
     required_evidence: [change_set, validation_report, authorization_gate_result, authorization_receipt]
+    binding_transition_contract:
+      expected_current_ref: work_item.remote_change_binding_id
+      successor_output: remote_change_binding
+      update_current_ref: work_item.remote_change_binding_id
+      concurrency: compare_and_swap
     reconciliation: registered.remote_binding_reconciliation.v1
     produces: [remote_change_binding, review_subject_snapshot]
 
@@ -1598,7 +1652,13 @@ activities:
     contract: registered.provider_change_publish_or_bind.v1
     idempotency: required
     authority: execution_authorization
+    requested_action: publish_integrated_change
     required_evidence: [integrated_change_set, validation_report, authorization_gate_result, authorization_receipt]
+    binding_transition_contract:
+      expected_current_ref: work_item.remote_change_binding_id
+      successor_output: remote_change_binding
+      update_current_ref: work_item.remote_change_binding_id
+      concurrency: compare_and_swap
     reconciliation: registered.remote_binding_reconciliation.v1
     produces: [remote_change_binding, review_subject_snapshot]
 
@@ -1608,11 +1668,20 @@ activities:
     requested_action: merge_current_subject
     produces: [merge_gate_result, authorization_receipt]
 
+  revalidate_merge_authorization:
+    executor: registered_server
+    contract: registered.merge_gate.v1
+    requested_action: merge_current_subject
+    required_evidence: [remote_change_binding, authorization_receipt]
+    produces: [merge_gate_result]
+
   merge_change:
     executor: provider_action
     contract: registered.provider_merge.v1
     idempotency: required
     authority: merge_authorization
+    requested_action: merge_current_subject
+    required_evidence: [remote_change_binding, merge_gate_result, authorization_receipt]
     reconciliation: registered.remote_reconciliation.v1
     produces: [merge_attempt_receipt]
 
@@ -1620,13 +1689,23 @@ activities:
     executor: registered_server
     contract: registered.stack_entry_merge_gate.v1
     requested_action: merge_current_stack_entry
-    produces: [merge_gate_result, stack_rebase_context, authorization_receipt]
+    required_evidence: [remote_change_binding]
+    produces: [merge_gate_result, stack_rebase_context, stack_review_refresh_context, authorization_receipt]
+
+  revalidate_stack_merge_authorization:
+    executor: registered_server
+    contract: registered.stack_entry_merge_gate.v1
+    requested_action: merge_current_stack_entry
+    required_evidence: [remote_change_binding, merge_gate_result, authorization_receipt]
+    produces: [merge_gate_result, stack_rebase_context, stack_review_refresh_context]
 
   merge_stack_entry:
     executor: provider_action
     contract: registered.provider_stack_entry_merge.v1
     idempotency: required
     authority: stack_entry_merge_authorization
+    requested_action: merge_current_stack_entry
+    required_evidence: [remote_change_binding, merge_gate_result, authorization_receipt]
     reconciliation: registered.stack_entry_reconciliation.v1
     produces: [merge_attempt_receipt]
 
@@ -1656,9 +1735,10 @@ activities:
       writable_scope: plan_authorized
     input_schema: stack_rebase_input.v1
     output_schema: stack_rebase_output.v1
-    required_evidence: [stack_rebase_context, authorization_receipt]
+    required_evidence: [stack_rebase_context, authorization_gate_result, authorization_receipt]
     allowed_decisions: []
     authority: stack_rebase_authorization
+    requested_action: rebase_remaining_stack
     produces: [change_set, validation_report]
 
   evaluate_stack_republication_authority:
@@ -1674,15 +1754,22 @@ activities:
     contract: registered.provider_stack_republish.v1
     idempotency: required
     authority: stack_republication_authorization
-    required_evidence: [change_set, validation_report, authorization_receipt]
-    reconciliation: registered.remote_binding_reconciliation.v1
-    produces: [stack_republication_receipt, remote_change_binding]
+    requested_action: republish_rebased_stack
+    required_evidence: [stack_rebase_context, change_set, validation_report, authorization_gate_result, authorization_receipt]
+    reconciliation: registered.stack_republication_reconciliation.v1
+    produces: [stack_republication_receipt, stack_review_refresh_context]
 
   request_stack_child_reviews:
     executor: registered_server
     contract: registered.stack_child_review_refresh.v1
-    required_evidence: [child_materialization, child_outcome, remote_change_binding, review_subject_snapshot]
-    produces: [child_review_refresh, review_subject_snapshot]
+    required_evidence: [child_materialization, child_outcome, stack_review_refresh_context]
+    produces: [child_review_refresh]
+
+  request_republished_stack_child_reviews:
+    executor: registered_server
+    contract: registered.stack_child_review_refresh.v1
+    required_evidence: [child_materialization, child_outcome, stack_review_refresh_context, stack_republication_receipt]
+    produces: [child_review_refresh]
 
   request_independent_child_review:
     executor: registered_server
@@ -1768,6 +1855,9 @@ evidence:
   stack_rebase_context:
     payload_schema: .harness/schemas/stack-rebase-context.v1.json
     allowed_producers: [server_policy_engine]
+  stack_review_refresh_context:
+    payload_schema: .harness/schemas/stack-review-refresh-context.v1.json
+    allowed_producers: [server_policy_engine, remote_provider]
   stack_republication_receipt:
     payload_schema: .harness/schemas/stack-republication-receipt.v1.json
     allowed_producers: [remote_provider]
@@ -1825,9 +1915,10 @@ decomposition:
       landing_path_signal: integration_child
       child_review_target: awaiting_parent_handoff
       landing_owner: parent
+      completion_milestone: ready_for_integration
       parent_completion_signal: integration_contribution_accepted
       parent_merge_subject: integrated_change_binding
-      parent_completion: integration_remote_merge_confirmed
+      parent_completion: integration_remote_merge_and_child_acknowledgements
 
 review:
   child:
@@ -1934,22 +2025,20 @@ stateDiagram-v2
     stack_merge_gate --> awaiting_stack_merge_authorization: human required
     stack_merge_gate --> awaiting_stack_checks: checks pending
     stack_merge_gate --> awaiting_stack_facts: facts unavailable
-    stack_merge_gate --> refreshing_stale_stack_facts: review stale
+    stack_merge_gate --> requesting_stack_child_reviews: review stale
     stack_merge_gate --> stack_rebase_gate: rebase required
-    refreshing_stale_stack_facts --> requesting_stack_child_reviews: current identities collected
     landing_stack_entry --> reconciling_stack_entry
     reconciling_stack_entry --> stack_rebase_gate: more entries
     reconciling_stack_entry --> reconciling_child_set: stack complete
     stack_rebase_gate --> rebasing_stack: authorized
     stack_rebase_gate --> awaiting_stack_rebase_authorization: human required
-    awaiting_stack_rebase_authorization --> stack_rebase_gate: authorization received
+    awaiting_stack_rebase_authorization --> rebasing_stack: authorization received
     rebasing_stack --> stack_republication_gate: local identities changed
-    stack_republication_gate --> publishing_rebased_stack: authorized for new identity
     stack_republication_gate --> awaiting_stack_republication_authorization: human required
-    awaiting_stack_republication_authorization --> stack_republication_gate: authorization received
-    publishing_rebased_stack --> refreshing_rebased_stack_facts: bindings superseded
-    refreshing_rebased_stack_facts --> requesting_stack_child_reviews: remote identities confirmed
+    awaiting_stack_republication_authorization --> publishing_rebased_stack: authorization received
+    publishing_rebased_stack --> requesting_republished_stack_child_reviews: provider outcomes recorded
     requesting_stack_child_reviews --> awaiting_stack_child_reviews: child commands committed
+    requesting_republished_stack_child_reviews --> awaiting_stack_child_reviews: child commands committed
     awaiting_stack_child_reviews --> preparing_stack_review: all leaf reviews current
     awaiting_parent_handoff --> refreshing_child_review_facts: re-review required
     implementing --> collecting_implemented_change_facts
@@ -2011,12 +2100,27 @@ stateDiagram-v2
     refreshing_child_review_facts --> assessing_refreshed_child_risk: current identity collected
     assessing_refreshed_child_risk --> validating_refreshed_child: risk classified
     validating_refreshed_child --> leaf_review_child: current head validated
-    awaiting_merge_authorization --> merge_gate: authorization received; refresh facts
-    awaiting_stack_merge_authorization --> stack_merge_gate: authorization received; refresh facts
+    awaiting_merge_authorization --> revalidating_merge_authorization: authorization received
+    revalidating_merge_authorization --> merging: current gate eligible
+    revalidating_merge_authorization --> awaiting_remote_checks: checks pending
+    revalidating_merge_authorization --> awaiting_remote_facts: facts unavailable
+    revalidating_merge_authorization --> refreshing_direct_review_facts: direct review stale
+    revalidating_merge_authorization --> refreshing_integration_review_facts: integration review stale
+    revalidating_merge_authorization --> refreshing_independent_child_review_facts: child review stale
+    awaiting_stack_merge_authorization --> revalidating_stack_merge_authorization: authorization received
+    revalidating_stack_merge_authorization --> landing_stack_entry: current gate eligible
+    revalidating_stack_merge_authorization --> awaiting_stack_checks: checks pending
+    revalidating_stack_merge_authorization --> awaiting_stack_facts: facts unavailable
+    revalidating_stack_merge_authorization --> requesting_stack_child_reviews: review stale
+    revalidating_stack_merge_authorization --> stack_rebase_gate: rebase required
+    revalidating_stack_merge_authorization --> reconciling_child_set: stack complete
     awaiting_stack_checks --> stack_merge_gate: checks eligible
     awaiting_stack_facts --> stack_merge_gate: facts available
     merging --> reconciling
-    reconciling --> done: remote confirms merge
+    reconciling --> done: ordinary subject merge confirmed
+    reconciling --> releasing_integration_children: integration parent merge confirmed
+    releasing_integration_children --> awaiting_integration_child_acknowledgements: releases committed
+    awaiting_integration_child_acknowledgements --> done: all children acknowledged
     state blocked
     collecting_facts --> blocked
     assessing_risk --> blocked
@@ -2081,6 +2185,7 @@ stateDiagram-v2
     awaiting_integration_publication_authorization --> blocked
     integration_review --> blocked
     merge_gate --> blocked
+    revalidating_merge_authorization --> blocked
     awaiting_remote_checks --> blocked
     awaiting_remote_facts --> blocked
     refreshing_direct_review_facts --> blocked
@@ -2094,9 +2199,9 @@ stateDiagram-v2
     validating_refreshed_child --> blocked
     stack_merge_gate --> blocked
     awaiting_stack_merge_authorization --> blocked
+    revalidating_stack_merge_authorization --> blocked
     awaiting_stack_checks --> blocked
     awaiting_stack_facts --> blocked
-    refreshing_stale_stack_facts --> blocked
     landing_stack_entry --> blocked
     reconciling_stack_entry --> blocked
     stack_rebase_gate --> blocked
@@ -2105,11 +2210,13 @@ stateDiagram-v2
     stack_republication_gate --> blocked
     awaiting_stack_republication_authorization --> blocked
     publishing_rebased_stack --> blocked
-    refreshing_rebased_stack_facts --> blocked
     requesting_stack_child_reviews --> blocked
+    requesting_republished_stack_child_reviews --> blocked
     awaiting_stack_child_reviews --> blocked
     merging --> blocked
     reconciling --> blocked
+    releasing_integration_children --> blocked
+    awaiting_integration_child_acknowledgements --> blocked
     blocked --> collecting_facts: authorized replan
     blocked --> cancelled: cancel
     done --> [*]
@@ -2174,14 +2281,23 @@ authorization and any repair mutation. Because the Work Item is already bound to
 planner may choose only direct repair or abstention; it cannot decompose into replacement child PRs
 and leave the original binding unresolved.
 
+Publication also preserves that identity. The publication activity snapshots the exact current
+`work_item.remote_change_binding_id`: `null` permits one issue-first initial binding, while a
+non-null value requires updating the provider object named by that binding and creating or reusing
+one immutable successor version. Reconciled activity completion inserts the successor and
+compare-and-swaps the Work Item pointer in one transaction. A lost CAS reloads and reconciles the
+winner; it never creates a replacement PR or repeats an already confirmed provider write.
+
 ### 12.3 High-risk flow
 
 High-risk work may collect facts, run semantic assessment, and produce a plan. Before a mutating
 activity is dispatched, Harness requires an execution authorization receipt scoped to the exact
 Work Item, Workflow hash, risk assessment, plan revision, and authorized writable scope. Runtime
-workspace enforcement MUST reject an attempted write outside that scope before mutation and return
-the Work Item to authorization rather than relying on a later publication gate. Merge remains
-human-only even after implementation and review.
+workspace enforcement MUST reject an attempted write outside that scope before mutation, persist
+runtime-enforcement Evidence, and route the Work Item to `blocked`. Renewing or broadening scope
+uses the operator-owned `replan` route through fact collection, renewed risk assessment, and a new
+action-specific authorization; it never jumps directly back to mutation. Merge remains human-only
+even after implementation and review.
 
 ## 13. Risk and Authorization
 
@@ -2398,7 +2514,11 @@ Use when intermediate changes must not land independently. Children produce revi
 artifacts or branches. A dedicated integration activity assembles them under one fenced workspace
 and records exact child inputs. The integration PR receives a fresh parent review; child approvals
 do not approve the assembled head automatically. Children stop at `parent_handoff` and cannot
-publish or merge independently.
+publish or merge independently. Their reviewed `ready_for_integration` milestone lets the parent
+integrate without terminalizing them. After the integration PR merge is reconciled, the parent
+atomically releases every child with `integration_contribution_accepted` and waits for a terminal
+acknowledgement from every child in the pinned decomposition revision before it reaches `done` or
+returns unused child budget.
 
 ### 15.4 Strategy changes
 
@@ -2549,12 +2669,15 @@ unavailable.
 Every code-producing child requires an eligible current-head receipt before it can contribute a
 successful child outcome.
 
-For a stack rebase or stale stack receipt, fresh provider facts feed
-`registered.stack_child_review_refresh.v1`. It atomically invalidates affected child outcomes,
-materializes one child-owned, single-tagged `review_subject_snapshot` per affected Work Item from
-its current remote binding, and enqueues `re_review_required` commands. Each child returns from
-`parent_handoff` through `refreshing_child_review_facts`, `assessing_refreshed_child_risk`, and
-`validating_refreshed_child` before `leaf_review_child`. Runtime enforcement regenerates its
+For a stack rebase or stale stack receipt, the parent consumes a current
+`stack_review_refresh_context` through `registered.stack_child_review_refresh.v1`. That contract
+atomically invalidates affected child outcomes and enqueues one idempotent `re_review_required`
+command per affected Work Item; it does not manufacture child-owned provider snapshots. Each child
+returns from `parent_handoff` through `refreshing_child_review_facts`, where
+`refresh_remote_change_binding` collects current provider facts, compare-and-swaps that child's
+binding pointer, and creates the successor single-tagged `review_subject_snapshot`. It then runs
+`assessing_refreshed_child_risk` and `validating_refreshed_child` before `leaf_review_child`.
+Runtime enforcement regenerates its
 `ChildOutcome` only when the new semantic risk assessment, validation report, and leaf review
 receipt are all bound to the same current child code identity. The parent waits at
 `awaiting_stack_child_reviews` and cannot rematerialize the stack review subject until every
@@ -2719,7 +2842,8 @@ After restart:
 1. replay the pinned Workflow and event log;
 2. rebuild projections;
 3. fence expired leases and orphaned attempts;
-4. identify active states without an active command, job, wait, child barrier, or operator gate;
+4. identify active states without an active command, job, wait, child barrier, review barrier,
+   parent handoff, or operator gate;
 5. refresh external facts needed for reconciliation;
 6. emit repair commands or block with evidence; and
 7. never silently rewrite logical state to make projections look healthy.
@@ -2792,6 +2916,22 @@ actions. Automatic authority activities declare the same `requested_action` used
 gate counterpart. A validated receipt may emit only the matching declared signal; the API and
 reducer do not infer an action or resume target from a state name.
 
+An operator gate validates and persists the human receipt but does not implicitly collect external
+facts. Human authorization for direct/integration or stack-entry merge routes first to the explicit
+`revalidate_merge_authorization` or `revalidate_stack_merge_authorization` activity. Those
+activities rerun the registered gate against current provider facts and the persisted receipt;
+pending, unavailable, stale, failed, or denied results follow their declared non-mutation routes.
+The stack gate contract also loads the current `IntegrationProgress` supporting record and fences
+the evaluation on its generation, landing cursor, and current binding. Its declared `produces` list
+is the set of possible signal-bound outputs: `stack_rebase_context` exists only for
+`rebase_required`, while `stack_review_refresh_context` exists only for `review_stale`; an eligible
+first entry requires neither context. Revalidation consumes the prior `merge_gate_result` and human
+receipt, not a rebase context, and rejects either when its recorded generation, cursor, binding, or
+action differs from current progress.
+Other authorized mutations rely on the target dispatcher to revalidate the exact action, Evidence
+IDs, code identity, binding or integration generation, expiry, and revocation immediately before
+execution. No human receipt routes directly to a provider merge action.
+
 Stack landing persists an `IntegrationProgress` cursor before its first gate. Each entry refreshes
 facts and authorization against its current code identity, records the provider result, reconciles
 that entry, and advances the cursor. Before rebasing remaining entries, an action-specific gate
@@ -2809,11 +2949,30 @@ cursor-advancing rounds and at most three stale-fact re-review rounds at each cu
 landing cursor resets only the per-cursor stale count; recovery and replay preserve the cumulative
 count.
 
+A parent never applies the singular Work Item binding-refresh contract to an ordered stack. A stale
+stack review invokes `request_stack_child_reviews` with a `stack_review_refresh_context` produced by
+the current stack-entry gate and bound to its post-observation integration generation, landing
+cursor, and affected child bindings. Successful republication instead invokes
+`request_republished_stack_child_reviews` with a new refresh context bound to the post-action
+generation, publish cursor, affected successor bindings, and exact `stack_republication_receipt`.
+Both contracts lock their declared generation, invalidate the affected child outcomes, and
+atomically enqueue one idempotent `re_review_required` command per affected child. Each child then
+refreshes and compare-and-swaps its own binding pointer before risk, validation, and leaf review.
+Stack republication reconciliation records one provider outcome per remaining entry and advances
+the publish cursor and integration generation by compare-and-swap; partial or mixed identities do
+not reach the parent review barrier.
+
 `stack_rebase_context` normalizes the two legal rebase triggers: current merge-gate base drift and
 post-landing advancement to remaining entries. It binds the integration-progress generation,
 landing cursor, expected parent, remaining ordered bindings, current remote facts, and trigger. The
 rebase authority gate and Agent activity consume that same context, so neither path depends on
 Evidence that only the other path can produce.
+
+`stack_review_refresh_context` is distinct from `stack_rebase_context`: it authorizes only the
+generation-scoped child re-review fan-out described above and cannot trigger a rebase. A stale gate
+context is invalid after any cursor or generation change. A post-republication context is invalid
+without its matching republication receipt or after any later provider observation advances the
+generation.
 
 ## 23. Dual-Truth Reconciliation
 
