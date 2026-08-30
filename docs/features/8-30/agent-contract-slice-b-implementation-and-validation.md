@@ -266,6 +266,7 @@ All evidence below was produced fresh during this implementation session.
 | Runtime worker integration | Agent-contract integration module against disposable PostgreSQL database | 3 passed |
 | Dependency security | `cargo audit` | Exit 0; only two allowed pre-existing warnings |
 | Required agent package suite | `cargo test --package harness-agents` | 360 passed, 7 ignored, 1 load-sensitive failure |
+| Repository pre-push gate | DB-less project pre-push hook | Pass; workspace clippy, database-independent workspace tests, and 746 `harness-workflow` tests passed |
 
 The disposable PostgreSQL database was created on the local Docker PostgreSQL service at port 55433 and dropped with force immediately after the three narrow suites. It contained test data only and is not recoverable.
 
@@ -274,6 +275,8 @@ The disposable PostgreSQL database was created on the local Docker PostgreSQL se
 The full `harness-agents` package suite was run twice. Both runs passed 360 tests and ignored 7 tests, but the same app-server child-startup timing test exceeded its three-second threshold under extreme machine load. An exact rerun of that test passed. The machine load average was approximately 58 on 12 cores with unrelated compiler and JavaScript test processes active.
 
 No assertion, timeout, test infrastructure, or production behavior was weakened to hide the failure. GitHub CI remains the authoritative clean-environment result.
+
+The later repository pre-push run rebuilt and completed the database-independent workspace test selection successfully, including the full `harness-agents` test binary. This provides a subsequent clean run of the previously timing-sensitive test without changing it. The earlier failure remains recorded above because it explains why a single test result should not have been represented as clean before the later gate completed.
 
 ### 10.2 Dependency assessment
 
