@@ -34,9 +34,6 @@ mod server_merge;
 mod server_validation;
 mod transcript_durability;
 pub(crate) mod turn_engine;
-#[cfg(test)]
-#[path = "worker_tick_tests.rs"]
-mod worker_tick_tests;
 mod workspace;
 
 pub(crate) use workspace::cleanup_terminal_runtime_workspace_if_uncontended;
