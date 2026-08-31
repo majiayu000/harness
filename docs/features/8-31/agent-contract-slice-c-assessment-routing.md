@@ -90,9 +90,9 @@ Fresh evidence from this branch:
 | Surface | Result |
 |---|---|
 | Canonical contract tests | 9 passed |
-| Declarative contract tests | 18 passed |
-| Server contract tests | 28 passed, 1 ignored live dogfood |
-| Runtime dispatch tests | 26 passed |
+| Declarative contract tests | 19 passed |
+| Server `contract` filter | 89 passed, 1 ignored live dogfood |
+| Runtime dispatch tests | 27 passed |
 | Exact-replay preflight test | 1 passed |
 | Real submission, assessment, route, and store reopen | passed; one model-backend invocation |
 | Durable correction | invalid primary plus one valid correction passed; two persisted reservations |
@@ -118,6 +118,8 @@ The fifth independent review found two validation-order gaps. Dispatcher and exe
 The sixth independent review found two remaining authorization-order gaps. Dispatch now binds the complete contract command to the persisted workflow instance and its hydrated pinned declarative definition, including the exact contract, prompt, definition hash, subject, facts, and provenance. Executor preflight then binds the runtime job snapshot back to that authorized command before exact-replay or disabled-worker handling. A final fresh-context review remains required.
 
 The seventh independent review found three downgrade and lifecycle gaps. Contract expectation now comes from the pinned definition and current instance state rather than mutable command/job markers. The job snapshot binds activity, command identity, profile hash, profile name, and runtime kind before any other preflight. Finally, closing the backend event channel no longer escapes timeout or lease-loss selection: the runtime keeps the backend future fenced until completion or cancellation. A further fresh-context review remains required.
+
+The eighth independent review found four final dispatch and lifecycle gaps. Timeout and lease-loss selection is now fair under a continuously ready event stream while completed streams still drain every buffered observation. Pinned-command validation runs before the mutable command type can select the non-runtime skip path. Fatal contract corruption terminates from the pinned state contract even when persisted completion identities are malformed. Backend resolution is runtime-kind aware, so `CodexJsonrpc` authorizes and executes a fresh per-turn JSON-RPC backend instead of the Codex oneshot singleton. A further fresh-context review remains required.
 
 ## Slice D boundary
 

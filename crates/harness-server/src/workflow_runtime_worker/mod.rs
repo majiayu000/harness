@@ -40,7 +40,7 @@ pub(crate) use agent_contract_enforcement::{
     ensure_backend_can_enforce_contract, validate_pinned_agent_contract_command,
 };
 pub(crate) use circuit_breaker_events::emit_circuit_breaker_events;
-pub(crate) use runtime_profile::agent_name_for_runtime_kind;
+pub(crate) use runtime_profile::agent_backend_for_runtime_kind;
 pub(crate) use transcript_durability::{
     hydrate_exact_replay_transcript, strip_caller_transcript_unavailable_signal,
 };

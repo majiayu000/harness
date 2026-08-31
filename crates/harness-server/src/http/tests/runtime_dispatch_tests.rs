@@ -122,7 +122,13 @@ where
         ),
     )?;
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
-    registry.register("codex", Arc::new(DispatchContractAgent { enforceable }));
+    registry.register(
+        "codex",
+        Arc::new(DispatchContractAgent { enforceable: false }),
+    );
+    registry.register_turn_backend_factory("codex", move || {
+        Arc::new(DispatchContractAgent { enforceable })
+    })?;
     let state = make_test_state_with_workflow_runtime_config_and_registry(
         dir.path(),
         &project_root,
@@ -247,6 +253,28 @@ async fn runtime_dispatch_fails_when_pinned_contract_marker_is_removed() -> anyh
             .as_object_mut()
             .expect("contract command payload")
             .remove("agent_contract");
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_when_contract_command_type_is_substituted() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, |command| {
+        command.command_type = harness_workflow::runtime::WorkflowCommandType::MarkBlocked;
     })
     .await?;
 

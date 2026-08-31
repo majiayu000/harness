@@ -643,6 +643,64 @@ mod declarative_agent_contract_tests {
         Ok(())
     }
 
+    #[test]
+    fn fatal_contract_failure_ignores_corrupted_completion_identity() -> anyhow::Result<()> {
+        let definition = build_declarative_definition(
+            &classifier_policy(),
+            &activity_policies(Some(contract())),
+        )?;
+        let instance = WorkflowInstance::new(
+            definition.policy().id.clone(),
+            definition.definition_version(),
+            "classifying",
+            WorkflowSubject::new("test", "fatal-contract-identity"),
+        )
+        .with_id("fatal-contract-identity")
+        .with_server_data(json!({"definition_hash": definition.definition_hash()}));
+        let mut command =
+            crate::runtime::declarative_agent_contract::declarative_enqueue_activity_command(
+                &definition,
+                &instance,
+                "classify_scope",
+                "fatal-contract-identity-1".to_string(),
+            )?;
+        command.command_type = WorkflowCommandType::MarkBlocked;
+        command.command["activity"] = json!("substituted_activity");
+        let result = ActivityResult::failed(
+            "substituted_activity",
+            "Pinned agent contract failed validation.",
+            "the persisted contract identity was corrupted",
+        )
+        .with_error_kind(ActivityErrorKind::Fatal);
+        let event = WorkflowEvent::new(
+            &instance.id,
+            1,
+            crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+            "runtime-test",
+        )
+        .with_payload(json!({
+            "command_id": "command-1",
+            "runtime_job_id": "job-1",
+            "command": command,
+            "activity_result": result,
+        }));
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry.register_declarative_current(definition)?;
+
+        let decision = crate::runtime::reducer::reduce_runtime_job_completed_with_registry(
+            &registry,
+            &instance,
+            &event,
+        )?
+        .expect("fatal contract corruption must terminate the workflow");
+
+        assert_eq!(decision.next_state, "failed");
+        assert!(decision.commands.iter().all(|command| {
+            command.command_type != WorkflowCommandType::EnqueueActivity
+        }));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn malformed_contract_dispatch_failure_atomically_terminates_the_workflow(
     ) -> anyhow::Result<()> {

@@ -11,7 +11,7 @@ use super::agent_contract_enforcement::{
 };
 use super::agent_contract_execution::execute_contract_attempts;
 use super::data_helpers::activity_name;
-use super::runtime_profile::{agent_name_for_runtime_kind, runtime_profile_for_job};
+use super::runtime_profile::{agent_backend_for_runtime_kind, runtime_profile_for_job};
 
 #[derive(Debug)]
 pub(super) struct AgentContractExecutionError {
@@ -61,10 +61,8 @@ async fn execute_contract_job_inner(
     lease_lost: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ActivityResult> {
     let activity = activity_name(job);
-    let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
-    let Some(backend) = state.core.server.agent_registry.get(agent_name) else {
-        anyhow::bail!("runtime agent `{agent_name}` is not registered");
-    };
+    let backend =
+        agent_backend_for_runtime_kind(&state.core.server.agent_registry, job.runtime_kind)?;
     if let Err(error) = ensure_backend_can_enforce_contract(backend.as_ref()) {
         return Ok(contract_preflight_failure(
             job,

@@ -38,6 +38,17 @@ pub(super) struct ContractAttempt {
     pub(super) observations: TurnStreamObservations,
 }
 
+impl ContractAttempt {
+    fn record_event(&mut self, event: AgentEvent) {
+        self.observations.record_stream_item(&event);
+        match event {
+            AgentEvent::ItemCompleted { item } => self.items.push(item),
+            AgentEvent::TurnCompleted { output } => self.output = output,
+            _ => {}
+        }
+    }
+}
+
 pub(super) struct ContractVerdict {
     pub(super) outcome: String,
     pub(super) raw: Value,
@@ -108,25 +119,19 @@ pub(super) async fn execute_agent_contract_attempt(
     let stream_backend = Arc::clone(&backend);
     let mut stream = tokio::spawn(async move { stream_backend.execute_stream(request, tx).await });
 
-    let mut observations = TurnStreamObservations::default();
-    let mut items = Vec::new();
-    let mut output = String::new();
+    let mut attempt = ContractAttempt {
+        output: String::new(),
+        items: Vec::new(),
+        observations: TurnStreamObservations::default(),
+    };
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
     tokio::pin!(deadline);
     let mut event_channel_open = true;
     let stream_result = loop {
         tokio::select! {
-            biased;
             event = rx.recv(), if event_channel_open => {
                 match event {
-                    Some(event) => {
-                        observations.record_stream_item(&event);
-                        match event {
-                            AgentEvent::ItemCompleted { item } => items.push(item),
-                            AgentEvent::TurnCompleted { output: reply } => output = reply,
-                            _ => {}
-                        }
-                    }
+                    Some(event) => attempt.record_event(event),
                     None => event_channel_open = false,
                 }
             }
@@ -178,12 +183,11 @@ pub(super) async fn execute_agent_contract_attempt(
     stream_result
         .map_err(|error| anyhow::anyhow!("contract attempt stream task panicked: {error}"))?
         .map_err(|error| anyhow::anyhow!("contract attempt launch failed: {error}"))?;
+    while let Ok(event) = rx.try_recv() {
+        attempt.record_event(event);
+    }
 
-    Ok(ContractAttempt {
-        output,
-        items,
-        observations,
-    })
+    Ok(attempt)
 }
 
 #[cfg(test)]

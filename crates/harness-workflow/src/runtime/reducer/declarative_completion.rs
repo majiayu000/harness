@@ -63,40 +63,48 @@ fn reduce_generic_declarative_completion(
             ),
         );
     };
-    if result.activity != expected_activity {
-        return invalid_completion(
-            instance,
-            event,
-            result,
-            format!(
-                "declarative workflow '{}' state '{}' expected activity '{}', but result named '{}'",
-                policy.id, instance.state, expected_activity, result.activity
-            ),
+    let terminal_contract_failure = definition.agent_contract(expected_activity).is_some()
+        && result.status == ActivityStatus::Failed
+        && matches!(
+            result.error_kind,
+            Some(ActivityErrorKind::Fatal | ActivityErrorKind::Configuration)
         );
-    }
-    let Some(command) = event_workflow_command(event) else {
-        return invalid_completion(
-            instance,
-            event,
-            result,
-            format!(
-                "declarative workflow '{}' completion is missing its enqueue_activity command",
-                policy.id
-            ),
-        );
-    };
-    if command.command_type != WorkflowCommandType::EnqueueActivity
-        || command.activity_name() != Some(expected_activity)
-    {
-        return invalid_completion(
-            instance,
-            event,
-            result,
-            format!(
-                "declarative workflow '{}' state '{}' completion command does not enqueue expected activity '{}'",
-                policy.id, instance.state, expected_activity
-            ),
-        );
+    if !terminal_contract_failure {
+        if result.activity != expected_activity {
+            return invalid_completion(
+                instance,
+                event,
+                result,
+                format!(
+                    "declarative workflow '{}' state '{}' expected activity '{}', but result named '{}'",
+                    policy.id, instance.state, expected_activity, result.activity
+                ),
+            );
+        }
+        let Some(command) = event_workflow_command(event) else {
+            return invalid_completion(
+                instance,
+                event,
+                result,
+                format!(
+                    "declarative workflow '{}' completion is missing its enqueue_activity command",
+                    policy.id
+                ),
+            );
+        };
+        if command.command_type != WorkflowCommandType::EnqueueActivity
+            || command.activity_name() != Some(expected_activity)
+        {
+            return invalid_completion(
+                instance,
+                event,
+                result,
+                format!(
+                    "declarative workflow '{}' state '{}' completion command does not enqueue expected activity '{}'",
+                    policy.id, instance.state, expected_activity
+                ),
+            );
+        }
     }
 
     let route = match result.status {
@@ -141,11 +149,6 @@ fn reduce_generic_declarative_completion(
             }
         }
         ActivityStatus::Failed => {
-            let terminal_contract_failure = definition.agent_contract(expected_activity).is_some()
-                && matches!(
-                    result.error_kind,
-                    Some(ActivityErrorKind::Fatal | ActivityErrorKind::Configuration)
-                );
             if terminal_contract_failure {
                 terminal_for_class(definition, WorkflowTerminalState::Failed)
                     .map(|target| (target, "terminal agent contract failure".to_string()))

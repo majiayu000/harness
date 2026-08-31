@@ -513,6 +513,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continuous_event_stream_does_not_starve_attempt_timeout() {
+        struct StreamingBackend;
+        #[async_trait]
+        impl AgentBackend for StreamingBackend {
+            fn name(&self) -> &str {
+                "streaming-contract-backend"
+            }
+            fn agent_contract_capabilities(
+                &self,
+            ) -> harness_core::agent::AgentContractCapabilities {
+                harness_core::agent::AgentContractCapabilities {
+                    prompt_only_launch: true,
+                    pinned_output_schema: true,
+                    attempt_observation_stream: true,
+                }
+            }
+            async fn execute_stream(
+                &self,
+                _request: harness_core::agent::AgentRequest,
+                tx: tokio::sync::mpsc::Sender<harness_core::agent::AgentEvent>,
+            ) -> harness_core::error::Result<()> {
+                loop {
+                    tx.send(harness_core::agent::AgentEvent::TurnStarted)
+                        .await
+                        .map_err(|error| {
+                            harness_core::error::HarnessError::AgentExecution(error.to_string())
+                        })?;
+                }
+            }
+        }
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            super::super::agent_contract_attempt::execute_agent_contract_attempt(
+                Arc::new(StreamingBackend),
+                &pinned_contract(),
+                None,
+                None,
+                1,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("continuous events must not starve the attempt deadline");
+        let error = result.expect_err("continuous event stream must time out");
+
+        assert!(error.to_string().contains("timed out after 1s"), "{error}");
+    }
+
+    #[tokio::test]
     async fn real_submission_assessment_routes_and_reopens_without_model_replay(
     ) -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {

@@ -98,13 +98,6 @@ async fn dispatch_runtime_command_with_project_policy(
     fallback_profile_selector: RuntimeProfileSelector,
     dispatch_owner: &str,
 ) -> anyhow::Result<CommandDispatchOutcome> {
-    if !command.command.requires_runtime_job() {
-        return RuntimeCommandDispatcher::with_profile_selector(store, fallback_profile_selector)
-            .with_dispatcher_id(dispatch_owner)
-            .dispatch_command(command)
-            .await;
-    }
-
     let has_agent_contract =
         match crate::workflow_runtime_worker::validate_pinned_agent_contract_command(
             store, &command,
@@ -141,6 +134,13 @@ async fn dispatch_runtime_command_with_project_policy(
                 });
             }
         };
+
+    if !command.command.requires_runtime_job() {
+        return RuntimeCommandDispatcher::with_profile_selector(store, fallback_profile_selector)
+            .with_dispatcher_id(dispatch_owner)
+            .dispatch_command(command)
+            .await;
+    }
 
     let project_root = runtime_command_project_root(store, &command, &state.core.project_root)
         .await
@@ -237,11 +237,11 @@ fn enforceable_agent_contract_profile(
     if !profile.timeout_secs.is_some_and(|timeout| timeout > 0) {
         return None;
     }
-    let Ok(agent_name) = crate::workflow_runtime_worker::agent_name_for_runtime_kind(profile.kind)
-    else {
-        return None;
-    };
-    let backend = state.core.server.agent_registry.get(agent_name)?;
+    let backend = crate::workflow_runtime_worker::agent_backend_for_runtime_kind(
+        &state.core.server.agent_registry,
+        profile.kind,
+    )
+    .ok()?;
     if crate::workflow_runtime_worker::ensure_backend_can_enforce_contract(backend.as_ref())
         .is_err()
     {
