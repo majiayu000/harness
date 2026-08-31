@@ -15,10 +15,15 @@ impl WorkflowRuntimeStore {
     /// closed instead of launching the model again.
     pub async fn reserve_agent_contract_attempt(
         &self,
-        runtime_job_id: &str,
+        claimed_job: &RuntimeJob,
+        max_turns: Option<u32>,
         primary_attempt: u32,
         correction_attempt: u32,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<AgentContractAttemptReservation> {
+        let runtime_job_id = &claimed_job.id;
+        let Some(claimed_lease) = claimed_job.lease.as_ref() else {
+            return Ok(AgentContractAttemptReservation::StaleLease);
+        };
         let mut tx = self.pool.begin().await?;
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
@@ -28,11 +33,16 @@ impl WorkflowRuntimeStore {
         let Some((data,)) = row else {
             return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!("agent_contract_attempt:{runtime_job_id}"))
-            .execute(&mut *tx)
-            .await?;
         let job: RuntimeJob = serde_json::from_str(&data)?;
+        if job.status != RuntimeJobStatus::Running
+            || job.lease_generation != claimed_job.lease_generation
+            || job.lease.as_ref().is_none_or(|lease| {
+                lease.owner != claimed_lease.owner || lease.expires_at <= Utc::now()
+            })
+        {
+            tx.commit().await?;
+            return Ok(AgentContractAttemptReservation::StaleLease);
+        }
         let contract_value = job
             .input
             .pointer("/command/agent_contract")
@@ -76,8 +86,51 @@ impl WorkflowRuntimeStore {
         .await?;
         if existing.is_some() {
             tx.commit().await?;
-            return Ok(false);
+            return Ok(AgentContractAttemptReservation::AlreadyReserved);
         }
+        let workflow_id: Option<(String,)> = sqlx::query_as(
+            "SELECT command.workflow_id
+             FROM workflow_commands AS command
+             WHERE command.id = $1",
+        )
+        .bind(&job.command_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((workflow_id,)) = workflow_id else {
+            anyhow::bail!("workflow command not found: {}", job.command_id);
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("runtime_turn_budget:{workflow_id}"))
+            .execute(&mut *tx)
+            .await?;
+        if let Some(max_turns) = max_turns {
+            let (turns_started,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*)
+                 FROM runtime_events AS event
+                 JOIN runtime_jobs AS budget_job ON budget_job.id = event.runtime_job_id
+                 JOIN workflow_commands AS command ON command.id = budget_job.command_id
+                 WHERE command.workflow_id = $1
+                   AND event.event_type = 'RuntimeTurnStarted'",
+            )
+            .bind(&workflow_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if turns_started >= i64::from(max_turns) {
+                tx.commit().await?;
+                return Ok(AgentContractAttemptReservation::BudgetExhausted);
+            }
+        }
+        runtime_job_leases::append_runtime_event_tx(
+            &mut tx,
+            runtime_job_id,
+            "RuntimeTurnStarted",
+            serde_json::json!({
+                "owner": claimed_lease.owner,
+                "lease_generation": claimed_job.lease_generation,
+                "reservation_key": format!("agent_contract:{reservation_key}"),
+            }),
+        )
+        .await?;
         runtime_job_leases::append_runtime_event_tx(
             &mut tx,
             runtime_job_id,
@@ -92,7 +145,7 @@ impl WorkflowRuntimeStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(AgentContractAttemptReservation::Reserved)
     }
 
     pub async fn record_runtime_event(

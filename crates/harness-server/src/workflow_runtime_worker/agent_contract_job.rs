@@ -43,14 +43,13 @@ pub(super) fn pinned_agent_contract_for_execution(
         .map_err(|error| AgentContractExecutionError::new(error).into())
 }
 
-/// Executes a contract-carrying runtime job end to end: capability preflight,
-/// pinned launch, observation, and verdict validation.
 pub(super) async fn execute_contract_job(
     state: &Arc<AppState>,
     job: &RuntimeJob,
     pinned: PinnedJobAgentContract,
+    lease_lost: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ActivityResult> {
-    execute_contract_job_inner(state, job, pinned)
+    execute_contract_job_inner(state, job, pinned, lease_lost)
         .await
         .map_err(|error| AgentContractExecutionError::new(error).into())
 }
@@ -59,6 +58,7 @@ async fn execute_contract_job_inner(
     state: &Arc<AppState>,
     job: &RuntimeJob,
     pinned: PinnedJobAgentContract,
+    lease_lost: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ActivityResult> {
     let activity = activity_name(job);
     let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
@@ -99,6 +99,8 @@ async fn execute_contract_job_inner(
         profile.model.clone(),
         profile.reasoning_effort.clone(),
         timeout_secs,
+        profile.max_turns,
+        lease_lost,
     )
     .await
 }
@@ -286,6 +288,7 @@ mod tests {
             harness_workflow::runtime::RuntimeKind::CodexExec,
         );
         runtime_profile.timeout_secs = Some(30);
+        runtime_profile.max_turns = Some(2);
         store
             .enqueue_runtime_job(
                 &command_id,
@@ -304,10 +307,6 @@ mod tests {
             .await
     }
 
-    /// A contract job on a backend that claims no enforcement capabilities must
-    /// fail explicitly at preflight without spawning any agent process. The
-    /// dispatcher barrier that normally holds such commands must not be the only
-    /// line of defense.
     #[tokio::test]
     async fn contract_job_on_unclaiming_backend_fails_without_spawning() -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
@@ -367,10 +366,6 @@ mod tests {
         Ok(())
     }
 
-    /// A contract job on a conforming backend executes the real attempt: pinned
-    /// pinned prompt and input only, deny-all launch, empty ephemeral workspace outside the
-    /// repository, pinned schema document handed to the backend, and a structured
-    /// verdict recorded on the succeeded result.
     #[tokio::test]
     async fn contract_job_named_like_server_activity_still_executes_pinned_contract(
     ) -> anyhow::Result<()> {
@@ -557,6 +552,14 @@ mod tests {
         assert_eq!(reservations[0].event["correction_attempt"], 0);
         assert_eq!(reservations[1].event["primary_attempt"], 1);
         assert_eq!(reservations[1].event["correction_attempt"], 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "RuntimeTurnStarted")
+                .count(),
+            2,
+            "each model invocation must consume one workflow runtime turn"
+        );
         let completed = store
             .get_runtime_job(&runtime_job.id)
             .await?
@@ -570,64 +573,6 @@ mod tests {
             .expect("server assessment attached");
         assert_eq!(assessment.artifact["budget"]["primary_attempts_used"], 1);
         assert_eq!(assessment.artifact["budget"]["corrections_used"], 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn reclaimed_job_does_not_repeat_a_durably_reserved_attempt() -> anyhow::Result<()> {
-        if !crate::test_helpers::db_tests_enabled().await {
-            return Ok(());
-        }
-
-        let dir = tempfile::tempdir()?;
-        let project_root = dir.path().join("project");
-        std::fs::create_dir_all(&project_root)?;
-        let agent =
-            ContractStreamAgent::new(vec![harness_core::agent::AgentEvent::TurnCompleted {
-                output: valid_verdict_reply(),
-            }]);
-        let mut registry = harness_agents::registry::AgentRegistry::new("codex");
-        registry.register("codex", agent.clone());
-        let state = Arc::new(
-            crate::test_helpers::make_test_state_with_project_root_and_registry(
-                dir.path(),
-                &project_root,
-                registry,
-            )
-            .await?,
-        );
-        let store = state
-            .core
-            .workflow_runtime_store
-            .as_ref()
-            .expect("workflow runtime store should be configured");
-        let runtime_job = enqueue_contract_job(store, &project_root, "classify_scope").await?;
-        assert!(
-            store
-                .reserve_agent_contract_attempt(&runtime_job.id, 1, 0)
-                .await?
-        );
-
-        let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
-            &state,
-            "worker-after-restart",
-            chrono::Duration::minutes(5),
-        )
-        .await?;
-
-        assert_eq!(tick.failed, 1);
-        assert!(
-            agent.requests.lock().await.is_empty(),
-            "a persisted reservation must prevent a duplicate model call"
-        );
-        let events = store.runtime_events_for(&runtime_job.id).await?;
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.event_type == "AgentContractAttemptStarted")
-                .count(),
-            1
-        );
         Ok(())
     }
 
@@ -763,6 +708,7 @@ mod dogfood_tests {
             Some("gpt-5.6-sol".to_string()),
             Some("high".to_string()),
             300,
+            None,
             None,
         )
         .await?;

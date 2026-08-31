@@ -3,8 +3,8 @@
 use crate::http::AppState;
 use harness_core::agent::AgentBackend;
 use harness_workflow::runtime::{
-    ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob,
-    AGENT_CONTRACT_VERDICT_ARTIFACT,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, ActivityStatus,
+    AgentContractAttemptReservation, RuntimeJob, AGENT_CONTRACT_VERDICT_ARTIFACT,
 };
 use std::sync::Arc;
 
@@ -23,6 +23,8 @@ pub(super) async fn execute_contract_attempts(
     model: Option<String>,
     reasoning_effort: Option<String>,
     timeout_secs: u64,
+    max_turns: Option<u32>,
+    lease_lost: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ActivityResult> {
     let store = state
         .core
@@ -35,20 +37,36 @@ pub(super) async fn execute_contract_attempts(
     let mut previous_output = String::new();
     for primary_attempt in 1..=pinned.contract.max_primary_attempts {
         for correction_attempt in 0..=pinned.contract.max_corrections {
-            if !store
-                .reserve_agent_contract_attempt(&job.id, primary_attempt, correction_attempt)
+            match store
+                .reserve_agent_contract_attempt(job, max_turns, primary_attempt, correction_attempt)
                 .await?
             {
-                let mut result = ActivityResult::failed(
-                    activity,
-                    "Agent contract attempt budget was already consumed.",
-                    format!(
-                        "attempt reservation primary:{primary_attempt}:correction:{correction_attempt} already exists; refusing to invoke the model again"
-                    ),
-                )
-                .with_error_kind(ActivityErrorKind::Fatal);
-                result.artifacts = observations;
-                return Ok(result);
+                AgentContractAttemptReservation::Reserved => {}
+                AgentContractAttemptReservation::BudgetExhausted => {
+                    return Ok(ActivityResult {
+                        activity: activity.to_string(),
+                        status: ActivityStatus::Blocked,
+                        summary: "Agent contract workflow turn budget was exhausted.".to_string(),
+                        artifacts: observations,
+                        signals: Vec::new(),
+                        validation: Vec::new(),
+                        error: Some("the next pinned agent-contract attempt would exceed the runtime profile max_turns".to_string()),
+                        error_kind: None,
+                    });
+                }
+                AgentContractAttemptReservation::AlreadyReserved
+                | AgentContractAttemptReservation::StaleLease => {
+                    let mut result = ActivityResult::failed(
+                        activity,
+                        "Agent contract attempt reservation is no longer available.",
+                        format!(
+                            "attempt reservation primary:{primary_attempt}:correction:{correction_attempt} was already consumed or the runtime lease is stale; refusing to invoke the model"
+                        ),
+                    )
+                    .with_error_kind(ActivityErrorKind::Fatal);
+                    result.artifacts = observations;
+                    return Ok(result);
+                }
             }
             if correction_attempt > 0 {
                 corrections_used += 1;
@@ -62,6 +80,7 @@ pub(super) async fn execute_contract_attempts(
                 reasoning_effort.clone(),
                 timeout_secs,
                 correction,
+                Some(lease_lost.clone()),
             )
             .await
             {
@@ -220,6 +239,7 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::Mutex;
 
     struct LoopAgent {
@@ -342,6 +362,90 @@ mod tests {
             .register_declarative_current(loop_definition())
             .expect("loop definition should register");
         registry
+    }
+
+    #[tokio::test]
+    async fn lease_loss_cancels_the_contract_backend_before_returning() {
+        struct CancellationMarker(Arc<AtomicBool>);
+        impl Drop for CancellationMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct HangingAgent {
+            started: Arc<tokio::sync::Notify>,
+            cancelled: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl AgentBackend for HangingAgent {
+            fn name(&self) -> &str {
+                "hanging-contract-agent"
+            }
+            fn agent_contract_capabilities(
+                &self,
+            ) -> harness_core::agent::AgentContractCapabilities {
+                harness_core::agent::AgentContractCapabilities {
+                    prompt_only_launch: true,
+                    pinned_output_schema: true,
+                    attempt_observation_stream: true,
+                }
+            }
+            async fn execute_stream(
+                &self,
+                _request: harness_core::agent::AgentRequest,
+                _tx: tokio::sync::mpsc::Sender<harness_core::agent::AgentEvent>,
+            ) -> harness_core::error::Result<()> {
+                let _marker = CancellationMarker(Arc::clone(&self.cancelled));
+                self.started.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let definition = loop_definition();
+        let pinned_activity = definition
+            .agent_contract("classify_scope")
+            .expect("classifier contract");
+        let contract_value = serde_json::to_value(&pinned_activity.contract).expect("contract");
+        let pinned = PinnedJobAgentContract {
+            contract: pinned_activity.contract.clone(),
+            prompt: pinned_activity.prompt.clone(),
+            input: json!({
+                "schema": "harness.semantic_activity_input.v1",
+                "subject": {"kind": "test", "identity": "lease-loss"},
+                "facts": {"scope": "small"},
+                "provenance": {"/scope": "server"},
+                "contract_hash": harness_workflow::runtime::stable_remote_fact_hash(&contract_value),
+            }),
+            definition_hash: definition.definition_hash().to_string(),
+        };
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let backend = Arc::new(HangingAgent {
+            started: Arc::clone(&started),
+            cancelled: Arc::clone(&cancelled),
+        });
+        let (lease_lost, receiver) = tokio::sync::watch::channel(false);
+        let attempt = tokio::spawn(async move {
+            super::super::agent_contract_attempt::execute_agent_contract_attempt(
+                backend,
+                &pinned,
+                None,
+                None,
+                30,
+                None,
+                Some(receiver),
+            )
+            .await
+        });
+        started.notified().await;
+        lease_lost.send_replace(true);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), attempt)
+            .await
+            .expect("lease-loss cancellation should not hang")
+            .expect("attempt task should not panic")
+            .expect_err("lease loss must fail the attempt");
+        assert!(error.to_string().contains("lease loss"), "{error}");
+        assert!(cancelled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

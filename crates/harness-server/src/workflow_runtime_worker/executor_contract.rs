@@ -13,14 +13,14 @@ use harness_workflow::runtime::{
 #[async_trait]
 impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
-        job_consumes_runtime_turn(job)
+        job.input.pointer("/command/agent_contract").is_none() && job_requires_agent_runtime(job)
     }
 
     async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
         // Internal server-owned activities do not run a user agent. They must keep
         // flowing even when the runtime worker is disabled, otherwise disabling the
         // worker would strand workflows or prevent server-owned PR snapshots.
-        if !job_consumes_runtime_turn(job) {
+        if !job_requires_agent_runtime(job) {
             return None;
         }
         if let Some(result) = exact_replay_preflight_result(self.state, job).await {
@@ -48,7 +48,7 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     }
 }
 
-fn job_consumes_runtime_turn(job: &RuntimeJob) -> bool {
+fn job_requires_agent_runtime(job: &RuntimeJob) -> bool {
     job.input.pointer("/command/agent_contract").is_some() || !is_internal_non_agent_activity(job)
 }
 
@@ -134,7 +134,7 @@ mod tests {
             serde_json::json!(harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY);
 
         assert!(is_internal_non_agent_activity(&job));
-        assert!(job_consumes_runtime_turn(&job));
+        assert!(job_requires_agent_runtime(&job));
     }
 
     #[test]

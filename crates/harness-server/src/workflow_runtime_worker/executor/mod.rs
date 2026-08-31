@@ -122,7 +122,13 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         // as defense in depth.
         if let Some(pinned) = super::agent_contract_job::pinned_agent_contract_for_execution(&job)?
         {
-            return super::agent_contract_job::execute_contract_job(self.state, &job, pinned).await;
+            return super::agent_contract_job::execute_contract_job(
+                self.state,
+                &job,
+                pinned,
+                self.lease_lost_receiver.clone(),
+            )
+            .await;
         }
         if let Some(result) = self
             .execute_server_owned_activity(&job, workflow.as_ref())

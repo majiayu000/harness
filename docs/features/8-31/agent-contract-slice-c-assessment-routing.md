@@ -90,7 +90,7 @@ Fresh evidence from this branch:
 | Surface | Result |
 |---|---|
 | Canonical contract tests | 9 passed |
-| Declarative contract tests | 16 passed |
+| Declarative contract tests | 17 passed |
 | Server contract tests | 25 passed, 1 ignored live dogfood |
 | Runtime dispatch tests | 23 passed |
 | Real submission, assessment, route, and store reopen | passed; one model-backend invocation |
@@ -109,6 +109,8 @@ The first independent review found three blockers. The remediation binds authori
 The second independent review found that server-owned activity dispatch still preceded contract extraction and that malformed pinned payloads could escape the typed fatal boundary. Contract extraction now runs first for every activity name, including server-owned name collisions, and every present-contract extraction error is wrapped as a fatal contract execution error. A further fresh-context review remains required.
 
 The third independent review found three remaining upstream gaps. Malformed present contracts now fail their claimed command instead of entering a permanent dispatch barrier; contract presence takes precedence over server-owned activity names for runtime-turn budgeting and disabled-worker policy; and fatal or configuration contract failures terminate instead of following `on_failure` into a new contract budget. A further fresh-context review remains required.
+
+The fourth independent review found five remaining lifecycle gaps. Contract validation now precedes project policy and config resolution; invalid dispatch atomically records command failure, completion, and the reducer decision; every model invocation atomically consumes one workflow turn and one contract attempt; reservations require the current running lease owner and generation; and the contract stream terminates on lease loss. A further fresh-context review remains required.
 
 ## Slice D boundary
 

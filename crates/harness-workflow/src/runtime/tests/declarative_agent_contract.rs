@@ -610,6 +610,73 @@ mod declarative_agent_contract_tests {
     }
 
     #[tokio::test]
+    async fn malformed_contract_dispatch_failure_atomically_terminates_the_workflow(
+    ) -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let definition = build_declarative_definition(
+            &classifier_policy(),
+            &activity_policies(Some(contract())),
+        )?;
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry.register_declarative_current(definition.clone())?;
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db"))
+            .await?
+            .with_definition_registry(registry.into_shared());
+        let instance = WorkflowInstance::new(
+            definition.policy().id.clone(),
+            definition.definition_version(),
+            "classifying",
+            WorkflowSubject::new("test", "malformed-dispatch"),
+        )
+        .with_id("malformed-contract-dispatch")
+        .with_server_data(json!({"definition_hash": definition.definition_hash()}));
+        store.force_upsert_lifecycle_state_for_test(&instance).await?;
+        let mut command =
+            crate::runtime::declarative_agent_contract::declarative_enqueue_activity_command(
+                &definition,
+                &instance,
+                "classify_scope",
+                "malformed-contract-dispatch-1".to_string(),
+            )?;
+        command.command["agent_contract"] = serde_json::Value::Null;
+        store.enqueue_command(&instance.id, None, &command).await?;
+        let claimed = store
+            .claim_pending_commands("dispatcher", chrono::Utc::now() + chrono::Duration::seconds(30), 1)
+            .await?
+            .pop()
+            .expect("command should be claimed");
+        let result = ActivityResult::failed(
+            "classify_scope",
+            "Pinned agent contract failed dispatch validation.",
+            "agent_contract must be an object",
+        )
+        .with_error_kind(ActivityErrorKind::Fatal);
+
+        assert!(store
+            .fail_claimed_command_with_completion_if_owned(
+                &claimed.id,
+                DispatchClaim {
+                    owner: "dispatcher",
+                    generation: claimed.dispatch_claim_generation,
+                },
+                &result,
+            )
+            .await?);
+        assert_eq!(
+            store.get_instance(&instance.id).await?.expect("workflow").state,
+            "failed"
+        );
+        assert_eq!(
+            store.events_for(&instance.id).await?.into_iter().filter(|event| event.event_type == "RuntimeJobCompleted").count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dispatcher_defers_agent_contract_command_without_backend_authorization(
     ) -> anyhow::Result<()> {
         if resolve_database_url(None).is_err() {

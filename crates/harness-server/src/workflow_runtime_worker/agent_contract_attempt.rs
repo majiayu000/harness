@@ -1,15 +1,8 @@
 //! Real execution path for one pinned agent-contract attempt.
 //!
-//! Production dispatch reaches this path only after the server authorizes the
-//! exact selected profile against the concrete backend's capability claims.
-//!
 //! Enforcement model: a conforming backend cannot switch its tool surface off
 //! (codex-cli has no such flag), so the contract is enforced by construction
 //! plus observation —
-//! - the launch input is the pinned prompt plus pinned semantic input envelope:
-//!   no prompt packet, repo memory, workflow document, user config, or rule files;
-//! - the workspace is a fresh empty temp directory with no repository
-//!   checkout (`workspace: ephemeral_empty`);
 //! - the launch is deny-all-tools (`allowed_tools = []`), read-only sandbox,
 //!   approvals never;
 //! - the pinned output schema document is handed to the backend's structured
@@ -38,26 +31,18 @@ use super::agent_contract_enforcement::{
 };
 use super::agent_contract_prompt::contract_attempt_prompt;
 
-/// Everything the server observed and received from one contract attempt.
 #[derive(Debug)]
 pub(super) struct ContractAttempt {
-    /// Final structured reply text from the backend.
     pub(super) output: String,
-    /// Completed transcript items, recorded from the stream.
     pub(super) items: Vec<Item>,
-    /// Server-observed stream facts for the whole attempt.
     pub(super) observations: TurnStreamObservations,
 }
 
-/// Structured verdict parsed from a contract attempt's reply.
 pub(super) struct ContractVerdict {
     pub(super) outcome: String,
     pub(super) raw: Value,
 }
 
-/// Launches one contract attempt against `backend` and records the whole
-/// stream. This is the enforcement primitive itself; it performs the
-/// capability preflight again so a direct caller can never skip it.
 pub(super) async fn execute_agent_contract_attempt(
     backend: Arc<dyn AgentBackend>,
     pinned: &PinnedJobAgentContract,
@@ -65,6 +50,7 @@ pub(super) async fn execute_agent_contract_attempt(
     reasoning_effort: Option<String>,
     timeout_secs: u64,
     correction: Option<(&str, &str)>,
+    mut lease_lost: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> anyhow::Result<ContractAttempt> {
     if timeout_secs == 0 {
         anyhow::bail!("agent contract attempt timeout_secs must be positive");
@@ -158,6 +144,30 @@ pub(super) async fn execute_agent_contract_attempt(
                 }
                 anyhow::bail!("agent contract attempt timed out after {timeout_secs}s");
             }
+            _ = async {
+                let Some(receiver) = lease_lost.as_mut() else {
+                    std::future::pending::<()>().await;
+                    return;
+                };
+                while !*receiver.borrow() {
+                    if receiver.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            } => {
+                stream.abort();
+                match stream.await {
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => anyhow::bail!(
+                        "agent contract attempt lease-loss cleanup failed: {error}"
+                    ),
+                    Ok(Err(error)) => anyhow::bail!(
+                        "agent contract attempt stream failed during lease-loss cleanup: {error}"
+                    ),
+                    Ok(Ok(())) => {}
+                }
+                anyhow::bail!("agent contract attempt cancelled after runtime lease loss");
+            }
         }
     }
     stream
@@ -172,9 +182,6 @@ pub(super) async fn execute_agent_contract_attempt(
     })
 }
 
-/// Converts an observed attempt into the job's `ActivityResult`: violations
-/// invalidate the attempt, an unparsable or off-vocabulary verdict fails it,
-/// and the server-authored observation artifact is attached either way.
 #[cfg(test)]
 pub(super) fn contract_attempt_activity_result(
     activity: &str,
@@ -217,9 +224,6 @@ pub(super) fn contract_attempt_activity_result(
     }
 }
 
-/// Everything observed during the attempt that the pinned contract forbids.
-/// Fail closed: unknown event kinds count as violations because an
-/// unrecognized surface cannot be proven benign.
 pub(super) fn contract_violations(attempt: &ContractAttempt) -> Vec<String> {
     let mut violations = BTreeSet::new();
     for item in &attempt.items {
@@ -266,9 +270,6 @@ pub(super) fn contract_violations(attempt: &ContractAttempt) -> Vec<String> {
     violations.into_iter().collect()
 }
 
-/// Validates the attempt's reply against the pinned contract: it must be a
-/// JSON object naming the pinned output schema, with an `outcome` from the
-/// pinned vocabulary and a non-empty `rationale`.
 pub(super) fn parse_contract_verdict(
     output: &str,
     contract: &WorkflowAgentContract,
@@ -342,7 +343,6 @@ mod tests {
         .to_string()
     }
 
-    /// Records the launch request and workspace state, then replays a script.
     struct ScriptedBackend {
         conforming: bool,
         script: Mutex<Vec<AgentEvent>>,
@@ -421,6 +421,7 @@ mod tests {
             None,
             30,
             None,
+            None,
         )
         .await
         .expect_err("a backend claiming nothing must be rejected before launch");
@@ -443,6 +444,7 @@ mod tests {
             Some("gpt-5.4".to_string()),
             Some("high".to_string()),
             30,
+            None,
             None,
         )
         .await
@@ -518,9 +520,17 @@ mod tests {
             }]),
             schema_contents: Mutex::new(Vec::new()),
         });
-        execute_agent_contract_attempt(recording.clone(), &pinned_contract(), None, None, 30, None)
-            .await
-            .expect("scripted attempt succeeds");
+        execute_agent_contract_attempt(
+            recording.clone(),
+            &pinned_contract(),
+            None,
+            None,
+            30,
+            None,
+            None,
+        )
+        .await
+        .expect("scripted attempt succeeds");
         assert_eq!(
             recording.schema_contents.lock().expect("lock")[0],
             agent_contract_output_schema_document("harness.semantic_verdict.v1")
@@ -553,7 +563,7 @@ mod tests {
             },
         ]);
         let attempt =
-            execute_agent_contract_attempt(backend, &pinned_contract(), None, None, 30, None)
+            execute_agent_contract_attempt(backend, &pinned_contract(), None, None, 30, None, None)
                 .await
                 .expect("scripted attempt succeeds");
         assert_eq!(attempt.items.len(), 1);
@@ -614,7 +624,7 @@ mod tests {
             cancelled: Arc::clone(&cancelled),
         });
         let error =
-            execute_agent_contract_attempt(backend, &pinned_contract(), None, None, 1, None)
+            execute_agent_contract_attempt(backend, &pinned_contract(), None, None, 1, None, None)
                 .await
                 .expect_err("a hung backend must hit the pinned wall-clock boundary");
 
