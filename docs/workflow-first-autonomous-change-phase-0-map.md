@@ -1273,6 +1273,8 @@ a destructive transition:
 - a shared database role refuses cutover;
 - final provider-fence capture refuses while any old provider action lacks a reconciled terminal
   outcome;
+- cancellation is permitted only for provider actions proven never dispatched; every possible
+  dispatch is reconciled to authenticated remote terminal truth;
 - every new command/job claim is fenced before authority revocation; all claimed non-provider jobs,
   completion candidates, agent processes, and runtime-owned workspace leases must drain to zero;
 - final provider-fence capture refuses until old provider credentials are revoked and the
@@ -1360,6 +1362,10 @@ a destructive transition:
 - every external-merge wait persists an immutable snapshot of its binding, gate facts/result,
   authorization, review/risk inputs, and stack generation/cursor when applicable; confirmation is
   consumed only by its dedicated reconciliation activity;
+- external direct/stack waits revalidate authorization and block a merge observed after expiry or
+  revocation; provider reconciliation binds the exact merge attempt and gate chain;
+- each landed stack entry sends one child handoff receipt and waits for the child's terminal
+  acknowledgement before cursor advance, completion, or cancellation of remaining entries;
 - independent release invalidation switches an external-merge wait to fenced invalidation mode and
   immediately refreshes it; a later merge blocks as a policy violation instead of satisfying the child;
 - direct and stack merge provider actions reject a missing or stale current binding, gate result, or
