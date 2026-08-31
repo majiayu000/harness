@@ -253,21 +253,29 @@ pub(super) fn local_review_decision_from_activity_result(
         "local-review:{}:{}:address:{}",
         instance.id, pr_number, repair_dedupe_source
     );
-    Some(
-        build_local_review_completed_decision(
-            instance,
-            LocalReviewCompletedInput {
-                task_id: &task_id,
-                pr_number,
-                pr_url: pr_url.as_deref(),
-                repair_dedupe_key: &repair_dedupe_key,
-                outcome,
-                summary: result.summary.as_str(),
-            },
-        )
-        .decision
-        .with_evidence(runtime_completion_evidence(event, result)),
+    let mut decision = build_local_review_completed_decision(
+        instance,
+        LocalReviewCompletedInput {
+            task_id: &task_id,
+            pr_number,
+            pr_url: pr_url.as_deref(),
+            repair_dedupe_key: &repair_dedupe_key,
+            outcome,
+            summary: result.summary.as_str(),
+        },
     )
+    .decision;
+    if outcome == LocalReviewOutcome::Blocked {
+        let dedupe_key = decision.commands.first()?.dedupe_key.clone();
+        decision.commands = vec![runtime_blocked_command(
+            result.summary.as_str(),
+            None,
+            dedupe_key,
+            event,
+            result,
+        )];
+    }
+    Some(decision.with_evidence(runtime_completion_evidence(event, result)))
 }
 
 pub(super) fn pr_feedback_child_decision_from_activity_result(

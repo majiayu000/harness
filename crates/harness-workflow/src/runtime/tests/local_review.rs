@@ -557,6 +557,18 @@ fn local_review_blocked_result_routes_to_blocked() {
         decision.commands[0].dedupe_key,
         "local-review:job-1:77:blocked"
     );
+    assert_eq!(
+        decision.commands[0].command["last_stop"]["state"],
+        "blocked"
+    );
+    assert_eq!(
+        decision.commands[0].command["last_stop"]["activity"],
+        LOCAL_REVIEW_ACTIVITY
+    );
+    assert_eq!(
+        decision.commands[0].command["last_stop"]["runtime_job_id"],
+        "job-1"
+    );
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,
