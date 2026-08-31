@@ -333,7 +333,7 @@ impl<'a> RuntimeWorker<'a> {
             .commit_parent_runtime_completion(
                 parent_workflow_id,
                 &self.owner,
-                merge_child_completion_payload(event, &child.id),
+                merge_child_completion_payload(event, &child),
             )
             .await?;
         Ok(())
@@ -363,7 +363,7 @@ impl<'a> RuntimeWorker<'a> {
             .commit_parent_runtime_completion(
                 parent_workflow_id,
                 &self.owner,
-                merge_child_completion_payload(event, &child.id),
+                merge_child_completion_payload(event, &child),
             )
             .await?;
         Ok(())
@@ -454,14 +454,25 @@ fn runtime_event_result_succeeded(event: &super::model::WorkflowEvent) -> bool {
 
 fn merge_child_completion_payload(
     event: &super::model::WorkflowEvent,
-    child_workflow_id: &str,
+    child: &WorkflowInstance,
 ) -> serde_json::Value {
     let mut payload = event.event.clone();
     if let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "child_workflow_id".to_string(),
-            serde_json::json!(child_workflow_id),
-        );
+        object.insert("child_workflow_id".to_string(), serde_json::json!(child.id));
+        if let Some(runtime_job_id) = child
+            .data
+            .get("started_by_runtime_job_id")
+            .and_then(Value::as_str)
+        {
+            object.insert(
+                "recovery_activity".to_string(),
+                serde_json::json!("start_child_workflow"),
+            );
+            object.insert(
+                "recovery_runtime_job_id".to_string(),
+                serde_json::json!(runtime_job_id),
+            );
+        }
         if let Some(artifacts) = object
             .get_mut("activity_result")
             .and_then(serde_json::Value::as_object_mut)

@@ -406,6 +406,96 @@ async fn runtime_recovery_resumes_stopped_lifecycle_activity() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn runtime_recovery_replays_parent_command_for_legacy_child_stop() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let mut parent = project_issue_instance("/project-a", 1730, "awaiting_feedback");
+    store
+        .force_upsert_lifecycle_state_for_test(&parent)
+        .await?;
+    let parent_command = pr_feedback_child_command(
+        "start-feedback-child-1730",
+        "pr:77",
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+    );
+    let (_parent_command_id, parent_runtime_job_id) =
+        enqueue_original_runtime_job(&store, &parent.id, &parent_command).await?;
+
+    let child = WorkflowInstance::new(
+        PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "feedback_found",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("legacy-feedback-child-1730")
+    .with_parent(parent.id.clone())
+    .with_server_data(json!({
+        "started_by_runtime_job_id": parent_runtime_job_id,
+    }));
+    store.force_upsert_lifecycle_state_for_test(&child).await?;
+    let child_command =
+        WorkflowCommand::enqueue_activity(PR_FEEDBACK_INSPECT_ACTIVITY, "inspect-feedback-1730");
+    let (_child_command_id, child_runtime_job_id) =
+        enqueue_original_runtime_job(&store, &child.id, &child_command).await?;
+
+    parent.state = "blocked".to_string();
+    parent = parent.with_server_data(json!({
+        "last_stop": {
+            "state": "blocked",
+            "activity": PR_FEEDBACK_INSPECT_ACTIVITY,
+            "runtime_job_id": child_runtime_job_id
+        }
+    }));
+    store
+        .force_upsert_lifecycle_state_for_test(&parent)
+        .await?;
+
+    let workflow = recovered_workflow(
+        recover(
+            &store,
+            &parent.id,
+            super::WorkflowRuntimeRecoveryAction::Unblock,
+        )
+        .await?,
+        "legacy child stop recovery",
+    )?;
+
+    assert_eq!(workflow.state, "awaiting_feedback");
+    let commands = store.commands_for(&parent.id).await?;
+    let replayed = commands
+        .iter()
+        .find(|command| command.status == WorkflowCommandStatus::Pending)
+        .expect("parent child-workflow command should be replayed");
+    assert_eq!(replayed.command.command_type, WorkflowCommandType::StartChildWorkflow);
+    assert_eq!(replayed.command.command, parent_command.command);
+
+    let foreign_parent = project_issue_instance("/project-a", 1731, "blocked").with_server_data(
+        json!({
+            "last_stop": {
+                "state": "blocked",
+                "activity": PR_FEEDBACK_INSPECT_ACTIVITY,
+                "runtime_job_id": child_runtime_job_id
+            }
+        }),
+    );
+    store
+        .force_upsert_lifecycle_state_for_test(&foreign_parent)
+        .await?;
+    let foreign_outcome = recover(
+        &store,
+        &foreign_parent.id,
+        super::WorkflowRuntimeRecoveryAction::Unblock,
+    )
+    .await?;
+    assert_unsupported_activity(foreign_outcome, PR_FEEDBACK_INSPECT_ACTIVITY);
+    Ok(())
+}
+
+#[tokio::test]
 async fn successful_runtime_recovery_clears_resolved_stop_metadata() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());

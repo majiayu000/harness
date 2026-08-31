@@ -11,9 +11,6 @@ use crate::runtime::model::{
     ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowDecisionRecord, WorkflowEvidence,
 };
-use crate::runtime::pr_feedback::{
-    LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
-};
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::state_registry::{
     DeclarativeDefinitionPinError, DeclarativeDefinitionResolution, WorkflowDefinitionRegistry,
@@ -30,6 +27,9 @@ mod recovery_validation;
 use recovery_definition::{
     custom_declarative_definition, declarative_recovery_rejection, is_builtin_definition_id,
 };
+#[path = "recovery_dispatch.rs"]
+mod recovery_dispatch;
+use recovery_dispatch::*;
 #[path = "recovery_declarative_plan.rs"]
 mod recovery_declarative_plan;
 use recovery_declarative_plan::declarative_recovery_dispatch_plan;
@@ -82,25 +82,6 @@ pub enum WorkflowRuntimeRecoveryOutcome {
     TargetNotAllowed { workflow: WorkflowInstance, target_state: String },
     MissingRequiredEvidence { workflow: WorkflowInstance, detail: String },
     NotFound,
-}
-
-#[rustfmt::skip]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RecoveryDispatchTarget { state: String, activity: Option<String> }
-
-#[rustfmt::skip]
-#[derive(Debug, Clone, PartialEq)]
-struct RecoveryDispatchPlan { target: RecoveryDispatchTarget, command_source: RecoveryDispatchCommandSource }
-
-#[derive(Debug, Clone, PartialEq)]
-enum RecoveryDispatchCommandSource {
-    Replay(WorkflowCommand),
-    LegacyFallback,
-    /// Fully built progress command for a declarative recovery target, built
-    /// through the pinned-command path so an agent-contract activity keeps its
-    /// contract, prompt, and definition hash; only the dedupe key is assigned
-    /// at dispatch time.
-    DeclarativeProgress(WorkflowCommand),
 }
 
 impl WorkflowRuntimeStore {
@@ -355,7 +336,7 @@ async fn recovery_dispatch_plan_tx(
     }
     validate_stopped_metadata(&instance.data)?;
     let activity = stopped_activity(&instance.data)?;
-    let target = match recovery_dispatch_target(&instance.data, activity.as_deref())? {
+    let mut target = match recovery_dispatch_target(&instance.data, activity.as_deref())? {
         Ok(target) => target,
         Err(activity) => return Ok(Err(activity)),
     };
@@ -363,9 +344,26 @@ async fn recovery_dispatch_plan_tx(
         let Some(runtime_job_id) = stopped_runtime_job_id(&instance.data)? else {
             return Ok(Err(activity));
         };
-        let command = select_command_for_runtime_job_tx(tx, &instance.id, &runtime_job_id)
-            .await?
-            .ok_or_else(|| activity.clone());
+        let direct_command =
+            select_command_for_runtime_job_tx(tx, &instance.id, &runtime_job_id).await?;
+        let command = match direct_command {
+            Some(command) => Ok(command),
+            None => {
+                let parent_command =
+                    select_parent_command_for_child_job_tx(tx, &instance.id, &runtime_job_id)
+                        .await?;
+                if parent_command.is_some() {
+                    target = match recovery_dispatch_target(
+                        &instance.data,
+                        Some("start_child_workflow"),
+                    )? {
+                        Ok(target) => target,
+                        Err(activity) => return Ok(Err(activity)),
+                    };
+                }
+                parent_command.ok_or_else(|| activity.clone())
+            }
+        };
         let command = match command {
             Ok(command) => command,
             Err(activity) => return Ok(Err(activity)),
@@ -381,107 +379,6 @@ async fn recovery_dispatch_plan_tx(
         target: target.clone(),
         command_source,
     }))
-}
-
-fn recovery_dispatch_target(
-    data: &Value,
-    activity_name: Option<&str>,
-) -> anyhow::Result<Result<RecoveryDispatchTarget, Option<String>>> {
-    let activity = activity_name.map(ToOwned::to_owned);
-    let Some(activity_name) = activity.as_deref() else {
-        if has_no_structured_stop_metadata(data)? {
-            return Ok(Ok(RecoveryDispatchTarget {
-                state: "implementing".to_string(),
-                activity: Some("implement_issue".to_string()),
-            }));
-        }
-        return Ok(Err(activity));
-    };
-    let target = match activity_name {
-        "implement_issue" => RecoveryDispatchTarget {
-            state: "implementing".to_string(),
-            activity: Some("implement_issue".to_string()),
-        },
-        "replan_issue" => RecoveryDispatchTarget {
-            state: "replanning".to_string(),
-            activity: Some("replan_issue".to_string()),
-        },
-        "merge_pr" => RecoveryDispatchTarget {
-            state: "merging".to_string(),
-            activity: Some("merge_pr".to_string()),
-        },
-        LOCAL_REVIEW_ACTIVITY => RecoveryDispatchTarget {
-            state: "local_review_gate".to_string(),
-            activity: Some(LOCAL_REVIEW_ACTIVITY.to_string()),
-        },
-        "sweep_pr_feedback" => RecoveryDispatchTarget {
-            state: "awaiting_feedback".to_string(),
-            activity: Some("sweep_pr_feedback".to_string()),
-        },
-        PR_FEEDBACK_INSPECT_ACTIVITY => RecoveryDispatchTarget {
-            state: "awaiting_feedback".to_string(),
-            activity: Some(PR_FEEDBACK_INSPECT_ACTIVITY.to_string()),
-        },
-        "start_child_workflow" => RecoveryDispatchTarget {
-            state: "awaiting_feedback".to_string(),
-            activity: Some("start_child_workflow".to_string()),
-        },
-        "address_pr_feedback" => RecoveryDispatchTarget {
-            state: "addressing_feedback".to_string(),
-            activity: Some("address_pr_feedback".to_string()),
-        },
-        _ => return Ok(Err(activity)),
-    };
-    Ok(Ok(target))
-}
-
-async fn select_command_for_runtime_job_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workflow_id: &str,
-    runtime_job_id: &str,
-) -> anyhow::Result<Option<WorkflowCommand>> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT command.data::text FROM runtime_jobs AS job JOIN workflow_commands AS command ON command.id = job.command_id WHERE job.id = $1 AND command.workflow_id = $2",
-    )
-    .bind(runtime_job_id)
-    .bind(workflow_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    row.map(|(data,)| serde_json::from_str(&data))
-        .transpose()
-        .map_err(Into::into)
-}
-
-#[rustfmt::skip]
-fn command_matches_recovery_target(command: &WorkflowCommand, target: &RecoveryDispatchTarget) -> bool {
-    match command.command_type {
-        WorkflowCommandType::EnqueueActivity => {
-            command.activity_name() == target.activity.as_deref()
-                && enqueue_payload_matches_target(&command.command)
-        }
-        WorkflowCommandType::StartChildWorkflow => {
-            let payload = &command.command;
-            matches!(target.activity.as_deref(), Some("start_child_workflow" | "sweep_pr_feedback"))
-                && payload.get("definition_id").and_then(Value::as_str) == Some(PR_FEEDBACK_DEFINITION_ID)
-                && payload.get("child_activity").and_then(Value::as_str) == Some(PR_FEEDBACK_INSPECT_ACTIVITY)
-                && payload.get("pr_number").and_then(Value::as_u64).is_some()
-                && payload.get("subject_key").and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())
-        }
-        _ => false,
-    }
-}
-
-fn enqueue_payload_matches_target(payload: &Value) -> bool {
-    let review_summary = payload
-        .get("review_summary")
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty());
-    let hygiene = payload
-        .get("hygiene")
-        .or_else(|| payload.get("hygiene_context"))
-        .is_some_and(|value| !value.is_null());
-    payload.get("source").and_then(Value::as_str) != Some("pr_hygiene")
-        || (payload.get("pr_number").and_then(Value::as_u64).is_some() && review_summary && hygiene)
 }
 
 #[rustfmt::skip]

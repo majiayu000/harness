@@ -206,6 +206,35 @@ fn blocker_count_from_local_review_does_not_block_remote_feedback_repair() {
 }
 
 #[test]
+fn propagated_child_block_records_the_parent_recovery_command() {
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+        "feedback_repair_round": 1,
+        "feedback_repair_blocker_count": 1,
+        "feedback_repair_lane": "remote_feedback",
+    }));
+    let mut event = event_for_result(blocking_feedback_result(1));
+    event.event["recovery_activity"] = json!("start_child_workflow");
+    event.event["recovery_runtime_job_id"] = json!("parent-start-child-job");
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("non-converging child feedback should stop the parent");
+
+    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(
+        decision.commands[0].command["last_stop"]["activity"],
+        "start_child_workflow"
+    );
+    assert_eq!(
+        decision.commands[0].command["last_stop"]["runtime_job_id"],
+        "parent-start-child-job"
+    );
+}
+
+#[test]
 fn fewer_feedback_blockers_allows_the_next_repair_round() {
     let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
