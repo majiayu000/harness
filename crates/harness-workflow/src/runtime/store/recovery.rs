@@ -341,37 +341,40 @@ async fn recovery_dispatch_plan_tx(
         Err(activity) => return Ok(Err(activity)),
     };
     let command_source = if activity.is_some() {
-        let Some(runtime_job_id) = stopped_runtime_job_id(&instance.data)? else {
-            return Ok(Err(activity));
-        };
-        let direct_command =
-            select_command_for_runtime_job_tx(tx, &instance.id, &runtime_job_id).await?;
-        let command = match direct_command {
-            Some(command) => Ok(command),
-            None => {
-                let parent_command =
-                    select_parent_command_for_child_job_tx(tx, &instance.id, &runtime_job_id)
-                        .await?;
-                if parent_command.is_some() {
-                    target = match recovery_dispatch_target(
-                        &instance.data,
-                        Some("start_child_workflow"),
-                    )? {
-                        Ok(target) => target,
-                        Err(activity) => return Ok(Err(activity)),
-                    };
+        if let Some(runtime_job_id) = stopped_runtime_job_id(&instance.data)? {
+            let direct_command =
+                select_command_for_runtime_job_tx(tx, &instance.id, &runtime_job_id).await?;
+            let command = match direct_command {
+                Some(command) => Ok(command),
+                None => {
+                    let parent_command =
+                        select_parent_command_for_child_job_tx(tx, &instance.id, &runtime_job_id)
+                            .await?;
+                    if parent_command.is_some() {
+                        target = match recovery_dispatch_target(
+                            &instance.data,
+                            Some("start_child_workflow"),
+                        )? {
+                            Ok(target) => target,
+                            Err(activity) => return Ok(Err(activity)),
+                        };
+                    }
+                    parent_command.ok_or_else(|| activity.clone())
                 }
-                parent_command.ok_or_else(|| activity.clone())
+            };
+            let command = match command {
+                Ok(command) => command,
+                Err(activity) => return Ok(Err(activity)),
+            };
+            if !command_matches_recovery_target(&command, &target) {
+                return Ok(Err(activity));
             }
-        };
-        let command = match command {
-            Ok(command) => command,
-            Err(activity) => return Ok(Err(activity)),
-        };
-        if !command_matches_recovery_target(&command, &target) {
+            RecoveryDispatchCommandSource::Replay(command)
+        } else if is_hygiene_convergence_stop(&instance.data)? {
+            RecoveryDispatchCommandSource::HygieneRepair
+        } else {
             return Ok(Err(activity));
         }
-        RecoveryDispatchCommandSource::Replay(command)
     } else {
         RecoveryDispatchCommandSource::LegacyFallback
     };
@@ -581,6 +584,11 @@ fn recovery_dispatch_command(
     });
     for field in RECOVERY_CONTEXT_FIELDS {
         copy_optional_data_field(&mut payload, &instance.data, field);
+    }
+    if plan.command_source == RecoveryDispatchCommandSource::HygieneRepair {
+        payload["source"] = json!("pr_hygiene");
+        payload["review_summary"] = instance.data["feedback_summary"].clone();
+        payload["hygiene"] = instance.data["hygiene_context"].clone();
     }
     WorkflowCommand::new(WorkflowCommandType::EnqueueActivity, dedupe_key, payload)
 }

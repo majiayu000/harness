@@ -4,18 +4,18 @@ use harness_workflow::runtime::{
     build_local_review_completed_decision, build_pr_detected_decision, build_pr_feedback_decision,
     DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrierInput,
     DispatchBarrierReasonCode, LocalReviewCompletedInput, LocalReviewOutcome,
-    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome, WorkflowCommandType,
+    PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
 };
 use harness_workflow::runtime::{
     build_local_review_request_decision, build_pr_feedback_sweep_decision,
     build_pr_hygiene_repair_decision, next_feedback_repair_round, DataProvenance,
     DecisionValidator, FeedbackRepairLane, FeedbackRepairStop, LocalReviewDecisionInput,
     PrFeedbackSweepDecisionInput, PrHygieneRepairDecisionInput, RemoteFactSnapshot,
-    ValidationContext, WorkflowCommand, WorkflowCommandStatus, WorkflowDecision,
-    WorkflowDecisionRecord, WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence,
-    WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY,
+    ValidationContext, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
+    WorkflowDecision, WorkflowDecisionRecord, WorkflowDecisionTransition, WorkflowDefinition,
+    WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_HYGIENE_CONVERGENCE_STOP_SOURCE,
 };
 use serde_json::json;
 use std::path::Path;

@@ -881,6 +881,41 @@ fn runtime_completion_reducer_finishes_from_server_merged_pr_snapshot() {
 }
 
 #[test]
+fn runtime_completion_reducer_does_not_finish_failed_merge_from_merged_snapshot() {
+    let instance = issue_instance("merging").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::failed(
+        "merge_pr",
+        "Server-side merge completion verification rejected a stale pull request head.",
+        "observed head did not match expected_head_sha",
+    )
+    .with_error_kind(ActivityErrorKind::Fatal)
+    .with_artifact(ActivityArtifact::new(
+        crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "snapshot_source": "server_github_graphql",
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "state": "MERGED",
+            "head_oid": "stale-head",
+            "observed_at": "2026-08-31T00:00:00Z",
+        }),
+    ));
+    let event = runtime_completion_event(&instance, "merge_pr", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("failed merge verification should produce a failure decision");
+
+    assert_eq!(decision.decision, "fail_after_runtime_activity");
+    assert_eq!(decision.next_state, "failed");
+}
+
+#[test]
 fn runtime_completion_reducer_cancels_from_server_closed_pr_snapshot() {
     let instance = issue_instance("local_review_gate").with_server_data(json!({
         "repo": "owner/repo",

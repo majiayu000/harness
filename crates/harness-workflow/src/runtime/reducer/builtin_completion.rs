@@ -57,8 +57,10 @@ pub(super) fn reduce_builtin_completion(
     ) {
         return None;
     }
-    if let Some(decision) = terminal_pr_snapshot_decision(instance, event, result) {
-        return Some(Ok(Some(decision)));
+    if result.status == ActivityStatus::Succeeded {
+        if let Some(decision) = terminal_pr_snapshot_decision(instance, event, result) {
+            return Some(Ok(Some(decision)));
+        }
     }
     if result.status != ActivityStatus::Succeeded {
         if let Some(decision) = github_issue_closed_decision(instance, event, result) {

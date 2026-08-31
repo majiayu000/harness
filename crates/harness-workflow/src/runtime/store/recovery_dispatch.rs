@@ -21,6 +21,7 @@ pub(super) struct RecoveryDispatchPlan {
 pub(super) enum RecoveryDispatchCommandSource {
     Replay(WorkflowCommand),
     LegacyFallback,
+    HygieneRepair,
     /// Fully built progress command for a declarative recovery target, built
     /// through the pinned-command path so an agent-contract activity keeps its
     /// contract, prompt, and definition hash; only the dedupe key is assigned
@@ -78,6 +79,34 @@ pub(super) fn recovery_dispatch_target(
         _ => return Ok(Err(activity)),
     };
     Ok(Ok(target))
+}
+
+pub(super) fn is_hygiene_convergence_stop(data: &Value) -> anyhow::Result<bool> {
+    if data.pointer("/last_stop/source").and_then(Value::as_str)
+        != Some(crate::runtime::pr_feedback::PR_HYGIENE_CONVERGENCE_STOP_SOURCE)
+    {
+        return Ok(false);
+    }
+    let hygiene = data
+        .get("hygiene_context")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            anyhow::anyhow!("workflow runtime recovery hygiene_context must be an object")
+        })?;
+    if data.pointer("/last_stop/state").and_then(Value::as_str) != Some("blocked")
+        || data.pointer("/last_stop/activity").and_then(Value::as_str)
+            != Some("address_pr_feedback")
+        || data.get("pr_number").and_then(Value::as_u64).is_none()
+        || data
+            .get("feedback_summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        || hygiene.get("source").and_then(Value::as_str) != Some("pr_hygiene")
+    {
+        anyhow::bail!("workflow runtime recovery hygiene convergence metadata is incomplete");
+    }
+    Ok(true)
 }
 
 pub(super) async fn select_command_for_runtime_job_tx(

@@ -202,6 +202,87 @@ fn automatic_unblock_preserves_feedback_repair_budget() {
 }
 
 #[test]
+fn marked_hygiene_convergence_recovers_address_pr_feedback() {
+    let instance = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "blocked",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_server_data(serde_json::json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "feedback_summary": "Runtime PR hygiene found mergeability repair is needed for PR #77.",
+        "feedback_repair_round": 3,
+        "feedback_repair_blocker_count": 1,
+        "feedback_repair_lane": "remote_feedback",
+        "last_stop": {
+            "state": "blocked",
+            "activity": "address_pr_feedback",
+            "source": "pr_hygiene_convergence"
+        },
+        "hygiene_context": {
+            "source": "pr_hygiene",
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "merge_state_status": "DIRTY"
+        }
+    }));
+
+    let activity =
+        stopped_activity(&instance.data).expect("hygiene convergence activity should parse");
+    assert!(is_hygiene_convergence_stop(&instance.data)
+        .expect("hygiene convergence marker should validate"));
+    let target = recovery_dispatch_target(&instance.data, activity.as_deref())
+        .expect("hygiene recovery metadata should parse")
+        .expect("hygiene convergence should have a recovery target");
+    assert_eq!(target.state, "addressing_feedback");
+    assert_eq!(target.activity.as_deref(), Some("address_pr_feedback"));
+
+    let command = recovery_dispatch_command(
+        &instance,
+        WorkflowRuntimeRecoveryAction::Unblock,
+        "operator resolved the convergence stop",
+        &RecoveryDispatchPlan {
+            target,
+            command_source: RecoveryDispatchCommandSource::HygieneRepair,
+        },
+        "event-one",
+    );
+    assert_eq!(command.activity_name(), Some("address_pr_feedback"));
+    assert_eq!(command.command["source"], "pr_hygiene");
+    assert_eq!(command.command["pr_number"], 77);
+    assert_eq!(
+        command.command["review_summary"],
+        "Runtime PR hygiene found mergeability repair is needed for PR #77."
+    );
+    assert_eq!(command.command["hygiene"], instance.data["hygiene_context"]);
+}
+
+#[test]
+fn metadata_free_legacy_recovery_ignores_stale_hygiene_context() {
+    let data = serde_json::json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "feedback_summary": "A prior hygiene repair was requested.",
+        "hygiene_context": {
+            "source": "pr_hygiene",
+            "pr_number": 77
+        }
+    });
+
+    let target = recovery_dispatch_target(&data, None)
+        .expect("legacy recovery metadata should parse")
+        .expect("legacy recovery should keep its fallback target");
+
+    assert_eq!(target.state, "implementing");
+    assert_eq!(target.activity.as_deref(), Some("implement_issue"));
+}
+
+#[test]
 fn declarative_recovery_builds_exact_progress_driver_and_preserves_evidence() {
     let definition = definition();
     let instance = instance(&definition);

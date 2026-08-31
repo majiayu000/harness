@@ -30,10 +30,7 @@ pub(super) async fn evaluate_hygiene_repair_convergence(
         "blocked",
         &reason,
     )
-    .with_command(WorkflowCommand::mark_blocked(
-        &reason,
-        format!("pr-hygiene:{}:convergence-block", instance.id),
-    ))
+    .with_command(hygiene_convergence_blocked_command(&instance.id, &reason))
     .with_evidence(WorkflowEvidence::new("pr_feedback_convergence", &reason))
     .high_confidence();
     let outcome = commit_runtime_decision(
@@ -71,6 +68,21 @@ pub(super) async fn evaluate_hygiene_repair_convergence(
     Ok(HygieneRepairConvergence::Stop(outcome))
 }
 
+fn hygiene_convergence_blocked_command(instance_id: &str, reason: &str) -> WorkflowCommand {
+    WorkflowCommand::new(
+        WorkflowCommandType::MarkBlocked,
+        format!("pr-hygiene:{instance_id}:convergence-block"),
+        json!({
+            "reason": reason,
+            "last_stop": {
+                "state": "blocked",
+                "activity": "address_pr_feedback",
+                "source": PR_HYGIENE_CONVERGENCE_STOP_SOURCE,
+            },
+        }),
+    )
+}
+
 fn hygiene_repair_stop(stop: FeedbackRepairStop) -> (&'static str, String) {
     match stop {
         FeedbackRepairStop::RoundLimit { completed_rounds } => (
@@ -91,5 +103,26 @@ fn hygiene_repair_stop(stop: FeedbackRepairStop) -> (&'static str, String) {
                 "PR hygiene repair did not decrease actionable blockers ({previous} before, {current} now); automatic repair is stopped to prevent oscillation."
             ),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convergence_block_records_hygiene_recovery_source() {
+        let command = hygiene_convergence_blocked_command("workflow-1", "no progress");
+
+        assert_eq!(command.command_type, WorkflowCommandType::MarkBlocked);
+        assert_eq!(command.command["last_stop"]["state"], "blocked");
+        assert_eq!(
+            command.command["last_stop"]["activity"],
+            "address_pr_feedback"
+        );
+        assert_eq!(
+            command.command["last_stop"]["source"],
+            PR_HYGIENE_CONVERGENCE_STOP_SOURCE
+        );
     }
 }
