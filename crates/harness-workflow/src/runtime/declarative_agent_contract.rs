@@ -49,6 +49,13 @@ struct AgentContractAssessmentBudget {
     corrections_used: u32,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AgentContractAttemptFact {
+    primary_attempt: u32,
+    correction_attempt: u32,
+}
+
 /// One activity's complete pinned agent execution policy: the contract plus
 /// the effective prompt. Both participate in the definition identity and the
 /// persisted metadata, so execution never rereads the mutable `WORKFLOW.md`
@@ -90,6 +97,31 @@ pub(crate) fn validated_agent_contract_assessment_outcome(
         .get("runtime_job_id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("agent contract completion is missing runtime_job_id"))?;
+    let runtime_job_profile = event
+        .event
+        .get("runtime_job_profile")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!("agent contract completion is missing runtime_job_profile")
+        })?;
+    let runtime_job_kind: RuntimeKind = serde_json::from_value(
+        event
+            .event
+            .get("runtime_job_kind")
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("agent contract completion is missing runtime_job_kind")
+            })?,
+    )?;
+    let attempt_facts: Vec<AgentContractAttemptFact> = serde_json::from_value(
+        event
+            .event
+            .get("agent_contract_attempts")
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("agent contract completion is missing agent_contract_attempts")
+            })?,
+    )?;
     if command.command_type != WorkflowCommandType::EnqueueActivity
         || command.activity_name() != Some(activity)
     {
@@ -146,6 +178,29 @@ pub(crate) fn validated_agent_contract_assessment_outcome(
         .map_err(anyhow::Error::msg)?;
     let expected_contract_hash = super::remote_facts::stable_remote_fact_hash(contract_value);
     let expected_input_hash = super::remote_facts::stable_remote_fact_hash(input);
+    let mut expected_primary = 1;
+    let mut expected_correction = 0;
+    for fact in &attempt_facts {
+        if fact.primary_attempt != expected_primary
+            || fact.correction_attempt != expected_correction
+            || fact.primary_attempt > pinned.contract.max_primary_attempts
+        {
+            anyhow::bail!("agent contract completion has an invalid attempt reservation sequence");
+        }
+        if expected_correction == pinned.contract.max_corrections {
+            expected_primary = expected_primary.saturating_add(1);
+            expected_correction = 0;
+        } else {
+            expected_correction = expected_correction.saturating_add(1);
+        }
+    }
+    let Some(last_attempt) = attempt_facts.last() else {
+        anyhow::bail!("agent contract completion has no persisted attempt reservation");
+    };
+    let corrections_used = attempt_facts
+        .iter()
+        .filter(|fact| fact.correction_attempt > 0)
+        .count() as u32;
     if assessment.schema != AGENT_CONTRACT_ASSESSMENT_SCHEMA
         || assessment.assessment_id != format!("{runtime_job_id}:agent-contract-assessment")
         || assessment.activity != activity
@@ -154,8 +209,9 @@ pub(crate) fn validated_agent_contract_assessment_outcome(
         || assessment.input_hash != expected_input_hash
         || assessment.runtime_job_id != runtime_job_id
         || assessment.command_id != command_id
-        || assessment.runtime_profile.trim().is_empty()
-        || assessment.runtime_kind == RuntimeKind::RemoteHost
+        || assessment.runtime_profile != runtime_job_profile
+        || assessment.runtime_kind != runtime_job_kind
+        || runtime_job_kind == RuntimeKind::RemoteHost
         || assessment.outcome
             != assessment
                 .verdict
@@ -170,13 +226,8 @@ pub(crate) fn validated_agent_contract_assessment_outcome(
             .any(|outcome| outcome == &assessment.outcome)
         || assessment.budget.max_primary_attempts != pinned.contract.max_primary_attempts
         || assessment.budget.max_corrections != pinned.contract.max_corrections
-        || assessment.budget.primary_attempts_used == 0
-        || assessment.budget.primary_attempts_used > pinned.contract.max_primary_attempts
-        || assessment.budget.corrections_used
-            > pinned
-                .contract
-                .max_corrections
-                .saturating_mul(assessment.budget.primary_attempts_used)
+        || assessment.budget.primary_attempts_used != last_attempt.primary_attempt
+        || assessment.budget.corrections_used != corrections_used
     {
         anyhow::bail!("agent contract assessment failed pinned-event validation");
     }

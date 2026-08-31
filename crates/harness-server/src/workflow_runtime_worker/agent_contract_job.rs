@@ -4,6 +4,7 @@ use crate::http::AppState;
 use harness_core::config::workflow::agent_contract_output_schema_document;
 use harness_workflow::runtime::{ActivityErrorKind, ActivityResult, RuntimeJob};
 use std::sync::Arc;
+use std::{error::Error, fmt};
 
 use super::agent_contract_enforcement::{
     ensure_backend_can_enforce_contract, PinnedJobAgentContract,
@@ -12,9 +13,42 @@ use super::agent_contract_execution::execute_contract_attempts;
 use super::data_helpers::activity_name;
 use super::runtime_profile::{agent_name_for_runtime_kind, runtime_profile_for_job};
 
+#[derive(Debug)]
+pub(super) struct AgentContractExecutionError {
+    source: anyhow::Error,
+}
+
+impl AgentContractExecutionError {
+    pub(super) fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+}
+
+impl fmt::Display for AgentContractExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for AgentContractExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.source()
+    }
+}
+
 /// Executes a contract-carrying runtime job end to end: capability preflight,
 /// pinned launch, observation, and verdict validation.
 pub(super) async fn execute_contract_job(
+    state: &Arc<AppState>,
+    job: &RuntimeJob,
+    pinned: PinnedJobAgentContract,
+) -> anyhow::Result<ActivityResult> {
+    execute_contract_job_inner(state, job, pinned)
+        .await
+        .map_err(|error| AgentContractExecutionError::new(error).into())
+}
+
+async fn execute_contract_job_inner(
     state: &Arc<AppState>,
     job: &RuntimeJob,
     pinned: PinnedJobAgentContract,

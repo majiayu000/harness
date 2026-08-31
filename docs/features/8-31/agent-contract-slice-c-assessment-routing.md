@@ -90,8 +90,8 @@ Fresh evidence from this branch:
 | Surface | Result |
 |---|---|
 | Canonical contract tests | 9 passed |
-| Declarative contract tests | 13 passed |
-| Server contract tests | 24 passed, 1 ignored live dogfood |
+| Declarative contract tests | 15 passed |
+| Server contract tests | 25 passed, 1 ignored live dogfood |
 | Runtime dispatch tests | 22 passed |
 | Real submission, assessment, route, and store reopen | passed; one model-backend invocation |
 | Durable correction | invalid primary plus one valid correction passed; two persisted reservations |
@@ -103,6 +103,8 @@ Fresh evidence from this branch:
 | Real Codex Slice B dogfood | `gpt-5.6-sol`, 1 passed in 9.96 seconds |
 
 Repository pre-push, independent fresh-context review, and GitHub `CI Result` remain merge gates and are not claimed by this record yet.
+
+The first independent review found three blockers. The remediation binds authorization to the complete post-rewrite runtime profile, classifies every infrastructure error from the dedicated contract path as fatal, and snapshots the persisted runtime job identity plus exact attempt reservations into the atomic completion event for replay validation. A new independent review is still required.
 
 ## Slice D boundary
 

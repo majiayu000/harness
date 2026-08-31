@@ -448,6 +448,20 @@ mod tests {
                 .state,
             "implementing"
         );
+        let workflow_events = store.events_for(&instance.id).await?;
+        let completion_event = workflow_events
+            .iter()
+            .find(|event| event.event_type == "RuntimeJobCompleted")
+            .expect("contract completion event should persist");
+        assert_eq!(
+            completion_event.event["runtime_job_profile"],
+            "codex-contract"
+        );
+        assert_eq!(completion_event.event["runtime_job_kind"], "codex_exec");
+        assert_eq!(
+            completion_event.event["agent_contract_attempts"],
+            json!([{"primary_attempt": 1, "correction_attempt": 0}])
+        );
         drop(state);
         drop(store);
 

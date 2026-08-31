@@ -59,6 +59,11 @@ fn execution_error_result(activity: String, error: anyhow::Error) -> ActivityRes
         error.to_string(),
     );
     if error
+        .downcast_ref::<super::agent_contract_job::AgentContractExecutionError>()
+        .is_some()
+    {
+        result.with_error_kind(ActivityErrorKind::Fatal)
+    } else if error
         .downcast_ref::<PromptPacketConfigurationError>()
         .is_some()
     {
@@ -85,6 +90,21 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("unclassified workflow.data")));
+    }
+
+    #[test]
+    fn agent_contract_infrastructure_errors_are_fatal() {
+        let error = super::super::agent_contract_job::AgentContractExecutionError::new(
+            anyhow::anyhow!("attempt completion event could not be persisted"),
+        );
+
+        let result = execution_error_result("classify_scope".to_string(), error.into());
+
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Fatal));
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("attempt completion event")));
     }
 
     #[test]
