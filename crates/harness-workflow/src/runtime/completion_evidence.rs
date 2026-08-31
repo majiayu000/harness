@@ -57,7 +57,7 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 11] = [
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 12] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
@@ -68,6 +68,7 @@ pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 11] = [
     ARTIFACT_VERIFIED_ISSUE_STATE,
     ARTIFACT_MERGE_COMPLETION_VERIFICATION,
     ARTIFACT_RUNTIME_TURN_OBSERVATIONS,
+    super::AGENT_CONTRACT_ASSESSMENT_ARTIFACT,
     super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
 ];
 

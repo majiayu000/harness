@@ -58,6 +58,7 @@ pub struct RuntimeCommandDispatcher<'a> {
     lease_duration: Duration,
     defer_backoff: DispatchBackoffPolicy,
     budget_policy: RuntimeBudgetPolicy,
+    enforceable_agent_contract_profile: Option<RuntimeProfile>,
 }
 
 impl<'a> RuntimeCommandDispatcher<'a> {
@@ -79,6 +80,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             lease_duration: Duration::seconds(30),
             defer_backoff: DispatchBackoffPolicy::default(),
             budget_policy: RuntimeBudgetPolicy::default(),
+            enforceable_agent_contract_profile: None,
         }
     }
 
@@ -118,6 +120,30 @@ impl<'a> RuntimeCommandDispatcher<'a> {
     pub fn with_budget_policy(mut self, budget_policy: RuntimeBudgetPolicy) -> Self {
         self.budget_policy = budget_policy;
         self
+    }
+
+    /// Authorizes the exact selected profile for a pinned agent contract.
+    ///
+    /// The server supplies this only after checking the concrete backend
+    /// instance that profile will launch. The default remains fail-closed.
+    pub fn with_enforceable_agent_contract_profile(
+        mut self,
+        runtime_profile: RuntimeProfile,
+    ) -> Self {
+        self.enforceable_agent_contract_profile = Some(runtime_profile);
+        self
+    }
+
+    /// Resolves every command-level rewrite before the server authorizes the
+    /// concrete backend. The same exact profile is checked again at enqueue.
+    pub async fn effective_profile_for_command(
+        &self,
+        command: &WorkflowCommandRecord,
+    ) -> anyhow::Result<RuntimeProfile> {
+        let mut runtime_profile = self.profile_for_command(command).await?;
+        apply_eval_runtime_profile_policy(&mut runtime_profile, command)?;
+        apply_candidate_runtime_budget(&mut runtime_profile, &command.command.command)?;
+        Ok(runtime_profile)
     }
 
     pub async fn dispatch_once(&self) -> anyhow::Result<Option<CommandDispatchOutcome>> {
@@ -209,14 +235,14 @@ impl<'a> RuntimeCommandDispatcher<'a> {
         let instance = self.store.get_instance(&command.workflow_id).await?;
 
         let activity = command.command.runtime_activity_key().to_string();
-        if command.command.command.get("agent_contract").is_some() {
+        let runtime_profile = self.effective_profile_for_command(&command).await?;
+        if command.command.command.get("agent_contract").is_some()
+            && self.enforceable_agent_contract_profile.as_ref() != Some(&runtime_profile)
+        {
             return self
                 .defer_unenforceable_agent_contract(&command, instance.as_ref(), &activity)
                 .await;
         }
-        let mut runtime_profile = self.profile_for_command(&command).await?;
-        apply_eval_runtime_profile_policy(&mut runtime_profile, &command)?;
-        apply_candidate_runtime_budget(&mut runtime_profile, &command.command.command)?;
         let isolation =
             isolation_resolution_for_command(instance.as_ref(), &command, &self.isolation_config)
                 .with_context(|| {

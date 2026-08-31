@@ -1,4 +1,86 @@
 use super::*;
+use crate::runtime::AgentContractAttemptReservation;
+
+#[tokio::test]
+async fn agent_contract_attempt_reservation_rejects_a_reclaimed_lease() -> anyhow::Result<()> {
+    if harness_core::db::resolve_test_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = issue_instance("implementing").with_id("contract-stale-lease");
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "contract-stale-lease-command",
+        json!({
+            "activity": "implement_issue",
+            "agent_contract": {
+                "input_schema": "harness.semantic_activity_input.v1",
+                "output_schema": "harness.semantic_verdict.v1",
+                "allowed_outcomes": ["small", "large"],
+                "tools": "none",
+                "mutation": "forbidden",
+                "workspace": "ephemeral_empty",
+                "fresh_context": true,
+                "max_primary_attempts": 1,
+                "max_corrections": 1
+            }
+        }),
+    );
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexExec,
+            "codex-contract",
+            json!({"activity": "implement_issue", "command": command.command}),
+        )
+        .await?;
+    let first_expiry = Utc::now() + chrono::Duration::minutes(5);
+    let first = store
+        .claim_next_runtime_job_excluding_runtime_kind(
+            RuntimeKind::RemoteHost,
+            "first-worker",
+            first_expiry,
+        )
+        .await?
+        .expect("job should be claimed");
+    assert_eq!(
+        store
+            .reserve_agent_contract_attempt(&first, Some(2), 1, 0)
+            .await?,
+        AgentContractAttemptReservation::Reserved
+    );
+    store
+        .extend_runtime_job_lease_if_owned(
+            &job.id,
+            "first-worker",
+            first_expiry,
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await?
+        .expect("lease should expire");
+    let second = store
+        .claim_next_runtime_job_excluding_runtime_kind(
+            RuntimeKind::RemoteHost,
+            "second-worker",
+            Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await?
+        .expect("job should be reclaimed");
+    assert!(second.lease_generation > first.lease_generation);
+    assert_eq!(
+        store
+            .reserve_agent_contract_attempt(&first, Some(2), 1, 1)
+            .await?,
+        AgentContractAttemptReservation::StaleLease
+    );
+    Ok(())
+}
+
 #[rustfmt::skip]
 #[tokio::test]
 async fn runtime_turn_reservation_is_atomic_and_replay_safe() -> anyhow::Result<()> {

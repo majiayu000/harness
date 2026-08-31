@@ -163,6 +163,14 @@ pub struct RuntimeJobCompletionLease<'a> {
     pub proof: Option<uuid::Uuid>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentContractAttemptReservation {
+    Reserved,
+    AlreadyReserved,
+    BudgetExhausted,
+    StaleLease,
+}
+
 impl<'a> RuntimeJobCompletionLease<'a> {
     pub fn local(owner: &'a str, expires_at: DateTime<Utc>) -> Self {
         Self {

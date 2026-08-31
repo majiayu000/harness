@@ -461,19 +461,42 @@ impl WorkflowRuntimeStore {
                 0
             };
 
+        let mut completion_payload = json!({
+            "command_id": command.id,
+            "command": command.command,
+            "runtime_job_id": job.id,
+            "runtime_job_status": job.status,
+            "active_start_child_workflow_commands": active_start_child_workflow_commands,
+            "activity_result": result,
+        });
+        if job.input.pointer("/command/agent_contract").is_some() {
+            let rows: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT (data #>> '{event,primary_attempt}')::bigint,
+                        (data #>> '{event,correction_attempt}')::bigint
+                 FROM runtime_events
+                 WHERE runtime_job_id = $1
+                   AND event_type = 'AgentContractAttemptStarted'
+                 ORDER BY sequence ASC",
+            )
+            .bind(&job.id)
+            .fetch_all(&mut *tx)
+            .await?;
+            completion_payload["runtime_job_profile"] = json!(job.runtime_profile);
+            completion_payload["runtime_job_kind"] = json!(job.runtime_kind);
+            completion_payload["agent_contract_attempts"] = json!(rows
+                .into_iter()
+                .map(|(primary_attempt, correction_attempt)| json!({
+                    "primary_attempt": primary_attempt,
+                    "correction_attempt": correction_attempt,
+                }))
+                .collect::<Vec<_>>());
+        }
         let event = transaction_helpers::insert_event_tx(
             &mut tx,
             &command.workflow_id,
             "RuntimeJobCompleted",
             lease.owner,
-            json!({
-                "command_id": command.id,
-                "command": command.command,
-                "runtime_job_id": job.id,
-                "runtime_job_status": job.status,
-                "active_start_child_workflow_commands": active_start_child_workflow_commands,
-                "activity_result": result,
-            }),
+            completion_payload,
         )
         .await?;
 
