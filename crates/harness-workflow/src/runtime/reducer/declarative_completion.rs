@@ -100,7 +100,27 @@ fn reduce_generic_declarative_completion(
     }
 
     let route = match result.status {
-        ActivityStatus::Succeeded => success_route(source, result),
+        ActivityStatus::Succeeded => {
+            if definition.agent_contract(expected_activity).is_some() {
+                match crate::runtime::declarative_agent_contract::validated_agent_contract_assessment_outcome(
+                    definition,
+                    expected_activity,
+                    event,
+                    result,
+                ) {
+                    Ok(Some(outcome)) => source
+                        .on_signal
+                        .get(&outcome)
+                        .map(|target| (target.as_str(), format!("agent contract outcome '{outcome}'"))),
+                    Ok(None) => None,
+                    Err(error) => {
+                        return invalid_completion(instance, event, result, error.to_string())
+                    }
+                }
+            } else {
+                success_route(source, result)
+            }
+        }
         ActivityStatus::Blocked | ActivityStatus::SucceededWithBlockers => {
             if let Some(target) = source.on_blocked.as_deref() {
                 Some((target, "on_blocked".to_string()))

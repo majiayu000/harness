@@ -8,7 +8,7 @@ use harness_core::types::ExecutionPhase;
 use harness_workflow::runtime::{RuntimeJob, RuntimeKind, RuntimeProfile};
 use serde::Serialize;
 
-pub(super) fn agent_name_for_runtime_kind(kind: RuntimeKind) -> anyhow::Result<&'static str> {
+pub(crate) fn agent_name_for_runtime_kind(kind: RuntimeKind) -> anyhow::Result<&'static str> {
     match kind {
         RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => Ok("codex"),
         RuntimeKind::ClaudeCode => Ok("claude"),

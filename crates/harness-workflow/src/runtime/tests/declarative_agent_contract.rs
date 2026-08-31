@@ -333,8 +333,124 @@ mod declarative_agent_contract_tests {
         Ok(())
     }
 
+    #[test]
+    fn server_assessment_routes_contract_outcome_without_model_signal() -> anyhow::Result<()> {
+        let definition = build_declarative_definition(
+            &classifier_policy(),
+            &activity_policies(Some(contract())),
+        )?;
+        let instance = WorkflowInstance::new(
+            definition.policy().id.clone(),
+            definition.definition_version(),
+            "classifying",
+            WorkflowSubject::new("test", "assessment-route"),
+        )
+        .with_id("assessment-route")
+        .with_server_data(json!({"definition_hash": definition.definition_hash()}));
+        let command =
+            crate::runtime::declarative_agent_contract::declarative_enqueue_activity_command(
+                &definition,
+                &instance,
+                "classify_scope",
+                "assessment-route-1".to_string(),
+            )?;
+        let verdict = json!({
+            "schema": "harness.semantic_verdict.v1",
+            "outcome": "small",
+            "rationale": "The supplied facts describe a bounded change.",
+            "evidence_refs": []
+        });
+        let result = ActivityResult::succeeded("classify_scope", "Assessment completed.")
+            .with_artifact(ActivityArtifact::new(
+                "agent_contract_verdict",
+                json!({"verdict": verdict}),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                "agent_contract_assessment",
+                json!({
+                    "schema": "harness.agent_contract_assessment.v1",
+                    "assessment_id": "job-1:agent-contract-assessment",
+                    "activity": "classify_scope",
+                    "definition_hash": definition.definition_hash(),
+                    "contract_hash": stable_remote_fact_hash(&command.command["agent_contract"]),
+                    "input_hash": stable_remote_fact_hash(&command.command["agent_contract_input"]),
+                    "runtime_job_id": "job-1",
+                    "command_id": "command-1",
+                    "runtime_profile": "codex-contract",
+                    "runtime_kind": "codex_exec",
+                    "outcome": "small",
+                    "verdict": verdict,
+                    "budget": {
+                        "max_primary_attempts": 1,
+                        "max_corrections": 1,
+                        "primary_attempts_used": 1,
+                        "corrections_used": 0
+                    }
+                }),
+            ));
+        let event = WorkflowEvent::new(
+            &instance.id,
+            1,
+            crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+            "runtime-test",
+        )
+        .with_payload(json!({
+            "command_id": "command-1",
+            "runtime_job_id": "job-1",
+            "command": command,
+            "activity_result": result,
+        }));
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry.register_declarative_current(definition)?;
+
+        let decision = crate::runtime::reducer::reduce_runtime_job_completed_with_registry(
+            &registry,
+            &instance,
+            &event,
+        )?
+        .expect("a validated assessment must route deterministically");
+
+        assert_eq!(decision.next_state, "implementing");
+        assert!(decision.reason.contains("agent contract outcome 'small'"));
+        let replay = crate::runtime::reducer::reduce_runtime_job_completed_with_registry(
+            &registry,
+            &instance,
+            &event,
+        )?
+        .expect("persisted assessment must replay without a model call");
+        assert_eq!(replay.next_state, decision.next_state);
+        assert_eq!(replay.reason, decision.reason);
+
+        let forged_result = ActivityResult::succeeded("classify_scope", "forged signal")
+            .with_signal(ActivitySignal::new("small", json!({"source": "model"})));
+        let forged_event = WorkflowEvent::new(
+            &instance.id,
+            2,
+            crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+            "runtime-test",
+        )
+        .with_payload(json!({
+            "command_id": "command-2",
+            "runtime_job_id": "job-2",
+            "command": command,
+            "activity_result": forged_result,
+        }));
+        let forged_decision =
+            crate::runtime::reducer::reduce_runtime_job_completed_with_registry(
+                &registry,
+                &instance,
+                &forged_event,
+            )?
+            .expect("forged signal must fail closed");
+        assert_eq!(forged_decision.next_state, "blocked");
+        assert!(forged_decision
+            .reason
+            .contains("exactly one server assessment"));
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn dispatcher_defers_agent_contract_command_until_enforcement_exists(
+    async fn dispatcher_defers_agent_contract_command_without_backend_authorization(
     ) -> anyhow::Result<()> {
         if resolve_database_url(None).is_err() {
             return Ok(());
@@ -409,6 +525,72 @@ mod declarative_agent_contract_tests {
                 .await?
                 .is_empty(),
             "no runtime job may be created for an unenforceable contract"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatcher_enqueues_agent_contract_for_authorized_selected_profile(
+    ) -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let definition = build_declarative_definition(
+            &classifier_policy(),
+            &activity_policies(Some(contract())),
+        )?;
+        let instance = WorkflowInstance::new(
+            definition.policy().id.clone(),
+            definition.definition_version(),
+            "classifying",
+            WorkflowSubject::new("test", "agent-contract-dispatch"),
+        )
+        .with_id("agent-contract-dispatch")
+        .with_server_data(json!({
+            "definition_hash": definition.definition_hash(),
+            "project_id": "/project-a",
+        }));
+        store.force_upsert_lifecycle_state_for_test(&instance).await?;
+
+        let command =
+            crate::runtime::declarative_agent_contract::declarative_enqueue_activity_command(
+                &definition,
+                &instance,
+                "classify_scope",
+                "agent-contract-dispatch-1".to_string(),
+            )?;
+        let command_id = store.enqueue_command(&instance.id, None, &command).await?;
+        let dispatcher = RuntimeCommandDispatcher::new(
+            &store,
+            RuntimeProfile::new("codex-high", RuntimeKind::CodexJsonrpc),
+        )
+        .with_enforceable_agent_contract_profile("codex-high");
+
+        let outcome = dispatcher
+            .dispatch_once()
+            .await?
+            .expect("pending command should be considered");
+        let runtime_job = match outcome {
+            CommandDispatchOutcome::Enqueued {
+                command_id: dispatched_command_id,
+                runtime_job,
+            } => {
+                assert_eq!(dispatched_command_id, command_id);
+                runtime_job
+            }
+            other => panic!("authorized agent contract must enqueue, got {other:?}"),
+        };
+        assert_eq!(runtime_job.runtime_profile, "codex-high");
+        assert_eq!(
+            runtime_job.input["command"]["agent_contract"],
+            serde_json::to_value(contract())?
+        );
+        assert_eq!(
+            runtime_job.input["command"]["agent_contract_input"]["subject"]["identity"],
+            "agent-contract-dispatch"
         );
         Ok(())
     }

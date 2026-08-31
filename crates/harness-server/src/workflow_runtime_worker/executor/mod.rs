@@ -123,9 +123,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         // ephemeral workspace, pinned prompt only, deny-all launch, pinned
         // output schema, attempt-wide observation). Extraction errors on a
         // malformed or null contract payload, so a bad payload can never
-        // select the ordinary path. The dispatcher still holds contract
-        // commands behind the enforcement barrier until the assessment slice
-        // ships.
+        // select the ordinary path. Production dispatch reaches this branch
+        // only after capability authorization; the executor repeats preflight
+        // as defense in depth.
         if let Some(pinned) =
             super::agent_contract_enforcement::pinned_agent_contract_for_job(&job)?
         {

@@ -166,14 +166,18 @@ async fn dispatch_runtime_command_with_project_policy(
     let dispatch_gate_fact_hash = command_dispatch_gate_fact_hash(&command);
     let workflow_cfg =
         load_runtime_workflow_config(&project_root, "workflow runtime command dispatcher")?;
-    let outcome = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
+    let enforceable_agent_contract_profile =
+        enforceable_agent_contract_profile(state, store, &command, &profile_selector).await?;
+    let mut dispatcher = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
         .with_isolation_config(isolation_config)
         .with_isolation_availability(state.isolation_availability.clone())
         .with_dispatcher_id(dispatch_owner)
         .with_defer_backoff(dispatch_backoff(&workflow_cfg.runtime_dispatch)?)
-        .with_budget_policy(workflow_cfg.runtime_budget_policy)
-        .dispatch_command(command)
-        .await?;
+        .with_budget_policy(workflow_cfg.runtime_budget_policy);
+    if let Some(profile) = enforceable_agent_contract_profile {
+        dispatcher = dispatcher.with_enforceable_agent_contract_profile(profile);
+    }
+    let outcome = dispatcher.dispatch_command(command).await?;
     record_runtime_agent_dispatch_counter(
         state,
         repo.as_deref(),
@@ -182,6 +186,54 @@ async fn dispatch_runtime_command_with_project_policy(
         dispatch_gate_fact_hash.as_deref(),
     );
     Ok(outcome)
+}
+
+async fn enforceable_agent_contract_profile(
+    state: &AppState,
+    store: &WorkflowRuntimeStore,
+    command: &WorkflowCommandRecord,
+    profile_selector: &RuntimeProfileSelector,
+) -> anyhow::Result<Option<String>> {
+    let Some(contract_value) = command.command.command.get("agent_contract") else {
+        return Ok(None);
+    };
+    let Ok(contract) = serde_json::from_value::<
+        harness_core::config::workflow::WorkflowAgentContract,
+    >(contract_value.clone()) else {
+        return Ok(None);
+    };
+    let activity = command.command.runtime_activity_key();
+    if contract.validate(activity).is_err()
+        || harness_core::config::workflow::agent_contract_output_schema_document(
+            &contract.output_schema,
+        )
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let instance = store.get_instance(&command.workflow_id).await?;
+    let profile = profile_selector.select(
+        instance
+            .as_ref()
+            .map(|workflow| workflow.definition_id.as_str()),
+        Some(activity),
+    );
+    if !profile.timeout_secs.is_some_and(|timeout| timeout > 0) {
+        return Ok(None);
+    }
+    let Ok(agent_name) = crate::workflow_runtime_worker::agent_name_for_runtime_kind(profile.kind)
+    else {
+        return Ok(None);
+    };
+    let Some(backend) = state.core.server.agent_registry.get(agent_name) else {
+        return Ok(None);
+    };
+    if crate::workflow_runtime_worker::ensure_backend_can_enforce_contract(backend.as_ref())
+        .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(profile.name.clone()))
 }
 
 async fn runtime_isolation_config_for_command(

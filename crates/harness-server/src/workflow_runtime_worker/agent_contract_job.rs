@@ -5,12 +5,10 @@ use harness_core::config::workflow::agent_contract_output_schema_document;
 use harness_workflow::runtime::{ActivityErrorKind, ActivityResult, RuntimeJob};
 use std::sync::Arc;
 
-use super::agent_contract_attempt::{
-    contract_attempt_activity_result, execute_agent_contract_attempt,
-};
 use super::agent_contract_enforcement::{
     ensure_backend_can_enforce_contract, PinnedJobAgentContract,
 };
+use super::agent_contract_execution::execute_contract_attempts;
 use super::data_helpers::activity_name;
 use super::runtime_profile::{agent_name_for_runtime_kind, runtime_profile_for_job};
 
@@ -51,17 +49,17 @@ pub(super) async fn execute_contract_job(
             "the pinned runtime profile has no positive timeout_secs",
         ));
     };
-    let attempt = execute_agent_contract_attempt(
+    execute_contract_attempts(
+        state,
+        job,
         backend,
         &pinned,
+        &activity,
         profile.model.clone(),
         profile.reasoning_effort.clone(),
         timeout_secs,
     )
-    .await?;
-    Ok(contract_attempt_activity_result(
-        &activity, &pinned, &attempt,
-    ))
+    .await
 }
 
 fn contract_preflight_failure(job: &RuntimeJob, activity: &str, reason: &str) -> ActivityResult {
@@ -92,15 +90,19 @@ mod tests {
     /// Contract-conforming scripted backend: claims every enforcement capability,
     /// records the launch request and workspace state, and replays a script.
     struct ContractStreamAgent {
-        script: Mutex<Vec<harness_core::agent::AgentEvent>>,
+        scripts: Mutex<std::collections::VecDeque<Vec<harness_core::agent::AgentEvent>>>,
         requests: Mutex<Vec<AgentRequest>>,
         workspace_entry_counts: Mutex<Vec<usize>>,
     }
 
     impl ContractStreamAgent {
         fn new(script: Vec<harness_core::agent::AgentEvent>) -> Arc<Self> {
+            Self::with_scripts(vec![script])
+        }
+
+        fn with_scripts(scripts: Vec<Vec<harness_core::agent::AgentEvent>>) -> Arc<Self> {
             Arc::new(Self {
-                script: Mutex::new(script),
+                scripts: Mutex::new(scripts.into()),
                 requests: Mutex::new(Vec::new()),
                 workspace_entry_counts: Mutex::new(Vec::new()),
             })
@@ -131,7 +133,7 @@ mod tests {
                 .unwrap_or(usize::MAX);
             self.workspace_entry_counts.lock().await.push(entries);
             self.requests.lock().await.push(req);
-            let script = std::mem::take(&mut *self.script.lock().await);
+            let script = self.scripts.lock().await.pop_front().unwrap_or_default();
             for event in script {
                 tx.send(event).await.map_err(|error| {
                     harness_core::error::HarnessError::AgentExecution(error.to_string())
@@ -422,12 +424,160 @@ mod tests {
             .find(|artifact| artifact.artifact_type == "agent_contract_verdict")
             .expect("verdict artifact attached");
         assert_eq!(verdict.artifact["outcome"], "small");
+        let assessment = output
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "agent_contract_assessment")
+            .expect("server assessment attached");
+        assert_eq!(
+            assessment.artifact["assessment_id"],
+            format!("{}:agent-contract-assessment", runtime_job.id)
+        );
+        assert_eq!(assessment.artifact["command_id"], runtime_job.command_id);
+        assert_eq!(assessment.artifact["outcome"], "small");
+        assert_eq!(assessment.artifact["budget"]["primary_attempts_used"], 1);
+        assert_eq!(assessment.artifact["budget"]["corrections_used"], 0);
         assert!(
             output.artifacts.iter().any(|artifact| {
                 artifact.artifact_type
                     == harness_workflow::runtime::completion_evidence::ARTIFACT_RUNTIME_TURN_OBSERVATIONS
             }),
             "the server-observed attempt record is attached"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_verdict_consumes_durable_correction_then_assesses_success(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+        let agent = ContractStreamAgent::with_scripts(vec![
+            vec![harness_core::agent::AgentEvent::TurnCompleted {
+                output: "not valid JSON".to_string(),
+            }],
+            vec![harness_core::agent::AgentEvent::TurnCompleted {
+                output: valid_verdict_reply(),
+            }],
+        ]);
+        let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+        registry.register("codex", agent.clone());
+        let state = Arc::new(
+            crate::test_helpers::make_test_state_with_project_root_and_registry(
+                dir.path(),
+                &project_root,
+                registry,
+            )
+            .await?,
+        );
+        let store = state
+            .core
+            .workflow_runtime_store
+            .as_ref()
+            .expect("workflow runtime store should be configured");
+        let runtime_job = enqueue_contract_job(store, &project_root).await?;
+
+        let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+            &state,
+            "worker-test",
+            chrono::Duration::minutes(5),
+        )
+        .await?;
+
+        assert_eq!(
+            tick.succeeded, 1,
+            "a valid bounded correction should succeed"
+        );
+        let requests = agent.requests.lock().await;
+        assert_eq!(requests.len(), 2, "one primary plus one correction");
+        assert!(requests[1].prompt.contains("not valid JSON"));
+        assert!(requests[1].prompt.contains("failed server validation"));
+        drop(requests);
+        let events = store.runtime_events_for(&runtime_job.id).await?;
+        let reservations = events
+            .iter()
+            .filter(|event| event.event_type == "AgentContractAttemptStarted")
+            .collect::<Vec<_>>();
+        assert_eq!(reservations.len(), 2);
+        assert_eq!(reservations[0].event["primary_attempt"], 1);
+        assert_eq!(reservations[0].event["correction_attempt"], 0);
+        assert_eq!(reservations[1].event["primary_attempt"], 1);
+        assert_eq!(reservations[1].event["correction_attempt"], 1);
+        let completed = store
+            .get_runtime_job(&runtime_job.id)
+            .await?
+            .expect("runtime job should exist");
+        let output: harness_workflow::runtime::ActivityResult =
+            serde_json::from_value(completed.output.expect("successful job carries output"))?;
+        let assessment = output
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "agent_contract_assessment")
+            .expect("server assessment attached");
+        assert_eq!(assessment.artifact["budget"]["primary_attempts_used"], 1);
+        assert_eq!(assessment.artifact["budget"]["corrections_used"], 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reclaimed_job_does_not_repeat_a_durably_reserved_attempt() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+        let agent =
+            ContractStreamAgent::new(vec![harness_core::agent::AgentEvent::TurnCompleted {
+                output: valid_verdict_reply(),
+            }]);
+        let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+        registry.register("codex", agent.clone());
+        let state = Arc::new(
+            crate::test_helpers::make_test_state_with_project_root_and_registry(
+                dir.path(),
+                &project_root,
+                registry,
+            )
+            .await?,
+        );
+        let store = state
+            .core
+            .workflow_runtime_store
+            .as_ref()
+            .expect("workflow runtime store should be configured");
+        let runtime_job = enqueue_contract_job(store, &project_root).await?;
+        assert!(
+            store
+                .reserve_agent_contract_attempt(&runtime_job.id, 1, 0)
+                .await?
+        );
+
+        let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+            &state,
+            "worker-after-restart",
+            chrono::Duration::minutes(5),
+        )
+        .await?;
+
+        assert_eq!(tick.failed, 1);
+        assert!(
+            agent.requests.lock().await.is_empty(),
+            "a persisted reservation must prevent a duplicate model call"
+        );
+        let events = store.runtime_events_for(&runtime_job.id).await?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "AgentContractAttemptStarted")
+                .count(),
+            1
         );
         Ok(())
     }
@@ -564,6 +714,7 @@ mod dogfood_tests {
             Some("gpt-5.6-sol".to_string()),
             Some("high".to_string()),
             300,
+            None,
         )
         .await?;
 

@@ -1,9 +1,8 @@
-//! Runtime-side enforcement surface for pinned agent contracts (Slice B).
+//! Runtime-side enforcement surface for pinned agent contracts.
 //!
-//! The dispatcher defers agent-contract commands behind the
-//! `agent_contract_enforcement_unavailable` barrier until the assessment
-//! slice ships. This module supplies the executor-level primitives behind
-//! that barrier: it extracts the pinned contract from a runtime job
+//! The dispatcher authorizes only an exact selected profile whose concrete
+//! backend claims the required capabilities. This module supplies the
+//! executor-level defense in depth: it extracts the pinned contract from a runtime job
 //! fail-closed, verifies that the backend instance about to be launched
 //! claims every enforcement capability, and records the per-attempt stream
 //! observations (tool and mutation activity, unknown event kinds, approval
@@ -95,7 +94,7 @@ pub(super) fn pinned_agent_contract_for_job(
 /// attempt would launch — claims every capability the contract's no-tool,
 /// no-mutation, ephemeral-empty-workspace constraints require. Fail closed:
 /// an unclaimed capability rejects the attempt before anything is spawned.
-pub(super) fn ensure_backend_can_enforce_contract(
+pub(crate) fn ensure_backend_can_enforce_contract(
     backend: &dyn AgentBackend,
 ) -> anyhow::Result<()> {
     let missing = backend

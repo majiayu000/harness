@@ -1,5 +1,148 @@
 use super::*;
 
+struct DispatchContractAgent {
+    enforceable: bool,
+}
+
+#[async_trait::async_trait]
+impl harness_core::agent::AgentBackend for DispatchContractAgent {
+    fn name(&self) -> &str {
+        "dispatch-contract-agent"
+    }
+
+    fn agent_contract_capabilities(&self) -> harness_core::agent::AgentContractCapabilities {
+        if !self.enforceable {
+            return harness_core::agent::AgentContractCapabilities::default();
+        }
+        harness_core::agent::AgentContractCapabilities {
+            prompt_only_launch: true,
+            pinned_output_schema: true,
+            attempt_observation_stream: true,
+        }
+    }
+}
+
+struct ContractDispatchResult {
+    enqueued: usize,
+    deferred: usize,
+    runtime_jobs: usize,
+}
+
+fn pinned_contract_dispatch_command() -> harness_workflow::runtime::WorkflowCommand {
+    harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
+        "contract-dispatch-1",
+        serde_json::json!({
+            "activity": "classify_scope",
+            "agent_contract": {
+                "input_schema": "harness.semantic_activity_input.v1",
+                "output_schema": "harness.semantic_verdict.v1",
+                "allowed_outcomes": ["small", "large"],
+                "tools": "none",
+                "mutation": "forbidden",
+                "workspace": "ephemeral_empty",
+                "fresh_context": true,
+                "max_primary_attempts": 1,
+                "max_corrections": 1
+            },
+            "prompt": "Classify only the supplied facts.",
+            "definition_hash": "sha256:pinned",
+            "agent_contract_input": {
+                "schema": "harness.semantic_activity_input.v1",
+                "subject": {"kind": "test", "identity": "contract-dispatch"},
+                "facts": {"scope": "small"},
+                "provenance": {"/scope": "server"},
+                "contract_hash": "sha256:pinned-contract"
+            }
+        }),
+    )
+}
+
+async fn dispatch_contract_with_backend(
+    enforceable: bool,
+) -> anyhow::Result<ContractDispatchResult> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(ContractDispatchResult {
+            enqueued: 0,
+            deferred: 0,
+            runtime_jobs: 0,
+        });
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("contract-project");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\n  runtime_profile: codex-contract\n  timeout_secs: 30\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register("codex", Arc::new(DispatchContractAgent { enforceable }));
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        &project_root,
+        harness_core::config::HarnessConfig::default(),
+        registry,
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "contract_workflow",
+        1,
+        "classifying",
+        harness_workflow::runtime::WorkflowSubject::new("test", "contract-dispatch"),
+    )
+    .with_id("contract-dispatch")
+    .with_server_data(serde_json::json!({"project_id": project_root}));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let command_id = store
+        .enqueue_command(&workflow.id, None, &pinned_contract_dispatch_command())
+        .await?;
+    let mut profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-contract",
+        harness_workflow::runtime::RuntimeKind::CodexExec,
+    );
+    profile.timeout_secs = Some(30);
+
+    let tick = super::background::run_runtime_command_dispatch_tick(&state, profile, 10).await?;
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    Ok(ContractDispatchResult {
+        enqueued: tick.enqueued,
+        deferred: tick.deferred,
+        runtime_jobs: jobs.len(),
+    })
+}
+
+#[tokio::test]
+async fn runtime_dispatch_authorizes_contract_only_from_selected_backend_capabilities(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true).await?;
+    assert_eq!(result.enqueued, 1);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.runtime_jobs, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_defers_contract_for_nonconforming_selected_backend() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(false).await?;
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {

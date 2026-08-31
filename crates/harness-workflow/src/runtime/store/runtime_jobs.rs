@@ -9,6 +9,92 @@ type RuntimeEventSummaryRow = (
     Option<i64>,
 );
 impl WorkflowRuntimeStore {
+    /// Durably consumes one pinned agent-contract attempt slot before the
+    /// model is invoked. Returning `false` means this exact slot was already
+    /// consumed (for example before a worker restart), so callers must fail
+    /// closed instead of launching the model again.
+    pub async fn reserve_agent_contract_attempt(
+        &self,
+        runtime_job_id: &str,
+        primary_attempt: u32,
+        correction_attempt: u32,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
+                .bind(runtime_job_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((data,)) = row else {
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("agent_contract_attempt:{runtime_job_id}"))
+            .execute(&mut *tx)
+            .await?;
+        let job: RuntimeJob = serde_json::from_str(&data)?;
+        let contract_value = job
+            .input
+            .pointer("/command/agent_contract")
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime job {runtime_job_id} does not carry a pinned agent_contract"
+                )
+            })?;
+        let contract: harness_core::config::workflow::WorkflowAgentContract =
+            serde_json::from_value(contract_value)?;
+        let activity = job
+            .input
+            .get("activity")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        contract.validate(activity)?;
+        if primary_attempt == 0 || primary_attempt > contract.max_primary_attempts {
+            anyhow::bail!(
+                "agent contract primary attempt {primary_attempt} exceeds pinned budget {}",
+                contract.max_primary_attempts
+            );
+        }
+        if correction_attempt > contract.max_corrections {
+            anyhow::bail!(
+                "agent contract correction attempt {correction_attempt} exceeds pinned budget {}",
+                contract.max_corrections
+            );
+        }
+        let reservation_key = format!("primary:{primary_attempt}:correction:{correction_attempt}");
+        let existing: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM runtime_events
+             WHERE runtime_job_id = $1
+               AND event_type = 'AgentContractAttemptStarted'
+               AND data #>> '{event,reservation_key}' = $2
+             LIMIT 1",
+        )
+        .bind(runtime_job_id)
+        .bind(&reservation_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_some() {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        runtime_job_leases::append_runtime_event_tx(
+            &mut tx,
+            runtime_job_id,
+            "AgentContractAttemptStarted",
+            serde_json::json!({
+                "reservation_key": reservation_key,
+                "primary_attempt": primary_attempt,
+                "correction_attempt": correction_attempt,
+                "max_primary_attempts": contract.max_primary_attempts,
+                "max_corrections": contract.max_corrections,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn record_runtime_event(
         &self,
         runtime_job_id: &str,

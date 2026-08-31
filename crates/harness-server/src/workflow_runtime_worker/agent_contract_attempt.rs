@@ -1,10 +1,7 @@
-//! Real execution path for a pinned agent-contract runtime job (Slice B).
+//! Real execution path for one pinned agent-contract attempt.
 //!
-//! The dispatcher still holds contract commands behind the
-//! `agent_contract_enforcement_unavailable` barrier until the assessment
-//! slice ships, so no production dispatch reaches this path yet; the executor
-//! wiring and the worker-tick integration tests keep it real and directly
-//! callable instead of merely declared.
+//! Production dispatch reaches this path only after the server authorizes the
+//! exact selected profile against the concrete backend's capability claims.
 //!
 //! Enforcement model: a conforming backend cannot switch its tool surface off
 //! (codex-cli has no such flag), so the contract is enforced by construction
@@ -23,19 +20,23 @@
 use harness_core::agent::{AgentBackend, AgentEvent, AgentRequest, AGENT_OUTPUT_SCHEMA_PATH_ENV};
 use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::workflow::{
-    agent_contract_output_schema_document, validate_agent_contract_input,
-    validate_agent_contract_output, WorkflowAgentContract,
+    agent_contract_output_schema_document, validate_agent_contract_output, WorkflowAgentContract,
 };
 use harness_core::types::Item;
+#[cfg(test)]
 use harness_workflow::runtime::{ActivityErrorKind, ActivityResult};
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+#[cfg(test)]
+use super::agent_contract_enforcement::turn_observation_artifact;
 use super::agent_contract_enforcement::{
-    ensure_backend_can_enforce_contract, turn_observation_artifact, PinnedJobAgentContract,
-    TurnStreamObservations,
+    ensure_backend_can_enforce_contract, PinnedJobAgentContract, TurnStreamObservations,
 };
+use super::agent_contract_prompt::contract_attempt_prompt;
 
 /// Everything the server observed and received from one contract attempt.
 #[derive(Debug)]
@@ -63,6 +64,7 @@ pub(super) async fn execute_agent_contract_attempt(
     model: Option<String>,
     reasoning_effort: Option<String>,
     timeout_secs: u64,
+    correction: Option<(&str, &str)>,
 ) -> anyhow::Result<ContractAttempt> {
     if timeout_secs == 0 {
         anyhow::bail!("agent contract attempt timeout_secs must be positive");
@@ -75,7 +77,13 @@ pub(super) async fn execute_agent_contract_attempt(
                 pinned.contract.output_schema
             )
         })?;
-    let prompt = contract_attempt_prompt(pinned)?;
+    let base_prompt = contract_attempt_prompt(pinned)?;
+    let prompt = match correction {
+        Some((previous_output, validation_error)) => format!(
+            "{base_prompt}\n\nThe previous reply failed server validation. Return a corrected verdict using the same pinned facts and no tools.\n\nValidation error:\n{validation_error}\n\nPrevious reply:\n{previous_output}"
+        ),
+        None => base_prompt,
+    };
 
     // The workspace stays literally empty: the schema file lives in its own
     // temp directory so nothing but the pinned prompt reaches the attempt.
@@ -164,42 +172,10 @@ pub(super) async fn execute_agent_contract_attempt(
     })
 }
 
-/// Builds the only model-visible input for a contract attempt. The static
-/// pinned instruction and the immutable input envelope are serialized into a
-/// single prompt; no workflow document, repository state, or live request is
-/// consulted here.
-fn contract_attempt_prompt(pinned: &PinnedJobAgentContract) -> anyhow::Result<String> {
-    validate_contract_input(pinned)?;
-    Ok(format!(
-        "{}\n\nAgent contract input (JSON):\n{}",
-        pinned.prompt,
-        serde_json::to_string_pretty(&pinned.input)?
-    ))
-}
-
-fn validate_contract_input(pinned: &PinnedJobAgentContract) -> anyhow::Result<()> {
-    validate_agent_contract_input(&pinned.contract.input_schema, &pinned.input)
-        .map_err(anyhow::Error::msg)?;
-    let contract_hash = pinned
-        .input
-        .get("contract_hash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("validated input is missing a string contract_hash"))?;
-    let contract_value = serde_json::to_value(&pinned.contract)?;
-    let expected_hash = harness_workflow::runtime::stable_remote_fact_hash(&contract_value);
-    if contract_hash != expected_hash {
-        anyhow::bail!(
-            "agent contract input hash `{contract_hash}` does not match pinned contract hash `{expected_hash}`"
-        );
-    }
-    Ok(())
-}
-
 /// Converts an observed attempt into the job's `ActivityResult`: violations
 /// invalidate the attempt, an unparsable or off-vocabulary verdict fails it,
 /// and the server-authored observation artifact is attached either way.
-/// Correction retries within `max_corrections` arrive with the assessment
-/// slice.
+#[cfg(test)]
 pub(super) fn contract_attempt_activity_result(
     activity: &str,
     pinned: &PinnedJobAgentContract,
@@ -438,10 +414,16 @@ mod tests {
     #[tokio::test]
     async fn attempt_rejects_backend_without_capability_claims() {
         let backend = ScriptedBackend::without_claims();
-        let error =
-            execute_agent_contract_attempt(backend.clone(), &pinned_contract(), None, None, 30)
-                .await
-                .expect_err("a backend claiming nothing must be rejected before launch");
+        let error = execute_agent_contract_attempt(
+            backend.clone(),
+            &pinned_contract(),
+            None,
+            None,
+            30,
+            None,
+        )
+        .await
+        .expect_err("a backend claiming nothing must be rejected before launch");
         assert!(error.to_string().contains("cannot enforce"), "{error}");
         assert!(
             backend.requests.lock().expect("lock").is_empty(),
@@ -461,6 +443,7 @@ mod tests {
             Some("gpt-5.4".to_string()),
             Some("high".to_string()),
             30,
+            None,
         )
         .await
         .expect("scripted attempt succeeds");
@@ -535,7 +518,7 @@ mod tests {
             }]),
             schema_contents: Mutex::new(Vec::new()),
         });
-        execute_agent_contract_attempt(recording.clone(), &pinned_contract(), None, None, 30)
+        execute_agent_contract_attempt(recording.clone(), &pinned_contract(), None, None, 30, None)
             .await
             .expect("scripted attempt succeeds");
         assert_eq!(
@@ -569,9 +552,10 @@ mod tests {
                 output: valid_verdict_reply(),
             },
         ]);
-        let attempt = execute_agent_contract_attempt(backend, &pinned_contract(), None, None, 30)
-            .await
-            .expect("scripted attempt succeeds");
+        let attempt =
+            execute_agent_contract_attempt(backend, &pinned_contract(), None, None, 30, None)
+                .await
+                .expect("scripted attempt succeeds");
         assert_eq!(attempt.items.len(), 1);
         assert_eq!(
             attempt.observations.reported_models,
@@ -629,9 +613,10 @@ mod tests {
         let backend = Arc::new(HangingBackend {
             cancelled: Arc::clone(&cancelled),
         });
-        let error = execute_agent_contract_attempt(backend, &pinned_contract(), None, None, 1)
-            .await
-            .expect_err("a hung backend must hit the pinned wall-clock boundary");
+        let error =
+            execute_agent_contract_attempt(backend, &pinned_contract(), None, None, 1, None)
+                .await
+                .expect_err("a hung backend must hit the pinned wall-clock boundary");
 
         assert!(error.to_string().contains("timed out after 1s"), "{error}");
         assert!(
