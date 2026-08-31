@@ -334,6 +334,40 @@ mod declarative_agent_contract_tests {
     }
 
     #[test]
+    fn pinned_command_validation_rejects_substituted_semantic_input() -> anyhow::Result<()> {
+        let definition = build_declarative_definition(
+            &classifier_policy(),
+            &activity_policies(Some(contract())),
+        )?;
+        let instance = WorkflowInstance::new(
+            definition.policy().id.clone(),
+            definition.definition_version(),
+            definition.policy().initial.clone(),
+            WorkflowSubject::new("test", "submission"),
+        )
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
+        let mut command = build_declarative_submission_decision(&definition, &instance)?
+            .commands
+            .into_iter()
+            .next()
+            .expect("submission must enqueue the initial activity");
+        command.command["agent_contract_input"]["facts"]["definition_hash"] =
+            json!("sha256:substituted");
+
+        let error = validate_declarative_agent_contract_command(
+            &definition,
+            &instance,
+            &command,
+        )
+        .expect_err("substituted semantic input must fail before dispatch");
+
+        assert!(error
+            .to_string()
+            .contains("does not match the pinned workflow instance"));
+        Ok(())
+    }
+
+    #[test]
     fn server_assessment_routes_contract_outcome_without_model_signal() -> anyhow::Result<()> {
         let definition = build_declarative_definition(
             &classifier_policy(),

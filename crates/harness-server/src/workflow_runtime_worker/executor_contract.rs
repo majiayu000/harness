@@ -23,6 +23,28 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
         if !job_requires_agent_runtime(job) {
             return None;
         }
+        if let Some(result) = agent_contract_validation_preflight_result(job) {
+            return Some(result);
+        }
+        if job.input.pointer("/command/agent_contract").is_some() {
+            let validation = match self.state.core.workflow_runtime_store.as_deref() {
+                Some(store) => {
+                    super::agent_contract_enforcement::validate_pinned_agent_contract_job(
+                        store, job,
+                    )
+                    .await
+                }
+                None => Err(anyhow::anyhow!(
+                    "agent contract runtime job requires the workflow runtime store"
+                )),
+            };
+            if let Err(error) = validation {
+                let error = anyhow::Error::new(
+                    super::agent_contract_job::AgentContractExecutionError::new(error),
+                );
+                return Some(execution_error_result(activity_name(job), error));
+            }
+        }
         if let Some(result) = exact_replay_preflight_result(self.state, job).await {
             return Some(result);
         }
@@ -46,6 +68,13 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
         // run before execute returns (GH-1877).
         self.cancel_lease_lost();
     }
+}
+
+fn agent_contract_validation_preflight_result(job: &RuntimeJob) -> Option<ActivityResult> {
+    job.input.pointer("/command/agent_contract")?;
+    super::agent_contract_job::pinned_agent_contract_for_execution(job)
+        .err()
+        .map(|error| execution_error_result(activity_name(job), error))
 }
 
 fn job_requires_agent_runtime(job: &RuntimeJob) -> bool {
@@ -152,5 +181,31 @@ mod tests {
             result.artifacts[0].artifact_type,
             harness_workflow::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION
         );
+    }
+
+    #[test]
+    fn malformed_contract_is_fatal_before_other_executor_preflight() {
+        let job = RuntimeJob::pending(
+            "command-preflight-order",
+            harness_workflow::runtime::RuntimeKind::CodexExec,
+            "codex-contract",
+            serde_json::json!({
+                "activity": "classify_scope",
+                "command": {"agent_contract": null}
+            }),
+        );
+
+        let result = agent_contract_validation_preflight_result(&job)
+            .expect("a malformed present contract must produce a preflight result");
+
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Fatal));
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unparseable agent_contract")));
     }
 }

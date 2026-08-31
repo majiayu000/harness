@@ -127,6 +127,10 @@ mod tests {
     use harness_core::agent::{
         AgentBackend, AgentRequest, StreamItem, AGENT_OUTPUT_SCHEMA_PATH_ENV,
     };
+    use harness_core::config::workflow::{
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+    };
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -214,33 +218,91 @@ mod tests {
         }
     }
 
-    fn contract_command_payload() -> serde_json::Value {
-        let contract: harness_core::config::workflow::WorkflowAgentContract =
-            serde_json::from_value(serde_json::json!({
-                "input_schema": "harness.semantic_activity_input.v1",
-                "output_schema": "harness.semantic_verdict.v1",
-                "allowed_outcomes": ["small", "large"],
-                "tools": "none",
-                "mutation": "forbidden",
-                "workspace": "ephemeral_empty",
-                "fresh_context": true,
-            }))
-            .expect("contract fixture should deserialize");
-        let contract = serde_json::to_value(contract).expect("contract fixture should serialize");
-        let contract_hash = harness_workflow::runtime::stable_remote_fact_hash(&contract);
-        serde_json::json!({
-            "activity": "classify_scope",
-            "agent_contract": contract,
-            "prompt": "Classify only the supplied facts.",
-            "agent_contract_input": {
-                "schema": "harness.semantic_activity_input.v1",
-                "subject": {"kind": "issue", "identity": "owner/repo#126"},
-                "facts": {"changed_files": ["src/lib.rs"]},
-                "provenance": {"/changed_files": "server"},
-                "contract_hash": contract_hash,
-            },
-            "definition_hash": "sha256:pinned",
-        })
+    fn contract_definition(
+        activity: &str,
+    ) -> anyhow::Result<harness_workflow::runtime::DeclarativeWorkflowDefinition> {
+        let contract = serde_json::from_value(serde_json::json!({
+            "input_schema": "harness.semantic_activity_input.v1",
+            "output_schema": "harness.semantic_verdict.v1",
+            "allowed_outcomes": ["small", "large"],
+            "tools": "none",
+            "mutation": "forbidden",
+            "workspace": "ephemeral_empty",
+            "fresh_context": true,
+        }))?;
+        let policy = WorkflowDefinitionPolicy {
+            id: format!("contract_test_{activity}"),
+            initial: "classifying".to_string(),
+            states: BTreeMap::from([
+                (
+                    "classifying".to_string(),
+                    DeclaredState {
+                        activity: Some(activity.to_string()),
+                        on_failure: Some("blocked".to_string()),
+                        on_signal: BTreeMap::from([
+                            ("small".to_string(), "done".to_string()),
+                            ("large".to_string(), "blocked".to_string()),
+                        ]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "blocked".to_string(),
+                    DeclaredState {
+                        progress: Some(DeclaredProgressMode::OperatorGate),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            terminal: BTreeMap::from([
+                ("done".to_string(), "succeeded".to_string()),
+                ("failed".to_string(), "failed".to_string()),
+                ("cancelled".to_string(), "cancelled".to_string()),
+            ]),
+            evidence_required: BTreeMap::new(),
+            recovery_targets: vec!["classifying".to_string()],
+            intake: None,
+        };
+        harness_workflow::runtime::build_declarative_definition(
+            &policy,
+            &BTreeMap::from([(
+                activity.to_string(),
+                WorkflowActivityPolicy {
+                    prompt: Some("Classify only the supplied facts.".to_string()),
+                    agent_contract: Some(contract),
+                    ..Default::default()
+                },
+            )]),
+        )
+    }
+
+    async fn make_contract_test_state(
+        config_root: &std::path::Path,
+        project_root: &std::path::Path,
+        agent_registry: harness_agents::registry::AgentRegistry,
+        activity: &str,
+    ) -> anyhow::Result<Arc<crate::http::AppState>> {
+        let mut state = crate::test_helpers::make_test_state_with_project_root_and_registry(
+            config_root,
+            project_root,
+            agent_registry,
+        )
+        .await?;
+        let definition = contract_definition(activity)?;
+        let mut definition_registry =
+            harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins();
+        definition_registry.register_declarative_current(definition)?;
+        let store_path =
+            harness_core::config::dirs::default_db_path(config_root, "workflow_runtime");
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store = harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &store_path,
+            Some(&database_url),
+        )
+        .await?
+        .with_definition_registry(definition_registry.into_shared());
+        state.core.workflow_runtime_store = Some(Arc::new(store));
+        Ok(Arc::new(state))
     }
 
     fn valid_verdict_reply() -> String {
@@ -258,10 +320,11 @@ mod tests {
         project_root: &std::path::Path,
         activity: &str,
     ) -> anyhow::Result<harness_workflow::runtime::RuntimeJob> {
+        let definition = contract_definition(activity)?;
         let workflow = harness_workflow::runtime::WorkflowInstance::new(
-            "github_issue_pr",
-            1,
-            "implementing",
+            definition.policy().id.clone(),
+            definition.definition_version(),
+            definition.policy().initial.clone(),
             harness_workflow::runtime::WorkflowSubject::new("issue", "issue:126"),
         )
         .with_id("issue-126")
@@ -270,18 +333,26 @@ mod tests {
                 "project_id": project_root,
                 "repo": "owner/repo",
                 "issue_number": 126,
+                "changed_files": ["src/lib.rs"],
+                "definition_hash": definition.definition_hash(),
             }),
             harness_workflow::runtime::DataProvenance::Server,
         );
+        store
+            .persist_definition_version(
+                &harness_workflow::runtime::persisted_declarative_definition(&definition, None),
+            )
+            .await?;
         crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
             .await?;
-        let mut command_payload = contract_command_payload();
-        command_payload["activity"] = serde_json::json!(activity);
-        let command = harness_workflow::runtime::WorkflowCommand::new(
-            harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
-            "classify-126",
-            command_payload.clone(),
-        );
+        let command = harness_workflow::runtime::build_declarative_submission_decision(
+            &definition,
+            &workflow,
+        )?
+        .commands
+        .into_iter()
+        .next()
+        .expect("contract submission must enqueue its initial activity");
         let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
         let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
             "codex-default",
@@ -299,7 +370,7 @@ mod tests {
                     "command_id": command_id,
                     "command_type": command.command_type,
                     "dedupe_key": command.dedupe_key,
-                    "command": command_payload,
+                    "command": command.command,
                     "activity": activity,
                     "runtime_profile": runtime_profile,
                 }),
@@ -320,14 +391,8 @@ mod tests {
         let agent = UnclaimingStreamAgent::new();
         let mut registry = harness_agents::registry::AgentRegistry::new("codex");
         registry.register("codex", agent.clone());
-        let state = Arc::new(
-            crate::test_helpers::make_test_state_with_project_root_and_registry(
-                dir.path(),
-                &project_root,
-                registry,
-            )
-            .await?,
-        );
+        let state =
+            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope").await?;
         let store = state
             .core
             .workflow_runtime_store
@@ -382,14 +447,13 @@ mod tests {
             }]);
         let mut registry = harness_agents::registry::AgentRegistry::new("codex");
         registry.register("codex", agent.clone());
-        let state = Arc::new(
-            crate::test_helpers::make_test_state_with_project_root_and_registry(
-                dir.path(),
-                &project_root,
-                registry,
-            )
-            .await?,
-        );
+        let state = make_contract_test_state(
+            dir.path(),
+            &project_root,
+            registry,
+            harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+        )
+        .await?;
         let store = state
             .core
             .workflow_runtime_store
@@ -421,9 +485,10 @@ mod tests {
         let requests = agent.requests.lock().await;
         assert_eq!(requests.len(), 1, "exactly one attempt launch");
         let request = &requests[0];
-        let payload = contract_command_payload();
+        let payload = &runtime_job.input["command"];
         let expected_prompt = format!(
-            "Classify only the supplied facts.\n\nAgent contract input (JSON):\n{}",
+            "{}\n\nAgent contract input (JSON):\n{}",
+            payload["prompt"].as_str().expect("pinned prompt"),
             serde_json::to_string_pretty(&payload["agent_contract_input"])?
         );
         assert_eq!(request.prompt, expected_prompt);
@@ -511,14 +576,8 @@ mod tests {
         ]);
         let mut registry = harness_agents::registry::AgentRegistry::new("codex");
         registry.register("codex", agent.clone());
-        let state = Arc::new(
-            crate::test_helpers::make_test_state_with_project_root_and_registry(
-                dir.path(),
-                &project_root,
-                registry,
-            )
-            .await?,
-        );
+        let state =
+            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope").await?;
         let store = state
             .core
             .workflow_runtime_store
@@ -602,14 +661,8 @@ mod tests {
         ]);
         let mut registry = harness_agents::registry::AgentRegistry::new("codex");
         registry.register("codex", agent.clone());
-        let state = Arc::new(
-            crate::test_helpers::make_test_state_with_project_root_and_registry(
-                dir.path(),
-                &project_root,
-                registry,
-            )
-            .await?,
-        );
+        let state =
+            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope").await?;
         let store = state
             .core
             .workflow_runtime_store

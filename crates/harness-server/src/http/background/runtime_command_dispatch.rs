@@ -107,8 +107,10 @@ async fn dispatch_runtime_command_with_project_policy(
 
     let has_agent_contract =
         match crate::workflow_runtime_worker::validate_pinned_agent_contract_command(
-            &command.command,
-        ) {
+            store, &command,
+        )
+        .await
+        {
             Ok(has_agent_contract) => has_agent_contract,
             Err(error) => {
                 let reason = format!("invalid pinned agent_contract: {error}");

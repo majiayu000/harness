@@ -385,3 +385,40 @@ pub(crate) fn declarative_enqueue_activity_command(
         None => Ok(WorkflowCommand::enqueue_activity(activity, dedupe_key)),
     }
 }
+
+/// Validates that a persisted contract command is exactly the command derived
+/// from the workflow instance's pinned declarative definition and data.
+pub fn validate_declarative_agent_contract_command(
+    definition: &DeclarativeWorkflowDefinition,
+    instance: &WorkflowInstance,
+    command: &WorkflowCommand,
+) -> anyhow::Result<bool> {
+    let command_has_contract = command.command.get("agent_contract").is_some();
+    let activity = command.activity_name().ok_or_else(|| {
+        anyhow::anyhow!("agent contract command does not name an enqueue activity")
+    })?;
+    let definition_has_contract = definition.agent_contract(activity).is_some();
+    if !command_has_contract && !definition_has_contract {
+        return Ok(false);
+    }
+    if command_has_contract != definition_has_contract {
+        anyhow::bail!("agent contract command does not match the pinned workflow definition");
+    }
+    if instance.definition_id != definition.policy().id
+        || instance.definition_version != definition.definition_version()
+        || instance.data.get("definition_hash").and_then(Value::as_str)
+            != Some(definition.definition_hash())
+    {
+        anyhow::bail!("workflow instance does not match its pinned declarative definition");
+    }
+    let expected = declarative_enqueue_activity_command(
+        definition,
+        instance,
+        activity,
+        command.dedupe_key.clone(),
+    )?;
+    if expected != *command {
+        anyhow::bail!("agent contract command does not match the pinned workflow instance");
+    }
+    Ok(true)
+}

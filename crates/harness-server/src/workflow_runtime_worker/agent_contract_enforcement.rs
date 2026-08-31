@@ -15,7 +15,9 @@ use harness_core::config::workflow::{
 };
 use harness_core::types::Item;
 use harness_workflow::runtime::completion_evidence::ARTIFACT_RUNTIME_TURN_OBSERVATIONS;
-use harness_workflow::runtime::{ActivityArtifact, RuntimeJob, WorkflowCommand};
+use harness_workflow::runtime::{
+    ActivityArtifact, RuntimeJob, WorkflowCommandRecord, WorkflowRuntimeStore,
+};
 use serde_json::{json, Value};
 
 /// Pinned agent contract carried by a runtime job's command payload.
@@ -45,15 +47,69 @@ pub(super) fn pinned_agent_contract_for_job(
     extract_pinned_agent_contract(command, activity, &format!("runtime job {}", job.id))
 }
 
-pub(crate) fn validate_pinned_agent_contract_command(
-    command: &WorkflowCommand,
+pub(crate) async fn validate_pinned_agent_contract_command(
+    store: &WorkflowRuntimeStore,
+    command: &WorkflowCommandRecord,
 ) -> anyhow::Result<bool> {
-    extract_pinned_agent_contract(
-        Some(&command.command),
-        command.runtime_activity_key(),
+    let pinned = extract_pinned_agent_contract(
+        Some(&command.command.command),
+        command.command.runtime_activity_key(),
         "workflow command",
+    )?;
+    if pinned.is_none() {
+        return Ok(false);
+    }
+    let instance = store
+        .get_instance(&command.workflow_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "workflow command references missing instance '{}'",
+                command.workflow_id
+            )
+        })?;
+    let persisted = store
+        .get_definition(&instance.definition_id, instance.definition_version)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "workflow instance '{}' references missing definition '{}@{}'",
+                instance.id,
+                instance.definition_id,
+                instance.definition_version
+            )
+        })?;
+    let definition =
+        harness_workflow::runtime::hydrate_persisted_declarative_definition(&persisted)?;
+    harness_workflow::runtime::validate_declarative_agent_contract_command(
+        &definition,
+        &instance,
+        &command.command,
     )
-    .map(|pinned| pinned.is_some())
+}
+
+pub(crate) async fn validate_pinned_agent_contract_job(
+    store: &WorkflowRuntimeStore,
+    job: &RuntimeJob,
+) -> anyhow::Result<bool> {
+    let pinned = pinned_agent_contract_for_job(job)?;
+    if pinned.is_none() {
+        return Ok(false);
+    }
+    let command = store
+        .get_command(&job.command_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("runtime job references a missing workflow command"))?;
+    if job.input.get("workflow_id").and_then(Value::as_str) != Some(&command.workflow_id)
+        || job.input.get("command_id").and_then(Value::as_str) != Some(&command.id)
+        || job.input.get("command_type")
+            != Some(&serde_json::to_value(command.command.command_type)?)
+        || job.input.get("dedupe_key").and_then(Value::as_str) != Some(&command.command.dedupe_key)
+        || job.input.get("command") != Some(&command.command.command)
+    {
+        anyhow::bail!("runtime job agent contract snapshot does not match its workflow command");
+    }
+    validate_pinned_agent_contract_command(store, &command).await
 }
 
 fn extract_pinned_agent_contract(

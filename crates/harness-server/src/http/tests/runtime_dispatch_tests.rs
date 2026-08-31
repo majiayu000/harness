@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 
 struct DispatchContractAgent {
     enforceable: bool,
@@ -31,7 +32,8 @@ struct ContractDispatchResult {
     completion_events: usize,
 }
 
-fn pinned_contract_dispatch_command() -> harness_workflow::runtime::WorkflowCommand {
+fn contract_dispatch_definition(
+) -> anyhow::Result<harness_workflow::runtime::DeclarativeWorkflowDefinition> {
     let contract: harness_core::config::workflow::WorkflowAgentContract =
         serde_json::from_value(serde_json::json!({
             "input_schema": "harness.semantic_activity_input.v1",
@@ -45,32 +47,60 @@ fn pinned_contract_dispatch_command() -> harness_workflow::runtime::WorkflowComm
             "max_corrections": 1
         }))
         .expect("valid dispatch contract fixture");
-    let contract_value = serde_json::to_value(&contract).expect("serialized dispatch contract");
-    let contract_hash = harness_workflow::runtime::stable_remote_fact_hash(&contract_value);
-    harness_workflow::runtime::WorkflowCommand::new(
-        harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
-        "contract-dispatch-1",
-        serde_json::json!({
-            "activity": "classify_scope",
-            "agent_contract": contract_value,
-            "prompt": "Classify only the supplied facts.",
-            "definition_hash": "sha256:pinned",
-            "agent_contract_input": {
-                "schema": "harness.semantic_activity_input.v1",
-                "subject": {"kind": "test", "identity": "contract-dispatch"},
-                "facts": {"scope": "small"},
-                "provenance": {"/scope": "server"},
-                "contract_hash": contract_hash
-            }
-        }),
-    )
+    let policy = harness_core::config::workflow::WorkflowDefinitionPolicy {
+        id: "contract_workflow".to_string(),
+        initial: "classifying".to_string(),
+        states: BTreeMap::from([
+            (
+                "classifying".to_string(),
+                harness_core::config::workflow::DeclaredState {
+                    activity: Some("classify_scope".to_string()),
+                    on_failure: Some("blocked".to_string()),
+                    on_signal: BTreeMap::from([
+                        ("small".to_string(), "done".to_string()),
+                        ("large".to_string(), "blocked".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "blocked".to_string(),
+                harness_core::config::workflow::DeclaredState {
+                    progress: Some(
+                        harness_core::config::workflow::DeclaredProgressMode::OperatorGate,
+                    ),
+                    ..Default::default()
+                },
+            ),
+        ]),
+        terminal: BTreeMap::from([
+            ("done".to_string(), "succeeded".to_string()),
+            ("failed".to_string(), "failed".to_string()),
+            ("cancelled".to_string(), "cancelled".to_string()),
+        ]),
+        evidence_required: BTreeMap::new(),
+        recovery_targets: vec!["classifying".to_string()],
+        intake: None,
+    };
+    let activity_policies = BTreeMap::from([(
+        "classify_scope".to_string(),
+        harness_core::config::workflow::WorkflowActivityPolicy {
+            prompt: Some("Classify only the supplied facts.".to_string()),
+            agent_contract: Some(contract),
+            ..Default::default()
+        },
+    )]);
+    harness_workflow::runtime::build_declarative_definition(&policy, &activity_policies)
 }
 
-async fn dispatch_contract_with_backend(
+async fn dispatch_contract_with_backend<F>(
     enforceable: bool,
     runtime_enabled: bool,
-    command: harness_workflow::runtime::WorkflowCommand,
-) -> anyhow::Result<ContractDispatchResult> {
+    mutate_command: F,
+) -> anyhow::Result<ContractDispatchResult>
+where
+    F: FnOnce(&mut harness_workflow::runtime::WorkflowCommand),
+{
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(ContractDispatchResult {
             enqueued: 0,
@@ -105,15 +135,32 @@ async fn dispatch_contract_with_backend(
         .workflow_runtime_store
         .as_ref()
         .expect("workflow runtime store should be configured");
+    let definition = contract_dispatch_definition()?;
     let workflow = harness_workflow::runtime::WorkflowInstance::new(
-        "contract_workflow",
-        1,
-        "classifying",
+        definition.policy().id.clone(),
+        definition.definition_version(),
+        definition.policy().initial.clone(),
         harness_workflow::runtime::WorkflowSubject::new("test", "contract-dispatch"),
     )
     .with_id("contract-dispatch")
-    .with_server_data(serde_json::json!({"project_id": project_root}));
+    .with_server_data(serde_json::json!({
+        "definition_hash": definition.definition_hash(),
+        "project_id": project_root,
+        "scope": "small"
+    }));
+    store
+        .persist_definition_version(
+            &harness_workflow::runtime::persisted_declarative_definition(&definition, None),
+        )
+        .await?;
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let mut command =
+        harness_workflow::runtime::build_declarative_submission_decision(&definition, &workflow)?
+            .commands
+            .into_iter()
+            .next()
+            .expect("contract submission must enqueue its initial activity");
+    mutate_command(&mut command);
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let mut profile = harness_workflow::runtime::RuntimeProfile::new(
         "codex-contract",
@@ -146,8 +193,7 @@ async fn runtime_dispatch_authorizes_contract_only_from_selected_backend_capabil
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result =
-        dispatch_contract_with_backend(true, true, pinned_contract_dispatch_command()).await?;
+    let result = dispatch_contract_with_backend(true, true, |_| {}).await?;
     assert_eq!(result.enqueued, 1);
     assert_eq!(result.deferred, 0);
     assert_eq!(result.runtime_jobs, 1);
@@ -160,8 +206,7 @@ async fn runtime_dispatch_defers_contract_for_nonconforming_selected_backend() -
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result =
-        dispatch_contract_with_backend(false, true, pinned_contract_dispatch_command()).await?;
+    let result = dispatch_contract_with_backend(false, true, |_| {}).await?;
     assert_eq!(result.enqueued, 0);
     assert_eq!(result.deferred, 1);
     assert_eq!(result.runtime_jobs, 0);
@@ -174,10 +219,10 @@ async fn runtime_dispatch_fails_malformed_present_contract_instead_of_deferring(
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let mut command = pinned_contract_dispatch_command();
-    command.command["agent_contract"] = serde_json::Value::Null;
-
-    let result = dispatch_contract_with_backend(true, false, command).await?;
+    let result = dispatch_contract_with_backend(true, false, |command| {
+        command.command["agent_contract"] = serde_json::Value::Null;
+    })
+    .await?;
 
     assert_eq!(result.enqueued, 0);
     assert_eq!(result.deferred, 0);
@@ -197,14 +242,36 @@ async fn runtime_dispatch_fails_incomplete_contract_envelope_before_disabled_pol
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let mut command = pinned_contract_dispatch_command();
-    command
-        .command
-        .as_object_mut()
-        .expect("contract command payload")
-        .remove("prompt");
+    let result = dispatch_contract_with_backend(true, false, |command| {
+        command
+            .command
+            .as_object_mut()
+            .expect("contract command payload")
+            .remove("prompt");
+    })
+    .await?;
 
-    let result = dispatch_contract_with_backend(true, false, command).await?;
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_semantic_input_substituted_after_pinning() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, |command| {
+        command.command["agent_contract_input"]["facts"]["scope"] = serde_json::json!("large");
+    })
+    .await?;
 
     assert_eq!(result.enqueued, 0);
     assert_eq!(result.deferred, 0);

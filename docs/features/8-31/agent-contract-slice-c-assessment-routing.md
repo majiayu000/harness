@@ -2,7 +2,7 @@
 
 Date: 2026-08-31
 
-Status: Implemented locally; PR review and CI pending
+Status: Implemented; final PR review and CI pending
 
 Scope: close the production workflow loop for the pinned agent-contract primitive delivered in Slice B
 
@@ -31,7 +31,7 @@ declarative submission
   -> transactional workflow event, decision, and evidence
 ```
 
-The command remains the immutable execution snapshot. It carries the contract, prompt, semantic input, input provenance, contract hash, definition hash, and budgets produced by Slice A and Slice B.
+The command remains the immutable execution snapshot. It carries the contract, prompt, semantic input, input provenance, contract hash, definition hash, and budgets produced by Slice A and Slice B. Before dispatch, the server reconstructs the expected command from the persisted workflow instance and its pinned declarative definition and requires exact equality. Before any executor preflight, the runtime job snapshot is also required to match that authorized command exactly.
 
 ## Capability-aware dispatch
 
@@ -45,7 +45,7 @@ The workflow dispatcher remains fail-closed by default. The server authorizes on
 
 Effective-profile rewrites are applied before the dispatcher compares the authorization. An eval override cannot authorize one profile and enqueue a different runtime kind or profile.
 
-A missing backend, incomplete capability claim, remote runtime, zero timeout, malformed contract, or profile mismatch leaves the command behind `agent_contract_enforcement_unavailable` and creates no runtime job. Executor preflight repeats the backend check as defense in depth.
+A missing backend, incomplete capability claim, remote runtime, zero timeout, malformed contract, or profile mismatch leaves the command behind `agent_contract_enforcement_unavailable` and creates no runtime job. A contract that is malformed or differs from the pinned definition or instance fails the command and workflow fatally. Executor preflight validates the complete job-to-command binding before exact-replay and disabled-worker checks, then repeats the backend check as defense in depth.
 
 ## Durable attempt budget
 
@@ -90,9 +90,10 @@ Fresh evidence from this branch:
 | Surface | Result |
 |---|---|
 | Canonical contract tests | 9 passed |
-| Declarative contract tests | 17 passed |
+| Declarative contract tests | 18 passed |
 | Server contract tests | 26 passed, 1 ignored live dogfood |
-| Runtime dispatch tests | 24 passed |
+| Runtime dispatch tests | 25 passed |
+| Exact-replay preflight test | 1 passed |
 | Real submission, assessment, route, and store reopen | passed; one model-backend invocation |
 | Durable correction | invalid primary plus one valid correction passed; two persisted reservations |
 | Reclaimed reservation | failed without a duplicate model invocation |
@@ -113,6 +114,8 @@ The third independent review found three remaining upstream gaps. Malformed pres
 The fourth independent review found five remaining lifecycle gaps. Contract validation now precedes project policy and config resolution; invalid dispatch atomically records command failure, completion, and the reducer decision; every model invocation atomically consumes one workflow turn and one contract attempt; reservations require the current running lease owner and generation; and the contract stream terminates on lease loss. A further fresh-context review remains required.
 
 The fifth independent review found two validation-order gaps. Dispatcher and executor now share the same complete pinned-envelope validation, including prompt, definition hash, semantic input, canonical output schema, and contract hash. That validation finishes before project policy resolution and before any workflow-turn or attempt reservation. A further fresh-context review remains required.
+
+The sixth independent review found two remaining authorization-order gaps. Dispatch now binds the complete contract command to the persisted workflow instance and its hydrated pinned declarative definition, including the exact contract, prompt, definition hash, subject, facts, and provenance. Executor preflight then binds the runtime job snapshot back to that authorized command before exact-replay or disabled-worker handling. A final fresh-context review remains required.
 
 ## Slice D boundary
 

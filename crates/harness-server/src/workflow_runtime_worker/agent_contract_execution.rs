@@ -479,6 +479,11 @@ mod tests {
         state.core.workflow_runtime_store = Some(Arc::clone(&store));
         let state = Arc::new(state);
         let definition = loop_definition();
+        store
+            .persist_definition_version(
+                &harness_workflow::runtime::persisted_declarative_definition(&definition, None),
+            )
+            .await?;
         let instance = WorkflowInstance::new(
             definition.policy().id.clone(),
             definition.definition_version(),
