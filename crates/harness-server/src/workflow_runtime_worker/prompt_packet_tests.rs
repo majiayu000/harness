@@ -95,6 +95,13 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
         "local_review_gate"
     );
     assert_eq!(
+        schema["transition_contract"]["on_failed"]["reducer_next_state"],
+        "local_review_gate"
+    );
+    assert!(schema["transition_contract"]["on_failed"]["retry_policy"]
+        .as_str()
+        .is_some_and(|value| value.contains("MUST NOT replay")));
+    assert_eq!(
         schema["activity_contract"]["accepted_artifacts"][1],
         PR_REPAIR_SNAPSHOT_ARTIFACT
     );
@@ -125,6 +132,11 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
         .is_some_and(|items| items.iter().any(|item| item
             .as_str()
             .is_some_and(|value| value.contains("pr_hygiene update/rebase")))));
+    assert!(schema["agent_summary_contract"]["must_not_include"]
+        .as_array()
+        .is_some_and(|items| items.contains(&json!(
+            "waiting for hosted CI or newly generated feedback after the repair push"
+        ))));
     assert!(
         schema["transition_contract"]["on_succeeded"]["required_summary"]
             .as_str()
@@ -191,6 +203,11 @@ fn activity_result_schema_requires_exactly_one_local_review_outcome() {
             LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
             LOCAL_REVIEW_BLOCKED_SIGNAL,
         ])
+    );
+    assert!(
+        schema["agent_summary_contract"]["signals"][LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL]
+            .as_str()
+            .is_some_and(|value| value.contains("actionable_blocker_count"))
     );
 }
 
@@ -435,6 +452,7 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
     assert!(snapshot_fields.contains(&json!("snapshot_source")));
     assert!(snapshot_fields.contains(&json!("head_oid")));
     assert!(snapshot_fields.contains(&json!("review_threads_complete")));
+    assert!(snapshot_fields.contains(&json!("actionable_blocker_count")));
     assert!(schema["workflow_decision_contract"]["allowed_transitions"]
         .as_array()
         .expect("allowed transitions should be an array")

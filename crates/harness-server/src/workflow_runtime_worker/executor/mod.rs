@@ -410,10 +410,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         attempt + 1,
                     ));
                 }
-                let result =
-                    harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(
-                        result,
-                    );
                 let result = super::transcript_durability::attach_runtime_transcript_source(
                     result,
                     transcript_turn.as_ref().unwrap_or(&turn),

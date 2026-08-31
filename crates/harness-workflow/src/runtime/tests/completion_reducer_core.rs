@@ -811,6 +811,178 @@ fn runtime_completion_reducer_finishes_succeeded_feedback_closed_issue_signal_wi
 }
 
 #[test]
+fn runtime_completion_reducer_finishes_closed_issue_during_local_review() {
+    let instance = issue_instance("local_review_gate");
+    let result = ActivityResult::succeeded(
+        LOCAL_REVIEW_ACTIVITY,
+        "Issue was closed while local review was running.",
+    )
+    .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(123));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("verified issue closure should terminate local review");
+
+    assert_eq!(decision.decision, "finish_closed_issue");
+    assert_eq!(decision.next_state, "done");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("server-verified issue closure should validate during local review");
+}
+
+#[test]
+fn runtime_completion_reducer_finishes_from_server_merged_pr_snapshot() {
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server snapshot observed a merged pull request.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "snapshot_source": "server_github_graphql",
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "state": "MERGED",
+            "head_oid": "abc123",
+            "merge_commit_sha": "def456",
+            "observed_at": "2026-08-31T00:00:00Z",
+        }),
+    ));
+    let event = runtime_completion_event(&instance, PR_FEEDBACK_INSPECT_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("server-observed PR merge should terminate feedback processing");
+
+    assert_eq!(decision.decision, "finish_server_observed_pr_merge");
+    assert_eq!(decision.next_state, "done");
+    assert_eq!(decision.commands[0].command_type, WorkflowCommandType::MarkDone);
+}
+
+#[test]
+fn runtime_completion_reducer_cancels_from_server_closed_pr_snapshot() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server snapshot observed a closed pull request.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "snapshot_source": "server_github_graphql",
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "state": "CLOSED",
+            "head_oid": "abc123",
+            "observed_at": "2026-08-31T00:00:00Z",
+        }),
+    ));
+    let event = runtime_completion_event(&instance, PR_FEEDBACK_INSPECT_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("server-observed PR closure should terminate feedback processing");
+
+    assert_eq!(decision.decision, "cancel_server_observed_closed_pr");
+    assert_eq!(decision.next_state, "cancelled");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkCancelled
+    );
+}
+
+#[test]
+fn runtime_completion_reducer_requires_complete_bound_pr_identity_for_terminal_snapshot() {
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
+        "pr_number": 77,
+    }));
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server snapshot observed a merged pull request.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "snapshot_source": "server_github_graphql",
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "state": "MERGED",
+        }),
+    ));
+    let event = runtime_completion_event(&instance, PR_FEEDBACK_INSPECT_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("invalid feedback completion should produce a decision");
+
+    assert_ne!(decision.decision, "finish_server_observed_pr_merge");
+    assert_ne!(decision.next_state, "done");
+}
+
+#[test]
+fn runtime_completion_reducer_validates_late_server_merge_from_blocked_state() {
+    let instance = issue_instance("blocked").with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server snapshot observed a late pull request merge.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "snapshot_source": "server_github_graphql",
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "state": "MERGED",
+        }),
+    ));
+    let event = runtime_completion_event(&instance, PR_FEEDBACK_INSPECT_ACTIVITY, result);
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("late server merge should terminate a blocked workflow");
+
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("runtime-observed merge should validate from blocked");
+    assert_eq!(decision.next_state, "done");
+}
+
+#[test]
 fn runtime_completion_reducer_uses_issue_state_artifact_as_closed_issue_evidence() {
     let instance = issue_instance("implementing");
     let result =
@@ -1065,6 +1237,10 @@ fn runtime_completion_reducer_accepts_structured_workflow_decision_artifact() {
     .with_artifact(ActivityArtifact::new(
         "workflow_decision",
         serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ))
+    .with_signal(ActivitySignal::new(
+        "NoFeedbackFound",
+        json!({ "pr_number": 77 }),
     ));
     let event = WorkflowEvent::new(
         &instance.id,

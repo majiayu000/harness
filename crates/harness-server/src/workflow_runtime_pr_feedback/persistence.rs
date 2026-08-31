@@ -179,7 +179,6 @@ pub(super) async fn persist_pr_hygiene_repair_request(
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
     let workflow_id = instance.id.clone();
     let task_id = runtime_task_id_from_instance(&instance);
-    let project_id = ctx.project_root.to_string_lossy().into_owned();
     let pr_url = optional_string_field(&instance.data, "pr_url").or_else(|| {
         ctx.pr_url
             .map(str::trim)
@@ -218,18 +217,24 @@ pub(super) async fn persist_pr_hygiene_repair_request(
             "Comment asking whether the PR should be closed when dirty_age_secs is at least dirty_age_to_comment_secs and no recent activity explains the stale state."
         ],
     });
-    let mut accepted_data = pr_runtime_data(
-        ctx.project_root,
-        project_id,
-        repo.as_deref(),
+    let next_round = match evaluate_hygiene_repair_convergence(
+        store,
+        &instance,
+        new_instance,
         issue_number,
-        ctx.task_id,
-        ctx.pr_number,
-        pr_url.as_deref(),
-        Some(&summary),
-    );
+        &ctx,
+    )
+    .await?
+    {
+        HygieneRepairConvergence::Continue { next_round } => next_round,
+        HygieneRepairConvergence::Stop(outcome) => return Ok(outcome),
+    };
+    let mut accepted_data = instance.data.clone();
     if let Some(object) = accepted_data.as_object_mut() {
         object.insert("hygiene_context".to_string(), hygiene_context.clone());
+        object.insert("feedback_summary".to_string(), json!(summary));
+        object.insert("feedback_repair_round".to_string(), json!(next_round));
+        object.insert("feedback_repair_blocker_count".to_string(), json!(1));
     }
     let repair_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let output = build_pr_hygiene_repair_decision(

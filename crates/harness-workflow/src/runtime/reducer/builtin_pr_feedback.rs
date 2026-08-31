@@ -1,6 +1,6 @@
 use super::support::{
     event_field_string, has_signal, json_value_u64, optional_data_string, result_signal_string,
-    result_signal_u64, runtime_completion_evidence,
+    result_signal_u64, runtime_blocked_command, runtime_completion_evidence,
 };
 use super::GITHUB_ISSUE_PR_DEFINITION_ID;
 use crate::runtime::model::{
@@ -8,9 +8,10 @@ use crate::runtime::model::{
     WorkflowInstance,
 };
 use crate::runtime::pr_feedback::{
-    build_local_review_completed_decision, build_pr_feedback_decision, LocalReviewCompletedInput,
-    LocalReviewOutcome, PrFeedbackDecisionInput, PrFeedbackOutcome, LOCAL_REVIEW_ACTIVITY,
-    LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
+    build_local_review_completed_decision, build_pr_feedback_decision, next_feedback_repair_round,
+    FeedbackRepairStop, LocalReviewCompletedInput, LocalReviewOutcome, PrFeedbackDecisionInput,
+    PrFeedbackOutcome, LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL,
+    LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL, MAX_FEEDBACK_REPAIR_ROUNDS,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
@@ -34,6 +35,16 @@ pub(super) fn pr_feedback_sweep_decision_from_activity_result(
         return None;
     }
     let outcome = pr_feedback_outcome_from_signals(result)?;
+    if outcome == PrFeedbackOutcome::BlockingFeedback {
+        if let Some(decision) = feedback_repair_convergence_blocked_decision(
+            instance,
+            event,
+            result,
+            result_signal_u64(result, "actionable_blocker_count"),
+        ) {
+            return Some(decision);
+        }
+    }
     let pr_number = result_signal_u64(result, "pr_number").or_else(|| {
         instance
             .data
@@ -59,6 +70,106 @@ pub(super) fn pr_feedback_sweep_decision_from_activity_result(
         .decision
         .with_evidence(runtime_completion_evidence(event, result)),
     )
+}
+
+fn feedback_repair_convergence_blocked_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    current_blockers: Option<u64>,
+) -> Option<WorkflowDecision> {
+    let completed_rounds = instance
+        .data
+        .get("feedback_repair_round")
+        .and_then(json_value_u64)
+        .unwrap_or(0);
+    if completed_rounds == 0 {
+        return None;
+    }
+
+    let Some(current_blockers) = current_blockers else {
+        if completed_rounds == 0 {
+            return None;
+        }
+        return Some(feedback_repair_blocked_decision(
+            instance,
+            event,
+            result,
+            "block_feedback_repair_unmeasured",
+            "PR feedback repair progress cannot be measured because the server-owned blocker count is missing; automatic repair is stopped.",
+        ));
+    };
+    let (decision_name, reason) = match next_feedback_repair_round(&instance.data, current_blockers)
+    {
+        Ok(_) => return None,
+        Err(FeedbackRepairStop::RoundLimit { .. }) => (
+            "block_feedback_repair_round_limit",
+            format!("PR feedback remains actionable after {MAX_FEEDBACK_REPAIR_ROUNDS} repair rounds; operator review is required before more mutations."),
+        ),
+        Err(FeedbackRepairStop::MissingBaseline { .. }) => (
+            "block_feedback_repair_unmeasured",
+            "PR feedback repair progress cannot be measured because the prior blocker baseline is missing; automatic repair is stopped."
+                .to_string(),
+        ),
+        Err(FeedbackRepairStop::NoProgress { previous, current }) => (
+            "block_feedback_repair_oscillation",
+            format!("PR feedback repair did not decrease actionable blockers ({previous} before, {current} now); automatic repair is stopped to prevent oscillation."),
+        ),
+    };
+    Some(feedback_repair_blocked_decision(
+        instance,
+        event,
+        result,
+        decision_name,
+        &reason,
+    ))
+}
+
+fn feedback_repair_blocked_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    decision_name: &str,
+    reason: &str,
+) -> WorkflowDecision {
+    WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        decision_name,
+        "blocked",
+        reason,
+    )
+    .with_command(runtime_blocked_command(
+        reason,
+        None,
+        format!("pr-feedback:{}:convergence-block:{}", instance.id, event.id),
+        event,
+        result,
+    ))
+    .with_evidence(runtime_completion_evidence(event, result))
+    .high_confidence()
+}
+
+pub(super) fn pr_feedback_activity_missing_outcome_signal(
+    instance: &WorkflowInstance,
+    result: &ActivityResult,
+) -> bool {
+    matches!(
+        (
+            instance.definition_id.as_str(),
+            instance.state.as_str(),
+            result.activity.as_str()
+        ),
+        (
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            "awaiting_feedback",
+            "sweep_pr_feedback" | PR_FEEDBACK_INSPECT_ACTIVITY
+        ) | (
+            PR_FEEDBACK_DEFINITION_ID,
+            "inspecting",
+            PR_FEEDBACK_INSPECT_ACTIVITY
+        )
+    ) && pr_feedback_outcome_from_signals(result).is_none()
 }
 
 pub(super) fn pr_feedback_success_contract_error(
@@ -103,16 +214,6 @@ pub(super) fn pr_feedback_success_contract_error(
     None
 }
 
-pub(super) fn pr_feedback_blocking_signal_overrides_structured_ready(
-    instance: &WorkflowInstance,
-    result: &ActivityResult,
-    structured_decision: Option<&WorkflowDecision>,
-) -> bool {
-    github_issue_pr_feedback_activity_matches(instance, result)
-        && pr_feedback_outcome_from_signals(result) == Some(PrFeedbackOutcome::BlockingFeedback)
-        && structured_decision.is_some_and(structured_ready_decision)
-}
-
 pub(super) fn local_review_decision_from_activity_result(
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
@@ -125,6 +226,16 @@ pub(super) fn local_review_decision_from_activity_result(
         return None;
     }
     let outcome = local_review_outcome_from_signals(result)?;
+    if outcome == LocalReviewOutcome::ChangesRequested {
+        if let Some(decision) = feedback_repair_convergence_blocked_decision(
+            instance,
+            event,
+            result,
+            result_signal_u64(result, "actionable_blocker_count"),
+        ) {
+            return Some(decision);
+        }
+    }
     let pr_number = result_signal_u64(result, "pr_number").or_else(|| {
         instance
             .data
@@ -325,9 +436,10 @@ fn ready_snapshot_proves_pr_ready(instance: &WorkflowInstance, result: &Activity
         .iter()
         .filter(|artifact| artifact.artifact_type == SERVER_PR_SNAPSHOT_ARTIFACT)
         .any(|artifact| {
-            snapshot_has_server_source(&artifact.artifact)
-                && snapshot_has_pr_identity(instance, result, &artifact.artifact)
-                && snapshot_has_head_identity(&artifact.artifact)
+            crate::runtime::pr_feedback::server_pr_snapshot_matches_instance(
+                instance,
+                &artifact.artifact,
+            ) && snapshot_has_head_identity(&artifact.artifact)
                 && snapshot_has_observation_time(&artifact.artifact)
                 && (snapshot_allows_production_readiness(&artifact.artifact)
                     || snapshot_allows_eval_draft_validation(instance, &artifact.artifact))
@@ -365,14 +477,6 @@ fn expected_base_ref_matches(instance: &WorkflowInstance, snapshot: &Value) -> b
     };
     string_field(snapshot, &["base_ref", "baseRefName"])
         .is_some_and(|observed| observed == expected)
-}
-
-fn snapshot_has_server_source(snapshot: &Value) -> bool {
-    string_field_matches(
-        snapshot,
-        &["snapshot_source", "snapshotSource"],
-        &["server_github_graphql"],
-    )
 }
 
 fn snapshot_has_pr_identity(

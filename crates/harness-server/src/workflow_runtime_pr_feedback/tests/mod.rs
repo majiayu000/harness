@@ -509,6 +509,8 @@ async fn pr_hygiene_repair_requests_address_pr_feedback_with_context() -> anyhow
         anyhow::bail!("workflow should exist");
     };
     assert_eq!(instance.state, "addressing_feedback");
+    assert_eq!(instance.data["feedback_repair_round"], 1);
+    assert_eq!(instance.data["feedback_repair_blocker_count"], 1);
     let commands = store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(

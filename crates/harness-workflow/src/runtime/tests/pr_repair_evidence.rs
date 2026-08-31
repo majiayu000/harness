@@ -1,11 +1,13 @@
 use super::*;
 use crate::runtime::{
-    build_pr_hygiene_repair_decision, PrHygieneRepairDecisionInput, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    build_pr_feedback_decision, build_pr_hygiene_repair_decision, PrFeedbackDecisionInput,
+    PrFeedbackOutcome, PrHygieneRepairDecisionInput, PR_REPAIR_SNAPSHOT_ARTIFACT,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 
 fn pr_workflow_state(state: &str) -> WorkflowInstance {
     issue_instance(state).with_server_data(json!({
+        "repo": "owner/repo",
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-1",
@@ -75,6 +77,7 @@ fn ready_snapshot_artifact() -> ActivityArtifact {
         json!({
             "schema": "harness.github.pr_snapshot.v1",
             "snapshot_source": "server_github_graphql",
+            "repo": "owner/repo",
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77",
             "head_oid": "abc123",
@@ -128,6 +131,146 @@ fn repair_snapshot_artifact() -> ActivityArtifact {
             ]
         }),
     )
+}
+
+fn blocking_feedback_result(actionable_blocker_count: u64) -> ActivityResult {
+    ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Server-owned PR inspection found actionable feedback.",
+    )
+    .with_signal(ActivitySignal::new(
+        "FeedbackFound",
+        json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "actionable_blocker_count": actionable_blocker_count,
+        }),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        SERVER_PR_SNAPSHOT_ARTIFACT,
+        json!({
+            "schema": "harness.github.pr_snapshot.v1",
+            "snapshot_source": "server_github_graphql",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "head_oid": "abc123",
+            "observed_at": "2026-06-06T00:00:00Z",
+            "actionable_blocker_count": actionable_blocker_count,
+        }),
+    ))
+}
+
+#[test]
+fn repeated_feedback_without_fewer_blockers_stops_repair_oscillation() {
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+        "feedback_repair_round": 1,
+        "feedback_repair_blocker_count": 2,
+    }));
+    let event = event_for_result(blocking_feedback_result(2));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("non-converging feedback should stop the workflow");
+
+    assert_eq!(decision.decision, "block_feedback_repair_oscillation");
+    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(
+        decision.commands[0].command_type,
+        WorkflowCommandType::MarkBlocked
+    );
+    assert!(decision.reason.contains("did not decrease"));
+}
+
+#[test]
+fn fewer_feedback_blockers_allows_the_next_repair_round() {
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+        "feedback_repair_round": 1,
+        "feedback_repair_blocker_count": 2,
+    }));
+    let event = event_for_result(blocking_feedback_result(1));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("decreasing blockers should allow another repair round");
+
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+}
+
+#[test]
+fn feedback_repair_history_without_blocker_baseline_stops() {
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+        "feedback_repair_round": 1,
+    }));
+    let event = event_for_result(blocking_feedback_result(1));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing blocker baseline should stop the workflow");
+
+    assert_eq!(decision.decision, "block_feedback_repair_unmeasured");
+    assert_eq!(decision.next_state, "blocked");
+}
+
+#[test]
+fn structured_only_quality_gate_decision_requires_feedback_outcome_signal() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let proposed_decision = build_pr_feedback_decision(
+        &instance,
+        PrFeedbackDecisionInput {
+            task_id: "runtime-task-1",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            outcome: PrFeedbackOutcome::ReadyToMerge,
+            summary: "Agent requested the quality gate without an outcome signal.",
+        },
+    )
+    .decision;
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime agent emitted only a structured quality-gate decision.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing feedback outcome should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+}
+
+#[test]
+fn feedback_repair_round_limit_stops_even_when_blockers_decrease() {
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+        "feedback_repair_round": 3,
+        "feedback_repair_blocker_count": 2,
+    }));
+    let event = event_for_result(blocking_feedback_result(1));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("repair round limit should stop the workflow");
+
+    assert_eq!(decision.decision, "block_feedback_repair_round_limit");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision.reason.contains("3 repair rounds"));
 }
 
 #[test]
@@ -254,6 +397,78 @@ fn structured_ready_decision_with_blocking_signal_uses_blocking_feedback() {
 }
 
 #[test]
+fn structured_address_decision_cannot_bypass_feedback_convergence() {
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+        "feedback_repair_round": 1,
+        "feedback_repair_blocker_count": 2,
+    }));
+    let proposed_decision = build_pr_feedback_decision(
+        &instance,
+        PrFeedbackDecisionInput {
+            task_id: "runtime-task-1",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            outcome: PrFeedbackOutcome::BlockingFeedback,
+            summary: "Agent requested another repair round.",
+        },
+    )
+    .decision;
+    let result = blocking_feedback_result(2).with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("structured decision must still pass convergence policy");
+
+    assert_eq!(decision.decision, "block_feedback_repair_oscillation");
+    assert_eq!(decision.next_state, "blocked");
+}
+
+#[test]
+fn structured_only_address_decision_cannot_bypass_feedback_convergence() {
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+        "feedback_repair_round": 1,
+        "feedback_repair_blocker_count": 2,
+    }));
+    let proposed_decision = build_pr_feedback_decision(
+        &instance,
+        PrFeedbackDecisionInput {
+            task_id: "runtime-task-1",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            outcome: PrFeedbackOutcome::BlockingFeedback,
+            summary: "Agent requested another repair round without a feedback signal.",
+        },
+    )
+    .decision;
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Runtime agent emitted only a structured repair decision.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("structured repair must still pass convergence policy");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+}
+
+#[test]
 fn closed_issue_evidence_wins_over_structured_ready_decision() {
     let instance = pr_workflow_state("awaiting_feedback");
     let proposed_decision = WorkflowDecision::new(
@@ -291,7 +506,7 @@ fn closed_issue_evidence_wins_over_structured_ready_decision() {
 }
 
 #[test]
-fn address_pr_feedback_success_without_repair_evidence_blocks() {
+fn address_pr_feedback_success_without_repair_evidence_reconciles() {
     let instance = pr_workflow_state("addressing_feedback");
     let result = ActivityResult::succeeded(
         "address_pr_feedback",
@@ -301,10 +516,10 @@ fn address_pr_feedback_success_without_repair_evidence_blocks() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("missing repair evidence should block");
+        .expect("missing repair evidence should reconcile uncertain side effects");
 
-    assert_eq!(decision.decision, "block_invalid_agent_output");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "reinspect_after_feedback_repair_failure");
+    assert_eq!(decision.next_state, "local_review_gate");
     assert!(decision.reason.contains("PR repair evidence is missing"));
 }
 
@@ -335,7 +550,49 @@ fn address_pr_feedback_success_with_repair_snapshot_requests_local_review() {
 }
 
 #[test]
-fn address_pr_feedback_snapshot_with_failed_validation_blocks() {
+fn structured_address_pr_feedback_success_cannot_bypass_runtime_local_review() {
+    let instance = pr_workflow_state("addressing_feedback");
+    let proposed_decision = WorkflowDecision::new(
+        &instance.id,
+        "addressing_feedback",
+        "address_local_review_feedback",
+        "addressing_feedback",
+        "Agent requested another feedback repair pass.",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "address_pr_feedback",
+        "agent-selected-feedback-replay",
+    ))
+    .high_confidence();
+    let result = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Runtime agent addressed review feedback and selected the next state.",
+    )
+    .with_artifact(repair_snapshot_artifact())
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ))
+    .with_validation(ValidationRecord::new(
+        "cargo test -p harness-workflow pr_repair_evidence",
+        "passed",
+    ));
+    let event = event_for_result(result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("feedback repair should request runtime-owned local review");
+
+    assert_eq!(decision.decision, "run_local_review_after_rework");
+    assert_eq!(decision.next_state, "local_review_gate");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some(LOCAL_REVIEW_ACTIVITY)
+    );
+}
+
+#[test]
+fn address_pr_feedback_snapshot_with_failed_validation_reconciles() {
     let instance = pr_workflow_state("addressing_feedback");
     let result = ActivityResult::succeeded(
         "address_pr_feedback",
@@ -363,15 +620,15 @@ fn address_pr_feedback_snapshot_with_failed_validation_blocks() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("failed validation evidence should block");
+        .expect("failed validation evidence should reconcile uncertain side effects");
 
-    assert_eq!(decision.decision, "block_invalid_agent_output");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "reinspect_after_feedback_repair_failure");
+    assert_eq!(decision.next_state, "local_review_gate");
     assert!(decision.reason.contains("PR repair evidence is missing"));
 }
 
 #[test]
-fn address_pr_feedback_snapshot_with_mixed_validation_blocks() {
+fn address_pr_feedback_snapshot_with_mixed_validation_reconciles() {
     let instance = pr_workflow_state("addressing_feedback");
     let result = ActivityResult::succeeded(
         "address_pr_feedback",
@@ -404,15 +661,15 @@ fn address_pr_feedback_snapshot_with_mixed_validation_blocks() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("mixed validation evidence should block");
+        .expect("mixed validation evidence should reconcile uncertain side effects");
 
-    assert_eq!(decision.decision, "block_invalid_agent_output");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "reinspect_after_feedback_repair_failure");
+    assert_eq!(decision.next_state, "local_review_gate");
     assert!(decision.reason.contains("PR repair evidence is missing"));
 }
 
 #[test]
-fn address_pr_feedback_snapshot_for_different_pr_blocks() {
+fn address_pr_feedback_snapshot_for_different_pr_reconciles() {
     let instance = pr_workflow_state("addressing_feedback");
     let result = ActivityResult::succeeded(
         "address_pr_feedback",
@@ -439,10 +696,10 @@ fn address_pr_feedback_snapshot_for_different_pr_blocks() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("wrong PR repair evidence should block");
+        .expect("wrong PR repair evidence should reconcile uncertain side effects");
 
-    assert_eq!(decision.decision, "block_invalid_agent_output");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "reinspect_after_feedback_repair_failure");
+    assert_eq!(decision.next_state, "local_review_gate");
     assert!(decision.reason.contains("PR repair evidence is missing"));
 }
 

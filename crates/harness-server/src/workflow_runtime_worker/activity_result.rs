@@ -91,7 +91,9 @@ pub(super) fn activity_result_from_turn_with_workflow(
         ActivityResultEnvelopeOutcome::Accepted | ActivityResultEnvelopeOutcome::TurnCancelled => {}
     }
     let envelope_artifact = envelope.to_artifact();
-    let result = envelope.into_final_result();
+    let result = harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(
+        envelope.into_final_result(),
+    );
     result
         .with_artifact(envelope_artifact)
         .with_artifact(workflow_prompt_artifact(prompt_packet_digest))
