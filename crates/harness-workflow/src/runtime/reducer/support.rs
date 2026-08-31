@@ -242,7 +242,10 @@ fn runtime_stop_metadata(
     let mut metadata = json!({
         "state": state,
         "activity": stop_activity_name(event, result),
-        "runtime_job_id": optional_json_string(event_field_string(event, "runtime_job_id")),
+        "runtime_job_id": optional_json_string(
+            event_field_string(event, "recovery_runtime_job_id")
+                .or_else(|| event_field_string(event, "runtime_job_id")),
+        ),
         "event_id": event.id,
         "recorded_at": event.created_at,
     });
@@ -273,13 +276,16 @@ fn apply_stop_classification(
 }
 
 fn stop_activity_name(event: &WorkflowEvent, result: &ActivityResult) -> String {
-    event_workflow_command(event)
-        .as_ref()
-        .and_then(WorkflowCommand::activity_name)
-        .or_else(|| (!result.activity.trim().is_empty()).then_some(result.activity.as_str()))
-        .or_else(|| event_command_type(event))
-        .unwrap_or("<unknown>")
-        .to_string()
+    event_field_string(event, "recovery_activity")
+        .or_else(|| {
+            event_workflow_command(event)
+                .as_ref()
+                .and_then(WorkflowCommand::activity_name)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| (!result.activity.trim().is_empty()).then(|| result.activity.to_string()))
+        .or_else(|| event_command_type(event).map(ToOwned::to_owned))
+        .unwrap_or_else(|| "<unknown>".to_string())
 }
 
 fn blocked_unblock_hint() -> &'static str {

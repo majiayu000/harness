@@ -188,6 +188,7 @@ impl TransitionAllowlist {
                 [EnqueueActivity, StartChildWorkflow, Wait],
             )
             .allow("blocked", "merging", [EnqueueActivity])
+            .allow("blocked", "done", [MarkDone])
             .allow("cancelled", "scheduled", [EnqueueActivity, Wait])
             .allow("cancelled", "planning", [EnqueueActivity, Wait])
             .allow("cancelled", "implementing", [EnqueueActivity, Wait])
@@ -249,6 +250,7 @@ impl TransitionAllowlist {
                 "addressing_feedback",
                 [EnqueueActivity, MarkBlocked, Wait],
             )
+            .allow("local_review_gate", "done", [MarkDone])
             .allow("pr_open", "done", [MarkDone])
             .allow(
                 "awaiting_feedback",

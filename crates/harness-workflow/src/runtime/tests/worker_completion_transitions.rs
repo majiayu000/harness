@@ -421,6 +421,9 @@ async fn runtime_worker_stamps_pr_feedback_child_with_inspected_remote_fact() ->
     .with_id("pr-feedback-child-fact-stamp")
     .with_parent(parent.id.clone())
     .with_server_data(json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
         "remote_fact_hash": "sha256:pre-inspection",
         "remote_fact_activity_at": "2026-07-30T00:00:00Z",
     }));

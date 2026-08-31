@@ -229,7 +229,7 @@ fn normalize_github_pr_snapshot(
     let changed_files_complete = !connection_has_next_page(pr, "files");
     let closing_issues_complete = !connection_has_next_page(pr, "closingIssuesReferences");
 
-    Ok(json!({
+    let mut snapshot = json!({
         "schema": SERVER_PR_SNAPSHOT_SCHEMA,
         "snapshot_source": "server_github_graphql",
         "observed_at": observed_at,
@@ -269,7 +269,9 @@ fn normalize_github_pr_snapshot(
         "changed_files_complete": changed_files_complete,
         "closing_issues": closing_issues,
         "closing_issues_complete": closing_issues_complete,
-    }))
+    });
+    snapshot["actionable_blocker_count"] = json!(actionable_blocker_count(&snapshot));
+    Ok(snapshot)
 }
 
 fn active_unresolved_review_threads(pr: &Value) -> Vec<Value> {
@@ -391,6 +393,10 @@ fn pr_feedback_signal_for_snapshot(snapshot: &Value) -> ActivitySignal {
             .get("active_unresolved_review_threads_count")
             .cloned()
             .unwrap_or(Value::Null),
+        "actionable_blocker_count": snapshot
+            .get("actionable_blocker_count")
+            .cloned()
+            .unwrap_or(Value::Null),
         "status_check_rollup_state": snapshot
             .get("status_check_rollup_state")
             .cloned()
@@ -400,6 +406,19 @@ fn pr_feedback_signal_for_snapshot(snapshot: &Value) -> ActivitySignal {
         "is_draft": snapshot.get("is_draft").cloned().unwrap_or(Value::Null),
     });
     ActivitySignal::new(pr_feedback_signal_type(snapshot), payload)
+}
+
+fn actionable_blocker_count(snapshot: &Value) -> u64 {
+    let active_threads = snapshot
+        .get("active_unresolved_review_threads_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    active_threads
+        + u64::from(snapshot_review_threads_incomplete(snapshot))
+        + u64::from(string_eq(snapshot, "review_decision", "CHANGES_REQUESTED"))
+        + u64::from(snapshot_merge_state_requires_repair(snapshot))
+        + u64::from(!snapshot_base_ref_matches_expected(snapshot))
+        + u64::from(snapshot_check_failed(snapshot))
 }
 
 fn pr_feedback_signal_type(snapshot: &Value) -> &'static str {

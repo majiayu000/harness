@@ -510,11 +510,11 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             "on_succeeded": {
                 "reducer_next_state": "local_review_gate",
                 "success_requires": "A succeeded address_pr_feedback result MUST include pr_repair_snapshot with final head, observed_at, action proof, and passing validation evidence, unless IssueClosed/IssueAlreadyResolved or issue_state proves the issue or PR is already closed/resolved.",
-                "required_summary": "Describe addressed review feedback, pushed/no-code action, validation evidence, or closed issue evidence. For command_input.source=pr_hygiene, describe the GitHub-side update/rebase attempt, configured rebase-needed label action on failure, and stale comment/escalation threshold decision. Harness will run local review before remote feedback unless terminal closed evidence finishes the workflow."
+                "required_summary": "Describe addressed review feedback, pushed/no-code action, validation evidence, or closed issue evidence. If the fresh PR merge_state_status is DIRTY or BEHIND, update or rebase the PR branch and push it before returning; a no-code result is invalid while mergeability remains blocked. For command_input.source=pr_hygiene, also describe the configured rebase-needed label action on update/rebase failure and the stale comment/escalation threshold decision. Harness will run local review before remote feedback unless terminal closed evidence finishes the workflow."
             },
             "on_failed": {
-                "reducer_next_state": "failed_or_retry",
-                "retry_policy": "runtime_retry_policy may retry this activity before failure."
+                "reducer_next_state": "local_review_gate",
+                "retry_policy": "Harness MUST NOT replay address_pr_feedback after observable agent activity because it may already have pushed changes. Harness runs an independent local review to reconcile the current repository state. A confirmed zero-activity SpawnFailure may be retried because the agent process did not start."
             }
         }),
         ("github_issue_pr", harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY) => json!({
@@ -535,15 +535,15 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         ("github_issue_pr", "sweep_pr_feedback")
         | ("github_issue_pr", PR_FEEDBACK_INSPECT_ACTIVITY) => json!({
             "on_succeeded": {
-                "reducer_next_state": "derived_from_structured_decision_or_signals; ready evidence starts quality_gate before ready_to_merge",
+                "reducer_next_state": "derived_from_required_feedback_outcome_signal; an optional structured decision may accompany the signal; ready evidence starts quality_gate before ready_to_merge",
                 "accepted_signals": ["FeedbackFound", "NoFeedbackFound", "PrReadyToMerge", "ChangesRequested", "ChecksFailed"],
                 "accepted_artifacts": ["workflow_decision", SERVER_PR_SNAPSHOT_ARTIFACT, PR_FEEDBACK_SNAPSHOT_ARTIFACT],
                 "success_requires": "PrReadyToMerge requires server_pr_snapshot collected by Harness with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, complete reviewThreads, and zero active unresolved review threads; the parent then starts a quality_gate before ready_to_merge.",
                 "required_summary": "Describe inspected PR feedback, review state, checks, mergeability, draft state, unresolved review threads, snapshot source, and next action."
             },
             "structured_decision": {
-                "preferred": true,
-                "description": "Return a workflow_decision artifact for address_pr_feedback or wait_for_pr_feedback. Prefer the PrReadyToMerge signal plus server_pr_snapshot for readiness; the reducer starts quality_gate."
+                "optional": true,
+                "description": "A workflow_decision artifact may accompany an accepted feedback outcome signal, but it is not valid by itself. Prefer the PrReadyToMerge signal plus server_pr_snapshot for readiness; the reducer starts quality_gate."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -560,7 +560,7 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             },
             "structured_decision": {
                 "optional": true,
-                "description": "A workflow_decision artifact may update the pr_feedback child workflow, but ready_to_merge workflow_decisions still require the same server_pr_snapshot evidence as PrReadyToMerge signals; parent readiness goes through quality_gate."
+                "description": "A workflow_decision artifact may accompany an accepted feedback outcome signal to update the pr_feedback child workflow, but it is not valid by itself. Ready-to-merge output still requires the same server_pr_snapshot evidence as PrReadyToMerge signals; parent readiness goes through quality_gate."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -673,8 +673,8 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "must_not_include": ["direct workflow state changes"],
         }),
         ("github_issue_pr", "address_pr_feedback") => json!({
-            "must_include": ["review feedback addressed or explicit no-code reason", "changed files or explicit no-code-change reason", "validation commands or closed issue evidence", "fresh PR state checked before final response", "final PR head or closed issue evidence", "pr_hygiene update/rebase, label, escalation, or stale-comment outcome when command_input.source=pr_hygiene"],
-            "must_not_include": ["claiming review approval without a fresh review signal", "marking review threads resolved without current GitHub evidence"],
+            "must_include": ["review feedback addressed or explicit no-code reason", "changed files or explicit no-code-change reason", "validation commands or closed issue evidence", "fresh PR state checked before final response", "when fresh merge_state_status is DIRTY or BEHIND, update or rebase and push the PR branch; no-code is invalid while mergeability remains blocked", "final PR head or closed issue evidence", "one repair batch and push followed by an immediate return to Harness", "pr_hygiene update/rebase, label, escalation, or stale-comment outcome when command_input.source=pr_hygiene"],
+            "must_not_include": ["claiming review approval without a fresh review signal", "marking review threads resolved without current GitHub evidence", "waiting for hosted CI or newly generated feedback after the repair push"],
             "artifacts": {
                 "pr_repair_snapshot": {
                     "required_when": "Feedback repair was performed, review-thread action was taken, or a no-code-change repair conclusion is returned.",
@@ -699,7 +699,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
             "must_not_include": ["repository code changes", "workflow table mutations", "remote review approval claims"],
             "signals": {
                 "LocalReviewPassed": "Use only when the local agent review finds no blocking issues.",
-                "LocalReviewChangesRequested": "Use when local review finds blocking code, test, regression, or security issues that need a fix round.",
+                "LocalReviewChangesRequested": "Use when local review finds blocking code, test, regression, or security issues that need a fix round. Include actionable_blocker_count in the signal payload.",
                 "LocalReviewBlocked": "Use when local review cannot complete because required PR context or validation evidence is unavailable."
             }
         }),
@@ -717,7 +717,7 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                 "server_pr_snapshot": {
                     "required_when": "Using PrReadyToMerge.",
                     "source": "Harness server GitHub GraphQL collector",
-                    "fields": ["schema", "snapshot_source", "pr_number", "pr_url", "head_oid", "observed_at", "active_unresolved_review_threads", "active_unresolved_review_threads_count", "review_threads_complete", "status_check_rollup_state", "merge_state_status", "review_decision", "is_draft", "changed_files"]
+                    "fields": ["schema", "snapshot_source", "pr_number", "pr_url", "head_oid", "observed_at", "active_unresolved_review_threads", "active_unresolved_review_threads_count", "actionable_blocker_count", "review_threads_complete", "status_check_rollup_state", "merge_state_status", "review_decision", "is_draft", "changed_files"]
                 },
                 "pr_feedback_snapshot": {
                     "required_when": "Harness server emits normalized PR feedback evidence.",
