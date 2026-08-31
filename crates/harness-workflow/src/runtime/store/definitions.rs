@@ -1,6 +1,8 @@
 use super::{to_jsonb_string, WorkflowRuntimeStore};
-use crate::runtime::declarative_pinning::hydrate_persisted_declarative_definition;
-use crate::runtime::declarative_pinning::DECLARATIVE_DEFINITION_METADATA_KIND;
+use crate::runtime::declarative_pinning::{
+    hydrate_persisted_declarative_definition, is_persisted_declarative_definition,
+    DECLARATIVE_DEFINITION_METADATA_KIND,
+};
 use crate::runtime::model::{WorkflowDefinition, WorkflowInstance};
 use crate::runtime::{
     DeclarativeWorkflowDefinition, WorkflowDefinitionRegistry, WorkflowTerminalState,
@@ -9,7 +11,7 @@ use sqlx::{Postgres, Transaction};
 
 impl WorkflowRuntimeStore {
     pub async fn upsert_definition(&self, definition: &WorkflowDefinition) -> anyhow::Result<()> {
-        if is_declarative_definition(definition) {
+        if is_persisted_declarative_definition(definition) {
             return self.persist_definition_version(definition).await;
         }
         let data = to_jsonb_string(definition)?;
@@ -139,7 +141,7 @@ impl WorkflowRuntimeStore {
         self.list_definitions()
             .await?
             .into_iter()
-            .filter(is_declarative_definition)
+            .filter(is_persisted_declarative_definition)
             .map(|definition| hydrate_persisted_declarative_definition(&definition))
             .collect()
     }
@@ -171,7 +173,8 @@ fn persisted_terminal_state(
     instance: &WorkflowInstance,
     definition: Option<&WorkflowDefinition>,
 ) -> anyhow::Result<Option<WorkflowTerminalState>> {
-    let Some(definition) = definition.filter(|definition| is_declarative_definition(definition))
+    let Some(definition) =
+        definition.filter(|definition| is_persisted_declarative_definition(definition))
     else {
         return Ok(None);
     };
@@ -203,12 +206,4 @@ fn persisted_terminal_state(
         .iter()
         .find(|state| state.key.state.as_ref() == instance.state)
         .and_then(|state| state.terminal_state))
-}
-
-fn is_declarative_definition(definition: &WorkflowDefinition) -> bool {
-    definition
-        .metadata
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        == Some(DECLARATIVE_DEFINITION_METADATA_KIND)
 }

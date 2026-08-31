@@ -10,8 +10,8 @@ use crate::runtime::declarative::{
     workflow_evidence_from_activity_artifacts, DeclarativeWorkflowDefinition,
 };
 use crate::runtime::model::{
-    ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowEvent, WorkflowEvidence, WorkflowInstance,
+    ActivityErrorKind, ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType,
+    WorkflowDecision, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
 use crate::runtime::state_registry::{
     DeclarativeDefinitionPinError, WorkflowDefinitionRegistry, WorkflowTerminalState,
@@ -63,44 +63,72 @@ fn reduce_generic_declarative_completion(
             ),
         );
     };
-    if result.activity != expected_activity {
-        return invalid_completion(
-            instance,
-            event,
-            result,
-            format!(
-                "declarative workflow '{}' state '{}' expected activity '{}', but result named '{}'",
-                policy.id, instance.state, expected_activity, result.activity
-            ),
+    let terminal_contract_failure = definition.agent_contract(expected_activity).is_some()
+        && result.status == ActivityStatus::Failed
+        && matches!(
+            result.error_kind,
+            Some(ActivityErrorKind::Fatal | ActivityErrorKind::Configuration)
         );
-    }
-    let Some(command) = event_workflow_command(event) else {
-        return invalid_completion(
-            instance,
-            event,
-            result,
-            format!(
-                "declarative workflow '{}' completion is missing its enqueue_activity command",
-                policy.id
-            ),
-        );
-    };
-    if command.command_type != WorkflowCommandType::EnqueueActivity
-        || command.activity_name() != Some(expected_activity)
-    {
-        return invalid_completion(
-            instance,
-            event,
-            result,
-            format!(
-                "declarative workflow '{}' state '{}' completion command does not enqueue expected activity '{}'",
-                policy.id, instance.state, expected_activity
-            ),
-        );
+    if !terminal_contract_failure {
+        if result.activity != expected_activity {
+            return invalid_completion(
+                instance,
+                event,
+                result,
+                format!(
+                    "declarative workflow '{}' state '{}' expected activity '{}', but result named '{}'",
+                    policy.id, instance.state, expected_activity, result.activity
+                ),
+            );
+        }
+        let Some(command) = event_workflow_command(event) else {
+            return invalid_completion(
+                instance,
+                event,
+                result,
+                format!(
+                    "declarative workflow '{}' completion is missing its enqueue_activity command",
+                    policy.id
+                ),
+            );
+        };
+        if command.command_type != WorkflowCommandType::EnqueueActivity
+            || command.activity_name() != Some(expected_activity)
+        {
+            return invalid_completion(
+                instance,
+                event,
+                result,
+                format!(
+                    "declarative workflow '{}' state '{}' completion command does not enqueue expected activity '{}'",
+                    policy.id, instance.state, expected_activity
+                ),
+            );
+        }
     }
 
     let route = match result.status {
-        ActivityStatus::Succeeded => success_route(source, result),
+        ActivityStatus::Succeeded => {
+            if definition.agent_contract(expected_activity).is_some() {
+                match crate::runtime::declarative_agent_contract::validated_agent_contract_assessment_outcome(
+                    definition,
+                    expected_activity,
+                    event,
+                    result,
+                ) {
+                    Ok(Some(outcome)) => source
+                        .on_signal
+                        .get(&outcome)
+                        .map(|target| (target.as_str(), format!("agent contract outcome '{outcome}'"))),
+                    Ok(None) => None,
+                    Err(error) => {
+                        return invalid_completion(instance, event, result, error.to_string())
+                    }
+                }
+            } else {
+                success_route(source, result)
+            }
+        }
         ActivityStatus::Blocked | ActivityStatus::SucceededWithBlockers => {
             if let Some(target) = source.on_blocked.as_deref() {
                 Some((target, "on_blocked".to_string()))
@@ -121,7 +149,10 @@ fn reduce_generic_declarative_completion(
             }
         }
         ActivityStatus::Failed => {
-            if let Some(target) = source.on_failure.as_deref() {
+            if terminal_contract_failure {
+                terminal_for_class(definition, WorkflowTerminalState::Failed)
+                    .map(|target| (target, "terminal agent contract failure".to_string()))
+            } else if let Some(target) = source.on_failure.as_deref() {
                 Some((target, "on_failure".to_string()))
             } else if let Some(decision) =
                 retry_failed_declarative_activity_decision(instance, event, result)

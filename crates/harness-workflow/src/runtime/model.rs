@@ -533,14 +533,24 @@ pub struct RuntimeJob {
     pub updated_at: DateTime<Utc>,
 }
 
+pub const RUNTIME_PROFILE_SNAPSHOT_HASH_KEY: &str = "_runtime_profile_snapshot_hash";
+
 impl RuntimeJob {
     pub fn pending(
         command_id: impl Into<String>,
         runtime_kind: RuntimeKind,
         runtime_profile: impl Into<String>,
-        input: Value,
+        mut input: Value,
     ) -> Self {
         let now = Utc::now();
+        if let Some(profile) = input.get("runtime_profile").cloned() {
+            if let Some(object) = input.as_object_mut() {
+                object.insert(
+                    RUNTIME_PROFILE_SNAPSHOT_HASH_KEY.to_string(),
+                    Value::String(super::remote_facts::stable_remote_fact_hash(&profile)),
+                );
+            }
+        }
         Self {
             id: Uuid::new_v4().to_string(),
             command_id: command_id.into(),

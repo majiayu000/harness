@@ -98,6 +98,43 @@ async fn dispatch_runtime_command_with_project_policy(
     fallback_profile_selector: RuntimeProfileSelector,
     dispatch_owner: &str,
 ) -> anyhow::Result<CommandDispatchOutcome> {
+    let has_agent_contract =
+        match crate::workflow_runtime_worker::validate_pinned_agent_contract_command(
+            store, &command,
+        )
+        .await
+        {
+            Ok(has_agent_contract) => has_agent_contract,
+            Err(error) => {
+                let reason = format!("invalid pinned agent_contract: {error}");
+                let result = harness_workflow::runtime::ActivityResult::failed(
+                    command.command.runtime_activity_key(),
+                    "Pinned agent contract failed dispatch validation.",
+                    &reason,
+                )
+                .with_error_kind(harness_workflow::runtime::ActivityErrorKind::Fatal);
+                let failed = store
+                    .fail_claimed_command_with_completion_if_owned(
+                        &command.id,
+                        harness_workflow::runtime::DispatchClaim {
+                            owner: dispatch_owner,
+                            generation: command.dispatch_claim_generation,
+                        },
+                        &result,
+                    )
+                    .await?;
+                return Ok(CommandDispatchOutcome::Skipped {
+                    command_id: command.id,
+                    reason: if failed {
+                        reason
+                    } else {
+                        "dispatch claim became stale before invalid agent_contract failure"
+                            .to_string()
+                    },
+                });
+            }
+        };
+
     if !command.command.requires_runtime_job() {
         return RuntimeCommandDispatcher::with_profile_selector(store, fallback_profile_selector)
             .with_dispatcher_id(dispatch_owner)
@@ -166,14 +203,19 @@ async fn dispatch_runtime_command_with_project_policy(
     let dispatch_gate_fact_hash = command_dispatch_gate_fact_hash(&command);
     let workflow_cfg =
         load_runtime_workflow_config(&project_root, "workflow runtime command dispatcher")?;
-    let outcome = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
+    let mut dispatcher = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
         .with_isolation_config(isolation_config)
         .with_isolation_availability(state.isolation_availability.clone())
         .with_dispatcher_id(dispatch_owner)
         .with_defer_backoff(dispatch_backoff(&workflow_cfg.runtime_dispatch)?)
-        .with_budget_policy(workflow_cfg.runtime_budget_policy)
-        .dispatch_command(command)
-        .await?;
+        .with_budget_policy(workflow_cfg.runtime_budget_policy);
+    let effective_profile = dispatcher.effective_profile_for_command(&command).await?;
+    if let Some(profile) =
+        enforceable_agent_contract_profile(state, has_agent_contract, &effective_profile)
+    {
+        dispatcher = dispatcher.with_enforceable_agent_contract_profile(profile);
+    }
+    let outcome = dispatcher.dispatch_command(command).await?;
     record_runtime_agent_dispatch_counter(
         state,
         repo.as_deref(),
@@ -182,6 +224,30 @@ async fn dispatch_runtime_command_with_project_policy(
         dispatch_gate_fact_hash.as_deref(),
     );
     Ok(outcome)
+}
+
+fn enforceable_agent_contract_profile(
+    state: &AppState,
+    has_agent_contract: bool,
+    profile: &harness_workflow::runtime::RuntimeProfile,
+) -> Option<harness_workflow::runtime::RuntimeProfile> {
+    if !has_agent_contract {
+        return None;
+    }
+    if !profile.timeout_secs.is_some_and(|timeout| timeout > 0) {
+        return None;
+    }
+    let backend = crate::workflow_runtime_worker::agent_backend_for_runtime_kind(
+        &state.core.server.agent_registry,
+        profile.kind,
+    )
+    .ok()?;
+    if crate::workflow_runtime_worker::ensure_backend_can_enforce_contract(backend.as_ref())
+        .is_err()
+    {
+        return None;
+    }
+    Some(profile.clone())
 }
 
 async fn runtime_isolation_config_for_command(

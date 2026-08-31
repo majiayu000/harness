@@ -16,6 +16,14 @@ const METADATA_SCHEMA_VERSION_V1: u64 = 1;
 /// without the contracts.
 const METADATA_SCHEMA_VERSION_V2: u64 = 2;
 
+pub fn is_persisted_declarative_definition(definition: &DurableWorkflowDefinition) -> bool {
+    definition
+        .metadata
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        == Some(DECLARATIVE_DEFINITION_METADATA_KIND)
+}
+
 pub fn declarative_definition_identity(
     policy: &WorkflowDefinitionPolicy,
     activity_contracts: &BTreeMap<String, PinnedAgentContractActivity>,

@@ -79,13 +79,18 @@ pub use data_provenance::{
 };
 pub use data_write::WorkflowDataWrite;
 pub use declarative::{build_declarative_definition, DeclarativeWorkflowDefinition};
-pub use declarative_agent_contract::PinnedAgentContractActivity;
+pub use declarative_agent_contract::{
+    validate_declarative_agent_contract_command, PinnedAgentContractActivity,
+    AGENT_CONTRACT_ASSESSMENT_ARTIFACT, AGENT_CONTRACT_ASSESSMENT_SCHEMA,
+    AGENT_CONTRACT_VERDICT_ARTIFACT,
+};
 pub use declarative_interpreter::{
     build_declarative_submission_decision, DECLARATIVE_SUBMISSION_DECISION,
 };
 pub use declarative_pinning::{
     declarative_definition_identity, hydrate_declarative_definition,
-    hydrate_persisted_declarative_definition, persisted_declarative_definition,
+    hydrate_persisted_declarative_definition, is_persisted_declarative_definition,
+    persisted_declarative_definition,
 };
 pub use dispatch_barrier::{
     DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrier, DispatchBarrierInput,
@@ -134,7 +139,7 @@ pub use model::{
     RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord,
     WorkflowCommand, WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision,
     WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
-    WorkflowLease, WorkflowSubject,
+    WorkflowLease, WorkflowSubject, RUNTIME_PROFILE_SNAPSHOT_HASH_KEY,
 };
 pub use otel_trace_context::WorkflowOtelTraceContext;
 pub use plan_issue::{
@@ -194,19 +199,19 @@ pub use state_registry::{
 pub use status::WorkflowCommandStatus;
 pub use store::PromptPayloadIntegrityError;
 pub use store::{
-    cost_usd_from_micros, cost_usd_to_micros, DecisionProvenanceConflict,
-    DriverlessProgressInstance, DriverlessProgressProvenanceStatus, RuntimeAgentTelemetry,
-    RuntimeHistoryPruneSummary, RuntimeJobClaimDeferOutcome, RuntimeJobCompletionLease,
-    RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
-    RuntimeWorkflowUsage, WorkflowCancellationCleanupOutcome, WorkflowChildStart,
-    WorkflowChildStartOutcome, WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
-    WorkflowCoverageRecoveryTransition, WorkflowDecisionTransition, WorkflowPrBindingRepairOutcome,
-    WorkflowRejectedDecisionTransition, WorkflowRunEvidence, WorkflowRunEvidenceExport,
-    WorkflowRunEvidenceInput, WorkflowRunEvidenceQuery, WorkflowRuntimeRecoveryAction,
-    WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore,
-    WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
-    WorkflowSubmissionFilter, WorkflowSubmissionHourlyDone, WorkflowSubmissionMetrics,
-    WorkflowSubmissionProjectMetrics, WorkflowSubmissionPromptPayload,
+    cost_usd_from_micros, cost_usd_to_micros, AgentContractAttemptReservation,
+    DecisionProvenanceConflict, DriverlessProgressInstance, DriverlessProgressProvenanceStatus,
+    RuntimeAgentTelemetry, RuntimeHistoryPruneSummary, RuntimeJobClaimDeferOutcome,
+    RuntimeJobCompletionLease, RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert,
+    RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage, WorkflowCancellationCleanupOutcome,
+    WorkflowChildStart, WorkflowChildStartOutcome, WorkflowCoverageRecoveryExpected,
+    WorkflowCoverageRecoveryOutcome, WorkflowCoverageRecoveryTransition,
+    WorkflowDecisionTransition, WorkflowPrBindingRepairOutcome, WorkflowRejectedDecisionTransition,
+    WorkflowRunEvidence, WorkflowRunEvidenceExport, WorkflowRunEvidenceInput,
+    WorkflowRunEvidenceQuery, WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome,
+    WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore, WorkflowSubmissionDecisionCommit,
+    WorkflowSubmissionDecisionTransition, WorkflowSubmissionFilter, WorkflowSubmissionHourlyDone,
+    WorkflowSubmissionMetrics, WorkflowSubmissionProjectMetrics, WorkflowSubmissionPromptPayload,
     WORKFLOW_RUN_EVIDENCE_DEFAULT_LIMIT, WORKFLOW_RUN_EVIDENCE_EXPORT_SCHEMA,
     WORKFLOW_RUN_EVIDENCE_MAX_LIMIT, WORKFLOW_RUN_EVIDENCE_PAYLOAD_MAX_BYTES,
     WORKFLOW_RUN_EVIDENCE_RETENTION_MAX_BATCH, WORKFLOW_RUN_EVIDENCE_SCHEMA,
