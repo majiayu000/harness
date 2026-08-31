@@ -91,8 +91,8 @@ Fresh evidence from this branch:
 |---|---|
 | Canonical contract tests | 9 passed |
 | Declarative contract tests | 19 passed |
-| Server `contract` filter | 89 passed, 1 ignored live dogfood |
-| Runtime dispatch tests | 27 passed |
+| Server `contract` filter | 90 passed, 1 ignored live dogfood |
+| Runtime dispatch tests | 28 passed |
 | Exact-replay preflight test | 1 passed |
 | Real submission, assessment, route, and store reopen | passed; one model-backend invocation |
 | Durable correction | invalid primary plus one valid correction passed; two persisted reservations |
@@ -120,6 +120,8 @@ The sixth independent review found two remaining authorization-order gaps. Dispa
 The seventh independent review found three downgrade and lifecycle gaps. Contract expectation now comes from the pinned definition and current instance state rather than mutable command/job markers. The job snapshot binds activity, command identity, profile hash, profile name, and runtime kind before any other preflight. Finally, closing the backend event channel no longer escapes timeout or lease-loss selection: the runtime keeps the backend future fenced until completion or cancellation. A further fresh-context review remains required.
 
 The eighth independent review found four final dispatch and lifecycle gaps. Timeout and lease-loss selection is now fair under a continuously ready event stream while completed streams still drain every buffered observation. Pinned-command validation runs before the mutable command type can select the non-runtime skip path. Fatal contract corruption terminates from the pinned state contract even when persisted completion identities are malformed. Backend resolution is runtime-kind aware, so `CodexJsonrpc` authorizes and executes a fresh per-turn JSON-RPC backend instead of the Codex oneshot singleton. A further fresh-context review remains required.
+
+The ninth independent review found a combined-marker downgrade under internally consistent persistence corruption. Normal classified writes, submission construction, and command enqueue already reject removal of a declarative definition pin. The dispatcher now also treats the immutable persisted definition kind as authoritative when both mutable contract markers are missing, so a coherently corrupted instance and command cannot select either ordinary execution or the non-runtime skip path. A further fresh-context review remains required.
 
 ## Slice D boundary
 

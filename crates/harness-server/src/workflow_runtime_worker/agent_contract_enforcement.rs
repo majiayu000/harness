@@ -62,20 +62,25 @@ pub(crate) async fn validate_pinned_agent_contract_command(
                 command.workflow_id
             )
         })?;
-    if !command_has_contract && instance.data.get("definition_hash").is_none() {
-        return Ok(false);
-    }
     let persisted = store
         .get_definition(&instance.definition_id, instance.definition_version)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "workflow instance '{}' references missing definition '{}@{}'",
-                instance.id,
-                instance.definition_id,
-                instance.definition_version
-            )
-        })?;
+        .await?;
+    if !command_has_contract
+        && instance.data.get("definition_hash").is_none()
+        && !persisted
+            .as_ref()
+            .is_some_and(harness_workflow::runtime::is_persisted_declarative_definition)
+    {
+        return Ok(false);
+    }
+    let persisted = persisted.ok_or_else(|| {
+        anyhow::anyhow!(
+            "workflow instance '{}' references missing definition '{}@{}'",
+            instance.id,
+            instance.definition_id,
+            instance.definition_version
+        )
+    })?;
     let definition =
         harness_workflow::runtime::hydrate_persisted_declarative_definition(&persisted)?;
     let has_contract = harness_workflow::runtime::validate_declarative_agent_contract_command(

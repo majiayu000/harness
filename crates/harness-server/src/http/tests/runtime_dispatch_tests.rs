@@ -96,6 +96,7 @@ fn contract_dispatch_definition(
 async fn dispatch_contract_with_backend<F>(
     enforceable: bool,
     runtime_enabled: bool,
+    corrupt_instance_pin: bool,
     mutate_command: F,
 ) -> anyhow::Result<ContractDispatchResult>
 where
@@ -166,8 +167,36 @@ where
             .into_iter()
             .next()
             .expect("contract submission must enqueue its initial activity");
+    let original_command = command.clone();
     mutate_command(&mut command);
-    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let command_id = store
+        .enqueue_command(
+            &workflow.id,
+            None,
+            if corrupt_instance_pin {
+                &original_command
+            } else {
+                &command
+            },
+        )
+        .await?;
+    if corrupt_instance_pin {
+        let mut corrupted = workflow.clone();
+        corrupted.remove_data_field(
+            "definition_hash",
+            harness_workflow::runtime::DataProvenance::Server,
+        )?;
+        sqlx::query("UPDATE workflow_instances SET data = $2::jsonb WHERE id = $1")
+            .bind(&workflow.id)
+            .bind(serde_json::to_string(&corrupted)?)
+            .execute(store.pool())
+            .await?;
+        sqlx::query("UPDATE workflow_commands SET data = $2::jsonb WHERE id = $1")
+            .bind(&command_id)
+            .bind(serde_json::to_string(&command)?)
+            .execute(store.pool())
+            .await?;
+    }
     let mut profile = harness_workflow::runtime::RuntimeProfile::new(
         "codex-contract",
         harness_workflow::runtime::RuntimeKind::CodexExec,
@@ -199,7 +228,7 @@ async fn runtime_dispatch_authorizes_contract_only_from_selected_backend_capabil
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result = dispatch_contract_with_backend(true, true, |_| {}).await?;
+    let result = dispatch_contract_with_backend(true, true, false, |_| {}).await?;
     assert_eq!(result.enqueued, 1);
     assert_eq!(result.deferred, 0);
     assert_eq!(result.runtime_jobs, 1);
@@ -212,7 +241,7 @@ async fn runtime_dispatch_defers_contract_for_nonconforming_selected_backend() -
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result = dispatch_contract_with_backend(false, true, |_| {}).await?;
+    let result = dispatch_contract_with_backend(false, true, false, |_| {}).await?;
     assert_eq!(result.enqueued, 0);
     assert_eq!(result.deferred, 1);
     assert_eq!(result.runtime_jobs, 0);
@@ -225,7 +254,7 @@ async fn runtime_dispatch_fails_malformed_present_contract_instead_of_deferring(
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result = dispatch_contract_with_backend(true, false, |command| {
+    let result = dispatch_contract_with_backend(true, false, false, |command| {
         command.command["agent_contract"] = serde_json::Value::Null;
     })
     .await?;
@@ -247,7 +276,35 @@ async fn runtime_dispatch_fails_when_pinned_contract_marker_is_removed() -> anyh
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result = dispatch_contract_with_backend(true, true, |command| {
+    let result = dispatch_contract_with_backend(true, true, false, |command| {
+        command
+            .command
+            .as_object_mut()
+            .expect("contract command payload")
+            .remove("agent_contract");
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_when_contract_identity_and_type_are_all_corrupted(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, true, |command| {
+        command.command_type = harness_workflow::runtime::WorkflowCommandType::MarkBlocked;
         command
             .command
             .as_object_mut()
@@ -273,7 +330,7 @@ async fn runtime_dispatch_fails_when_contract_command_type_is_substituted() -> a
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result = dispatch_contract_with_backend(true, true, |command| {
+    let result = dispatch_contract_with_backend(true, true, false, |command| {
         command.command_type = harness_workflow::runtime::WorkflowCommandType::MarkBlocked;
     })
     .await?;
@@ -296,7 +353,7 @@ async fn runtime_dispatch_fails_incomplete_contract_envelope_before_disabled_pol
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result = dispatch_contract_with_backend(true, false, |command| {
+    let result = dispatch_contract_with_backend(true, false, false, |command| {
         command
             .command
             .as_object_mut()
@@ -322,7 +379,7 @@ async fn runtime_dispatch_fails_semantic_input_substituted_after_pinning() -> an
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result = dispatch_contract_with_backend(true, true, |command| {
+    let result = dispatch_contract_with_backend(true, true, false, |command| {
         command.command["agent_contract_input"]["facts"]["scope"] = serde_json::json!("large");
     })
     .await?;
