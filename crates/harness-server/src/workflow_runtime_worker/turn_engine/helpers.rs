@@ -150,7 +150,7 @@ impl RuntimeUsageContext {
             .await
     }
 
-    async fn persist_token_usage(
+    pub(crate) async fn persist_token_usage(
         &self,
         turn_id: &TurnId,
         usage: &TokenUsage,

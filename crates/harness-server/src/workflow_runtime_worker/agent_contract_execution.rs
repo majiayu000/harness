@@ -2,6 +2,7 @@
 
 use crate::http::AppState;
 use harness_core::agent::AgentBackend;
+use harness_core::types::TurnId;
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivityStatus,
     AgentContractAttemptReservation, RuntimeJob, AGENT_CONTRACT_VERDICT_ARTIFACT,
@@ -13,6 +14,7 @@ use super::agent_contract_attempt::{
     contract_violations, execute_agent_contract_attempt, parse_contract_verdict,
 };
 use super::agent_contract_enforcement::{turn_observation_artifact, PinnedJobAgentContract};
+use super::turn_engine::helpers::RuntimeUsageContext;
 
 pub(super) async fn execute_contract_attempts(
     state: &AppState,
@@ -24,6 +26,7 @@ pub(super) async fn execute_contract_attempts(
     reasoning_effort: Option<String>,
     timeout_secs: u64,
     max_turns: Option<u32>,
+    runtime_usage: Option<&RuntimeUsageContext>,
     lease_lost: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ActivityResult> {
     let store = state
@@ -111,6 +114,12 @@ pub(super) async fn execute_contract_attempts(
                 .saturating_mul(pinned.contract.max_corrections + 1)
                 .saturating_add(correction_attempt)
                 .saturating_add(1);
+            if let (Some(context), Some(usage)) =
+                (runtime_usage, attempt.observations.token_usage.as_ref())
+            {
+                let turn_id = TurnId::from_str(&format!("agent-contract:{}:{turn_number}", job.id));
+                context.persist_token_usage(&turn_id, usage).await?;
+            }
             observations.push(turn_observation_artifact(
                 turn_number,
                 &attempt.items,
@@ -266,6 +275,18 @@ mod tests {
             tx: tokio::sync::mpsc::Sender<harness_core::agent::AgentEvent>,
         ) -> harness_core::error::Result<()> {
             *self.requests.lock().await += 1;
+            tx.send(harness_core::agent::AgentEvent::TokenUsage {
+                usage: harness_core::types::TokenUsage {
+                    input_tokens: 11,
+                    output_tokens: 7,
+                    total_tokens: 18,
+                    cost_usd: 0.125,
+                },
+            })
+            .await
+            .map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(error.to_string())
+            })?;
             tx.send(harness_core::agent::AgentEvent::TurnCompleted {
                 output: json!({
                     "schema": "harness.semantic_verdict.v1",
@@ -686,6 +707,14 @@ mod tests {
             completion_event.event["agent_contract_attempts"],
             json!([{"primary_attempt": 1, "correction_attempt": 0}])
         );
+        let usage = store
+            .runtime_usage_for_workflow(&instance.id)
+            .await?
+            .expect("contract attempt usage should persist");
+        assert_eq!(usage.metrics.input_tokens, 11);
+        assert_eq!(usage.metrics.output_tokens, 7);
+        assert_eq!(usage.metrics.reported_total_tokens, Some(18));
+        assert_eq!(usage.cost_usd_micros, 125_000);
         drop(state);
         drop(store);
 

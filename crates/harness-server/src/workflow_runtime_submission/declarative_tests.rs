@@ -3,13 +3,16 @@ use chrono::{Duration, Utc};
 use harness_core::{
     config::isolation::IsolationTrustClass,
     config::workflow::{
-        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowAgentContract,
+        WorkflowDefinitionPolicy,
     },
     db::resolve_database_url,
 };
 use harness_workflow::runtime::{
-    store::RuntimeJobEnqueueOutcome, ActivityResult, ActivitySignal, RuntimeKind,
-    WorkflowCommandStatus, WorkflowCommandType, WorkflowDefinitionRegistry,
+    build_declarative_submission_decision, store::RuntimeJobEnqueueOutcome,
+    validate_declarative_agent_contract_command, ActivityResult, ActivitySignal,
+    DeclarativeWorkflowDefinition, RuntimeKind, WorkflowCommandStatus, WorkflowCommandType,
+    WorkflowDefinitionRegistry,
 };
 use std::{
     collections::BTreeMap,
@@ -74,6 +77,60 @@ fn register_test_definition() -> WorkflowDefinitionRegistry {
     registry
 }
 
+fn agent_contract_definition() -> DeclarativeWorkflowDefinition {
+    let policy = WorkflowDefinitionPolicy {
+        id: "submission_test_agent_contract".to_string(),
+        initial: "assessing".to_string(),
+        states: BTreeMap::from([
+            (
+                "assessing".to_string(),
+                DeclaredState {
+                    activity: Some("assess".to_string()),
+                    on_signal: BTreeMap::from([("approved".to_string(), "done".to_string())]),
+                    ..DeclaredState::default()
+                },
+            ),
+            (
+                "blocked".to_string(),
+                DeclaredState {
+                    progress: Some(DeclaredProgressMode::OperatorGate),
+                    ..DeclaredState::default()
+                },
+            ),
+        ]),
+        terminal: BTreeMap::from([
+            ("done".to_string(), "succeeded".to_string()),
+            ("failed".to_string(), "failed".to_string()),
+            ("cancelled".to_string(), "cancelled".to_string()),
+        ]),
+        evidence_required: BTreeMap::new(),
+        recovery_targets: vec!["assessing".to_string()],
+        intake: None,
+    };
+    let contract: WorkflowAgentContract = serde_json::from_value(json!({
+        "input_schema": "harness.semantic_activity_input.v1",
+        "output_schema": "harness.semantic_verdict.v1",
+        "allowed_outcomes": ["approved"],
+        "tools": "none",
+        "mutation": "forbidden",
+        "workspace": "ephemeral_empty",
+        "fresh_context": true,
+    }))
+    .expect("valid agent contract");
+    harness_workflow::runtime::build_declarative_definition(
+        &policy,
+        &BTreeMap::from([(
+            "assess".to_string(),
+            WorkflowActivityPolicy {
+                prompt: Some("Assess the pinned facts.".to_string()),
+                agent_contract: Some(contract),
+                ..WorkflowActivityPolicy::default()
+            },
+        )]),
+    )
+    .expect("agent contract definition should compile")
+}
+
 fn create_test_project(root: &Path) -> anyhow::Result<PathBuf> {
     let project_root = root.join("project");
     std::fs::create_dir(&project_root)?;
@@ -132,6 +189,45 @@ fn declarative_submission_decision_validates_against_the_registered_submission_r
             &ValidationContext::new("workflow-policy", chrono::Utc::now()),
         )
         .expect("registered declarative submission transition should validate");
+}
+
+#[test]
+fn agent_contract_submission_command_matches_the_committed_instance() -> anyhow::Result<()> {
+    let definition = agent_contract_definition();
+    let project_root = Path::new("/project");
+    let task_id = TaskId::from_str("agent-contract-submission");
+    let instance = super::declarative::submission_instance(
+        &DeclarativeSubmissionRuntimeContext {
+            project_root,
+            definition_id: definition.policy().id.as_str(),
+            task_id: &task_id,
+            prompt: "Assess this submission.",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            source: None,
+            external_id: None,
+            subject_key: None,
+            repo: None,
+            author_trust_class: None,
+        },
+        "/project",
+        "agent-contract-workflow",
+        "prompt-memory:test",
+        &definition,
+    );
+    let decision = build_declarative_submission_decision(&definition, &instance)?;
+    let mut committed = instance.clone();
+    committed.state = decision.next_state.clone();
+    committed.version = committed.version.saturating_add(1);
+    let data = merge_last_decision(std::mem::take(&mut committed.data), &decision.decision);
+    classify_submission_data(&mut committed, data)?;
+
+    assert!(validate_declarative_agent_contract_command(
+        &definition,
+        &committed,
+        &decision.commands[0],
+    )?);
+    Ok(())
 }
 
 #[test]

@@ -13,7 +13,7 @@ use harness_core::agent::{AgentBackend, AgentEvent, ModelIdentitySource};
 use harness_core::config::workflow::{
     agent_contract_output_schema_document, WorkflowAgentContract,
 };
-use harness_core::types::Item;
+use harness_core::types::{Item, TokenUsage};
 use harness_workflow::runtime::completion_evidence::ARTIFACT_RUNTIME_TURN_OBSERVATIONS;
 use harness_workflow::runtime::{
     ActivityArtifact, RuntimeJob, RuntimeProfile, WorkflowCommandRecord, WorkflowRuntimeStore,
@@ -234,6 +234,7 @@ pub(crate) struct TurnStreamObservations {
     pub(crate) unknown_item_kinds: Vec<String>,
     pub(crate) approval_requests: u32,
     pub(crate) tool_output_deltas: u32,
+    pub(crate) token_usage: Option<TokenUsage>,
 }
 
 /// Item kinds the runtime recognizes as carrying no tool or mutation surface.
@@ -262,6 +263,7 @@ impl TurnStreamObservations {
             AgentEvent::ToolOutputDelta { .. } => {
                 self.tool_output_deltas = self.tool_output_deltas.saturating_add(1);
             }
+            AgentEvent::TokenUsage { usage } => self.token_usage = Some(usage.clone()),
             _ => {}
         }
     }

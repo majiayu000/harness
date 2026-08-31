@@ -12,6 +12,7 @@ use super::agent_contract_enforcement::{
 use super::agent_contract_execution::execute_contract_attempts;
 use super::data_helpers::activity_name;
 use super::runtime_profile::{agent_backend_for_runtime_kind, runtime_profile_for_job};
+use super::runtime_usage::runtime_usage_context;
 
 #[derive(Debug)]
 pub(super) struct AgentContractExecutionError {
@@ -88,6 +89,14 @@ async fn execute_contract_job_inner(
             "the pinned runtime profile has no positive timeout_secs",
         ));
     };
+    let runtime_usage = runtime_usage_context(
+        state,
+        job,
+        None,
+        &profile,
+        backend.name(),
+        &state.core.project_root,
+    );
     execute_contract_attempts(
         state,
         job,
@@ -98,6 +107,7 @@ async fn execute_contract_job_inner(
         profile.reasoning_effort.clone(),
         timeout_secs,
         profile.max_turns,
+        runtime_usage.as_ref(),
         lease_lost,
     )
     .await
