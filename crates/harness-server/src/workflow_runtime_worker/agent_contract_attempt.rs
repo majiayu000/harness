@@ -106,26 +106,31 @@ pub(super) async fn execute_agent_contract_attempt(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
     let stream_backend = Arc::clone(&backend);
-    let stream = tokio::spawn(async move { stream_backend.execute_stream(request, tx).await });
+    let mut stream = tokio::spawn(async move { stream_backend.execute_stream(request, tx).await });
 
     let mut observations = TurnStreamObservations::default();
     let mut items = Vec::new();
     let mut output = String::new();
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
     tokio::pin!(deadline);
-    loop {
+    let mut event_channel_open = true;
+    let stream_result = loop {
         tokio::select! {
-            event = rx.recv() => {
-                let Some(event) = event else {
-                    break;
-                };
-                observations.record_stream_item(&event);
+            biased;
+            event = rx.recv(), if event_channel_open => {
                 match event {
-                    AgentEvent::ItemCompleted { item } => items.push(item),
-                    AgentEvent::TurnCompleted { output: reply } => output = reply,
-                    _ => {}
+                    Some(event) => {
+                        observations.record_stream_item(&event);
+                        match event {
+                            AgentEvent::ItemCompleted { item } => items.push(item),
+                            AgentEvent::TurnCompleted { output: reply } => output = reply,
+                            _ => {}
+                        }
+                    }
+                    None => event_channel_open = false,
                 }
             }
+            result = &mut stream => break result,
             _ = &mut deadline => {
                 stream.abort();
                 match stream.await {
@@ -169,9 +174,8 @@ pub(super) async fn execute_agent_contract_attempt(
                 anyhow::bail!("agent contract attempt cancelled after runtime lease loss");
             }
         }
-    }
-    stream
-        .await
+    };
+    stream_result
         .map_err(|error| anyhow::anyhow!("contract attempt stream task panicked: {error}"))?
         .map_err(|error| anyhow::anyhow!("contract attempt launch failed: {error}"))?;
 

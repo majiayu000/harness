@@ -17,33 +17,29 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     }
 
     async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
+        if let Some(result) = agent_contract_validation_preflight_result(job) {
+            return Some(result);
+        }
+        let validation = match self.state.core.workflow_runtime_store.as_deref() {
+            Some(store) => {
+                super::agent_contract_enforcement::validate_pinned_agent_contract_job(store, job)
+                    .await
+            }
+            None => Err(anyhow::anyhow!(
+                "runtime job requires the workflow runtime store"
+            )),
+        };
+        if let Err(error) = validation {
+            let error = anyhow::Error::new(
+                super::agent_contract_job::AgentContractExecutionError::new(error),
+            );
+            return Some(execution_error_result(activity_name(job), error));
+        }
         // Internal server-owned activities do not run a user agent. They must keep
         // flowing even when the runtime worker is disabled, otherwise disabling the
         // worker would strand workflows or prevent server-owned PR snapshots.
         if !job_requires_agent_runtime(job) {
             return None;
-        }
-        if let Some(result) = agent_contract_validation_preflight_result(job) {
-            return Some(result);
-        }
-        if job.input.pointer("/command/agent_contract").is_some() {
-            let validation = match self.state.core.workflow_runtime_store.as_deref() {
-                Some(store) => {
-                    super::agent_contract_enforcement::validate_pinned_agent_contract_job(
-                        store, job,
-                    )
-                    .await
-                }
-                None => Err(anyhow::anyhow!(
-                    "agent contract runtime job requires the workflow runtime store"
-                )),
-            };
-            if let Err(error) = validation {
-                let error = anyhow::Error::new(
-                    super::agent_contract_job::AgentContractExecutionError::new(error),
-                );
-                return Some(execution_error_result(activity_name(job), error));
-            }
         }
         if let Some(result) = exact_replay_preflight_result(self.state, job).await {
             return Some(result);

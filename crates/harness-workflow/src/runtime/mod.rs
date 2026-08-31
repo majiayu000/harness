@@ -138,7 +138,7 @@ pub use model::{
     RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord,
     WorkflowCommand, WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision,
     WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
-    WorkflowLease, WorkflowSubject,
+    WorkflowLease, WorkflowSubject, RUNTIME_PROFILE_SNAPSHOT_HASH_KEY,
 };
 pub use otel_trace_context::WorkflowOtelTraceContext;
 pub use plan_issue::{

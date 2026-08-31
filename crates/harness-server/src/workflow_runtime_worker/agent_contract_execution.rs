@@ -364,6 +364,26 @@ mod tests {
         registry
     }
 
+    fn pinned_contract() -> PinnedJobAgentContract {
+        let definition = loop_definition();
+        let pinned_activity = definition
+            .agent_contract("classify_scope")
+            .expect("classifier contract");
+        let contract_value = serde_json::to_value(&pinned_activity.contract).expect("contract");
+        PinnedJobAgentContract {
+            contract: pinned_activity.contract.clone(),
+            prompt: pinned_activity.prompt.clone(),
+            input: json!({
+                "schema": "harness.semantic_activity_input.v1",
+                "subject": {"kind": "test", "identity": "contract-execution"},
+                "facts": {"scope": "small"},
+                "provenance": {"/scope": "server"},
+                "contract_hash": harness_workflow::runtime::stable_remote_fact_hash(&contract_value),
+            }),
+            definition_hash: definition.definition_hash().to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn lease_loss_cancels_the_contract_backend_before_returning() {
         struct CancellationMarker(Arc<AtomicBool>);
@@ -401,23 +421,7 @@ mod tests {
             }
         }
 
-        let definition = loop_definition();
-        let pinned_activity = definition
-            .agent_contract("classify_scope")
-            .expect("classifier contract");
-        let contract_value = serde_json::to_value(&pinned_activity.contract).expect("contract");
-        let pinned = PinnedJobAgentContract {
-            contract: pinned_activity.contract.clone(),
-            prompt: pinned_activity.prompt.clone(),
-            input: json!({
-                "schema": "harness.semantic_activity_input.v1",
-                "subject": {"kind": "test", "identity": "lease-loss"},
-                "facts": {"scope": "small"},
-                "provenance": {"/scope": "server"},
-                "contract_hash": harness_workflow::runtime::stable_remote_fact_hash(&contract_value),
-            }),
-            definition_hash: definition.definition_hash().to_string(),
-        };
+        let pinned = pinned_contract();
         let started = Arc::new(tokio::sync::Notify::new());
         let cancelled = Arc::new(AtomicBool::new(false));
         let backend = Arc::new(HangingAgent {
@@ -445,6 +449,66 @@ mod tests {
             .expect("attempt task should not panic")
             .expect_err("lease loss must fail the attempt");
         assert!(error.to_string().contains("lease loss"), "{error}");
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn closed_event_channel_does_not_escape_attempt_timeout() {
+        struct CancellationMarker(Arc<AtomicBool>);
+        impl Drop for CancellationMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct ClosedChannelBackend {
+            cancelled: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl AgentBackend for ClosedChannelBackend {
+            fn name(&self) -> &str {
+                "closed-channel-contract-backend"
+            }
+            fn agent_contract_capabilities(
+                &self,
+            ) -> harness_core::agent::AgentContractCapabilities {
+                harness_core::agent::AgentContractCapabilities {
+                    prompt_only_launch: true,
+                    pinned_output_schema: true,
+                    attempt_observation_stream: true,
+                }
+            }
+            async fn execute_stream(
+                &self,
+                _request: harness_core::agent::AgentRequest,
+                tx: tokio::sync::mpsc::Sender<harness_core::agent::AgentEvent>,
+            ) -> harness_core::error::Result<()> {
+                let _marker = CancellationMarker(Arc::clone(&self.cancelled));
+                drop(tx);
+                std::future::pending().await
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let backend = Arc::new(ClosedChannelBackend {
+            cancelled: Arc::clone(&cancelled),
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::super::agent_contract_attempt::execute_agent_contract_attempt(
+                backend,
+                &pinned_contract(),
+                None,
+                None,
+                1,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the attempt timeout must remain active after its event channel closes");
+        let error = result.expect_err("the closed-channel backend must time out");
+
+        assert!(error.to_string().contains("timed out after 1s"), "{error}");
         assert!(cancelled.load(Ordering::SeqCst));
     }
 

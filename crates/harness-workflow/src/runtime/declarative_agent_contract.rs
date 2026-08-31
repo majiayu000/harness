@@ -394,16 +394,6 @@ pub fn validate_declarative_agent_contract_command(
     command: &WorkflowCommand,
 ) -> anyhow::Result<bool> {
     let command_has_contract = command.command.get("agent_contract").is_some();
-    let activity = command.activity_name().ok_or_else(|| {
-        anyhow::anyhow!("agent contract command does not name an enqueue activity")
-    })?;
-    let definition_has_contract = definition.agent_contract(activity).is_some();
-    if !command_has_contract && !definition_has_contract {
-        return Ok(false);
-    }
-    if command_has_contract != definition_has_contract {
-        anyhow::bail!("agent contract command does not match the pinned workflow definition");
-    }
     if instance.definition_id != definition.policy().id
         || instance.definition_version != definition.definition_version()
         || instance.data.get("definition_hash").and_then(Value::as_str)
@@ -411,6 +401,23 @@ pub fn validate_declarative_agent_contract_command(
     {
         anyhow::bail!("workflow instance does not match its pinned declarative definition");
     }
+    let activity = definition
+        .policy()
+        .states
+        .get(&instance.state)
+        .and_then(|state| state.activity.as_deref());
+    let definition_has_contract = activity
+        .and_then(|activity| definition.agent_contract(activity))
+        .is_some();
+    if !command_has_contract && !definition_has_contract {
+        return Ok(false);
+    }
+    if command_has_contract != definition_has_contract {
+        anyhow::bail!("agent contract command does not match the pinned workflow definition");
+    }
+    let activity = activity.ok_or_else(|| {
+        anyhow::anyhow!("pinned workflow state does not authorize an agent contract activity")
+    })?;
     let expected = declarative_enqueue_activity_command(
         definition,
         instance,
