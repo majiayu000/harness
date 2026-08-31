@@ -12,7 +12,7 @@ use std::sync::Arc;
 use super::agent_contract_assessment::attach_server_assessment;
 use super::agent_contract_attempt::{contract_violations, parse_contract_verdict};
 use super::agent_contract_enforcement::{turn_observation_artifact, PinnedJobAgentContract};
-use super::agent_contract_stream::execute_agent_contract_attempt;
+use super::agent_contract_stream::{execute_agent_contract_attempt, ContractAttemptFailure};
 use super::turn_engine::helpers::RuntimeUsageContext;
 
 pub(super) async fn execute_contract_attempts(
@@ -94,6 +94,18 @@ pub(super) async fn execute_contract_attempts(
             {
                 Ok(attempt) => attempt,
                 Err(error) => {
+                    let (error, output) = match error.downcast::<ContractAttemptFailure>() {
+                        Ok(failure) => {
+                            let (attempt, error) = failure.into_parts();
+                            observations.push(turn_observation_artifact(
+                                turn_number,
+                                &attempt.items,
+                                &attempt.observations,
+                            ));
+                            (error, attempt.output)
+                        }
+                        Err(error) => (error, String::new()),
+                    };
                     let error = error.to_string();
                     record_attempt_completed(
                         store,
@@ -101,7 +113,7 @@ pub(super) async fn execute_contract_attempts(
                         primary_attempt,
                         correction_attempt,
                         "execution_error",
-                        "",
+                        &output,
                         Some(&error),
                     )
                     .await?;

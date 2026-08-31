@@ -250,6 +250,55 @@ async fn budget_ceiling_does_not_preempt_terminal_completion() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn budget_ceiling_preempts_terminal_agent_contract_completion() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db"))
+        .await?
+        .with_budget_policy(ceiling_store_policy(15.0, RuntimeBudgetEnforcement::Enforce));
+    let instance = ceiling_instance(&store, "budget-ceiling-terminal-contract", 20.0).await?;
+    let result = ActivityResult::succeeded(
+        "implement_issue",
+        "The issue was already closed before implementation completed.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 123,
+            "state": "closed",
+            "issue_url": "https://github.com/owner/repo/issues/123"
+        }),
+    ))
+    .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(123));
+
+    let record = store
+        .commit_parent_runtime_completion(
+            &instance.id,
+            "runtime-1",
+            json!({
+                "command_id": "ceiling-terminal-contract-command",
+                "runtime_job_id": "ceiling-terminal-contract-job",
+                "command": {
+                    "command_type": "enqueue_activity",
+                    "dedupe_key": "ceiling-terminal-contract",
+                    "command": {"agent_contract": {"output_schema": "test"}}
+                },
+                "activity_result": result,
+            }),
+        )
+        .await?
+        .expect("over-budget contract completion still produces a decision");
+
+    assert!(record.accepted, "{:?}", record.rejection_reason);
+    assert_eq!(record.decision.decision, "block_budget_exhausted");
+    assert_eq!(record.decision.next_state, "blocked");
+    Ok(())
+}
+
+#[tokio::test]
 async fn budget_ceiling_unlimited_policy_never_blocks() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());

@@ -13,6 +13,30 @@ use super::agent_contract_enforcement::{
 use super::agent_contract_prompt::contract_attempt_prompt;
 use super::turn_engine::helpers::{RuntimeUsageContext, TurnBudgetStop};
 
+#[derive(Debug)]
+pub(super) struct ContractAttemptFailure {
+    pub(super) attempt: ContractAttempt,
+    source: anyhow::Error,
+}
+
+impl ContractAttemptFailure {
+    fn new(attempt: ContractAttempt, source: anyhow::Error) -> Self {
+        Self { attempt, source }
+    }
+
+    pub(super) fn into_parts(self) -> (ContractAttempt, anyhow::Error) {
+        (self.attempt, self.source)
+    }
+}
+
+impl std::fmt::Display for ContractAttemptFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ContractAttemptFailure {}
+
 pub(super) async fn execute_agent_contract_attempt(
     backend: Arc<dyn AgentBackend>,
     pinned: &PinnedJobAgentContract,
@@ -82,27 +106,7 @@ pub(super) async fn execute_agent_contract_attempt(
     let mut event_channel_open = true;
     let stream_result = loop {
         tokio::select! {
-            event = rx.recv(), if event_channel_open => {
-                match event {
-                    Some(event) => match record_event(&mut attempt, event, runtime_usage).await {
-                        Ok(Some(stop)) => {
-                            cancel_stream(&mut stream, "budget-stop").await?;
-                            return Err(budget_stop_error(&stop));
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            cancel_stream(&mut stream, "usage-accounting").await?;
-                            return Err(error);
-                        }
-                    },
-                    None => event_channel_open = false,
-                }
-            }
-            result = &mut stream => break result,
-            _ = &mut deadline => {
-                cancel_stream(&mut stream, "timeout").await?;
-                anyhow::bail!("agent contract attempt timed out after {timeout_secs}s");
-            }
+            biased;
             _ = async {
                 let Some(receiver) = lease_lost.as_mut() else {
                     std::future::pending::<()>().await;
@@ -114,21 +118,119 @@ pub(super) async fn execute_agent_contract_attempt(
                     }
                 }
             } => {
-                cancel_stream(&mut stream, "lease-loss").await?;
-                anyhow::bail!("agent contract attempt cancelled after runtime lease loss");
+                let error = anyhow::anyhow!(
+                    "agent contract attempt cancelled after runtime lease loss"
+                );
+                let error = stop_and_drain(
+                    &mut stream,
+                    &mut rx,
+                    &mut attempt,
+                    runtime_usage,
+                    "lease-loss",
+                    error,
+                )
+                .await;
+                return Err(ContractAttemptFailure::new(attempt, error).into());
             }
+            _ = &mut deadline => {
+                let error = anyhow::anyhow!(
+                    "agent contract attempt timed out after {timeout_secs}s"
+                );
+                let error = stop_and_drain(
+                    &mut stream,
+                    &mut rx,
+                    &mut attempt,
+                    runtime_usage,
+                    "timeout",
+                    error,
+                )
+                .await;
+                return Err(ContractAttemptFailure::new(attempt, error).into());
+            }
+            event = rx.recv(), if event_channel_open => {
+                match event {
+                    Some(event) => match record_event(&mut attempt, event, runtime_usage).await {
+                        Ok(Some(stop)) => {
+                            let error = stop_and_drain(
+                                &mut stream,
+                                &mut rx,
+                                &mut attempt,
+                                runtime_usage,
+                                "budget-stop",
+                                budget_stop_error(&stop),
+                            )
+                            .await;
+                            return Err(ContractAttemptFailure::new(attempt, error).into());
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let error = stop_and_drain(
+                                &mut stream,
+                                &mut rx,
+                                &mut attempt,
+                                runtime_usage,
+                                "usage-accounting",
+                                error,
+                            )
+                            .await;
+                            return Err(ContractAttemptFailure::new(attempt, error).into());
+                        }
+                    },
+                    None => event_channel_open = false,
+                }
+            }
+            result = &mut stream => break result,
         }
     };
 
+    match drain_events(&mut rx, &mut attempt, runtime_usage).await {
+        Ok(Some(stop)) => {
+            return Err(ContractAttemptFailure::new(attempt, budget_stop_error(&stop)).into())
+        }
+        Ok(None) => {}
+        Err(error) => return Err(ContractAttemptFailure::new(attempt, error).into()),
+    }
+    if let Err(error) = stream_result
+        .map_err(|error| anyhow::anyhow!("contract attempt stream task panicked: {error}"))?
+        .map_err(|error| anyhow::anyhow!("contract attempt launch failed: {error}"))
+    {
+        return Err(ContractAttemptFailure::new(attempt, error).into());
+    }
+    Ok(attempt)
+}
+
+async fn drain_events(
+    rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    attempt: &mut ContractAttempt,
+    runtime_usage: Option<(&RuntimeUsageContext, &TurnId)>,
+) -> anyhow::Result<Option<TurnBudgetStop>> {
+    let mut budget_stop = None;
     while let Ok(event) = rx.try_recv() {
-        if let Some(stop) = record_event(&mut attempt, event, runtime_usage).await? {
-            return Err(budget_stop_error(&stop));
+        if let Some(stop) = record_event(attempt, event, runtime_usage).await? {
+            budget_stop.get_or_insert(stop);
         }
     }
-    stream_result
-        .map_err(|error| anyhow::anyhow!("contract attempt stream task panicked: {error}"))?
-        .map_err(|error| anyhow::anyhow!("contract attempt launch failed: {error}"))?;
-    Ok(attempt)
+    Ok(budget_stop)
+}
+
+async fn stop_and_drain(
+    stream: &mut tokio::task::JoinHandle<harness_core::error::Result<()>>,
+    rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    attempt: &mut ContractAttempt,
+    runtime_usage: Option<(&RuntimeUsageContext, &TurnId)>,
+    reason: &str,
+    primary: anyhow::Error,
+) -> anyhow::Error {
+    let cleanup_error = cancel_stream(stream, reason).await.err();
+    let drain_error = drain_events(rx, attempt, runtime_usage).await.err();
+    match (cleanup_error, drain_error) {
+        (None, None) => primary,
+        (Some(cleanup), None) => anyhow::anyhow!("{primary}; cleanup failed: {cleanup}"),
+        (None, Some(drain)) => anyhow::anyhow!("{primary}; event drain failed: {drain}"),
+        (Some(cleanup), Some(drain)) => {
+            anyhow::anyhow!("{primary}; cleanup failed: {cleanup}; event drain failed: {drain}")
+        }
+    }
 }
 
 async fn record_event(

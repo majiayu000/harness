@@ -33,7 +33,8 @@ pub(super) async fn budget_ceiling_blocked_decision(
     decision: &WorkflowDecision,
 ) -> anyhow::Result<Option<WorkflowDecision>> {
     if budget_policy.unlimited
-        || !decision_schedules_more_work(definition_registry, instance, decision)
+        || (!decision_schedules_more_work(definition_registry, instance, decision)
+            && !completion_has_successful_agent_contract(event))
     {
         return Ok(None);
     }
@@ -90,9 +91,9 @@ pub(super) async fn budget_ceiling_blocked_decision(
     }
 }
 
-/// The ceiling only preempts decisions that would keep the workflow running.
-/// A decision that already lands in a terminal state or in `blocked` needs no
-/// budget intervention — the workflow is stopping either way.
+/// Ordinary terminal decisions keep their domain outcome. Agent-contract
+/// completions are the exception: their verdict is the spending decision, so
+/// the transaction-time fence remains authoritative even for a terminal route.
 fn decision_schedules_more_work(
     definition_registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
@@ -108,4 +109,16 @@ fn decision_schedules_more_work(
             &decision.next_state,
         )
         .is_none()
+}
+
+fn completion_has_successful_agent_contract(event: &WorkflowEvent) -> bool {
+    event
+        .event
+        .pointer("/command/command/agent_contract")
+        .is_some()
+        && event
+            .event
+            .pointer("/activity_result/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("succeeded")
 }

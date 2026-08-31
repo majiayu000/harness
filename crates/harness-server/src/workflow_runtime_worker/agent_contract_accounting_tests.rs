@@ -44,6 +44,30 @@ impl AgentBackend for AccountingAgent {
         .await
         .map_err(|error| harness_core::error::HarnessError::AgentExecution(error.to_string()))?;
         if self.fail_after_usage {
+            tx.send(AgentEvent::ModelReported {
+                model: "gpt-test".to_string(),
+                source: harness_core::agent::ModelIdentitySource::LaunchDerived,
+            })
+            .await
+            .map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(error.to_string())
+            })?;
+            tx.send(AgentEvent::ToolCall {
+                name: "forbidden-tool".to_string(),
+                input: json!({}),
+            })
+            .await
+            .map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(error.to_string())
+            })?;
+            tx.send(AgentEvent::ApprovalRequest {
+                id: "approval-1".to_string(),
+                command: "forbidden command".to_string(),
+            })
+            .await
+            .map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(error.to_string())
+            })?;
             return Err(harness_core::error::HarnessError::AgentExecution(
                 "backend failed after reporting usage".to_string(),
             ));
@@ -60,6 +84,44 @@ impl AgentBackend for AccountingAgent {
         .await
         .map_err(|error| harness_core::error::HarnessError::AgentExecution(error.to_string()))?;
         Ok(())
+    }
+}
+
+struct LeaseLossAfterUsageAgent {
+    lease_lost: tokio::sync::watch::Sender<bool>,
+}
+
+#[async_trait]
+impl AgentBackend for LeaseLossAfterUsageAgent {
+    fn name(&self) -> &str {
+        "lease-loss-after-usage-agent"
+    }
+
+    fn agent_contract_capabilities(&self) -> AgentContractCapabilities {
+        AgentContractCapabilities {
+            prompt_only_launch: true,
+            pinned_output_schema: true,
+            attempt_observation_stream: true,
+        }
+    }
+
+    async fn execute_stream(
+        &self,
+        _request: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        tx.send(AgentEvent::TokenUsage {
+            usage: harness_core::types::TokenUsage {
+                input_tokens: 23,
+                output_tokens: 5,
+                total_tokens: 28,
+                cost_usd: 0.25,
+            },
+        })
+        .await
+        .map_err(|error| harness_core::error::HarnessError::AgentExecution(error.to_string()))?;
+        self.lease_lost.send_replace(true);
+        std::future::pending().await
     }
 }
 
@@ -157,6 +219,20 @@ async fn usage_survives_backend_failure_after_report() -> anyhow::Result<()> {
     assert!(error
         .to_string()
         .contains("backend failed after reporting usage"));
+    let failure = error
+        .downcast::<super::super::agent_contract_stream::ContractAttemptFailure>()
+        .expect("stream failures must retain their partial attempt");
+    assert_eq!(failure.attempt.observations.approval_requests, 1);
+    assert_eq!(
+        failure.attempt.observations.reported_models[0].0,
+        "gpt-test"
+    );
+    assert!(failure
+        .attempt
+        .observations
+        .started_item_kinds
+        .iter()
+        .any(|kind| kind == "tool_call:forbidden-tool"));
     let usage = context
         .store
         .runtime_usage_for_workflow(&context.workflow_id)
@@ -164,6 +240,55 @@ async fn usage_survives_backend_failure_after_report() -> anyhow::Result<()> {
         .expect("reported usage must persist before the backend error returns");
     assert_eq!(usage.metrics.reported_total_tokens, Some(18));
     assert_eq!(usage.cost_usd_micros, 125_000);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_loss_drains_queued_usage_before_returning() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let (_dir, context, turn_id) = usage_fixture(RuntimeBudgetPolicy {
+        unlimited: true,
+        ..RuntimeBudgetPolicy::default()
+    })
+    .await?;
+    let (lease_lost, receiver) = tokio::sync::watch::channel(false);
+
+    let error = execute_agent_contract_attempt(
+        Arc::new(LeaseLossAfterUsageAgent { lease_lost }),
+        &pinned_contract(),
+        None,
+        None,
+        30,
+        None,
+        Some((&context, &turn_id)),
+        Some(receiver),
+    )
+    .await
+    .expect_err("lease loss must cancel the attempt");
+
+    assert!(error.to_string().contains("lease loss"), "{error}");
+    let failure = error
+        .downcast::<super::super::agent_contract_stream::ContractAttemptFailure>()
+        .expect("lease loss must retain its partial attempt");
+    assert_eq!(
+        failure
+            .attempt
+            .observations
+            .token_usage
+            .as_ref()
+            .expect("queued usage must be observed")
+            .total_tokens,
+        28
+    );
+    let usage = context
+        .store
+        .runtime_usage_for_workflow(&context.workflow_id)
+        .await?
+        .expect("queued usage must persist during lease-loss cleanup");
+    assert_eq!(usage.metrics.reported_total_tokens, Some(28));
+    assert_eq!(usage.cost_usd_micros, 250_000);
     Ok(())
 }
 
