@@ -444,6 +444,9 @@ async fn runtime_recovery_replays_parent_command_for_legacy_child_stop() -> anyh
 
     parent.state = "blocked".to_string();
     parent = parent.with_server_data(json!({
+        "feedback_repair_round": 3,
+        "feedback_repair_blocker_count": 1,
+        "feedback_repair_lane": "remote_feedback",
         "last_stop": {
             "state": "blocked",
             "activity": PR_FEEDBACK_INSPECT_ACTIVITY,
@@ -465,6 +468,9 @@ async fn runtime_recovery_replays_parent_command_for_legacy_child_stop() -> anyh
     )?;
 
     assert_eq!(workflow.state, "awaiting_feedback");
+    assert!(workflow.data.get("feedback_repair_round").is_none());
+    assert!(workflow.data.get("feedback_repair_blocker_count").is_none());
+    assert!(workflow.data.get("feedback_repair_lane").is_none());
     let commands = store.commands_for(&parent.id).await?;
     let replayed = commands
         .iter()

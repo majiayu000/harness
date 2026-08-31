@@ -132,6 +132,11 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
         .is_some_and(|items| items.iter().any(|item| item
             .as_str()
             .is_some_and(|value| value.contains("pr_hygiene update/rebase")))));
+    assert!(schema["agent_summary_contract"]["must_include"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item
+            .as_str()
+            .is_some_and(|value| value.contains("DIRTY or BEHIND")))));
     assert!(schema["agent_summary_contract"]["must_not_include"]
         .as_array()
         .is_some_and(|items| items.contains(&json!(

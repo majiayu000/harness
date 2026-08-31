@@ -177,6 +177,31 @@ fn declarative_recovery_requires_operator_and_pinned_target_selection() {
 }
 
 #[test]
+fn automatic_unblock_preserves_feedback_repair_budget() {
+    let definition = definition();
+    let mut instance = instance(&definition).with_server_data(serde_json::json!({
+        "feedback_repair_round": 3,
+        "feedback_repair_blocker_count": 1,
+        "feedback_repair_lane": "remote_feedback",
+    }));
+
+    persist_operator_recovery_data(
+        &mut instance,
+        WorkflowRuntimeRecoveryAction::Unblock,
+        "transient stop recheck",
+        "auto_recovery",
+        "blocked",
+        "running",
+        "event-one",
+    )
+    .expect("automatic recovery metadata should persist");
+
+    assert_eq!(instance.data["feedback_repair_round"], 3);
+    assert_eq!(instance.data["feedback_repair_blocker_count"], 1);
+    assert_eq!(instance.data["feedback_repair_lane"], "remote_feedback");
+}
+
+#[test]
 fn declarative_recovery_builds_exact_progress_driver_and_preserves_evidence() {
     let definition = definition();
     let instance = instance(&definition);

@@ -460,7 +460,11 @@ fn persist_operator_recovery_data(
     // A successful recovery ends the stop episode. Stop classification and
     // auto-recovery state must not leak into later terminal history or keep
     // recovered transcript dependency families pinned.
-    instance.apply_data_writes([
+    let reset_feedback_repair = action == WorkflowRuntimeRecoveryAction::Unblock
+        && previous_state == "blocked"
+        && actor == "operator"
+        && instance.data.get("feedback_repair_round").is_some();
+    let mut writes = vec![
         crate::runtime::WorkflowDataWrite::remove(
             "auto_recovery",
             crate::runtime::DataProvenance::Server,
@@ -493,7 +497,20 @@ fn persist_operator_recovery_data(
             }),
             crate::runtime::DataProvenance::Server,
         ),
-    ])
+    ];
+    if reset_feedback_repair {
+        for field in [
+            "feedback_repair_round",
+            "feedback_repair_blocker_count",
+            "feedback_repair_lane",
+        ] {
+            writes.push(crate::runtime::WorkflowDataWrite::remove(
+                field,
+                crate::runtime::DataProvenance::Server,
+            ));
+        }
+    }
+    instance.apply_data_writes(writes)
 }
 
 fn recovery_dispatch_decision(
