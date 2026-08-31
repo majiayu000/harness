@@ -13,14 +13,32 @@ use harness_workflow::runtime::{
 #[async_trait]
 impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
-        !is_internal_non_agent_activity(job)
+        job.input.pointer("/command/agent_contract").is_none() && job_requires_agent_runtime(job)
     }
 
     async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
+        if let Some(result) = agent_contract_validation_preflight_result(job) {
+            return Some(result);
+        }
+        let validation = match self.state.core.workflow_runtime_store.as_deref() {
+            Some(store) => {
+                super::agent_contract_enforcement::validate_pinned_agent_contract_job(store, job)
+                    .await
+            }
+            None => Err(anyhow::anyhow!(
+                "runtime job requires the workflow runtime store"
+            )),
+        };
+        if let Err(error) = validation {
+            let error = anyhow::Error::new(
+                super::agent_contract_job::AgentContractExecutionError::new(error),
+            );
+            return Some(execution_error_result(activity_name(job), error));
+        }
         // Internal server-owned activities do not run a user agent. They must keep
         // flowing even when the runtime worker is disabled, otherwise disabling the
         // worker would strand workflows or prevent server-owned PR snapshots.
-        if is_internal_non_agent_activity(job) {
+        if !job_requires_agent_runtime(job) {
             return None;
         }
         if let Some(result) = exact_replay_preflight_result(self.state, job).await {
@@ -48,6 +66,17 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     }
 }
 
+fn agent_contract_validation_preflight_result(job: &RuntimeJob) -> Option<ActivityResult> {
+    job.input.pointer("/command/agent_contract")?;
+    super::agent_contract_job::pinned_agent_contract_for_execution(job)
+        .err()
+        .map(|error| execution_error_result(activity_name(job), error))
+}
+
+fn job_requires_agent_runtime(job: &RuntimeJob) -> bool {
+    job.input.pointer("/command/agent_contract").is_some() || !is_internal_non_agent_activity(job)
+}
+
 fn postprocess_local_execution_result(result: ActivityResult) -> ActivityResult {
     strip_transcript_unavailable_signal(result)
 }
@@ -59,6 +88,11 @@ fn execution_error_result(activity: String, error: anyhow::Error) -> ActivityRes
         error.to_string(),
     );
     if error
+        .downcast_ref::<super::agent_contract_job::AgentContractExecutionError>()
+        .is_some()
+    {
+        result.with_error_kind(ActivityErrorKind::Fatal)
+    } else if error
         .downcast_ref::<PromptPacketConfigurationError>()
         .is_some()
     {
@@ -88,6 +122,47 @@ mod tests {
     }
 
     #[test]
+    fn agent_contract_infrastructure_errors_are_fatal() {
+        let job = RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexExec,
+            "codex-contract",
+            serde_json::json!({
+                "activity": "classify_scope",
+                "command": {"agent_contract": null}
+            }),
+        );
+        let error = super::super::agent_contract_job::pinned_agent_contract_for_execution(&job)
+            .expect_err("malformed present contract must fail extraction");
+
+        let result = execution_error_result("classify_scope".to_string(), error);
+
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Fatal));
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unparseable agent_contract payload")));
+    }
+
+    #[test]
+    fn server_owned_name_collision_still_consumes_an_agent_runtime_turn() {
+        let mut job = RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexExec,
+            "codex-contract",
+            serde_json::json!({
+                "activity": harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+                "command": {"agent_contract": {}}
+            }),
+        );
+        job.input["activity"] =
+            serde_json::json!(harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY);
+
+        assert!(is_internal_non_agent_activity(&job));
+        assert!(job_requires_agent_runtime(&job));
+    }
+
+    #[test]
     fn local_executor_retains_server_attached_completion_evidence() {
         let result = ActivityResult::succeeded("merge_pr", "verified merge")
             .with_artifact(harness_workflow::runtime::ActivityArtifact::new(
@@ -102,5 +177,31 @@ mod tests {
             result.artifacts[0].artifact_type,
             harness_workflow::runtime::completion_evidence::ARTIFACT_MERGE_COMPLETION_VERIFICATION
         );
+    }
+
+    #[test]
+    fn malformed_contract_is_fatal_before_other_executor_preflight() {
+        let job = RuntimeJob::pending(
+            "command-preflight-order",
+            harness_workflow::runtime::RuntimeKind::CodexExec,
+            "codex-contract",
+            serde_json::json!({
+                "activity": "classify_scope",
+                "command": {"agent_contract": null}
+            }),
+        );
+
+        let result = agent_contract_validation_preflight_result(&job)
+            .expect("a malformed present contract must produce a preflight result");
+
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Fatal));
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unparseable agent_contract")));
     }
 }

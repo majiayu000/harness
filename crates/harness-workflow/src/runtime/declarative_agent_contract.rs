@@ -7,12 +7,54 @@
 //! carries the exact contract the instance was pinned to.
 
 use super::declarative::DeclarativeWorkflowDefinition;
-use super::model::{WorkflowCommand, WorkflowCommandType, WorkflowInstance};
+use super::model::{
+    ActivityResult, RuntimeKind, WorkflowCommand, WorkflowCommandType, WorkflowInstance,
+};
 use harness_core::config::workflow::{
-    DeclaredState, WorkflowActivityPolicy, WorkflowAgentContract, WorkflowDefinitionPolicy,
+    validate_agent_contract_input, validate_agent_contract_output, DeclaredState,
+    WorkflowActivityPolicy, WorkflowAgentContract, WorkflowDefinitionPolicy,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+
+pub const AGENT_CONTRACT_ASSESSMENT_SCHEMA: &str = "harness.agent_contract_assessment.v1";
+pub const AGENT_CONTRACT_ASSESSMENT_ARTIFACT: &str = "agent_contract_assessment";
+pub const AGENT_CONTRACT_VERDICT_ARTIFACT: &str = "agent_contract_verdict";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentContractAssessment {
+    schema: String,
+    assessment_id: String,
+    activity: String,
+    definition_hash: String,
+    contract_hash: String,
+    input_hash: String,
+    runtime_job_id: String,
+    command_id: String,
+    runtime_profile: String,
+    runtime_kind: RuntimeKind,
+    outcome: String,
+    verdict: Value,
+    budget: AgentContractAssessmentBudget,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentContractAssessmentBudget {
+    max_primary_attempts: u32,
+    max_corrections: u32,
+    primary_attempts_used: u32,
+    corrections_used: u32,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AgentContractAttemptFact {
+    primary_attempt: u32,
+    correction_attempt: u32,
+}
 
 /// One activity's complete pinned agent execution policy: the contract plus
 /// the effective prompt. Both participate in the definition identity and the
@@ -23,6 +65,173 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct PinnedAgentContractActivity {
     pub prompt: String,
     pub contract: WorkflowAgentContract,
+}
+
+/// Validates the single server-authored assessment carried by a completed
+/// contract activity and returns the exact outcome used for `on_signal`
+/// routing. Every identity and hash is checked against the pinned completion
+/// event so replay never consults mutable workflow configuration or model
+/// output outside the persisted event.
+pub(crate) fn validated_agent_contract_assessment_outcome(
+    definition: &DeclarativeWorkflowDefinition,
+    activity: &str,
+    event: &super::model::WorkflowEvent,
+    result: &ActivityResult,
+) -> anyhow::Result<Option<String>> {
+    let Some(pinned) = definition.agent_contract(activity) else {
+        return Ok(None);
+    };
+    let command: WorkflowCommand =
+        serde_json::from_value(
+            event.event.get("command").cloned().ok_or_else(|| {
+                anyhow::anyhow!("agent contract completion is missing its command")
+            })?,
+        )?;
+    let command_id = event
+        .event
+        .get("command_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("agent contract completion is missing command_id"))?;
+    let runtime_job_id = event
+        .event
+        .get("runtime_job_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("agent contract completion is missing runtime_job_id"))?;
+    let runtime_job_profile = event
+        .event
+        .get("runtime_job_profile")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!("agent contract completion is missing runtime_job_profile")
+        })?;
+    let runtime_job_kind: RuntimeKind = serde_json::from_value(
+        event
+            .event
+            .get("runtime_job_kind")
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("agent contract completion is missing runtime_job_kind")
+            })?,
+    )?;
+    let attempt_facts: Vec<AgentContractAttemptFact> = serde_json::from_value(
+        event
+            .event
+            .get("agent_contract_attempts")
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("agent contract completion is missing agent_contract_attempts")
+            })?,
+    )?;
+    if command.command_type != WorkflowCommandType::EnqueueActivity
+        || command.activity_name() != Some(activity)
+    {
+        anyhow::bail!("agent contract completion command does not enqueue activity '{activity}'");
+    }
+    let contract_value = command
+        .command
+        .get("agent_contract")
+        .ok_or_else(|| anyhow::anyhow!("agent contract completion command lost its contract"))?;
+    if contract_value != &serde_json::to_value(&pinned.contract)? {
+        anyhow::bail!("agent contract completion command does not match the pinned definition");
+    }
+    if command.command.get("prompt").and_then(Value::as_str) != Some(pinned.prompt.as_str())
+        || command
+            .command
+            .get("definition_hash")
+            .and_then(Value::as_str)
+            != Some(definition.definition_hash())
+    {
+        anyhow::bail!(
+            "agent contract completion command lost its pinned prompt or definition hash"
+        );
+    }
+    let input = command
+        .command
+        .get("agent_contract_input")
+        .ok_or_else(|| anyhow::anyhow!("agent contract completion command lost its input"))?;
+    validate_agent_contract_input(&pinned.contract.input_schema, input)
+        .map_err(anyhow::Error::msg)?;
+
+    let assessments = result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == AGENT_CONTRACT_ASSESSMENT_ARTIFACT)
+        .collect::<Vec<_>>();
+    let [assessment_artifact] = assessments.as_slice() else {
+        anyhow::bail!("agent contract activity must contain exactly one server assessment");
+    };
+    let assessment: AgentContractAssessment =
+        serde_json::from_value(assessment_artifact.artifact.clone())?;
+    let verdicts = result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == AGENT_CONTRACT_VERDICT_ARTIFACT)
+        .collect::<Vec<_>>();
+    let [verdict_artifact] = verdicts.as_slice() else {
+        anyhow::bail!("agent contract activity must contain exactly one raw verdict artifact");
+    };
+    let raw_verdict = verdict_artifact
+        .artifact
+        .get("verdict")
+        .ok_or_else(|| anyhow::anyhow!("agent contract verdict artifact is missing verdict"))?;
+    validate_agent_contract_output(&pinned.contract.output_schema, &assessment.verdict)
+        .map_err(anyhow::Error::msg)?;
+    let expected_contract_hash = super::remote_facts::stable_remote_fact_hash(contract_value);
+    let expected_input_hash = super::remote_facts::stable_remote_fact_hash(input);
+    let mut expected_primary = 1;
+    let mut expected_correction = 0;
+    for fact in &attempt_facts {
+        if fact.primary_attempt != expected_primary
+            || fact.correction_attempt != expected_correction
+            || fact.primary_attempt > pinned.contract.max_primary_attempts
+        {
+            anyhow::bail!("agent contract completion has an invalid attempt reservation sequence");
+        }
+        if expected_correction == pinned.contract.max_corrections {
+            expected_primary = expected_primary.saturating_add(1);
+            expected_correction = 0;
+        } else {
+            expected_correction = expected_correction.saturating_add(1);
+        }
+    }
+    let Some(last_attempt) = attempt_facts.last() else {
+        anyhow::bail!("agent contract completion has no persisted attempt reservation");
+    };
+    let corrections_used = attempt_facts
+        .iter()
+        .filter(|fact| fact.correction_attempt > 0)
+        .count() as u32;
+    if assessment.schema != AGENT_CONTRACT_ASSESSMENT_SCHEMA
+        || assessment.assessment_id != format!("{runtime_job_id}:agent-contract-assessment")
+        || assessment.activity != activity
+        || assessment.definition_hash != definition.definition_hash()
+        || assessment.contract_hash != expected_contract_hash
+        || assessment.input_hash != expected_input_hash
+        || assessment.runtime_job_id != runtime_job_id
+        || assessment.command_id != command_id
+        || assessment.runtime_profile != runtime_job_profile
+        || assessment.runtime_kind != runtime_job_kind
+        || runtime_job_kind == RuntimeKind::RemoteHost
+        || assessment.outcome
+            != assessment
+                .verdict
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        || raw_verdict != &assessment.verdict
+        || !pinned
+            .contract
+            .allowed_outcomes
+            .iter()
+            .any(|outcome| outcome == &assessment.outcome)
+        || assessment.budget.max_primary_attempts != pinned.contract.max_primary_attempts
+        || assessment.budget.max_corrections != pinned.contract.max_corrections
+        || assessment.budget.primary_attempts_used != last_attempt.primary_attempt
+        || assessment.budget.corrections_used != corrections_used
+    {
+        anyhow::bail!("agent contract assessment failed pinned-event validation");
+    }
+    Ok(Some(assessment.outcome))
 }
 
 /// Validates and pins the agent contracts of every activity the definition
@@ -175,4 +384,48 @@ pub(crate) fn declarative_enqueue_activity_command(
         }
         None => Ok(WorkflowCommand::enqueue_activity(activity, dedupe_key)),
     }
+}
+
+/// Validates that a persisted contract command is exactly the command derived
+/// from the workflow instance's pinned declarative definition and data.
+pub fn validate_declarative_agent_contract_command(
+    definition: &DeclarativeWorkflowDefinition,
+    instance: &WorkflowInstance,
+    command: &WorkflowCommand,
+) -> anyhow::Result<bool> {
+    let command_has_contract = command.command.get("agent_contract").is_some();
+    if instance.definition_id != definition.policy().id
+        || instance.definition_version != definition.definition_version()
+        || instance.data.get("definition_hash").and_then(Value::as_str)
+            != Some(definition.definition_hash())
+    {
+        anyhow::bail!("workflow instance does not match its pinned declarative definition");
+    }
+    let activity = definition
+        .policy()
+        .states
+        .get(&instance.state)
+        .and_then(|state| state.activity.as_deref());
+    let definition_has_contract = activity
+        .and_then(|activity| definition.agent_contract(activity))
+        .is_some();
+    if !command_has_contract && !definition_has_contract {
+        return Ok(false);
+    }
+    if command_has_contract != definition_has_contract {
+        anyhow::bail!("agent contract command does not match the pinned workflow definition");
+    }
+    let activity = activity.ok_or_else(|| {
+        anyhow::anyhow!("pinned workflow state does not authorize an agent contract activity")
+    })?;
+    let expected = declarative_enqueue_activity_command(
+        definition,
+        instance,
+        activity,
+        command.dedupe_key.clone(),
+    )?;
+    if expected != *command {
+        anyhow::bail!("agent contract command does not match the pinned workflow instance");
+    }
+    Ok(true)
 }

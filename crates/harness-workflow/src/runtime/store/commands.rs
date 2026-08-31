@@ -13,6 +13,82 @@ use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
 
 impl WorkflowRuntimeStore {
+    pub async fn fail_claimed_command_with_completion_if_owned(
+        &self,
+        command_id: &str,
+        dispatch_claim: DispatchClaim<'_>,
+        result: &crate::runtime::ActivityResult,
+    ) -> anyhow::Result<bool> {
+        let generation = i64::try_from(dispatch_claim.generation)
+            .map_err(|_| anyhow::anyhow!("dispatch claim generation exceeds PostgreSQL BIGINT"))?;
+        let workflow_id: Option<(String,)> =
+            sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
+                .bind(command_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((workflow_id,)) = workflow_id else {
+            anyhow::bail!("workflow command not found: {command_id}");
+        };
+        let mut tx = self.pool.begin().await?;
+        let instance = super::select_instance_for_update_tx(&mut tx, &workflow_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("workflow instance not found: {workflow_id}"))?;
+        let command_row: Option<(String, Option<String>, i64, String)> = sqlx::query_as(
+            "SELECT status, dispatch_owner, dispatch_claim_generation, data::text
+             FROM workflow_commands WHERE id = $1 FOR UPDATE",
+        )
+        .bind(command_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((status, owner, current_generation, command_data)) = command_row else {
+            anyhow::bail!("workflow command not found: {command_id}");
+        };
+        if status != WorkflowCommandStatus::Dispatching.as_str()
+            || owner.as_deref() != Some(dispatch_claim.owner)
+            || current_generation != generation
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let command: WorkflowCommand = serde_json::from_str(&command_data)?;
+        sqlx::query(
+            "UPDATE workflow_commands
+             SET status = $2, dispatch_owner = NULL,
+                 dispatch_lease_expires_at = NULL, dispatch_not_before = NULL,
+                 dispatch_barrier = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1",
+        )
+        .bind(command_id)
+        .bind(WorkflowCommandStatus::Failed.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let event = super::insert_event_tx(
+            &mut tx,
+            &workflow_id,
+            "RuntimeJobCompleted",
+            dispatch_claim.owner,
+            json!({
+                "command_id": command_id,
+                "command": command,
+                "runtime_job_id": format!("dispatch-validation:{command_id}:{generation}"),
+                "runtime_job_status": "failed",
+                "activity_result": result,
+            }),
+        )
+        .await?;
+        super::runtime_completion::apply_runtime_completion_decision_tx(
+            &mut tx,
+            &self.definition_registry,
+            &instance.id,
+            dispatch_claim.owner,
+            &event,
+            &self.budget_policy,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn skip_claimed_command_if_owned(
         &self,
         command_id: &str,

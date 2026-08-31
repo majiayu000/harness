@@ -1,4 +1,400 @@
 use super::*;
+use std::collections::BTreeMap;
+
+struct DispatchContractAgent {
+    enforceable: bool,
+}
+
+#[async_trait::async_trait]
+impl harness_core::agent::AgentBackend for DispatchContractAgent {
+    fn name(&self) -> &str {
+        "dispatch-contract-agent"
+    }
+
+    fn agent_contract_capabilities(&self) -> harness_core::agent::AgentContractCapabilities {
+        if !self.enforceable {
+            return harness_core::agent::AgentContractCapabilities::default();
+        }
+        harness_core::agent::AgentContractCapabilities {
+            prompt_only_launch: true,
+            pinned_output_schema: true,
+            attempt_observation_stream: true,
+        }
+    }
+}
+
+struct ContractDispatchResult {
+    enqueued: usize,
+    deferred: usize,
+    skipped: usize,
+    runtime_jobs: usize,
+    command_status: harness_workflow::runtime::WorkflowCommandStatus,
+    completion_events: usize,
+}
+
+fn contract_dispatch_definition(
+) -> anyhow::Result<harness_workflow::runtime::DeclarativeWorkflowDefinition> {
+    let contract: harness_core::config::workflow::WorkflowAgentContract =
+        serde_json::from_value(serde_json::json!({
+            "input_schema": "harness.semantic_activity_input.v1",
+            "output_schema": "harness.semantic_verdict.v1",
+            "allowed_outcomes": ["small", "large"],
+            "tools": "none",
+            "mutation": "forbidden",
+            "workspace": "ephemeral_empty",
+            "fresh_context": true,
+            "max_primary_attempts": 1,
+            "max_corrections": 1
+        }))
+        .expect("valid dispatch contract fixture");
+    let policy = harness_core::config::workflow::WorkflowDefinitionPolicy {
+        id: "contract_workflow".to_string(),
+        initial: "classifying".to_string(),
+        states: BTreeMap::from([
+            (
+                "classifying".to_string(),
+                harness_core::config::workflow::DeclaredState {
+                    activity: Some("classify_scope".to_string()),
+                    on_failure: Some("blocked".to_string()),
+                    on_signal: BTreeMap::from([
+                        ("small".to_string(), "done".to_string()),
+                        ("large".to_string(), "blocked".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "blocked".to_string(),
+                harness_core::config::workflow::DeclaredState {
+                    progress: Some(
+                        harness_core::config::workflow::DeclaredProgressMode::OperatorGate,
+                    ),
+                    ..Default::default()
+                },
+            ),
+        ]),
+        terminal: BTreeMap::from([
+            ("done".to_string(), "succeeded".to_string()),
+            ("failed".to_string(), "failed".to_string()),
+            ("cancelled".to_string(), "cancelled".to_string()),
+        ]),
+        evidence_required: BTreeMap::new(),
+        recovery_targets: vec!["classifying".to_string()],
+        intake: None,
+    };
+    let activity_policies = BTreeMap::from([(
+        "classify_scope".to_string(),
+        harness_core::config::workflow::WorkflowActivityPolicy {
+            prompt: Some("Classify only the supplied facts.".to_string()),
+            agent_contract: Some(contract),
+            ..Default::default()
+        },
+    )]);
+    harness_workflow::runtime::build_declarative_definition(&policy, &activity_policies)
+}
+
+async fn dispatch_contract_with_backend<F>(
+    enforceable: bool,
+    runtime_enabled: bool,
+    corrupt_instance_pin: bool,
+    mutate_command: F,
+) -> anyhow::Result<ContractDispatchResult>
+where
+    F: FnOnce(&mut harness_workflow::runtime::WorkflowCommand),
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(ContractDispatchResult {
+            enqueued: 0,
+            deferred: 0,
+            skipped: 0,
+            runtime_jobs: 0,
+            command_status: harness_workflow::runtime::WorkflowCommandStatus::Pending,
+            completion_events: 0,
+        });
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("contract-project");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        format!(
+            "---\nruntime_dispatch:\n  enabled: {runtime_enabled}\n  runtime_profile: codex-contract\n  timeout_secs: 30\nruntime_worker:\n  enabled: {runtime_enabled}\n---\n"
+        ),
+    )?;
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register(
+        "codex",
+        Arc::new(DispatchContractAgent { enforceable: false }),
+    );
+    registry.register_turn_backend_factory("codex", move || {
+        Arc::new(DispatchContractAgent { enforceable })
+    })?;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        &project_root,
+        harness_core::config::HarnessConfig::default(),
+        registry,
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let definition = contract_dispatch_definition()?;
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        definition.policy().id.clone(),
+        definition.definition_version(),
+        definition.policy().initial.clone(),
+        harness_workflow::runtime::WorkflowSubject::new("test", "contract-dispatch"),
+    )
+    .with_id("contract-dispatch")
+    .with_server_data(serde_json::json!({
+        "definition_hash": definition.definition_hash(),
+        "project_id": project_root,
+        "scope": "small"
+    }));
+    store
+        .persist_definition_version(
+            &harness_workflow::runtime::persisted_declarative_definition(&definition, None),
+        )
+        .await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let mut command =
+        harness_workflow::runtime::build_declarative_submission_decision(&definition, &workflow)?
+            .commands
+            .into_iter()
+            .next()
+            .expect("contract submission must enqueue its initial activity");
+    let original_command = command.clone();
+    mutate_command(&mut command);
+    let command_id = store
+        .enqueue_command(
+            &workflow.id,
+            None,
+            if corrupt_instance_pin {
+                &original_command
+            } else {
+                &command
+            },
+        )
+        .await?;
+    if corrupt_instance_pin {
+        let mut corrupted = workflow.clone();
+        corrupted.remove_data_field(
+            "definition_hash",
+            harness_workflow::runtime::DataProvenance::Server,
+        )?;
+        sqlx::query("UPDATE workflow_instances SET data = $2::jsonb WHERE id = $1")
+            .bind(&workflow.id)
+            .bind(serde_json::to_string(&corrupted)?)
+            .execute(store.pool())
+            .await?;
+        sqlx::query("UPDATE workflow_commands SET data = $2::jsonb WHERE id = $1")
+            .bind(&command_id)
+            .bind(serde_json::to_string(&command)?)
+            .execute(store.pool())
+            .await?;
+    }
+    let mut profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-contract",
+        harness_workflow::runtime::RuntimeKind::CodexExec,
+    );
+    profile.timeout_secs = Some(30);
+
+    let tick = super::background::run_runtime_command_dispatch_tick(&state, profile, 10).await?;
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    let command_status = store.commands_for(&workflow.id).await?[0].status;
+    let completion_events = store
+        .events_for(&workflow.id)
+        .await?
+        .into_iter()
+        .filter(|event| event.event_type == "RuntimeJobCompleted")
+        .count();
+    Ok(ContractDispatchResult {
+        enqueued: tick.enqueued,
+        deferred: tick.deferred,
+        skipped: tick.skipped,
+        runtime_jobs: jobs.len(),
+        command_status,
+        completion_events,
+    })
+}
+
+#[tokio::test]
+async fn runtime_dispatch_authorizes_contract_only_from_selected_backend_capabilities(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, false, |_| {}).await?;
+    assert_eq!(result.enqueued, 1);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.runtime_jobs, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_defers_contract_for_nonconforming_selected_backend() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(false, true, false, |_| {}).await?;
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_malformed_present_contract_instead_of_deferring(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, false, false, |command| {
+        command.command["agent_contract"] = serde_json::Value::Null;
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_when_pinned_contract_marker_is_removed() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, false, |command| {
+        command
+            .command
+            .as_object_mut()
+            .expect("contract command payload")
+            .remove("agent_contract");
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_when_contract_identity_and_type_are_all_corrupted(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, true, |command| {
+        command.command_type = harness_workflow::runtime::WorkflowCommandType::MarkBlocked;
+        command
+            .command
+            .as_object_mut()
+            .expect("contract command payload")
+            .remove("agent_contract");
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_when_contract_command_type_is_substituted() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, false, |command| {
+        command.command_type = harness_workflow::runtime::WorkflowCommandType::MarkBlocked;
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_incomplete_contract_envelope_before_disabled_policy(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, false, false, |command| {
+        command
+            .command
+            .as_object_mut()
+            .expect("contract command payload")
+            .remove("prompt");
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_semantic_input_substituted_after_pinning() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, false, |command| {
+        command.command["agent_contract_input"]["facts"]["scope"] = serde_json::json!("large");
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
 
 #[tokio::test]
 async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result<()> {

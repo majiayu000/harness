@@ -4,28 +4,65 @@ use crate::http::AppState;
 use harness_core::config::workflow::agent_contract_output_schema_document;
 use harness_workflow::runtime::{ActivityErrorKind, ActivityResult, RuntimeJob};
 use std::sync::Arc;
+use std::{error::Error, fmt};
 
-use super::agent_contract_attempt::{
-    contract_attempt_activity_result, execute_agent_contract_attempt,
-};
 use super::agent_contract_enforcement::{
     ensure_backend_can_enforce_contract, PinnedJobAgentContract,
 };
+use super::agent_contract_execution::execute_contract_attempts;
 use super::data_helpers::activity_name;
-use super::runtime_profile::{agent_name_for_runtime_kind, runtime_profile_for_job};
+use super::runtime_profile::{agent_backend_for_runtime_kind, runtime_profile_for_job};
 
-/// Executes a contract-carrying runtime job end to end: capability preflight,
-/// pinned launch, observation, and verdict validation.
+#[derive(Debug)]
+pub(super) struct AgentContractExecutionError {
+    source: anyhow::Error,
+}
+
+impl AgentContractExecutionError {
+    pub(super) fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+}
+
+impl fmt::Display for AgentContractExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for AgentContractExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.source()
+    }
+}
+
+pub(super) fn pinned_agent_contract_for_execution(
+    job: &RuntimeJob,
+) -> anyhow::Result<Option<PinnedJobAgentContract>> {
+    super::agent_contract_enforcement::pinned_agent_contract_for_job(job)
+        .map_err(|error| AgentContractExecutionError::new(error).into())
+}
+
 pub(super) async fn execute_contract_job(
     state: &Arc<AppState>,
     job: &RuntimeJob,
     pinned: PinnedJobAgentContract,
+    lease_lost: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<ActivityResult> {
+    execute_contract_job_inner(state, job, pinned, lease_lost)
+        .await
+        .map_err(|error| AgentContractExecutionError::new(error).into())
+}
+
+async fn execute_contract_job_inner(
+    state: &Arc<AppState>,
+    job: &RuntimeJob,
+    pinned: PinnedJobAgentContract,
+    lease_lost: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ActivityResult> {
     let activity = activity_name(job);
-    let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
-    let Some(backend) = state.core.server.agent_registry.get(agent_name) else {
-        anyhow::bail!("runtime agent `{agent_name}` is not registered");
-    };
+    let backend =
+        agent_backend_for_runtime_kind(&state.core.server.agent_registry, job.runtime_kind)?;
     if let Err(error) = ensure_backend_can_enforce_contract(backend.as_ref()) {
         return Ok(contract_preflight_failure(
             job,
@@ -51,17 +88,19 @@ pub(super) async fn execute_contract_job(
             "the pinned runtime profile has no positive timeout_secs",
         ));
     };
-    let attempt = execute_agent_contract_attempt(
+    execute_contract_attempts(
+        state,
+        job,
         backend,
         &pinned,
+        &activity,
         profile.model.clone(),
         profile.reasoning_effort.clone(),
         timeout_secs,
+        profile.max_turns,
+        lease_lost,
     )
-    .await?;
-    Ok(contract_attempt_activity_result(
-        &activity, &pinned, &attempt,
-    ))
+    .await
 }
 
 fn contract_preflight_failure(job: &RuntimeJob, activity: &str, reason: &str) -> ActivityResult {
@@ -86,21 +125,29 @@ mod tests {
     use harness_core::agent::{
         AgentBackend, AgentRequest, StreamItem, AGENT_OUTPUT_SCHEMA_PATH_ENV,
     };
+    use harness_core::config::workflow::{
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+    };
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
     /// Contract-conforming scripted backend: claims every enforcement capability,
     /// records the launch request and workspace state, and replays a script.
     struct ContractStreamAgent {
-        script: Mutex<Vec<harness_core::agent::AgentEvent>>,
+        scripts: Mutex<std::collections::VecDeque<Vec<harness_core::agent::AgentEvent>>>,
         requests: Mutex<Vec<AgentRequest>>,
         workspace_entry_counts: Mutex<Vec<usize>>,
     }
 
     impl ContractStreamAgent {
         fn new(script: Vec<harness_core::agent::AgentEvent>) -> Arc<Self> {
+            Self::with_scripts(vec![script])
+        }
+
+        fn with_scripts(scripts: Vec<Vec<harness_core::agent::AgentEvent>>) -> Arc<Self> {
             Arc::new(Self {
-                script: Mutex::new(script),
+                scripts: Mutex::new(scripts.into()),
                 requests: Mutex::new(Vec::new()),
                 workspace_entry_counts: Mutex::new(Vec::new()),
             })
@@ -131,7 +178,7 @@ mod tests {
                 .unwrap_or(usize::MAX);
             self.workspace_entry_counts.lock().await.push(entries);
             self.requests.lock().await.push(req);
-            let script = std::mem::take(&mut *self.script.lock().await);
+            let script = self.scripts.lock().await.pop_front().unwrap_or_default();
             for event in script {
                 tx.send(event).await.map_err(|error| {
                     harness_core::error::HarnessError::AgentExecution(error.to_string())
@@ -169,33 +216,91 @@ mod tests {
         }
     }
 
-    fn contract_command_payload() -> serde_json::Value {
-        let contract: harness_core::config::workflow::WorkflowAgentContract =
-            serde_json::from_value(serde_json::json!({
-                "input_schema": "harness.semantic_activity_input.v1",
-                "output_schema": "harness.semantic_verdict.v1",
-                "allowed_outcomes": ["small", "large"],
-                "tools": "none",
-                "mutation": "forbidden",
-                "workspace": "ephemeral_empty",
-                "fresh_context": true,
-            }))
-            .expect("contract fixture should deserialize");
-        let contract = serde_json::to_value(contract).expect("contract fixture should serialize");
-        let contract_hash = harness_workflow::runtime::stable_remote_fact_hash(&contract);
-        serde_json::json!({
-            "activity": "classify_scope",
-            "agent_contract": contract,
-            "prompt": "Classify only the supplied facts.",
-            "agent_contract_input": {
-                "schema": "harness.semantic_activity_input.v1",
-                "subject": {"kind": "issue", "identity": "owner/repo#126"},
-                "facts": {"changed_files": ["src/lib.rs"]},
-                "provenance": {"/changed_files": "server"},
-                "contract_hash": contract_hash,
-            },
-            "definition_hash": "sha256:pinned",
-        })
+    fn contract_definition(
+        activity: &str,
+    ) -> anyhow::Result<harness_workflow::runtime::DeclarativeWorkflowDefinition> {
+        let contract = serde_json::from_value(serde_json::json!({
+            "input_schema": "harness.semantic_activity_input.v1",
+            "output_schema": "harness.semantic_verdict.v1",
+            "allowed_outcomes": ["small", "large"],
+            "tools": "none",
+            "mutation": "forbidden",
+            "workspace": "ephemeral_empty",
+            "fresh_context": true,
+        }))?;
+        let policy = WorkflowDefinitionPolicy {
+            id: format!("contract_test_{activity}"),
+            initial: "classifying".to_string(),
+            states: BTreeMap::from([
+                (
+                    "classifying".to_string(),
+                    DeclaredState {
+                        activity: Some(activity.to_string()),
+                        on_failure: Some("blocked".to_string()),
+                        on_signal: BTreeMap::from([
+                            ("small".to_string(), "done".to_string()),
+                            ("large".to_string(), "blocked".to_string()),
+                        ]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "blocked".to_string(),
+                    DeclaredState {
+                        progress: Some(DeclaredProgressMode::OperatorGate),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            terminal: BTreeMap::from([
+                ("done".to_string(), "succeeded".to_string()),
+                ("failed".to_string(), "failed".to_string()),
+                ("cancelled".to_string(), "cancelled".to_string()),
+            ]),
+            evidence_required: BTreeMap::new(),
+            recovery_targets: vec!["classifying".to_string()],
+            intake: None,
+        };
+        harness_workflow::runtime::build_declarative_definition(
+            &policy,
+            &BTreeMap::from([(
+                activity.to_string(),
+                WorkflowActivityPolicy {
+                    prompt: Some("Classify only the supplied facts.".to_string()),
+                    agent_contract: Some(contract),
+                    ..Default::default()
+                },
+            )]),
+        )
+    }
+
+    async fn make_contract_test_state(
+        config_root: &std::path::Path,
+        project_root: &std::path::Path,
+        agent_registry: harness_agents::registry::AgentRegistry,
+        activity: &str,
+    ) -> anyhow::Result<Arc<crate::http::AppState>> {
+        let mut state = crate::test_helpers::make_test_state_with_project_root_and_registry(
+            config_root,
+            project_root,
+            agent_registry,
+        )
+        .await?;
+        let definition = contract_definition(activity)?;
+        let mut definition_registry =
+            harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins();
+        definition_registry.register_declarative_current(definition)?;
+        let store_path =
+            harness_core::config::dirs::default_db_path(config_root, "workflow_runtime");
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store = harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+            &store_path,
+            Some(&database_url),
+        )
+        .await?
+        .with_definition_registry(definition_registry.into_shared());
+        state.core.workflow_runtime_store = Some(Arc::new(store));
+        Ok(Arc::new(state))
     }
 
     fn valid_verdict_reply() -> String {
@@ -211,11 +316,13 @@ mod tests {
     async fn enqueue_contract_job(
         store: &harness_workflow::runtime::WorkflowRuntimeStore,
         project_root: &std::path::Path,
+        activity: &str,
     ) -> anyhow::Result<harness_workflow::runtime::RuntimeJob> {
+        let definition = contract_definition(activity)?;
         let workflow = harness_workflow::runtime::WorkflowInstance::new(
-            "github_issue_pr",
-            1,
-            "implementing",
+            definition.policy().id.clone(),
+            definition.definition_version(),
+            definition.policy().initial.clone(),
             harness_workflow::runtime::WorkflowSubject::new("issue", "issue:126"),
         )
         .with_id("issue-126")
@@ -224,23 +331,33 @@ mod tests {
                 "project_id": project_root,
                 "repo": "owner/repo",
                 "issue_number": 126,
+                "changed_files": ["src/lib.rs"],
+                "definition_hash": definition.definition_hash(),
             }),
             harness_workflow::runtime::DataProvenance::Server,
         );
+        store
+            .persist_definition_version(
+                &harness_workflow::runtime::persisted_declarative_definition(&definition, None),
+            )
+            .await?;
         crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
             .await?;
-        let command_payload = contract_command_payload();
-        let command = harness_workflow::runtime::WorkflowCommand::new(
-            harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
-            "classify-126",
-            command_payload.clone(),
-        );
+        let command = harness_workflow::runtime::build_declarative_submission_decision(
+            &definition,
+            &workflow,
+        )?
+        .commands
+        .into_iter()
+        .next()
+        .expect("contract submission must enqueue its initial activity");
         let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
         let mut runtime_profile = harness_workflow::runtime::RuntimeProfile::new(
             "codex-default",
             harness_workflow::runtime::RuntimeKind::CodexExec,
         );
         runtime_profile.timeout_secs = Some(30);
+        runtime_profile.max_turns = Some(2);
         store
             .enqueue_runtime_job(
                 &command_id,
@@ -251,18 +368,14 @@ mod tests {
                     "command_id": command_id,
                     "command_type": command.command_type,
                     "dedupe_key": command.dedupe_key,
-                    "command": command_payload,
-                    "activity": "classify_scope",
+                    "command": command.command,
+                    "activity": activity,
                     "runtime_profile": runtime_profile,
                 }),
             )
             .await
     }
 
-    /// A contract job on a backend that claims no enforcement capabilities must
-    /// fail explicitly at preflight without spawning any agent process. The
-    /// dispatcher barrier that normally holds such commands must not be the only
-    /// line of defense.
     #[tokio::test]
     async fn contract_job_on_unclaiming_backend_fails_without_spawning() -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
@@ -276,20 +389,14 @@ mod tests {
         let agent = UnclaimingStreamAgent::new();
         let mut registry = harness_agents::registry::AgentRegistry::new("codex");
         registry.register("codex", agent.clone());
-        let state = Arc::new(
-            crate::test_helpers::make_test_state_with_project_root_and_registry(
-                dir.path(),
-                &project_root,
-                registry,
-            )
-            .await?,
-        );
+        let state =
+            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope").await?;
         let store = state
             .core
             .workflow_runtime_store
             .as_ref()
             .expect("workflow runtime store should be configured");
-        let runtime_job = enqueue_contract_job(store, &project_root).await?;
+        let runtime_job = enqueue_contract_job(store, &project_root, "classify_scope").await?;
 
         let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
             &state,
@@ -322,12 +429,9 @@ mod tests {
         Ok(())
     }
 
-    /// A contract job on a conforming backend executes the real attempt: pinned
-    /// pinned prompt and input only, deny-all launch, empty ephemeral workspace outside the
-    /// repository, pinned schema document handed to the backend, and a structured
-    /// verdict recorded on the succeeded result.
     #[tokio::test]
-    async fn contract_job_executes_pinned_attempt_on_conforming_backend() -> anyhow::Result<()> {
+    async fn contract_job_named_like_server_activity_still_executes_pinned_contract(
+    ) -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
         }
@@ -341,20 +445,24 @@ mod tests {
             }]);
         let mut registry = harness_agents::registry::AgentRegistry::new("codex");
         registry.register("codex", agent.clone());
-        let state = Arc::new(
-            crate::test_helpers::make_test_state_with_project_root_and_registry(
-                dir.path(),
-                &project_root,
-                registry,
-            )
-            .await?,
-        );
+        let state = make_contract_test_state(
+            dir.path(),
+            &project_root,
+            registry,
+            harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+        )
+        .await?;
         let store = state
             .core
             .workflow_runtime_store
             .as_ref()
             .expect("workflow runtime store should be configured");
-        let runtime_job = enqueue_contract_job(store, &project_root).await?;
+        let runtime_job = enqueue_contract_job(
+            store,
+            &project_root,
+            harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+        )
+        .await?;
 
         let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
             &state,
@@ -375,9 +483,10 @@ mod tests {
         let requests = agent.requests.lock().await;
         assert_eq!(requests.len(), 1, "exactly one attempt launch");
         let request = &requests[0];
-        let payload = contract_command_payload();
+        let payload = &runtime_job.input["command"];
         let expected_prompt = format!(
-            "Classify only the supplied facts.\n\nAgent contract input (JSON):\n{}",
+            "{}\n\nAgent contract input (JSON):\n{}",
+            payload["prompt"].as_str().expect("pinned prompt"),
             serde_json::to_string_pretty(&payload["agent_contract_input"])?
         );
         assert_eq!(request.prompt, expected_prompt);
@@ -422,6 +531,19 @@ mod tests {
             .find(|artifact| artifact.artifact_type == "agent_contract_verdict")
             .expect("verdict artifact attached");
         assert_eq!(verdict.artifact["outcome"], "small");
+        let assessment = output
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "agent_contract_assessment")
+            .expect("server assessment attached");
+        assert_eq!(
+            assessment.artifact["assessment_id"],
+            format!("{}:agent-contract-assessment", runtime_job.id)
+        );
+        assert_eq!(assessment.artifact["command_id"], runtime_job.command_id);
+        assert_eq!(assessment.artifact["outcome"], "small");
+        assert_eq!(assessment.artifact["budget"]["primary_attempts_used"], 1);
+        assert_eq!(assessment.artifact["budget"]["corrections_used"], 0);
         assert!(
             output.artifacts.iter().any(|artifact| {
                 artifact.artifact_type
@@ -429,6 +551,85 @@ mod tests {
             }),
             "the server-observed attempt record is attached"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_verdict_consumes_durable_correction_then_assesses_success(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+        let agent = ContractStreamAgent::with_scripts(vec![
+            vec![harness_core::agent::AgentEvent::TurnCompleted {
+                output: "not valid JSON".to_string(),
+            }],
+            vec![harness_core::agent::AgentEvent::TurnCompleted {
+                output: valid_verdict_reply(),
+            }],
+        ]);
+        let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+        registry.register("codex", agent.clone());
+        let state =
+            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope").await?;
+        let store = state
+            .core
+            .workflow_runtime_store
+            .as_ref()
+            .expect("workflow runtime store should be configured");
+        let runtime_job = enqueue_contract_job(store, &project_root, "classify_scope").await?;
+
+        let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+            &state,
+            "worker-test",
+            chrono::Duration::minutes(5),
+        )
+        .await?;
+
+        assert_eq!(
+            tick.succeeded, 1,
+            "a valid bounded correction should succeed"
+        );
+        let requests = agent.requests.lock().await;
+        assert_eq!(requests.len(), 2, "one primary plus one correction");
+        assert!(requests[1].prompt.contains("not valid JSON"));
+        assert!(requests[1].prompt.contains("failed server validation"));
+        drop(requests);
+        let events = store.runtime_events_for(&runtime_job.id).await?;
+        let reservations = events
+            .iter()
+            .filter(|event| event.event_type == "AgentContractAttemptStarted")
+            .collect::<Vec<_>>();
+        assert_eq!(reservations.len(), 2);
+        assert_eq!(reservations[0].event["primary_attempt"], 1);
+        assert_eq!(reservations[0].event["correction_attempt"], 0);
+        assert_eq!(reservations[1].event["primary_attempt"], 1);
+        assert_eq!(reservations[1].event["correction_attempt"], 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "RuntimeTurnStarted")
+                .count(),
+            2,
+            "each model invocation must consume one workflow runtime turn"
+        );
+        let completed = store
+            .get_runtime_job(&runtime_job.id)
+            .await?
+            .expect("runtime job should exist");
+        let output: harness_workflow::runtime::ActivityResult =
+            serde_json::from_value(completed.output.expect("successful job carries output"))?;
+        let assessment = output
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "agent_contract_assessment")
+            .expect("server assessment attached");
+        assert_eq!(assessment.artifact["budget"]["primary_attempts_used"], 1);
+        assert_eq!(assessment.artifact["budget"]["corrections_used"], 1);
         Ok(())
     }
 
@@ -458,20 +659,14 @@ mod tests {
         ]);
         let mut registry = harness_agents::registry::AgentRegistry::new("codex");
         registry.register("codex", agent.clone());
-        let state = Arc::new(
-            crate::test_helpers::make_test_state_with_project_root_and_registry(
-                dir.path(),
-                &project_root,
-                registry,
-            )
-            .await?,
-        );
+        let state =
+            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope").await?;
         let store = state
             .core
             .workflow_runtime_store
             .as_ref()
             .expect("workflow runtime store should be configured");
-        let runtime_job = enqueue_contract_job(store, &project_root).await?;
+        let runtime_job = enqueue_contract_job(store, &project_root, "classify_scope").await?;
 
         let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
             &state,
@@ -564,6 +759,8 @@ mod dogfood_tests {
             Some("gpt-5.6-sol".to_string()),
             Some("high".to_string()),
             300,
+            None,
+            None,
         )
         .await?;
 
