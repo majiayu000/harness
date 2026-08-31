@@ -135,6 +135,7 @@ fn parent_pr_inspection_tracks_and_resets_feedback_repair_progress() -> anyhow::
 
     assert_eq!(instance.data["feedback_repair_round"], 1);
     assert_eq!(instance.data["feedback_repair_blocker_count"], 2);
+    assert_eq!(instance.data["feedback_repair_lane"], "remote_feedback");
 
     let pending_decision = WorkflowDecision::new(
         &instance.id,
@@ -166,6 +167,7 @@ fn parent_pr_inspection_tracks_and_resets_feedback_repair_progress() -> anyhow::
 
     assert_eq!(instance.data["feedback_repair_round"], 1);
     assert_eq!(instance.data["feedback_repair_blocker_count"], 2);
+    assert_eq!(instance.data["feedback_repair_lane"], "remote_feedback");
 
     let converged_event = WorkflowEvent::new(&instance.id, 3, "RuntimeJobCompleted", "runtime-3")
         .with_payload(json!({
@@ -190,6 +192,7 @@ fn parent_pr_inspection_tracks_and_resets_feedback_repair_progress() -> anyhow::
 
     assert!(instance.data.get("feedback_repair_round").is_none());
     assert!(instance.data.get("feedback_repair_blocker_count").is_none());
+    assert!(instance.data.get("feedback_repair_lane").is_none());
     Ok(())
 }
 
@@ -320,6 +323,7 @@ fn local_review_repair_advances_feedback_repair_progress() -> anyhow::Result<()>
 
     assert_eq!(instance.data["feedback_repair_round"], 2);
     assert_eq!(instance.data["feedback_repair_blocker_count"], 1);
+    assert_eq!(instance.data["feedback_repair_lane"], "local_review");
     Ok(())
 }
 
@@ -451,6 +455,7 @@ fn snapshotless_first_feedback_sweep_records_an_unmeasured_round() -> anyhow::Re
 
     assert_eq!(instance.data["feedback_repair_round"], 1);
     assert!(instance.data.get("feedback_repair_blocker_count").is_none());
+    assert_eq!(instance.data["feedback_repair_lane"], "remote_feedback");
     Ok(())
 }
 
@@ -488,6 +493,7 @@ fn snapshotless_feedback_sweep_persists_a_measured_signal_baseline() -> anyhow::
 
     assert_eq!(instance.data["feedback_repair_round"], 1);
     assert_eq!(instance.data["feedback_repair_blocker_count"], 2);
+    assert_eq!(instance.data["feedback_repair_lane"], "remote_feedback");
     Ok(())
 }
 

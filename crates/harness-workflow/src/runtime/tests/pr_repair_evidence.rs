@@ -168,6 +168,7 @@ fn repeated_feedback_without_fewer_blockers_stops_repair_oscillation() {
         "task_id": "runtime-task-1",
         "feedback_repair_round": 1,
         "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "remote_feedback",
     }));
     let event = event_for_result(blocking_feedback_result(2));
 
@@ -185,6 +186,26 @@ fn repeated_feedback_without_fewer_blockers_stops_repair_oscillation() {
 }
 
 #[test]
+fn blocker_count_from_local_review_does_not_block_remote_feedback_repair() {
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "runtime-task-1",
+        "feedback_repair_round": 1,
+        "feedback_repair_blocker_count": 1,
+        "feedback_repair_lane": "local_review",
+    }));
+    let event = event_for_result(blocking_feedback_result(1));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("a different blocker lane should allow the next repair round");
+
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+}
+
+#[test]
 fn fewer_feedback_blockers_allows_the_next_repair_round() {
     let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
@@ -192,6 +213,7 @@ fn fewer_feedback_blockers_allows_the_next_repair_round() {
         "task_id": "runtime-task-1",
         "feedback_repair_round": 1,
         "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "remote_feedback",
     }));
     let event = event_for_result(blocking_feedback_result(1));
 
@@ -261,6 +283,7 @@ fn feedback_repair_round_limit_stops_even_when_blockers_decrease() {
         "task_id": "runtime-task-1",
         "feedback_repair_round": 3,
         "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "local_review",
     }));
     let event = event_for_result(blocking_feedback_result(1));
 
@@ -404,6 +427,8 @@ fn structured_address_decision_cannot_bypass_feedback_convergence() {
         "task_id": "runtime-task-1",
         "feedback_repair_round": 1,
         "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "remote_feedback",
+        "feedback_repair_lane": "remote_feedback",
     }));
     let proposed_decision = build_pr_feedback_decision(
         &instance,
@@ -438,6 +463,7 @@ fn structured_only_address_decision_cannot_bypass_feedback_convergence() {
         "task_id": "runtime-task-1",
         "feedback_repair_round": 1,
         "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "remote_feedback",
     }));
     let proposed_decision = build_pr_feedback_decision(
         &instance,

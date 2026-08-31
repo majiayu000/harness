@@ -15,6 +15,21 @@ pub const LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL: &str = "LocalReviewChangesReque
 pub const LOCAL_REVIEW_BLOCKED_SIGNAL: &str = "LocalReviewBlocked";
 pub const MAX_FEEDBACK_REPAIR_ROUNDS: u64 = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackRepairLane {
+    LocalReview,
+    RemoteFeedback,
+}
+
+impl FeedbackRepairLane {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalReview => "local_review",
+            Self::RemoteFeedback => "remote_feedback",
+        }
+    }
+}
+
 pub(super) fn server_pr_snapshot_matches_instance(
     instance: &WorkflowInstance,
     snapshot: &Value,
@@ -70,6 +85,7 @@ pub enum FeedbackRepairStop {
 pub fn next_feedback_repair_round(
     data: &Value,
     current_blockers: u64,
+    lane: FeedbackRepairLane,
 ) -> Result<u64, FeedbackRepairStop> {
     let completed_rounds = data
         .get("feedback_repair_round")
@@ -84,12 +100,15 @@ pub fn next_feedback_repair_round(
     if completed_rounds > 0 && previous.is_none() {
         return Err(FeedbackRepairStop::MissingBaseline { completed_rounds });
     }
-    if let Some(previous) = previous {
-        if current_blockers >= previous {
-            return Err(FeedbackRepairStop::NoProgress {
-                previous,
-                current: current_blockers,
-            });
+    let previous_lane = data.get("feedback_repair_lane").and_then(Value::as_str);
+    if previous_lane == Some(lane.as_str()) {
+        if let Some(previous) = previous {
+            if current_blockers >= previous {
+                return Err(FeedbackRepairStop::NoProgress {
+                    previous,
+                    current: current_blockers,
+                });
+            }
         }
     }
     Ok(completed_rounds.saturating_add(1))

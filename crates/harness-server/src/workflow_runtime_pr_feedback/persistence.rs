@@ -235,6 +235,10 @@ pub(super) async fn persist_pr_hygiene_repair_request(
         object.insert("feedback_summary".to_string(), json!(summary));
         object.insert("feedback_repair_round".to_string(), json!(next_round));
         object.insert("feedback_repair_blocker_count".to_string(), json!(1));
+        object.insert(
+            "feedback_repair_lane".to_string(),
+            json!(FeedbackRepairLane::RemoteFeedback.as_str()),
+        );
     }
     let repair_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let output = build_pr_hygiene_repair_decision(

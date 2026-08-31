@@ -230,6 +230,7 @@ fn local_review_same_blocker_count_stops_feedback_repair_oscillation() {
         "pr_url": "https://github.com/owner/repo/pull/77",
         "feedback_repair_round": 1,
         "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "local_review",
     }));
     let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Two blockers remain.")
         .with_signal(ActivitySignal::new(
@@ -257,6 +258,7 @@ fn local_review_lower_blocker_count_allows_feedback_repair() {
         "pr_url": "https://github.com/owner/repo/pull/77",
         "feedback_repair_round": 1,
         "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "local_review",
     }));
     let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "One blocker remains.")
         .with_signal(ActivitySignal::new(
@@ -284,6 +286,7 @@ fn local_review_missing_blocker_count_stops_when_repair_history_exists() {
         "pr_url": "https://github.com/owner/repo/pull/77",
         "feedback_repair_round": 1,
         "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "local_review",
     }));
     let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Blockers remain.").with_signal(
         ActivitySignal::new(
@@ -311,6 +314,7 @@ fn structured_local_review_decision_cannot_bypass_feedback_convergence() {
         "pr_url": "https://github.com/owner/repo/pull/77",
         "feedback_repair_round": 1,
         "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "local_review",
     }));
     let proposed_decision = build_local_review_completed_decision(
         &instance,

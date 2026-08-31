@@ -13,7 +13,11 @@ pub(super) async fn evaluate_hygiene_repair_convergence(
     ctx: &PrHygieneRepairRuntimeContext<'_>,
 ) -> anyhow::Result<HygieneRepairConvergence> {
     let current_blockers = 1;
-    let stop = match next_feedback_repair_round(&instance.data, current_blockers) {
+    let stop = match next_feedback_repair_round(
+        &instance.data,
+        current_blockers,
+        FeedbackRepairLane::RemoteFeedback,
+    ) {
         Ok(next_round) => return Ok(HygieneRepairConvergence::Continue { next_round }),
         Err(stop) => stop,
     };

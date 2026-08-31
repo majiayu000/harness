@@ -9,8 +9,8 @@ use crate::runtime::model::{
 };
 use crate::runtime::pr_feedback::{
     build_local_review_completed_decision, build_pr_feedback_decision, next_feedback_repair_round,
-    FeedbackRepairStop, LocalReviewCompletedInput, LocalReviewOutcome, PrFeedbackDecisionInput,
-    PrFeedbackOutcome, LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL,
+    FeedbackRepairLane, FeedbackRepairStop, LocalReviewCompletedInput, LocalReviewOutcome,
+    PrFeedbackDecisionInput, PrFeedbackOutcome, LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL,
     LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL, MAX_FEEDBACK_REPAIR_ROUNDS,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT,
     SERVER_PR_SNAPSHOT_ARTIFACT,
@@ -41,6 +41,7 @@ pub(super) fn pr_feedback_sweep_decision_from_activity_result(
             event,
             result,
             result_signal_u64(result, "actionable_blocker_count"),
+            FeedbackRepairLane::RemoteFeedback,
         ) {
             return Some(decision);
         }
@@ -77,6 +78,7 @@ fn feedback_repair_convergence_blocked_decision(
     event: &WorkflowEvent,
     result: &ActivityResult,
     current_blockers: Option<u64>,
+    lane: FeedbackRepairLane,
 ) -> Option<WorkflowDecision> {
     let completed_rounds = instance
         .data
@@ -99,8 +101,8 @@ fn feedback_repair_convergence_blocked_decision(
             "PR feedback repair progress cannot be measured because the server-owned blocker count is missing; automatic repair is stopped.",
         ));
     };
-    let (decision_name, reason) = match next_feedback_repair_round(&instance.data, current_blockers)
-    {
+    let (decision_name, reason) =
+        match next_feedback_repair_round(&instance.data, current_blockers, lane) {
         Ok(_) => return None,
         Err(FeedbackRepairStop::RoundLimit { .. }) => (
             "block_feedback_repair_round_limit",
@@ -232,6 +234,7 @@ pub(super) fn local_review_decision_from_activity_result(
             event,
             result,
             result_signal_u64(result, "actionable_blocker_count"),
+            FeedbackRepairLane::LocalReview,
         ) {
             return Some(decision);
         }

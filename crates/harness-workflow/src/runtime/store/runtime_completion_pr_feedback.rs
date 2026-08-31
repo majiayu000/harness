@@ -1,8 +1,8 @@
 use crate::runtime::model::{WorkflowDecision, WorkflowEvent, WorkflowInstance};
 use crate::runtime::{
-    next_feedback_repair_round, DataProvenance, WorkflowDataWrite, GITHUB_ISSUE_PR_DEFINITION_ID,
-    LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, PR_FEEDBACK_DEFINITION_ID,
-    PR_FEEDBACK_INSPECT_ACTIVITY, SERVER_PR_SNAPSHOT_ARTIFACT,
+    next_feedback_repair_round, DataProvenance, FeedbackRepairLane, WorkflowDataWrite,
+    GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde_json::{json, Value};
 
@@ -14,10 +14,14 @@ pub(super) fn apply_pr_feedback_completion_data_side_effect(
     if local_review_requests_repair(instance, decision) {
         let blocker_count = local_review_blocker_count(event);
         let next_round = match blocker_count {
-            Some(blocker_count) => next_feedback_repair_round(&instance.data, blocker_count)
-                .map_err(|stop| {
-                    anyhow::anyhow!("local review repair progress was rejected: {stop:?}")
-                })?,
+            Some(blocker_count) => next_feedback_repair_round(
+                &instance.data,
+                blocker_count,
+                FeedbackRepairLane::LocalReview,
+            )
+            .map_err(|stop| {
+                anyhow::anyhow!("local review repair progress was rejected: {stop:?}")
+            })?,
             None => {
                 let completed_rounds = instance
                     .data
@@ -33,11 +37,18 @@ pub(super) fn apply_pr_feedback_completion_data_side_effect(
             }
         };
         ensure_object_data(instance);
-        let mut writes = vec![WorkflowDataWrite::set(
-            "feedback_repair_round",
-            json!(next_round),
-            DataProvenance::Server,
-        )];
+        let mut writes = vec![
+            WorkflowDataWrite::set(
+                "feedback_repair_round",
+                json!(next_round),
+                DataProvenance::Server,
+            ),
+            WorkflowDataWrite::set(
+                "feedback_repair_lane",
+                json!(FeedbackRepairLane::LocalReview.as_str()),
+                DataProvenance::Server,
+            ),
+        ];
         if let Some(blocker_count) = blocker_count {
             writes.push(WorkflowDataWrite::set(
                 "feedback_repair_blocker_count",
@@ -138,11 +149,12 @@ fn apply_snapshotless_parent_repair_progress(
 ) -> anyhow::Result<()> {
     let blocker_count = pr_feedback_signal_blocker_count(event);
     let next_round = match blocker_count {
-        Some(blocker_count) => {
-            next_feedback_repair_round(&instance.data, blocker_count).map_err(|stop| {
-                anyhow::anyhow!("PR feedback repair progress was rejected: {stop:?}")
-            })?
-        }
+        Some(blocker_count) => next_feedback_repair_round(
+            &instance.data,
+            blocker_count,
+            FeedbackRepairLane::RemoteFeedback,
+        )
+        .map_err(|stop| anyhow::anyhow!("PR feedback repair progress was rejected: {stop:?}"))?,
         None => {
             let completed_rounds = instance
                 .data
@@ -158,11 +170,18 @@ fn apply_snapshotless_parent_repair_progress(
         }
     };
     ensure_object_data(instance);
-    let mut writes = vec![WorkflowDataWrite::set(
-        "feedback_repair_round",
-        json!(next_round),
-        DataProvenance::Server,
-    )];
+    let mut writes = vec![
+        WorkflowDataWrite::set(
+            "feedback_repair_round",
+            json!(next_round),
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
+            "feedback_repair_lane",
+            json!(FeedbackRepairLane::RemoteFeedback.as_str()),
+            DataProvenance::Server,
+        ),
+    ];
     if let Some(blocker_count) = blocker_count {
         writes.push(WorkflowDataWrite::set(
             "feedback_repair_blocker_count",
@@ -206,10 +225,12 @@ fn apply_parent_inspection_progress(
                     "server-owned PR feedback snapshot is missing actionable_blocker_count"
                 )
             })?;
-        let next_round =
-            next_feedback_repair_round(&instance.data, blocker_count).map_err(|stop| {
-                anyhow::anyhow!("PR feedback repair progress was rejected: {stop:?}")
-            })?;
+        let next_round = next_feedback_repair_round(
+            &instance.data,
+            blocker_count,
+            FeedbackRepairLane::RemoteFeedback,
+        )
+        .map_err(|stop| anyhow::anyhow!("PR feedback repair progress was rejected: {stop:?}"))?;
         writes.push(WorkflowDataWrite::set(
             "feedback_repair_round",
             json!(next_round),
@@ -218,6 +239,11 @@ fn apply_parent_inspection_progress(
         writes.push(WorkflowDataWrite::set(
             "feedback_repair_blocker_count",
             json!(blocker_count),
+            DataProvenance::Server,
+        ));
+        writes.push(WorkflowDataWrite::set(
+            "feedback_repair_lane",
+            json!(FeedbackRepairLane::RemoteFeedback.as_str()),
             DataProvenance::Server,
         ));
     } else if decision.next_state == "quality_gate_pending"
@@ -237,6 +263,10 @@ fn apply_parent_inspection_progress(
         ));
         writes.push(WorkflowDataWrite::remove(
             "feedback_repair_blocker_count",
+            DataProvenance::Server,
+        ));
+        writes.push(WorkflowDataWrite::remove(
+            "feedback_repair_lane",
             DataProvenance::Server,
         ));
     }
