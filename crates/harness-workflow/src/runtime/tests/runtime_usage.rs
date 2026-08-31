@@ -154,6 +154,33 @@ async fn runtime_usage_for_workflow_aggregates_distinct_turns() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn runtime_usage_for_workflow_preserves_reported_total_when_components_are_higher(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let usage = runtime_usage_upsert(RuntimeUsageMetrics {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 3,
+        cache_creation_input_tokens: 2,
+        reported_total_tokens: Some(12),
+    });
+
+    store.upsert_runtime_usage(&usage).await?;
+    let usage = store
+        .runtime_usage_for_workflow("workflow-1")
+        .await?
+        .expect("workflow usage should exist");
+
+    assert_eq!(usage.metrics.total_tokens(), 12);
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_agent_telemetry_for_workflow_returns_outcome_and_agent_usage() -> anyhow::Result<()>
 {
     if resolve_database_url(None).is_err() {

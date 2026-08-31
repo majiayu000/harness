@@ -21,9 +21,13 @@ impl UsageMetrics {
     }
 
     pub fn total_tokens(&self) -> u64 {
-        self.reported_total_tokens
-            .unwrap_or(0)
-            .max(self.component_total_tokens())
+        derived_total_tokens(
+            self.reported_total_tokens,
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_input_tokens
+                .saturating_add(self.cache_creation_input_tokens),
+        )
     }
 
     pub fn from_token_usage(usage: &TokenUsage) -> Self {
@@ -57,6 +61,19 @@ impl UsageMetrics {
                 .and_then(Value::as_u64),
         })
     }
+}
+
+pub fn derived_total_tokens(
+    reported_total_tokens: Option<u64>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+) -> u64 {
+    reported_total_tokens.unwrap_or_else(|| {
+        input_tokens
+            .saturating_add(output_tokens)
+            .saturating_add(cached_input_tokens)
+    })
 }
 
 pub fn parse_result_usage_metrics(line: &str) -> Option<UsageMetrics> {
@@ -105,6 +122,14 @@ mod tests {
         let usage = parse_result_usage_metrics(line).expect("usage should parse");
         assert_eq!(usage.reported_total_tokens, Some(20));
         assert_eq!(usage.total_tokens(), 20);
+    }
+
+    #[test]
+    fn preserves_reported_total_when_components_are_higher() {
+        let line = r#"{"type":"result","usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":4,"total_tokens":12}}"#;
+        let usage = parse_result_usage_metrics(line).expect("usage should parse");
+        assert_eq!(usage.reported_total_tokens, Some(12));
+        assert_eq!(usage.total_tokens(), 12);
     }
 
     #[test]
