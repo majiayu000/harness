@@ -10,10 +10,12 @@
 //! launch lives in [`super::agent_contract_attempt`].
 
 use harness_core::agent::{AgentBackend, AgentEvent, ModelIdentitySource};
-use harness_core::config::workflow::WorkflowAgentContract;
+use harness_core::config::workflow::{
+    agent_contract_output_schema_document, WorkflowAgentContract,
+};
 use harness_core::types::Item;
 use harness_workflow::runtime::completion_evidence::ARTIFACT_RUNTIME_TURN_OBSERVATIONS;
-use harness_workflow::runtime::{ActivityArtifact, RuntimeJob};
+use harness_workflow::runtime::{ActivityArtifact, RuntimeJob, WorkflowCommand};
 use serde_json::{json, Value};
 
 /// Pinned agent contract carried by a runtime job's command payload.
@@ -35,32 +37,51 @@ pub(super) fn pinned_agent_contract_for_job(
     job: &RuntimeJob,
 ) -> anyhow::Result<Option<PinnedJobAgentContract>> {
     let command = job.input.get("command");
-    let Some(contract_value) = command.and_then(|command| command.get("agent_contract")) else {
-        return Ok(None);
-    };
-    let contract: WorkflowAgentContract =
-        serde_json::from_value(contract_value.clone()).map_err(|error| {
-            anyhow::anyhow!(
-                "runtime job {} carries an unparseable agent_contract payload: {error}",
-                job.id
-            )
-        })?;
     let activity = job
         .input
         .get("activity")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    extract_pinned_agent_contract(command, activity, &format!("runtime job {}", job.id))
+}
+
+pub(crate) fn validate_pinned_agent_contract_command(
+    command: &WorkflowCommand,
+) -> anyhow::Result<bool> {
+    extract_pinned_agent_contract(
+        Some(&command.command),
+        command.runtime_activity_key(),
+        "workflow command",
+    )
+    .map(|pinned| pinned.is_some())
+}
+
+fn extract_pinned_agent_contract(
+    command: Option<&Value>,
+    activity: &str,
+    context: &str,
+) -> anyhow::Result<Option<PinnedJobAgentContract>> {
+    let Some(contract_value) = command.and_then(|command| command.get("agent_contract")) else {
+        return Ok(None);
+    };
+    let contract: WorkflowAgentContract =
+        serde_json::from_value(contract_value.clone()).map_err(|error| {
+            anyhow::anyhow!("{context} carries an unparseable agent_contract payload: {error}")
+        })?;
     contract.validate(activity)?;
+    if agent_contract_output_schema_document(&contract.output_schema).is_none() {
+        anyhow::bail!(
+            "output schema '{}' has no canonical enforcement document",
+            contract.output_schema
+        );
+    }
     let prompt = command
         .and_then(|command| command.get("prompt"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "runtime job {} carries an agent_contract without its pinned prompt",
-                job.id
-            )
+            anyhow::anyhow!("{context} carries an agent_contract without its pinned prompt")
         })?;
     let definition_hash = command
         .and_then(|command| command.get("definition_hash"))
@@ -69,25 +90,23 @@ pub(super) fn pinned_agent_contract_for_job(
         .filter(|hash| !hash.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "runtime job {} carries an agent_contract without its pinned definition hash",
-                job.id
+                "{context} carries an agent_contract without its pinned definition hash"
             )
         })?;
     let input = command
         .and_then(|command| command.get("agent_contract_input"))
         .cloned()
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "runtime job {} carries an agent_contract without its pinned input envelope",
-                job.id
-            )
+            anyhow::anyhow!("{context} carries an agent_contract without its pinned input envelope")
         })?;
-    Ok(Some(PinnedJobAgentContract {
+    let pinned = PinnedJobAgentContract {
         contract,
         prompt: prompt.to_string(),
         input,
         definition_hash: definition_hash.to_string(),
-    }))
+    };
+    super::agent_contract_prompt::validate_contract_input(&pinned)?;
+    Ok(Some(pinned))
 }
 
 /// Whether the backend instance the registry returned — the same object the
@@ -236,12 +255,17 @@ mod tests {
     }
 
     fn contract_input_value() -> Value {
+        let contract: WorkflowAgentContract =
+            serde_json::from_value(contract_value()).expect("fixture contract");
+        let contract_hash = harness_workflow::runtime::stable_remote_fact_hash(
+            &serde_json::to_value(contract).expect("serialized fixture contract"),
+        );
         json!({
             "schema": "harness.semantic_activity_input.v1",
             "subject": {"kind": "issue", "identity": "owner/repo#126"},
             "facts": {"changed_files": ["src/lib.rs"]},
             "provenance": {"/changed_files": "server"},
-            "contract_hash": "sha256:contract",
+            "contract_hash": contract_hash,
         })
     }
 
@@ -320,6 +344,21 @@ mod tests {
         assert_eq!(pinned.prompt, "Classify only the supplied facts.");
         assert_eq!(pinned.definition_hash, "sha256:abc");
         assert_eq!(pinned.contract.allowed_outcomes, vec!["small", "large"]);
+    }
+
+    #[test]
+    fn mismatched_contract_hash_fails_during_job_extraction() {
+        let mut input = contract_input_value();
+        input["contract_hash"] = json!("sha256:wrong");
+        let job = contract_job(json!({
+            "activity": "classify_scope",
+            "agent_contract": contract_value(),
+            "prompt": "Classify only the supplied facts.",
+            "definition_hash": "sha256:abc",
+            "agent_contract_input": input,
+        }));
+
+        assert!(pinned_agent_contract_for_job(&job).is_err());
     }
 
     #[test]

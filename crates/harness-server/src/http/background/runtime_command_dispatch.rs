@@ -105,36 +105,40 @@ async fn dispatch_runtime_command_with_project_policy(
             .await;
     }
 
-    let has_agent_contract = match validate_pinned_agent_contract_command(&command) {
-        Ok(has_agent_contract) => has_agent_contract,
-        Err(error) => {
-            let reason = format!("invalid pinned agent_contract: {error}");
-            let result = harness_workflow::runtime::ActivityResult::failed(
-                command.command.runtime_activity_key(),
-                "Pinned agent contract failed dispatch validation.",
-                &reason,
-            )
-            .with_error_kind(harness_workflow::runtime::ActivityErrorKind::Fatal);
-            let failed = store
-                .fail_claimed_command_with_completion_if_owned(
-                    &command.id,
-                    harness_workflow::runtime::DispatchClaim {
-                        owner: dispatch_owner,
-                        generation: command.dispatch_claim_generation,
-                    },
-                    &result,
+    let has_agent_contract =
+        match crate::workflow_runtime_worker::validate_pinned_agent_contract_command(
+            &command.command,
+        ) {
+            Ok(has_agent_contract) => has_agent_contract,
+            Err(error) => {
+                let reason = format!("invalid pinned agent_contract: {error}");
+                let result = harness_workflow::runtime::ActivityResult::failed(
+                    command.command.runtime_activity_key(),
+                    "Pinned agent contract failed dispatch validation.",
+                    &reason,
                 )
-                .await?;
-            return Ok(CommandDispatchOutcome::Skipped {
-                command_id: command.id,
-                reason: if failed {
-                    reason
-                } else {
-                    "dispatch claim became stale before invalid agent_contract failure".to_string()
-                },
-            });
-        }
-    };
+                .with_error_kind(harness_workflow::runtime::ActivityErrorKind::Fatal);
+                let failed = store
+                    .fail_claimed_command_with_completion_if_owned(
+                        &command.id,
+                        harness_workflow::runtime::DispatchClaim {
+                            owner: dispatch_owner,
+                            generation: command.dispatch_claim_generation,
+                        },
+                        &result,
+                    )
+                    .await?;
+                return Ok(CommandDispatchOutcome::Skipped {
+                    command_id: command.id,
+                    reason: if failed {
+                        reason
+                    } else {
+                        "dispatch claim became stale before invalid agent_contract failure"
+                            .to_string()
+                    },
+                });
+            }
+        };
 
     let project_root = runtime_command_project_root(store, &command, &state.core.project_root)
         .await
@@ -218,27 +222,6 @@ async fn dispatch_runtime_command_with_project_policy(
         dispatch_gate_fact_hash.as_deref(),
     );
     Ok(outcome)
-}
-
-fn validate_pinned_agent_contract_command(command: &WorkflowCommandRecord) -> anyhow::Result<bool> {
-    let Some(contract_value) = command.command.command.get("agent_contract") else {
-        return Ok(false);
-    };
-    let contract = serde_json::from_value::<harness_core::config::workflow::WorkflowAgentContract>(
-        contract_value.clone(),
-    )?;
-    contract.validate(command.command.runtime_activity_key())?;
-    if harness_core::config::workflow::agent_contract_output_schema_document(
-        &contract.output_schema,
-    )
-    .is_none()
-    {
-        anyhow::bail!(
-            "output schema '{}' has no canonical enforcement document",
-            contract.output_schema
-        );
-    }
-    Ok(true)
 }
 
 fn enforceable_agent_contract_profile(

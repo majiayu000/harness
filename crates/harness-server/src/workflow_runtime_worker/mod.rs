@@ -36,7 +36,9 @@ mod workspace;
 
 pub(crate) use workspace::cleanup_terminal_runtime_workspace_if_uncontended;
 
-pub(crate) use agent_contract_enforcement::ensure_backend_can_enforce_contract;
+pub(crate) use agent_contract_enforcement::{
+    ensure_backend_can_enforce_contract, validate_pinned_agent_contract_command,
+};
 pub(crate) use circuit_breaker_events::emit_circuit_breaker_events;
 pub(crate) use runtime_profile::agent_name_for_runtime_kind;
 pub(crate) use transcript_durability::{

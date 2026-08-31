@@ -32,22 +32,27 @@ struct ContractDispatchResult {
 }
 
 fn pinned_contract_dispatch_command() -> harness_workflow::runtime::WorkflowCommand {
+    let contract: harness_core::config::workflow::WorkflowAgentContract =
+        serde_json::from_value(serde_json::json!({
+            "input_schema": "harness.semantic_activity_input.v1",
+            "output_schema": "harness.semantic_verdict.v1",
+            "allowed_outcomes": ["small", "large"],
+            "tools": "none",
+            "mutation": "forbidden",
+            "workspace": "ephemeral_empty",
+            "fresh_context": true,
+            "max_primary_attempts": 1,
+            "max_corrections": 1
+        }))
+        .expect("valid dispatch contract fixture");
+    let contract_value = serde_json::to_value(&contract).expect("serialized dispatch contract");
+    let contract_hash = harness_workflow::runtime::stable_remote_fact_hash(&contract_value);
     harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
         "contract-dispatch-1",
         serde_json::json!({
             "activity": "classify_scope",
-            "agent_contract": {
-                "input_schema": "harness.semantic_activity_input.v1",
-                "output_schema": "harness.semantic_verdict.v1",
-                "allowed_outcomes": ["small", "large"],
-                "tools": "none",
-                "mutation": "forbidden",
-                "workspace": "ephemeral_empty",
-                "fresh_context": true,
-                "max_primary_attempts": 1,
-                "max_corrections": 1
-            },
+            "agent_contract": contract_value,
             "prompt": "Classify only the supplied facts.",
             "definition_hash": "sha256:pinned",
             "agent_contract_input": {
@@ -55,7 +60,7 @@ fn pinned_contract_dispatch_command() -> harness_workflow::runtime::WorkflowComm
                 "subject": {"kind": "test", "identity": "contract-dispatch"},
                 "facts": {"scope": "small"},
                 "provenance": {"/scope": "server"},
-                "contract_hash": "sha256:pinned-contract"
+                "contract_hash": contract_hash
             }
         }),
     )
@@ -171,6 +176,33 @@ async fn runtime_dispatch_fails_malformed_present_contract_instead_of_deferring(
     }
     let mut command = pinned_contract_dispatch_command();
     command.command["agent_contract"] = serde_json::Value::Null;
+
+    let result = dispatch_contract_with_backend(true, false, command).await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_incomplete_contract_envelope_before_disabled_policy(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let mut command = pinned_contract_dispatch_command();
+    command
+        .command
+        .as_object_mut()
+        .expect("contract command payload")
+        .remove("prompt");
 
     let result = dispatch_contract_with_backend(true, false, command).await?;
 

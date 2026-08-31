@@ -91,8 +91,8 @@ Fresh evidence from this branch:
 |---|---|
 | Canonical contract tests | 9 passed |
 | Declarative contract tests | 17 passed |
-| Server contract tests | 25 passed, 1 ignored live dogfood |
-| Runtime dispatch tests | 23 passed |
+| Server contract tests | 26 passed, 1 ignored live dogfood |
+| Runtime dispatch tests | 24 passed |
 | Real submission, assessment, route, and store reopen | passed; one model-backend invocation |
 | Durable correction | invalid primary plus one valid correction passed; two persisted reservations |
 | Reclaimed reservation | failed without a duplicate model invocation |
@@ -111,6 +111,8 @@ The second independent review found that server-owned activity dispatch still pr
 The third independent review found three remaining upstream gaps. Malformed present contracts now fail their claimed command instead of entering a permanent dispatch barrier; contract presence takes precedence over server-owned activity names for runtime-turn budgeting and disabled-worker policy; and fatal or configuration contract failures terminate instead of following `on_failure` into a new contract budget. A further fresh-context review remains required.
 
 The fourth independent review found five remaining lifecycle gaps. Contract validation now precedes project policy and config resolution; invalid dispatch atomically records command failure, completion, and the reducer decision; every model invocation atomically consumes one workflow turn and one contract attempt; reservations require the current running lease owner and generation; and the contract stream terminates on lease loss. A further fresh-context review remains required.
+
+The fifth independent review found two validation-order gaps. Dispatcher and executor now share the same complete pinned-envelope validation, including prompt, definition hash, semantic input, canonical output schema, and contract hash. That validation finishes before project policy resolution and before any workflow-turn or attempt reservation. A further fresh-context review remains required.
 
 ## Slice D boundary
 

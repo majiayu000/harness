@@ -9,7 +9,6 @@ use super::agent_contract_enforcement::PinnedJobAgentContract;
 /// pinned instruction and immutable input envelope are serialized into one
 /// prompt; no workflow document, repository state, or live request is read.
 pub(super) fn contract_attempt_prompt(pinned: &PinnedJobAgentContract) -> anyhow::Result<String> {
-    validate_contract_input(pinned)?;
     Ok(format!(
         "{}\n\nAgent contract input (JSON):\n{}",
         pinned.prompt,
@@ -17,7 +16,7 @@ pub(super) fn contract_attempt_prompt(pinned: &PinnedJobAgentContract) -> anyhow
     ))
 }
 
-fn validate_contract_input(pinned: &PinnedJobAgentContract) -> anyhow::Result<()> {
+pub(super) fn validate_contract_input(pinned: &PinnedJobAgentContract) -> anyhow::Result<()> {
     validate_agent_contract_input(&pinned.contract.input_schema, &pinned.input)
         .map_err(anyhow::Error::msg)?;
     let contract_hash = pinned
