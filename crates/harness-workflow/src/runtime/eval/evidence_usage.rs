@@ -43,7 +43,7 @@ pub(super) fn usage_snapshots(
                 Confidence::Unknown
             },
         };
-        snapshot.total_tokens = snapshot.derived_total_tokens();
+        snapshot.total_tokens = derived_total_tokens_from_payload(payload, &snapshot);
         if usage_snapshot_has_measurement(&snapshot) {
             usage.push(snapshot);
         }
@@ -110,7 +110,7 @@ pub(super) fn usage_snapshot_from_event(
             Confidence::Unknown
         },
     };
-    snapshot.total_tokens = snapshot.derived_total_tokens();
+    snapshot.total_tokens = derived_total_tokens_from_payload(payload, &snapshot);
     snapshot
 }
 
@@ -122,19 +122,37 @@ fn cached_input_tokens_from_payload(payload: &Value) -> Option<u64> {
     payload
         .get("cached_input_tokens")
         .and_then(Value::as_u64)
-        .or_else(|| {
-            let cache_read = payload
-                .get("cache_read_input_tokens")
-                .and_then(Value::as_u64);
-            let cache_creation = payload
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64);
-            (cache_read.is_some() || cache_creation.is_some()).then(|| {
-                cache_read
-                    .unwrap_or(0)
-                    .saturating_add(cache_creation.unwrap_or(0))
-            })
+        .or_else(|| additive_cached_input_tokens_from_payload(payload))
+}
+
+fn additive_cached_input_tokens_from_payload(payload: &Value) -> Option<u64> {
+    let cache_read = payload
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64);
+    let cache_creation = payload
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    (cache_read.is_some() || cache_creation.is_some()).then(|| {
+        cache_read
+            .unwrap_or(0)
+            .saturating_add(cache_creation.unwrap_or(0))
+    })
+}
+
+fn derived_total_tokens_from_payload(payload: &Value, snapshot: &UsageSnapshot) -> Option<u64> {
+    let has_components = snapshot.input_tokens.is_some()
+        || snapshot.output_tokens.is_some()
+        || snapshot.cached_input_tokens.is_some();
+    snapshot.total_tokens.or_else(|| {
+        has_components.then(|| {
+            harness_observe::usage::derived_total_tokens(
+                None,
+                snapshot.input_tokens.unwrap_or(0),
+                snapshot.output_tokens.unwrap_or(0),
+                additive_cached_input_tokens_from_payload(payload).unwrap_or(0),
+            )
         })
+    })
 }
 
 fn usage_snapshot_has_measurement(snapshot: &UsageSnapshot) -> bool {
@@ -203,5 +221,23 @@ mod tests {
 
         assert_eq!(snapshot.cached_input_tokens, Some(5));
         assert_eq!(snapshot.total_tokens, Some(20));
+    }
+
+    #[test]
+    fn event_usage_does_not_add_subset_cached_input_tokens_to_total() {
+        let snapshot = usage_snapshot_from_event(
+            Some("workflow-1"),
+            "job-1",
+            &json!({
+                "usage": {
+                    "input_tokens": 10,
+                    "cached_input_tokens": 4,
+                    "output_tokens": 3
+                }
+            }),
+        );
+
+        assert_eq!(snapshot.cached_input_tokens, Some(4));
+        assert_eq!(snapshot.total_tokens, Some(13));
     }
 }

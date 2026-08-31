@@ -489,11 +489,7 @@ fn runtime_usage_record_from_row(row: RuntimeUsageDbRow) -> anyhow::Result<Runti
 }
 
 fn usage_metrics_are_zero(metrics: &RuntimeUsageMetrics) -> bool {
-    metrics.input_tokens == 0
-        && metrics.output_tokens == 0
-        && metrics.cache_read_input_tokens == 0
-        && metrics.cache_creation_input_tokens == 0
-        && metrics.total_tokens() == 0
+    metrics.is_zero_token_usage()
 }
 
 fn aggregate_usage_records(

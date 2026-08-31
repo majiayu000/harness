@@ -177,7 +177,7 @@ impl UsageSnapshot {
                     None,
                     self.input_tokens.unwrap_or(0),
                     self.output_tokens.unwrap_or(0),
-                    self.cached_input_tokens.unwrap_or(0),
+                    0,
                 )
             })
         })

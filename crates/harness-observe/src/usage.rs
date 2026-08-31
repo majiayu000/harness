@@ -30,6 +30,14 @@ impl UsageMetrics {
         )
     }
 
+    pub fn is_zero_token_usage(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_input_tokens == 0
+            && self.cache_creation_input_tokens == 0
+            && self.total_tokens() == 0
+    }
+
     pub fn from_token_usage(usage: &TokenUsage) -> Self {
         let prompt_and_output = usage.input_tokens.saturating_add(usage.output_tokens);
         Self {
@@ -67,12 +75,12 @@ pub fn derived_total_tokens(
     reported_total_tokens: Option<u64>,
     input_tokens: u64,
     output_tokens: u64,
-    cached_input_tokens: u64,
+    additive_cached_input_tokens: u64,
 ) -> u64 {
     reported_total_tokens.unwrap_or_else(|| {
         input_tokens
             .saturating_add(output_tokens)
-            .saturating_add(cached_input_tokens)
+            .saturating_add(additive_cached_input_tokens)
     })
 }
 
@@ -130,6 +138,19 @@ mod tests {
         let usage = parse_result_usage_metrics(line).expect("usage should parse");
         assert_eq!(usage.reported_total_tokens, Some(12));
         assert_eq!(usage.total_tokens(), 12);
+    }
+
+    #[test]
+    fn zero_token_usage_counts_cache_components() {
+        let usage = UsageMetrics {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 4,
+            cache_creation_input_tokens: 0,
+            reported_total_tokens: Some(0),
+        };
+
+        assert!(!usage.is_zero_token_usage());
     }
 
     #[test]
