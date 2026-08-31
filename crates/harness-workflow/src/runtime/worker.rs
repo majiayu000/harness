@@ -323,6 +323,12 @@ impl<'a> RuntimeWorker<'a> {
         if !runtime_event_result_succeeded(event) {
             return Ok(());
         }
+        if child.state == "blocked"
+            && child.data.get("stop_reason_code").and_then(Value::as_str)
+                == Some(super::STOP_REASON_INVALID_AGENT_OUTPUT)
+        {
+            return Ok(());
+        }
         if matches!(child.state.as_str(), "pending" | "inspecting") {
             return Ok(());
         }
