@@ -192,10 +192,11 @@ restored pre-vNext host cannot claim vNext work.
 The final boundary includes every subject observed through the drain, so an object created by an
 old runtime action cannot re-enter as vNext work. Subjects at or before that boundary remain fenced
 from automatic vNext rediscovery; objects created by other actors during the maintenance window
-also require explicit human-authorized adoption. Subjects created after the final boundary are
-eligible for normal vNext intake because no pre-vNext provider writer remains. An unverifiable
-boundary disables automatic intake for that binding. Adoption creates new vNext identities and
-does not import old Harness runtime state.
+also require explicit human-authorized adoption, including objects created after final fence capture
+but before explicit vNext activation. Only subjects first created after the activation transaction
+ends the maintenance window are eligible for normal vNext intake. An unverifiable boundary disables
+automatic intake for that binding. Adoption creates new vNext identities and does not import old
+Harness runtime state.
 
 The captured provider fence records and their digest are stored in the immutable cutover manifest,
 outside the runtime schema that will be replaced. The replacement transaction installs those exact

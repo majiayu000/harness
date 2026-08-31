@@ -860,7 +860,9 @@ review quorum lives in compiled review policy and immutable actor assignments, a
 can target only the source state captured by its named compiled control route.
 
 Entering `review_barrier` atomically creates the declared number of distinct reviewer assignments
-and their review commands for one code identity. Recovery treats the barrier as healthy only when
+and their review commands for one code identity. Quorum-counted assignments also require distinct
+effective reviewer identities; separate assignment IDs cannot duplicate one vote. Recovery treats
+the barrier as healthy only when
 every outstanding assignment has exactly one active command or terminal receipt. A changed code
 identity revokes the assignments and receipts; only a complete eligible quorum emits `approved`.
 
@@ -1364,6 +1366,8 @@ a destructive transition:
   consumed only by its dedicated reconciliation activity;
 - external direct/stack waits revalidate authorization and block a merge observed after expiry or
   revocation; provider reconciliation binds the exact merge attempt and gate chain;
+- external stack waits preserve their identity when a current child outcome changes and block a
+  later merge before cursor advance;
 - each landed stack entry sends one child handoff receipt and waits for the child's terminal
   acknowledgement before cursor advance, completion, or cancellation of remaining entries;
 - independent release invalidation switches an external-merge wait to fenced invalidation mode and

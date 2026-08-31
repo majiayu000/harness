@@ -1114,6 +1114,7 @@ definition:
       review:
         activity: review_integration
         distinct_assignments: true
+        distinct_reviewer_identities: true
         quorum_policy: integration
       on_signal:
         approved: merge_gate
@@ -1409,8 +1410,8 @@ definition:
       wait:
         fact_kind: external_stack_entry_merge
         refresh_contract: registered.stack_entry_reconciliation.v1
-        nonterminal_facts: [authorization_stale]
-        preserve_wait_identity_on: [authorization_stale]
+        nonterminal_facts: [authorization_stale, stack_child_outcome_stale]
+        preserve_wait_identity_on: [authorization_stale, stack_child_outcome_stale]
         max_refreshes: 120
         deadline: 24h
         backoff: {initial: 30s, maximum: 10m, multiplier: 2}
@@ -1418,6 +1419,9 @@ definition:
         merged: reconciling_external_stack_entry
         authorization_stale: awaiting_external_stack_merge
         stale_authorization_subject_quarantined: stack_merge_gate
+        stack_child_outcome_stale: awaiting_external_stack_merge
+        stack_outcome_quarantined: requesting_stack_child_reviews
+        merge_after_stack_outcome_stale: reconciling_external_stack_entry
         merge_after_authorization_stale: reconciling_external_stack_entry
         review_stale: requesting_stack_child_reviews
         rebase_required: stack_rebase_gate
@@ -1429,6 +1433,7 @@ definition:
       on_signal:
         entry_confirmed: releasing_landed_stack_child
         merge_after_authorization_stale: blocked
+        merge_after_stack_outcome_stale: blocked
         divergence: blocked
       on_failure: blocked
     landing_stack_entry:
@@ -2207,7 +2212,7 @@ activities:
   reconcile_external_stack_entry:
     executor: registered_server
     contract: registered.external_stack_entry_reconciliation.v1
-    required_evidence: [external_merge_wait_snapshot, remote_merge_confirmation, authorization_receipt]
+    required_evidence: [external_merge_wait_snapshot, remote_merge_confirmation, authorization_receipt, child_materialization, child_outcome]
     produces: [stack_entry_reconciliation, stack_rebase_context]
 
   release_landed_stack_child:
@@ -2612,10 +2617,14 @@ stateDiagram-v2
     awaiting_external_stack_merge --> reconciling_external_stack_entry: external merge confirmed
     awaiting_external_stack_merge --> awaiting_external_stack_merge: authorization stale; preserve wait identity
     awaiting_external_stack_merge --> stack_merge_gate: stale-authorization subject closed unmerged
+    awaiting_external_stack_merge --> awaiting_external_stack_merge: stack child outcome stale; preserve wait identity
+    awaiting_external_stack_merge --> requesting_stack_child_reviews: stale-outcome subject closed unmerged
+    awaiting_external_stack_merge --> reconciling_external_stack_entry: merge after stack child outcome stale
     awaiting_external_stack_merge --> requesting_stack_child_reviews: review stale
     awaiting_external_stack_merge --> stack_rebase_gate: rebase required
     reconciling_external_stack_entry --> releasing_landed_stack_child: entry confirmed
     reconciling_external_stack_entry --> blocked: merge after authorization stale
+    reconciling_external_stack_entry --> blocked: merge after stack child outcome stale
     landing_stack_entry --> reconciling_stack_entry
     reconciling_stack_entry --> releasing_landed_stack_child: entry confirmed
     releasing_landed_stack_child --> awaiting_stack_entry_acknowledgement: landed signal committed
@@ -2897,7 +2906,9 @@ requiring a second human gate.
 Workflow may define additional states, but every active state MUST have an activity, a child
 barrier, a review barrier, an external wait, an operator gate, a parent handoff, or a compiled
 control return. A review barrier owns immutable, distinct reviewer assignments and does not emit
-`approved` until its declared quorum is satisfied.
+`approved` until its declared quorum is satisfied. When identity uniqueness is declared, assignment
+IDs counted toward one quorum must also have distinct effective reviewer identities; one reviewer
+cannot vote twice through separate assignments.
 
 ## 12. End-to-End Flow
 
@@ -3839,6 +3850,12 @@ the quarantine into integration fact/risk/validation/review refresh. A merge obs
 child outcome changed is reconciled with the current child set and blocks as a policy violation;
 leaving the wait cannot make that merge invisible.
 
+A stack-child outcome change uses the same durable-wait rule for
+`awaiting_external_stack_merge`: the exact wait identity remains active until the PR is closed
+unmerged and child reviews are refreshed. A merge observed after cancellation, failure, or
+supersession consumes current child outcomes and blocks before cursor advance or landing
+acknowledgement.
+
 Every direct and stack external-merge refresh also revalidates the exact authorization receipt
 bound by its wait snapshot. Expiry or revocation switches the same wait to authorization-stale mode;
 an open PR remains monitored and cannot reuse the receipt. Exact closed-unmerged facts discharge
@@ -4088,6 +4105,7 @@ Required metrics include:
 
 - malformed reviewer output is protocol failure, never approval;
 - same identity cannot fill author and reviewer roles;
+- one effective reviewer identity cannot satisfy multiple assignments in the same quorum;
 - push after review invalidates the receipt;
 - child approval does not satisfy parent integration review;
 - unresolved current review thread blocks merge;
