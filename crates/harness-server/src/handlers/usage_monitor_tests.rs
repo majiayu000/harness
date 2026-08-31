@@ -32,6 +32,37 @@ fn usage_aggregate_requires_configured_price_for_cost() {
     assert_eq!(usage.estimated_cost_json(true), None);
 }
 
+#[test]
+fn usage_aggregate_sums_reported_record_totals() {
+    let mut usage = UsageAggregate::default();
+    usage.add(
+        &UsageMetrics {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 3,
+            cache_creation_input_tokens: 2,
+            reported_total_tokens: Some(14),
+        },
+        Some(0.1),
+    );
+    usage.add(
+        &UsageMetrics {
+            input_tokens: 4,
+            output_tokens: 2,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            reported_total_tokens: Some(11),
+        },
+        Some(0.2),
+    );
+
+    assert_eq!(usage.input_tokens, 14);
+    assert_eq!(usage.output_tokens, 7);
+    assert_eq!(usage.cache_read_input_tokens, 3);
+    assert_eq!(usage.cache_creation_input_tokens, 2);
+    assert_eq!(usage.total_tokens(), 25);
+}
+
 #[tokio::test]
 async fn usage_monitor_response_includes_postgres_catalog_census() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
