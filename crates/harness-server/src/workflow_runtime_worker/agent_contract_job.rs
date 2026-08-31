@@ -11,6 +11,7 @@ use super::agent_contract_enforcement::{
 };
 use super::agent_contract_execution::execute_contract_attempts;
 use super::data_helpers::activity_name;
+use super::job_context::{project_root_for_job, workflow_for_job};
 use super::runtime_profile::{agent_backend_for_runtime_kind, runtime_profile_for_job};
 use super::runtime_usage::runtime_usage_context;
 
@@ -89,13 +90,15 @@ async fn execute_contract_job_inner(
             "the pinned runtime profile has no positive timeout_secs",
         ));
     };
+    let workflow = workflow_for_job(state, job).await?;
+    let source_project_root = project_root_for_job(state, job, workflow.as_ref())?;
     let runtime_usage = runtime_usage_context(
         state,
         job,
-        None,
+        workflow.as_ref(),
         &profile,
         backend.name(),
-        &state.core.project_root,
+        &source_project_root,
     );
     execute_contract_attempts(
         state,
@@ -711,10 +714,9 @@ mod dogfood_tests {
     //! turn and requires local Codex authentication. Run it by exact name when
     //! validating a Codex/model combination before enabling contract dispatch.
 
-    use super::super::agent_contract_attempt::{
-        contract_violations, execute_agent_contract_attempt, parse_contract_verdict,
-    };
+    use super::super::agent_contract_attempt::{contract_violations, parse_contract_verdict};
     use super::super::agent_contract_enforcement::PinnedJobAgentContract;
+    use super::super::agent_contract_stream::execute_agent_contract_attempt;
     use harness_agents::codex::CodexAgent;
     use harness_core::config::agents::SandboxMode;
     use harness_core::config::workflow::WorkflowAgentContract;
@@ -769,6 +771,7 @@ mod dogfood_tests {
             Some("gpt-5.6-sol".to_string()),
             Some("high".to_string()),
             300,
+            None,
             None,
             None,
         )

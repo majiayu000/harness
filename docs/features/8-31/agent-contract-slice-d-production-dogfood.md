@@ -45,12 +45,20 @@ attempt observations and writes it through the same `RuntimeUsageContext` used
 by ordinary turns. The usage key is a stable per-job, per-attempt turn id, so
 replay remains idempotent.
 
+Fresh review then found three accounting blockers in that first implementation.
+The final implementation persists each token event before handling a subsequent
+backend failure, evaluates the existing workflow budget ceiling immediately
+after persistence, and resolves the workflow before constructing the usage
+context so project and task attribution come from the durable instance. Focused
+tests cover failure-after-usage, a terminal verdict crossing an enforced
+ceiling, and project/task attribution through the full submission path.
+
 ## Final production evidence
 
 Final submission:
 
-- submission id: `9e500996-3943-4bbc-b8b9-f75dcb438ea0`
-- runtime job id: `7e003e96-d3c1-4995-8fa5-c9eb917192f1`
+- submission id: `f43b7fd2-da4c-488e-8530-d148b471d587`
+- runtime job id: `1ba6a188-dc15-4606-914b-be1e3449a51d`
 - terminal projection: `done:done`
 - verdict outcome: `approved`
 - observed model: `gpt-5.6-sol` (`launch_derived`)
@@ -63,17 +71,21 @@ Final submission:
 
 Timing from server-authored PostgreSQL timestamps:
 
-- submission to persisted artifacts: `14.556s`
-- runtime job lifetime: `13.672s`
-- agent-contract attempt: `12.977s`
+- submission to persisted artifacts: `15.841s`
+- runtime job lifetime: `15.472s`
+- agent-contract attempt: `14.693s`
 
 Usage returned by the runtime submission API and persisted in
 `runtime_usage_events`:
 
-- input tokens: `21,757`
-- output tokens: `140`
+- input tokens: `21,764`
+- output tokens: `133`
 - reported total tokens: `21,897`
 - provider-reported cost: `$0.00`
+
+The persisted usage row is attributed to project
+`/private/tmp/harness-slice-d-20260831/project` and task
+`f43b7fd2-da4c-488e-8530-d148b471d587`.
 
 Harness does not synthesize a price when the Codex stream reports zero cost;
 the stored and returned value remains the provider-reported value.
@@ -103,8 +115,11 @@ The implementation is covered by:
 ```text
 cargo test -p harness-server agent_contract_submission_command_matches_the_committed_instance
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server real_submission_assessment_routes_and_reopens_without_model_replay
+HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server usage_survives_backend_failure_after_report
+HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server enforced_budget_rejects_terminal_verdict_after_usage_crosses_ceiling
 ```
 
 The first test protects the submission/commit/dispatch fact identity. The
-second protects assessment routing, durable reopen behavior, and exact token
-and cost persistence for a contract attempt.
+second protects assessment routing, durable reopen behavior, exact token and
+cost persistence, and project/task attribution. The final two protect failed
+attempt accounting and enforced mid-attempt budget stops.

@@ -7,6 +7,7 @@ mod agent_contract_enforcement;
 mod agent_contract_execution;
 mod agent_contract_job;
 mod agent_contract_prompt;
+mod agent_contract_stream;
 mod child_workflow;
 mod child_workflow_non_issue;
 mod child_workflow_replay;

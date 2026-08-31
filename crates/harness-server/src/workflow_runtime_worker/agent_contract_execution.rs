@@ -10,10 +10,9 @@ use harness_workflow::runtime::{
 use std::sync::Arc;
 
 use super::agent_contract_assessment::attach_server_assessment;
-use super::agent_contract_attempt::{
-    contract_violations, execute_agent_contract_attempt, parse_contract_verdict,
-};
+use super::agent_contract_attempt::{contract_violations, parse_contract_verdict};
 use super::agent_contract_enforcement::{turn_observation_artifact, PinnedJobAgentContract};
+use super::agent_contract_stream::execute_agent_contract_attempt;
 use super::turn_engine::helpers::RuntimeUsageContext;
 
 pub(super) async fn execute_contract_attempts(
@@ -76,6 +75,11 @@ pub(super) async fn execute_contract_attempts(
             }
             let correction = (correction_attempt > 0)
                 .then_some((previous_output.as_str(), last_validation_error.as_str()));
+            let turn_number = (primary_attempt - 1)
+                .saturating_mul(pinned.contract.max_corrections + 1)
+                .saturating_add(correction_attempt)
+                .saturating_add(1);
+            let turn_id = TurnId::from_str(&format!("agent-contract:{}:{turn_number}", job.id));
             let attempt = match execute_agent_contract_attempt(
                 Arc::clone(&backend),
                 pinned,
@@ -83,6 +87,7 @@ pub(super) async fn execute_contract_attempts(
                 reasoning_effort.clone(),
                 timeout_secs,
                 correction,
+                runtime_usage.map(|context| (context, &turn_id)),
                 Some(lease_lost.clone()),
             )
             .await
@@ -110,16 +115,6 @@ pub(super) async fn execute_contract_attempts(
                     return Ok(result);
                 }
             };
-            let turn_number = (primary_attempt - 1)
-                .saturating_mul(pinned.contract.max_corrections + 1)
-                .saturating_add(correction_attempt)
-                .saturating_add(1);
-            if let (Some(context), Some(usage)) =
-                (runtime_usage, attempt.observations.token_usage.as_ref())
-            {
-                let turn_id = TurnId::from_str(&format!("agent-contract:{}:{turn_number}", job.id));
-                context.persist_token_usage(&turn_id, usage).await?;
-            }
             observations.push(turn_observation_artifact(
                 turn_number,
                 &attempt.items,
@@ -451,12 +446,13 @@ mod tests {
         });
         let (lease_lost, receiver) = tokio::sync::watch::channel(false);
         let attempt = tokio::spawn(async move {
-            super::super::agent_contract_attempt::execute_agent_contract_attempt(
+            super::super::agent_contract_stream::execute_agent_contract_attempt(
                 backend,
                 &pinned,
                 None,
                 None,
                 30,
+                None,
                 None,
                 Some(receiver),
             )
@@ -515,12 +511,13 @@ mod tests {
         });
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            super::super::agent_contract_attempt::execute_agent_contract_attempt(
+            super::super::agent_contract_stream::execute_agent_contract_attempt(
                 backend,
                 &pinned_contract(),
                 None,
                 None,
                 1,
+                None,
                 None,
                 None,
             ),
@@ -567,12 +564,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            super::super::agent_contract_attempt::execute_agent_contract_attempt(
+            super::super::agent_contract_stream::execute_agent_contract_attempt(
                 Arc::new(StreamingBackend),
                 &pinned_contract(),
                 None,
                 None,
                 1,
+                None,
                 None,
                 None,
             ),
@@ -631,6 +629,7 @@ mod tests {
             json!({
                 "definition_hash": definition.definition_hash(),
                 "project_id": project_root,
+                "task_id": "loop-e2e-task",
                 "scope": "bounded"
             }),
             DataProvenance::Server,
@@ -715,6 +714,18 @@ mod tests {
         assert_eq!(usage.metrics.output_tokens, 7);
         assert_eq!(usage.metrics.reported_total_tokens, Some(18));
         assert_eq!(usage.cost_usd_micros, 125_000);
+        let usage_records = store
+            .runtime_usage_between(
+                chrono::Utc::now() - chrono::Duration::minutes(1),
+                chrono::Utc::now() + chrono::Duration::minutes(1),
+            )
+            .await?;
+        let usage_record = usage_records
+            .iter()
+            .find(|record| record.runtime_job_id == runtime_job.id)
+            .expect("contract attempt usage record should persist");
+        assert_eq!(usage_record.project, project_root.to_string_lossy());
+        assert_eq!(usage_record.task_id.as_deref(), Some("loop-e2e-task"));
         drop(state);
         drop(store);
 

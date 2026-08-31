@@ -190,7 +190,7 @@ impl RuntimeUsageContext {
     ///
     /// `enforce` returns the stop for the caller to act on; `shadow` records a
     /// `BudgetShadowDecision` runtime event and returns `None`.
-    async fn budget_stop(&self) -> anyhow::Result<Option<TurnBudgetStop>> {
+    pub(crate) async fn budget_stop(&self) -> anyhow::Result<Option<TurnBudgetStop>> {
         if self.budget_policy.unlimited {
             return Ok(None);
         }
