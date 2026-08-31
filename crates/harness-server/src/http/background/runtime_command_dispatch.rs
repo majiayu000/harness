@@ -173,8 +173,31 @@ async fn dispatch_runtime_command_with_project_policy(
         .with_defer_backoff(dispatch_backoff(&workflow_cfg.runtime_dispatch)?)
         .with_budget_policy(workflow_cfg.runtime_budget_policy);
     let effective_profile = dispatcher.effective_profile_for_command(&command).await?;
-    if let Some(profile) = enforceable_agent_contract_profile(state, &command, &effective_profile) {
-        dispatcher = dispatcher.with_enforceable_agent_contract_profile(profile);
+    match enforceable_agent_contract_profile(state, &command, &effective_profile) {
+        Ok(Some(profile)) => {
+            dispatcher = dispatcher.with_enforceable_agent_contract_profile(profile);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let reason = format!("invalid pinned agent_contract: {error}");
+            let failed = store
+                .fail_claimed_command_if_owned(
+                    &command.id,
+                    harness_workflow::runtime::DispatchClaim {
+                        owner: dispatch_owner,
+                        generation: command.dispatch_claim_generation,
+                    },
+                )
+                .await?;
+            return Ok(CommandDispatchOutcome::Skipped {
+                command_id: command.id,
+                reason: if failed {
+                    reason
+                } else {
+                    "dispatch claim became stale before invalid agent_contract failure".to_string()
+                },
+            });
+        }
     }
     let outcome = dispatcher.dispatch_command(command).await?;
     record_runtime_agent_dispatch_counter(
@@ -191,36 +214,41 @@ fn enforceable_agent_contract_profile(
     state: &AppState,
     command: &WorkflowCommandRecord,
     profile: &harness_workflow::runtime::RuntimeProfile,
-) -> Option<harness_workflow::runtime::RuntimeProfile> {
-    let contract_value = command.command.command.get("agent_contract")?;
-    let Ok(contract) = serde_json::from_value::<
-        harness_core::config::workflow::WorkflowAgentContract,
-    >(contract_value.clone()) else {
-        return None;
+) -> anyhow::Result<Option<harness_workflow::runtime::RuntimeProfile>> {
+    let Some(contract_value) = command.command.command.get("agent_contract") else {
+        return Ok(None);
     };
+    let contract = serde_json::from_value::<harness_core::config::workflow::WorkflowAgentContract>(
+        contract_value.clone(),
+    )?;
     let activity = command.command.runtime_activity_key();
-    if contract.validate(activity).is_err()
-        || harness_core::config::workflow::agent_contract_output_schema_document(
-            &contract.output_schema,
-        )
-        .is_none()
+    contract.validate(activity)?;
+    if harness_core::config::workflow::agent_contract_output_schema_document(
+        &contract.output_schema,
+    )
+    .is_none()
     {
-        return None;
+        anyhow::bail!(
+            "output schema '{}' has no canonical enforcement document",
+            contract.output_schema
+        );
     }
     if !profile.timeout_secs.is_some_and(|timeout| timeout > 0) {
-        return None;
+        return Ok(None);
     }
     let Ok(agent_name) = crate::workflow_runtime_worker::agent_name_for_runtime_kind(profile.kind)
     else {
-        return None;
+        return Ok(None);
     };
-    let backend = state.core.server.agent_registry.get(agent_name)?;
+    let Some(backend) = state.core.server.agent_registry.get(agent_name) else {
+        return Ok(None);
+    };
     if crate::workflow_runtime_worker::ensure_backend_can_enforce_contract(backend.as_ref())
         .is_err()
     {
-        return None;
+        return Ok(None);
     }
-    Some(profile.clone())
+    Ok(Some(profile.clone()))
 }
 
 async fn runtime_isolation_config_for_command(

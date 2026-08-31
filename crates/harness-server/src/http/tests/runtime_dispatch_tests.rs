@@ -25,7 +25,9 @@ impl harness_core::agent::AgentBackend for DispatchContractAgent {
 struct ContractDispatchResult {
     enqueued: usize,
     deferred: usize,
+    skipped: usize,
     runtime_jobs: usize,
+    command_status: harness_workflow::runtime::WorkflowCommandStatus,
 }
 
 fn pinned_contract_dispatch_command() -> harness_workflow::runtime::WorkflowCommand {
@@ -60,12 +62,15 @@ fn pinned_contract_dispatch_command() -> harness_workflow::runtime::WorkflowComm
 
 async fn dispatch_contract_with_backend(
     enforceable: bool,
+    command: harness_workflow::runtime::WorkflowCommand,
 ) -> anyhow::Result<ContractDispatchResult> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(ContractDispatchResult {
             enqueued: 0,
             deferred: 0,
+            skipped: 0,
             runtime_jobs: 0,
+            command_status: harness_workflow::runtime::WorkflowCommandStatus::Pending,
         });
     }
 
@@ -99,9 +104,7 @@ async fn dispatch_contract_with_backend(
     .with_id("contract-dispatch")
     .with_server_data(serde_json::json!({"project_id": project_root}));
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
-    let command_id = store
-        .enqueue_command(&workflow.id, None, &pinned_contract_dispatch_command())
-        .await?;
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let mut profile = harness_workflow::runtime::RuntimeProfile::new(
         "codex-contract",
         harness_workflow::runtime::RuntimeKind::CodexExec,
@@ -110,10 +113,13 @@ async fn dispatch_contract_with_backend(
 
     let tick = super::background::run_runtime_command_dispatch_tick(&state, profile, 10).await?;
     let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    let command_status = store.commands_for(&workflow.id).await?[0].status;
     Ok(ContractDispatchResult {
         enqueued: tick.enqueued,
         deferred: tick.deferred,
+        skipped: tick.skipped,
         runtime_jobs: jobs.len(),
+        command_status,
     })
 }
 
@@ -123,7 +129,7 @@ async fn runtime_dispatch_authorizes_contract_only_from_selected_backend_capabil
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result = dispatch_contract_with_backend(true).await?;
+    let result = dispatch_contract_with_backend(true, pinned_contract_dispatch_command()).await?;
     assert_eq!(result.enqueued, 1);
     assert_eq!(result.deferred, 0);
     assert_eq!(result.runtime_jobs, 1);
@@ -136,10 +142,32 @@ async fn runtime_dispatch_defers_contract_for_nonconforming_selected_backend() -
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    let result = dispatch_contract_with_backend(false).await?;
+    let result = dispatch_contract_with_backend(false, pinned_contract_dispatch_command()).await?;
     assert_eq!(result.enqueued, 0);
     assert_eq!(result.deferred, 1);
     assert_eq!(result.runtime_jobs, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_malformed_present_contract_instead_of_deferring(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let mut command = pinned_contract_dispatch_command();
+    command.command["agent_contract"] = serde_json::Value::Null;
+
+    let result = dispatch_contract_with_backend(true, command).await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
     Ok(())
 }
 

@@ -10,8 +10,8 @@ use crate::runtime::declarative::{
     workflow_evidence_from_activity_artifacts, DeclarativeWorkflowDefinition,
 };
 use crate::runtime::model::{
-    ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
-    WorkflowEvent, WorkflowEvidence, WorkflowInstance,
+    ActivityErrorKind, ActivityResult, ActivityStatus, WorkflowCommand, WorkflowCommandType,
+    WorkflowDecision, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
 use crate::runtime::state_registry::{
     DeclarativeDefinitionPinError, WorkflowDefinitionRegistry, WorkflowTerminalState,
@@ -141,7 +141,15 @@ fn reduce_generic_declarative_completion(
             }
         }
         ActivityStatus::Failed => {
-            if let Some(target) = source.on_failure.as_deref() {
+            let terminal_contract_failure = definition.agent_contract(expected_activity).is_some()
+                && matches!(
+                    result.error_kind,
+                    Some(ActivityErrorKind::Fatal | ActivityErrorKind::Configuration)
+                );
+            if terminal_contract_failure {
+                terminal_for_class(definition, WorkflowTerminalState::Failed)
+                    .map(|target| (target, "terminal agent contract failure".to_string()))
+            } else if let Some(target) = source.on_failure.as_deref() {
                 Some((target, "on_failure".to_string()))
             } else if let Some(decision) =
                 retry_failed_declarative_activity_decision(instance, event, result)

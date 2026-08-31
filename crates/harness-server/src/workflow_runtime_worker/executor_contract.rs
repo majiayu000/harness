@@ -13,14 +13,14 @@ use harness_workflow::runtime::{
 #[async_trait]
 impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
     fn consumes_runtime_turn(&self, job: &RuntimeJob) -> bool {
-        !is_internal_non_agent_activity(job)
+        job_consumes_runtime_turn(job)
     }
 
     async fn preflight_result(&self, job: &RuntimeJob) -> Option<ActivityResult> {
         // Internal server-owned activities do not run a user agent. They must keep
         // flowing even when the runtime worker is disabled, otherwise disabling the
         // worker would strand workflows or prevent server-owned PR snapshots.
-        if is_internal_non_agent_activity(job) {
+        if !job_consumes_runtime_turn(job) {
             return None;
         }
         if let Some(result) = exact_replay_preflight_result(self.state, job).await {
@@ -46,6 +46,10 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
         // run before execute returns (GH-1877).
         self.cancel_lease_lost();
     }
+}
+
+fn job_consumes_runtime_turn(job: &RuntimeJob) -> bool {
+    job.input.pointer("/command/agent_contract").is_some() || !is_internal_non_agent_activity(job)
 }
 
 fn postprocess_local_execution_result(result: ActivityResult) -> ActivityResult {
@@ -113,6 +117,24 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("unparseable agent_contract payload")));
+    }
+
+    #[test]
+    fn server_owned_name_collision_still_consumes_an_agent_runtime_turn() {
+        let mut job = RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexExec,
+            "codex-contract",
+            serde_json::json!({
+                "activity": harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+                "command": {"agent_contract": {}}
+            }),
+        );
+        job.input["activity"] =
+            serde_json::json!(harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY);
+
+        assert!(is_internal_non_agent_activity(&job));
+        assert!(job_consumes_runtime_turn(&job));
     }
 
     #[test]

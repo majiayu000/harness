@@ -547,6 +547,68 @@ mod declarative_agent_contract_tests {
         Ok(())
     }
 
+    #[test]
+    fn fatal_contract_failure_cannot_route_to_a_fresh_contract_job() -> anyhow::Result<()> {
+        let mut policy = classifier_policy();
+        policy
+            .states
+            .get_mut("classifying")
+            .expect("classifying state")
+            .on_failure = Some("classifying".to_string());
+        let definition = build_declarative_definition(
+            &policy,
+            &activity_policies(Some(contract())),
+        )?;
+        let instance = WorkflowInstance::new(
+            definition.policy().id.clone(),
+            definition.definition_version(),
+            "classifying",
+            WorkflowSubject::new("test", "fatal-contract"),
+        )
+        .with_id("fatal-contract")
+        .with_server_data(json!({"definition_hash": definition.definition_hash()}));
+        let command =
+            crate::runtime::declarative_agent_contract::declarative_enqueue_activity_command(
+                &definition,
+                &instance,
+                "classify_scope",
+                "fatal-contract-1".to_string(),
+            )?;
+        let result = ActivityResult::failed(
+            "classify_scope",
+            "Agent contract execution failed.",
+            "attempt completion persistence failed",
+        )
+        .with_error_kind(ActivityErrorKind::Fatal);
+        let event = WorkflowEvent::new(
+            &instance.id,
+            1,
+            crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+            "runtime-test",
+        )
+        .with_payload(json!({
+            "command_id": "command-1",
+            "runtime_job_id": "job-1",
+            "command": command,
+            "activity_result": result,
+        }));
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry.register_declarative_current(definition)?;
+
+        let decision = crate::runtime::reducer::reduce_runtime_job_completed_with_registry(
+            &registry,
+            &instance,
+            &event,
+        )?
+        .expect("fatal contract failure must produce a terminal decision");
+
+        assert_eq!(decision.next_state, "failed");
+        assert!(decision.commands.iter().all(|command| {
+            command.command_type != WorkflowCommandType::EnqueueActivity
+        }));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn dispatcher_defers_agent_contract_command_without_backend_authorization(
     ) -> anyhow::Result<()> {
