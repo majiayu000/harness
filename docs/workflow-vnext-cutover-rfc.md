@@ -39,8 +39,8 @@ Use an offline, one-way runtime cutover with a mandatory immutable audit archive
 1. atomically stop pre-vNext intake and fence every new command/job claim or dispatch;
 2. cancel or drain all active non-provider runtime jobs, terminate their agent processes, reconcile
    their completion candidates, and verify zero live workspace leases or owned processes;
-3. cancel active provider actions or drain them to reconciled terminal outcomes, recording every
-   remote object created or changed during the drain;
+3. cancel only provider actions proven never dispatched; reconcile every possibly dispatched action
+   to remote terminal truth, recording every remote object created or changed during the drain;
 4. revoke old provider credentials and verify zero pre-vNext provider writers;
 5. revoke the pre-vNext runtime-host registration/heartbeat epoch and verify zero accepted old-epoch
    hosts;
@@ -66,7 +66,7 @@ auditable record of earlier decisions.
 flowchart LR
     Old[Pre-vNext runtime] --> Stop[Stop intake and all command/job claims]
     Stop --> RuntimeDrain[Drain jobs, processes, and workspace leases]
-    RuntimeDrain --> Drain[Cancel or reconcile active provider actions]
+    RuntimeDrain --> Drain[Cancel undispatched actions; reconcile every possible dispatch]
     Drain --> ProviderFence[Revoke credentials and verify zero provider writers]
     ProviderFence --> HostFence[Revoke runtime-host epoch and verify zero old hosts]
     HostFence --> Capture[Capture final provider fence manifest]
@@ -173,9 +173,11 @@ that no runtime-owned workspace lease or process remains. A claimed ordinary job
 until database-role revocation, and workspace cleanup is never used as a substitute for process
 termination and reconciliation.
 
-The provider side is another write surface. After the runtime drain, cutover either cancels each
-active provider action or drains it to a reconciled terminal outcome, recording every remote object
-created or changed. Only after revoking old provider
+The provider side is another write surface. After the runtime drain, cutover may cancel an action
+only when durable outbox/transport evidence proves it was never dispatched. Every dispatched,
+possibly dispatched, running, returned, timed-out, or otherwise ambiguous action is reconciled to
+authenticated remote terminal truth, recording every remote object created or changed. Only after
+revoking old provider
 credentials and verifying zero pre-vNext provider writers may cutover capture the provider
 boundary. A database writer fence does not prove this condition.
 
@@ -297,7 +299,7 @@ Decision: rejected.
 | Catalog inspection is infeasible on the real database | High | Read-only scoped benchmark before implementation; redesign on threshold failure |
 | Old process writes during cutover | Critical | Exclusive role, credential revocation, session termination, zero-session verification |
 | Ordinary runtime job or agent process survives the fence | Critical | Fence every command/job claim, drain or cancel claimed work, reconcile completion candidates, terminate process groups, and verify zero workspace leases/processes before provider or database revocation |
-| Old provider writer mutates remote state after archive | Critical | Drain provider outbox/attempts, revoke credentials, and verify zero provider writers before archive |
+| Old provider writer mutates remote state after archive | Critical | Cancel only proven-undispatched actions; reconcile every possible dispatch; revoke credentials; verify zero provider writers before archive |
 | Old runtime host is restored or resumes heartbeats | Critical | Archive then reset only the configured runtime-state snapshot, rotate the host authority epoch, reject old-epoch registration/heartbeat, and verify empty vNext host/cache state |
 | Shared task rows are over-deleted | Critical | Fixed predicates, locked counts, cleanup preconditions, preservation tests |
 | Old provider object re-enters as new work | High | Provider intake fences and fail-closed unverifiable bindings |

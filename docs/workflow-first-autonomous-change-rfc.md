@@ -694,7 +694,7 @@ definition:
       source: operator
       requested_action: cancel_work_item
       allowed_from: nonterminal_except_cancellation_flow
-      excluded_states: [awaiting_cancellation_authorization, resuming_denied_cancellation, refreshing_cancellation_admission_facts, reconciling_cancellation, reconciling_cancellation_external_outcome, reconciling_cancellation_stack_entry, cancelling_child_set, awaiting_child_cancellations]
+      excluded_states: [awaiting_cancellation_authorization, resuming_denied_cancellation, refreshing_cancellation_admission_facts, reconciling_cancellation, reconciling_cancellation_external_outcome, reconciling_cancellation_stack_entry, reconciling_cancellation_external_stack_entry, cancelling_child_set, awaiting_child_cancellations]
       continuation: persist_source_state_and_driver
       on_duplicate: retain_current_cancellation_state
       target: awaiting_cancellation_authorization
@@ -702,7 +702,7 @@ definition:
       source: parent_command
       requested_action: cancel_work_item
       allowed_from: nonterminal_except_cancellation_flow
-      excluded_states: [awaiting_cancellation_authorization, resuming_denied_cancellation, refreshing_cancellation_admission_facts, reconciling_cancellation, reconciling_cancellation_external_outcome, reconciling_cancellation_stack_entry, cancelling_child_set, awaiting_child_cancellations]
+      excluded_states: [awaiting_cancellation_authorization, resuming_denied_cancellation, refreshing_cancellation_admission_facts, reconciling_cancellation, reconciling_cancellation_external_outcome, reconciling_cancellation_stack_entry, reconciling_cancellation_external_stack_entry, cancelling_child_set, awaiting_child_cancellations]
       continuation: persist_source_state_and_driver
       on_duplicate: retain_current_cancellation_state
       required_evidence: [child_cancellation_request, cancellation_receipt]
@@ -1101,10 +1101,14 @@ definition:
       progress: parent_handoff
       on_signal:
         release_independent: merge_gate
-        stack_entry_landed: reconciling
+        stack_entry_landed: recording_stack_entry_landing
         integration_contribution_accepted: done
         re_review_required: refreshing_child_review_facts
         parent_failed: blocked
+    recording_stack_entry_landing:
+      activity: record_stack_entry_landing
+      on_success: done
+      on_failure: blocked
     integration_review:
       progress: review_barrier
       review:
@@ -1184,6 +1188,11 @@ definition:
     fencing_independent_release:
       activity: invalidate_independent_release
       on_success: refreshing_independent_child_review_facts
+      on_failure: blocked
+    fencing_external_independent_release:
+      activity: invalidate_external_independent_release
+      preserved_progress_driver: external_merge_wait
+      on_success: awaiting_external_merge
       on_failure: blocked
     requesting_independent_child_review:
       activity: request_independent_child_review
@@ -1267,20 +1276,24 @@ definition:
       wait:
         fact_kind: external_merge
         refresh_contract: registered.remote_reconciliation.v1
-        nonterminal_facts: [invalidated_release_open_unmerged, integration_child_outcome_stale]
-        preserve_wait_identity_on: [integration_child_outcome_stale]
+        nonterminal_facts: [invalidated_release_open_unmerged, integration_child_outcome_stale, authorization_stale]
+        preserve_wait_identity_on: [integration_child_outcome_stale, authorization_stale]
         max_refreshes: 120
         deadline: 24h
         backoff: {initial: 30s, maximum: 10m, multiplier: 2}
       on_signal:
         merged: reconciling_external_merge
+        authorization_stale: awaiting_external_merge
+        stale_authorization_subject_quarantined: merge_gate
+        merge_after_authorization_stale: reconciling_external_merge
         direct_review_stale: refreshing_direct_review_facts
         integration_review_stale: refreshing_integration_review_facts
         integration_child_outcome_stale: awaiting_external_merge
         integration_outcome_quarantined: refreshing_integration_review_facts
         merge_after_integration_outcome_stale: reconciling_external_merge
-        independent_child_review_stale: fencing_independent_release
+        independent_child_review_stale: fencing_external_independent_release
         invalidated_release_quarantined: awaiting_parent_handoff
+        invalidated_trigger_review_quarantined: refreshing_independent_child_review_facts
         invalidated_release_identity_drift: blocked
         merge_after_invalidation: reconciling_external_merge
         remote_failed: blocked
@@ -1292,6 +1305,7 @@ definition:
         direct_merged: done
         integration_parent_merged: releasing_integration_children
         independent_child_merged: done
+        merge_after_authorization_stale: blocked
         integration_child_outcome_stale: blocked
         merge_after_integration_outcome_stale: blocked
         invalidated_release_quarantined: awaiting_parent_handoff
@@ -1395,11 +1409,16 @@ definition:
       wait:
         fact_kind: external_stack_entry_merge
         refresh_contract: registered.stack_entry_reconciliation.v1
+        nonterminal_facts: [authorization_stale]
+        preserve_wait_identity_on: [authorization_stale]
         max_refreshes: 120
         deadline: 24h
         backoff: {initial: 30s, maximum: 10m, multiplier: 2}
       on_signal:
         merged: reconciling_external_stack_entry
+        authorization_stale: awaiting_external_stack_merge
+        stale_authorization_subject_quarantined: stack_merge_gate
+        merge_after_authorization_stale: reconciling_external_stack_entry
         review_stale: requesting_stack_child_reviews
         rebase_required: stack_rebase_gate
         remote_failed: blocked
@@ -1408,8 +1427,8 @@ definition:
     reconciling_external_stack_entry:
       activity: reconcile_external_stack_entry
       on_signal:
-        more_entries: stack_rebase_gate
-        stack_complete: reconciling_child_set
+        entry_confirmed: releasing_landed_stack_child
+        merge_after_authorization_stale: blocked
         divergence: blocked
       on_failure: blocked
     landing_stack_entry:
@@ -1419,9 +1438,20 @@ definition:
     reconciling_stack_entry:
       activity: reconcile_stack_entry
       on_signal:
-        more_entries: stack_rebase_gate
-        stack_complete: reconciling_child_set
+        entry_confirmed: releasing_landed_stack_child
         divergence: blocked
+      on_failure: blocked
+    releasing_landed_stack_child:
+      activity: release_landed_stack_child
+      on_success: awaiting_stack_entry_acknowledgement
+      on_failure: blocked
+    awaiting_stack_entry_acknowledgement:
+      progress: child_barrier
+      on_signal:
+        acknowledged_more_entries: stack_rebase_gate
+        acknowledged_stack_complete: reconciling_child_set
+        acknowledged_cancel_remaining: cancelling_child_set
+        child_failed: blocked
       on_failure: blocked
     stack_rebase_gate:
       activity: evaluate_stack_rebase_authority
@@ -1552,6 +1582,7 @@ definition:
         subject_succeeded: done
         integration_parent_merged: releasing_integration_children
         stack_entry_merged: reconciling_cancellation_stack_entry
+        external_stack_entry_merged: reconciling_cancellation_external_stack_entry
         continuation_required: blocked
         facts_unavailable: blocked
         divergence: blocked
@@ -1559,8 +1590,14 @@ definition:
     reconciling_cancellation_stack_entry:
       activity: reconcile_stack_entry
       on_signal:
-        more_entries: cancelling_child_set
-        stack_complete: reconciling_child_set
+        entry_confirmed: releasing_landed_stack_child
+        divergence: blocked
+      on_failure: blocked
+    reconciling_cancellation_external_stack_entry:
+      activity: reconcile_external_stack_entry
+      on_signal:
+        entry_confirmed: releasing_landed_stack_child
+        merge_after_authorization_stale: blocked
         divergence: blocked
       on_failure: blocked
     cancelling_child_set:
@@ -1939,6 +1976,12 @@ activities:
     required_evidence: [parent_release_snapshot, parent_handoff_receipt, merge_gate_result]
     produces: [parent_release_invalidation]
 
+  invalidate_external_independent_release:
+    executor: registered_server
+    contract: registered.parent_handoff_external_wait_invalidation.v1
+    required_evidence: [parent_release_snapshot, parent_handoff_receipt, merge_gate_result, external_merge_wait_snapshot]
+    produces: [parent_release_invalidation]
+
   release_integration_children:
     executor: registered_server
     contract: registered.integration_child_handoff_release.v1
@@ -2145,13 +2188,14 @@ activities:
   reconcile_stack_entry:
     executor: registered_server
     contract: registered.stack_entry_reconciliation.v1
+    required_evidence: [remote_change_binding, merge_attempt_receipt, child_materialization, child_outcome, review_subject_snapshot, semantic_risk_assessment, stack_review_receipt, stack_entry_gate_snapshot, merge_fact_snapshot, merge_gate_result, authorization_receipt]
     produces: [stack_entry_reconciliation, stack_rebase_context]
 
   reconcile_external_merge:
     executor: registered_server
     contract: registered.external_merge_reconciliation.v1
     required_evidence:
-      all: [external_merge_wait_snapshot, remote_merge_confirmation]
+      all: [external_merge_wait_snapshot, remote_merge_confirmation, authorization_receipt]
       by_wait_mode:
         current: []
         release_invalidated: [parent_release_invalidation]
@@ -2163,8 +2207,21 @@ activities:
   reconcile_external_stack_entry:
     executor: registered_server
     contract: registered.external_stack_entry_reconciliation.v1
-    required_evidence: [external_merge_wait_snapshot, remote_merge_confirmation]
+    required_evidence: [external_merge_wait_snapshot, remote_merge_confirmation, authorization_receipt]
     produces: [stack_entry_reconciliation, stack_rebase_context]
+
+  release_landed_stack_child:
+    executor: registered_server
+    contract: registered.stack_landing_handoff.v1
+    required_evidence: [child_materialization, child_outcome, stack_entry_reconciliation]
+    produces: [stack_entry_landing_receipt]
+
+  record_stack_entry_landing:
+    executor: registered_server
+    contract: registered.stack_landing_acknowledgement.v1
+    required_evidence: [stack_entry_landing_receipt]
+    produces: [stack_entry_landing_acknowledgement]
+    terminal_fold_produces: [child_outcome]
 
   evaluate_stack_rebase_authority:
     executor: registered_server
@@ -2250,10 +2307,10 @@ activities:
     executor: registered_server
     contract: registered.remote_reconciliation.v1
     required_evidence:
-      all: []
+      all: [remote_change_binding, merge_attempt_receipt, merge_fact_snapshot, merge_gate_result, authorization_receipt]
       by_subject:
         direct: []
-        independent_child: []
+        independent_child: [parent_release_snapshot, parent_handoff_receipt]
         integration_parent: [child_materialization, child_outcome]
     produces: [remote_merge_confirmation]
 
@@ -2357,6 +2414,12 @@ evidence:
   stack_entry_reconciliation:
     payload_schema: .harness/schemas/stack-entry-reconciliation.v1.json
     allowed_producers: [server_policy_engine]
+  stack_entry_landing_receipt:
+    payload_schema: .harness/schemas/stack-entry-landing-receipt.v1.json
+    allowed_producers: [server_policy_engine]
+  stack_entry_landing_acknowledgement:
+    payload_schema: .harness/schemas/stack-entry-landing-acknowledgement.v1.json
+    allowed_producers: [runtime_enforcement]
   stack_entry_gate_snapshot:
     payload_schema: .harness/schemas/stack-entry-gate-snapshot.v1.json
     allowed_producers: [server_policy_engine]
@@ -2547,13 +2610,17 @@ stateDiagram-v2
     stack_merge_gate --> reconciling_child_set: stack already complete
     stack_merge_gate --> awaiting_external_stack_merge: provider merge action unavailable
     awaiting_external_stack_merge --> reconciling_external_stack_entry: external merge confirmed
+    awaiting_external_stack_merge --> awaiting_external_stack_merge: authorization stale; preserve wait identity
+    awaiting_external_stack_merge --> stack_merge_gate: stale-authorization subject closed unmerged
     awaiting_external_stack_merge --> requesting_stack_child_reviews: review stale
     awaiting_external_stack_merge --> stack_rebase_gate: rebase required
-    reconciling_external_stack_entry --> stack_rebase_gate: more entries
-    reconciling_external_stack_entry --> reconciling_child_set: stack complete
+    reconciling_external_stack_entry --> releasing_landed_stack_child: entry confirmed
+    reconciling_external_stack_entry --> blocked: merge after authorization stale
     landing_stack_entry --> reconciling_stack_entry
-    reconciling_stack_entry --> stack_rebase_gate: more entries
-    reconciling_stack_entry --> reconciling_child_set: stack complete
+    reconciling_stack_entry --> releasing_landed_stack_child: entry confirmed
+    releasing_landed_stack_child --> awaiting_stack_entry_acknowledgement: landed signal committed
+    awaiting_stack_entry_acknowledgement --> stack_rebase_gate: child ack; more entries
+    awaiting_stack_entry_acknowledgement --> reconciling_child_set: child ack; stack complete
     stack_rebase_gate --> rebasing_stack: authorized
     stack_rebase_gate --> awaiting_stack_rebase_authorization: human required
     awaiting_stack_rebase_authorization --> rebasing_stack: authorization received
@@ -2640,6 +2707,8 @@ stateDiagram-v2
     revalidating_merge_authorization --> fencing_independent_release: child review stale
     revalidating_merge_authorization --> awaiting_external_merge: provider merge action unavailable
     awaiting_external_merge --> reconciling_external_merge: external merge confirmed
+    awaiting_external_merge --> awaiting_external_merge: authorization stale; preserve wait identity
+    awaiting_external_merge --> merge_gate: stale-authorization subject closed unmerged
     awaiting_external_merge --> refreshing_direct_review_facts: direct review stale
     awaiting_external_merge --> refreshing_integration_review_facts: integration review stale
     awaiting_external_merge --> awaiting_external_merge: integration child outcome stale; preserve wait identity
@@ -2653,6 +2722,7 @@ stateDiagram-v2
     reconciling_external_merge --> releasing_integration_children: integration parent merge confirmed
     reconciling_external_merge --> blocked: integration child outcome stale
     reconciling_external_merge --> blocked: merge after integration child outcome stale
+    reconciling_external_merge --> blocked: merge after authorization stale
     reconciling_external_merge --> awaiting_parent_handoff: invalidated remote change is closed unmerged
     reconciling_external_merge --> blocked: invalidated release identity drift
     reconciling_external_merge --> blocked: merge occurred after release invalidation
@@ -3052,6 +3122,12 @@ collected `merge_fact_snapshot`; the gate result binds both. Revalidation consum
 snapshots/gate/authorization plus the same immutable aggregate inputs and emits successor snapshots.
 Any provider target consumes the exact snapshots selected by its gate result; a missing or stale
 aggregate input cannot be recovered from mutable `IntegrationProgress`.
+
+After each stack merge is reconciled, `release_landed_stack_child` emits exactly one
+`stack_entry_landed` command and receipt for the corresponding child. The child records that receipt,
+terminalizes, and emits its acknowledgement/`ChildOutcome`; the parent cannot advance the landing
+cursor, rebase the next entry, complete the stack, or cancel remaining entries until the dedicated
+child barrier observes that acknowledgement.
 
 When the selected provider lacks `atomic_full_merge_predicate`, an eligible ordinary or stack gate
 emits `external_merge_required`. Its durable wait preserves the gate result and, when applicable,
@@ -3763,6 +3839,17 @@ the quarantine into integration fact/risk/validation/review refresh. A merge obs
 child outcome changed is reconciled with the current child set and blocks as a policy violation;
 leaving the wait cannot make that merge invisible.
 
+Every direct and stack external-merge refresh also revalidates the exact authorization receipt
+bound by its wait snapshot. Expiry or revocation switches the same wait to authorization-stale mode;
+an open PR remains monitored and cannot reuse the receipt. Exact closed-unmerged facts discharge
+the quarantine to the matching merge gate. If the remote merge occurred, dedicated reconciliation
+records a policy violation and blocks; it cannot convert a stale receipt into success.
+
+When the child that detected stale independent review already owns an external-merge wait,
+`fencing_external_independent_release` preserves that exact wait while invalidating the release.
+The child remains quarantined until its PR is proven closed unmerged, then begins review refresh;
+the sibling handoff route is not used for this triggering child.
+
 Entering an operator gate atomically persists its requested action, prerequisite Evidence IDs,
 accepted receipt kind, and compiled signal-to-route map. Direct implementation, direct repair, child
 materialization, child repair, integration, integration repair, provider publication,
@@ -4035,8 +4122,9 @@ and a stale worker cannot complete after lease reassignment. Cutover fixtures MU
 new command/job claims are fenced; every claimed non-provider job is cancelled or drained; every
 completion candidate is reconciled; and zero runtime-owned agent processes or workspace leases
 remain before provider or database authority is revoked. Provider fixtures MUST also prove that
-final fence capture is refused until every active provider action is reconciled to a terminal
-outcome and old provider credentials are revoked with zero writers verified; objects observed or
+only provider actions proven never dispatched may be cancelled; final fence capture is refused
+until every possibly dispatched provider action is reconciled to authenticated terminal truth and
+old provider credentials are revoked with zero writers verified; objects observed or
 changed during drain fall at or before the final fence; every poll, webhook, and submission path
 quarantines those pre-cutover objects; an unverifiable provider boundary disables automatic intake;
 and explicit human-authorized adoption creates only new vNext identities.
