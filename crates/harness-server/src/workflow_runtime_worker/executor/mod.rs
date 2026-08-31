@@ -112,12 +112,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             workflow.as_ref(),
         )
         .await?;
-        if let Some(result) = self
-            .execute_server_owned_activity(&job, workflow.as_ref())
-            .await?
-        {
-            return Ok(result);
-        }
         // A pinned agent contract never runs through the ordinary workspace
         // and tool surface: it takes the dedicated enforcement path (empty
         // ephemeral workspace, pinned prompt only, deny-all launch, pinned
@@ -126,10 +120,15 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         // select the ordinary path. Production dispatch reaches this branch
         // only after capability authorization; the executor repeats preflight
         // as defense in depth.
-        if let Some(pinned) =
-            super::agent_contract_enforcement::pinned_agent_contract_for_job(&job)?
+        if let Some(pinned) = super::agent_contract_job::pinned_agent_contract_for_execution(&job)?
         {
             return super::agent_contract_job::execute_contract_job(self.state, &job, pinned).await;
+        }
+        if let Some(result) = self
+            .execute_server_owned_activity(&job, workflow.as_ref())
+            .await?
+        {
+            return Ok(result);
         }
         let source_project_root =
             super::job_context::project_root_for_job(self.state, &job, workflow.as_ref())?;

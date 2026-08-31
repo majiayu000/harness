@@ -106,6 +106,8 @@ Repository pre-push, independent fresh-context review, and GitHub `CI Result` re
 
 The first independent review found three blockers. The remediation binds authorization to the complete post-rewrite runtime profile, classifies every infrastructure error from the dedicated contract path as fatal, and snapshots the persisted runtime job identity plus exact attempt reservations into the atomic completion event for replay validation. A new independent review is still required.
 
+The second independent review found that server-owned activity dispatch still preceded contract extraction and that malformed pinned payloads could escape the typed fatal boundary. Contract extraction now runs first for every activity name, including server-owned name collisions, and every present-contract extraction error is wrapped as a fatal contract execution error. A further fresh-context review remains required.
+
 ## Slice D boundary
 
 Slice D must start from the merged Slice C commit and use the production server dispatch path with a real Codex-only submission. It must capture restart/replay behavior plus latency, token, and cost evidence. It must not broaden this contract into automated merge authorization or the unrelated vNext phases.

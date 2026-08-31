@@ -36,6 +36,13 @@ impl Error for AgentContractExecutionError {
     }
 }
 
+pub(super) fn pinned_agent_contract_for_execution(
+    job: &RuntimeJob,
+) -> anyhow::Result<Option<PinnedJobAgentContract>> {
+    super::agent_contract_enforcement::pinned_agent_contract_for_job(job)
+        .map_err(|error| AgentContractExecutionError::new(error).into())
+}
+
 /// Executes a contract-carrying runtime job end to end: capability preflight,
 /// pinned launch, observation, and verdict validation.
 pub(super) async fn execute_contract_job(
@@ -247,6 +254,7 @@ mod tests {
     async fn enqueue_contract_job(
         store: &harness_workflow::runtime::WorkflowRuntimeStore,
         project_root: &std::path::Path,
+        activity: &str,
     ) -> anyhow::Result<harness_workflow::runtime::RuntimeJob> {
         let workflow = harness_workflow::runtime::WorkflowInstance::new(
             "github_issue_pr",
@@ -265,7 +273,8 @@ mod tests {
         );
         crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
             .await?;
-        let command_payload = contract_command_payload();
+        let mut command_payload = contract_command_payload();
+        command_payload["activity"] = serde_json::json!(activity);
         let command = harness_workflow::runtime::WorkflowCommand::new(
             harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
             "classify-126",
@@ -288,7 +297,7 @@ mod tests {
                     "command_type": command.command_type,
                     "dedupe_key": command.dedupe_key,
                     "command": command_payload,
-                    "activity": "classify_scope",
+                    "activity": activity,
                     "runtime_profile": runtime_profile,
                 }),
             )
@@ -325,7 +334,7 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .expect("workflow runtime store should be configured");
-        let runtime_job = enqueue_contract_job(store, &project_root).await?;
+        let runtime_job = enqueue_contract_job(store, &project_root, "classify_scope").await?;
 
         let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
             &state,
@@ -363,7 +372,8 @@ mod tests {
     /// repository, pinned schema document handed to the backend, and a structured
     /// verdict recorded on the succeeded result.
     #[tokio::test]
-    async fn contract_job_executes_pinned_attempt_on_conforming_backend() -> anyhow::Result<()> {
+    async fn contract_job_named_like_server_activity_still_executes_pinned_contract(
+    ) -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
         }
@@ -390,7 +400,12 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .expect("workflow runtime store should be configured");
-        let runtime_job = enqueue_contract_job(store, &project_root).await?;
+        let runtime_job = enqueue_contract_job(
+            store,
+            &project_root,
+            harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+        )
+        .await?;
 
         let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
             &state,
@@ -514,7 +529,7 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .expect("workflow runtime store should be configured");
-        let runtime_job = enqueue_contract_job(store, &project_root).await?;
+        let runtime_job = enqueue_contract_job(store, &project_root, "classify_scope").await?;
 
         let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
             &state,
@@ -586,7 +601,7 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .expect("workflow runtime store should be configured");
-        let runtime_job = enqueue_contract_job(store, &project_root).await?;
+        let runtime_job = enqueue_contract_job(store, &project_root, "classify_scope").await?;
         assert!(
             store
                 .reserve_agent_contract_attempt(&runtime_job.id, 1, 0)
@@ -655,7 +670,7 @@ mod tests {
             .workflow_runtime_store
             .as_ref()
             .expect("workflow runtime store should be configured");
-        let runtime_job = enqueue_contract_job(store, &project_root).await?;
+        let runtime_job = enqueue_contract_job(store, &project_root, "classify_scope").await?;
 
         let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
             &state,

@@ -94,17 +94,25 @@ mod tests {
 
     #[test]
     fn agent_contract_infrastructure_errors_are_fatal() {
-        let error = super::super::agent_contract_job::AgentContractExecutionError::new(
-            anyhow::anyhow!("attempt completion event could not be persisted"),
+        let job = RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexExec,
+            "codex-contract",
+            serde_json::json!({
+                "activity": "classify_scope",
+                "command": {"agent_contract": null}
+            }),
         );
+        let error = super::super::agent_contract_job::pinned_agent_contract_for_execution(&job)
+            .expect_err("malformed present contract must fail extraction");
 
-        let result = execution_error_result("classify_scope".to_string(), error.into());
+        let result = execution_error_result("classify_scope".to_string(), error);
 
         assert_eq!(result.error_kind, Some(ActivityErrorKind::Fatal));
         assert!(result
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("attempt completion event")));
+            .is_some_and(|error| error.contains("unparseable agent_contract payload")));
     }
 
     #[test]
