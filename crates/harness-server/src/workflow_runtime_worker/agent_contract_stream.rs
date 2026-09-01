@@ -4,6 +4,8 @@ use harness_core::agent::{AgentBackend, AgentEvent, AgentRequest, AGENT_OUTPUT_S
 use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::workflow::agent_contract_output_schema_document;
 use harness_core::types::TurnId;
+use harness_workflow::runtime::completion_evidence::ARTIFACT_RUNTIME_BUDGET_STOP;
+use harness_workflow::runtime::ActivityArtifact;
 use std::sync::Arc;
 
 use super::agent_contract_attempt::ContractAttempt;
@@ -285,6 +287,18 @@ fn budget_stop_error(stop: &TurnBudgetStop) -> anyhow::Error {
         stop.workflow_id,
         stop.spent_usd,
         stop.budget_usd
+    )
+}
+
+pub(super) fn budget_stop_artifact(stop: &TurnBudgetStop) -> ActivityArtifact {
+    ActivityArtifact::new(
+        ARTIFACT_RUNTIME_BUDGET_STOP,
+        serde_json::json!({
+            "workflow_id": stop.workflow_id,
+            "spent_usd": stop.spent_usd,
+            "budget_usd": stop.budget_usd,
+            "enforcement": "enforce",
+        }),
     )
 }
 

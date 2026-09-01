@@ -44,6 +44,9 @@ pub const ARTIFACT_MERGE_COMPLETION_VERIFICATION: &str = "merge_completion_verif
 /// Server-observed per-attempt stream/tool/model observations for one runtime
 /// turn. Authored only by the runtime worker from its own event stream.
 pub const ARTIFACT_RUNTIME_TURN_OBSERVATIONS: &str = "server_runtime_turn_observations";
+/// Server-observed proof that the in-flight turn was interrupted after its
+/// persisted usage reached the enforced workflow budget.
+pub const ARTIFACT_RUNTIME_BUDGET_STOP: &str = "server_runtime_budget_stop";
 pub const MERGE_COMPLETION_VERIFICATION_SCHEMA: &str =
     "harness.github.merge_completion_verification.v1";
 
@@ -57,7 +60,7 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 12] = [
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 13] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
@@ -68,6 +71,7 @@ pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 12] = [
     ARTIFACT_VERIFIED_ISSUE_STATE,
     ARTIFACT_MERGE_COMPLETION_VERIFICATION,
     ARTIFACT_RUNTIME_TURN_OBSERVATIONS,
+    ARTIFACT_RUNTIME_BUDGET_STOP,
     super::AGENT_CONTRACT_ASSESSMENT_ARTIFACT,
     super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
 ];

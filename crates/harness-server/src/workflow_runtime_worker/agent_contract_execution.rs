@@ -13,7 +13,8 @@ use super::agent_contract_assessment::attach_server_assessment;
 use super::agent_contract_attempt::{contract_violations, parse_contract_verdict};
 use super::agent_contract_enforcement::{turn_observation_artifact, PinnedJobAgentContract};
 use super::agent_contract_stream::{
-    enforced_budget_cost_error, execute_agent_contract_attempt, ContractAttemptFailure,
+    budget_stop_artifact, enforced_budget_cost_error, execute_agent_contract_attempt,
+    ContractAttemptFailure,
 };
 use super::turn_engine::helpers::RuntimeUsageContext;
 
@@ -138,7 +139,7 @@ pub(super) async fn execute_contract_attempts(
                         Some(&error),
                     )
                     .await?;
-                    if budget_stop.is_some() {
+                    if let Some(stop) = budget_stop {
                         return Ok(ActivityResult {
                             activity: activity.to_string(),
                             status: ActivityStatus::Blocked,
@@ -150,7 +151,8 @@ pub(super) async fn execute_contract_attempts(
                             validation: Vec::new(),
                             error: Some(error),
                             error_kind: None,
-                        });
+                        }
+                        .with_artifact(budget_stop_artifact(&stop)));
                     }
                     let mut result = ActivityResult::failed(
                         activity,
@@ -270,10 +272,9 @@ async fn record_attempt_completed(
                 "validation_error": validation_error,
             }),
         )
-        .await?;
-    Ok(())
+        .await
+        .map(|_| ())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

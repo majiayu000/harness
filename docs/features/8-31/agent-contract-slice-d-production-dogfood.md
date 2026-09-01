@@ -83,7 +83,9 @@ explicitly claim that its streamed usage contains reported USD cost before an
 agent contract can launch under `enforce`; otherwise the activity blocks before
 model execution. Shadow and unlimited policies remain available. Mid-turn
 ceiling exhaustion from a cost-reporting backend is retained as a structured
-budget stop and produces a blocked activity rather than a fatal failure.
+server-authored budget stop. The completion transaction recognizes that marker
+before declarative `on_blocked` routing, so it cannot be redirected into a
+terminal state instead of the operator-only budget block.
 
 ## Final production evidence
 
@@ -159,6 +161,7 @@ HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server enfor
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server lease_loss_drains_queued_usage_before_returning
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server enforced_budget_requires_backend_reported_cost
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-workflow budget_ceiling_preempts_terminal_agent_contract_completion
+HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-workflow budget_stop_preempts_declarative_on_blocked_terminal_route
 ```
 
 The first test protects the submission/commit/dispatch fact identity. The
