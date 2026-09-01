@@ -1,6 +1,6 @@
 # Technical Design: Minimal Workflow Classification Path
 
-Status: Approved current-runtime path — Slices A and B merged; Slices C and D pending
+Status: Approved current-runtime path — Slices A through D merged
 
 Date: 2026-08-28
 
@@ -27,8 +27,13 @@ structured-output, enforcement, and replay contracts that a future Workflow arch
   runtime events, supports structured `ActivityResult`, and runs Codex through both oneshot and
   per-turn `AgentBackend` surfaces.
 - Slice A merged in PR #2020: generic declaration, validation, persistence, and contract pinning.
-- Slice B merged in PR #2025: constrained and observable `AgentBackend` execution. The production
-  dispatcher remains fail-closed until Slice C supplies assessment, routing, budgets, and replay.
+- Slice B merged in PR #2025: constrained and observable `AgentBackend` execution.
+- Slice C merged in PR #2028: server-authored assessment, declared outcome routing, bounded
+  correction attempts, and deterministic replay.
+- Slice D merged in PR #2031: sanitized Codex-only production dogfood through the runtime
+  submission API, restart/replay proof, durable usage accounting, and published evidence. The
+  Codex stream did not report monetary cost, so the evidence records cost as unknown rather than
+  treating its numeric placeholder as a measurement.
 - PR #2010 proves a Codex-backed, no-tool classifier can execute, but its two commits touch 43 files
   with approximately 1,854 insertions and 429 deletions.
 - PR #2010 also introduces a classifier-specific config type and cross-layer routing. That shape is
@@ -247,7 +252,7 @@ Status: merged in PR #2020.
 
 ### Slice B — Backend enforcement and structured output
 
-Status: merged in PR #2025. The dispatcher barrier remains closed by design.
+Status: merged in PR #2025.
 
 - pass the pinned output schema through `AgentBackend` capabilities;
 - make Codex the first conforming runtime;
@@ -256,7 +261,7 @@ Status: merged in PR #2025. The dispatcher barrier remains closed by design.
 
 ### Slice C — Assessment, routing, and replay
 
-Status: not implemented.
+Status: merged in PR #2028.
 
 - validate one candidate output;
 - persist one server-authored assessment;
@@ -266,7 +271,8 @@ Status: not implemented.
 
 ### Slice D — Dogfood
 
-Status: not implemented.
+Status: merged in PR #2031. Production dogfood completed; monetary cost remains unknown because
+the provider stream did not report it.
 
 - run a real classification through the Workflow runtime submission API using Codex;
 - prove operation with no Claude credentials;
