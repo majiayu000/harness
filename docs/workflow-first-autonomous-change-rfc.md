@@ -2703,7 +2703,7 @@ stateDiagram-v2
     awaiting_child_repair_authorization --> repairing_child_change: repair approved
     leaf_review_child --> awaiting_parent_handoff: approved
     awaiting_parent_handoff --> merge_gate: independent released
-    awaiting_parent_handoff --> reconciling: stack entry landed
+    awaiting_parent_handoff --> recording_stack_entry_landing: stack entry landed
     awaiting_parent_handoff --> done: integration contribution accepted
     integrating --> collecting_integrated_change_facts
     repairing_integration --> collecting_integrated_change_facts
@@ -2762,7 +2762,7 @@ stateDiagram-v2
     awaiting_external_merge --> awaiting_external_merge: integration child outcome stale; preserve wait identity
     awaiting_external_merge --> refreshing_integration_review_facts: invalidated integration PR closed unmerged
     awaiting_external_merge --> reconciling_external_merge: merge after integration child outcome stale
-    awaiting_external_merge --> fencing_independent_release: child review stale
+    awaiting_external_merge --> fencing_external_independent_release: child review stale
     awaiting_external_merge --> awaiting_parent_handoff: invalidated remote change is closed unmerged
     awaiting_external_merge --> blocked: invalidated release identity drift
     awaiting_external_merge --> reconciling_external_merge: merge observed after invalidation
