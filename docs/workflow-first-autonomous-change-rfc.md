@@ -629,6 +629,8 @@ ChildWorkItemRelation
 ```
 
 Children have their own workflow state, workspace, attempts, evidence, review receipts, and outcomes.
+A child may remain a member across decomposition revisions; relation identity therefore includes
+the decomposition revision so replay preserves membership in every historical graph.
 A `ChildOutcome` may record the relation's declared readiness milestone without terminalizing the
 child; budget reservation returns only after a later terminal outcome. Parent progress consumes
 typed milestone or terminal outcomes rather than inferring completion from prose or branch existence.
@@ -834,7 +836,7 @@ definition:
       on_signal:
         independent_ready: preparing_independent_set_review
         stacked_ready: preparing_stack_review
-        integration_ready: authorizing_integration
+        integration_ready: preparing_integration_execution_subject
         child_failed: blocked
     preparing_independent_set_review:
       activity: materialize_parent_review_subject
@@ -919,6 +921,22 @@ definition:
       on_signal:
         decompose: validating_decomposition
         abstain: blocked
+    preparing_integration_execution_subject:
+      activity: materialize_parent_review_subject
+      on_success: collecting_integration_execution_facts
+      on_failure: blocked
+    collecting_integration_execution_facts:
+      activity: collect_parent_composition_facts
+      on_success: assessing_integration_execution_risk
+      on_failure: blocked
+    assessing_integration_execution_risk:
+      activity: assess_risk
+      on_signal:
+        low: authorizing_integration
+        medium: authorizing_integration
+        high: authorizing_integration
+        abstain: blocked
+      on_failure: blocked
     authorizing_integration:
       activity: evaluate_integration_execution_authority
       on_signal:
@@ -1773,7 +1791,7 @@ activities:
     contract: registered.execution_authority_gate.v1
     authority: execution
     requested_action: integrate_children
-    required_evidence: [decomposition_validation, child_materialization, child_outcome, semantic_risk_assessment]
+    required_evidence: [decomposition_validation, child_materialization, child_outcome, review_subject_snapshot, semantic_risk_assessment]
     produces: [authorization_gate_result, authorization_receipt]
 
   evaluate_integration_repair_authority:
@@ -2602,7 +2620,10 @@ stateDiagram-v2
     preparing_stack_review --> collecting_stack_review_facts: ordered identity materialized
     collecting_stack_review_facts --> assessing_stack_review_risk: aggregate facts collected
     assessing_stack_review_risk --> reviewing_stack: aggregate risk classified
-    executing_children --> authorizing_integration: integration inputs ready
+    executing_children --> preparing_integration_execution_subject: integration inputs ready
+    preparing_integration_execution_subject --> collecting_integration_execution_facts: aggregate identity materialized
+    collecting_integration_execution_facts --> assessing_integration_execution_risk: aggregate facts collected
+    assessing_integration_execution_risk --> authorizing_integration: aggregate risk classified
     authorizing_integration --> integrating: execution authorized
     authorizing_integration --> awaiting_integration_execution_authorization: human required
     awaiting_integration_execution_authorization --> integrating: integration approved
@@ -2832,6 +2853,9 @@ stateDiagram-v2
     leaf_review_direct --> blocked
     leaf_review_child --> blocked
     awaiting_parent_handoff --> blocked
+    preparing_integration_execution_subject --> blocked
+    collecting_integration_execution_facts --> blocked
+    assessing_integration_execution_risk --> blocked
     integrating --> blocked
     authorizing_integration_repair --> blocked
     awaiting_integration_repair_authorization --> blocked
@@ -3547,6 +3571,10 @@ emit the barrier's `approved` signal. Before an independent-set or stack barrier
 registered parent-composition collector derives a `CodeChangeSnapshot` from the exact materialized
 aggregate subject and `assess_risk` binds its result to that aggregate identity. The barrier and
 each review activity consume that assessment, so quorum never falls back to the pre-child risk.
+Before integration writes begin, the same subject materialization, parent-composition fact
+collection, and risk assessment run over the complete child set. Integration execution authority
+requires that current aggregate subject and its derived assessment, so cross-child interactions can
+raise the execution tier before the integration workspace is mutated.
 
 ### 18.4 Integration review
 
