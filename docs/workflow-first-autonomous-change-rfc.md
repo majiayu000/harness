@@ -857,6 +857,7 @@ definition:
       review:
         activity: review_independent_set
         distinct_assignments: true
+        distinct_reviewer_identities: true
         quorum_policy: parent_composition
       on_signal:
         approved: releasing_independent_children
@@ -907,6 +908,7 @@ definition:
       review:
         activity: review_stack
         distinct_assignments: true
+        distinct_reviewer_identities: true
         quorum_policy: parent_composition
       on_signal:
         approved: stack_merge_gate
@@ -1277,8 +1279,8 @@ definition:
       wait:
         fact_kind: external_merge
         refresh_contract: registered.remote_reconciliation.v1
-        nonterminal_facts: [invalidated_release_open_unmerged, integration_child_outcome_stale, authorization_stale]
-        preserve_wait_identity_on: [integration_child_outcome_stale, authorization_stale]
+        nonterminal_facts: [invalidated_release_open_unmerged, integration_child_outcome_stale, authorization_stale, direct_review_stale, integration_review_stale]
+        preserve_wait_identity_on: [integration_child_outcome_stale, authorization_stale, direct_review_stale, integration_review_stale]
         max_refreshes: 120
         deadline: 24h
         backoff: {initial: 30s, maximum: 10m, multiplier: 2}
@@ -1287,8 +1289,12 @@ definition:
         authorization_stale: awaiting_external_merge
         stale_authorization_subject_quarantined: merge_gate
         merge_after_authorization_stale: reconciling_external_merge
-        direct_review_stale: refreshing_direct_review_facts
-        integration_review_stale: refreshing_integration_review_facts
+        direct_review_stale: awaiting_external_merge
+        stale_direct_review_subject_quarantined: refreshing_direct_review_facts
+        merge_after_direct_review_stale: reconciling_external_merge
+        integration_review_stale: awaiting_external_merge
+        stale_integration_review_subject_quarantined: refreshing_integration_review_facts
+        merge_after_integration_review_stale: reconciling_external_merge
         integration_child_outcome_stale: awaiting_external_merge
         integration_outcome_quarantined: refreshing_integration_review_facts
         merge_after_integration_outcome_stale: reconciling_external_merge
@@ -1307,6 +1313,8 @@ definition:
         integration_parent_merged: releasing_integration_children
         independent_child_merged: done
         merge_after_authorization_stale: blocked
+        merge_after_direct_review_stale: blocked
+        merge_after_integration_review_stale: blocked
         integration_child_outcome_stale: blocked
         merge_after_integration_outcome_stale: blocked
         invalidated_release_quarantined: awaiting_parent_handoff
@@ -1410,8 +1418,8 @@ definition:
       wait:
         fact_kind: external_stack_entry_merge
         refresh_contract: registered.stack_entry_reconciliation.v1
-        nonterminal_facts: [authorization_stale, stack_child_outcome_stale]
-        preserve_wait_identity_on: [authorization_stale, stack_child_outcome_stale]
+        nonterminal_facts: [authorization_stale, stack_child_outcome_stale, review_stale]
+        preserve_wait_identity_on: [authorization_stale, stack_child_outcome_stale, review_stale]
         max_refreshes: 120
         deadline: 24h
         backoff: {initial: 30s, maximum: 10m, multiplier: 2}
@@ -1423,7 +1431,9 @@ definition:
         stack_outcome_quarantined: requesting_stack_child_reviews
         merge_after_stack_outcome_stale: reconciling_external_stack_entry
         merge_after_authorization_stale: reconciling_external_stack_entry
-        review_stale: requesting_stack_child_reviews
+        review_stale: awaiting_external_stack_merge
+        stale_review_subject_quarantined: requesting_stack_child_reviews
+        merge_after_review_stale: reconciling_external_stack_entry
         rebase_required: stack_rebase_gate
         remote_failed: blocked
         deadline_exceeded: blocked
@@ -1434,6 +1444,7 @@ definition:
         entry_confirmed: releasing_landed_stack_child
         merge_after_authorization_stale: blocked
         merge_after_stack_outcome_stale: blocked
+        merge_after_review_stale: blocked
         divergence: blocked
       on_failure: blocked
     landing_stack_entry:
@@ -2620,11 +2631,14 @@ stateDiagram-v2
     awaiting_external_stack_merge --> awaiting_external_stack_merge: stack child outcome stale; preserve wait identity
     awaiting_external_stack_merge --> requesting_stack_child_reviews: stale-outcome subject closed unmerged
     awaiting_external_stack_merge --> reconciling_external_stack_entry: merge after stack child outcome stale
-    awaiting_external_stack_merge --> requesting_stack_child_reviews: review stale
+    awaiting_external_stack_merge --> awaiting_external_stack_merge: review stale; preserve wait identity
+    awaiting_external_stack_merge --> requesting_stack_child_reviews: stale-review subject closed unmerged
+    awaiting_external_stack_merge --> reconciling_external_stack_entry: merge after review stale
     awaiting_external_stack_merge --> stack_rebase_gate: rebase required
     reconciling_external_stack_entry --> releasing_landed_stack_child: entry confirmed
     reconciling_external_stack_entry --> blocked: merge after authorization stale
     reconciling_external_stack_entry --> blocked: merge after stack child outcome stale
+    reconciling_external_stack_entry --> blocked: merge after review stale
     landing_stack_entry --> reconciling_stack_entry
     reconciling_stack_entry --> releasing_landed_stack_child: entry confirmed
     releasing_landed_stack_child --> awaiting_stack_entry_acknowledgement: landed signal committed
@@ -2718,8 +2732,12 @@ stateDiagram-v2
     awaiting_external_merge --> reconciling_external_merge: external merge confirmed
     awaiting_external_merge --> awaiting_external_merge: authorization stale; preserve wait identity
     awaiting_external_merge --> merge_gate: stale-authorization subject closed unmerged
-    awaiting_external_merge --> refreshing_direct_review_facts: direct review stale
-    awaiting_external_merge --> refreshing_integration_review_facts: integration review stale
+    awaiting_external_merge --> awaiting_external_merge: direct review stale; preserve wait identity
+    awaiting_external_merge --> refreshing_direct_review_facts: stale direct-review subject closed unmerged
+    awaiting_external_merge --> reconciling_external_merge: merge after direct review stale
+    awaiting_external_merge --> awaiting_external_merge: integration review stale; preserve wait identity
+    awaiting_external_merge --> refreshing_integration_review_facts: stale integration-review subject closed unmerged
+    awaiting_external_merge --> reconciling_external_merge: merge after integration review stale
     awaiting_external_merge --> awaiting_external_merge: integration child outcome stale; preserve wait identity
     awaiting_external_merge --> refreshing_integration_review_facts: invalidated integration PR closed unmerged
     awaiting_external_merge --> reconciling_external_merge: merge after integration child outcome stale
@@ -2729,6 +2747,8 @@ stateDiagram-v2
     awaiting_external_merge --> reconciling_external_merge: merge observed after invalidation
     reconciling_external_merge --> done: direct or independent child merge confirmed
     reconciling_external_merge --> releasing_integration_children: integration parent merge confirmed
+    reconciling_external_merge --> blocked: merge after direct review stale
+    reconciling_external_merge --> blocked: merge after integration review stale
     reconciling_external_merge --> blocked: integration child outcome stale
     reconciling_external_merge --> blocked: merge after integration child outcome stale
     reconciling_external_merge --> blocked: merge after authorization stale
@@ -3862,6 +3882,13 @@ an open PR remains monitored and cannot reuse the receipt. Exact closed-unmerged
 the quarantine to the matching merge gate. If the remote merge occurred, dedicated reconciliation
 records a policy violation and blocks; it cannot convert a stale receipt into success.
 
+Review staleness during a direct, integration, or stack external-merge wait follows the same
+durable quarantine rule. The existing wait identity, webhook routing, refresh schedule, and bound
+snapshot remain active while the remote change is open. Exact closed-unmerged facts discharge the
+quarantine into the subject-specific fact and review refresh path. A merge observed after review
+became stale is reconciled against the original wait snapshot and blocks as a policy violation;
+review refresh cannot make that merge invisible.
+
 When the child that detected stale independent review already owns an external-merge wait,
 `fencing_external_independent_release` preserves that exact wait while invalidating the release.
 The child remains quarantined until its PR is proven closed unmerged, then begins review refresh;
@@ -4106,6 +4133,7 @@ Required metrics include:
 - malformed reviewer output is protocol failure, never approval;
 - same identity cannot fill author and reviewer roles;
 - one effective reviewer identity cannot satisfy multiple assignments in the same quorum;
+- independent-set and stack parent review barriers enforce reviewer-identity uniqueness;
 - push after review invalidates the receipt;
 - child approval does not satisfy parent integration review;
 - unresolved current review thread blocks merge;
@@ -4118,6 +4146,8 @@ Required metrics include:
   outcome-ambiguous;
 - a GitHub external merge wait remains quarantined after release invalidation while its remote
   change is open and unmerged, and a later merge is observed and blocked;
+- direct, integration, and stack external merge waits preserve their wait identity after review
+  staleness until exact closed-unmerged confirmation, and block a merge observed meanwhile;
 - only an exact closed-unmerged provider confirmation releases that quarantine to parent handoff;
 - cancellation admission with an external-merge continuation rejects a missing or mismatched wait
   snapshot, release-invalidation overlay, driver snapshot, or fresh remote confirmation;
