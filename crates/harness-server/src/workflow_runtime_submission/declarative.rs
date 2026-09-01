@@ -5,7 +5,7 @@ use super::{
 };
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
-    build_declarative_submission_decision, persisted_declarative_definition,
+    build_declarative_submission_decision, persisted_declarative_definition, DataProvenance,
     DeclarativeWorkflowDefinition, ValidationContext, WorkflowCommandStatus, WorkflowInstance,
     WorkflowRuntimeStore, WorkflowSubject, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload, DECLARATIVE_SUBMISSION_DECISION,
@@ -26,6 +26,7 @@ pub(crate) struct DeclarativeSubmissionRuntimeContext<'a> {
     pub subject_key: Option<&'a str>,
     pub repo: Option<&'a str>,
     pub author_trust_class: Option<IsolationTrustClass>,
+    pub classification_input_provenance: DataProvenance,
 }
 
 pub(crate) async fn record_declarative_submission(
@@ -231,6 +232,7 @@ pub(super) fn submission_instance(
         "prompt_summary": "declarative workflow task",
         "prompt_chars": ctx.prompt.chars().count(),
         "prompt_ref": prompt_ref,
+        "classification_input": ctx.prompt,
         "source": ctx.source,
         "external_id": ctx.external_id,
         "repo": ctx.repo,
@@ -250,7 +252,10 @@ pub(super) fn submission_instance(
         ),
     )
     .with_id(workflow_id)
-    .with_data_field_provenance(data, submission_field_provenance)
+    .with_data_field_provenance(data, |field| match field {
+        "classification_input" => ctx.classification_input_provenance,
+        _ => submission_field_provenance(field),
+    })
 }
 
 async fn persist_definition_metadata(

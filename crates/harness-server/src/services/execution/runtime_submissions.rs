@@ -204,6 +204,7 @@ impl DefaultExecutionService {
                 subject_key: None,
                 repo: prepared.req.repo.as_deref(),
                 author_trust_class: None,
+                classification_input_provenance: harness_workflow::runtime::DataProvenance::Server,
             },
         )
         .await

@@ -10,7 +10,7 @@ use harness_core::{
 };
 use harness_workflow::runtime::{
     build_declarative_submission_decision, store::RuntimeJobEnqueueOutcome,
-    validate_declarative_agent_contract_command, ActivityResult, ActivitySignal,
+    validate_declarative_agent_contract_command, ActivityResult, ActivitySignal, DataProvenance,
     DeclarativeWorkflowDefinition, RuntimeKind, WorkflowCommandStatus, WorkflowCommandType,
     WorkflowDefinitionRegistry,
 };
@@ -209,6 +209,7 @@ fn agent_contract_submission_command_matches_the_committed_instance() -> anyhow:
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
         "/project",
         "agent-contract-workflow",
@@ -216,6 +217,30 @@ fn agent_contract_submission_command_matches_the_committed_instance() -> anyhow:
         &definition,
     );
     let decision = build_declarative_submission_decision(&definition, &instance)?;
+    assert_eq!(
+        instance.data["classification_input"],
+        "Assess this submission."
+    );
+    let provenance = instance
+        .data_provenance
+        .as_ref()
+        .expect("declarative submission facts must carry provenance");
+    assert_eq!(
+        provenance.provenance_for("/classification_input"),
+        Some(DataProvenance::Server)
+    );
+    assert!(provenance
+        .value_digests
+        .contains_key("/classification_input"));
+    assert_eq!(
+        decision.commands[0].command["agent_contract_input"]["facts"]["classification_input"],
+        "Assess this submission."
+    );
+    assert_eq!(
+        decision.commands[0].command["agent_contract_input"]["provenance"]["entries"]
+            ["/classification_input"],
+        "server"
+    );
     let mut committed = instance.clone();
     committed.state = decision.next_state.clone();
     committed.version = committed.version.saturating_add(1);
@@ -249,6 +274,7 @@ fn declarative_submission_preserves_intake_identity_and_trust() {
         subject_key: Some("github:owner/repo:issue:42"),
         repo: Some("owner/repo"),
         author_trust_class: Some(IsolationTrustClass::NonCollaborator),
+        classification_input_provenance: DataProvenance::External,
     };
 
     let instance = super::declarative::submission_instance(
@@ -263,6 +289,13 @@ fn declarative_submission_preserves_intake_identity_and_trust() {
     assert_eq!(instance.data["external_id"], "42");
     assert_eq!(instance.data["repo"], "owner/repo");
     assert_eq!(instance.data["author_trust_class"], "non_collaborator");
+    assert_eq!(
+        instance
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/classification_input")),
+        Some(DataProvenance::External)
+    );
 }
 
 #[tokio::test]
@@ -289,6 +322,7 @@ async fn declarative_submission_pins_immutable_definition_metadata() -> anyhow::
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
     )
     .await?;
@@ -348,6 +382,7 @@ async fn declarative_submission_enqueues_initial_activity_atomically() -> anyhow
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
     )
     .await?;
@@ -389,6 +424,7 @@ async fn declarative_submission_mapped_signal_reaches_terminal_state() -> anyhow
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
     )
     .await?;
@@ -478,6 +514,7 @@ async fn declarative_submission_can_be_cancelled_by_an_operator() -> anyhow::Res
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
     )
     .await?;
@@ -520,6 +557,7 @@ async fn declarative_submission_rejects_dependencies() -> anyhow::Result<()> {
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
     )
     .await
@@ -564,6 +602,7 @@ async fn declarative_submission_rejects_unknown_and_builtin_ids() -> anyhow::Res
                 subject_key: None,
                 repo: None,
                 author_trust_class: None,
+                classification_input_provenance: DataProvenance::Server,
             },
         )
         .await
@@ -609,6 +648,7 @@ async fn declarative_dedupe_and_cap_query_key_off_subject_external_id() -> anyho
                     subject_key: None,
                     repo: None,
                     author_trust_class: None,
+                    classification_input_provenance: DataProvenance::Server,
                 },
             )
             .await

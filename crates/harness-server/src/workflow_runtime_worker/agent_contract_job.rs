@@ -689,6 +689,8 @@ mod dogfood_tests {
         let contract_hash = harness_workflow::runtime::stable_remote_fact_hash(
             &serde_json::to_value(&contract).expect("serialize dogfood contract"),
         );
+        let facts = json!({"changed_files": ["docs/agent-contract.md"]});
+        let facts_digest = harness_workflow::runtime::stable_remote_fact_hash(&facts);
         PinnedJobAgentContract {
             contract,
             prompt: concat!(
@@ -700,8 +702,12 @@ mod dogfood_tests {
             input: json!({
                 "schema": "harness.semantic_activity_input.v1",
                 "subject": {"kind": "pull_request", "identity": "owner/repo#2020"},
-                "facts": {"changed_files": ["docs/agent-contract.md"]},
-                "provenance": {"/changed_files": "server"},
+                "facts": facts,
+                "provenance": {
+                    "schema": "harness.workflow.data_provenance.v1",
+                    "entries": {"": "server"},
+                    "value_digests": {"": facts_digest}
+                },
                 "contract_hash": contract_hash,
             }),
             definition_hash: "sha256:dogfood-definition".to_string(),
@@ -733,7 +739,7 @@ mod dogfood_tests {
             violations.is_empty(),
             "live attempt violations: {violations:?}"
         );
-        let verdict = parse_contract_verdict(&attempt.output, &pinned.contract)
+        let verdict = parse_contract_verdict(&attempt.output, &pinned.contract, &pinned.input)
             .map_err(anyhow::Error::msg)?;
         assert_eq!(verdict.outcome, "small");
         assert!(

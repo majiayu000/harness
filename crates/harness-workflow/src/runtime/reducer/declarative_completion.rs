@@ -289,15 +289,23 @@ fn transition_decision(
         }
     };
 
-    Ok(WorkflowDecision::new(
+    let mut decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
         "apply_declarative_transition",
         target,
-        reason,
-    )
-    .with_command(command)
-    .high_confidence())
+        &reason,
+    );
+    if target == "blocked" {
+        decision = decision.with_command(runtime_blocked_command(
+            &reason,
+            None,
+            format!("{}:mark-blocked", event_dedupe_key(instance, target, event)),
+            event,
+            result,
+        ));
+    }
+    Ok(decision.with_command(command).high_confidence())
 }
 
 fn terminal_class(
