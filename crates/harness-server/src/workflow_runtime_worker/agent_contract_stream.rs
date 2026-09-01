@@ -145,11 +145,9 @@ pub(super) async fn execute_agent_contract_attempt(
                     error,
                 )
                 .await;
-                return Err(match budget_stop {
-                    Some(stop) => ContractAttemptFailure::budget(attempt, stop, error),
-                    None => ContractAttemptFailure::new(attempt, error),
-                }
-                .into());
+                let mut failure = ContractAttemptFailure::new(attempt, error);
+                failure.budget_stop = budget_stop;
+                return Err(failure.into());
             }
             _ = &mut deadline => {
                 let error = anyhow::anyhow!(
@@ -164,11 +162,9 @@ pub(super) async fn execute_agent_contract_attempt(
                     error,
                 )
                 .await;
-                return Err(match budget_stop {
-                    Some(stop) => ContractAttemptFailure::budget(attempt, stop, error),
-                    None => ContractAttemptFailure::new(attempt, error),
-                }
-                .into());
+                let mut failure = ContractAttemptFailure::new(attempt, error);
+                failure.budget_stop = budget_stop;
+                return Err(failure.into());
             }
             event = rx.recv(), if event_channel_open => {
                 match event {
@@ -187,7 +183,7 @@ pub(super) async fn execute_agent_contract_attempt(
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            let (error, _) = stop_and_drain(
+                            let (error, budget_stop) = stop_and_drain(
                                 &mut stream,
                                 &mut rx,
                                 &mut attempt,
@@ -196,7 +192,9 @@ pub(super) async fn execute_agent_contract_attempt(
                                 error,
                             )
                             .await;
-                            return Err(ContractAttemptFailure::new(attempt, error).into());
+                            let mut failure = ContractAttemptFailure::new(attempt, error);
+                            failure.budget_stop = budget_stop;
+                            return Err(failure.into());
                         }
                     },
                     None => event_channel_open = false,
@@ -206,13 +204,13 @@ pub(super) async fn execute_agent_contract_attempt(
         }
     };
 
-    match drain_events(&mut rx, &mut attempt, runtime_usage).await {
-        Ok(Some(stop)) => {
-            let error = budget_stop_error(&stop);
-            return Err(ContractAttemptFailure::budget(attempt, stop, error).into());
-        }
-        Ok(None) => {}
-        Err(error) => return Err(ContractAttemptFailure::new(attempt, error).into()),
+    let (budget_stop, drain_error) = drain_events(&mut rx, &mut attempt, runtime_usage).await;
+    if let Some(stop) = budget_stop {
+        let error = budget_stop_error(&stop);
+        return Err(ContractAttemptFailure::budget(attempt, stop, error).into());
+    }
+    if let Some(error) = drain_error {
+        return Err(ContractAttemptFailure::new(attempt, error).into());
     }
     if let Err(error) = stream_result
         .map_err(|error| anyhow::anyhow!("contract attempt stream task panicked: {error}"))?
@@ -238,14 +236,18 @@ async fn drain_events(
     rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
     attempt: &mut ContractAttempt,
     runtime_usage: Option<(&RuntimeUsageContext, &TurnId)>,
-) -> anyhow::Result<Option<TurnBudgetStop>> {
+) -> (Option<TurnBudgetStop>, Option<anyhow::Error>) {
     let mut budget_stop = None;
     while let Ok(event) = rx.try_recv() {
-        if let Some(stop) = record_event(attempt, event, runtime_usage).await? {
-            budget_stop.get_or_insert(stop);
+        match record_event(attempt, event, runtime_usage).await {
+            Ok(Some(stop)) => {
+                budget_stop.get_or_insert(stop);
+            }
+            Ok(None) => {}
+            Err(error) => return (budget_stop, Some(error)),
         }
     }
-    Ok(budget_stop)
+    (budget_stop, None)
 }
 
 async fn stop_and_drain(
@@ -257,10 +259,7 @@ async fn stop_and_drain(
     primary: anyhow::Error,
 ) -> (anyhow::Error, Option<TurnBudgetStop>) {
     let cleanup_error = cancel_stream(stream, reason).await.err();
-    let (drain_error, budget_stop) = match drain_events(rx, attempt, runtime_usage).await {
-        Ok(stop) => (None, stop),
-        Err(error) => (Some(error), None),
-    };
+    let (budget_stop, drain_error) = drain_events(rx, attempt, runtime_usage).await;
     let error = match (cleanup_error, drain_error) {
         (None, None) => primary,
         (Some(cleanup), None) => anyhow::anyhow!("{primary}; cleanup failed: {cleanup}"),
@@ -498,18 +497,20 @@ mod accounting_tests {
             tx: tokio::sync::mpsc::Sender<AgentEvent>,
         ) -> harness_core::error::Result<()> {
             self.lease_lost.send_replace(true);
-            tx.send(AgentEvent::TokenUsage {
-                usage: harness_core::types::TokenUsage {
-                    input_tokens: 23,
-                    output_tokens: 5,
-                    total_tokens: 28,
-                    cost_usd: 0.25,
-                },
-            })
-            .await
-            .map_err(|error| {
-                harness_core::error::HarnessError::AgentExecution(error.to_string())
-            })?;
+            for cost_usd in [0.25, f64::NAN] {
+                tx.send(AgentEvent::TokenUsage {
+                    usage: harness_core::types::TokenUsage {
+                        input_tokens: 23,
+                        output_tokens: 5,
+                        total_tokens: 28,
+                        cost_usd,
+                    },
+                })
+                .await
+                .map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(error.to_string())
+                })?;
+            }
             std::future::pending().await
         }
     }
@@ -683,7 +684,7 @@ mod accounting_tests {
     }
 
     #[tokio::test]
-    async fn lease_loss_preserves_budget_stop_from_queued_usage() -> anyhow::Result<()> {
+    async fn lease_loss_preserves_budget_stop_before_later_usage_error() -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
             return Ok(());
         }
