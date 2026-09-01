@@ -1,132 +1,6 @@
-//! Job-level dispatch for pinned agent contracts.
-
-use crate::http::AppState;
-use harness_core::config::workflow::agent_contract_output_schema_document;
-use harness_workflow::runtime::{ActivityErrorKind, ActivityResult, RuntimeJob};
-use std::sync::Arc;
-use std::{error::Error, fmt};
-
-use super::agent_contract_enforcement::{
-    ensure_backend_can_enforce_contract, PinnedJobAgentContract,
+pub(super) use super::agent_contract_dispatch::{
+    execute_contract_job, pinned_agent_contract_for_execution, AgentContractExecutionError,
 };
-use super::agent_contract_execution::execute_contract_attempts;
-use super::data_helpers::activity_name;
-use super::job_context::{project_root_for_job, workflow_for_job};
-use super::runtime_profile::{agent_backend_for_runtime_kind, runtime_profile_for_job};
-use super::runtime_usage::runtime_usage_context;
-
-#[derive(Debug)]
-pub(super) struct AgentContractExecutionError {
-    source: anyhow::Error,
-}
-
-impl AgentContractExecutionError {
-    pub(super) fn new(source: anyhow::Error) -> Self {
-        Self { source }
-    }
-}
-
-impl fmt::Display for AgentContractExecutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.source.fmt(formatter)
-    }
-}
-
-impl Error for AgentContractExecutionError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source.source()
-    }
-}
-
-pub(super) fn pinned_agent_contract_for_execution(
-    job: &RuntimeJob,
-) -> anyhow::Result<Option<PinnedJobAgentContract>> {
-    super::agent_contract_enforcement::pinned_agent_contract_for_job(job)
-        .map_err(|error| AgentContractExecutionError::new(error).into())
-}
-
-pub(super) async fn execute_contract_job(
-    state: &Arc<AppState>,
-    job: &RuntimeJob,
-    pinned: PinnedJobAgentContract,
-    lease_lost: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<ActivityResult> {
-    execute_contract_job_inner(state, job, pinned, lease_lost)
-        .await
-        .map_err(|error| AgentContractExecutionError::new(error).into())
-}
-
-async fn execute_contract_job_inner(
-    state: &Arc<AppState>,
-    job: &RuntimeJob,
-    pinned: PinnedJobAgentContract,
-    lease_lost: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<ActivityResult> {
-    let activity = activity_name(job);
-    let backend =
-        agent_backend_for_runtime_kind(&state.core.server.agent_registry, job.runtime_kind)?;
-    if let Err(error) = ensure_backend_can_enforce_contract(backend.as_ref()) {
-        return Ok(contract_preflight_failure(
-            job,
-            &activity,
-            &error.to_string(),
-        ));
-    }
-    if agent_contract_output_schema_document(&pinned.contract.output_schema).is_none() {
-        return Ok(contract_preflight_failure(
-            job,
-            &activity,
-            &format!(
-                "output schema `{}` has no canonical schema document to enforce",
-                pinned.contract.output_schema
-            ),
-        ));
-    }
-    let profile = runtime_profile_for_job(job)?;
-    let Some(timeout_secs) = profile.timeout_secs.filter(|timeout| *timeout > 0) else {
-        return Ok(contract_preflight_failure(
-            job,
-            &activity,
-            "the pinned runtime profile has no positive timeout_secs",
-        ));
-    };
-    let workflow = workflow_for_job(state, job).await?;
-    let source_project_root = project_root_for_job(state, job, workflow.as_ref())?;
-    let runtime_usage = runtime_usage_context(
-        state,
-        job,
-        workflow.as_ref(),
-        &profile,
-        backend.name(),
-        &source_project_root,
-    );
-    execute_contract_attempts(
-        state,
-        job,
-        backend,
-        &pinned,
-        &activity,
-        profile.model.clone(),
-        profile.reasoning_effort.clone(),
-        timeout_secs,
-        profile.max_turns,
-        runtime_usage.as_ref(),
-        lease_lost,
-    )
-    .await
-}
-
-fn contract_preflight_failure(job: &RuntimeJob, activity: &str, reason: &str) -> ActivityResult {
-    ActivityResult::failed(
-        activity,
-        format!(
-            "Runtime job {} carries a pinned agent_contract that cannot be enforced.",
-            job.id
-        ),
-        reason,
-    )
-    .with_error_kind(ActivityErrorKind::Fatal)
-}
 
 #[cfg(test)]
 mod tests {
@@ -139,7 +13,8 @@ mod tests {
         AgentBackend, AgentRequest, StreamItem, AGENT_OUTPUT_SCHEMA_PATH_ENV,
     };
     use harness_core::config::workflow::{
-        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+        DeclaredProgressMode, DeclaredState, RuntimeBudgetEnforcement, RuntimeBudgetPolicy,
+        WorkflowActivityPolicy, WorkflowDefinitionPolicy,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -151,18 +26,31 @@ mod tests {
         scripts: Mutex<std::collections::VecDeque<Vec<harness_core::agent::AgentEvent>>>,
         requests: Mutex<Vec<AgentRequest>>,
         workspace_entry_counts: Mutex<Vec<usize>>,
+        reports_usage_cost: bool,
     }
 
     impl ContractStreamAgent {
         fn new(script: Vec<harness_core::agent::AgentEvent>) -> Arc<Self> {
-            Self::with_scripts(vec![script])
+            Self::with_scripts_and_cost_reporting(vec![script], true)
         }
 
         fn with_scripts(scripts: Vec<Vec<harness_core::agent::AgentEvent>>) -> Arc<Self> {
+            Self::with_scripts_and_cost_reporting(scripts, true)
+        }
+
+        fn cost_blind() -> Arc<Self> {
+            Self::with_scripts_and_cost_reporting(Vec::new(), false)
+        }
+
+        fn with_scripts_and_cost_reporting(
+            scripts: Vec<Vec<harness_core::agent::AgentEvent>>,
+            reports_usage_cost: bool,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 scripts: Mutex::new(scripts.into()),
                 requests: Mutex::new(Vec::new()),
                 workspace_entry_counts: Mutex::new(Vec::new()),
+                reports_usage_cost,
             })
         }
     }
@@ -179,6 +67,10 @@ mod tests {
                 pinned_output_schema: true,
                 attempt_observation_stream: true,
             }
+        }
+
+        fn reports_usage_cost(&self) -> bool {
+            self.reports_usage_cost
         }
 
         async fn execute_stream(
@@ -250,6 +142,7 @@ mod tests {
                     DeclaredState {
                         activity: Some(activity.to_string()),
                         on_failure: Some("blocked".to_string()),
+                        on_blocked: Some("done".to_string()),
                         on_signal: BTreeMap::from([
                             ("small".to_string(), "done".to_string()),
                             ("large".to_string(), "blocked".to_string()),
@@ -292,6 +185,7 @@ mod tests {
         project_root: &std::path::Path,
         agent_registry: harness_agents::registry::AgentRegistry,
         activity: &str,
+        enforce_budget: bool,
     ) -> anyhow::Result<Arc<crate::http::AppState>> {
         let mut state = crate::test_helpers::make_test_state_with_project_root_and_registry(
             config_root,
@@ -306,12 +200,18 @@ mod tests {
         let store_path =
             harness_core::config::dirs::default_db_path(config_root, "workflow_runtime");
         let database_url = crate::test_helpers::test_database_url()?;
-        let store = harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+        let mut store = harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
             &store_path,
             Some(&database_url),
         )
         .await?
         .with_definition_registry(definition_registry.into_shared());
+        if enforce_budget {
+            store = store.with_budget_policy(RuntimeBudgetPolicy {
+                enforcement: RuntimeBudgetEnforcement::Enforce,
+                ..RuntimeBudgetPolicy::default()
+            });
+        }
         state.core.workflow_runtime_store = Some(Arc::new(store));
         Ok(Arc::new(state))
     }
@@ -403,7 +303,8 @@ mod tests {
         let mut registry = harness_agents::registry::AgentRegistry::new("codex");
         registry.register("codex", agent.clone());
         let state =
-            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope").await?;
+            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope", false)
+                .await?;
         let store = state
             .core
             .workflow_runtime_store
@@ -443,6 +344,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enforced_budget_rejects_cost_blind_contract_backend_as_failure() -> anyhow::Result<()>
+    {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+        let agent = ContractStreamAgent::cost_blind();
+        let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+        registry.register("codex", agent.clone());
+        let state =
+            make_contract_test_state(dir.path(), &project_root, registry, "classify_cost", true)
+                .await?;
+        let store = state
+            .core
+            .workflow_runtime_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("workflow runtime store should be configured"))?;
+        let runtime_job = enqueue_contract_job(store, &project_root, "classify_cost").await?;
+
+        let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+            &state,
+            "worker-test",
+            chrono::Duration::minutes(5),
+        )
+        .await?;
+
+        assert_eq!(tick.failed, 1);
+        assert!(agent.requests.lock().await.is_empty());
+        let completed = store
+            .get_runtime_job(&runtime_job.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("runtime job should exist"))?;
+        assert_eq!(
+            completed.status,
+            harness_workflow::runtime::RuntimeJobStatus::Failed
+        );
+        let workflow = store
+            .get_instance("issue-126")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("workflow should exist"))?;
+        assert_eq!(workflow.state, "failed");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn contract_job_named_like_server_activity_still_executes_pinned_contract(
     ) -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
@@ -463,6 +411,7 @@ mod tests {
             &project_root,
             registry,
             harness_workflow::runtime::PR_FEEDBACK_INSPECT_ACTIVITY,
+            false,
         )
         .await?;
         let store = state
@@ -588,7 +537,8 @@ mod tests {
         let mut registry = harness_agents::registry::AgentRegistry::new("codex");
         registry.register("codex", agent.clone());
         let state =
-            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope").await?;
+            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope", false)
+                .await?;
         let store = state
             .core
             .workflow_runtime_store
@@ -673,7 +623,8 @@ mod tests {
         let mut registry = harness_agents::registry::AgentRegistry::new("codex");
         registry.register("codex", agent.clone());
         let state =
-            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope").await?;
+            make_contract_test_state(dir.path(), &project_root, registry, "classify_scope", false)
+                .await?;
         let store = state
             .core
             .workflow_runtime_store

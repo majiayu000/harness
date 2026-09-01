@@ -38,6 +38,8 @@ pub(in crate::http) struct RuntimeTaskResponse {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     token_usage: Option<harness_core::types::TokenUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd_observed: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pending_approvals: Vec<harness_core::types::Item>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,15 +129,14 @@ async fn runtime_task_response_by_handle(
         .unwrap_or_else(|| task_id.0.clone());
     let error = runtime_string_field(&workflow.data, "failure_reason");
     let terminal = TaskTerminalInfo::from_status_error(&task_status, error.as_deref());
-    let token_usage = store
-        .runtime_usage_for_workflow(&workflow.id)
-        .await?
-        .map(|usage| harness_core::types::TokenUsage {
-            input_tokens: usage.metrics.input_tokens,
-            output_tokens: usage.metrics.output_tokens,
-            total_tokens: usage.metrics.total_tokens(),
-            cost_usd: harness_workflow::runtime::cost_usd_from_micros(usage.cost_usd_micros),
-        });
+    let runtime_usage = store.runtime_usage_for_workflow(&workflow.id).await?;
+    let cost_usd_observed = runtime_usage.as_ref().map(|usage| usage.cost_usd_observed);
+    let token_usage = runtime_usage.map(|usage| harness_core::types::TokenUsage {
+        input_tokens: usage.metrics.input_tokens,
+        output_tokens: usage.metrics.output_tokens,
+        total_tokens: usage.metrics.total_tokens(),
+        cost_usd: harness_workflow::runtime::cost_usd_from_micros(usage.cost_usd_micros),
+    });
     let pending_approvals = state
         .core
         .server
@@ -170,6 +171,7 @@ async fn runtime_task_response_by_handle(
         issue,
         error,
         token_usage,
+        cost_usd_observed,
         pending_approvals,
         terminal,
         depends_on: runtime_task_id_array(&workflow.data, "depends_on"),

@@ -123,15 +123,17 @@ Usage returned by the runtime submission API and persisted in
 - input tokens: `21,807`
 - output tokens: `222`
 - reported total tokens: `22,029`
-- provider-reported cost: `$0.00`
+- stored cost placeholder: `$0.00`
+- provider USD cost observed: `false`
 
 The persisted usage row is attributed to project
 `/private/tmp/harness-slice-d-sanitized-20260901/project` and task
 `1315b97d-1369-4a67-83c1-f4412e33d12c`. Its stable turn id is
 `agent-contract:0ebdc15c-ffb8-4687-a32c-87839aafb2c2:1`.
 
-Harness does not synthesize a price when the Codex stream reports zero cost;
-the stored and returned value remains the provider-reported value.
+Codex reported token counts without a provider USD cost. Harness keeps the
+token usage and exposes `cost_usd_observed: false`; the stored zero is only the
+numeric placeholder for an unknown cost and is not a cost measurement.
 
 ## Restart and replay
 
@@ -179,7 +181,7 @@ second protects assessment routing, durable reopen behavior, exact token and
 cost persistence, and project/task attribution. The remaining tests protect
 failed-attempt accounting and observations, enforced mid-attempt and
 transaction-time budget stops, and queued usage during lease cancellation. The
-production success reported zero cost, so the transaction-time ceiling is
-proved by the focused database test rather than that successful run. Codex
+production success had no observed USD cost, so the transaction-time ceiling
+is proved by the focused database test rather than that successful run. Codex
 cannot silently enter that enforced path: its missing cost-reporting capability
 is covered by the preflight test and blocks before launch.

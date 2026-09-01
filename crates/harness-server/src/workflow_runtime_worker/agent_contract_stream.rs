@@ -567,6 +567,7 @@ mod accounting_tests {
             runtime_kind: RuntimeKind::CodexExec,
             runtime_profile: "codex-accounting".to_string(),
             agent: "accounting-agent".to_string(),
+            cost_usd_observed: true,
             model: "gpt-test".to_string(),
             project: "/project/accounting".to_string(),
             task_id: Some("task-accounting".to_string()),

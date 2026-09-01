@@ -39,16 +39,12 @@ pub(super) async fn execute_contract_attempts(
     if let Some(error) = runtime_usage
         .and_then(|context| enforced_budget_cost_error(backend.as_ref(), &context.budget_policy))
     {
-        return Ok(ActivityResult {
-            activity: activity.to_string(),
-            status: ActivityStatus::Blocked,
-            summary: "Agent contract execution requires observable USD cost for the enforced workflow budget.".to_string(),
-            artifacts: Vec::new(),
-            signals: Vec::new(),
-            validation: Vec::new(),
-            error: Some(error),
-            error_kind: Some(ActivityErrorKind::Configuration),
-        });
+        return Ok(ActivityResult::failed(
+            activity,
+            "Agent contract execution requires observable USD cost for the enforced workflow budget.",
+            error,
+        )
+        .with_error_kind(ActivityErrorKind::Configuration));
     }
     let mut observations = Vec::new();
     let mut corrections_used = 0;

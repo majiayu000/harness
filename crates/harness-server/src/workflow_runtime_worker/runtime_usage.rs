@@ -11,6 +11,7 @@ pub(super) fn runtime_usage_context(
     workflow: Option<&WorkflowInstance>,
     runtime_profile: &RuntimeProfile,
     agent_name: &str,
+    cost_usd_observed: bool,
     source_project_root: &Path,
 ) -> Option<RuntimeUsageContext> {
     let store = state.core.workflow_runtime_store.as_ref()?.clone();
@@ -29,6 +30,7 @@ pub(super) fn runtime_usage_context(
         runtime_kind: job.runtime_kind,
         runtime_profile: job.runtime_profile.clone(),
         agent: agent_name.to_string(),
+        cost_usd_observed,
         model: runtime_profile
             .model
             .clone()

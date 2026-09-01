@@ -3,6 +3,7 @@ mod activity_result;
 mod activity_status_contract;
 mod agent_contract_assessment;
 mod agent_contract_attempt;
+mod agent_contract_dispatch;
 mod agent_contract_enforcement;
 mod agent_contract_execution;
 mod agent_contract_job;

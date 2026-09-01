@@ -34,6 +34,7 @@ fn ceiling_usage_upsert(workflow_id: &str, cost_usd_micros: u64) -> RuntimeUsage
         candidate_count: None,
         metrics: RuntimeUsageMetrics::default(),
         cost_usd_micros,
+        cost_usd_observed: true,
         reported_at: Utc::now(),
     }
 }
