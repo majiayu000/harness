@@ -136,7 +136,7 @@ pub(super) async fn execute_agent_contract_attempt(
                 let error = anyhow::anyhow!(
                     "agent contract attempt cancelled after runtime lease loss"
                 );
-                let error = stop_and_drain(
+                let (error, budget_stop) = stop_and_drain(
                     &mut stream,
                     &mut rx,
                     &mut attempt,
@@ -145,13 +145,17 @@ pub(super) async fn execute_agent_contract_attempt(
                     error,
                 )
                 .await;
-                return Err(ContractAttemptFailure::new(attempt, error).into());
+                return Err(match budget_stop {
+                    Some(stop) => ContractAttemptFailure::budget(attempt, stop, error),
+                    None => ContractAttemptFailure::new(attempt, error),
+                }
+                .into());
             }
             _ = &mut deadline => {
                 let error = anyhow::anyhow!(
                     "agent contract attempt timed out after {timeout_secs}s"
                 );
-                let error = stop_and_drain(
+                let (error, budget_stop) = stop_and_drain(
                     &mut stream,
                     &mut rx,
                     &mut attempt,
@@ -160,13 +164,17 @@ pub(super) async fn execute_agent_contract_attempt(
                     error,
                 )
                 .await;
-                return Err(ContractAttemptFailure::new(attempt, error).into());
+                return Err(match budget_stop {
+                    Some(stop) => ContractAttemptFailure::budget(attempt, stop, error),
+                    None => ContractAttemptFailure::new(attempt, error),
+                }
+                .into());
             }
             event = rx.recv(), if event_channel_open => {
                 match event {
                     Some(event) => match record_event(&mut attempt, event, runtime_usage).await {
                         Ok(Some(stop)) => {
-                            let error = stop_and_drain(
+                            let (error, _) = stop_and_drain(
                                 &mut stream,
                                 &mut rx,
                                 &mut attempt,
@@ -179,7 +187,7 @@ pub(super) async fn execute_agent_contract_attempt(
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            let error = stop_and_drain(
+                            let (error, _) = stop_and_drain(
                                 &mut stream,
                                 &mut rx,
                                 &mut attempt,
@@ -212,6 +220,17 @@ pub(super) async fn execute_agent_contract_attempt(
     {
         return Err(ContractAttemptFailure::new(attempt, error).into());
     }
+    if runtime_usage.is_some_and(|(context, _)| {
+        !context.budget_policy.unlimited
+            && context.budget_policy.enforcement
+                == harness_core::config::workflow::RuntimeBudgetEnforcement::Enforce
+    }) && attempt.observations.token_usage.is_none()
+    {
+        let error = anyhow::anyhow!(
+            "agent backend did not emit observable USD cost usage under enforced workflow budget policy"
+        );
+        return Err(ContractAttemptFailure::new(attempt, error).into());
+    }
     Ok(attempt)
 }
 
@@ -236,17 +255,21 @@ async fn stop_and_drain(
     runtime_usage: Option<(&RuntimeUsageContext, &TurnId)>,
     reason: &str,
     primary: anyhow::Error,
-) -> anyhow::Error {
+) -> (anyhow::Error, Option<TurnBudgetStop>) {
     let cleanup_error = cancel_stream(stream, reason).await.err();
-    let drain_error = drain_events(rx, attempt, runtime_usage).await.err();
-    match (cleanup_error, drain_error) {
+    let (drain_error, budget_stop) = match drain_events(rx, attempt, runtime_usage).await {
+        Ok(stop) => (None, stop),
+        Err(error) => (Some(error), None),
+    };
+    let error = match (cleanup_error, drain_error) {
         (None, None) => primary,
         (Some(cleanup), None) => anyhow::anyhow!("{primary}; cleanup failed: {cleanup}"),
         (None, Some(drain)) => anyhow::anyhow!("{primary}; event drain failed: {drain}"),
         (Some(cleanup), Some(drain)) => {
             anyhow::anyhow!("{primary}; cleanup failed: {cleanup}; event drain failed: {drain}")
         }
-    }
+    };
+    (error, budget_stop)
 }
 
 async fn record_event(
@@ -333,6 +356,7 @@ mod accounting_tests {
     use std::sync::Arc;
 
     struct AccountingAgent {
+        emit_usage: bool,
         fail_after_usage: bool,
     }
 
@@ -359,18 +383,20 @@ mod accounting_tests {
             _request: AgentRequest,
             tx: tokio::sync::mpsc::Sender<AgentEvent>,
         ) -> harness_core::error::Result<()> {
-            tx.send(AgentEvent::TokenUsage {
-                usage: harness_core::types::TokenUsage {
-                    input_tokens: 11,
-                    output_tokens: 7,
-                    total_tokens: 18,
-                    cost_usd: 0.125,
-                },
-            })
-            .await
-            .map_err(|error| {
-                harness_core::error::HarnessError::AgentExecution(error.to_string())
-            })?;
+            if self.emit_usage {
+                tx.send(AgentEvent::TokenUsage {
+                    usage: harness_core::types::TokenUsage {
+                        input_tokens: 11,
+                        output_tokens: 7,
+                        total_tokens: 18,
+                        cost_usd: 0.125,
+                    },
+                })
+                .await
+                .map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(error.to_string())
+                })?;
+            }
             if self.fail_after_usage {
                 tx.send(AgentEvent::ModelReported {
                     model: "gpt-test".to_string(),
@@ -440,6 +466,7 @@ mod accounting_tests {
         assert!(enforced_budget_cost_error(&CostBlindAgent, &shadow).is_none());
         assert!(enforced_budget_cost_error(
             &AccountingAgent {
+                emit_usage: true,
                 fail_after_usage: false,
             },
             &enforce
@@ -470,6 +497,7 @@ mod accounting_tests {
             _request: AgentRequest,
             tx: tokio::sync::mpsc::Sender<AgentEvent>,
         ) -> harness_core::error::Result<()> {
+            self.lease_lost.send_replace(true);
             tx.send(AgentEvent::TokenUsage {
                 usage: harness_core::types::TokenUsage {
                     input_tokens: 23,
@@ -482,7 +510,6 @@ mod accounting_tests {
             .map_err(|error| {
                 harness_core::error::HarnessError::AgentExecution(error.to_string())
             })?;
-            self.lease_lost.send_replace(true);
             std::future::pending().await
         }
     }
@@ -565,6 +592,7 @@ mod accounting_tests {
 
         let error = execute_agent_contract_attempt(
             Arc::new(AccountingAgent {
+                emit_usage: true,
                 fail_after_usage: true,
             }),
             &pinned_contract(),
@@ -655,6 +683,69 @@ mod accounting_tests {
     }
 
     #[tokio::test]
+    async fn lease_loss_preserves_budget_stop_from_queued_usage() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let (_dir, context, turn_id) = usage_fixture(RuntimeBudgetPolicy {
+            default_workflow_budget_usd: 0.10,
+            enforcement: RuntimeBudgetEnforcement::Enforce,
+            ..RuntimeBudgetPolicy::default()
+        })
+        .await?;
+        let (lease_lost, receiver) = tokio::sync::watch::channel(false);
+
+        let error = execute_agent_contract_attempt(
+            Arc::new(LeaseLossAfterUsageAgent { lease_lost }),
+            &pinned_contract(),
+            None,
+            None,
+            30,
+            None,
+            Some((&context, &turn_id)),
+            Some(receiver),
+        )
+        .await
+        .expect_err("lease-loss cleanup must retain a queued budget stop");
+        let failure = error
+            .downcast::<ContractAttemptFailure>()
+            .expect("lease loss must retain its structured failure");
+        assert!(failure.budget_stop.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enforced_budget_requires_an_observed_usage_event() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let (_dir, context, turn_id) = usage_fixture(RuntimeBudgetPolicy {
+            default_workflow_budget_usd: 1.0,
+            enforcement: RuntimeBudgetEnforcement::Enforce,
+            ..RuntimeBudgetPolicy::default()
+        })
+        .await?;
+
+        let error = execute_agent_contract_attempt(
+            Arc::new(AccountingAgent {
+                emit_usage: false,
+                fail_after_usage: false,
+            }),
+            &pinned_contract(),
+            None,
+            None,
+            30,
+            None,
+            Some((&context, &turn_id)),
+            None,
+        )
+        .await
+        .expect_err("an enforced budget requires observable per-attempt usage");
+        assert!(error.to_string().contains("usage"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn enforced_budget_rejects_terminal_verdict_after_usage_crosses_ceiling(
     ) -> anyhow::Result<()> {
         if !crate::test_helpers::db_tests_enabled().await {
@@ -669,6 +760,7 @@ mod accounting_tests {
 
         let error = execute_agent_contract_attempt(
             Arc::new(AccountingAgent {
+                emit_usage: true,
                 fail_after_usage: false,
             }),
             &pinned_contract(),

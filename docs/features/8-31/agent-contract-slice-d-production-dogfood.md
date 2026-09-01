@@ -87,6 +87,12 @@ server-authored budget stop. The completion transaction recognizes that marker
 before declarative `on_blocked` routing, so it cannot be redirected into a
 terminal state instead of the operator-only budget block.
 
+Integration review against the latest `main` closed two final cancellation and
+accounting races. Timeout or lease-loss cleanup now propagates a budget stop
+found while draining already-queued usage, and `enforce` requires each launched
+attempt to emit an observed usage event before its verdict can be accepted. A
+provider-reported zero cost remains valid; an absent usage event does not.
+
 ## Final production evidence
 
 Final submission:
@@ -159,7 +165,9 @@ HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server real_
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server usage_survives_backend_failure_after_report
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server enforced_budget_rejects_terminal_verdict_after_usage_crosses_ceiling
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server lease_loss_drains_queued_usage_before_returning
+HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server lease_loss_preserves_budget_stop_from_queued_usage
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server enforced_budget_requires_backend_reported_cost
+HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server enforced_budget_requires_an_observed_usage_event
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-workflow budget_ceiling_preempts_terminal_agent_contract_completion
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-workflow budget_stop_preempts_declarative_on_blocked_terminal_route
 ```
