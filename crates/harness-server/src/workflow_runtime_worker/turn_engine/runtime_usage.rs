@@ -1,3 +1,4 @@
+use harness_core::agent::AgentBackend;
 use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 use harness_core::run_id::RunId;
 use harness_core::types::{TokenUsage, TurnId};
@@ -18,6 +19,35 @@ pub(crate) struct TurnBudgetStop {
     pub(crate) budget_usd: f64,
 }
 
+pub(crate) fn budget_stop_artifact(
+    stop: &TurnBudgetStop,
+) -> harness_workflow::runtime::ActivityArtifact {
+    harness_workflow::runtime::ActivityArtifact::new(
+        harness_workflow::runtime::completion_evidence::ARTIFACT_RUNTIME_BUDGET_STOP,
+        serde_json::json!({
+            "workflow_id": stop.workflow_id,
+            "spent_usd": stop.spent_usd,
+            "budget_usd": stop.budget_usd,
+            "enforcement": "enforce",
+        }),
+    )
+}
+
+pub(crate) fn enforced_budget_cost_error(
+    backend: &dyn AgentBackend,
+    policy: &RuntimeBudgetPolicy,
+) -> Option<String> {
+    (!policy.unlimited
+        && policy.enforcement == RuntimeBudgetEnforcement::Enforce
+        && !backend.reports_usage_cost())
+    .then(|| {
+        format!(
+            "agent backend `{}` does not report USD cost; refusing to launch an agent contract under enforced USD budget policy",
+            backend.name()
+        )
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeUsageContext {
     pub(crate) store: Arc<WorkflowRuntimeStore>,
@@ -28,7 +58,6 @@ pub(crate) struct RuntimeUsageContext {
     pub(crate) runtime_kind: RuntimeKind,
     pub(crate) runtime_profile: String,
     pub(crate) agent: String,
-    pub(crate) cost_usd_observed: bool,
     pub(crate) model: String,
     pub(crate) project: String,
     pub(crate) task_id: Option<String>,
@@ -49,7 +78,6 @@ impl std::fmt::Debug for RuntimeUsageContext {
             .field("runtime_kind", &self.runtime_kind)
             .field("runtime_profile", &self.runtime_profile)
             .field("agent", &self.agent)
-            .field("cost_usd_observed", &self.cost_usd_observed)
             .field("model", &self.model)
             .field("project", &self.project)
             .field("task_id", &self.task_id)
@@ -92,6 +120,7 @@ impl RuntimeUsageContext {
         &self,
         turn_id: &TurnId,
         usage: &TokenUsage,
+        cost_usd_observed: bool,
     ) -> anyhow::Result<()> {
         match self
             .store
@@ -113,7 +142,7 @@ impl RuntimeUsageContext {
                 candidate_count: self.candidate_count,
                 metrics: RuntimeUsageMetrics::from_token_usage(usage),
                 cost_usd_micros: cost_usd_to_micros(usage.cost_usd)?,
-                cost_usd_observed: self.cost_usd_observed,
+                cost_usd_observed,
                 reported_at: chrono::Utc::now(),
             })
             .await?

@@ -98,7 +98,6 @@ async fn execute_contract_job_inner(
         workflow.as_ref(),
         &profile,
         backend.name(),
-        backend.reports_usage_cost(),
         &source_project_root,
     );
     execute_contract_attempts(

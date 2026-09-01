@@ -94,17 +94,19 @@ fn parse_acp_notification(value: &Value) -> Option<ParsedAcpMessage> {
                 "usage_update" => {
                     let used = update.get("used").and_then(Value::as_u64).unwrap_or(0);
                     let size = update.get("size").and_then(Value::as_u64).unwrap_or(0);
-                    let cost = update
-                        .pointer("/cost/amount")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
+                    let cost = update.pointer("/cost/amount").and_then(Value::as_f64);
+                    let cost_usd_observed = cost.is_some()
+                        && update.pointer("/cost/currency").and_then(Value::as_str) == Some("USD");
                     let usage = TokenUsage {
                         input_tokens: used,
                         output_tokens: 0,
                         total_tokens: size,
-                        cost_usd: cost,
+                        cost_usd: cost.filter(|_| cost_usd_observed).unwrap_or(0.0),
                     };
-                    Some(ParsedAcpMessage::Event(AgentEvent::TokenUsage { usage }))
+                    Some(ParsedAcpMessage::Event(AgentEvent::TokenUsage {
+                        usage,
+                        cost_usd_observed,
+                    }))
                 }
                 _ => Some(ParsedAcpMessage::Ignore),
             }

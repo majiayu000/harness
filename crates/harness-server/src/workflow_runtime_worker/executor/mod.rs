@@ -340,7 +340,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                             workflow.as_ref(),
                             &runtime_profile,
                             agent_name,
-                            false,
                             &source_project_root,
                         ),
                         egress_verified_at_dispatch: Some(Arc::clone(&egress_verified_at_dispatch)),

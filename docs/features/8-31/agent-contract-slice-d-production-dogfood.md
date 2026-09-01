@@ -135,6 +135,12 @@ Codex reported token counts without a provider USD cost. Harness keeps the
 token usage and exposes `cost_usd_observed: false`; the stored zero is only the
 numeric placeholder for an unknown cost and is not a cost measurement.
 
+A current-binary restart then migrated the same isolated database and queried
+this completed submission without creating new work. The task API returned the
+same token counts and `cost_usd_observed: false`; runtime events remained `5`,
+usage rows `1`, and completed attempts `1`, so the verification did not replay
+the model or create another accounting row.
+
 ## Restart and replay
 
 After the final terminal result, the server was stopped and restarted against
@@ -172,6 +178,7 @@ HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server lease
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server lease_loss_preserves_budget_stop_before_later_usage_error
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server enforced_budget_requires_backend_reported_cost
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server enforced_budget_requires_an_observed_usage_event
+HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server get_task_runtime_issue_exposes_tracker_identity_and_cost_observation
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-workflow budget_ceiling_preempts_terminal_agent_contract_completion
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-workflow budget_stop_preempts_declarative_on_blocked_terminal_route
 ```

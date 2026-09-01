@@ -199,7 +199,8 @@ fn otel_turn_spans_parse_token_usage_notification() {
                 output_tokens: 8,
                 total_tokens: 38,
                 cost_usd: 0.0,
-            }
+            },
+            cost_usd_observed: false,
         })
     );
 }

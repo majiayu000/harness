@@ -99,9 +99,10 @@ pub trait AgentBackend: Send + Sync {
     fn agent_contract_capabilities(&self) -> AgentContractCapabilities {
         AgentContractCapabilities::default()
     }
-    /// Whether streamed [`TokenUsage`] values contain backend-reported USD
-    /// cost rather than an unknown placeholder. Enforced USD budgets must not
-    /// launch against a backend that cannot make this claim.
+    /// Whether the backend can emit provider-reported USD cost. Each usage
+    /// event separately records whether that event contained an observed cost;
+    /// enforced USD budgets reject both incapable backends and unobserved
+    /// attempt usage.
     fn reports_usage_cost(&self) -> bool {
         false
     }
@@ -476,6 +477,9 @@ pub enum AgentEvent {
     ItemCompletedKind,
     TokenUsage {
         usage: TokenUsage,
+        /// Whether `usage.cost_usd` came from the provider rather than a
+        /// numeric placeholder used when only token counts are available.
+        cost_usd_observed: bool,
     },
     /// Model identity observed for this turn, with the observation source so
     /// consumers can distinguish a provider-confirmed identity from one
@@ -601,6 +605,7 @@ mod tests {
             },
             AgentEvent::TokenUsage {
                 usage: TokenUsage::default(),
+                cost_usd_observed: false,
             },
             AgentEvent::Warning {
                 message: "careful".into(),

@@ -235,6 +235,7 @@ pub(crate) struct TurnStreamObservations {
     pub(crate) approval_requests: u32,
     pub(crate) tool_output_deltas: u32,
     pub(crate) token_usage: Option<TokenUsage>,
+    pub(crate) cost_usd_observed: bool,
 }
 
 /// Item kinds the runtime recognizes as carrying no tool or mutation surface.
@@ -263,7 +264,13 @@ impl TurnStreamObservations {
             AgentEvent::ToolOutputDelta { .. } => {
                 self.tool_output_deltas = self.tool_output_deltas.saturating_add(1);
             }
-            AgentEvent::TokenUsage { usage } => self.token_usage = Some(usage.clone()),
+            AgentEvent::TokenUsage {
+                usage,
+                cost_usd_observed,
+            } => {
+                self.token_usage = Some(usage.clone());
+                self.cost_usd_observed = *cost_usd_observed;
+            }
             _ => {}
         }
     }
@@ -323,6 +330,7 @@ pub(super) fn turn_observation_artifact(
             "unknown_item_kinds": observations.unknown_item_kinds,
             "approval_requests": observations.approval_requests,
             "tool_output_deltas": observations.tool_output_deltas,
+            "cost_usd_observed": observations.cost_usd_observed,
             "reported_models": observations
                 .reported_models
                 .iter()

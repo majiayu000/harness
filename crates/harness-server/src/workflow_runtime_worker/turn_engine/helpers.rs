@@ -120,7 +120,10 @@ pub(crate) async fn process_stream_item(
                 },
             );
         }
-        StreamItem::TokenUsage { usage } => {
+        StreamItem::TokenUsage {
+            usage,
+            cost_usd_observed,
+        } => {
             if let Err(err) =
                 server
                     .thread_manager
@@ -137,7 +140,10 @@ pub(crate) async fn process_stream_item(
                 },
             );
             if let Some(context) = runtime_usage {
-                if let Err(error) = context.persist_token_usage(turn_id, &usage).await {
+                if let Err(error) = context
+                    .persist_token_usage(turn_id, &usage, cost_usd_observed)
+                    .await
+                {
                     tracing::error!(
                         runtime_job_id = %context.runtime_job_id,
                         command_id = %context.command_id,
@@ -368,7 +374,6 @@ mod tests {
             runtime_kind: RuntimeKind::CodexExec,
             runtime_profile: "codex-default".to_string(),
             agent: "codex".to_string(),
-            cost_usd_observed: true,
             model: "gpt-5".to_string(),
             project: dir.path().to_string_lossy().into_owned(),
             task_id: Some("issue-1439".to_string()),
@@ -393,6 +398,7 @@ mod tests {
                     total_tokens: 20,
                     cost_usd: 0.125,
                 },
+                cost_usd_observed: true,
             },
         )
         .await;
@@ -482,7 +488,6 @@ mod tests {
             runtime_kind: RuntimeKind::CodexExec,
             runtime_profile: "codex-default".to_string(),
             agent: "codex".to_string(),
-            cost_usd_observed: true,
             model: "gpt-5".to_string(),
             project: "/project-a".to_string(),
             task_id: None,
@@ -502,6 +507,7 @@ mod tests {
                 total_tokens: 15,
                 cost_usd,
             },
+            cost_usd_observed: true,
         }
     }
 

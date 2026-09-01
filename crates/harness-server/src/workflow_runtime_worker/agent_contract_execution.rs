@@ -325,6 +325,7 @@ mod tests {
                     total_tokens: 18,
                     cost_usd: 0.125,
                 },
+                cost_usd_observed: true,
             })
             .await
             .map_err(|error| {

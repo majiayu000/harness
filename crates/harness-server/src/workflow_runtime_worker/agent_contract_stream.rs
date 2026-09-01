@@ -4,8 +4,6 @@ use harness_core::agent::{AgentBackend, AgentEvent, AgentRequest, AGENT_OUTPUT_S
 use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::workflow::agent_contract_output_schema_document;
 use harness_core::types::TurnId;
-use harness_workflow::runtime::completion_evidence::ARTIFACT_RUNTIME_BUDGET_STOP;
-use harness_workflow::runtime::ActivityArtifact;
 use std::sync::Arc;
 
 use super::agent_contract_attempt::ContractAttempt;
@@ -14,6 +12,9 @@ use super::agent_contract_enforcement::{
 };
 use super::agent_contract_prompt::contract_attempt_prompt;
 use super::turn_engine::helpers::{RuntimeUsageContext, TurnBudgetStop};
+pub(super) use super::turn_engine::runtime_usage::{
+    budget_stop_artifact, enforced_budget_cost_error,
+};
 
 #[derive(Debug)]
 pub(super) struct ContractAttemptFailure {
@@ -222,7 +223,7 @@ pub(super) async fn execute_agent_contract_attempt(
         !context.budget_policy.unlimited
             && context.budget_policy.enforcement
                 == harness_core::config::workflow::RuntimeBudgetEnforcement::Enforce
-    }) && attempt.observations.token_usage.is_none()
+    }) && !attempt.observations.cost_usd_observed
     {
         let error = anyhow::anyhow!(
             "agent backend did not emit observable USD cost usage under enforced workflow budget policy"
@@ -277,14 +278,20 @@ async fn record_event(
     runtime_usage: Option<(&RuntimeUsageContext, &TurnId)>,
 ) -> anyhow::Result<Option<TurnBudgetStop>> {
     let usage = match &event {
-        AgentEvent::TokenUsage { usage } => Some(usage.clone()),
+        AgentEvent::TokenUsage {
+            usage,
+            cost_usd_observed,
+        } => Some((usage.clone(), *cost_usd_observed)),
         _ => None,
     };
     attempt.record_event(event);
-    let (Some(usage), Some((context, turn_id))) = (usage, runtime_usage) else {
+    let (Some((usage, cost_usd_observed)), Some((context, turn_id))) = (usage, runtime_usage)
+    else {
         return Ok(None);
     };
-    context.persist_token_usage(turn_id, &usage).await?;
+    context
+        .persist_token_usage(turn_id, &usage, cost_usd_observed)
+        .await?;
     context.budget_stop().await
 }
 
@@ -312,34 +319,6 @@ fn budget_stop_error(stop: &TurnBudgetStop) -> anyhow::Error {
     )
 }
 
-pub(super) fn budget_stop_artifact(stop: &TurnBudgetStop) -> ActivityArtifact {
-    ActivityArtifact::new(
-        ARTIFACT_RUNTIME_BUDGET_STOP,
-        serde_json::json!({
-            "workflow_id": stop.workflow_id,
-            "spent_usd": stop.spent_usd,
-            "budget_usd": stop.budget_usd,
-            "enforcement": "enforce",
-        }),
-    )
-}
-
-pub(super) fn enforced_budget_cost_error(
-    backend: &dyn AgentBackend,
-    policy: &harness_core::config::workflow::RuntimeBudgetPolicy,
-) -> Option<String> {
-    (!policy.unlimited
-        && policy.enforcement
-            == harness_core::config::workflow::RuntimeBudgetEnforcement::Enforce
-        && !backend.reports_usage_cost())
-    .then(|| {
-        format!(
-            "agent backend `{}` does not report USD cost; refusing to launch an agent contract under enforced USD budget policy",
-            backend.name()
-        )
-    })
-}
-
 #[cfg(test)]
 mod accounting_tests {
     use super::*;
@@ -357,6 +336,7 @@ mod accounting_tests {
     struct AccountingAgent {
         emit_usage: bool,
         fail_after_usage: bool,
+        cost_usd_observed: bool,
     }
 
     #[async_trait]
@@ -390,6 +370,7 @@ mod accounting_tests {
                         total_tokens: 18,
                         cost_usd: 0.125,
                     },
+                    cost_usd_observed: self.cost_usd_observed,
                 })
                 .await
                 .map_err(|error| {
@@ -467,6 +448,7 @@ mod accounting_tests {
             &AccountingAgent {
                 emit_usage: true,
                 fail_after_usage: false,
+                cost_usd_observed: true,
             },
             &enforce
         )
@@ -505,6 +487,7 @@ mod accounting_tests {
                         total_tokens: 28,
                         cost_usd,
                     },
+                    cost_usd_observed: true,
                 })
                 .await
                 .map_err(|error| {
@@ -567,7 +550,6 @@ mod accounting_tests {
             runtime_kind: RuntimeKind::CodexExec,
             runtime_profile: "codex-accounting".to_string(),
             agent: "accounting-agent".to_string(),
-            cost_usd_observed: true,
             model: "gpt-test".to_string(),
             project: "/project/accounting".to_string(),
             task_id: Some("task-accounting".to_string()),
@@ -596,6 +578,7 @@ mod accounting_tests {
             Arc::new(AccountingAgent {
                 emit_usage: true,
                 fail_after_usage: true,
+                cost_usd_observed: true,
             }),
             &pinned_contract(),
             None,
@@ -730,8 +713,9 @@ mod accounting_tests {
 
         let error = execute_agent_contract_attempt(
             Arc::new(AccountingAgent {
-                emit_usage: false,
+                emit_usage: true,
                 fail_after_usage: false,
+                cost_usd_observed: false,
             }),
             &pinned_contract(),
             None,
@@ -764,6 +748,7 @@ mod accounting_tests {
             Arc::new(AccountingAgent {
                 emit_usage: true,
                 fail_after_usage: false,
+                cost_usd_observed: true,
             }),
             &pinned_contract(),
             None,

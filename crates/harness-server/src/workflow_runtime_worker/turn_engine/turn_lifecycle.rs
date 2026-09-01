@@ -125,10 +125,6 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     } else {
         server.agent_registry.turn_execution_adapter(&agent_name)
     };
-    if let Some(context) = options.runtime_usage.as_mut() {
-        let execution_backend = execution_adapter.as_deref().unwrap_or(agent.as_ref());
-        context.cost_usd_observed = execution_backend.reports_usage_cost();
-    }
     let adapter_opt = if options.force_code_agent {
         None
     } else {

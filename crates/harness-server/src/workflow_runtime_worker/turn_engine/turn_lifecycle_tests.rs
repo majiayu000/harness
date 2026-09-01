@@ -633,6 +633,7 @@ fn normalize_preserves_warning_diagnostic_cancelled_and_token_usage_events() {
             total_tokens: 3,
             cost_usd: 0.0,
         },
+        cost_usd_observed: false,
     });
 
     assert_eq!(
@@ -661,7 +662,8 @@ fn normalize_preserves_warning_diagnostic_cancelled_and_token_usage_events() {
                 output_tokens: 2,
                 total_tokens: 3,
                 cost_usd: 0.0,
-            }
+            },
+            cost_usd_observed: false,
         })
     );
 }
