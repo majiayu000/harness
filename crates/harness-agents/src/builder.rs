@@ -54,6 +54,10 @@ impl<A: CodeAgent> CodeAgent for ConfiguredAgent<A> {
         self.inner.agent_contract_capabilities()
     }
 
+    fn reports_usage_cost(&self) -> bool {
+        self.inner.reports_usage_cost()
+    }
+
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         self.inner.execute(req).await
     }

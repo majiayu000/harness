@@ -207,6 +207,21 @@ else
         fail "starter explicit-bin override: exit=$status output=$output"
     fi
 
+    # Codex-only launches must not inherit the Claude backend credential.
+    fix="$(new_fixture starter-sanitized-claude-credential)"
+    printf '#!/bin/sh\nif [ -n "${ANTHROPIC_API_KEY:-}" ]; then exit 9; fi\nexit 0\n' > "$fix/operator-harness"
+    chmod +x "$fix/operator-harness"
+    set +e
+    output="$(cd "$fix" && ANTHROPIC_API_KEY=must-not-leak "$STARTER" --port 39415 --bin "$fix/operator-harness" --foreground 2>&1)"
+    status=$?
+    set -e
+    if [ "$status" -eq 0 ] &&
+        printf '%s' "$output" | grep -q "sanitized vars: -u ANTHROPIC_API_KEY"; then
+        pass "starter strips the Claude backend credential"
+    else
+        fail "starter Claude credential sanitization: exit=$status output=$output"
+    fi
+
     # The recorded-live-PID fast path reports freshness separately from
     # process health and stays successful and non-destructive.
     fix="$(new_fixture starter-live-pid)"

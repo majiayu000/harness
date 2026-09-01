@@ -12,7 +12,9 @@ use std::sync::Arc;
 use super::agent_contract_assessment::attach_server_assessment;
 use super::agent_contract_attempt::{contract_violations, parse_contract_verdict};
 use super::agent_contract_enforcement::{turn_observation_artifact, PinnedJobAgentContract};
-use super::agent_contract_stream::{execute_agent_contract_attempt, ContractAttemptFailure};
+use super::agent_contract_stream::{
+    enforced_budget_cost_error, execute_agent_contract_attempt, ContractAttemptFailure,
+};
 use super::turn_engine::helpers::RuntimeUsageContext;
 
 pub(super) async fn execute_contract_attempts(
@@ -33,6 +35,20 @@ pub(super) async fn execute_contract_attempts(
         .workflow_runtime_store
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("workflow runtime store is unavailable"))?;
+    if let Some(error) = runtime_usage
+        .and_then(|context| enforced_budget_cost_error(backend.as_ref(), &context.budget_policy))
+    {
+        return Ok(ActivityResult {
+            activity: activity.to_string(),
+            status: ActivityStatus::Blocked,
+            summary: "Agent contract execution requires observable USD cost for the enforced workflow budget.".to_string(),
+            artifacts: Vec::new(),
+            signals: Vec::new(),
+            validation: Vec::new(),
+            error: Some(error),
+            error_kind: Some(ActivityErrorKind::Configuration),
+        });
+    }
     let mut observations = Vec::new();
     let mut corrections_used = 0;
     let mut last_validation_error = "agent contract produced no valid verdict".to_string();
@@ -94,29 +110,48 @@ pub(super) async fn execute_contract_attempts(
             {
                 Ok(attempt) => attempt,
                 Err(error) => {
-                    let (error, output) = match error.downcast::<ContractAttemptFailure>() {
-                        Ok(failure) => {
-                            let (attempt, error) = failure.into_parts();
-                            observations.push(turn_observation_artifact(
-                                turn_number,
-                                &attempt.items,
-                                &attempt.observations,
-                            ));
-                            (error, attempt.output)
-                        }
-                        Err(error) => (error, String::new()),
-                    };
+                    let (error, output, budget_stop) =
+                        match error.downcast::<ContractAttemptFailure>() {
+                            Ok(failure) => {
+                                let (attempt, error, budget_stop) = failure.into_parts();
+                                observations.push(turn_observation_artifact(
+                                    turn_number,
+                                    &attempt.items,
+                                    &attempt.observations,
+                                ));
+                                (error, attempt.output, budget_stop)
+                            }
+                            Err(error) => (error, String::new(), None),
+                        };
                     let error = error.to_string();
                     record_attempt_completed(
                         store,
                         job,
                         primary_attempt,
                         correction_attempt,
-                        "execution_error",
+                        if budget_stop.is_some() {
+                            "budget_exhausted"
+                        } else {
+                            "execution_error"
+                        },
                         &output,
                         Some(&error),
                     )
                     .await?;
+                    if budget_stop.is_some() {
+                        return Ok(ActivityResult {
+                            activity: activity.to_string(),
+                            status: ActivityStatus::Blocked,
+                            summary:
+                                "Agent contract attempt stopped at the enforced workflow budget."
+                                    .to_string(),
+                            artifacts: observations,
+                            signals: Vec::new(),
+                            validation: Vec::new(),
+                            error: Some(error),
+                            error_kind: None,
+                        });
+                    }
                     let mut result = ActivityResult::failed(
                         activity,
                         "Agent contract attempt failed before producing a verdict.",
@@ -274,6 +309,10 @@ mod tests {
                 pinned_output_schema: true,
                 attempt_observation_stream: true,
             }
+        }
+
+        fn reports_usage_cost(&self) -> bool {
+            true
         }
 
         async fn execute_stream(

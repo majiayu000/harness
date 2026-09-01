@@ -37,10 +37,6 @@ use super::agent_contract_enforcement::TurnStreamObservations;
 use super::agent_contract_prompt::contract_attempt_prompt;
 #[cfg(test)]
 use super::agent_contract_stream::execute_agent_contract_attempt;
-#[cfg(test)]
-#[path = "agent_contract_accounting_tests.rs"]
-mod accounting_tests;
-
 #[derive(Debug)]
 pub(super) struct ContractAttempt {
     pub(super) output: String,

@@ -23,8 +23,8 @@ Options:
   -h, --help            Show this help
 
 This wrapper is safe to run from Codex sessions. It preserves normal shell
-environment such as PATH, HOME, GITHUB_TOKEN, and API keys, but removes local
-Codex/Claude wrapper variables that can confuse spawned agent subprocesses.
+environment such as PATH, HOME, GITHUB_TOKEN, and unrelated API keys, but
+removes the Anthropic API key plus local Codex/Claude wrapper variables.
 When available, background mode runs the server in a detached tmux session so it
 does not depend on the calling tool process lifetime.
 
@@ -380,9 +380,11 @@ if [[ "$binary_freshness_state" != "fresh" ]]; then
   echo "warning: freshness is not enforced for explicit --bin/HARNESS_BIN selections" >&2
 fi
 
-unset_args=()
+unset_args=("-u" "ANTHROPIC_API_KEY")
 while IFS='=' read -r name _; do
   case "$name" in
+    ANTHROPIC_API_KEY)
+      ;;
     CODEX*|Codex*)
       unset_args+=("-u" "$name")
       ;;

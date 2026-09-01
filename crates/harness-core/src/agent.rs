@@ -99,6 +99,12 @@ pub trait AgentBackend: Send + Sync {
     fn agent_contract_capabilities(&self) -> AgentContractCapabilities {
         AgentContractCapabilities::default()
     }
+    /// Whether streamed [`TokenUsage`] values contain backend-reported USD
+    /// cost rather than an unknown placeholder. Enforced USD budgets must not
+    /// launch against a backend that cannot make this claim.
+    fn reports_usage_cost(&self) -> bool {
+        false
+    }
     async fn execute(&self, _req: AgentRequest) -> crate::error::Result<AgentResponse> {
         Err(crate::error::Error::Unsupported(
             "execute not supported".into(),

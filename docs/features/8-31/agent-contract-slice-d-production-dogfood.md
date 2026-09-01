@@ -2,6 +2,8 @@
 
 Date: 2026-08-31
 
+Last verified: 2026-09-01
+
 ## Scope
 
 Slice D exercises the merged Slice C contract path through a real production
@@ -13,17 +15,32 @@ RFC, or any vNext phase.
 The production profile used:
 
 - runtime kind: `codex_exec`
-- runtime profile: `slice-d-codex-contract`
+- runtime profile: `slice-d-sanitized-codex`
 - model: `gpt-5.6-sol`
 - reasoning effort: `high`
 - approval policy: `never`
 - primary attempts: `1`
 - correction attempts available: `1`
 - runtime timeout: `300s`
+- USD budget enforcement: `shadow`
 
 The server ran on an isolated local port with an isolated disposable
 PostgreSQL database and an isolated XDG configuration root. The submission was
 created through `POST /api/workflows/runtime/submissions`.
+
+## Credential isolation
+
+Harness recognizes `ANTHROPIC_API_KEY` as the Claude backend credential. The
+Codex-safe server launcher now always removes that variable before starting the
+server, along with inherited Codex and Claude wrapper-session variables. Its
+integration test injects a sentinel Anthropic key into the parent environment
+and proves the launched process cannot read it.
+
+The final production run injected a sentinel `ANTHROPIC_API_KEY` into the
+launcher environment. The launch record contains `-u ANTHROPIC_API_KEY`, and a
+direct check of the live server process environment confirmed the variable was
+absent before submission. The selected and observed runtime was Codex; no
+Claude backend or credential participated in the run.
 
 ## Production findings
 
@@ -60,12 +77,20 @@ drains the agent stream on timeout, lease loss, budget exhaustion, or accounting
 failure. This prevents an already-queued usage event from being lost during
 cancellation without adding a second accounting path.
 
+The final fresh review also identified that Codex reports token counts but not
+provider USD cost. Harness does not invent a price. A backend must now
+explicitly claim that its streamed usage contains reported USD cost before an
+agent contract can launch under `enforce`; otherwise the activity blocks before
+model execution. Shadow and unlimited policies remain available. Mid-turn
+ceiling exhaustion from a cost-reporting backend is retained as a structured
+budget stop and produces a blocked activity rather than a fatal failure.
+
 ## Final production evidence
 
 Final submission:
 
-- submission id: `fa8edffc-d198-40e9-86b3-53b06723b47c`
-- runtime job id: `64854d15-c448-4a77-8843-a3eae43ec78e`
+- submission id: `1315b97d-1369-4a67-83c1-f4412e33d12c`
+- runtime job id: `0ebdc15c-ffb8-4687-a32c-87839aafb2c2`
 - terminal projection: `done:done`
 - verdict outcome: `approved`
 - observed model: `gpt-5.6-sol` (`launch_derived`)
@@ -78,22 +103,22 @@ Final submission:
 
 Timing from server-authored PostgreSQL timestamps:
 
-- submission to persisted artifacts: `16.745s`
-- runtime job lifetime: `15.684s`
-- agent-contract attempt: `13.540s`
+- submission to persisted artifacts: `24.545s`
+- runtime job lifetime: `23.756s`
+- agent-contract attempt: `22.745s`
 
 Usage returned by the runtime submission API and persisted in
 `runtime_usage_events`:
 
-- input tokens: `21,789`
-- output tokens: `132`
-- reported total tokens: `21,921`
+- input tokens: `21,807`
+- output tokens: `222`
+- reported total tokens: `22,029`
 - provider-reported cost: `$0.00`
 
 The persisted usage row is attributed to project
-`/private/tmp/harness-slice-d-20260831/project` and task
-`fa8edffc-d198-40e9-86b3-53b06723b47c`. Its stable turn id is
-`agent-contract:64854d15-c448-4a77-8843-a3eae43ec78e:1`.
+`/private/tmp/harness-slice-d-sanitized-20260901/project` and task
+`1315b97d-1369-4a67-83c1-f4412e33d12c`. Its stable turn id is
+`agent-contract:0ebdc15c-ffb8-4687-a32c-87839aafb2c2:1`.
 
 Harness does not synthesize a price when the Codex stream reports zero cost;
 the stored and returned value remains the provider-reported value.
@@ -118,19 +143,21 @@ No model attempt was replayed and no usage row was duplicated.
 
 The canonical compact JSON hashes matched across the restart:
 
-- submission response: `92b0f4ca0eb7d1c0f55d789ccc5339010d9302237b3507b12d48f8673d89957f`
-- artifacts response: `fd102abd5fc4f01200293384149f9f789c6c308ecdf4f6b6327d8ca7e146430f`
+- submission response: `f092acb874a3ee750ad9b38ecae4f1120d865a14d4743d8f12772a57bd42f65f`
+- artifacts response: `62f6f50120d197795f277ecd0705dbf441808bc2ded490ad3496381a36bca112`
 
 ## Focused verification
 
 The implementation is covered by:
 
 ```text
+scripts/test-binary-freshness.sh
 cargo test -p harness-server agent_contract_submission_command_matches_the_committed_instance
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server real_submission_assessment_routes_and_reopens_without_model_replay
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server usage_survives_backend_failure_after_report
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server enforced_budget_rejects_terminal_verdict_after_usage_crosses_ceiling
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server lease_loss_drains_queued_usage_before_returning
+HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-server enforced_budget_requires_backend_reported_cost
 HARNESS_DATABASE_URL=<isolated-test-database> cargo test -p harness-workflow budget_ceiling_preempts_terminal_agent_contract_completion
 ```
 
@@ -140,4 +167,6 @@ cost persistence, and project/task attribution. The remaining tests protect
 failed-attempt accounting and observations, enforced mid-attempt and
 transaction-time budget stops, and queued usage during lease cancellation. The
 production success reported zero cost, so the transaction-time ceiling is
-proved by the focused database test rather than that successful run.
+proved by the focused database test rather than that successful run. Codex
+cannot silently enter that enforced path: its missing cost-reporting capability
+is covered by the preflight test and blocks before launch.
