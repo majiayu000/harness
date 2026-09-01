@@ -257,10 +257,7 @@ fn agent_contract_submission_command_matches_the_committed_instance() -> anyhow:
 
 #[test]
 fn declarative_submission_preserves_intake_identity_and_trust() {
-    let registry = register_test_definition();
-    let Some(definition) = registry.current_declarative_definition(TEST_DEFINITION_ID) else {
-        panic!("definition should be registered");
-    };
+    let definition = agent_contract_definition();
     let task_id = TaskId::from_str("declarative-intake-identity");
     let ctx = DeclarativeSubmissionRuntimeContext {
         project_root: Path::new("/repo"),
@@ -296,6 +293,66 @@ fn declarative_submission_preserves_intake_identity_and_trust() {
             .and_then(|provenance| provenance.provenance_for("/classification_input")),
         Some(DataProvenance::External)
     );
+    let decision = build_declarative_submission_decision(&definition, &instance)
+        .expect("agent contract submission decision should build");
+    let mut committed = instance.clone();
+    committed.state = decision.next_state.clone();
+    committed.version = committed.version.saturating_add(1);
+    let data = merge_last_decision(std::mem::take(&mut committed.data), &decision.decision);
+    super::declarative::classify_declarative_submission_data(
+        &mut committed,
+        data,
+        DataProvenance::External,
+    )
+    .expect("committed intake facts should retain their trust classification");
+    assert_eq!(
+        committed
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/classification_input")),
+        Some(DataProvenance::External)
+    );
+    assert!(validate_declarative_agent_contract_command(
+        &definition,
+        &committed,
+        &decision.commands[0],
+    )
+    .expect("committed intake command should retain its pinned provenance"));
+}
+
+#[test]
+fn declarative_submission_without_agent_contract_keeps_prompt_out_of_facts() {
+    let registry = register_test_definition();
+    let definition = registry
+        .current_declarative_definition(TEST_DEFINITION_ID)
+        .expect("definition should be registered");
+    let task_id = TaskId::from_str("declarative-no-agent-contract");
+    let instance = super::declarative::submission_instance(
+        &DeclarativeSubmissionRuntimeContext {
+            project_root: Path::new("/repo"),
+            definition_id: TEST_DEFINITION_ID,
+            task_id: &task_id,
+            prompt: "perform the declared work",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            source: None,
+            external_id: None,
+            subject_key: None,
+            repo: None,
+            author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
+        },
+        "/repo",
+        "declarative-no-agent-contract-workflow",
+        "prompt-ref",
+        &definition,
+    );
+
+    assert!(instance.data.get("classification_input").is_none());
+    assert!(instance
+        .data_provenance
+        .as_ref()
+        .is_some_and(|provenance| provenance.provenance_for("/classification_input").is_none()));
 }
 
 #[tokio::test]

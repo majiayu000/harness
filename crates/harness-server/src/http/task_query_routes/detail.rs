@@ -90,10 +90,8 @@ async fn runtime_task_response_by_handle(
     let error = match runtime_string_field(&workflow.data, "failure_reason") {
         Some(reason) => Some(reason),
         None => store
-            .rejected_decisions_for_workflows_limited(std::slice::from_ref(&workflow.id), 1)
+            .latest_unresolved_rejection_for_workflow(&workflow.id)
             .await?
-            .remove(&workflow.id)
-            .and_then(|records| records.into_iter().next())
             .and_then(|record| record.rejection_reason),
     };
     let terminal = TaskTerminalInfo::from_status_error(&task_status, error.as_deref());
