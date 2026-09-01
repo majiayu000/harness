@@ -60,7 +60,8 @@ pub const REASON_PR_BINDING_VERIFICATION_FAILED: &str = "pr_binding_verification
 /// Artifact types only the server may author on an [`ActivityResult`].
 /// Agent-authored artifacts with these types must be stripped before the
 /// server attaches its own.
-pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 13] = [
+pub const ARTIFACT_ACTIVITY_RESULT_ENVELOPE: &str = "activity_result_envelope";
+pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 14] = [
     ARTIFACT_VERIFIED_PR_BINDING,
     ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
     ARTIFACT_SERVER_VALIDATION_DIGEST,
@@ -74,6 +75,7 @@ pub const SERVER_RESERVED_ARTIFACT_TYPES: [&str; 13] = [
     ARTIFACT_RUNTIME_BUDGET_STOP,
     super::AGENT_CONTRACT_ASSESSMENT_ARTIFACT,
     super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
+    ARTIFACT_ACTIVITY_RESULT_ENVELOPE,
 ];
 
 pub fn downgrade_agent_authored_decision(mut decision: WorkflowDecision) -> WorkflowDecision {
@@ -318,6 +320,10 @@ mod tests {
             .with_artifact(ActivityArtifact::new(
                 super::super::pr_feedback::SERVER_PR_SNAPSHOT_ARTIFACT,
                 json!({ "snapshot_source": "forged" }),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                "activity_result_envelope",
+                json!({ "outcome": "forged" }),
             ))
             .with_artifact(ActivityArtifact::new(
                 "pull_request",

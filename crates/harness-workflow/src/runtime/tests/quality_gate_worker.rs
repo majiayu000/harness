@@ -160,7 +160,7 @@ async fn runtime_worker_propagates_quality_gate_child_failure_to_parent() -> any
 }
 
 #[tokio::test]
-async fn runtime_worker_does_not_propagate_still_inspecting_pr_feedback_child() -> anyhow::Result<()>
+async fn runtime_worker_blocks_invalid_pr_feedback_child_without_propagating() -> anyhow::Result<()>
 {
     if resolve_database_url(None).is_err() {
         return Ok(());
@@ -214,7 +214,11 @@ async fn runtime_worker_does_not_propagate_still_inspecting_pr_feedback_child() 
         .get_instance(&child.id)
         .await?
         .expect("child workflow should exist");
-    assert_eq!(child_after.state, "inspecting");
+    assert_eq!(child_after.state, "blocked");
+    assert_eq!(child_after.data["stop_reason_code"], "invalid_agent_output");
+    assert!(child_after.data["blocked_reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("required feedback outcome signal")));
     let parent_after = store
         .get_instance(&parent.id)
         .await?
@@ -225,7 +229,7 @@ async fn runtime_worker_does_not_propagate_still_inspecting_pr_feedback_child() 
         parent_events
             .iter()
             .all(|event| event.event_type != "RuntimeJobCompleted"),
-        "still-inspecting child success must not propagate to parent"
+        "invalid child success must not propagate to parent"
     );
     Ok(())
 }
