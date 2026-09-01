@@ -406,7 +406,7 @@ workflow_child_relations
   dependencies jsonb
   required_output_evidence jsonb
   status
-  unique(parent_workflow_id, child_workflow_id)
+  unique(parent_workflow_id, child_workflow_id, decomposition_revision)
 
 workflow_parent_releases
   id primary key
