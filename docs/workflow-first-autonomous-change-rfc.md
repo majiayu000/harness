@@ -2763,7 +2763,9 @@ stateDiagram-v2
     awaiting_external_merge --> refreshing_integration_review_facts: invalidated integration PR closed unmerged
     awaiting_external_merge --> reconciling_external_merge: merge after integration child outcome stale
     awaiting_external_merge --> fencing_external_independent_release: child review stale
-    awaiting_external_merge --> awaiting_parent_handoff: invalidated remote change is closed unmerged
+    fencing_external_independent_release --> awaiting_external_merge: release invalidated; preserve wait identity
+    awaiting_external_merge --> refreshing_independent_child_review_facts: triggering child closed unmerged
+    awaiting_external_merge --> awaiting_parent_handoff: invalidated sibling remote change is closed unmerged
     awaiting_external_merge --> blocked: invalidated release identity drift
     awaiting_external_merge --> reconciling_external_merge: merge observed after invalidation
     reconciling_external_merge --> done: direct or independent child merge confirmed
@@ -2878,6 +2880,7 @@ stateDiagram-v2
     assessing_refreshed_integration_risk --> blocked
     validating_refreshed_integration --> blocked
     fencing_independent_release --> blocked
+    fencing_external_independent_release --> blocked
     refreshing_independent_child_review_facts --> blocked
     requesting_independent_child_review --> blocked
     refreshing_child_review_facts --> blocked
@@ -2921,8 +2924,9 @@ stateDiagram-v2
     reconciling_cancellation_external_outcome --> done: subject completed
     reconciling_cancellation_external_outcome --> releasing_integration_children: integration parent merged
     reconciling_cancellation_external_outcome --> reconciling_cancellation_stack_entry: stack entry merged
-    reconciling_cancellation_stack_entry --> cancelling_child_set: entries remain
-    reconciling_cancellation_stack_entry --> reconciling_child_set: stack complete
+    reconciling_cancellation_external_outcome --> reconciling_cancellation_external_stack_entry: external stack entry merged
+    reconciling_cancellation_stack_entry --> releasing_landed_stack_child: entry confirmed
+    reconciling_cancellation_external_stack_entry --> releasing_landed_stack_child: entry confirmed
     cancelling_child_set --> cancelled: no active children
     cancelling_child_set --> awaiting_child_cancellations: cancellation commands committed
     awaiting_child_cancellations --> cancelled: all children terminal
@@ -2934,6 +2938,7 @@ stateDiagram-v2
     reconciling_cancellation --> blocked
     reconciling_cancellation_external_outcome --> blocked
     reconciling_cancellation_stack_entry --> blocked
+    reconciling_cancellation_external_stack_entry --> blocked
     done --> [*]
 ```
 
