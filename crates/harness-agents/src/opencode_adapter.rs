@@ -444,6 +444,10 @@ impl AgentAdapter for OpenCodeAcpAdapter {
         "opencode"
     }
 
+    fn reports_usage_cost(&self) -> bool {
+        true
+    }
+
     async fn start_turn(
         &self,
         req: AgentRequest,

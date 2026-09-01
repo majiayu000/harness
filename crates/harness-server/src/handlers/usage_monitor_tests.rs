@@ -244,6 +244,7 @@ fn runtime_usage_record_becomes_usage_record_with_candidate() -> anyhow::Result<
             reported_total_tokens: Some(30),
         },
         cost_usd_micros: 125_000,
+        cost_usd_observed: true,
         reported_at: Utc::now(),
         updated_at: Utc::now(),
     };

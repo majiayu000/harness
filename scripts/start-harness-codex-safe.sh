@@ -25,8 +25,8 @@ Options:
   -h, --help            Show this help
 
 This wrapper is safe to run from Codex sessions. It preserves normal shell
-environment such as PATH, HOME, GITHUB_TOKEN, and API keys, but removes local
-Codex/Claude wrapper variables that can confuse spawned agent subprocesses.
+environment such as PATH, HOME, GITHUB_TOKEN, and unrelated API keys, but
+removes the Anthropic API key plus local Codex/Claude wrapper variables.
 With --require-github-token, the wrapper imports the current `gh auth token`
 into GITHUB_TOKEN when needed without printing it. Strict GitHub-authenticated
 starts use the direct background launcher instead of tmux so the credential is
@@ -417,9 +417,11 @@ if [[ "$binary_freshness_state" != "fresh" ]]; then
   echo "warning: freshness is not enforced for explicit --bin/HARNESS_BIN selections" >&2
 fi
 
-unset_args=()
+unset_args=("-u" "ANTHROPIC_API_KEY")
 while IFS='=' read -r name _; do
   case "$name" in
+    ANTHROPIC_API_KEY)
+      ;;
     CODEX*|Codex*)
       unset_args+=("-u" "$name")
       ;;

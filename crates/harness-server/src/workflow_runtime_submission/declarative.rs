@@ -235,6 +235,8 @@ pub(super) fn submission_instance(
         "external_id": ctx.external_id,
         "repo": ctx.repo,
         "depends_on": [],
+        "last_decision": DECLARATIVE_SUBMISSION_DECISION,
+        "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
     });
     insert_author_trust_class(&mut data, ctx.author_trust_class);
     let data = crate::workflow_runtime_policy::merge_runtime_retry_policy(ctx.project_root, data);

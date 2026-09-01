@@ -270,7 +270,10 @@ fn apply_codex_exec_event(
         ParsedCodexExecEvent::TurnCompleted { usage } => {
             if let Some(usage) = usage {
                 parsed.token_usage = usage.clone();
-                emitted_items.push(StreamItem::TokenUsage { usage });
+                emitted_items.push(StreamItem::TokenUsage {
+                    usage,
+                    cost_usd_observed: false,
+                });
             }
             apply_codex_terminal(
                 parsed,

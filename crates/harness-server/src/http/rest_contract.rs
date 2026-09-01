@@ -213,7 +213,6 @@ register_legacy_dtos!(
     crate::http::task_mutation_routes::WorkflowRuntimeRecoveryRouteRequest,
     crate::http::task_query_routes::RuntimeSubmissionListParams,
     crate::http::task_query_routes::RuntimeSubmissionListResponse,
-    crate::http::task_query_routes::detail::RuntimeTaskResponse,
     crate::http::workflow_routes::IssueWorkflowByIssueQuery,
     crate::http::workflow_routes::IssueWorkflowByPrQuery,
     crate::http::workflow_routes::ProjectWorkflowByProjectQuery,

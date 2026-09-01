@@ -186,7 +186,12 @@ fn parse_app_server_agent_event(
             .get("tokenUsage")
             .and_then(|usage| usage.get("total"))
             .and_then(parse_codex_token_usage)
-            .map(|usage| ParsedCodexMessage::Event(AgentEvent::TokenUsage { usage }))
+            .map(|usage| {
+                ParsedCodexMessage::Event(AgentEvent::TokenUsage {
+                    usage,
+                    cost_usd_observed: false,
+                })
+            })
             .unwrap_or(ParsedCodexMessage::Ignore),
         "warning" => ParsedCodexMessage::Event(AgentEvent::Diagnostic {
             severity: AgentDiagnosticSeverity::Warning,

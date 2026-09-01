@@ -1,7 +1,8 @@
 use super::*;
 use harness_workflow::runtime::{
-    RuntimeKind, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType, WorkflowInstance,
-    WorkflowRunEvidenceInput, WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    RuntimeKind, RuntimeUsageMetrics, RuntimeUsageUpsert, WorkflowCommand, WorkflowCommandStatus,
+    WorkflowCommandType, WorkflowInstance, WorkflowRunEvidenceInput, WorkflowRuntimeStore,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 
 #[tokio::test]
@@ -145,7 +146,8 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn get_task_runtime_issue_exposes_tracker_identity() -> anyhow::Result<()> {
+async fn get_task_runtime_issue_exposes_tracker_identity_and_cost_observation() -> anyhow::Result<()>
+{
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
@@ -186,6 +188,37 @@ async fn get_task_runtime_issue_exposes_tracker_identity() -> anyhow::Result<()>
         },
     )
     .await?;
+    let workflow = store
+        .get_instance_by_task_id(task_id.as_str())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("runtime workflow should exist"))?;
+    store
+        .upsert_runtime_usage(&RuntimeUsageUpsert {
+            runtime_job_id: "opencode-api-job".to_string(),
+            command_id: "opencode-api-command".to_string(),
+            workflow_id: workflow.id,
+            turn_id: Some("opencode-api-turn".to_string()),
+            agent_run_id: None,
+            runtime_kind: RuntimeKind::OpenCode,
+            runtime_profile: "opencode-default".to_string(),
+            agent: "opencode".to_string(),
+            model: "opencode".to_string(),
+            project: project_root.display().to_string(),
+            task_id: Some(task_id.as_str().to_string()),
+            candidate_group_id: None,
+            candidate_id: None,
+            candidate_index: None,
+            candidate_count: None,
+            metrics: RuntimeUsageMetrics {
+                input_tokens: 53_000,
+                reported_total_tokens: Some(200_000),
+                ..RuntimeUsageMetrics::default()
+            },
+            cost_usd_micros: 45_000,
+            cost_usd_observed: true,
+            reported_at: Utc::now(),
+        })
+        .await?;
     let app = Router::new()
         .route(
             "/api/workflows/runtime/submissions/{id}",
@@ -207,6 +240,8 @@ async fn get_task_runtime_issue_exposes_tracker_identity() -> anyhow::Result<()>
     assert_eq!(body["external_id"], "issue:64");
     assert_eq!(body["tracker_source"], "github");
     assert_eq!(body["tracker_external_id"], "issue:64");
+    assert_eq!(body["token_usage"]["cost_usd"], 0.045);
+    assert_eq!(body["cost_usd_observed"], true);
     Ok(())
 }
 

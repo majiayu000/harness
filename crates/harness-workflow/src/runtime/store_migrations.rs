@@ -783,4 +783,10 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         description: "enforce unique runtime GitHub issue identities",
         sql: github_identity::SQL,
     },
+    Migration {
+        version: 33,
+        description: "record whether runtime USD cost was provider observed",
+        sql: "ALTER TABLE runtime_usage_events
+              ADD COLUMN IF NOT EXISTS cost_usd_observed BOOLEAN NOT NULL DEFAULT FALSE",
+    },
 ];

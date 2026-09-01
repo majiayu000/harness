@@ -13,7 +13,7 @@ use harness_core::agent::{AgentBackend, AgentEvent, ModelIdentitySource};
 use harness_core::config::workflow::{
     agent_contract_output_schema_document, WorkflowAgentContract,
 };
-use harness_core::types::Item;
+use harness_core::types::{Item, TokenUsage};
 use harness_workflow::runtime::completion_evidence::ARTIFACT_RUNTIME_TURN_OBSERVATIONS;
 use harness_workflow::runtime::{
     ActivityArtifact, RuntimeJob, RuntimeProfile, WorkflowCommandRecord, WorkflowRuntimeStore,
@@ -234,6 +234,8 @@ pub(crate) struct TurnStreamObservations {
     pub(crate) unknown_item_kinds: Vec<String>,
     pub(crate) approval_requests: u32,
     pub(crate) tool_output_deltas: u32,
+    pub(crate) token_usage: Option<TokenUsage>,
+    pub(crate) cost_usd_observed: bool,
 }
 
 /// Item kinds the runtime recognizes as carrying no tool or mutation surface.
@@ -261,6 +263,13 @@ impl TurnStreamObservations {
             }
             AgentEvent::ToolOutputDelta { .. } => {
                 self.tool_output_deltas = self.tool_output_deltas.saturating_add(1);
+            }
+            AgentEvent::TokenUsage {
+                usage,
+                cost_usd_observed,
+            } => {
+                self.token_usage = Some(usage.clone());
+                self.cost_usd_observed = *cost_usd_observed;
             }
             _ => {}
         }
@@ -321,6 +330,7 @@ pub(super) fn turn_observation_artifact(
             "unknown_item_kinds": observations.unknown_item_kinds,
             "approval_requests": observations.approval_requests,
             "tool_output_deltas": observations.tool_output_deltas,
+            "cost_usd_observed": observations.cost_usd_observed,
             "reported_models": observations
                 .reported_models
                 .iter()
