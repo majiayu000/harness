@@ -1,56 +1,14 @@
-use super::super::rest_contract::LegacyJson as Json;
+use super::super::rest_contract::{ContractJson, LegacyJson as Json};
 use super::*;
 use crate::runtime_projection::{runtime_string_field, RuntimeWorkflowProjection};
-
-#[derive(Serialize)]
-pub(in crate::http) struct RuntimeTaskResponse {
-    id: String,
-    task_id: String,
-    submission_id: String,
-    task_kind: TaskKind,
-    status: TaskStatus,
-    workflow_state: String,
-    failure_kind: Option<crate::workflow_runtime_submission::runtime_models::TaskFailureKind>,
-    phase: crate::workflow_runtime_submission::runtime_models::TaskPhase,
-    scheduler: crate::workflow_runtime_submission::runtime_state::TaskSchedulerState,
-    turn: u32,
-    pr_url: Option<String>,
-    description: Option<String>,
-    created_at: String,
-    updated_at: String,
-    execution_path: &'static str,
-    workflow_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    external_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tracker_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tracker_external_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repo: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    project: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    issue: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token_usage: Option<harness_core::types::TokenUsage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cost_usd_observed: Option<bool>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pending_approvals: Vec<harness_core::types::Item>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    terminal: Option<TaskTerminalInfo>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    depends_on: Vec<TaskId>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    subtask_ids: Vec<TaskId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workflow: Option<TaskWorkflowSummary>,
-}
+use crate::workflow_runtime_submission::{
+    runtime_models::{TaskPhase, TaskTerminalClassification},
+    runtime_state::{SchedulerOwnerKind, TaskSchedulerState},
+};
+use harness_protocol::rest::{
+    RuntimeTaskDetailErrorResponse, RuntimeTaskDetailResponse, RuntimeTaskSchedulerOwnerResponse,
+    RuntimeTaskSchedulerResponse, RuntimeTaskTerminalResponse, RuntimeTaskWorkflowResponse,
+};
 
 enum RuntimeProofLookup {
     Missing,
@@ -67,10 +25,12 @@ pub(crate) async fn get_runtime_submission(
     }
     let task_id = harness_core::types::TaskId(id);
     match runtime_task_response_by_handle(&state, &task_id).await {
-        Ok(Some(runtime_task)) => Json(runtime_task).into_response(),
+        Ok(Some(runtime_task)) => ContractJson(runtime_task).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "runtime submission not found"})),
+            ContractJson(RuntimeTaskDetailErrorResponse {
+                error: "runtime submission not found".to_string(),
+            }),
         )
             .into_response(),
         Err(error) => {
@@ -83,7 +43,7 @@ pub(crate) async fn get_runtime_submission(
 async fn runtime_task_response_by_handle(
     state: &AppState,
     task_id: &harness_core::types::TaskId,
-) -> anyhow::Result<Option<RuntimeTaskResponse>> {
+) -> anyhow::Result<Option<RuntimeTaskDetailResponse>> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(None);
     };
@@ -145,16 +105,16 @@ async fn runtime_task_response_by_handle(
     let description = Some(super::runtime_submissions::runtime_submission_description(
         &workflow, task_kind, issue,
     ));
-    Ok(Some(RuntimeTaskResponse {
+    Ok(Some(RuntimeTaskDetailResponse {
         id: submission_id.clone(),
         task_id: submission_id.clone(),
         submission_id,
-        task_kind,
-        status: task_status,
+        task_kind: task_kind.as_ref().to_string(),
+        status: task_status.as_str().to_string(),
         workflow_state: workflow.state.clone(),
-        failure_kind,
-        phase,
-        scheduler,
+        failure_kind: failure_kind.map(|kind| kind.as_ref().to_string()),
+        phase: task_phase_name(phase).to_string(),
+        scheduler: runtime_task_scheduler_response(scheduler),
         turn: 0,
         pr_url: runtime_string_field(&workflow.data, "pr_url"),
         description,
@@ -173,11 +133,74 @@ async fn runtime_task_response_by_handle(
         token_usage,
         cost_usd_observed,
         pending_approvals,
-        terminal,
+        terminal: terminal.map(runtime_task_terminal_response),
         depends_on: runtime_task_id_array(&workflow.data, "depends_on"),
         subtask_ids: Vec::new(),
-        workflow: Some(TaskWorkflowSummary::from_runtime(&workflow)),
+        workflow: Some(runtime_task_workflow_response(
+            TaskWorkflowSummary::from_runtime(&workflow),
+        )),
     }))
+}
+
+fn task_phase_name(phase: TaskPhase) -> &'static str {
+    match phase {
+        TaskPhase::Triage => "triage",
+        TaskPhase::Plan => "plan",
+        TaskPhase::Implement => "implement",
+        TaskPhase::Review => "review",
+        TaskPhase::Terminal => "terminal",
+    }
+}
+
+fn runtime_task_scheduler_response(scheduler: TaskSchedulerState) -> RuntimeTaskSchedulerResponse {
+    RuntimeTaskSchedulerResponse {
+        authority_state: scheduler.authority_state.as_str().to_string(),
+        owner: scheduler
+            .owner
+            .map(|owner| RuntimeTaskSchedulerOwnerResponse {
+                kind: match owner.kind {
+                    SchedulerOwnerKind::Scheduler => "scheduler",
+                    SchedulerOwnerKind::RuntimeHost => "runtime_host",
+                }
+                .to_string(),
+                id: owner.id,
+            }),
+        run_generation: scheduler.run_generation,
+        recovery_generation: scheduler.recovery_generation,
+        lease_expires_at: scheduler.lease_expires_at,
+    }
+}
+
+fn runtime_task_terminal_response(terminal: TaskTerminalInfo) -> RuntimeTaskTerminalResponse {
+    RuntimeTaskTerminalResponse {
+        status: terminal.status.as_str().to_string(),
+        classification: match terminal.classification {
+            TaskTerminalClassification::Done => "done",
+            TaskTerminalClassification::Failed => "failed",
+            TaskTerminalClassification::Stalled => "stalled",
+            TaskTerminalClassification::Cancelled => "cancelled",
+        }
+        .to_string(),
+        reason: terminal.reason,
+        rounds_used: terminal.rounds_used,
+        last_status: terminal
+            .last_status
+            .map(|status| status.as_str().to_string()),
+        waiting_on: terminal.waiting_on,
+    }
+}
+
+fn runtime_task_workflow_response(workflow: TaskWorkflowSummary) -> RuntimeTaskWorkflowResponse {
+    RuntimeTaskWorkflowResponse {
+        id: workflow.id,
+        definition_id: workflow.definition_id,
+        state: workflow.state,
+        project_id: workflow.project_id,
+        issue_number: workflow.issue_number,
+        pr_number: workflow.pr_number,
+        force_execute: workflow.force_execute,
+        plan_concern: workflow.plan_concern,
+    }
 }
 
 pub(crate) fn proof_from_runtime_workflow(

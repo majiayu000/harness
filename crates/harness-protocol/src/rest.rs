@@ -126,6 +126,112 @@ pub struct RuntimeHostLeaseResponse(pub serde_json::Value);
 #[serde(transparent)]
 pub struct RuntimeHostClaimResponse(pub serde_json::Value);
 
+/// Runtime task detail returned by the workflow submission API.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeTaskDetailResponse {
+    pub id: String,
+    pub task_id: String,
+    pub submission_id: String,
+    pub task_kind: String,
+    pub status: String,
+    pub workflow_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    pub phase: String,
+    pub scheduler: RuntimeTaskSchedulerResponse,
+    pub turn: u32,
+    pub pr_url: Option<String>,
+    pub description: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub execution_path: &'static str,
+    pub workflow_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracker_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracker_external_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<harness_core::types::TokenUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd_observed: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending_approvals: Vec<harness_core::types::Item>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<RuntimeTaskTerminalResponse>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<harness_core::types::TaskId>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subtask_ids: Vec<harness_core::types::TaskId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<RuntimeTaskWorkflowResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeTaskSchedulerResponse {
+    pub authority_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<RuntimeTaskSchedulerOwnerResponse>,
+    pub run_generation: u32,
+    pub recovery_generation: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeTaskSchedulerOwnerResponse {
+    pub kind: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeTaskTerminalResponse {
+    pub status: String,
+    pub classification: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rounds_used: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeTaskWorkflowResponse {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_id: Option<String>,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force_execute: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_concern: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeTaskDetailErrorResponse {
+    pub error: String,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WorkflowEvidenceQuery {
     #[serde(default)]
@@ -233,6 +339,12 @@ impl RestDto for RuntimeHostLeaseResponse {}
 
 impl private::Sealed for RuntimeHostClaimResponse {}
 impl RestDto for RuntimeHostClaimResponse {}
+
+impl private::Sealed for RuntimeTaskDetailResponse {}
+impl RestDto for RuntimeTaskDetailResponse {}
+
+impl private::Sealed for RuntimeTaskDetailErrorResponse {}
+impl RestDto for RuntimeTaskDetailErrorResponse {}
 
 impl private::Sealed for WorkflowEvidenceQuery {}
 impl RestDto for WorkflowEvidenceQuery {}
