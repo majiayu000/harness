@@ -28,8 +28,10 @@ reviews have checked internal consistency and repository facts, but the architec
 `Proposed` until the owner approves it.
 
 Current-runtime delivery has advanced independently of this vNext proposal: Slice A merged in PR
-#2020 and Slice B merged in PR #2025. Slice C (assessment, routing, budgets, and replay) and Slice D
-(production Codex-only dogfood) are not implemented. No vNext phase is authorized by those merges.
+#2020, Slice B in PR #2025, Slice C in PR #2028, and Slice D in PR #2031. Slice D completed
+sanitized Codex-only production dogfood, restart/replay proof, and durable usage accounting; its
+provider stream did not report monetary cost, so cost remains explicitly unknown. No vNext phase
+is authorized by those merges.
 
 ## 2. Executive Decision
 
