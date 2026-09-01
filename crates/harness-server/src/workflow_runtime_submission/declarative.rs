@@ -1,11 +1,11 @@
 use super::{
-    classify_submission_data, insert_author_trust_class, merge_last_decision,
-    prompt_memory::prompt_ref_for_submission, submission_field_provenance, TaskId,
-    WorkflowSubmissionRuntimeRecord, EXECUTION_PATH_WORKFLOW_RUNTIME,
+    insert_author_trust_class, merge_last_decision, prompt_memory::prompt_ref_for_submission,
+    submission_field_provenance, TaskId, WorkflowSubmissionRuntimeRecord,
+    EXECUTION_PATH_WORKFLOW_RUNTIME,
 };
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
-    build_declarative_submission_decision, persisted_declarative_definition,
+    build_declarative_submission_decision, persisted_declarative_definition, DataProvenance,
     DeclarativeWorkflowDefinition, ValidationContext, WorkflowCommandStatus, WorkflowInstance,
     WorkflowRuntimeStore, WorkflowSubject, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload, DECLARATIVE_SUBMISSION_DECISION,
@@ -26,6 +26,7 @@ pub(crate) struct DeclarativeSubmissionRuntimeContext<'a> {
     pub subject_key: Option<&'a str>,
     pub repo: Option<&'a str>,
     pub author_trust_class: Option<IsolationTrustClass>,
+    pub classification_input_provenance: DataProvenance,
 }
 
 pub(crate) async fn record_declarative_submission(
@@ -160,7 +161,11 @@ async fn persist_new_submission(
     final_instance.state = decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
     let data = merge_last_decision(std::mem::take(&mut final_instance.data), &decision.decision);
-    classify_submission_data(&mut final_instance, data)?;
+    classify_declarative_submission_data(
+        &mut final_instance,
+        data,
+        ctx.classification_input_provenance,
+    )?;
     let event_id = uuid::Uuid::new_v4().to_string();
     let Some(outcome) = store
         .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
@@ -238,6 +243,9 @@ pub(super) fn submission_instance(
         "last_decision": DECLARATIVE_SUBMISSION_DECISION,
         "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
     });
+    if !definition.activity_contracts().is_empty() {
+        data["classification_input"] = json!(ctx.prompt);
+    }
     insert_author_trust_class(&mut data, ctx.author_trust_class);
     let data = crate::workflow_runtime_policy::merge_runtime_retry_policy(ctx.project_root, data);
     WorkflowInstance::new(
@@ -250,7 +258,29 @@ pub(super) fn submission_instance(
         ),
     )
     .with_id(workflow_id)
-    .with_data_field_provenance(data, submission_field_provenance)
+    .with_data_field_provenance(data, |field| {
+        declarative_submission_field_provenance(field, ctx.classification_input_provenance)
+    })
+}
+
+pub(super) fn classify_declarative_submission_data(
+    instance: &mut WorkflowInstance,
+    data: serde_json::Value,
+    classification_input_provenance: DataProvenance,
+) -> anyhow::Result<()> {
+    instance.replace_data_with_field_provenance(data, |field| {
+        declarative_submission_field_provenance(field, classification_input_provenance)
+    })
+}
+
+fn declarative_submission_field_provenance(
+    field: &str,
+    classification_input_provenance: DataProvenance,
+) -> DataProvenance {
+    match field {
+        "classification_input" => classification_input_provenance,
+        _ => submission_field_provenance(field),
+    }
 }
 
 async fn persist_definition_metadata(

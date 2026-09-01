@@ -1,8 +1,8 @@
 use super::*;
 use harness_workflow::runtime::{
     RuntimeKind, RuntimeUsageMetrics, RuntimeUsageUpsert, WorkflowCommand, WorkflowCommandStatus,
-    WorkflowCommandType, WorkflowInstance, WorkflowRunEvidenceInput, WorkflowRuntimeStore,
-    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    WorkflowCommandType, WorkflowDecision, WorkflowDecisionRecord, WorkflowInstance,
+    WorkflowRunEvidenceInput, WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 
 #[tokio::test]
@@ -842,6 +842,190 @@ async fn get_task_runtime_issue_surfaces_failure_reason() -> anyhow::Result<()> 
         body["error"],
         "WorktreeCollision: workspace path is managed by another harness session"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_runtime_submission_surfaces_latest_transition_rejection() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "planning",
+        WorkflowSubject::new("issue", "issue:1300"),
+    )
+    .with_id("issue-1300")
+    .with_server_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 1300,
+        "task_id": "runtime-task-1300",
+        "task_ids": ["runtime-task-1300"],
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let rejected_event = store
+        .append_event(
+            &workflow.id,
+            "InvalidBlockedTransition",
+            "test",
+            serde_json::json!({}),
+        )
+        .await?;
+    let rejected = WorkflowDecisionRecord::rejected(
+        WorkflowDecision::new(
+            &workflow.id,
+            "planning",
+            "apply_declarative_transition",
+            "blocked",
+            "route the workflow to the operator gate",
+        )
+        .with_command(WorkflowCommand::new(
+            WorkflowCommandType::RequestOperatorAttention,
+            "issue-1300:operator",
+            serde_json::json!({"reason": "operator input required"}),
+        )),
+        Some(rejected_event.id),
+        "RequiredCommandMissing: transition 'planning' -> 'blocked' requires command MarkBlocked",
+    );
+    store.record_decision(&rejected).await?;
+    let heartbeat_event = store
+        .append_event(
+            &workflow.id,
+            "RuntimeHeartbeat",
+            "test",
+            serde_json::json!({}),
+        )
+        .await?;
+    store
+        .record_decision(&WorkflowDecisionRecord::accepted(
+            WorkflowDecision::new(
+                &workflow.id,
+                "planning",
+                "record_runtime_heartbeat",
+                "planning",
+                "record a later accepted decision without resolving the rejection",
+            ),
+            Some(heartbeat_event.id),
+        ))
+        .await?;
+    sqlx::query(
+        "UPDATE workflow_decisions
+         SET created_at = TIMESTAMPTZ '2026-09-01 00:00:00+00'
+         WHERE workflow_id = $1",
+    )
+    .bind(&workflow.id)
+    .execute(store.pool())
+    .await?;
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/submissions/{id}",
+            get(task_query_routes::get_runtime_submission),
+        )
+        .with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/submissions/runtime-task-1300")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "planning");
+    assert_eq!(
+        body["error"],
+        "RequiredCommandMissing: transition 'planning' -> 'blocked' requires command MarkBlocked"
+    );
+
+    let implementation_event = store
+        .append_event(
+            &workflow.id,
+            "ImplementationStarted",
+            "test",
+            serde_json::json!({}),
+        )
+        .await?;
+    store
+        .record_decision(&WorkflowDecisionRecord::accepted(
+            WorkflowDecision::new(
+                &workflow.id,
+                "planning",
+                "start_implementation",
+                "implementing",
+                "advance after retry",
+            ),
+            Some(implementation_event.id),
+        ))
+        .await?;
+    let replanning_event = store
+        .append_event(
+            &workflow.id,
+            "PlanningResumed",
+            "test",
+            serde_json::json!({}),
+        )
+        .await?;
+    store
+        .record_decision(&WorkflowDecisionRecord::accepted(
+            WorkflowDecision::new(
+                &workflow.id,
+                "implementing",
+                "return_to_planning",
+                "planning",
+                "re-enter the original state",
+            ),
+            Some(replanning_event.id),
+        ))
+        .await?;
+    sqlx::query(
+        "UPDATE workflow_decisions
+         SET created_at = TIMESTAMPTZ '2026-09-01 00:00:00+00'
+         WHERE workflow_id = $1",
+    )
+    .bind(&workflow.id)
+    .execute(store.pool())
+    .await?;
+    let mut recovered = workflow;
+    recovered.version = recovered.version.saturating_add(2);
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &recovered).await?;
+    let app = Router::new()
+        .route(
+            "/api/workflows/runtime/submissions/{id}",
+            get(task_query_routes::get_runtime_submission),
+        )
+        .with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/submissions/runtime-task-1300")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["status"], "planning");
+    assert_eq!(body["error"], serde_json::Value::Null);
     Ok(())
 }
 

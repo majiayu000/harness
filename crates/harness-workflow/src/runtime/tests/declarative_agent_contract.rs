@@ -440,7 +440,7 @@ mod declarative_agent_contract_tests {
             "activity_result": result,
         }));
         let mut registry = WorkflowDefinitionRegistry::with_builtins();
-        registry.register_declarative_current(definition)?;
+        registry.register_declarative_current(definition.clone())?;
 
         let decision = crate::runtime::reducer::reduce_runtime_job_completed_with_registry(
             &registry,
@@ -459,6 +459,82 @@ mod declarative_agent_contract_tests {
         .expect("persisted assessment must replay without a model call");
         assert_eq!(replay.next_state, decision.next_state);
         assert_eq!(replay.reason, decision.reason);
+
+        let blocked_verdict = json!({
+            "schema": "harness.semantic_verdict.v1",
+            "outcome": "large",
+            "rationale": "The supplied facts require operator review.",
+            "evidence_refs": []
+        });
+        let blocked_result = ActivityResult::succeeded("classify_scope", "Assessment completed.")
+            .with_artifact(ActivityArtifact::new(
+                "agent_contract_verdict",
+                json!({"verdict": blocked_verdict}),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                "agent_contract_assessment",
+                json!({
+                    "schema": "harness.agent_contract_assessment.v1",
+                    "assessment_id": "job-blocked:agent-contract-assessment",
+                    "activity": "classify_scope",
+                    "definition_hash": definition.definition_hash(),
+                    "contract_hash": stable_remote_fact_hash(&command.command["agent_contract"]),
+                    "input_hash": stable_remote_fact_hash(&command.command["agent_contract_input"]),
+                    "runtime_job_id": "job-blocked",
+                    "command_id": "command-blocked",
+                    "runtime_profile": "codex-contract",
+                    "runtime_kind": "codex_exec",
+                    "outcome": "large",
+                    "verdict": blocked_verdict,
+                    "budget": {
+                        "max_primary_attempts": 1,
+                        "max_corrections": 1,
+                        "primary_attempts_used": 1,
+                        "corrections_used": 0
+                    }
+                }),
+            ));
+        let blocked_event = WorkflowEvent::new(
+            &instance.id,
+            2,
+            crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+            "runtime-test",
+        )
+        .with_payload(json!({
+            "command_id": "command-blocked",
+            "runtime_job_id": "job-blocked",
+            "runtime_job_profile": "codex-contract",
+            "runtime_job_kind": "codex_exec",
+            "agent_contract_attempts": [
+                {"primary_attempt": 1, "correction_attempt": 0}
+            ],
+            "command": command,
+            "activity_result": blocked_result,
+        }));
+        let blocked_decision =
+            crate::runtime::reducer::reduce_runtime_job_completed_with_registry(
+                &registry,
+                &instance,
+                &blocked_event,
+            )?
+            .expect("blocked assessment must route to the operator gate");
+
+        assert_eq!(blocked_decision.next_state, "blocked");
+        assert!(blocked_decision.commands.iter().any(|command| {
+            command.command_type == WorkflowCommandType::MarkBlocked
+        }));
+        assert!(blocked_decision.commands.iter().any(|command| {
+            command.command_type == WorkflowCommandType::RequestOperatorAttention
+        }));
+        registry
+            .decision_validator_for_instance(&instance)
+            .expect("definition pin must resolve")
+            .expect("declarative definition must resolve a validator")
+            .validate(
+                &instance,
+                &blocked_decision,
+                &ValidationContext::new("workflow-policy", chrono::Utc::now()),
+            )?;
 
         let forged_result = ActivityResult::succeeded("classify_scope", "forged signal")
             .with_signal(ActivitySignal::new("small", json!({"source": "model"})));
@@ -490,6 +566,130 @@ mod declarative_agent_contract_tests {
         assert!(forged_decision
             .reason
             .contains("exactly one server assessment"));
+        Ok(())
+    }
+
+    #[test]
+    fn server_assessment_rejects_unverifiable_evidence_refs() -> anyhow::Result<()> {
+        let definition = build_declarative_definition(
+            &classifier_policy(),
+            &activity_policies(Some(contract())),
+        )?;
+        let instance = WorkflowInstance::new(
+            definition.policy().id.clone(),
+            definition.definition_version(),
+            "classifying",
+            WorkflowSubject::new("test", "assessment-evidence"),
+        )
+        .with_id("assessment-evidence")
+        .with_server_data(json!({
+            "definition_hash": definition.definition_hash(),
+            "classification_input": "Assess this submission."
+        }));
+        let base_command =
+            crate::runtime::declarative_agent_contract::declarative_enqueue_activity_command(
+                &definition,
+                &instance,
+                "classify_scope",
+                "assessment-evidence-1".to_string(),
+            )?;
+        let mut missing_provenance_command = base_command.clone();
+        missing_provenance_command.command["agent_contract_input"]["provenance"]["entries"] =
+            json!({});
+        missing_provenance_command.command["agent_contract_input"]["provenance"]
+            ["value_digests"] = json!({});
+        let cases = [
+            (
+                "missing-path",
+                base_command.clone(),
+                "/facts/does_not_exist",
+                "does not resolve",
+            ),
+            (
+                "outside-facts",
+                base_command,
+                "/subject/identity",
+                "must start with '/facts/'",
+            ),
+            (
+                "missing-provenance",
+                missing_provenance_command,
+                "/facts/classification_input",
+                "provenance",
+            ),
+        ];
+        let mut registry = WorkflowDefinitionRegistry::with_builtins();
+        registry.register_declarative_current(definition.clone())?;
+
+        for (case, command, evidence_ref, expected_error) in cases {
+            let runtime_job_id = format!("job-{case}");
+            let command_id = format!("command-{case}");
+            let verdict = json!({
+                "schema": "harness.semantic_verdict.v1",
+                "outcome": "small",
+                "rationale": "The supplied facts describe a bounded change.",
+                "evidence_refs": [evidence_ref]
+            });
+            let result = ActivityResult::succeeded("classify_scope", "Assessment completed.")
+                .with_artifact(ActivityArtifact::new(
+                    "agent_contract_verdict",
+                    json!({"verdict": verdict}),
+                ))
+                .with_artifact(ActivityArtifact::new(
+                    "agent_contract_assessment",
+                    json!({
+                        "schema": "harness.agent_contract_assessment.v1",
+                        "assessment_id": format!("{runtime_job_id}:agent-contract-assessment"),
+                        "activity": "classify_scope",
+                        "definition_hash": definition.definition_hash(),
+                        "contract_hash": stable_remote_fact_hash(&command.command["agent_contract"]),
+                        "input_hash": stable_remote_fact_hash(&command.command["agent_contract_input"]),
+                        "runtime_job_id": runtime_job_id,
+                        "command_id": command_id,
+                        "runtime_profile": "codex-contract",
+                        "runtime_kind": "codex_exec",
+                        "outcome": "small",
+                        "verdict": verdict,
+                        "budget": {
+                            "max_primary_attempts": 1,
+                            "max_corrections": 1,
+                            "primary_attempts_used": 1,
+                            "corrections_used": 0
+                        }
+                    }),
+                ));
+            let event = WorkflowEvent::new(
+                &instance.id,
+                1,
+                crate::runtime::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+                "runtime-test",
+            )
+            .with_payload(json!({
+                "command_id": command_id,
+                "runtime_job_id": runtime_job_id,
+                "runtime_job_profile": "codex-contract",
+                "runtime_job_kind": "codex_exec",
+                "agent_contract_attempts": [
+                    {"primary_attempt": 1, "correction_attempt": 0}
+                ],
+                "command": command,
+                "activity_result": result,
+            }));
+
+            let decision = crate::runtime::reducer::reduce_runtime_job_completed_with_registry(
+                &registry,
+                &instance,
+                &event,
+            )?
+            .expect("unverifiable evidence must fail closed");
+
+            assert_eq!(decision.next_state, "blocked", "{case}");
+            assert!(
+                decision.reason.contains(expected_error),
+                "{case}: {}",
+                decision.reason
+            );
+        }
         Ok(())
     }
 

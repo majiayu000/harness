@@ -87,7 +87,13 @@ async fn runtime_task_response_by_handle(
     let submission_id = submission_handle
         .map(|handle| handle.0)
         .unwrap_or_else(|| task_id.0.clone());
-    let error = runtime_string_field(&workflow.data, "failure_reason");
+    let error = match runtime_string_field(&workflow.data, "failure_reason") {
+        Some(reason) => Some(reason),
+        None => store
+            .latest_unresolved_rejection_for_workflow(&workflow.id)
+            .await?
+            .and_then(|record| record.rejection_reason),
+    };
     let terminal = TaskTerminalInfo::from_status_error(&task_status, error.as_deref());
     let runtime_usage = store.runtime_usage_for_workflow(&workflow.id).await?;
     let cost_usd_observed = runtime_usage.as_ref().map(|usage| usage.cost_usd_observed);

@@ -186,7 +186,7 @@ pub(super) async fn execute_contract_attempts(
                 result.artifacts = observations;
                 return Ok(result);
             }
-            match parse_contract_verdict(&attempt.output, &pinned.contract) {
+            match parse_contract_verdict(&attempt.output, &pinned.contract, &pinned.input) {
                 Ok(verdict) => {
                     record_attempt_completed(
                         store,

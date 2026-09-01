@@ -77,7 +77,7 @@ pub(super) fn contract_attempt_activity_result(
         .with_error_kind(ActivityErrorKind::Fatal)
         .with_artifact(observation_artifact);
     }
-    match parse_contract_verdict(&attempt.output, &pinned.contract) {
+    match parse_contract_verdict(&attempt.output, &pinned.contract, &pinned.input) {
         Ok(verdict) => ActivityResult::succeeded(
             activity,
             format!("Agent contract verdict: {}.", verdict.outcome),
@@ -151,10 +151,13 @@ pub(super) fn contract_violations(attempt: &ContractAttempt) -> Vec<String> {
 pub(super) fn parse_contract_verdict(
     output: &str,
     contract: &WorkflowAgentContract,
+    input: &Value,
 ) -> Result<ContractVerdict, String> {
     let raw: Value = serde_json::from_str(output.trim())
         .map_err(|error| format!("reply is not valid JSON: {error}"))?;
     validate_agent_contract_output(&contract.output_schema, &raw)?;
+    harness_workflow::runtime::validate_agent_contract_evidence_refs(input, &raw)
+        .map_err(|error| error.to_string())?;
     let outcome = raw
         .get("outcome")
         .and_then(Value::as_str)
@@ -197,14 +200,20 @@ mod tests {
         let contract_hash = harness_workflow::runtime::stable_remote_fact_hash(
             &serde_json::to_value(&contract).expect("serialize contract"),
         );
+        let facts = json!({"changed_files": ["src/lib.rs"]});
+        let facts_digest = harness_workflow::runtime::stable_remote_fact_hash(&facts);
         PinnedJobAgentContract {
             contract,
             prompt: "Classify only the supplied facts.".to_string(),
             input: json!({
                 "schema": "harness.semantic_activity_input.v1",
                 "subject": {"kind": "issue", "identity": "owner/repo#126"},
-                "facts": {"changed_files": ["src/lib.rs"]},
-                "provenance": {"/changed_files": "server"},
+                "facts": facts,
+                "provenance": {
+                    "schema": "harness.workflow.data_provenance.v1",
+                    "entries": {"": "server"},
+                    "value_digests": {"": facts_digest}
+                },
                 "contract_hash": contract_hash,
             }),
             definition_hash: "sha256:pinned".to_string(),
@@ -629,6 +638,16 @@ mod tests {
                 })
                 .to_string(),
                 "does not match schema",
+            ),
+            (
+                json!({
+                    "schema": "harness.semantic_verdict.v1",
+                    "outcome": "small",
+                    "rationale": "x",
+                    "evidence_refs": ["/facts/missing"],
+                })
+                .to_string(),
+                "does not resolve",
             ),
         ] {
             let attempt = ContractAttempt {
