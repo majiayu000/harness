@@ -588,7 +588,10 @@ confirmation before admission. Recovery never infers or drops an overlay from ev
 
 `provider_intake_fences` is seeded from the verified immutable cutover manifest before the vNext
 epoch is installed. The source fence records live outside the runtime schema being replaced, and
-the vNext listener cannot start until the installed records match that manifest.
+the vNext listener cannot start until the installed records match that manifest. The separate
+cutover proposal installs `disabled_unverifiable` for every provider binding because final capture
+is not atomic with activation; automatic provider intake cannot open without a separately reviewed
+provider-specific activation-boundary contract.
 
 The first implementation may store dependency/evidence ID arrays as JSONB, but validation and
 foreign ownership checks remain typed application contracts. A later normalized join table is
@@ -655,7 +658,7 @@ version and this table must change together; unknown or missing owned objects fa
 
 | Scope | Exact current source baseline | Count/action | Preconditions and exclusions |
 |---|---|---|---|
-| `${workflow_namespace}_runtime` | Migration ledger variant `schema_migrations` or `workflow_runtime_schema_migrations`, applied versions `1..32`; tables `workflow_definitions`, `workflow_instances`, `workflow_events`, `workflow_decisions`, `workflow_commands`, `runtime_jobs`, `runtime_events`, `workflow_artifacts`, `workflow_prompt_payloads`, `remote_fact_snapshots`, `workflow_repo_memory`, `runtime_usage_events`, `runtime_job_lease_renewal_receipts`, `workflow_artifact_dependencies`, `runtime_job_completions_dlq`, `workflow_run_evidence`, `runtime_job_lease_issuances`; functions `enforce_remote_lease_proof_writer()` and `record_runtime_job_lease_issuance()`; triggers `trg_enforce_remote_lease_proof_writer` and `trg_runtime_job_lease_issuance` on `runtime_jobs` | Count every table under lock, fingerprint the whole dedicated schema, then drop/recreate it for vNext | The `pg_catalog` digest must exactly cover relations, columns, constraints, indexes, functions, and triggers. No unlisted object may be dropped. |
+| `${workflow_namespace}_runtime` | Migration ledger variant `schema_migrations` or `workflow_runtime_schema_migrations`, applied versions `1..33`; tables `workflow_definitions`, `workflow_instances`, `workflow_events`, `workflow_decisions`, `workflow_commands`, `runtime_jobs`, `runtime_events`, `workflow_artifacts`, `workflow_prompt_payloads`, `remote_fact_snapshots`, `workflow_repo_memory`, `runtime_usage_events`, `runtime_job_lease_renewal_receipts`, `workflow_artifact_dependencies`, `runtime_job_completions_dlq`, `workflow_run_evidence`, `runtime_job_lease_issuances`; functions `enforce_remote_lease_proof_writer()` and `record_runtime_job_lease_issuance()`; triggers `trg_enforce_remote_lease_proof_writer` and `trg_runtime_job_lease_issuance` on `runtime_jobs` | Count every table under lock, fingerprint the whole dedicated schema, then drop/recreate it for vNext | The `pg_catalog` digest must exactly cover relations, columns, constraints, indexes, functions, and triggers. No unlisted object may be dropped. |
 | `${workflow_namespace}_issue` | Ledger variant `schema_migrations` or `issue_workflow_schema_migrations`, applied versions `1..6`; table `issue_workflows` and its indexes/constraints | Count and fingerprint, then drop the superseded dedicated schema | No row is imported. |
 | `${workflow_namespace}_project` | Ledger `schema_migrations`, applied versions `1..4`; table `project_workflows` and its indexes/constraints | Count and fingerprint, then drop the superseded dedicated schema | No row is imported. |
 | `runtime_state_store` | Shared ledger `schema_migrations`, applied versions `1..4`; tables `runtime_state` and `runtime_state_store_legacy_backfills`; rows selected by the exact configured `store_key = RuntimeStateStore::store_key_for_data_dir(<configured data dir>)` | Count, fingerprint, and archive all matching rows; delete only the matching `runtime_state` snapshot before activation; retain the shared schema, both tables, unrelated store keys, and the matching legacy-backfill markers as a fence against re-import | Rotate the runtime-host registration/heartbeat epoch and verify zero accepted old-epoch hosts before the reset. vNext starts with no restored hosts or project caches; an old host cannot re-register or claim work with pre-vNext authority. |
@@ -1271,7 +1274,8 @@ a destructive transition:
 - cutover imports no old definitions, instances, events, jobs, artifacts, or Evidence;
 - pre-cutover provider objects are never automatically adopted; explicit human-authorized adoption
   creates only new vNext identities;
-- an unverifiable provider fence disables automatic intake for that binding;
+- every provider binding remains `disabled_unverifiable` after final capture; subjects require
+  explicit adoption unless a separately reviewed activation-boundary contract exists;
 - a held old-worker transaction is rolled back when its exclusive old role is revoked and its
   session terminated; reconnect with that credential fails;
 - a shared database role refuses cutover;

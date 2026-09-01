@@ -56,7 +56,8 @@ Use an offline, one-way runtime cutover with a mandatory immutable audit archive
 12. start vNext only after its critical storage/epoch handshake succeeds, with production intake
     and provider dispatch still closed; and
 13. after the observation checks pass, require an explicit operator activation that atomically
-    forfeits production rollback before opening intake or enabling vNext provider credentials.
+    forfeits production rollback before opening non-provider intake or enabling vNext provider
+    credentials; automatic provider intake remains disabled and requires explicit adoption.
 
 vNext never reads the audit archive. Audit inspection uses an offline export reader or an isolated
 restoration environment. This preserves the no-compatibility boundary without deleting the only
@@ -78,7 +79,7 @@ flowchart LR
     Replace --> Epoch[Write vNext epoch last]
     Epoch --> Observe[Start vNext with production intake closed]
     Observe --> Activate[Explicitly forfeit rollback]
-    Activate --> New[Open intake and provider dispatch]
+    Activate --> New[Open non-provider intake and provider dispatch; keep automatic provider intake disabled]
     Export -. offline only .-> Audit[Audit reader / isolated restore]
     Audit -. no runtime import .-> New
 ```
@@ -146,7 +147,7 @@ must be attached before this RFC can be approved.
 
 The current candidate source inventory is maintained in
 `docs/workflow-first-autonomous-change-phase-0-map.md` section 6.5. It currently describes runtime
-migrations `1..32`, 17 runtime tables, two functions, two triggers, issue migrations `1..6`, project
+migrations `1..33`, 17 runtime tables, two functions, two triggers, issue migrations `1..6`, project
 migrations `1..4`, runtime-state migrations `1..4` with two shared tables, accepted ledger variants,
 and exact shared task/runtime-state predicates.
 
@@ -190,13 +191,14 @@ host/project-cache managers. Registration and heartbeat carrying the old epoch a
 restored pre-vNext host cannot claim vNext work.
 
 The final boundary includes every subject observed through the drain, so an object created by an
-old runtime action cannot re-enter as vNext work. Subjects at or before that boundary remain fenced
-from automatic vNext rediscovery; objects created by other actors during the maintenance window
-also require explicit human-authorized adoption, including objects created after final fence capture
-but before explicit vNext activation. Only subjects first created after the activation transaction
-ends the maintenance window are eligible for normal vNext intake. An unverifiable boundary disables
-automatic intake for that binding. Adoption creates new vNext identities and does not import old
-Harness runtime state.
+old runtime action cannot re-enter as vNext work. Final provider capture is not atomic with the
+later activation transaction, so this proposal cannot prove whether an externally created subject
+first appeared between those boundaries or after activation. Every installed binding therefore
+uses `disabled_unverifiable`: automatic provider intake remains closed, and every provider subject
+created after final capture requires explicit human-authorized adoption even after activation.
+Adoption creates new vNext identities and does not import old Harness runtime state. Enabling
+automatic provider intake requires a separately reviewed provider-specific activation-boundary
+contract and is outside this cutover proposal.
 
 The captured provider fence records and their digest are stored in the immutable cutover manifest,
 outside the runtime schema that will be replaced. The replacement transaction installs those exact
