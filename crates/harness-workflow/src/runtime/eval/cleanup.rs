@@ -40,13 +40,7 @@ pub async fn cancel_eval_workflow_family(
         let children = store.list_instances_by_parent(&workflow_id, None).await?;
         pending.extend(children.into_iter().map(|child| child.id));
         for command in store.commands_for(&workflow_id).await? {
-            if matches!(
-                command.status,
-                WorkflowCommandStatus::Pending
-                    | WorkflowCommandStatus::Dispatching
-                    | WorkflowCommandStatus::Deferred
-                    | WorkflowCommandStatus::Dispatched
-            ) {
+            if command.status.is_active() {
                 store
                     .cancel_command_and_unfinished_runtime_jobs(
                         &command.id,
