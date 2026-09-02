@@ -10,7 +10,6 @@ mod logging;
 mod mcp_server;
 mod plan;
 mod pr;
-#[cfg(feature = "server")]
 mod reconcile;
 mod rule;
 mod runtime;
@@ -308,7 +307,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
 
         Command::Reconcile { dry_run, project } => {
-            server_cmds::run_reconcile(dry_run, project, &config).await?;
+            reconcile::run(dry_run, project, &config).await?;
         }
     }
 
