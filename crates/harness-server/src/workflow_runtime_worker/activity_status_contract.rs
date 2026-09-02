@@ -305,10 +305,7 @@ fn collect_textual_blockers(text: &str, blockers: &mut Vec<String>) {
                 "failed checks",
             ],
         ),
-        (
-            "text:requested_changes",
-            &["requested changes", "changes requested"],
-        ),
+        ("text:requested_changes", &["changes requested"]),
         (
             "text:unresolved_review_threads",
             &[

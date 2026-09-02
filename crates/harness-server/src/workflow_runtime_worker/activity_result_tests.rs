@@ -464,7 +464,7 @@ fn pr_feedback_repair_keeps_failed_checks_reported_only_in_summary() {
 #[test]
 fn pr_feedback_repair_keeps_non_ci_blockers_reported_in_summary() {
     for blocker_summary in [
-        "The repair was pushed, but requested changes remain.",
+        "The repair was pushed, but the review state remains changes requested.",
         "The repair was pushed, but an unresolved review thread remains.",
         "The repair was pushed, but the PR is not merge-ready.",
         "The repair was pushed, but a quota notice blocks review.",
@@ -480,6 +480,20 @@ fn pr_feedback_repair_keeps_non_ci_blockers_reported_in_summary() {
         );
         assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
     }
+}
+
+#[test]
+fn pr_feedback_repair_does_not_treat_addressed_requested_changes_as_a_blocker() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Addressed the requested changes and pushed the repair.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
 }
 
 #[test]
