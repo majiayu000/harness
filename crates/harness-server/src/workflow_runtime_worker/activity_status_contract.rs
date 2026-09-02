@@ -141,8 +141,11 @@ fn activity_status_contract_blockers(
     }
 
     let mut summary_blockers = Vec::new();
-    if !local_review_outcome_accepts_blockers && !pr_feedback_repair {
+    if !local_review_outcome_accepts_blockers {
         collect_textual_blockers(&result.summary, &mut summary_blockers);
+    }
+    if pr_feedback_repair {
+        summary_blockers.retain(|blocker| blocker == "text:failing_checks");
     }
     if workflow_definition == Some(PROMPT_TASK_DEFINITION_ID)
         && result.activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
@@ -322,6 +325,7 @@ fn collect_textual_blockers(text: &str, blockers: &mut Vec<String>) {
 fn contains_affirmative_blocker(normalized_text: &str, needle: &str) -> bool {
     normalized_text.contains(needle)
         && !normalized_text.contains(&format!("no {needle}"))
+        && !normalized_text.contains(&format!("no new {needle}"))
         && !normalized_text.contains(&format!("without {needle}"))
 }
 

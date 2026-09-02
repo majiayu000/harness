@@ -19,8 +19,11 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
         "---\nworkspace:\n  strategy: source\n---\n",
     )?;
     let agent = RuntimeStreamAgent::new();
+    let oneshot_agent = RuntimeStreamAgent::new();
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
-    registry.register("codex", agent.clone());
+    registry.register("codex", oneshot_agent.clone());
+    let turn_agent = agent.clone();
+    registry.register_turn_backend_factory("codex", move || turn_agent.clone())?;
     let mut config = harness_core::config::HarnessConfig::default();
     config.agents.sandbox_mode = SandboxMode::WorkspaceWrite;
     config.agents.codex.default_model = "configured-codex-model".to_string();
@@ -264,6 +267,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
             "Bash".to_string(),
         ])]
     );
+    assert!(oneshot_agent.prompts.lock().await.is_empty());
     Ok(())
 }
 

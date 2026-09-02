@@ -392,6 +392,33 @@ fn pr_feedback_repair_keeps_actual_check_and_merge_blockers() {
 }
 
 #[test]
+fn pr_feedback_repair_keeps_failed_checks_reported_only_in_summary() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "The repair was pushed, but hosted CI still has failed checks.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "pr_repair_snapshot",
+        json!({
+            "fresh_pr_state": {
+                "mergeable": "MERGEABLE",
+                "merge_state_status": "BLOCKED",
+                "pending_checks": 2
+            }
+        }),
+    ));
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:failing_checks"));
+}
+
+#[test]
 fn activity_result_from_turn_preserves_prompt_nonzero_validation_report() {
     let job = RuntimeJob::pending(
         "command-1",
