@@ -62,10 +62,14 @@ Goals:
 - Persist one canonical fact snapshot and its provenance before creating the
   contract command.
 - Configure exact outcomes `allow`, `split_required`, and `needs_human`.
-- Continue only on `allow`; route the other outcomes and execution failures to
-  the operator-owned `blocked` state with the assessment or explicit error.
+- Continue only on `allow`; route the other semantic outcomes to the
+  operator-owned `blocked` state with the assessment. Preserve the existing
+  agent-contract terminal failure semantics instead of adding a second failure
+  route.
 - Recollect and reclassify in safe pre-merge states whenever any classified
   mutable identity changes.
+- Require a fresh prompt-driven snapshot and scope verdict after
+  `MergeRequested` and before merge dispatch.
 
 Non-goals:
 
@@ -97,7 +101,6 @@ definition:
   states:
     pr_scope_review:
       activity: review_pr_scope
-      on_failure: blocked
       on_signal:
         allow: pr_open
         split_required: blocked
@@ -118,6 +121,12 @@ GitHub access to collect the snapshot. Harness validates and persists the
 returned artifact; Harness crates do not invoke `gh`, `git`, or a GitHub client
 to fetch it.
 
+Collector dispatch requires a technically enforced read-only GitHub credential
+or tool surface. A prompt instruction is not an access-control boundary. If the
+selected runtime cannot prevent GitHub mutations during collection, PR 2 stops
+at design rather than dispatching contributor-controlled text with write
+authority.
+
 The snapshot contains:
 
 - issue number, URL, state, title, body, labels, and a digest of those mutable
@@ -135,8 +144,14 @@ The snapshot contains:
 The collection activity fails clearly instead of emitting classifier input
 when pagination is incomplete, non-binary textual content is incomplete, any
 identity conflicts, or any before/after identity differs. The reducer accepts
-only the validated snapshot shape, records its external provenance, and then
+only the validated snapshot shape, records it with `Agent` provenance, and then
 constructs the existing contract input from the committed workflow instance.
+
+Every value parsed from the collector's activity result remains agent-authored,
+including values the collector reports as provider-originated. Contributor text
+and the rest of the snapshot therefore remain inside untrusted framing whenever
+they are injected into a later prompt; the audit trail does not relabel them as
+independently verified `External` or server facts.
 
 This validation proves internal completeness and consistency of the agent's
 reported snapshot. It does not claim that Harness independently queried
@@ -152,11 +167,18 @@ implementing
       -> allow          -> pr_open
       -> split_required -> blocked + assessment
       -> needs_human    -> blocked + assessment
-      -> execution fail -> blocked + explicit error
+      -> contract failure -> existing terminal failure semantics
 
 safe pre-merge state + classified identity changed
   -> collect_pr_scope_facts
   -> pr_scope_review
+
+safe pre-merge state + MergeRequested
+  -> collect a fresh prompt-driven snapshot
+  -> pr_scope_review
+      -> current allow -> enqueue merge_pr
+      -> non-allow     -> blocked + assessment
+      -> contract failure -> existing terminal failure semantics
 ```
 
 The classified mutable identity includes the issue digest, PR metadata digest,
@@ -167,12 +189,15 @@ pagination and before contract dispatch.
 ordinary automatic route out of `blocked`; an operator may recover to
 `collect_pr_scope_facts` through the declared recovery target.
 
-Reclassification is limited to states before merge dispatch. Immediately
-before `MergeRequested` can enqueue `merge_pr`, the workflow requires a current
-`allow` assessment for the same classified identity. Once `merge_pr` is
-running, this feature does not promise cancellation or reclassification. A
-requirement to fence active merge work stops this recovery and becomes separate
-merge-lifecycle design.
+Reclassification is limited to states before merge dispatch. `MergeRequested`
+never directly enqueues `merge_pr`: it starts fresh collection and contract
+review, and only the resulting `allow` assessment for that newly observed
+identity may enqueue the merge. Fatal or configuration failures, including
+contract enforcement and exhausted invalid-verdict attempts, retain the
+existing terminal failure classification; `on_failure` is not used to rewrite
+them as `blocked`. Once `merge_pr` is running, this feature does not promise
+cancellation or reclassification. A requirement to fence active merge work
+stops this recovery and becomes separate merge-lifecycle design.
 
 ## Verification
 
@@ -188,13 +213,20 @@ merge-lifecycle design.
 
 - The fact collector runs through an agent prompt and no Harness crate spawns
   `gh` or `git`.
+- Collector dispatch fails before processing contributor text unless the
+  runtime enforces read-only GitHub access.
 - Complete pagination, incomplete patch, identity conflict, and every
   before/after race check have focused tests.
+- The stored collector snapshot has `Agent` provenance and is fenced as
+  untrusted on prompt reinjection.
 - Contract evidence references resolve under `/facts` with provenance coverage.
 - Issue, PR metadata, base, head, and comparison changes invalidate the prior
   assessment in every supported pre-merge state.
 - `blocked` requires operator-authorized recovery.
-- Merge dispatch rejects a stale assessment and never starts two merge jobs.
+- Semantic non-allow outcomes reach `blocked`; agent-contract failures preserve
+  the existing terminal failure classification.
+- `MergeRequested` forces a fresh snapshot and verdict; merge dispatch rejects
+  a stale assessment and never starts two merge jobs.
 - Existing v1 instances continue on v1; new unversioned instances use v2 only
   after the current-version switch.
 - One real Harness workflow submission exercises collection, assessment,
@@ -211,6 +243,8 @@ Implementation stops and returns to design when any of these occurs:
 - The integration requires a second generic semantic-execution contract.
 - Complete prompt-driven fact evidence cannot be represented without direct
   GitHub access from a Harness crate.
+- The selected runtime cannot technically enforce read-only GitHub access for
+  the fact collector.
 - The required change crosses into active merge cancellation, leases,
   ownership, or mutation authorization.
 - Verification requires changing unrelated workflow fixtures or behavior.
