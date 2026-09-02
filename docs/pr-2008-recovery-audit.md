@@ -13,6 +13,13 @@ model classifier, GitHub scope fact collection, built-in workflow versioning,
 and merge/lease hardening. The combined change is still failing CI after 30
 commits.
 
+Since this audit was written, `main` has delivered the generic semantic
+activity path as `WorkflowAgentContract`, including pinned inputs and
+provenance, no-tool execution, structured verdict validation, evidence
+reference validation, server-authored assessments, routing, replay, and
+production dogfood. Recovery must reuse that implementation. The classifier
+driver proposed by the original audit is no longer a remaining work item.
+
 | Severity | Count | Key areas |
 |---|---:|---|
 | Critical | 0 | — |
@@ -57,9 +64,11 @@ Observed branch size:
 - Impact: adding another classifier requires editing the same server driver;
   the abstraction is a GitHub scope executor disguised as a generic activity.
 - Confidence: High.
-- Suggested fix: the generic driver must accept an opaque, server-prepared
-  facts envelope. GitHub fact collection belongs to the `github_issue_pr`
-  integration layer.
+- Current recovery action: discard the PR #2008 classifier driver in favor of
+  the `agent_contract` implementation now on `main`. For the PR scope guard,
+  collect GitHub facts through an ordinary agent prompt, persist the validated
+  snapshot with provenance, and hand that snapshot to the existing no-tool
+  contract activity. Harness crates must not invoke GitHub or git directly.
 
 ### H3: Built-in policy pinning became a global admission dependency
 
@@ -73,9 +82,10 @@ Observed branch size:
 - Impact: unrelated runtime tests and historical rows fail before reaching
   their original behavior. This is migration coupling, not a local scope gate.
 - Confidence: High.
-- Suggested fix: pin classifier policy in the durable runtime job/assessment
-  at dispatch. Do not make a project classifier policy a required identity
-  field for every built-in workflow instance.
+- Current recovery action: use the contract, prompt, input, provenance, and
+  definition pinning already implemented by `agent_contract`. Do not add a
+  classifier policy identity or require a definition hash on historical
+  built-in rows.
 
 ### H4: Built-in workflow versioning was designed during implementation
 
@@ -88,7 +98,9 @@ Observed branch size:
   query mismatch. Review became the mechanism for discovering the migration.
 - Confidence: High.
 - Suggested fix: deliver multi-version built-in registry and selector semantics
-  as a behavior-neutral prerequisite. Only then introduce `github_issue_pr@2`.
+  as a behavior-neutral prerequisite. Historical v1 rows resolve by their
+  existing definition id and version, without a newly required content hash.
+  Only then introduce `github_issue_pr@2`.
 
 ### H5: The branch is not a verified deliverable
 
@@ -127,15 +139,16 @@ Observed branch size:
 - Impact: reviewers cannot tell which guarantees belong to which delivery
   boundary.
 - Confidence: High.
-- Suggested fix: document the generic driver first; add GitHub facts and
-  built-in routing only in the integration PR.
+- Current recovery action: treat the generic `agent_contract` path as delivered.
+  Document only the remaining behavior-neutral built-in versioning and the
+  prompt-driven GitHub fact snapshot plus v2 routing integration.
 
 ## Recovery Classification
 
 | Classification | PR #2008 material | Recovery action |
 |---|---|---|
-| Extract as design reference | `WorkflowClassifierPolicy`, verdict-route validation, provider-reported model event, server-authored assessment shape | Reimplement against `origin/main`; do not cherry-pick the 106-file feature commit |
-| Rewrite | `workflow_runtime_worker/classifier.rs`, classifier prompt packet construction, assessment persistence | Split generic execution from GitHub fact preparation; keep the driver fact-source agnostic |
+| Superseded by `main` | `WorkflowClassifierPolicy`, verdict-route validation, provider-reported model event, server-authored assessment shape | Use `WorkflowAgentContract`; do not recreate or cherry-pick the classifier path |
+| Rewrite | `workflow_runtime_worker/classifier.rs`, classifier prompt packet construction, assessment persistence | Keep GitHub collection in an agent prompt, persist one provenance-covered snapshot, and reuse the existing assessment path |
 | Rewrite after prerequisite | `scope_review.rs`, `github_issue_pr` state changes, head-change rechecks, built-in policy resolution | Wait for behavior-neutral built-in version registry, then add one PR-scope gate |
 | Independent follow-up | complete GitHub PR diff collector | Deliver with the GitHub integration or as its own fact-provider PR; it must not modify merge execution |
 | Independent security work | `server_merge.rs`, `merge_completion.rs`, `job_claim.rs`, leases, server-owned routing, atomic base authorization | Move findings to separate issues/PRs with their own threat model |
@@ -146,14 +159,14 @@ Observed branch size:
 | Phase | Scope | Dependencies | Validation |
 |---|---|---|---|
 | 0 | Freeze PR #2008 and preserve it as evidence | None | Branch clean; no further commits |
-| 1 | Generic declarative classifier driver | Existing declarative workflow runtime | Focused config, reducer, executor, and real Harness submission tests |
-| 2 | Behavior-neutral built-in definition version registry | Existing persisted definition fields | v1 lookup/replay/query tests; no `github_issue_pr` behavior change |
-| 3 | GitHub PR facts and `github_issue_pr@2` scope gate | Phases 1 and 2 | Head-bound fact tests and real Harness workflow submission |
+| 1 | Reuse the delivered `agent_contract` primitive | Current `main` | Existing contract tests and production dogfood evidence |
+| 2 | Behavior-neutral built-in definition version registry | Existing persisted definition fields | Version-only v1 lookup/replay/query tests; no `github_issue_pr` behavior change |
+| 3 | Prompt-driven GitHub facts and `github_issue_pr@2` scope gate | Phases 1 and 2 | Snapshot race/completeness tests and real Harness workflow submission |
 | 4 | Separate merge security remediation | Explicitly approved security scope | Dedicated threat-model tests and fresh review |
 
 ## Decision
 
 PR #2008 is evidence and a source of test cases, not a merge candidate. No
-commit from it should be cherry-picked wholesale. Recovery starts from a clean
-baseline and must preserve the boundaries in
+commit from it should be cherry-picked wholesale. Recovery starts from current
+`main`, reuses `agent_contract`, and must preserve the boundaries in
 [`model-scope-classifier-plan.md`](model-scope-classifier-plan.md).

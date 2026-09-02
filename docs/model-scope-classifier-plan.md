@@ -1,290 +1,220 @@
-# Model Scope Classifier Delivery Plan
+# Model Scope Guard Recovery Plan
 
 ## Outcome
 
-Harness can run a model-backed classifier as a durable declarative workflow
-activity, then use that capability to stop an off-scope GitHub PR before more
-agent work or merge preparation continues.
+Harness can stop an off-scope GitHub PR before review or merge preparation by
+combining the existing declarative `agent_contract` execution path with a
+versioned `github_issue_pr` graph and a prompt-driven GitHub fact snapshot.
 
 The model makes the semantic judgment. Change counts and file lists are facts,
 not hard-coded pass/fail thresholds.
 
-## Implementation Baseline
+## Current Baseline
 
-PR 1 must start from a stable `main` after the repository-lease work currently
-carried by PR #2006 is either merged, replaced, or explicitly abandoned. That
-branch changes runtime worker and workflow-store surfaces needed by the
-classifier driver, so stacking classifier code on the current unresolved branch
-would recreate the same hidden-dependency problem.
+The generic semantic-activity primitive is already implemented on `main`:
 
-The recovery audit and specification are safe to deliver independently because
-they add new documentation files only. No production-code recovery branch may
-be created from PR #2008 or by silently omitting unmerged runtime changes.
+- `WorkflowAgentContract` declares the canonical input and output schemas,
+  exact allowed outcomes, no tools, forbidden mutation, an empty workspace,
+  fresh context, and bounded attempts.
+- The declarative runtime pins the contract, prompt, definition identity,
+  semantic input, provenance, and contract hash in the command and runtime job.
+- The server validates model output, verifies every non-empty evidence reference
+  resolves below `/facts` with provenance coverage, authors the assessment, and
+  routes only its validated outcome.
+- Production dogfood has exercised dispatch, persistence, restart, replay, and
+  usage accounting.
+
+The recovery work must reuse that path. It must not add a parallel
+`classifier:` key, classifier-specific input or assessment schemas, or a second
+outcome-routing implementation.
 
 ## Delivery Boundaries
 
-This work is delivered as dependency-ordered PRs. A later PR must not be folded
-into an earlier one merely because implementation exposes an adjacent issue.
-
-### PR 1: Generic declarative classifier driver
+### PR 1: Behavior-neutral built-in definition versioning
 
 Goals:
 
-- Add a classifier policy to a declarative activity.
-- Validate declared verdicts and require an exact route for each verdict.
-- Run the model in a fresh, read-only, deny-all-tool turn.
-- Accept an opaque facts envelope supplied by the caller.
-- Validate exactly one structured classifier output.
-- Persist one server-authored assessment and route using its validated verdict.
-- Replay from the persisted assessment without invoking the model again.
-
-Non-goals:
-
-- GitHub API calls or GitHub-specific fields.
-- Changes to any built-in workflow definition.
-- Built-in definition versioning.
-- PR diff collection.
-- Merge, lease, remote-host ownership, or auto-merge changes.
-- A default change-scope policy embedded in Rust.
-
-### PR 2: Behavior-neutral built-in definition versioning
-
-Goals:
-
-- Register and resolve multiple immutable versions of one built-in definition.
-- Resolve reducers, validators, selectors, and terminal queries by the persisted
-  instance identity.
-- Preserve the current `github_issue_pr@1` graph and behavior exactly.
+- Register and resolve multiple immutable versions of a built-in definition.
+- Resolve reducers, validators, selectors, recovery, retention, and terminal
+  queries by the persisted built-in id and version.
+- Preserve existing `github_issue_pr@1` rows by their already-persisted
+  `definition_id` and `definition_version`; do not require a content hash they
+  do not carry.
+- Keep version 1 current until the scope-guard integration is complete.
 - Provide production-equivalent v1/current test builders.
 
 Non-goals:
 
 - New states or transitions.
-- Classifier execution.
-- Migration of active instances to a new graph.
+- A scope verdict.
+- Migration or backfill of active instances.
 - Merge behavior changes.
+- A new generic model-execution primitive.
 
-### PR 3: `github_issue_pr@2` PR-scope guard
+### PR 2: `github_issue_pr@2` scope guard
 
 Goals:
 
-- Register `github_issue_pr@2` with one PR-scope classifier state.
-- Make `github_issue_pr@2` the current graph for newly created unversioned
-  workflows while preserving existing v1 instances on the historical graph.
-- Collect an authoritative Issue snapshot and complete head-bound PR facts.
-- Trigger scope review after PR binding and whenever the issue snapshot, PR
-  head, base, or effective diff changes.
-- Continue only on `allow`; persist and expose all other verdicts as an
-  operator-visible blocked outcome.
-- Bind the accepted assessment to the observed issue revision and PR comparison
-  identity.
+- Register `github_issue_pr@2` with a prompt-driven fact collection activity
+  followed by one existing `agent_contract` activity.
+- Make version 2 current only after the complete v2 path is available; existing
+  version 1 instances continue through the historical v1 definition.
+- Persist one canonical fact snapshot and its provenance before creating the
+  contract command.
+- Configure exact outcomes `allow`, `split_required`, and `needs_human`.
+- Continue only on `allow`; route the other outcomes and execution failures to
+  the operator-owned `blocked` state with the assessment or explicit error.
+- Recollect and reclassify in safe pre-merge states whenever any classified
+  mutable identity changes.
 
 Non-goals:
 
+- A second `classifier` configuration surface.
+- Direct GitHub or git process execution inside Harness crates.
 - Pre-implementation plan classification.
 - Automatic splitting or rewriting of a PR.
-- Automatic merge implementation.
-- Changes to merge leases, merge ownership, or GitHub mutation APIs.
+- Cancellation of an already-running merge job.
+- Changes to merge leases, ownership, or mutation APIs.
 
-Plan classification may be proposed later using the same generic driver after
-the PR guard is proven in production.
+## Existing Agent Contract Configuration
 
-## PR 1 Contract
-
-### Configuration
+The scope verdict uses the supported contract fields and schemas:
 
 ```yaml
 activities:
-  classify_example:
-    classifier:
-      verdicts: [allow, split_required, needs_human]
-      instructions:
-        - Judge the supplied facts against the requested outcome.
-        - Treat metrics as evidence, never as fixed decision thresholds.
+  review_pr_scope:
+    prompt: Judge whether the supplied PR facts implement only the requested issue.
+    agent_contract:
+      input_schema: harness.semantic_activity_input.v1
+      output_schema: harness.semantic_verdict.v1
+      allowed_outcomes: [allow, split_required, needs_human]
+      tools: none
+      mutation: forbidden
+      workspace: ephemeral_empty
+      fresh_context: true
 
 definition:
   states:
-    classifying:
-      activity: classify_example
+    pr_scope_review:
+      activity: review_pr_scope
       on_failure: blocked
       on_signal:
-        allow: done
+        allow: pr_open
         split_required: blocked
         needs_human: blocked
 ```
 
-Validation rules:
+The output is the existing `harness.semantic_verdict.v1` envelope. Evidence
+references are JSON pointers such as `/facts/issue/title`; the runtime already
+requires each non-empty reference to resolve below `/facts` and to have
+provenance coverage. The persisted result is the existing server-authored
+`agent_contract_assessment`, not a classifier-specific assessment.
 
-- Verdicts are non-empty and unique.
-- Classifier activities cannot declare repository validation commands.
-- `on_success` is absent.
-- `on_failure` is explicit.
-- Signal routes exactly match the declared verdict set.
-- Classifier policy participates in the declarative definition identity.
+## Prompt-Driven GitHub Fact Snapshot
 
-### Input envelope
+Repository policy requires all GitHub and git interaction to occur in agent
+prompts. A preceding ordinary workflow activity therefore uses the agent's
+GitHub access to collect the snapshot. Harness validates and persists the
+returned artifact; Harness crates do not invoke `gh`, `git`, or a GitHub client
+to fetch it.
 
-The driver receives facts; it does not fetch them:
+The snapshot contains:
 
-```json
-{
-  "schema": "harness.runtime.classifier_input.v1",
-  "subject": {
-    "kind": "caller_defined",
-    "identity": "opaque stable identity"
-  },
-  "facts": {},
-  "provenance": {}
-}
-```
+- issue number, URL, state, title, body, labels, and a digest of those mutable
+  classified fields;
+- PR number, URL, state, title, body, base branch, base OID, head OID, and a
+  digest of the classified PR metadata;
+- the complete changed-file list and per-file patch availability, binary flag,
+  additions, deletions, and rename metadata;
+- pagination evidence, including the observed total and collected item count;
+- a comparison digest covering the base, head, changed files, and available
+  textual patches;
+- the same issue digest, PR metadata digest, base OID, and head OID observed
+  again after collection.
 
-`facts` and `provenance` are opaque JSON to the generic driver. The caller owns
-their schema and completeness checks.
+The collection activity fails clearly instead of emitting classifier input
+when pagination is incomplete, non-binary textual content is incomplete, any
+identity conflicts, or any before/after identity differs. The reducer accepts
+only the validated snapshot shape, records its external provenance, and then
+constructs the existing contract input from the committed workflow instance.
 
-### Model output
-
-```json
-{
-  "schema": "harness.runtime.classifier_output.v1",
-  "verdict": "allow",
-  "rationale": "Non-empty explanation grounded in supplied facts.",
-  "evidence_refs": ["/classifier_input/facts/example"]
-}
-```
-
-The server rejects missing, duplicate, malformed, or undeclared verdict
-outputs. Model-authored workflow signals are not trusted.
-
-### Persisted assessment
-
-```json
-{
-  "schema": "harness.runtime.classifier_assessment.v1",
-  "activity": "classify_example",
-  "subject": {
-    "kind": "caller_defined",
-    "identity": "opaque stable identity"
-  },
-  "verdict": "allow",
-  "rationale": "...",
-  "evidence_refs": [],
-  "policy_sha256": "sha256:...",
-  "prompt_packet_sha256": "sha256:...",
-  "runtime_job_id": "...",
-  "runtime_profile": "...",
-  "requested_model": "...",
-  "reported_model": "..."
-}
-```
-
-The assessment is authored by Harness after validation and stored with the
-activity result. The persisted `subject` is copied from the validated input
-envelope. The workflow transition consumes this assessment, not raw model
-signals.
-
-### Policy pinning
-
-- Custom declarative definitions include the classifier policy in their
-  content identity.
-- At job creation, the resolved policy and its digest are copied into durable
-  job input.
-- Retry and completion use the job snapshot, not the current checkout.
-- Built-in workflow instances do not gain a global classifier-policy identity
-  requirement in PR 1.
-
-### Execution boundary
-
-- Classifier turns have no repository mutation capability.
-- The backend must enforce an empty tool allowlist, not a finite denylist.
-- The backend must report the executed model identity.
-- If either guarantee is unavailable, dispatch fails clearly before model
-  execution.
-- The prompt packet must render the entire input envelope behind the existing
-  untrusted-data fence so contributor-controlled facts cannot issue routing
-  instructions.
-- Add an injection-focused verdict test that proves malicious issue, PR, or diff
-  text is treated only as classifier evidence.
-- Remote hosts are unsupported until they can attest the same guarantees.
-
-## PR 3 GitHub Facts Contract
-
-The GitHub integration prepares the generic input envelope with:
-
-- authoritative issue identity, revision or content digest, title, body, labels,
-  state, and URL;
-- authoritative PR identity, base branch, base OID or merge-base/diff digest,
-  head OID, title, body, and state;
-- the complete changed-file set;
-- complete diff content or an explicit unavailable/incomplete result;
-- additions, deletions, renames, and binary-file metadata;
-- observed head OID before and after collection.
-
-The integration fails before model dispatch when identity conflicts, paging is
-incomplete, textual diff content is incomplete or unavailable for a non-binary
-file, or the head changes during collection. The generic classifier driver does
-not know these rules.
+This validation proves internal completeness and consistency of the agent's
+reported snapshot. It does not claim that Harness independently queried
+GitHub; that would violate the prompt-only boundary.
 
 ## Workflow Semantics
 
 ```text
 implementing
   -> PR bound
+  -> collect_pr_scope_facts
   -> pr_scope_review
       -> allow          -> pr_open
       -> split_required -> blocked + assessment
       -> needs_human    -> blocked + assessment
       -> execution fail -> blocked + explicit error
 
-any nonterminal post-binding state
-  -> issue snapshot, PR head, base, or effective diff changed
+safe pre-merge state + classified identity changed
+  -> collect_pr_scope_facts
   -> pr_scope_review
 ```
 
-No scope verdict directly invokes or modifies merge execution.
+The classified mutable identity includes the issue digest, PR metadata digest,
+base OID, head OID, and comparison digest. Collection rechecks all five after
+pagination and before contract dispatch.
+
+`blocked` remains operator-owned. A later fact change does not create an
+ordinary automatic route out of `blocked`; an operator may recover to
+`collect_pr_scope_facts` through the declared recovery target.
+
+Reclassification is limited to states before merge dispatch. Immediately
+before `MergeRequested` can enqueue `merge_pr`, the workflow requires a current
+`allow` assessment for the same classified identity. Once `merge_pr` is
+running, this feature does not promise cancellation or reclassification. A
+requirement to fence active merge work stops this recovery and becomes separate
+merge-lifecycle design.
 
 ## Verification
 
 ### PR 1 focused verification
 
-- Configuration parsing and invalid route tests in `harness-core`.
-- Declarative identity and reducer routing tests in `harness-workflow`.
-- Deny-all launch, model identity, malformed output, duplicate output, and
-  server-authored assessment tests in `harness-server`/`harness-agents`.
-- One real Harness service submission using a minimal custom declarative
-  classifier workflow; verify the persisted assessment and terminal route.
-- `cargo fmt --all` and `cargo fmt --all -- --check`.
-- Package-scoped checks/tests during implementation; workspace clippy before
-  push as required by repository rules.
+- Existing v1 instances resolve by built-in id and version without a hash.
+- New instances remain on v1 until the current version is explicitly switched.
+- Reducer, validator, selector, recovery, retention, and terminal lookups use
+  the same persisted version.
+- Unknown built-in versions fail closed.
 
 ### PR 2 focused verification
 
-- v1 definition resolution by version and hash.
-- Existing v1 reducer behavior remains byte-for-byte equivalent at decision
-  boundaries.
-- Unknown or mismatched identities fail closed.
-- Terminal, retention, and selector queries use the same identity semantics.
+- The fact collector runs through an agent prompt and no Harness crate spawns
+  `gh` or `git`.
+- Complete pagination, incomplete patch, identity conflict, and every
+  before/after race check have focused tests.
+- Contract evidence references resolve under `/facts` with provenance coverage.
+- Issue, PR metadata, base, head, and comparison changes invalidate the prior
+  assessment in every supported pre-merge state.
+- `blocked` requires operator-authorized recovery.
+- Merge dispatch rejects a stale assessment and never starts two merge jobs.
+- Existing v1 instances continue on v1; new unversioned instances use v2 only
+  after the current-version switch.
+- One real Harness workflow submission exercises collection, assessment,
+  routing, and store reopen against an isolated database and controlled PR.
 
-### PR 3 focused verification
-
-- Complete fact pagination and head-change race tests.
-- PR binding enters scope review only for v2.
-- A new head invalidates the previous assessment.
-- Non-allow verdicts cannot progress to local review or quality gates.
-- Existing v1 instances continue on the v1 graph.
-- One real Harness workflow submission against a disposable test repository or
-  controlled PR fixture, without running broad local PostgreSQL suites.
+Each PR also runs the repository-required formatting, package-scoped tests and
+checks, and workspace clippy before push.
 
 ## Stop Conditions
 
 Implementation stops and returns to design when any of these occurs:
 
-- A PR requires changes from a later delivery boundary.
-- A third fresh-context review finds a new architectural blocker.
-- Verification requires changing unrelated workflow fixtures or merge
-  behavior.
-- The generic driver needs source-specific fields.
-- A required backend cannot prove deny-all tools and executed model identity.
+- Built-in versioning cannot preserve existing version-only v1 identity.
+- The integration requires a second generic semantic-execution contract.
+- Complete prompt-driven fact evidence cannot be represented without direct
+  GitHub access from a Harness crate.
+- The required change crosses into active merge cancellation, leases,
+  ownership, or mutation authorization.
+- Verification requires changing unrelated workflow fixtures or behavior.
 
 Diff size and file count are diagnostic evidence, not automatic rejection
 rules. The stop decision is based on whether the new work is independently
-valuable, independently testable, and outside the accepted contract.
+valuable, independently testable, and inside the accepted contract.
