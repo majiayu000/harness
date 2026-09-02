@@ -158,6 +158,26 @@ fn missing_terminal_fails_with_preceding_error_evidence() {
         parsed.structured_error.as_deref(),
         Some("authentication failed")
     );
+    assert_eq!(
+        parsed.structured_error_kind,
+        Some(CodexStructuredErrorKind::Provider)
+    );
+}
+
+#[test]
+fn missing_terminal_without_provider_evidence_is_permanent() {
+    let parsed = parse_codex_exec_output(r#"{"type":"thread.started","thread_id":"thread-1"}"#)
+        .expect("stdout should parse");
+
+    assert!(parsed.explicit_failure);
+    assert_eq!(
+        parsed.structured_error.as_deref(),
+        Some("codex stream ended without an authoritative terminal event")
+    );
+    assert_eq!(
+        parsed.structured_error_kind,
+        Some(CodexStructuredErrorKind::Permanent)
+    );
 }
 
 #[test]

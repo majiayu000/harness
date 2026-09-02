@@ -332,7 +332,7 @@ fn finish_codex_exec_output(parsed: &mut ParsedCodexExecOutput, terminal: CodexE
             });
             parsed
                 .structured_error_kind
-                .get_or_insert(CodexStructuredErrorKind::Provider);
+                .get_or_insert(CodexStructuredErrorKind::Permanent);
         }
         CodexExecTerminal::Completed => parsed.explicit_failure = false,
         CodexExecTerminal::Failed => parsed.explicit_failure = true,

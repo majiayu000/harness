@@ -570,7 +570,7 @@ mod tests {
         .await
         .expect_err("a hung backend must hit the pinned wall-clock boundary");
 
-        assert!(error.to_string().contains("timeout after 1s"), "{error}");
+        assert!(error.to_string().contains("timed out after 1s"), "{error}");
         let (_, source, _) = error
             .downcast::<ContractAttemptFailure>()
             .expect("attempt failures preserve observations")
