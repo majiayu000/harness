@@ -73,7 +73,7 @@ sequenceDiagram
 
 ## 4. Minimal Generic Contract
 
-Extend the current activity policy with one generic agent-execution contract rather than a
+The current activity policy exposes one generic agent-execution contract rather than a
 `classifier` field:
 
 ```yaml
@@ -103,7 +103,8 @@ definition:
         blocked: blocked
 ```
 
-The exact field names remain proposed, but these ownership rules are required:
+These field names match the shipped `WorkflowAgentContract` surface. The following ownership rules
+remain required:
 
 - the Workflow declares schemas, allowed outcomes, prompt, and routes;
 - the runtime enforces tools, mutation, workspace, freshness, attempts, and structured output;
@@ -338,12 +339,12 @@ Latency and cost targets must be measured during dogfood rather than invented in
 | Empty workspace prevents required facts | Medium | Persist facts before dispatch; no repository reads inside the classifier turn |
 | Scope expands back toward PR #2010 | High | Requirement-to-file/test traceability and per-slice review |
 
-## 13. Approval and Done Criteria
+## 13. Delivery and Done Criteria
 
-Implementation may begin only after the owner approves this narrow design and the proposed generic
-activity field shape.
+The owner approved this narrow design and its generic activity field shape before implementation;
+Slices A through D then delivered it in PRs #2020, #2025, #2028, and #2031.
 
-The feature is done only when:
+Delivery was complete only when:
 
 - all four delivery slices pass focused tests;
 - a fresh-context reviewer approves the final diff;
