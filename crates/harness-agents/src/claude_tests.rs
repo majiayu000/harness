@@ -563,7 +563,7 @@ printf '%s\n' '{"type":"result","result":"hello","usage":{"input_tokens":10,"out
     }
 
     let Some(usage) = events.iter().find_map(|item| match item {
-        StreamItem::TokenUsage { usage } => Some(usage),
+        StreamItem::TokenUsage { usage, .. } => Some(usage),
         _ => None,
     }) else {
         panic!("expected token usage event");

@@ -15,6 +15,7 @@ use super::runtime_usage::{
     cost_usd_from_micros, cost_usd_to_micros, runtime_usage_cost_for_workflow_tx,
 };
 use super::{insert_event_tx, RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
+use crate::runtime::completion_evidence::ARTIFACT_RUNTIME_BUDGET_STOP;
 use crate::runtime::model::{ActivityResult, WorkflowDecision, WorkflowEvent, WorkflowInstance};
 use crate::runtime::reducer::budget_exhausted_blocked_decision;
 use crate::runtime::WorkflowDefinitionRegistry;
@@ -33,7 +34,9 @@ pub(super) async fn budget_ceiling_blocked_decision(
     decision: &WorkflowDecision,
 ) -> anyhow::Result<Option<WorkflowDecision>> {
     if budget_policy.unlimited
-        || !decision_schedules_more_work(definition_registry, instance, decision)
+        || (!decision_schedules_more_work(definition_registry, instance, decision)
+            && !completion_has_successful_agent_contract(event)
+            && !completion_has_runtime_budget_stop(event))
     {
         return Ok(None);
     }
@@ -90,9 +93,9 @@ pub(super) async fn budget_ceiling_blocked_decision(
     }
 }
 
-/// The ceiling only preempts decisions that would keep the workflow running.
-/// A decision that already lands in a terminal state or in `blocked` needs no
-/// budget intervention — the workflow is stopping either way.
+/// Ordinary terminal decisions keep their domain outcome. Agent-contract
+/// completions are the exception: their verdict is the spending decision, so
+/// the transaction-time fence remains authoritative even for a terminal route.
 fn decision_schedules_more_work(
     definition_registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
@@ -108,4 +111,31 @@ fn decision_schedules_more_work(
             &decision.next_state,
         )
         .is_none()
+}
+
+fn completion_has_successful_agent_contract(event: &WorkflowEvent) -> bool {
+    event
+        .event
+        .pointer("/command/command/agent_contract")
+        .is_some()
+        && event
+            .event
+            .pointer("/activity_result/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("succeeded")
+}
+
+fn completion_has_runtime_budget_stop(event: &WorkflowEvent) -> bool {
+    event
+        .event
+        .pointer("/activity_result/artifacts")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|artifacts| {
+            artifacts.iter().any(|artifact| {
+                artifact
+                    .get("artifact_type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(ARTIFACT_RUNTIME_BUDGET_STOP)
+            })
+        })
 }

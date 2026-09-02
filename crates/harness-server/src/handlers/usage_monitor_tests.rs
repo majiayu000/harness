@@ -275,6 +275,7 @@ fn runtime_usage_record_becomes_usage_record_with_candidate() -> anyhow::Result<
             reported_total_tokens: Some(30),
         },
         cost_usd_micros: 125_000,
+        cost_usd_observed: true,
         reported_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -325,6 +326,7 @@ fn runtime_usage_record_keeps_cache_components_with_zero_reported_total() -> any
             reported_total_tokens: Some(0),
         },
         cost_usd_micros: 0,
+        cost_usd_observed: false,
         reported_at: Utc::now(),
         updated_at: Utc::now(),
     };

@@ -80,9 +80,9 @@ pub use data_provenance::{
 pub use data_write::WorkflowDataWrite;
 pub use declarative::{build_declarative_definition, DeclarativeWorkflowDefinition};
 pub use declarative_agent_contract::{
-    validate_declarative_agent_contract_command, PinnedAgentContractActivity,
-    AGENT_CONTRACT_ASSESSMENT_ARTIFACT, AGENT_CONTRACT_ASSESSMENT_SCHEMA,
-    AGENT_CONTRACT_VERDICT_ARTIFACT,
+    validate_agent_contract_evidence_refs, validate_declarative_agent_contract_command,
+    PinnedAgentContractActivity, AGENT_CONTRACT_ASSESSMENT_ARTIFACT,
+    AGENT_CONTRACT_ASSESSMENT_SCHEMA, AGENT_CONTRACT_VERDICT_ARTIFACT,
 };
 pub use declarative_interpreter::{
     build_declarative_submission_decision, DECLARATIVE_SUBMISSION_DECISION,
@@ -149,13 +149,15 @@ pub use plan_issue::{
 pub use pr_feedback::{
     build_local_review_completed_decision, build_local_review_request_decision,
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_inspect_decision,
-    build_pr_feedback_sweep_decision, build_pr_hygiene_repair_decision, LocalReviewCompletedInput,
-    LocalReviewDecisionInput, LocalReviewOutcome, PrDetectedDecisionInput, PrFeedbackDecisionInput,
-    PrFeedbackDecisionOutput, PrFeedbackInspectDecisionInput, PrFeedbackOutcome,
-    PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PrHygieneRepairDecisionInput,
-    LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
-    LOCAL_REVIEW_PASSED_SIGNAL, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
-    PR_FEEDBACK_SNAPSHOT_ARTIFACT, PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
+    build_pr_feedback_sweep_decision, build_pr_hygiene_repair_decision, next_feedback_repair_round,
+    FeedbackRepairLane, FeedbackRepairStop, LocalReviewCompletedInput, LocalReviewDecisionInput,
+    LocalReviewOutcome, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackDecisionOutput,
+    PrFeedbackInspectDecisionInput, PrFeedbackOutcome, PrFeedbackSweepDecisionInput,
+    PrFeedbackWorkflowAction, PrHygieneRepairDecisionInput, LOCAL_REVIEW_ACTIVITY,
+    LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
+    MAX_FEEDBACK_REPAIR_ROUNDS, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    PR_FEEDBACK_SNAPSHOT_ARTIFACT, PR_HYGIENE_CONVERGENCE_STOP_SOURCE, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 pub use prompt_task::{
     build_prompt_submission_decision, continuation_value, parse_external_state_signal,

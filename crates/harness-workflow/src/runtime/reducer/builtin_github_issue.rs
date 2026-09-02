@@ -17,7 +17,7 @@ use crate::runtime::model::{
     WorkflowEvidence, WorkflowInstance,
 };
 use crate::runtime::reason_class::STOP_REASON_INVALID_AGENT_OUTPUT;
-use crate::runtime::WorkflowDefinitionRegistry;
+use crate::runtime::{WorkflowDefinitionRegistry, SERVER_PR_SNAPSHOT_ARTIFACT};
 use serde_json::{json, Value};
 
 pub(super) fn issue_implementation_missing_result_decision(
@@ -84,12 +84,23 @@ pub(super) fn github_issue_closed_decision(
         return None;
     }
 
-    let closed_issue = closed_issue_evidence_from_activity_result(result)?;
+    let verified_issue = verified_issue_state_for_instance(instance, result);
+    let closed_issue = closed_issue_evidence_from_activity_result(result).or_else(|| {
+        verified_issue.map(|verified| ClosedIssueEvidence {
+            summary: format!(
+                "server verified issue {} is closed",
+                verified
+                    .get("issue_number")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+            ),
+            payload: verified.clone(),
+        })
+    })?;
     let reason = format!(
         "{} reported structured evidence that the GitHub issue is already closed",
         result.activity
     );
-    let verified_issue = verified_issue_state_for_instance(instance, result);
     let terminal_evidence = if let Some(verified_issue) = verified_issue {
         WorkflowEvidence::runtime_observed(
             EVIDENCE_GITHUB_TERMINAL,
@@ -165,8 +176,76 @@ fn github_issue_state_can_finish_closed(state: &str) -> bool {
             | "pr_open"
             | "awaiting_feedback"
             | "addressing_feedback"
+            | "local_review_gate"
             | "quality_gate_pending"
             | "ready_to_merge"
+    )
+}
+
+pub(super) fn terminal_pr_snapshot_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || matches!(instance.state.as_str(), "done" | "cancelled" | "failed")
+    {
+        return None;
+    }
+
+    let snapshot = result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == SERVER_PR_SNAPSHOT_ARTIFACT)
+        .map(|artifact| &artifact.artifact)
+        .find(|snapshot| {
+            crate::runtime::pr_feedback::server_pr_snapshot_matches_instance(instance, snapshot)
+        })?;
+    let pr_number = snapshot.get("pr_number").and_then(Value::as_u64)?;
+    let pr_url = snapshot.get("pr_url").and_then(Value::as_str)?;
+    let state = snapshot.get("state").and_then(Value::as_str)?;
+    let (decision, next_state, command_type, action) = match state {
+        "MERGED" => (
+            "finish_server_observed_pr_merge",
+            "done",
+            WorkflowCommandType::MarkDone,
+            "merged",
+        ),
+        "CLOSED" => (
+            "cancel_server_observed_closed_pr",
+            "cancelled",
+            WorkflowCommandType::MarkCancelled,
+            "closed without merge",
+        ),
+        _ => return None,
+    };
+    let reason = format!("server-owned GitHub snapshot observed pull request {action}");
+
+    Some(
+        WorkflowDecision::new(&instance.id, &instance.state, decision, next_state, &reason)
+            .with_command(WorkflowCommand::new(
+                command_type,
+                format!(
+                    "runtime-completion:{}:server-pr-terminal:{pr_number}",
+                    event.id
+                ),
+                json!({
+                    "reason": reason,
+                    "activity": result.activity,
+                    "runtime_job_id": event_field_string(event, "runtime_job_id"),
+                    "pr_number": pr_number,
+                    "pr_url": pr_url,
+                    "server_pr_snapshot": snapshot,
+                }),
+            ))
+            .with_evidence(WorkflowEvidence::runtime_observed(
+                EVIDENCE_GITHUB_TERMINAL,
+                format!("server_pr_snapshot: pr={pr_number} state={state}"),
+                "server_pr_snapshot",
+                Some(event.id.clone()),
+            ))
+            .with_evidence(runtime_completion_evidence(event, result))
+            .high_confidence(),
     )
 }
 

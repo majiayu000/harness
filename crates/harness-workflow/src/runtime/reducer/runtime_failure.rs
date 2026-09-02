@@ -7,7 +7,7 @@ use crate::runtime::model::{
     ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowEvent, WorkflowInstance,
 };
-use crate::runtime::pr_feedback::PR_FEEDBACK_DEFINITION_ID;
+use crate::runtime::pr_feedback::{LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID};
 use crate::runtime::prompt_task::PROMPT_TASK_DEFINITION_ID;
 use crate::runtime::quality_gate::QUALITY_GATE_DEFINITION_ID;
 use crate::runtime::reducer::GITHUB_ISSUE_PR_DEFINITION_ID;
@@ -68,6 +68,89 @@ pub(super) fn retry_failed_activity_decision(
     result: &ActivityResult,
 ) -> Option<WorkflowDecision> {
     retry_failed_activity_decision_inner(instance, event, result, false)
+}
+
+pub(super) fn reconcile_feedback_repair_completion_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    reason_override: Option<&str>,
+) -> Option<WorkflowDecision> {
+    if (
+        instance.definition_id.as_str(),
+        instance.state.as_str(),
+        result.activity.as_str(),
+    ) != (
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        "addressing_feedback",
+        "address_pr_feedback",
+    ) {
+        return None;
+    }
+    if result.status == crate::runtime::model::ActivityStatus::Failed
+        && result.error_kind == Some(ActivityErrorKind::SpawnFailure)
+        && server_confirmed_zero_activity_spawn_failure(result)
+    {
+        return None;
+    }
+
+    let reason = reason_override
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| runtime_failure_reason(result, "PR feedback repair did not complete."));
+    let completion_command_id =
+        event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "reinspect_after_feedback_repair_failure",
+            "local_review_gate",
+            format!(
+                "PR feedback repair ended with an uncertain side-effect state; run an independent local review before any further mutation. Last error: {reason}"
+            ),
+        )
+        .with_command(WorkflowCommand::enqueue_activity(
+            LOCAL_REVIEW_ACTIVITY,
+            format!(
+                "local-review:{}:after-repair-failure:{completion_command_id}",
+                instance.id
+            ),
+        ))
+        .with_evidence(runtime_completion_evidence(event, result))
+        .high_confidence(),
+    )
+}
+
+fn server_confirmed_zero_activity_spawn_failure(result: &ActivityResult) -> bool {
+    let Some(envelope) = result
+        .artifacts
+        .iter()
+        .rev()
+        .find(|artifact| {
+            artifact.artifact_type
+                == crate::runtime::completion_evidence::ARTIFACT_ACTIVITY_RESULT_ENVELOPE
+        })
+        .map(|artifact| &artifact.artifact)
+    else {
+        return false;
+    };
+
+    envelope.get("schema").and_then(Value::as_str)
+        == Some("harness.runtime.activity_result_envelope.v1")
+        && envelope.get("outcome").and_then(Value::as_str) == Some("zero_output_spawn_failure")
+        && envelope.get("raw_status").and_then(Value::as_str) == Some("completed")
+        && envelope
+            .pointer("/final_result/activity")
+            .and_then(Value::as_str)
+            == Some(result.activity.as_str())
+        && envelope
+            .pointer("/final_result/status")
+            .and_then(Value::as_str)
+            == Some("failed")
+        && envelope
+            .pointer("/final_result/error_kind")
+            .and_then(Value::as_str)
+            == Some("spawn_failure")
 }
 
 fn retry_failed_activity_decision_inner(

@@ -72,6 +72,10 @@ fn codex_exec_backend_claims_every_contract_capability() {
         capabilities.missing_for_enforcement().is_empty(),
         "codex exec is the first conforming backend: {capabilities:?}"
     );
+    assert!(
+        !agent.reports_usage_cost(),
+        "codex exec reports token counts but no provider USD cost"
+    );
 }
 
 #[test]

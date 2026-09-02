@@ -224,6 +224,170 @@ fn local_review_changes_requested_uses_completed_command_dedupe_key() {
 }
 
 #[test]
+fn local_review_same_blocker_count_stops_feedback_repair_oscillation() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "feedback_repair_round": 1,
+        "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "local_review",
+    }));
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Two blockers remain.")
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+                "actionable_blocker_count": 2,
+            }),
+        ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("non-converging local review should stop the workflow");
+
+    assert_eq!(decision.decision, "block_feedback_repair_oscillation");
+    assert_eq!(decision.next_state, "blocked");
+}
+
+#[test]
+fn local_review_lower_blocker_count_allows_feedback_repair() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "feedback_repair_round": 1,
+        "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "local_review",
+    }));
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "One blocker remains.")
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+                "actionable_blocker_count": 1,
+            }),
+        ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("converging local review should allow another repair");
+
+    assert_eq!(decision.decision, "address_local_review_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+}
+
+#[test]
+fn local_review_missing_blocker_count_stops_when_repair_history_exists() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "feedback_repair_round": 1,
+        "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "local_review",
+    }));
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Blockers remain.").with_signal(
+        ActivitySignal::new(
+            super::super::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+            }),
+        ),
+    );
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("unmeasured local review should stop the workflow");
+
+    assert_eq!(decision.decision, "block_feedback_repair_unmeasured");
+    assert_eq!(decision.next_state, "blocked");
+}
+
+#[test]
+fn structured_local_review_decision_cannot_bypass_feedback_convergence() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "feedback_repair_round": 1,
+        "feedback_repair_blocker_count": 2,
+        "feedback_repair_lane": "local_review",
+    }));
+    let proposed_decision = build_local_review_completed_decision(
+        &instance,
+        LocalReviewCompletedInput {
+            task_id: "runtime-task-1",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            repair_dedupe_key: "local-review:workflow-1:77:address:command-1",
+            outcome: LocalReviewOutcome::ChangesRequested,
+            summary: "Agent requested another repair round.",
+        },
+    )
+    .decision;
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Two blockers remain.")
+        .with_artifact(ActivityArtifact::new(
+            "workflow_decision",
+            serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+        ))
+        .with_signal(ActivitySignal::new(
+            super::super::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            json!({
+                "pr_number": 77,
+                "pr_url": "https://github.com/owner/repo/pull/77",
+                "actionable_blocker_count": 2,
+            }),
+        ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("structured decision must still pass convergence policy");
+
+    assert_eq!(decision.decision, "block_feedback_repair_oscillation");
+    assert_eq!(decision.next_state, "blocked");
+}
+
+#[test]
+fn structured_only_local_review_decision_requires_outcome_signal() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    let proposed_decision = build_local_review_completed_decision(
+        &instance,
+        LocalReviewCompletedInput {
+            task_id: "runtime-task-1",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            repair_dedupe_key: "unused-for-pass",
+            outcome: LocalReviewOutcome::Passed,
+            summary: "Agent passed local review without an outcome signal.",
+        },
+    )
+    .decision;
+    let result = ActivityResult::succeeded(
+        LOCAL_REVIEW_ACTIVITY,
+        "Runtime agent emitted only a structured local-review decision.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "workflow_decision",
+        serde_json::to_value(&proposed_decision).expect("decision should serialize"),
+    ));
+    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("missing local-review outcome should block");
+
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
+}
+
+#[test]
 fn local_review_passed_result_routes_to_awaiting_feedback() {
     let instance = issue_instance("local_review_gate").with_server_data(json!({
         "pr_number": 77,
@@ -396,6 +560,18 @@ fn local_review_blocked_result_routes_to_blocked() {
     assert_eq!(
         decision.commands[0].dedupe_key,
         "local-review:job-1:77:blocked"
+    );
+    assert_eq!(
+        decision.commands[0].command["last_stop"]["state"],
+        "blocked"
+    );
+    assert_eq!(
+        decision.commands[0].command["last_stop"]["activity"],
+        LOCAL_REVIEW_ACTIVITY
+    );
+    assert_eq!(
+        decision.commands[0].command["last_stop"]["runtime_job_id"],
+        "job-1"
     );
     DecisionValidator::github_issue_pr()
         .validate(

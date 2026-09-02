@@ -6,6 +6,7 @@
 //! the `EnqueueActivity` command payload so the runtime job snapshot always
 //! carries the exact contract the instance was pinned to.
 
+use super::data_provenance::WorkflowDataProvenance;
 use super::declarative::DeclarativeWorkflowDefinition;
 use super::model::{
     ActivityResult, RuntimeKind, WorkflowCommand, WorkflowCommandType, WorkflowInstance,
@@ -176,6 +177,7 @@ pub(crate) fn validated_agent_contract_assessment_outcome(
         .ok_or_else(|| anyhow::anyhow!("agent contract verdict artifact is missing verdict"))?;
     validate_agent_contract_output(&pinned.contract.output_schema, &assessment.verdict)
         .map_err(anyhow::Error::msg)?;
+    validate_agent_contract_evidence_refs(input, &assessment.verdict)?;
     let expected_contract_hash = super::remote_facts::stable_remote_fact_hash(contract_value);
     let expected_input_hash = super::remote_facts::stable_remote_fact_hash(input);
     let mut expected_primary = 1;
@@ -232,6 +234,57 @@ pub(crate) fn validated_agent_contract_assessment_outcome(
         anyhow::bail!("agent contract assessment failed pinned-event validation");
     }
     Ok(Some(assessment.outcome))
+}
+
+/// Validates that every model-supplied evidence reference names an immutable,
+/// provenance-covered value in the pinned facts envelope.
+pub fn validate_agent_contract_evidence_refs(input: &Value, verdict: &Value) -> anyhow::Result<()> {
+    let evidence_refs = verdict
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("agent contract verdict is missing evidence_refs"))?;
+    if evidence_refs.is_empty() {
+        return Ok(());
+    }
+    let facts = input
+        .get("facts")
+        .ok_or_else(|| anyhow::anyhow!("agent contract input is missing facts"))?;
+    let provenance: WorkflowDataProvenance = serde_json::from_value(
+        input
+            .get("provenance")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("agent contract input is missing provenance"))?,
+    )?;
+    provenance
+        .validate_persisted_data(facts)
+        .map_err(|error| anyhow::anyhow!("agent contract input provenance is invalid: {error}"))?;
+    for evidence_ref in evidence_refs {
+        let evidence_ref = evidence_ref
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("agent contract evidence reference is not a string"))?;
+        let Some(facts_pointer) = evidence_ref.strip_prefix("/facts") else {
+            anyhow::bail!(
+                "agent contract evidence reference '{evidence_ref}' must start with '/facts/'"
+            );
+        };
+        if !facts_pointer.starts_with('/') {
+            anyhow::bail!(
+                "agent contract evidence reference '{evidence_ref}' must start with '/facts/'"
+            );
+        }
+        if input.pointer(evidence_ref).is_none() {
+            anyhow::bail!(
+                "agent contract evidence reference '{evidence_ref}' does not resolve in the pinned input"
+            );
+        }
+        if provenance.is_legacy(facts_pointer) || provenance.provenance_for(facts_pointer).is_none()
+        {
+            anyhow::bail!(
+                "agent contract evidence reference '{evidence_ref}' has no provenance coverage"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Validates and pins the agent contracts of every activity the definition

@@ -156,19 +156,19 @@ fn github_issue_pr_validator_allows_completed_issue_done_reconciliation() {
 }
 
 #[test]
-fn github_issue_pr_validator_does_not_advertise_reconciliation_only_local_review_gate_done() {
+fn github_issue_pr_validator_advertises_evidence_gated_local_review_gate_done() {
     let validator = DecisionValidator::github_issue_pr();
 
-    assert!(!validator
+    assert!(validator
         .transition_rules_from("local_review_gate")
         .any(|rule| rule.to_state == "done"));
 }
 
 #[test]
-fn github_issue_pr_validator_does_not_advertise_reconciliation_only_blocked_done() {
+fn github_issue_pr_validator_advertises_evidence_gated_blocked_done() {
     let validator = DecisionValidator::github_issue_pr();
 
-    assert!(!validator
+    assert!(validator
         .transition_rules_from("blocked")
         .any(|rule| rule.to_state == "done"));
 }
@@ -233,11 +233,11 @@ fn github_issue_pr_validator_rejects_unevidenced_local_review_gate_done() {
             &decision,
             &ValidationContext::new("reconciliation", Utc::now()),
         )
-        .expect_err("local_review_gate -> done requires merged PR evidence");
+        .expect_err("local_review_gate -> done requires runtime-observed terminal evidence");
 
     assert_eq!(
         err.kind,
-        WorkflowDecisionRejectionKind::MissingTerminalEvidence
+        WorkflowDecisionRejectionKind::MissingRequiredEvidence
     );
 }
 
@@ -263,11 +263,11 @@ fn github_issue_pr_validator_rejects_unevidenced_blocked_done() {
             &decision,
             &ValidationContext::new("reconciliation", Utc::now()),
         )
-        .expect_err("blocked -> done requires merged PR evidence");
+        .expect_err("blocked -> done requires runtime-observed terminal evidence");
 
     assert_eq!(
         err.kind,
-        WorkflowDecisionRejectionKind::MissingTerminalEvidence
+        WorkflowDecisionRejectionKind::MissingRequiredEvidence
     );
 }
 

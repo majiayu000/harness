@@ -1,24 +1,7 @@
+pub(crate) use super::runtime_usage::{RuntimeUsageContext, TurnBudgetStop};
 use harness_core::agent::StreamItem;
-use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
-use harness_core::run_id::RunId;
-use harness_core::types::{Item, ThreadId, TokenUsage, TurnId, TurnStatus};
+use harness_core::types::{Item, ThreadId, TurnId, TurnStatus};
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
-use harness_workflow::runtime::{
-    cost_usd_from_micros, cost_usd_to_micros, RuntimeKind, RuntimeUsageMetrics, RuntimeUsageUpsert,
-    RuntimeUsageUpsertOutcome, WorkflowRuntimeStore,
-};
-use serde_json::json;
-use std::sync::Arc;
-
-/// Mid-turn budget stop (GH-1770 spec §4.3): the streamed usage that was just
-/// persisted put the workflow at or over its USD ceiling, so the in-flight
-/// turn must be interrupted rather than allowed to keep spending.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TurnBudgetStop {
-    pub(crate) workflow_id: String,
-    pub(crate) spent_usd: f64,
-    pub(crate) budget_usd: f64,
-}
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamCompletionState {
@@ -81,160 +64,6 @@ impl StreamCompletionState {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct RuntimeUsageContext {
-    pub(crate) store: Arc<WorkflowRuntimeStore>,
-    pub(crate) runtime_job_id: String,
-    pub(crate) command_id: String,
-    pub(crate) workflow_id: String,
-    pub(crate) agent_run_id: Option<RunId>,
-    pub(crate) runtime_kind: RuntimeKind,
-    pub(crate) runtime_profile: String,
-    pub(crate) agent: String,
-    pub(crate) model: String,
-    pub(crate) project: String,
-    pub(crate) task_id: Option<String>,
-    pub(crate) candidate_group_id: Option<String>,
-    pub(crate) candidate_id: Option<String>,
-    pub(crate) candidate_index: Option<u32>,
-    pub(crate) candidate_count: Option<u32>,
-    /// Budget policy for the mid-turn watchdog; the same policy the dispatch
-    /// gate and the completion ceiling apply.
-    pub(crate) budget_policy: RuntimeBudgetPolicy,
-}
-
-impl std::fmt::Debug for RuntimeUsageContext {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RuntimeUsageContext")
-            .field("runtime_job_id", &self.runtime_job_id)
-            .field("command_id", &self.command_id)
-            .field("workflow_id", &self.workflow_id)
-            .field("runtime_kind", &self.runtime_kind)
-            .field("runtime_profile", &self.runtime_profile)
-            .field("agent", &self.agent)
-            .field("model", &self.model)
-            .field("project", &self.project)
-            .field("task_id", &self.task_id)
-            .field("candidate_group_id", &self.candidate_group_id)
-            .field("candidate_id", &self.candidate_id)
-            .field("candidate_index", &self.candidate_index)
-            .field("candidate_count", &self.candidate_count)
-            .finish_non_exhaustive()
-    }
-}
-
-impl RuntimeUsageContext {
-    pub(crate) async fn persist_agent_run_start(&self, turn_id: &TurnId) -> anyhow::Result<()> {
-        self.store
-            .upsert_runtime_agent_run(&RuntimeUsageUpsert {
-                runtime_job_id: self.runtime_job_id.clone(),
-                command_id: self.command_id.clone(),
-                workflow_id: self.workflow_id.clone(),
-                turn_id: Some(turn_id.as_str().to_string()),
-                agent_run_id: self.agent_run_id.clone(),
-                runtime_kind: self.runtime_kind,
-                runtime_profile: self.runtime_profile.clone(),
-                agent: self.agent.clone(),
-                model: self.model.clone(),
-                project: self.project.clone(),
-                task_id: self.task_id.clone(),
-                candidate_group_id: self.candidate_group_id.clone(),
-                candidate_id: self.candidate_id.clone(),
-                candidate_index: self.candidate_index,
-                candidate_count: self.candidate_count,
-                metrics: RuntimeUsageMetrics::default(),
-                cost_usd_micros: 0,
-                reported_at: chrono::Utc::now(),
-            })
-            .await
-    }
-
-    async fn persist_token_usage(
-        &self,
-        turn_id: &TurnId,
-        usage: &TokenUsage,
-    ) -> anyhow::Result<()> {
-        match self
-            .store
-            .upsert_runtime_usage(&RuntimeUsageUpsert {
-                runtime_job_id: self.runtime_job_id.clone(),
-                command_id: self.command_id.clone(),
-                workflow_id: self.workflow_id.clone(),
-                turn_id: Some(turn_id.as_str().to_string()),
-                agent_run_id: self.agent_run_id.clone(),
-                runtime_kind: self.runtime_kind,
-                runtime_profile: self.runtime_profile.clone(),
-                agent: self.agent.clone(),
-                model: self.model.clone(),
-                project: self.project.clone(),
-                task_id: self.task_id.clone(),
-                candidate_group_id: self.candidate_group_id.clone(),
-                candidate_id: self.candidate_id.clone(),
-                candidate_index: self.candidate_index,
-                candidate_count: self.candidate_count,
-                metrics: RuntimeUsageMetrics::from_token_usage(usage),
-                cost_usd_micros: cost_usd_to_micros(usage.cost_usd)?,
-                reported_at: chrono::Utc::now(),
-            })
-            .await?
-        {
-            RuntimeUsageUpsertOutcome::SkippedZeroUsage => {}
-            RuntimeUsageUpsertOutcome::Persisted => {}
-        }
-        Ok(())
-    }
-
-    /// Mid-turn ceiling check (GH-1770 §4.3), run right after the streamed
-    /// usage was persisted so the aggregate already includes it.
-    ///
-    /// `enforce` returns the stop for the caller to act on; `shadow` records a
-    /// `BudgetShadowDecision` runtime event and returns `None`.
-    async fn budget_stop(&self) -> anyhow::Result<Option<TurnBudgetStop>> {
-        if self.budget_policy.unlimited {
-            return Ok(None);
-        }
-        // Integer micro-dollars, matching the dispatch gate and the completion
-        // ceiling: a float comparison could flip at the boundary.
-        let budget_usd = self.budget_policy.default_workflow_budget_usd;
-        let budget_usd_micros = cost_usd_to_micros(budget_usd)?;
-        let spent_usd_micros = self
-            .store
-            .runtime_usage_for_workflow(&self.workflow_id)
-            .await?
-            .map(|usage| usage.cost_usd_micros)
-            .unwrap_or(0);
-        if spent_usd_micros < budget_usd_micros {
-            return Ok(None);
-        }
-        let spent_usd = cost_usd_from_micros(spent_usd_micros);
-        match self.budget_policy.enforcement {
-            RuntimeBudgetEnforcement::Shadow => {
-                self.store
-                    .append_event(
-                        &self.workflow_id,
-                        "BudgetShadowDecision",
-                        "workflow_runtime_turn_watchdog",
-                        json!({
-                            "decision": "would_interrupt",
-                            "spent_usd": spent_usd,
-                            "budget_usd": budget_usd,
-                            "runtime_job_id": self.runtime_job_id,
-                            "command_id": self.command_id,
-                        }),
-                    )
-                    .await?;
-                Ok(None)
-            }
-            RuntimeBudgetEnforcement::Enforce => Ok(Some(TurnBudgetStop {
-                workflow_id: self.workflow_id.clone(),
-                spent_usd,
-                budget_usd,
-            })),
-        }
-    }
-}
-
 pub(crate) fn emit_runtime_notification(
     notify_tx: &Option<crate::notify::NotifySender>,
     notification_tx: &tokio::sync::broadcast::Sender<RpcNotification>,
@@ -291,7 +120,10 @@ pub(crate) async fn process_stream_item(
                 },
             );
         }
-        StreamItem::TokenUsage { usage } => {
+        StreamItem::TokenUsage {
+            usage,
+            cost_usd_observed,
+        } => {
             if let Err(err) =
                 server
                     .thread_manager
@@ -308,7 +140,10 @@ pub(crate) async fn process_stream_item(
                 },
             );
             if let Some(context) = runtime_usage {
-                if let Err(error) = context.persist_token_usage(turn_id, &usage).await {
+                if let Err(error) = context
+                    .persist_token_usage(turn_id, &usage, cost_usd_observed)
+                    .await
+                {
                     tracing::error!(
                         runtime_job_id = %context.runtime_job_id,
                         command_id = %context.command_id,
@@ -466,14 +301,19 @@ mod tests {
     use crate::{server::HarnessServer, thread_manager::ThreadManager};
     use harness_agents::registry::AgentRegistry;
     use harness_core::{
-        config::HarnessConfig,
+        config::{
+            workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy},
+            HarnessConfig,
+        },
         db::resolve_database_url,
+        run_id::RunId,
         types::{AgentId, TokenUsage},
     };
     use harness_workflow::runtime::{
         RuntimeKind, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
     };
     use std::str::FromStr;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn mark_turn_cancelled_transitions_turn_status() -> anyhow::Result<()> {
@@ -558,6 +398,7 @@ mod tests {
                     total_tokens: 20,
                     cost_usd: 0.125,
                 },
+                cost_usd_observed: true,
             },
         )
         .await;
@@ -666,6 +507,7 @@ mod tests {
                 total_tokens: 15,
                 cost_usd,
             },
+            cost_usd_observed: true,
         }
     }
 

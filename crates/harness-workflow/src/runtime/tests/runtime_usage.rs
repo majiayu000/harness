@@ -67,6 +67,7 @@ async fn runtime_usage_upsert_replaces_cumulative_turn_usage() -> anyhow::Result
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].metrics.total_tokens(), 30);
     assert_eq!(records[0].cost_usd_micros, 1_250_000);
+    assert!(records[0].cost_usd_observed);
     assert_eq!(records[0].model, "gpt-5.1");
     assert!(matches!(outcome, RuntimeUsageUpsertOutcome::Persisted));
     Ok(())
@@ -132,6 +133,7 @@ async fn runtime_usage_for_workflow_aggregates_distinct_turns() -> anyhow::Resul
         reported_total_tokens: Some(31),
     };
     second.cost_usd_micros = 1_250_000;
+    second.cost_usd_observed = false;
 
     store.upsert_runtime_usage(&first).await?;
     store.upsert_runtime_usage(&second).await?;
@@ -146,6 +148,7 @@ async fn runtime_usage_for_workflow_aggregates_distinct_turns() -> anyhow::Resul
     assert_eq!(usage.metrics.cache_creation_input_tokens, 1);
     assert_eq!(usage.metrics.total_tokens(), 48);
     assert_eq!(usage.cost_usd_micros, 2_000_000);
+    assert!(!usage.cost_usd_observed);
     assert!(store
         .runtime_usage_for_workflow("missing-workflow")
         .await?
@@ -379,6 +382,7 @@ fn runtime_usage_upsert(metrics: RuntimeUsageMetrics) -> RuntimeUsageUpsert {
         candidate_count: None,
         metrics,
         cost_usd_micros: 0,
+        cost_usd_observed: true,
         reported_at: Utc::now(),
     }
 }

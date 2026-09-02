@@ -193,6 +193,7 @@ impl CodeAgent for AnthropicApiAgent {
             &tx,
             StreamItem::TokenUsage {
                 usage: resp.token_usage,
+                cost_usd_observed: false,
             },
             self.name(),
             "token_usage",

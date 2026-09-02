@@ -66,7 +66,10 @@ fn apply_claude_stream_line(
 
     if let Some(usage) = usage {
         parsed.token_usage = usage.clone();
-        emitted_items.push(StreamItem::TokenUsage { usage });
+        emitted_items.push(StreamItem::TokenUsage {
+            usage,
+            cost_usd_observed: false,
+        });
     }
 
     if let Some(failure) = parse_stream_json_result_failure(line) {

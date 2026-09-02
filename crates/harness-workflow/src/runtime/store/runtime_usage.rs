@@ -46,6 +46,7 @@ pub struct RuntimeUsageUpsert {
     pub candidate_count: Option<u32>,
     pub metrics: RuntimeUsageMetrics,
     pub cost_usd_micros: u64,
+    pub cost_usd_observed: bool,
     pub reported_at: DateTime<Utc>,
 }
 
@@ -86,6 +87,7 @@ pub struct RuntimeUsageRecord {
     pub candidate_count: Option<u32>,
     pub metrics: RuntimeUsageMetrics,
     pub cost_usd_micros: u64,
+    pub cost_usd_observed: bool,
     pub reported_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -94,6 +96,7 @@ pub struct RuntimeUsageRecord {
 pub struct RuntimeWorkflowUsage {
     pub metrics: RuntimeUsageMetrics,
     pub cost_usd_micros: u64,
+    pub cost_usd_observed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,6 +135,7 @@ struct RuntimeUsageDbRow {
     cache_creation_input_tokens: i64,
     reported_total_tokens: Option<i64>,
     cost_usd_micros: i64,
+    cost_usd_observed: bool,
     reported_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -163,10 +167,11 @@ impl WorkflowRuntimeStore {
                  runtime_kind, runtime_profile, agent, model, project, task_id,
                  candidate_group_id, candidate_id, candidate_index, candidate_count,
                  input_tokens, output_tokens, cache_read_input_tokens,
-                 cache_creation_input_tokens, reported_total_tokens, cost_usd_micros, reported_at)
+                 cache_creation_input_tokens, reported_total_tokens, cost_usd_micros,
+                 cost_usd_observed, reported_at)
              VALUES
                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
              ON CONFLICT (runtime_job_id, usage_key) DO UPDATE SET
                 command_id = EXCLUDED.command_id,
                 workflow_id = EXCLUDED.workflow_id,
@@ -188,6 +193,7 @@ impl WorkflowRuntimeStore {
                 cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
                 reported_total_tokens = EXCLUDED.reported_total_tokens,
                 cost_usd_micros = EXCLUDED.cost_usd_micros,
+                cost_usd_observed = EXCLUDED.cost_usd_observed,
                 reported_at = EXCLUDED.reported_at,
                 updated_at = CURRENT_TIMESTAMP",
         )
@@ -226,6 +232,7 @@ impl WorkflowRuntimeStore {
                 .transpose()?,
         )
         .bind(u64_to_i64(usage.cost_usd_micros, "cost_usd_micros")?)
+        .bind(usage.cost_usd_observed)
         .bind(usage.reported_at)
         .execute(&self.pool)
         .await?;
@@ -244,6 +251,7 @@ impl WorkflowRuntimeStore {
                 candidate_group_id, candidate_id, candidate_index, candidate_count,
                 input_tokens, output_tokens, cache_read_input_tokens,
                 cache_creation_input_tokens, reported_total_tokens, cost_usd_micros,
+                cost_usd_observed,
                 reported_at, updated_at
              FROM runtime_usage_events
              WHERE reported_at >= $1 AND reported_at <= $2
@@ -262,7 +270,7 @@ impl WorkflowRuntimeStore {
         &self,
         workflow_id: &str,
     ) -> anyhow::Result<Option<RuntimeWorkflowUsage>> {
-        let row: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        let row: (i64, i64, i64, i64, i64, i64, i64, bool) = sqlx::query_as(
             "SELECT
                 COUNT(*)::BIGINT,
                 COALESCE(SUM(input_tokens), 0)::BIGINT,
@@ -274,7 +282,8 @@ impl WorkflowRuntimeStore {
                     input_tokens + output_tokens
                         + cache_read_input_tokens + cache_creation_input_tokens
                 )), 0)::BIGINT,
-                COALESCE(SUM(cost_usd_micros), 0)::BIGINT
+                COALESCE(SUM(cost_usd_micros), 0)::BIGINT,
+                COALESCE(BOOL_AND(cost_usd_observed), FALSE)
              FROM runtime_usage_events
              WHERE workflow_id = $1",
         )
@@ -293,6 +302,7 @@ impl WorkflowRuntimeStore {
                 reported_total_tokens: Some(i64_to_u64(row.5, "reported_total_tokens")?),
             },
             cost_usd_micros: i64_to_u64(row.6, "cost_usd_micros")?,
+            cost_usd_observed: row.7,
         }))
     }
 
@@ -361,6 +371,7 @@ impl WorkflowRuntimeStore {
                 candidate_group_id, candidate_id, candidate_index, candidate_count,
                 input_tokens, output_tokens, cache_read_input_tokens,
                 cache_creation_input_tokens, reported_total_tokens, cost_usd_micros,
+                cost_usd_observed,
                 reported_at, updated_at
              FROM runtime_usage_events
              WHERE workflow_id = $1 AND agent = $2
@@ -483,6 +494,7 @@ fn runtime_usage_record_from_row(row: RuntimeUsageDbRow) -> anyhow::Result<Runti
                 .transpose()?,
         },
         cost_usd_micros: i64_to_u64(row.cost_usd_micros, "cost_usd_micros")?,
+        cost_usd_observed: row.cost_usd_observed,
         reported_at: row.reported_at,
         updated_at: row.updated_at,
     })
@@ -501,6 +513,7 @@ fn aggregate_usage_records(
     let mut metrics = RuntimeUsageMetrics::default();
     let mut reported_total_tokens = 0_u64;
     let mut cost_usd_micros = 0_u64;
+    let mut cost_usd_observed = true;
     for record in records {
         metrics.input_tokens = checked_add(
             metrics.input_tokens,
@@ -528,11 +541,13 @@ fn aggregate_usage_records(
             "reported_total_tokens",
         )?;
         cost_usd_micros = checked_add(cost_usd_micros, record.cost_usd_micros, "cost_usd_micros")?;
+        cost_usd_observed &= record.cost_usd_observed;
     }
     metrics.reported_total_tokens = Some(reported_total_tokens);
     Ok(Some(RuntimeWorkflowUsage {
         metrics,
         cost_usd_micros,
+        cost_usd_observed,
     }))
 }
 

@@ -1,12 +1,11 @@
 use super::builtin_github_issue::{
     bind_pr_from_activity_result, closed_issue_evidence_from_activity_result,
     github_issue_closed_decision, issue_implementation_missing_result_decision,
-    merged_pr_from_activity_result,
+    merged_pr_from_activity_result, terminal_pr_snapshot_decision,
 };
 use super::builtin_plan_issue::issue_plan_decision_from_activity_result;
 use super::builtin_pr_feedback::{
-    local_review_decision_from_activity_result,
-    pr_feedback_blocking_signal_overrides_structured_ready,
+    local_review_decision_from_activity_result, pr_feedback_activity_missing_outcome_signal,
     pr_feedback_child_decision_from_activity_result, pr_feedback_success_contract_error,
     pr_feedback_sweep_decision_from_activity_result,
 };
@@ -16,8 +15,8 @@ use super::builtin_quality_gate::{
     quality_gate_success_contract_error, quality_gate_success_decision,
 };
 use super::runtime_failure::{
-    retry_failed_activity_decision, runtime_blocked_decision, runtime_cancelled_decision,
-    runtime_failed_decision,
+    reconcile_feedback_repair_completion_decision, retry_failed_activity_decision,
+    runtime_blocked_decision, runtime_cancelled_decision, runtime_failed_decision,
 };
 use super::support::{
     event_command_type, event_field_string, event_workflow_command,
@@ -57,6 +56,21 @@ pub(super) fn reduce_builtin_completion(
             | PR_FEEDBACK_DEFINITION_ID
     ) {
         return None;
+    }
+    if result.status == ActivityStatus::Succeeded {
+        if let Some(decision) = terminal_pr_snapshot_decision(instance, event, result) {
+            return Some(Ok(Some(decision)));
+        }
+    }
+    if result.status != ActivityStatus::Succeeded {
+        if let Some(decision) = github_issue_closed_decision(instance, event, result) {
+            return Some(Ok(Some(decision)));
+        }
+        if let Some(decision) =
+            reconcile_feedback_repair_completion_decision(instance, event, result, None)
+        {
+            return Some(Ok(Some(decision)));
+        }
     }
     let decision = match result.status {
         ActivityStatus::Succeeded => reduce_success(registry, instance, event, result),
@@ -106,6 +120,43 @@ fn reduce_success(
     if let Some(decision) = github_issue_closed_decision(instance, event, result) {
         return Some(decision);
     }
+    if let Some(reason) =
+        pr_feedback_success_contract_error(instance, result, structured_decision.as_ref())
+    {
+        if let Some(decision) =
+            reconcile_feedback_repair_completion_decision(instance, event, result, Some(&reason))
+        {
+            return Some(decision);
+        }
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, &reason,
+        ));
+    }
+    if let Some(decision) = pr_feedback_sweep_decision_from_activity_result(instance, event, result)
+    {
+        return Some(decision);
+    }
+    if let Some(decision) = local_review_decision_from_activity_result(instance, event, result) {
+        return Some(decision);
+    }
+    if pr_feedback_activity_missing_outcome_signal(instance, result) {
+        let reason = format!(
+            "{} succeeded without a required feedback outcome signal",
+            result.activity
+        );
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, &reason,
+        ));
+    }
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "local_review_gate"
+        && result.activity == LOCAL_REVIEW_ACTIVITY
+    {
+        let reason = "run_local_review succeeded without exactly one LocalReviewPassed, LocalReviewChangesRequested, or LocalReviewBlocked signal";
+        return Some(invalid_agent_output_blocked_decision(
+            instance, event, result, reason,
+        ));
+    }
     if let Some(decision) = issue_plan_decision_from_activity_result(instance, event, result) {
         return Some(decision);
     }
@@ -151,28 +202,13 @@ fn reduce_success(
             }));
         }
     }
-    if let Some(reason) =
-        pr_feedback_success_contract_error(instance, result, structured_decision.as_ref())
-    {
-        return Some(invalid_agent_output_blocked_decision(
-            instance, event, result, &reason,
-        ));
-    }
-    let pr_feedback_blocker_overrides_structured_ready =
-        pr_feedback_blocking_signal_overrides_structured_ready(
-            instance,
-            result,
-            structured_decision.as_ref(),
-        );
-    if let Some(decision) = structured_decision
-        .as_ref()
-        .filter(|_| !pr_feedback_blocker_overrides_structured_ready)
-        .filter(|decision| {
-            structured_decision_validates(registry, instance, event, result, decision)
-        })
-        .cloned()
-    {
+    if let Some(decision) = feedback_repair_success_decision(instance, event, result) {
         return Some(decision);
+    }
+    if let Some(decision) = structured_decision.as_ref().filter(|decision| {
+        structured_decision_validates(registry, instance, event, result, decision)
+    }) {
+        return Some(decision.clone());
     }
 
     if let Some(decision) = parent_quality_gate_pass_decision(registry, instance, event, result) {
@@ -217,24 +253,6 @@ fn reduce_success(
         return Some(decision);
     }
 
-    if let Some(decision) = pr_feedback_sweep_decision_from_activity_result(instance, event, result)
-    {
-        return Some(decision);
-    }
-
-    if let Some(decision) = local_review_decision_from_activity_result(instance, event, result) {
-        return Some(decision);
-    }
-    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
-        && instance.state == "local_review_gate"
-        && result.activity == LOCAL_REVIEW_ACTIVITY
-    {
-        let reason = "run_local_review succeeded without exactly one LocalReviewPassed, LocalReviewChangesRequested, or LocalReviewBlocked signal";
-        return Some(invalid_agent_output_blocked_decision(
-            instance, event, result, reason,
-        ));
-    }
-
     if let Some(decision) =
         pr_feedback_child_decision_from_activity_result(registry, instance, event, result)
     {
@@ -272,11 +290,6 @@ fn reduce_success(
             "implementing",
             "resume_implementation_after_replan",
             "replan activity completed; implementation can continue",
-        ),
-        (GITHUB_ISSUE_PR_DEFINITION_ID, "addressing_feedback", "address_pr_feedback") => (
-            "local_review_gate",
-            "run_local_review_after_rework",
-            "PR feedback rework activity completed; run local review before remote feedback",
         ),
         (QUALITY_GATE_DEFINITION_ID, "checking", QUALITY_GATE_ACTIVITY) => (
             "passed",
@@ -327,23 +340,41 @@ fn reduce_success(
             }),
         ));
     }
-    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
-        && instance.state == "addressing_feedback"
-        && result.activity == "address_pr_feedback"
-        && next_state == "local_review_gate"
+    Some(workflow_decision.high_confidence())
+}
+
+fn feedback_repair_success_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Option<WorkflowDecision> {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || instance.state != "addressing_feedback"
+        || result.activity != "address_pr_feedback"
     {
-        let completion_command_id =
-            event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
-        workflow_decision = workflow_decision.with_command(WorkflowCommand::enqueue_activity(
+        return None;
+    }
+
+    let completion_command_id =
+        event_field_string(event, "command_id").unwrap_or_else(|| event.id.clone());
+    Some(
+        WorkflowDecision::new(
+            &instance.id,
+            &instance.state,
+            "run_local_review_after_rework",
+            "local_review_gate",
+            "PR feedback rework activity completed; run local review before remote feedback",
+        )
+        .with_evidence(runtime_completion_evidence(event, result))
+        .with_command(WorkflowCommand::enqueue_activity(
             LOCAL_REVIEW_ACTIVITY,
             format!(
                 "local-review:{}:after-rework:{completion_command_id}",
                 instance.id
             ),
-        ));
-    }
-
-    Some(workflow_decision.high_confidence())
+        ))
+        .high_confidence(),
+    )
 }
 
 fn known_success_without_decision(
