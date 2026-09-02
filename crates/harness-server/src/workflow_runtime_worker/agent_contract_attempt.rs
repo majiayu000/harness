@@ -38,7 +38,7 @@ use super::agent_contract_enforcement::TurnStreamObservations;
 #[cfg(test)]
 use super::agent_contract_prompt::contract_attempt_prompt;
 #[cfg(test)]
-use super::agent_contract_stream::execute_agent_contract_attempt;
+use super::agent_contract_stream::{execute_agent_contract_attempt, ContractAttemptFailure};
 #[derive(Debug)]
 pub(super) struct ContractAttempt {
     pub(super) output: String,
@@ -570,7 +570,16 @@ mod tests {
         .await
         .expect_err("a hung backend must hit the pinned wall-clock boundary");
 
-        assert!(error.to_string().contains("timed out after 1s"), "{error}");
+        assert!(error.to_string().contains("timeout after 1s"), "{error}");
+        let (_, source, _) = error
+            .downcast::<ContractAttemptFailure>()
+            .expect("attempt failures preserve observations")
+            .into_parts();
+        assert_eq!(
+            contract_attempt_failure_kind(&source),
+            ActivityErrorKind::Retryable,
+            "executor deadline timeouts must retain their typed retry classification"
+        );
         assert!(
             cancelled.load(Ordering::SeqCst),
             "the timed-out stream task must be cancelled before returning"

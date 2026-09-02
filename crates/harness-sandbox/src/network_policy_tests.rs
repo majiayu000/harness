@@ -22,15 +22,16 @@ fn scoped_seatbelt_policy_denies_all_network_without_an_allowlist() {
 }
 
 #[test]
-fn danger_seatbelt_proxy_policy_allows_loopback_and_denies_remote_network() {
+fn danger_seatbelt_policy_allows_only_the_local_proxy() {
     let spec = SandboxSpec::new(SandboxMode::DangerFullAccess, "/tmp/project")
         .with_network_policy(NetworkPolicy::LocalProxy { port: 18_080 });
 
     let policy = seatbelt_policy(&spec).unwrap();
 
     assert!(policy.contains("(allow default)"));
-    assert!(policy.contains("(deny network-outbound (require-not (remote tcp \"localhost:*\")))"));
-    assert!(!policy.contains("localhost:18080"));
+    assert!(
+        policy.contains("(deny network-outbound (require-not (remote tcp \"localhost:18080\")))")
+    );
     assert!(!policy.contains("(allow network-outbound)"));
 }
 

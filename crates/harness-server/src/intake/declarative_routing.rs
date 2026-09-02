@@ -114,15 +114,9 @@ pub(super) async fn route_declarative_intake(
         return true;
     }
 
-    // Cap (B-008): operator-gated blocked instances remain nonterminal for
-    // dedupe, but they are not executable work and must not starve unrelated
-    // intake. At the executable ceiling, skip without marking dispatched so
+    // Cap (B-008): at the per-binding ceiling, skip without marking dispatched so
     // the issue is naturally retried on a later tick once the count drains.
-    let active_count = nonterminal
-        .iter()
-        .filter(|instance| state_counts_toward_intake_capacity(&instance.state))
-        .count();
-    if active_count as u32 >= cap {
+    if nonterminal.len() as u32 >= cap {
         audit(
             state,
             issue,
@@ -130,7 +124,7 @@ pub(super) async fn route_declarative_intake(
             &definition_id,
             "skipped_at_cap",
             &tie,
-            Some(&format!("{active_count} executable active >= cap {cap}")),
+            Some(&format!("{} active >= cap {cap}", nonterminal.len())),
         )
         .await;
         return true;
@@ -182,10 +176,6 @@ pub(super) async fn route_declarative_intake(
         }
     }
     true
-}
-
-fn state_counts_toward_intake_capacity(state: &str) -> bool {
-    state != "blocked"
 }
 
 /// Create the declarative instance via the same submission function operators
@@ -344,12 +334,5 @@ mod tests {
                 .expect("normalized non-GitHub identity should be valid"),
             "linear:ENG-42"
         );
-    }
-
-    #[test]
-    fn blocked_operator_gates_do_not_consume_executable_intake_capacity() {
-        assert!(!state_counts_toward_intake_capacity("blocked"));
-        assert!(state_counts_toward_intake_capacity("queued"));
-        assert!(state_counts_toward_intake_capacity("running"));
     }
 }

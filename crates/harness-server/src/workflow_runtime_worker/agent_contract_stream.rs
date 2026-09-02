@@ -152,9 +152,9 @@ pub(super) async fn execute_agent_contract_attempt(
                 return Err(failure.into());
             }
             _ = &mut deadline => {
-                let error = anyhow::anyhow!(
-                    "agent contract attempt timed out after {timeout_secs}s"
-                );
+                let error = anyhow::Error::new(harness_core::error::HarnessError::Timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                ));
                 let (error, budget_stop) = stop_and_drain(
                     &mut stream,
                     &mut rx,

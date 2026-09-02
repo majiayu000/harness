@@ -602,11 +602,13 @@ async fn successful_runtime_recovery_clears_resolved_stop_metadata() -> anyhow::
         .await?,
         "lost transcript recovery",
     )?;
+    for field in ["last_stop", "stop_reason_code", "reason_class", "error_kind"] {
+        assert!(
+            recovered.data.get(field).is_none(),
+            "successful recovery must clear stale {field}"
+        );
+    }
     for field in [
-        "last_stop",
-        "stop_reason_code",
-        "reason_class",
-        "error_kind",
         "blocked_reason",
         "unblock_hint",
         "failure_reason",
@@ -615,9 +617,9 @@ async fn successful_runtime_recovery_clears_resolved_stop_metadata() -> anyhow::
         "last_error",
         "error",
     ] {
-        assert!(
-            recovered.data.get(field).is_none(),
-            "successful recovery must clear stale {field}"
+        assert_eq!(
+            recovered.data[field], instance.data[field],
+            "successful recovery must preserve workflow data outside structured stop metadata"
         );
     }
     assert_eq!(recovered.data["last_operator_recovery"]["action"], "retry");

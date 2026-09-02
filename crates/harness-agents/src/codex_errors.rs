@@ -16,7 +16,20 @@ pub(super) fn codex_structured_error(
     if harness_core::error::is_quota_failure_message(&message) {
         return harness_core::error::HarnessError::QuotaExhausted(message);
     }
+    if is_codex_authentication_failure_message(&message) {
+        return harness_core::error::HarnessError::Config(message);
+    }
     harness_core::error::HarnessError::Upstream(message)
+}
+
+fn is_codex_authentication_failure_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("authentication failed")
+        || lower.contains("not authenticated")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || lower.contains("invalid_api_key")
+        || lower.contains("missing api key")
 }
 
 pub(super) fn codex_nonzero_exit_error(

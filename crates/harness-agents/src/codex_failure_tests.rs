@@ -126,3 +126,17 @@ exit 1
         harness_core::types::TurnFailureKind::Upstream
     );
 }
+
+#[test]
+fn classifies_authentication_failure_as_configuration() {
+    let err = codex_structured_error("authentication failed");
+
+    assert!(
+        matches!(err, harness_core::error::HarnessError::Config(_)),
+        "expected a configuration failure, got: {err:?}"
+    );
+    assert!(
+        err.turn_failure().is_none(),
+        "configuration failures must remain non-retryable"
+    );
+}
