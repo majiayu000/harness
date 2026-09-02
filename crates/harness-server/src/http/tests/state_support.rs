@@ -204,6 +204,14 @@ impl CodeAgent for RuntimeStreamAgent {
         let _ = tx.send(StreamItem::Done).await;
         Ok(())
     }
+
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.execute_stream(req, tx).await
+    }
 }
 
 #[async_trait]

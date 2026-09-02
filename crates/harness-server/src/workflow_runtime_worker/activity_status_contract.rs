@@ -145,7 +145,7 @@ fn activity_status_contract_blockers(
         collect_textual_blockers(&result.summary, &mut summary_blockers);
     }
     if pr_feedback_repair {
-        summary_blockers.retain(|blocker| blocker == "text:failing_checks");
+        summary_blockers.retain(|blocker| blocker != "text:pending_ci");
     }
     if workflow_definition == Some(PROMPT_TASK_DEFINITION_ID)
         && result.activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
@@ -323,10 +323,14 @@ fn collect_textual_blockers(text: &str, blockers: &mut Vec<String>) {
 }
 
 fn contains_affirmative_blocker(normalized_text: &str, needle: &str) -> bool {
-    normalized_text.contains(needle)
-        && !normalized_text.contains(&format!("no {needle}"))
-        && !normalized_text.contains(&format!("no new {needle}"))
-        && !normalized_text.contains(&format!("without {needle}"))
+    normalized_text
+        .split(['.', ';', '\n'])
+        .filter(|clause| clause.contains(needle))
+        .any(|clause| {
+            !clause.contains(&format!("no {needle}"))
+                && !clause.contains(&format!("no new {needle}"))
+                && !clause.contains(&format!("without {needle}"))
+        })
 }
 
 fn push_unique(blockers: &mut Vec<String>, blocker: impl Into<String>) {

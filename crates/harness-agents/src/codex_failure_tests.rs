@@ -160,3 +160,29 @@ fn keeps_permanent_structured_cli_errors_non_retryable() {
         harness_core::types::TurnFailureKind::Upstream
     );
 }
+
+#[test]
+fn preserves_stderr_for_permanent_structured_failure() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let parsed = codex_exec_parser::ParsedCodexExecOutput {
+        structured_error: Some("bad config".to_string()),
+        structured_error_kind: Some(codex_exec_parser::CodexStructuredErrorKind::Permanent),
+        ..Default::default()
+    };
+    let err = codex_errors::codex_nonzero_exit_error_from_parsed(
+        std::process::ExitStatus::from_raw(1 << 8),
+        "configuration parse failed at line 4",
+        &parsed,
+    );
+
+    assert!(matches!(
+        err,
+        harness_core::error::HarnessError::AgentExecution(_)
+    ));
+    assert!(
+        err.to_string()
+            .contains("configuration parse failed at line 4"),
+        "unexpected error: {err:?}"
+    );
+}

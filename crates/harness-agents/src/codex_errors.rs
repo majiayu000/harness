@@ -90,20 +90,43 @@ pub(super) fn codex_nonzero_exit_error(
     }
 
     if let Some(structured_error) = structured_error {
-        let mut error = codex_structured_error(
+        let error = codex_structured_error(
             format!("exit {status}: {}", structured_error.message),
             structured_error.kind,
         );
-        if matches!(error, harness_core::error::HarnessError::Upstream(_))
-            && !stderr.trim().is_empty()
-        {
-            error =
-                harness_core::error::HarnessError::Upstream(format!("{error}; stderr=[{stderr}]"));
+        if stderr.trim().is_empty() {
+            return error;
         }
-        return error;
+        return append_stderr(error, stderr);
     }
 
     harness_core::error::HarnessError::AgentExecution(format!(
         "codex exited with {status}: {stderr}"
     ))
+}
+
+fn append_stderr(
+    error: harness_core::error::HarnessError,
+    stderr: &str,
+) -> harness_core::error::HarnessError {
+    use harness_core::error::HarnessError;
+
+    match error {
+        HarnessError::AgentExecution(message) => {
+            HarnessError::AgentExecution(format!("{message}; stderr=[{stderr}]"))
+        }
+        HarnessError::Upstream(message) => {
+            HarnessError::Upstream(format!("{message}; stderr=[{stderr}]"))
+        }
+        HarnessError::Config(message) => {
+            HarnessError::Config(format!("{message}; stderr=[{stderr}]"))
+        }
+        HarnessError::BillingFailed(message) => {
+            HarnessError::BillingFailed(format!("{message}; stderr=[{stderr}]"))
+        }
+        HarnessError::QuotaExhausted(message) => {
+            HarnessError::QuotaExhausted(format!("{message}; stderr=[{stderr}]"))
+        }
+        other => other,
+    }
 }
