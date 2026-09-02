@@ -1,4 +1,6 @@
 use anyhow::Context;
+use harness_agents::registry::AgentRegistry;
+use harness_core::agent::AgentBackend;
 use harness_core::config::agents::{
     AgentPermissionMode, AgentsConfig, CapabilityProfile, SandboxMode,
 };
@@ -7,8 +9,9 @@ use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::types::ExecutionPhase;
 use harness_workflow::runtime::{RuntimeJob, RuntimeKind, RuntimeProfile};
 use serde::Serialize;
+use std::sync::Arc;
 
-pub(super) fn agent_name_for_runtime_kind(kind: RuntimeKind) -> anyhow::Result<&'static str> {
+pub(crate) fn agent_name_for_runtime_kind(kind: RuntimeKind) -> anyhow::Result<&'static str> {
     match kind {
         RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => Ok("codex"),
         RuntimeKind::ClaudeCode => Ok("claude"),
@@ -18,6 +21,25 @@ pub(super) fn agent_name_for_runtime_kind(kind: RuntimeKind) -> anyhow::Result<&
             anyhow::bail!("remote_host runtime jobs must be claimed by an external runtime host")
         }
     }
+}
+
+pub(crate) fn agent_backend_for_runtime_kind(
+    registry: &AgentRegistry,
+    kind: RuntimeKind,
+) -> anyhow::Result<Arc<dyn AgentBackend>> {
+    let agent_name = agent_name_for_runtime_kind(kind)?;
+    let backend = match kind {
+        RuntimeKind::CodexJsonrpc | RuntimeKind::OpenCode => {
+            registry.turn_execution_adapter(agent_name)
+        }
+        RuntimeKind::CodexExec | RuntimeKind::ClaudeCode | RuntimeKind::AnthropicApi => {
+            registry.get(agent_name)
+        }
+        RuntimeKind::RemoteHost => None,
+    };
+    backend.ok_or_else(|| {
+        anyhow::anyhow!("runtime agent `{agent_name}` has no backend for runtime kind `{kind:?}`")
+    })
 }
 
 pub(super) fn runtime_profile_for_job(job: &RuntimeJob) -> anyhow::Result<RuntimeProfile> {
@@ -61,8 +83,6 @@ pub(super) enum ResolvedApprovalPolicy {
 #[serde(rename_all = "snake_case")]
 pub(super) enum ToolAllowlistEnforcement {
     ClaudeCli,
-    AnthropicApiNoToolSurface,
-    CodexIsolatedReadOnly,
     NotEnforcedByHarness,
 }
 
@@ -70,9 +90,11 @@ impl ToolAllowlistEnforcement {
     fn for_runtime_kind(runtime_kind: RuntimeKind) -> Self {
         match runtime_kind {
             RuntimeKind::ClaudeCode => Self::ClaudeCli,
-            RuntimeKind::AnthropicApi => Self::AnthropicApiNoToolSurface,
-            RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc => Self::CodexIsolatedReadOnly,
-            RuntimeKind::RemoteHost | RuntimeKind::OpenCode => Self::NotEnforcedByHarness,
+            RuntimeKind::CodexExec
+            | RuntimeKind::CodexJsonrpc
+            | RuntimeKind::AnthropicApi
+            | RuntimeKind::RemoteHost
+            | RuntimeKind::OpenCode => Self::NotEnforcedByHarness,
         }
     }
 }
@@ -305,10 +327,35 @@ fn runtime_profile_approval_policy(
 mod tests {
     use super::*;
 
+    struct NamedBackend(&'static str);
+
+    #[async_trait::async_trait]
+    impl harness_core::agent::AgentBackend for NamedBackend {
+        fn name(&self) -> &str {
+            self.0
+        }
+    }
+
     fn profile_with_timeout(name: &str, kind: RuntimeKind) -> RuntimeProfile {
         let mut profile = RuntimeProfile::new(name, kind);
         profile.timeout_secs = Some(3600);
         profile
+    }
+
+    #[test]
+    fn codex_jsonrpc_contract_uses_a_fresh_turn_backend() {
+        let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+        registry.register("codex", std::sync::Arc::new(NamedBackend("codex-oneshot")));
+        registry
+            .register_turn_backend_factory("codex", || {
+                std::sync::Arc::new(NamedBackend("codex-jsonrpc"))
+            })
+            .expect("turn factory should register");
+
+        let selected = agent_backend_for_runtime_kind(&registry, RuntimeKind::CodexJsonrpc)
+            .expect("jsonrpc contract backend should resolve");
+
+        assert_eq!(selected.name(), "codex-jsonrpc");
     }
 
     #[test]
@@ -355,7 +402,7 @@ mod tests {
         assert_eq!(resolved.permission_mode, AgentPermissionMode::Scoped);
         assert_eq!(
             resolved.tool_allowlist_enforcement,
-            ToolAllowlistEnforcement::CodexIsolatedReadOnly
+            ToolAllowlistEnforcement::NotEnforcedByHarness
         );
         assert_eq!(resolved.allowed_tools, CapabilityProfile::ReadOnly.tools());
 

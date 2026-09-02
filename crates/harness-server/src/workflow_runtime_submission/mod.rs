@@ -353,7 +353,6 @@ pub(super) fn classify_submission_data(
 pub(super) fn submission_field_provenance(field: &str) -> DataProvenance {
     match field {
         "additional_prompt"
-        | "classifier_input"
         | "depends_on"
         | "continuation"
         | "external_id"

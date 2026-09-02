@@ -9,6 +9,145 @@ type RuntimeEventSummaryRow = (
     Option<i64>,
 );
 impl WorkflowRuntimeStore {
+    /// Durably consumes one pinned agent-contract attempt slot before the
+    /// model is invoked. Returning `false` means this exact slot was already
+    /// consumed (for example before a worker restart), so callers must fail
+    /// closed instead of launching the model again.
+    pub async fn reserve_agent_contract_attempt(
+        &self,
+        claimed_job: &RuntimeJob,
+        max_turns: Option<u32>,
+        primary_attempt: u32,
+        correction_attempt: u32,
+    ) -> anyhow::Result<AgentContractAttemptReservation> {
+        let runtime_job_id = &claimed_job.id;
+        let Some(claimed_lease) = claimed_job.lease.as_ref() else {
+            return Ok(AgentContractAttemptReservation::StaleLease);
+        };
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
+                .bind(runtime_job_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((data,)) = row else {
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+        };
+        let job: RuntimeJob = serde_json::from_str(&data)?;
+        if job.status != RuntimeJobStatus::Running
+            || job.lease_generation != claimed_job.lease_generation
+            || job.lease.as_ref().is_none_or(|lease| {
+                lease.owner != claimed_lease.owner || lease.expires_at <= Utc::now()
+            })
+        {
+            tx.commit().await?;
+            return Ok(AgentContractAttemptReservation::StaleLease);
+        }
+        let contract_value = job
+            .input
+            .pointer("/command/agent_contract")
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime job {runtime_job_id} does not carry a pinned agent_contract"
+                )
+            })?;
+        let contract: harness_core::config::workflow::WorkflowAgentContract =
+            serde_json::from_value(contract_value)?;
+        let activity = job
+            .input
+            .get("activity")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        contract.validate(activity)?;
+        if primary_attempt == 0 || primary_attempt > contract.max_primary_attempts {
+            anyhow::bail!(
+                "agent contract primary attempt {primary_attempt} exceeds pinned budget {}",
+                contract.max_primary_attempts
+            );
+        }
+        if correction_attempt > contract.max_corrections {
+            anyhow::bail!(
+                "agent contract correction attempt {correction_attempt} exceeds pinned budget {}",
+                contract.max_corrections
+            );
+        }
+        let reservation_key = format!("primary:{primary_attempt}:correction:{correction_attempt}");
+        let existing: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM runtime_events
+             WHERE runtime_job_id = $1
+               AND event_type = 'AgentContractAttemptStarted'
+               AND data #>> '{event,reservation_key}' = $2
+             LIMIT 1",
+        )
+        .bind(runtime_job_id)
+        .bind(&reservation_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_some() {
+            tx.commit().await?;
+            return Ok(AgentContractAttemptReservation::AlreadyReserved);
+        }
+        let workflow_id: Option<(String,)> = sqlx::query_as(
+            "SELECT command.workflow_id
+             FROM workflow_commands AS command
+             WHERE command.id = $1",
+        )
+        .bind(&job.command_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((workflow_id,)) = workflow_id else {
+            anyhow::bail!("workflow command not found: {}", job.command_id);
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("runtime_turn_budget:{workflow_id}"))
+            .execute(&mut *tx)
+            .await?;
+        if let Some(max_turns) = max_turns {
+            let (turns_started,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*)
+                 FROM runtime_events AS event
+                 JOIN runtime_jobs AS budget_job ON budget_job.id = event.runtime_job_id
+                 JOIN workflow_commands AS command ON command.id = budget_job.command_id
+                 WHERE command.workflow_id = $1
+                   AND event.event_type = 'RuntimeTurnStarted'",
+            )
+            .bind(&workflow_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if turns_started >= i64::from(max_turns) {
+                tx.commit().await?;
+                return Ok(AgentContractAttemptReservation::BudgetExhausted);
+            }
+        }
+        runtime_job_leases::append_runtime_event_tx(
+            &mut tx,
+            runtime_job_id,
+            "RuntimeTurnStarted",
+            serde_json::json!({
+                "owner": claimed_lease.owner,
+                "lease_generation": claimed_job.lease_generation,
+                "reservation_key": format!("agent_contract:{reservation_key}"),
+            }),
+        )
+        .await?;
+        runtime_job_leases::append_runtime_event_tx(
+            &mut tx,
+            runtime_job_id,
+            "AgentContractAttemptStarted",
+            serde_json::json!({
+                "reservation_key": reservation_key,
+                "primary_attempt": primary_attempt,
+                "correction_attempt": correction_attempt,
+                "max_primary_attempts": contract.max_primary_attempts,
+                "max_corrections": contract.max_corrections,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(AgentContractAttemptReservation::Reserved)
+    }
+
     pub async fn record_runtime_event(
         &self,
         runtime_job_id: &str,

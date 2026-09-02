@@ -74,6 +74,46 @@ async fn enqueue_test_runtime_job(
         .await
 }
 
+#[test]
+fn child_completion_payload_carries_parent_recovery_identity() {
+    let child = WorkflowInstance::new(
+        super::super::PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "feedback_found",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child")
+    .with_server_data(json!({
+        "started_by_runtime_job_id": "parent-start-child-job",
+    }));
+    let event = super::super::model::WorkflowEvent::new(
+        &child.id,
+        1,
+        "RuntimeJobCompleted",
+        "runtime-worker",
+    )
+    .with_payload(json!({
+        "runtime_job_id": "child-inspection-job",
+        "activity_result": {
+            "activity": super::super::PR_FEEDBACK_INSPECT_ACTIVITY,
+            "status": "succeeded",
+            "summary": "Feedback remains.",
+            "artifacts": [],
+            "signals": [],
+            "validation": [],
+            "error": null,
+            "error_kind": null
+        }
+    }));
+
+    let payload = merge_child_completion_payload(&event, &child);
+
+    assert_eq!(payload["child_workflow_id"], child.id);
+    assert_eq!(payload["recovery_activity"], "start_child_workflow");
+    assert_eq!(payload["recovery_runtime_job_id"], "parent-start-child-job");
+    assert_eq!(payload["runtime_job_id"], "child-inspection-job");
+}
+
 #[tokio::test]
 async fn preflight_result_completes_job_before_runtime_turn_starts() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {

@@ -36,6 +36,12 @@ use self::codex_args::{
     push_codex_sandbox_args,
 };
 
+#[path = "codex_errors.rs"]
+mod codex_errors;
+use self::codex_errors::{
+    codex_nonzero_exit_error, codex_structured_error, codex_structured_error_from_stdout,
+};
+
 #[path = "codex_spawn.rs"]
 mod codex_spawn;
 #[cfg(test)]
@@ -140,11 +146,17 @@ impl CodexAgent {
         req.sandbox_mode.unwrap_or(self.sandbox_mode)
     }
 
+    fn launch_model<'a>(&'a self, req: &'a AgentRequest) -> &'a str {
+        req.model.as_deref().unwrap_or(&self.default_model)
+    }
+
+    /// Sandbox for the codex *process* wrapper. A deny-all-tools request keeps
+    /// its declared sandbox inside codex (`base_args` still passes it) but is
+    /// not double-wrapped in an outer macOS seatbelt: nesting prevents Rust
+    /// from allocating its stack guard page during startup, and consumers see
+    /// the delegation instead of a claimed outer layer.
     fn process_sandbox_mode(&self, req: &AgentRequest) -> SandboxMode {
         if matches!(req.allowed_tools.as_deref(), Some([])) {
-            // Codex applies its own sandbox from `base_args`. Wrapping the
-            // Codex process in a second macOS seatbelt prevents Rust from
-            // allocating its stack guard page during startup.
             SandboxMode::DangerFullAccess
         } else {
             self.effective_sandbox_mode(req)
@@ -152,7 +164,7 @@ impl CodexAgent {
     }
 
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
-        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let model = self.launch_model(req);
         let reasoning_effort = self.effective_reasoning_effort(req);
         let sandbox_mode = self.effective_sandbox_mode(req);
         let mut args = vec![
@@ -168,6 +180,12 @@ impl CodexAgent {
         ];
         let deny_all_tools = matches!(req.allowed_tools.as_deref(), Some([]));
         if deny_all_tools {
+            // Narrow the *input* surface: no user config, rule files, or
+            // persisted session. codex-cli (checked against 0.150.1) has no
+            // flag that removes the tool surface itself — shell, file reads,
+            // web, and MCP stay launchable — so a deny-all consumer must also
+            // observe the event stream and invalidate the attempt on any tool
+            // activity; see `agent_contract_capabilities`.
             args.push(OsString::from("--ignore-user-config"));
             args.push(OsString::from("--ignore-rules"));
             args.push(OsString::from("--ephemeral"));
@@ -417,53 +435,6 @@ fn cloud_setup_env_removals(cloud: &CodexCloudConfig) -> Vec<String> {
     }
 }
 
-fn codex_structured_error_from_stdout(stdout: &str) -> Option<String> {
-    parse_codex_exec_output(stdout).ok()?.structured_error
-}
-
-fn codex_structured_error(message: impl Into<String>) -> harness_core::error::HarnessError {
-    let message = format!("codex structured error: {}", message.into());
-    if harness_core::error::is_billing_failure_message(&message) {
-        return harness_core::error::HarnessError::BillingFailed(message);
-    }
-    if harness_core::error::is_quota_failure_message(&message) {
-        return harness_core::error::HarnessError::QuotaExhausted(message);
-    }
-    harness_core::error::HarnessError::AgentExecution(message)
-}
-
-fn codex_nonzero_exit_error(
-    status: std::process::ExitStatus,
-    stderr: &str,
-    structured_error: Option<&str>,
-) -> harness_core::error::HarnessError {
-    if let Some(message) = structured_error {
-        let mut error = codex_structured_error(format!("exit {status}: {message}"));
-        if matches!(error, harness_core::error::HarnessError::AgentExecution(_))
-            && !stderr.trim().is_empty()
-        {
-            error = harness_core::error::HarnessError::AgentExecution(format!(
-                "{error}; stderr=[{stderr}]"
-            ));
-        }
-        return error;
-    }
-
-    if harness_core::error::is_billing_failure_message(stderr) {
-        return harness_core::error::HarnessError::BillingFailed(format!(
-            "codex billing failure (exit {status}): {stderr}"
-        ));
-    }
-    if harness_core::error::is_quota_failure_message(stderr) {
-        return harness_core::error::HarnessError::QuotaExhausted(format!(
-            "codex quota exhausted (exit {status}): {stderr}"
-        ));
-    }
-    harness_core::error::HarnessError::AgentExecution(format!(
-        "codex exited with {status}: {stderr}"
-    ))
-}
-
 #[async_trait]
 impl CodeAgent for CodexAgent {
     fn name(&self) -> &str {
@@ -472,6 +443,23 @@ impl CodeAgent for CodexAgent {
 
     fn capabilities(&self) -> Vec<Capability> {
         vec![Capability::Read, Capability::Write, Capability::Execute]
+    }
+
+    /// Claims for the `codex exec` launch path this backend owns:
+    /// `prompt_only_launch` via `--ignore-user-config --ignore-rules
+    /// --ephemeral` on deny-all requests, `pinned_output_schema` via
+    /// `--output-schema`, and `attempt_observation_stream` because the exec
+    /// JSON stream maps every item kind and surfaces unmapped kinds instead
+    /// of dropping them. A cloud-enabled instance cannot claim prompt-only
+    /// launch because it runs setup and applies container state first.
+    /// Deny-all does NOT disable codex's tools (no such CLI flag exists);
+    /// enforcement relies on observing the stream.
+    fn agent_contract_capabilities(&self) -> harness_core::agent::AgentContractCapabilities {
+        harness_core::agent::AgentContractCapabilities {
+            prompt_only_launch: !self.cloud.enabled,
+            pinned_output_schema: true,
+            attempt_observation_stream: true,
+        }
     }
 
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
@@ -573,8 +561,18 @@ impl CodeAgent for CodexAgent {
         }
 
         let parsed = parse_codex_exec_output(&stdout)?;
-        if let Some(message) = parsed.structured_error {
-            return Err(codex_structured_error(message));
+        if parsed.explicit_failure {
+            return Err(codex_structured_error(
+                parsed
+                    .structured_error
+                    .unwrap_or_else(|| "codex turn failed".to_string()),
+            ));
+        }
+        if let Some(message) = parsed.structured_error.as_deref() {
+            tracing::error!(
+                agent = self.name(),
+                "non-terminal Codex diagnostic: {message}"
+            );
         }
         for warning in &parsed.warnings {
             tracing::warn!(agent = self.name(), "{warning}");
@@ -607,6 +605,7 @@ impl CodeAgent for CodexAgent {
         self.run_setup_phase(&req).await?;
 
         let base_args = self.base_args(&req);
+        let launch_model = self.launch_model(&req).to_string();
         let process_sandbox_mode = self.process_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
             SandboxSpec::new(process_sandbox_mode, &req.project_root)
@@ -681,6 +680,18 @@ impl CodeAgent for CodexAgent {
             )
             .await?;
         }
+        // `codex exec` does not echo the serving model in its event stream, so
+        // the launch argument is the only observable identity for this turn.
+        send_stream_item(
+            &tx,
+            StreamItem::ModelReported {
+                model: launch_model,
+                source: harness_core::agent::ModelIdentitySource::LaunchDerived,
+            },
+            self.name(),
+            "model identity observation",
+        )
+        .await?;
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let mut stderr_task = None;
@@ -758,9 +769,22 @@ impl CodeAgent for CodexAgent {
                 parsed.structured_error.as_deref(),
             ));
         }
-        if let Some(message) = parsed.structured_error {
-            return Err(codex_structured_error(message));
+        if parsed.explicit_failure {
+            return Err(codex_structured_error(
+                parsed
+                    .structured_error
+                    .unwrap_or_else(|| "codex turn failed".to_string()),
+            ));
         }
+        send_stream_item(
+            &tx,
+            StreamItem::TurnCompleted {
+                output: parsed.output,
+            },
+            self.name(),
+            "turn_completed",
+        )
+        .await?;
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
     }

@@ -197,7 +197,6 @@ impl DefaultExecutionService {
                         "declarative workflow submissions require a non-empty prompt".to_string(),
                     )
                 })?,
-                classifier_input: prepared.req.classifier_input.as_ref(),
                 depends_on: &prepared.req.depends_on,
                 serialization_depends_on: &prepared.req.serialization_depends_on,
                 source: prepared.req.source.as_deref(),
@@ -205,6 +204,7 @@ impl DefaultExecutionService {
                 subject_key: None,
                 repo: prepared.req.repo.as_deref(),
                 author_trust_class: None,
+                classification_input_provenance: harness_workflow::runtime::DataProvenance::Server,
             },
         )
         .await

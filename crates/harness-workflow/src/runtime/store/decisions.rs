@@ -56,6 +56,40 @@ impl WorkflowRuntimeStore {
         Ok(by_workflow)
     }
 
+    pub async fn latest_unresolved_rejection_for_workflow(
+        &self,
+        workflow_id: &str,
+    ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT rejected.data::text
+             FROM workflow_decisions AS rejected
+             JOIN workflow_events AS rejected_event
+               ON rejected_event.id = rejected.event_id
+              AND rejected_event.workflow_id = rejected.workflow_id
+             WHERE rejected.workflow_id = $1
+               AND rejected.accepted = false
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM workflow_decisions AS progress
+                   JOIN workflow_events AS progress_event
+                     ON progress_event.id = progress.event_id
+                    AND progress_event.workflow_id = progress.workflow_id
+                   WHERE progress.workflow_id = rejected.workflow_id
+                     AND progress.accepted = true
+                     AND progress_event.sequence >= rejected_event.sequence
+                     AND progress.data->'decision'->>'observed_state'
+                         <> progress.data->'decision'->>'next_state'
+               )
+             ORDER BY rejected_event.sequence DESC
+             LIMIT 1",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(data,)| serde_json::from_str(&data).map_err(Into::into))
+            .transpose()
+    }
+
     pub async fn detail_counts_for_workflows(
         &self,
         workflow_ids: &[String],

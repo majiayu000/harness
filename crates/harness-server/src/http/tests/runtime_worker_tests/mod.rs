@@ -138,7 +138,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert_eq!(
         prompt_event.event["prompt_packet"]["resolved_runtime_settings"]
             ["tool_allowlist_enforcement"],
-        "codex_isolated_read_only"
+        "not_enforced_by_harness"
     );
     assert_eq!(
         prompt_event.event["prompt_packet"]["required_structured_output"]["validation_commands"],

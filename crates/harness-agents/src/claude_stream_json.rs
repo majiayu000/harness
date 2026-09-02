@@ -128,6 +128,7 @@ fn parse_assistant_events(message: &Value) -> Vec<AgentEvent> {
     {
         events.push(AgentEvent::ModelReported {
             model: model.to_string(),
+            source: harness_core::agent::ModelIdentitySource::ProviderReported,
         });
     }
     let mut text_buf = String::new();

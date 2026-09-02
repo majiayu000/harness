@@ -20,12 +20,7 @@ use harness_core::config::isolation::{
 };
 use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use uuid::Uuid;
-
-#[path = "dispatcher/input.rs"]
-mod input;
-use input::{author_trust_class_from_data, retry_not_before_for_command};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandDispatchOutcome {
@@ -47,81 +42,11 @@ pub enum CommandDispatchOutcome {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeProfileSelector {
-    default_profile: RuntimeProfile,
-    workflow_profiles: BTreeMap<String, RuntimeProfile>,
-    activity_profiles: BTreeMap<String, RuntimeProfile>,
-    workflow_activity_profiles: BTreeMap<String, BTreeMap<String, RuntimeProfile>>,
-}
-
-impl RuntimeProfileSelector {
-    pub fn new(default_profile: RuntimeProfile) -> Self {
-        Self {
-            default_profile,
-            workflow_profiles: BTreeMap::new(),
-            activity_profiles: BTreeMap::new(),
-            workflow_activity_profiles: BTreeMap::new(),
-        }
-    }
-
-    pub fn with_workflow_profile(
-        mut self,
-        definition_id: impl Into<String>,
-        profile: RuntimeProfile,
-    ) -> Self {
-        self.workflow_profiles.insert(definition_id.into(), profile);
-        self
-    }
-
-    pub fn with_activity_profile(
-        mut self,
-        activity: impl Into<String>,
-        profile: RuntimeProfile,
-    ) -> Self {
-        self.activity_profiles.insert(activity.into(), profile);
-        self
-    }
-
-    pub fn with_workflow_activity_profile(
-        mut self,
-        definition_id: impl Into<String>,
-        activity: impl Into<String>,
-        profile: RuntimeProfile,
-    ) -> Self {
-        self.workflow_activity_profiles
-            .entry(definition_id.into())
-            .or_default()
-            .insert(activity.into(), profile);
-        self
-    }
-
-    pub fn select(&self, definition_id: Option<&str>, activity: Option<&str>) -> &RuntimeProfile {
-        definition_id
-            .and_then(|id| {
-                activity.and_then(|name| {
-                    self.workflow_activity_profiles
-                        .get(id)
-                        .and_then(|profiles| profiles.get(name))
-                })
-            })
-            .or_else(|| activity.and_then(|name| self.activity_profiles.get(name)))
-            .or_else(|| definition_id.and_then(|id| self.workflow_profiles.get(id)))
-            .unwrap_or(&self.default_profile)
-    }
-
-    pub fn select_for_workflow(&self, definition_id: Option<&str>) -> &RuntimeProfile {
-        definition_id
-            .and_then(|id| self.workflow_profiles.get(id))
-            .unwrap_or(&self.default_profile)
-    }
-}
-
-impl From<RuntimeProfile> for RuntimeProfileSelector {
-    fn from(default_profile: RuntimeProfile) -> Self {
-        Self::new(default_profile)
-    }
-}
+#[path = "dispatcher_agent_contract_gate.rs"]
+mod agent_contract_gate;
+#[path = "dispatcher_profile_selector.rs"]
+mod profile_selector;
+pub use profile_selector::RuntimeProfileSelector;
 
 pub struct RuntimeCommandDispatcher<'a> {
     store: &'a WorkflowRuntimeStore,
@@ -133,6 +58,7 @@ pub struct RuntimeCommandDispatcher<'a> {
     lease_duration: Duration,
     defer_backoff: DispatchBackoffPolicy,
     budget_policy: RuntimeBudgetPolicy,
+    enforceable_agent_contract_profile: Option<RuntimeProfile>,
 }
 
 impl<'a> RuntimeCommandDispatcher<'a> {
@@ -154,6 +80,7 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             lease_duration: Duration::seconds(30),
             defer_backoff: DispatchBackoffPolicy::default(),
             budget_policy: RuntimeBudgetPolicy::default(),
+            enforceable_agent_contract_profile: None,
         }
     }
 
@@ -193,6 +120,30 @@ impl<'a> RuntimeCommandDispatcher<'a> {
     pub fn with_budget_policy(mut self, budget_policy: RuntimeBudgetPolicy) -> Self {
         self.budget_policy = budget_policy;
         self
+    }
+
+    /// Authorizes the exact selected profile for a pinned agent contract.
+    ///
+    /// The server supplies this only after checking the concrete backend
+    /// instance that profile will launch. The default remains fail-closed.
+    pub fn with_enforceable_agent_contract_profile(
+        mut self,
+        runtime_profile: RuntimeProfile,
+    ) -> Self {
+        self.enforceable_agent_contract_profile = Some(runtime_profile);
+        self
+    }
+
+    /// Resolves every command-level rewrite before the server authorizes the
+    /// concrete backend. The same exact profile is checked again at enqueue.
+    pub async fn effective_profile_for_command(
+        &self,
+        command: &WorkflowCommandRecord,
+    ) -> anyhow::Result<RuntimeProfile> {
+        let mut runtime_profile = self.profile_for_command(command).await?;
+        apply_eval_runtime_profile_policy(&mut runtime_profile, command)?;
+        apply_candidate_runtime_budget(&mut runtime_profile, &command.command.command)?;
+        Ok(runtime_profile)
     }
 
     pub async fn dispatch_once(&self) -> anyhow::Result<Option<CommandDispatchOutcome>> {
@@ -284,9 +235,14 @@ impl<'a> RuntimeCommandDispatcher<'a> {
         let instance = self.store.get_instance(&command.workflow_id).await?;
 
         let activity = command.command.runtime_activity_key().to_string();
-        let mut runtime_profile = self.profile_for_command(&command).await?;
-        apply_eval_runtime_profile_policy(&mut runtime_profile, &command)?;
-        apply_candidate_runtime_budget(&mut runtime_profile, &command.command.command)?;
+        let runtime_profile = self.effective_profile_for_command(&command).await?;
+        if command.command.command.get("agent_contract").is_some()
+            && self.enforceable_agent_contract_profile.as_ref() != Some(&runtime_profile)
+        {
+            return self
+                .defer_unenforceable_agent_contract(&command, instance.as_ref(), &activity)
+                .await;
+        }
         let isolation =
             isolation_resolution_for_command(instance.as_ref(), &command, &self.isolation_config)
                 .with_context(|| {
@@ -334,11 +290,6 @@ impl<'a> RuntimeCommandDispatcher<'a> {
             return Ok(outcome);
         }
         let not_before = retry_not_before_for_command(&command)?;
-        let classifier = super::classifier_job_snapshot(
-            self.store.definition_registry(),
-            instance.as_ref(),
-            &activity,
-        )?;
         match self
             .store
             .enqueue_runtime_job_for_claimed_command(
@@ -358,7 +309,6 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                     "command": command.command.command.clone(),
                     "runtime_profile": runtime_profile.clone(),
                     "isolation": isolation,
-                    "classifier": classifier,
                 }),
                 not_before,
             )
@@ -781,6 +731,40 @@ fn eval_timeout_secs(command: &WorkflowCommandRecord) -> Option<u64> {
         .filter(|timeout| *timeout > 0)
 }
 
-#[cfg(test)]
-#[path = "dispatcher/tests.rs"]
-mod tests;
+fn author_trust_class_from_data(
+    data: &serde_json::Value,
+) -> anyhow::Result<Option<IsolationTrustClass>> {
+    let Some(value) = data.get("author_trust_class") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .with_context(|| format!("invalid author_trust_class in workflow metadata: {value}"))
+}
+
+fn retry_not_before_for_command(
+    command: &WorkflowCommandRecord,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let Some(raw) = command
+        .command
+        .command
+        .get("retry_not_before")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    DateTime::parse_from_rfc3339(raw)
+        .map(|value| Some(value.with_timezone(&Utc)))
+        .with_context(|| {
+            format!(
+                "workflow command {} has invalid retry_not_before",
+                command.id
+            )
+        })
+}
+
+include!("dispatcher_tests.rs");

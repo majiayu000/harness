@@ -248,7 +248,7 @@ fn ready_to_merge_signal_with_only_agent_repair_snapshot_blocks() {
 }
 
 #[test]
-fn ready_to_merge_snapshot_accepts_quoted_pr_number() {
+fn ready_to_merge_snapshot_rejects_quoted_pr_number() {
     let instance = pr_workflow_state("awaiting_feedback");
     let result = ActivityResult::succeeded(
         PR_FEEDBACK_INSPECT_ACTIVITY,
@@ -279,10 +279,10 @@ fn ready_to_merge_snapshot_accepts_quoted_pr_number() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("quoted snapshot PR number should reduce");
+        .expect("quoted snapshot PR number should be rejected");
 
-    assert_eq!(decision.decision, "start_quality_gate");
-    assert_eq!(decision.next_state, "quality_gate_pending");
+    assert_eq!(decision.decision, "block_invalid_agent_output");
+    assert_eq!(decision.next_state, "blocked");
 }
 
 #[test]

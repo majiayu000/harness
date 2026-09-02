@@ -197,7 +197,6 @@ async fn dispatch(
             definition_id,
             task_id: &task_id,
             prompt: &prompt,
-            classifier_input: None,
             depends_on: &[],
             serialization_depends_on: &[],
             source: Some(source.name()),
@@ -205,6 +204,7 @@ async fn dispatch(
             subject_key: Some(subject_key),
             repo: issue.repo.as_deref(),
             author_trust_class: Some(issue.author_trust_class),
+            classification_input_provenance: harness_workflow::runtime::DataProvenance::External,
         },
     )
     .await?;

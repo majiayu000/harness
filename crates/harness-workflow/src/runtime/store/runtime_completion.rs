@@ -1,4 +1,5 @@
 use super::runtime_completion_budget::budget_ceiling_blocked_decision;
+use super::runtime_completion_pr_feedback::apply_pr_feedback_completion_data_side_effect;
 use super::{
     apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
     fence_terminal_transition_tx, insert_decision_record_once_tx, insert_event_tx,
@@ -19,8 +20,7 @@ use crate::runtime::status::WorkflowCommandStatus;
 use crate::runtime::validator::{
     ValidationContext, WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
 };
-use crate::runtime::{DataProvenance, WorkflowDataWrite};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 pub(super) fn validator_for_instance(
     registry: &WorkflowDefinitionRegistry,
@@ -466,104 +466,7 @@ fn apply_runtime_completion_data_side_effect(
     decision: &WorkflowDecision,
     event: &WorkflowEvent,
 ) -> anyhow::Result<()> {
-    let child_inspection = instance.definition_id == crate::runtime::PR_FEEDBACK_DEFINITION_ID
-        && instance.state == "inspecting"
-        && decision.observed_state == "inspecting"
-        && matches!(
-            decision.next_state.as_str(),
-            "feedback_found" | "no_actionable_feedback" | "ready_to_merge"
-        );
-    let parent_inspection = instance.definition_id == crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID
-        && instance.state == "awaiting_feedback"
-        && decision.observed_state == "awaiting_feedback"
-        && decision.next_state == "quality_gate_pending";
-    if !child_inspection && !parent_inspection {
-        return Ok(());
-    }
-    let Some(snapshot) = pr_feedback_snapshot_from_completion_event(event) else {
-        return Ok(());
-    };
-    let facts_for_hash = crate::runtime::stable_pr_snapshot_fact_hash_input(snapshot);
-    let fact_hash = crate::runtime::stable_remote_fact_hash(&facts_for_hash);
-    let activity_at = ["updated_at", "updatedAt"].into_iter().find_map(|field| {
-        snapshot
-            .get(field)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-    });
-    if !instance.data.is_object() {
-        instance.replace_classified_data(json!({}), DataProvenance::Server);
-    }
-    // The fact hash is the digest Harness computes over the snapshot, so it is
-    // server data about external data. The activity timestamp is read straight
-    // off the remote and stays externally classified.
-    let mut writes = vec![WorkflowDataWrite::set(
-        "remote_fact_hash",
-        json!(fact_hash),
-        DataProvenance::Server,
-    )];
-    if parent_inspection
-        && snapshot.get("snapshot_source").and_then(Value::as_str) == Some("server_github_graphql")
-    {
-        if let Some(head_sha) = ["head_oid", "head_sha", "headOid", "headSha"]
-            .into_iter()
-            .find_map(|field| snapshot.get(field).and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            writes.push(WorkflowDataWrite::set(
-                "pr_head_sha",
-                json!(head_sha),
-                DataProvenance::External,
-            ));
-        }
-        if let Some(pr_url) = ["pr_url", "prUrl", "url"]
-            .into_iter()
-            .find_map(|field| snapshot.get(field).and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            writes.push(WorkflowDataWrite::set(
-                "pr_url",
-                json!(pr_url),
-                DataProvenance::External,
-            ));
-        }
-    }
-    writes.push(match activity_at {
-        Some(activity_at) => WorkflowDataWrite::set(
-            "remote_fact_activity_at",
-            json!(activity_at),
-            DataProvenance::External,
-        ),
-        // Removing through the write API drops the classification with the
-        // field; a raw remove would strand a provenance pointer.
-        None => WorkflowDataWrite::remove("remote_fact_activity_at", DataProvenance::External),
-    });
-    instance.apply_data_writes(writes)
-}
-
-fn pr_feedback_snapshot_from_completion_event(event: &WorkflowEvent) -> Option<&Value> {
-    let result = event.event.get("activity_result")?;
-    if result.get("activity").and_then(Value::as_str)
-        != Some(crate::runtime::PR_FEEDBACK_INSPECT_ACTIVITY)
-    {
-        return None;
-    }
-    result
-        .get("artifacts")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|artifact| {
-            matches!(
-                artifact.get("artifact_type").and_then(Value::as_str),
-                Some(crate::runtime::SERVER_PR_SNAPSHOT_ARTIFACT)
-                    | Some(crate::runtime::PR_FEEDBACK_SNAPSHOT_ARTIFACT)
-            )
-        })
-        .and_then(|artifact| artifact.get("artifact"))
+    apply_pr_feedback_completion_data_side_effect(instance, decision, event)
 }
 
 fn validate_definition_pin_safety_transition(

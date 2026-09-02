@@ -1,8 +1,7 @@
 mod declarative_validation {
     use super::super::*;
     use harness_core::config::workflow::{
-        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowClassifierPolicy,
-        WorkflowDefinitionPolicy,
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,16 +47,6 @@ mod declarative_validation {
         BTreeMap::from([("implement".to_string(), WorkflowActivityPolicy::default())])
     }
 
-    fn classifier_activity_policy() -> WorkflowActivityPolicy {
-        WorkflowActivityPolicy {
-            classifier: Some(WorkflowClassifierPolicy {
-                verdicts: vec!["allow".to_string(), "needs_human".to_string()],
-                instructions: vec!["Judge only supplied facts.".to_string()],
-            }),
-            ..WorkflowActivityPolicy::default()
-        }
-    }
-
     fn error_for(policy: &WorkflowDefinitionPolicy) -> String {
         build_declarative_definition(policy, &activity_policies())
             .expect_err("declaration should be invalid")
@@ -98,50 +87,6 @@ mod declarative_validation {
         assert!(WorkflowDefinitionRegistry::with_builtins()
             .definition("docs_review")
             .is_none());
-    }
-
-    #[test]
-    fn classifier_routes_are_exact_and_policy_changes_definition_identity() {
-        let mut policy = valid_policy();
-        let state = policy.states.get_mut("reviewing").unwrap();
-        state.on_success = None;
-        state.on_signal = BTreeMap::from([
-            ("allow".to_string(), "done".to_string()),
-            ("needs_human".to_string(), "blocked".to_string()),
-        ]);
-        let activities = BTreeMap::from([(
-            "implement".to_string(),
-            classifier_activity_policy(),
-        )]);
-        let first = build_declarative_definition(&policy, &activities)
-            .expect("classifier definition should compile");
-
-        let mut changed = activities.clone();
-        changed
-            .get_mut("implement")
-            .unwrap()
-            .classifier
-            .as_mut()
-            .unwrap()
-            .instructions
-            .push("Explain uncertainty.".to_string());
-        let second = build_declarative_definition(&policy, &changed)
-            .expect("changed classifier definition should compile");
-
-        assert_ne!(first.definition_hash(), second.definition_hash());
-        assert_ne!(first.definition_version(), second.definition_version());
-
-        let mut missing_route = policy.clone();
-        missing_route
-            .states
-            .get_mut("reviewing")
-            .unwrap()
-            .on_signal
-            .remove("needs_human");
-        assert!(build_declarative_definition(&missing_route, &activities)
-            .expect_err("missing verdict route must fail")
-            .to_string()
-            .contains("exactly match"));
     }
 
     #[test]

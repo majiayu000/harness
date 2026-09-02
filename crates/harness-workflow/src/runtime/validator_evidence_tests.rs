@@ -226,6 +226,8 @@ fn builtin_evidence_contract_matches_spec_table() {
                     "done",
                     vec![EVIDENCE_GITHUB_TERMINAL],
                 ),
+                ("blocked", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                ("local_review_gate", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
                 (
                     "quality_gate_pending",
                     "done",

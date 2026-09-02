@@ -103,7 +103,6 @@ fn declarative_submission_instance_persists_runtime_retry_policy() -> anyhow::Re
         definition_id: PROJECT_DEFINITION_ID,
         task_id: &task_id,
         prompt: "perform the declared work",
-        classifier_input: None,
         depends_on: &[],
         serialization_depends_on: &[],
         source: Some("test"),
@@ -111,6 +110,7 @@ fn declarative_submission_instance_persists_runtime_retry_policy() -> anyhow::Re
         subject_key: None,
         repo: None,
         author_trust_class: None,
+        classification_input_provenance: harness_workflow::runtime::DataProvenance::Server,
     };
 
     let instance = super::declarative::submission_instance(

@@ -9,10 +9,111 @@ pub const PR_FEEDBACK_INSPECT_ACTIVITY: &str = "inspect_pr_feedback";
 pub const PR_FEEDBACK_SNAPSHOT_ARTIFACT: &str = "pr_feedback_snapshot";
 pub const PR_REPAIR_SNAPSHOT_ARTIFACT: &str = "pr_repair_snapshot";
 pub const SERVER_PR_SNAPSHOT_ARTIFACT: &str = "server_pr_snapshot";
+pub const PR_HYGIENE_CONVERGENCE_STOP_SOURCE: &str = "pr_hygiene_convergence";
 pub const LOCAL_REVIEW_ACTIVITY: &str = "run_local_review";
 pub const LOCAL_REVIEW_PASSED_SIGNAL: &str = "LocalReviewPassed";
 pub const LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL: &str = "LocalReviewChangesRequested";
 pub const LOCAL_REVIEW_BLOCKED_SIGNAL: &str = "LocalReviewBlocked";
+pub const MAX_FEEDBACK_REPAIR_ROUNDS: u64 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackRepairLane {
+    LocalReview,
+    RemoteFeedback,
+}
+
+impl FeedbackRepairLane {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalReview => "local_review",
+            Self::RemoteFeedback => "remote_feedback",
+        }
+    }
+}
+
+pub(super) fn server_pr_snapshot_matches_instance(
+    instance: &WorkflowInstance,
+    snapshot: &Value,
+) -> bool {
+    if snapshot.get("snapshot_source").and_then(Value::as_str) != Some("server_github_graphql") {
+        return false;
+    }
+    let Some(expected_repo) = instance
+        .data
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(expected_pr_number) = instance.data.get("pr_number").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(expected_pr_url) = instance
+        .data
+        .get("pr_url")
+        .and_then(Value::as_str)
+        .map(normalize_pr_url)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    snapshot
+        .get("repo")
+        .and_then(Value::as_str)
+        .is_some_and(|repo| repo.trim().eq_ignore_ascii_case(expected_repo))
+        && snapshot.get("pr_number").and_then(Value::as_u64) == Some(expected_pr_number)
+        && snapshot
+            .get("pr_url")
+            .and_then(Value::as_str)
+            .map(normalize_pr_url)
+            .is_some_and(|pr_url| pr_url.eq_ignore_ascii_case(expected_pr_url))
+}
+
+fn normalize_pr_url(value: &str) -> &str {
+    value.trim().trim_end_matches('/')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackRepairStop {
+    RoundLimit { completed_rounds: u64 },
+    MissingBaseline { completed_rounds: u64 },
+    NoProgress { previous: u64, current: u64 },
+}
+
+pub fn next_feedback_repair_round(
+    data: &Value,
+    current_blockers: u64,
+    lane: FeedbackRepairLane,
+) -> Result<u64, FeedbackRepairStop> {
+    let completed_rounds = data
+        .get("feedback_repair_round")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if completed_rounds >= MAX_FEEDBACK_REPAIR_ROUNDS {
+        return Err(FeedbackRepairStop::RoundLimit { completed_rounds });
+    }
+    let previous = data
+        .get("feedback_repair_blocker_count")
+        .and_then(Value::as_u64);
+    if completed_rounds > 0 && previous.is_none() {
+        return Err(FeedbackRepairStop::MissingBaseline { completed_rounds });
+    }
+    let previous_lane = data.get("feedback_repair_lane").and_then(Value::as_str);
+    if previous_lane == Some(lane.as_str()) {
+        if let Some(previous) = previous {
+            if current_blockers >= previous {
+                return Err(FeedbackRepairStop::NoProgress {
+                    previous,
+                    current: current_blockers,
+                });
+            }
+        }
+    }
+    Ok(completed_rounds.saturating_add(1))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrFeedbackWorkflowAction {

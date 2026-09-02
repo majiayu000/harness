@@ -113,6 +113,7 @@ fn maps_graphql_pr_to_runtime_snapshot_artifact() {
     assert_eq!(snapshot["review_decision"], "APPROVED");
     assert_eq!(snapshot["is_draft"], false);
     assert_eq!(snapshot["active_unresolved_review_threads_count"], 0);
+    assert_eq!(snapshot["actionable_blocker_count"], 0);
     assert_eq!(snapshot["changed_files"][0]["path"], "src/lib.rs");
     assert_eq!(snapshot["closing_issues"][0]["number"], 12);
     assert_eq!(snapshot["closing_issues_complete"], true);
@@ -479,7 +480,25 @@ fn unresolved_review_threads_emit_blocking_feedback() {
     let signal = pr_feedback_signal_for_snapshot(&snapshot);
 
     assert_eq!(snapshot["active_unresolved_review_threads_count"], 1);
+    assert_eq!(snapshot["actionable_blocker_count"], 1);
     assert_eq!(signal.signal_type, "FeedbackFound");
+    assert_eq!(signal.signal["actionable_blocker_count"], 1);
+}
+
+#[test]
+fn outdated_unresolved_review_threads_do_not_pollute_blocker_count() {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
+    let mut pr = ready_pr();
+    pr["reviewThreads"]["nodes"] = json!([
+        {"id": "thread-1", "path": "src/lib.rs", "line": 10, "isResolved": false, "isOutdated": true}
+    ]);
+    let snapshot = normalize_github_pr_snapshot(&target, &pr).unwrap();
+
+    let signal = pr_feedback_signal_for_snapshot(&snapshot);
+
+    assert_eq!(snapshot["active_unresolved_review_threads_count"], 0);
+    assert_eq!(snapshot["actionable_blocker_count"], 0);
+    assert_eq!(signal.signal_type, "PrReadyToMerge");
 }
 
 #[test]

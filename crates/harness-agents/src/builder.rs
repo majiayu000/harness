@@ -50,6 +50,14 @@ impl<A: CodeAgent> CodeAgent for ConfiguredAgent<A> {
         self.inner.capabilities()
     }
 
+    fn agent_contract_capabilities(&self) -> harness_core::agent::AgentContractCapabilities {
+        self.inner.agent_contract_capabilities()
+    }
+
+    fn reports_usage_cost(&self) -> bool {
+        self.inner.reports_usage_cost()
+    }
+
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         self.inner.execute(req).await
     }
@@ -310,6 +318,21 @@ mod tests {
         );
         assert!(registry.turn_execution_adapter("codex").is_some());
         assert_eq!(registry.resolved_default_agent_name(), Some("claude"));
+    }
+
+    #[test]
+    fn registry_codex_preserves_agent_contract_capabilities() {
+        let registry =
+            registry_from_config(&config(), SandboxMode::default()).expect("registry builds");
+        let codex = registry.get("codex").expect("codex backend is registered");
+
+        assert!(
+            codex
+                .agent_contract_capabilities()
+                .missing_for_enforcement()
+                .is_empty(),
+            "the configured production backend must preserve Codex contract capabilities"
+        );
     }
 
     #[test]

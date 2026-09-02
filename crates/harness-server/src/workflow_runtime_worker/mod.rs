@@ -1,6 +1,14 @@
 mod activity_contract;
 mod activity_result;
 mod activity_status_contract;
+mod agent_contract_assessment;
+mod agent_contract_attempt;
+mod agent_contract_dispatch;
+mod agent_contract_enforcement;
+mod agent_contract_execution;
+mod agent_contract_job;
+mod agent_contract_prompt;
+mod agent_contract_stream;
 mod child_workflow;
 mod child_workflow_non_issue;
 mod child_workflow_replay;
@@ -30,7 +38,11 @@ mod workspace;
 
 pub(crate) use workspace::cleanup_terminal_runtime_workspace_if_uncontended;
 
+pub(crate) use agent_contract_enforcement::{
+    ensure_backend_can_enforce_contract, validate_pinned_agent_contract_command,
+};
 pub(crate) use circuit_breaker_events::emit_circuit_breaker_events;
+pub(crate) use runtime_profile::agent_backend_for_runtime_kind;
 pub(crate) use transcript_durability::{
     hydrate_exact_replay_transcript, strip_caller_transcript_unavailable_signal,
 };

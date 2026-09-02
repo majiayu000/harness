@@ -45,13 +45,30 @@ fn parse_tool_call_update_status_transitions() {
 
 #[test]
 fn parse_usage_update_notification() {
+    assert!(OpenCodeAcpAdapter::new(PathBuf::from("opencode")).reports_usage_cost());
     let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"usage_update","used":53000,"size":200000,"cost":{"amount":0.045,"currency":"USD"}}}}"#;
     let message = parse_acp_message(line).unwrap();
     match message {
-        ParsedAcpMessage::Event(AgentEvent::TokenUsage { usage }) => {
+        ParsedAcpMessage::Event(AgentEvent::TokenUsage {
+            usage,
+            cost_usd_observed,
+        }) => {
             assert_eq!(usage.input_tokens, 53000);
             assert_eq!(usage.total_tokens, 200000);
             assert!((usage.cost_usd - 0.045).abs() < f64::EPSILON);
+            assert!(cost_usd_observed);
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    let without_cost = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"usage_update","used":10,"size":12}}}"#;
+    match parse_acp_message(without_cost).unwrap() {
+        ParsedAcpMessage::Event(AgentEvent::TokenUsage {
+            usage,
+            cost_usd_observed,
+        }) => {
+            assert_eq!(usage.cost_usd, 0.0);
+            assert!(!cost_usd_observed);
         }
         other => panic!("unexpected message: {other:?}"),
     }

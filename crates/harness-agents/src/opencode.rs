@@ -34,6 +34,7 @@ pub enum OpenCodeRunEvent {
     StepFinish {
         reason: String,
         tokens: TokenUsage,
+        cost_usd_observed: bool,
     },
 }
 
@@ -83,14 +84,18 @@ pub fn parse_opencode_run_line(line: &str) -> Option<OpenCodeRunEvent> {
                 .and_then(Value::as_str)
                 .unwrap_or("stop")
                 .to_string();
-            let tokens = parse_step_finish_tokens(&value);
-            Some(OpenCodeRunEvent::StepFinish { reason, tokens })
+            let (tokens, cost_usd_observed) = parse_step_finish_tokens(&value);
+            Some(OpenCodeRunEvent::StepFinish {
+                reason,
+                tokens,
+                cost_usd_observed,
+            })
         }
         _ => None,
     }
 }
 
-fn parse_step_finish_tokens(value: &Value) -> TokenUsage {
+fn parse_step_finish_tokens(value: &Value) -> (TokenUsage, bool) {
     let input = value
         .pointer("/part/tokens/input")
         .and_then(Value::as_u64)
@@ -103,16 +108,16 @@ fn parse_step_finish_tokens(value: &Value) -> TokenUsage {
         .pointer("/part/tokens/total")
         .and_then(Value::as_u64)
         .unwrap_or(input.saturating_add(output));
-    let cost = value
-        .pointer("/part/cost")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    TokenUsage {
-        input_tokens: input,
-        output_tokens: output,
-        total_tokens: total,
-        cost_usd: cost,
-    }
+    let cost = value.pointer("/part/cost").and_then(Value::as_f64);
+    (
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: total,
+            cost_usd: cost.unwrap_or(0.0),
+        },
+        cost.is_some(),
+    )
 }
 
 /// Build the permission env value for an explicit allowlist.
@@ -225,6 +230,10 @@ impl CodeAgent for OpenCodeAgent {
         vec![Capability::Read, Capability::Write, Capability::Execute]
     }
 
+    fn reports_usage_cost(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         if let Some(ref token) = req.capability_token {
             if token.is_expired() {
@@ -323,7 +332,7 @@ impl CodeAgent for OpenCodeAgent {
                         items.push(item);
                     }
                 }
-                Some(OpenCodeRunEvent::StepFinish { reason, tokens }) => {
+                Some(OpenCodeRunEvent::StepFinish { reason, tokens, .. }) => {
                     token_usage = tokens;
                     if reason != "stop" {
                         return Err(harness_core::error::HarnessError::AgentExecution(format!(
@@ -558,10 +567,17 @@ impl CodeAgent for OpenCodeAgent {
                         break;
                     }
                 }
-                OpenCodeRunEvent::StepFinish { reason, tokens } => {
+                OpenCodeRunEvent::StepFinish {
+                    reason,
+                    tokens,
+                    cost_usd_observed,
+                } => {
                     if send_stream_item(
                         &tx,
-                        StreamItem::TokenUsage { usage: tokens },
+                        StreamItem::TokenUsage {
+                            usage: tokens,
+                            cost_usd_observed,
+                        },
                         self.name(),
                         "usage",
                     )
@@ -657,18 +673,38 @@ mod tests {
 
     #[test]
     fn parses_step_finish_tokens() {
+        assert!(OpenCodeAgent::from_config(
+            OpenCodeAgentConfig::default(),
+            SandboxMode::DangerFullAccess,
+        )
+        .reports_usage_cost());
         let line = r#"{"type":"step_finish","part":{"reason":"stop","tokens":{"total":100,"input":90,"output":10,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}"#;
         let event = parse_opencode_run_line(line).unwrap();
         match event {
-            OpenCodeRunEvent::StepFinish { reason, tokens } => {
+            OpenCodeRunEvent::StepFinish {
+                reason,
+                tokens,
+                cost_usd_observed,
+            } => {
                 assert_eq!(reason, "stop");
                 assert_eq!(tokens.input_tokens, 90);
                 assert_eq!(tokens.output_tokens, 10);
                 assert_eq!(tokens.total_tokens, 100);
                 assert!((tokens.cost_usd - 0.001).abs() < f64::EPSILON);
+                assert!(cost_usd_observed);
             }
             other => panic!("unexpected event: {other:?}"),
         }
+
+        let line_without_cost =
+            r#"{"type":"step_finish","part":{"reason":"stop","tokens":{"total":1}}}"#;
+        assert!(matches!(
+            parse_opencode_run_line(line_without_cost),
+            Some(OpenCodeRunEvent::StepFinish {
+                cost_usd_observed: false,
+                ..
+            })
+        ));
     }
 
     #[test]

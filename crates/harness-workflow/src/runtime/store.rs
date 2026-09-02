@@ -76,6 +76,8 @@ mod recovery;
 mod runtime_completion;
 #[path = "store/runtime_completion_budget.rs"]
 mod runtime_completion_budget;
+#[path = "store/runtime_completion_pr_feedback.rs"]
+mod runtime_completion_pr_feedback;
 #[path = "store/runtime_job_lease_revocation.rs"]
 mod runtime_job_lease_revocation;
 #[path = "store/runtime_job_leases.rs"]
@@ -161,6 +163,14 @@ pub struct RuntimeJobCompletionLease<'a> {
     pub expires_at: DateTime<Utc>,
     pub generation: Option<u64>,
     pub proof: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentContractAttemptReservation {
+    Reserved,
+    AlreadyReserved,
+    BudgetExhausted,
+    StaleLease,
 }
 
 impl<'a> RuntimeJobCompletionLease<'a> {

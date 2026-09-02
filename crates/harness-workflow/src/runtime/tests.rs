@@ -59,6 +59,7 @@ include!("tests/completion_budget_ceiling.rs");
 include!("tests/command_store.rs");
 include!("tests/deferred_dispatch.rs");
 include!("tests/deferred_dispatch_review.rs");
+include!("tests/declarative_agent_contract.rs");
 include!("tests/declarative_pinning.rs");
 include!("tests/declarative_validation.rs");
 include!("tests/declarative_interpreter.rs");

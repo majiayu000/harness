@@ -34,6 +34,7 @@ fn ceiling_usage_upsert(workflow_id: &str, cost_usd_micros: u64) -> RuntimeUsage
         candidate_count: None,
         metrics: RuntimeUsageMetrics::default(),
         cost_usd_micros,
+        cost_usd_observed: true,
         reported_at: Utc::now(),
     }
 }
@@ -246,6 +247,158 @@ async fn budget_ceiling_does_not_preempt_terminal_completion() -> anyhow::Result
 
     assert_eq!(record.decision.decision, "finish_closed_issue");
     assert_eq!(record.decision.next_state, "done");
+    Ok(())
+}
+
+#[tokio::test]
+async fn budget_ceiling_preempts_terminal_agent_contract_completion() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db"))
+        .await?
+        .with_budget_policy(ceiling_store_policy(15.0, RuntimeBudgetEnforcement::Enforce));
+    let instance = ceiling_instance(&store, "budget-ceiling-terminal-contract", 20.0).await?;
+    let result = ActivityResult::succeeded(
+        "implement_issue",
+        "The issue was already closed before implementation completed.",
+    )
+    .with_signal(ActivitySignal::new(
+        "IssueClosed",
+        json!({
+            "issue_number": 123,
+            "state": "closed",
+            "issue_url": "https://github.com/owner/repo/issues/123"
+        }),
+    ))
+    .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(123));
+
+    let record = store
+        .commit_parent_runtime_completion(
+            &instance.id,
+            "runtime-1",
+            json!({
+                "command_id": "ceiling-terminal-contract-command",
+                "runtime_job_id": "ceiling-terminal-contract-job",
+                "command": {
+                    "command_type": "enqueue_activity",
+                    "dedupe_key": "ceiling-terminal-contract",
+                    "command": {"agent_contract": {"output_schema": "test"}}
+                },
+                "activity_result": result,
+            }),
+        )
+        .await?
+        .expect("over-budget contract completion still produces a decision");
+
+    assert!(record.accepted, "{:?}", record.rejection_reason);
+    assert_eq!(record.decision.decision, "block_budget_exhausted");
+    assert_eq!(record.decision.next_state, "blocked");
+    Ok(())
+}
+
+#[tokio::test]
+async fn budget_stop_preempts_declarative_on_blocked_terminal_route() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    use harness_core::config::workflow::{
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+    };
+    use std::collections::BTreeMap;
+
+    let definition = crate::runtime::build_declarative_definition(
+        &WorkflowDefinitionPolicy {
+            id: "budget_stop_terminal_route".to_string(),
+            initial: "running".to_string(),
+            states: BTreeMap::from([
+                (
+                    "running".to_string(),
+                    DeclaredState {
+                        activity: Some("run".to_string()),
+                        on_blocked: Some("done".to_string()),
+                        ..DeclaredState::default()
+                    },
+                ),
+                (
+                    "blocked".to_string(),
+                    DeclaredState {
+                        progress: Some(DeclaredProgressMode::OperatorGate),
+                        ..DeclaredState::default()
+                    },
+                ),
+            ]),
+            terminal: BTreeMap::from([
+                ("done".to_string(), "succeeded".to_string()),
+                ("failed".to_string(), "failed".to_string()),
+                ("cancelled".to_string(), "cancelled".to_string()),
+            ]),
+            evidence_required: BTreeMap::new(),
+            recovery_targets: Vec::new(),
+            intake: None,
+        },
+        &BTreeMap::from([("run".to_string(), WorkflowActivityPolicy::default())]),
+    )?;
+    let mut registry = crate::runtime::WorkflowDefinitionRegistry::with_builtins();
+    registry.register_declarative_current(definition.clone())?;
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db"))
+        .await?
+        .with_definition_registry(registry.into_shared())
+        .with_budget_policy(ceiling_store_policy(0.10, RuntimeBudgetEnforcement::Enforce));
+    let instance = WorkflowInstance::new(
+        definition.policy().id.clone(),
+        definition.definition_version(),
+        "running",
+        WorkflowSubject::new("test", "budget-stop-terminal-route"),
+    )
+    .with_id("budget-stop-terminal-route")
+    .with_server_data(json!({"definition_hash": definition.definition_hash()}));
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+    store
+        .upsert_runtime_usage(&ceiling_usage_upsert(&instance.id, 125_000))
+        .await?;
+
+    let result = ActivityResult {
+        activity: "run".to_string(),
+        status: ActivityStatus::Blocked,
+        summary: "The runtime stopped the turn at the enforced workflow budget.".to_string(),
+        artifacts: vec![ActivityArtifact::new(
+            crate::runtime::completion_evidence::ARTIFACT_RUNTIME_BUDGET_STOP,
+            json!({"spent_usd": 0.125, "budget_usd": 0.10}),
+        )],
+        signals: Vec::new(),
+        validation: Vec::new(),
+        error: Some("workflow budget exhausted".to_string()),
+        error_kind: None,
+    };
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "budget-stop-terminal-route-command",
+        json!({"activity": "run"}),
+    );
+    let record = store
+        .commit_parent_runtime_completion(
+            &instance.id,
+            "runtime-1",
+            json!({
+                "command_id": "budget-stop-terminal-route-command",
+                "runtime_job_id": "budget-stop-terminal-route-job",
+                "command": command,
+                "activity_result": result,
+            }),
+        )
+        .await?
+        .expect("the budget-stopped completion must produce a decision");
+
+    assert!(record.accepted, "{:?}", record.rejection_reason);
+    assert_eq!(record.decision.decision, "block_budget_exhausted");
+    assert_eq!(record.decision.next_state, "blocked");
     Ok(())
 }
 

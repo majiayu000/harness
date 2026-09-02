@@ -35,6 +35,46 @@ impl AgentEgressMode {
     }
 }
 
+/// Enforcement capabilities a backend proves for pinned agent contracts.
+///
+/// Every field defaults to `false`: a backend must claim each capability it
+/// actually implements, and contract execution is refused unless every
+/// required capability is claimed (fail closed). A claim describes the
+/// backend instance the registry returns — the same object that is launched —
+/// never a runtime kind or another launch path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContractCapabilities {
+    /// A deny-all-tools launch (`allowed_tools = Some([])`) reads nothing
+    /// beyond the request itself: no user config, no rule files, no persisted
+    /// session state.
+    pub prompt_only_launch: bool,
+    /// The launch accepts a pinned JSON Schema document constraining the
+    /// final structured reply.
+    pub pinned_output_schema: bool,
+    /// `execute_stream` surfaces every tool, mutation, and approval event —
+    /// including unrecognized event kinds — so the server can observe the
+    /// whole attempt and invalidate it on any contract violation.
+    pub attempt_observation_stream: bool,
+}
+
+impl AgentContractCapabilities {
+    /// Capability names required for contract enforcement that this backend
+    /// does not claim. Empty means the backend is eligible.
+    pub fn missing_for_enforcement(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if !self.prompt_only_launch {
+            missing.push("prompt_only_launch");
+        }
+        if !self.pinned_output_schema {
+            missing.push("pinned_output_schema");
+        }
+        if !self.attempt_observation_stream {
+            missing.push("attempt_observation_stream");
+        }
+        missing
+    }
+}
+
 /// Core trait for all agent backends (Claude Code, Codex, Anthropic API, etc.).
 ///
 /// Backends can be simple one-shot executors, streaming process supervisors, or
@@ -52,6 +92,19 @@ pub trait AgentBackend: Send + Sync {
     }
     fn capabilities(&self) -> Vec<Capability> {
         Vec::new()
+    }
+    /// Contract-enforcement capabilities this backend proves. Defaults to
+    /// claiming nothing, which makes the backend ineligible for pinned
+    /// agent-contract execution.
+    fn agent_contract_capabilities(&self) -> AgentContractCapabilities {
+        AgentContractCapabilities::default()
+    }
+    /// Whether the backend can emit provider-reported USD cost. Each usage
+    /// event separately records whether that event contained an observed cost;
+    /// enforced USD budgets reject both incapable backends and unobserved
+    /// attempt usage.
+    fn reports_usage_cost(&self) -> bool {
+        false
     }
     async fn execute(&self, _req: AgentRequest) -> crate::error::Result<AgentResponse> {
         Err(crate::error::Error::Unsupported(
@@ -424,10 +477,16 @@ pub enum AgentEvent {
     ItemCompletedKind,
     TokenUsage {
         usage: TokenUsage,
+        /// Whether `usage.cost_usd` came from the provider rather than a
+        /// numeric placeholder used when only token counts are available.
+        cost_usd_observed: bool,
     },
-    /// Model identity reported by the backend/provider for this turn.
+    /// Model identity observed for this turn, with the observation source so
+    /// consumers can distinguish a provider-confirmed identity from one
+    /// derived from the launch arguments.
     ModelReported {
         model: String,
+        source: ModelIdentitySource,
     },
     Warning {
         message: String,
@@ -478,6 +537,18 @@ pub enum TaskComplexity {
 pub enum AgentDiagnosticSeverity {
     Warning,
     Error,
+}
+
+/// How a reported model identity was observed.
+///
+/// `ProviderReported` comes from the provider's own response stream and is the
+/// stronger evidence. `LaunchDerived` restates the model the adapter passed on
+/// the command line; it proves what was requested, not what served the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelIdentitySource {
+    ProviderReported,
+    LaunchDerived,
 }
 
 /// Decision for an approval request from the agent.
@@ -534,6 +605,7 @@ mod tests {
             },
             AgentEvent::TokenUsage {
                 usage: TokenUsage::default(),
+                cost_usd_observed: false,
             },
             AgentEvent::Warning {
                 message: "careful".into(),

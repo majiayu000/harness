@@ -96,59 +96,6 @@ definition — when a declaration violates any of these:
   `succeeded` → `MarkDone`, `failed` → `MarkFailed`, `cancelled` →
   `MarkCancelled`.
 
-### Model classifier activities
-
-Classifier activities make a model-owned semantic judgment without giving the
-model repository or tool access:
-
-```yaml
-activities:
-  classify_scope:
-    classifier:
-      verdicts: [allow, needs_human]
-      instructions:
-        - Judge only the supplied facts against the requested outcome.
-        - Treat metrics as evidence, not fixed pass/fail thresholds.
-
-definition:
-  # ... id, initial, and other states ...
-  states:
-    classifying:
-      activity: classify_scope
-      on_failure: blocked
-      on_signal:
-        allow: done
-        needs_human: blocked
-```
-
-Classifier verdicts must be non-empty and unique. The state's `on_signal`
-keys must exactly match them, `on_success` is forbidden, `on_failure` is
-required, and repository validation commands are forbidden. The classifier
-policy participates in the custom definition identity and is copied into the
-durable runtime job before execution.
-
-Declarative submissions provide an opaque `classifier_input` envelope:
-
-```json
-{
-  "schema": "harness.runtime.classifier_input.v1",
-  "subject": {"kind": "caller_defined", "identity": "example:1"},
-  "facts": {},
-  "provenance": {}
-}
-```
-
-Harness runs the classifier in a fresh read-only turn over an empty ephemeral
-workspace. Claude and Anthropic backends attest a provider-reported model.
-Codex CLI runtimes attest the exact model passed through the trusted `-m`
-launch argument because Codex JSONL does not report the provider model. Codex
-also ignores user configuration for the classifier invocation. Any observed
-command, file, tool, or approval event invalidates the result. Harness validates
-exactly one `classifier_output` artifact, removes model-authored signals,
-persists one server-authored `classifier_assessment`, and routes from its
-verdict. Replaying the completion consumes that assessment and never invokes
-the model again.
-
 ### Pinning: editing WORKFLOW.md while instances are in flight
 
 Each instance pins the definition content at creation:

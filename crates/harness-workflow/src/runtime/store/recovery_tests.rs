@@ -2,7 +2,9 @@ use super::*;
 use crate::runtime::declarative::build_declarative_definition;
 use crate::runtime::model::{WorkflowEvidence, WorkflowSubject};
 use harness_core::config::workflow::{
-    DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+    AgentContractMutationPolicy, AgentContractToolPolicy, AgentContractWorkspacePolicy,
+    DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowAgentContract,
+    WorkflowDefinitionPolicy,
 };
 use std::collections::BTreeMap;
 
@@ -66,6 +68,65 @@ fn definition() -> crate::runtime::declarative::DeclarativeWorkflowDefinition {
     .expect("fixture definition should compile")
 }
 
+fn contract_recovery_definition() -> crate::runtime::declarative::DeclarativeWorkflowDefinition {
+    let policy = WorkflowDefinitionPolicy {
+        id: "contract_recovery_test".to_string(),
+        initial: "blocked".to_string(),
+        states: BTreeMap::from([
+            (
+                "blocked".to_string(),
+                DeclaredState {
+                    progress: Some(DeclaredProgressMode::OperatorGate),
+                    ..DeclaredState::default()
+                },
+            ),
+            (
+                "classifying".to_string(),
+                DeclaredState {
+                    activity: Some("classify".to_string()),
+                    on_failure: Some("failed".to_string()),
+                    on_signal: BTreeMap::from([
+                        ("small".to_string(), "done".to_string()),
+                        ("large".to_string(), "failed".to_string()),
+                    ]),
+                    ..DeclaredState::default()
+                },
+            ),
+        ]),
+        terminal: BTreeMap::from([
+            ("done".to_string(), "succeeded".to_string()),
+            ("failed".to_string(), "failed".to_string()),
+            ("cancelled".to_string(), "cancelled".to_string()),
+        ]),
+        evidence_required: BTreeMap::new(),
+        recovery_targets: vec!["classifying".to_string()],
+        intake: None,
+    };
+    let contract = WorkflowAgentContract {
+        input_schema: "harness.semantic_activity_input.v1".to_string(),
+        output_schema: "harness.semantic_verdict.v1".to_string(),
+        allowed_outcomes: vec!["small".to_string(), "large".to_string()],
+        tools: AgentContractToolPolicy::None,
+        mutation: AgentContractMutationPolicy::Forbidden,
+        workspace: AgentContractWorkspacePolicy::EphemeralEmpty,
+        fresh_context: true,
+        max_primary_attempts: 1,
+        max_corrections: 1,
+    };
+    build_declarative_definition(
+        &policy,
+        &BTreeMap::from([(
+            "classify".to_string(),
+            WorkflowActivityPolicy {
+                prompt: Some("Classify only the pinned input.".to_string()),
+                agent_contract: Some(contract),
+                ..WorkflowActivityPolicy::default()
+            },
+        )]),
+    )
+    .expect("contract recovery definition should compile")
+}
+
 fn instance(
     definition: &crate::runtime::declarative::DeclarativeWorkflowDefinition,
 ) -> WorkflowInstance {
@@ -116,6 +177,112 @@ fn declarative_recovery_requires_operator_and_pinned_target_selection() {
 }
 
 #[test]
+fn automatic_unblock_preserves_feedback_repair_budget() {
+    let definition = definition();
+    let mut instance = instance(&definition).with_server_data(serde_json::json!({
+        "feedback_repair_round": 3,
+        "feedback_repair_blocker_count": 1,
+        "feedback_repair_lane": "remote_feedback",
+    }));
+
+    persist_operator_recovery_data(
+        &mut instance,
+        WorkflowRuntimeRecoveryAction::Unblock,
+        "transient stop recheck",
+        "auto_recovery",
+        "blocked",
+        "running",
+        "event-one",
+    )
+    .expect("automatic recovery metadata should persist");
+
+    assert_eq!(instance.data["feedback_repair_round"], 3);
+    assert_eq!(instance.data["feedback_repair_blocker_count"], 1);
+    assert_eq!(instance.data["feedback_repair_lane"], "remote_feedback");
+}
+
+#[test]
+fn marked_hygiene_convergence_recovers_address_pr_feedback() {
+    let instance = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "blocked",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_server_data(serde_json::json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "feedback_summary": "Runtime PR hygiene found mergeability repair is needed for PR #77.",
+        "feedback_repair_round": 3,
+        "feedback_repair_blocker_count": 1,
+        "feedback_repair_lane": "remote_feedback",
+        "last_stop": {
+            "state": "blocked",
+            "activity": "address_pr_feedback",
+            "source": "pr_hygiene_convergence"
+        },
+        "hygiene_context": {
+            "source": "pr_hygiene",
+            "repo": "owner/repo",
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "merge_state_status": "DIRTY"
+        }
+    }));
+
+    let activity =
+        stopped_activity(&instance.data).expect("hygiene convergence activity should parse");
+    assert!(is_hygiene_convergence_stop(&instance.data)
+        .expect("hygiene convergence marker should validate"));
+    let target = recovery_dispatch_target(&instance.data, activity.as_deref())
+        .expect("hygiene recovery metadata should parse")
+        .expect("hygiene convergence should have a recovery target");
+    assert_eq!(target.state, "addressing_feedback");
+    assert_eq!(target.activity.as_deref(), Some("address_pr_feedback"));
+
+    let command = recovery_dispatch_command(
+        &instance,
+        WorkflowRuntimeRecoveryAction::Unblock,
+        "operator resolved the convergence stop",
+        &RecoveryDispatchPlan {
+            target,
+            command_source: RecoveryDispatchCommandSource::HygieneRepair,
+        },
+        "event-one",
+    );
+    assert_eq!(command.activity_name(), Some("address_pr_feedback"));
+    assert_eq!(command.command["source"], "pr_hygiene");
+    assert_eq!(command.command["pr_number"], 77);
+    assert_eq!(
+        command.command["review_summary"],
+        "Runtime PR hygiene found mergeability repair is needed for PR #77."
+    );
+    assert_eq!(command.command["hygiene"], instance.data["hygiene_context"]);
+}
+
+#[test]
+fn metadata_free_legacy_recovery_ignores_stale_hygiene_context() {
+    let data = serde_json::json!({
+        "repo": "owner/repo",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "feedback_summary": "A prior hygiene repair was requested.",
+        "hygiene_context": {
+            "source": "pr_hygiene",
+            "pr_number": 77
+        }
+    });
+
+    let target = recovery_dispatch_target(&data, None)
+        .expect("legacy recovery metadata should parse")
+        .expect("legacy recovery should keep its fallback target");
+
+    assert_eq!(target.state, "implementing");
+    assert_eq!(target.activity.as_deref(), Some("implement_issue"));
+}
+
+#[test]
 fn declarative_recovery_builds_exact_progress_driver_and_preserves_evidence() {
     let definition = definition();
     let instance = instance(&definition);
@@ -124,12 +291,13 @@ fn declarative_recovery_builds_exact_progress_driver_and_preserves_evidence() {
         ("waiting", WorkflowCommandType::Wait),
         ("approval", WorkflowCommandType::RequestOperatorAttention),
     ] {
-        let plan = declarative_recovery_dispatch_plan(&request(Some(target), &[]), &definition)
-            .expect("plan should build")
-            .expect("target should have a driver");
+        let plan =
+            declarative_recovery_dispatch_plan(&request(Some(target), &[]), &definition, &instance)
+                .expect("plan should build")
+                .expect("target should have a driver");
         assert!(matches!(
-            plan.command_source,
-            RecoveryDispatchCommandSource::DeclarativeProgress(command_type) if command_type == expected
+            &plan.command_source,
+            RecoveryDispatchCommandSource::DeclarativeProgress(command) if command.command_type == expected
         ));
         let command = recovery_dispatch_command(
             &instance,
@@ -148,10 +316,13 @@ fn declarative_recovery_builds_exact_progress_driver_and_preserves_evidence() {
         );
     }
     let evidence = [WorkflowEvidence::new("operator_ticket", "approved")];
-    let plan =
-        declarative_recovery_dispatch_plan(&request(Some("running"), &evidence), &definition)
-            .expect("plan should build")
-            .expect("target should have a driver");
+    let plan = declarative_recovery_dispatch_plan(
+        &request(Some("running"), &evidence),
+        &definition,
+        &instance,
+    )
+    .expect("plan should build")
+    .expect("target should have a driver");
     let decision = recovery_dispatch_decision(
         &instance,
         WorkflowRuntimeRecoveryAction::Unblock,
@@ -167,4 +338,48 @@ fn declarative_recovery_builds_exact_progress_driver_and_preserves_evidence() {
         WorkflowCommandType::EnqueueActivity
     );
     assert_eq!(decision.commands[0].activity_name(), Some("run"));
+}
+
+#[test]
+fn declarative_recovery_rebuilds_the_complete_pinned_contract_input() {
+    let definition = contract_recovery_definition();
+    let instance = WorkflowInstance::new(
+        definition.policy().id.clone(),
+        definition.definition_version(),
+        "blocked",
+        WorkflowSubject::new("issue", "owner/repo#42"),
+    )
+    .with_server_data(serde_json::json!({
+        "definition_hash": definition.definition_hash(),
+        "changed_files": ["src/lib.rs"],
+    }));
+    let plan = declarative_recovery_dispatch_plan(
+        &request(Some("classifying"), &[]),
+        &definition,
+        &instance,
+    )
+    .expect("plan should build")
+    .expect("contract target should have a driver");
+    let RecoveryDispatchCommandSource::DeclarativeProgress(command) = &plan.command_source else {
+        panic!("contract recovery must produce a declarative command")
+    };
+    let input = &command.command["agent_contract_input"];
+    assert_eq!(input["subject"]["kind"], "issue");
+    assert_eq!(input["subject"]["identity"], "owner/repo#42");
+    assert_eq!(input["facts"], instance.data);
+    assert_eq!(
+        input["provenance"],
+        serde_json::to_value(
+            instance
+                .data_provenance
+                .as_ref()
+                .expect("server facts have provenance")
+        )
+        .expect("serialize provenance")
+    );
+    assert_eq!(command.command["prompt"], "Classify only the pinned input.");
+    assert_eq!(
+        command.command["definition_hash"],
+        definition.definition_hash()
+    );
 }

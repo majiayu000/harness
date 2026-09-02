@@ -9,12 +9,12 @@ mod candidate_fanout;
 mod candidate_promotion;
 mod candidate_selection;
 mod candidate_terminal;
-mod classifier;
 mod command_record;
 pub mod completion_evidence;
 pub mod data_provenance;
 mod data_write;
 pub mod declarative;
+mod declarative_agent_contract;
 mod declarative_interpreter;
 mod declarative_pinning;
 mod dispatch_barrier;
@@ -74,22 +74,23 @@ pub use candidate_selection::{
     CandidateOutcome, CandidatePromotionRecord, CandidateRankingRecord, CandidateSelectionInput,
     CandidateSelectionRecord, CANDIDATE_SELECTION_RECORD_TYPE, CANDIDATE_SELECTION_SCHEMA,
 };
-pub use classifier::{
-    classifier_job_snapshot, validate_classifier_input, validated_classifier_verdict,
-    CLASSIFIER_ASSESSMENT_ARTIFACT, CLASSIFIER_ASSESSMENT_SCHEMA, CLASSIFIER_INPUT_SCHEMA,
-    CLASSIFIER_JOB_SCHEMA, CLASSIFIER_OUTPUT_ARTIFACT, CLASSIFIER_OUTPUT_SCHEMA,
-};
 pub use data_provenance::{
     workflow_data_pointer, DataProvenance, WorkflowDataProvenance, WORKFLOW_DATA_PROVENANCE_SCHEMA,
 };
 pub use data_write::WorkflowDataWrite;
 pub use declarative::{build_declarative_definition, DeclarativeWorkflowDefinition};
+pub use declarative_agent_contract::{
+    validate_agent_contract_evidence_refs, validate_declarative_agent_contract_command,
+    PinnedAgentContractActivity, AGENT_CONTRACT_ASSESSMENT_ARTIFACT,
+    AGENT_CONTRACT_ASSESSMENT_SCHEMA, AGENT_CONTRACT_VERDICT_ARTIFACT,
+};
 pub use declarative_interpreter::{
     build_declarative_submission_decision, DECLARATIVE_SUBMISSION_DECISION,
 };
 pub use declarative_pinning::{
     declarative_definition_identity, hydrate_declarative_definition,
-    hydrate_persisted_declarative_definition, persisted_declarative_definition,
+    hydrate_persisted_declarative_definition, is_persisted_declarative_definition,
+    persisted_declarative_definition,
 };
 pub use dispatch_barrier::{
     DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrier, DispatchBarrierInput,
@@ -138,7 +139,7 @@ pub use model::{
     RuntimeEvent, RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord,
     WorkflowCommand, WorkflowCommandRecord, WorkflowCommandType, WorkflowDecision,
     WorkflowDecisionRecord, WorkflowDefinition, WorkflowEvent, WorkflowEvidence, WorkflowInstance,
-    WorkflowLease, WorkflowSubject,
+    WorkflowLease, WorkflowSubject, RUNTIME_PROFILE_SNAPSHOT_HASH_KEY,
 };
 pub use otel_trace_context::WorkflowOtelTraceContext;
 pub use plan_issue::{
@@ -148,13 +149,15 @@ pub use plan_issue::{
 pub use pr_feedback::{
     build_local_review_completed_decision, build_local_review_request_decision,
     build_pr_detected_decision, build_pr_feedback_decision, build_pr_feedback_inspect_decision,
-    build_pr_feedback_sweep_decision, build_pr_hygiene_repair_decision, LocalReviewCompletedInput,
-    LocalReviewDecisionInput, LocalReviewOutcome, PrDetectedDecisionInput, PrFeedbackDecisionInput,
-    PrFeedbackDecisionOutput, PrFeedbackInspectDecisionInput, PrFeedbackOutcome,
-    PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PrHygieneRepairDecisionInput,
-    LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
-    LOCAL_REVIEW_PASSED_SIGNAL, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
-    PR_FEEDBACK_SNAPSHOT_ARTIFACT, PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
+    build_pr_feedback_sweep_decision, build_pr_hygiene_repair_decision, next_feedback_repair_round,
+    FeedbackRepairLane, FeedbackRepairStop, LocalReviewCompletedInput, LocalReviewDecisionInput,
+    LocalReviewOutcome, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackDecisionOutput,
+    PrFeedbackInspectDecisionInput, PrFeedbackOutcome, PrFeedbackSweepDecisionInput,
+    PrFeedbackWorkflowAction, PrHygieneRepairDecisionInput, LOCAL_REVIEW_ACTIVITY,
+    LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
+    MAX_FEEDBACK_REPAIR_ROUNDS, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    PR_FEEDBACK_SNAPSHOT_ARTIFACT, PR_HYGIENE_CONVERGENCE_STOP_SOURCE, PR_REPAIR_SNAPSHOT_ARTIFACT,
+    SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 pub use prompt_task::{
     build_prompt_submission_decision, continuation_value, parse_external_state_signal,
@@ -198,19 +201,19 @@ pub use state_registry::{
 pub use status::WorkflowCommandStatus;
 pub use store::PromptPayloadIntegrityError;
 pub use store::{
-    cost_usd_from_micros, cost_usd_to_micros, DecisionProvenanceConflict,
-    DriverlessProgressInstance, DriverlessProgressProvenanceStatus, RuntimeAgentTelemetry,
-    RuntimeHistoryPruneSummary, RuntimeJobClaimDeferOutcome, RuntimeJobCompletionLease,
-    RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome,
-    RuntimeWorkflowUsage, WorkflowCancellationCleanupOutcome, WorkflowChildStart,
-    WorkflowChildStartOutcome, WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
-    WorkflowCoverageRecoveryTransition, WorkflowDecisionTransition, WorkflowPrBindingRepairOutcome,
-    WorkflowRejectedDecisionTransition, WorkflowRunEvidence, WorkflowRunEvidenceExport,
-    WorkflowRunEvidenceInput, WorkflowRunEvidenceQuery, WorkflowRuntimeRecoveryAction,
-    WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore,
-    WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
-    WorkflowSubmissionFilter, WorkflowSubmissionHourlyDone, WorkflowSubmissionMetrics,
-    WorkflowSubmissionProjectMetrics, WorkflowSubmissionPromptPayload,
+    cost_usd_from_micros, cost_usd_to_micros, AgentContractAttemptReservation,
+    DecisionProvenanceConflict, DriverlessProgressInstance, DriverlessProgressProvenanceStatus,
+    RuntimeAgentTelemetry, RuntimeHistoryPruneSummary, RuntimeJobClaimDeferOutcome,
+    RuntimeJobCompletionLease, RuntimeUsageMetrics, RuntimeUsageRecord, RuntimeUsageUpsert,
+    RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage, WorkflowCancellationCleanupOutcome,
+    WorkflowChildStart, WorkflowChildStartOutcome, WorkflowCoverageRecoveryExpected,
+    WorkflowCoverageRecoveryOutcome, WorkflowCoverageRecoveryTransition,
+    WorkflowDecisionTransition, WorkflowPrBindingRepairOutcome, WorkflowRejectedDecisionTransition,
+    WorkflowRunEvidence, WorkflowRunEvidenceExport, WorkflowRunEvidenceInput,
+    WorkflowRunEvidenceQuery, WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome,
+    WorkflowRuntimeRecoveryRequest, WorkflowRuntimeStore, WorkflowSubmissionDecisionCommit,
+    WorkflowSubmissionDecisionTransition, WorkflowSubmissionFilter, WorkflowSubmissionHourlyDone,
+    WorkflowSubmissionMetrics, WorkflowSubmissionProjectMetrics, WorkflowSubmissionPromptPayload,
     WORKFLOW_RUN_EVIDENCE_DEFAULT_LIMIT, WORKFLOW_RUN_EVIDENCE_EXPORT_SCHEMA,
     WORKFLOW_RUN_EVIDENCE_MAX_LIMIT, WORKFLOW_RUN_EVIDENCE_PAYLOAD_MAX_BYTES,
     WORKFLOW_RUN_EVIDENCE_RETENTION_MAX_BATCH, WORKFLOW_RUN_EVIDENCE_SCHEMA,

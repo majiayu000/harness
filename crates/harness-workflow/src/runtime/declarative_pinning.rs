@@ -1,3 +1,4 @@
+use super::declarative_agent_contract::PinnedAgentContractActivity;
 use super::{
     declarative::{build_declarative_definition, DeclarativeWorkflowDefinition},
     model::WorkflowDefinition as DurableWorkflowDefinition,
@@ -7,27 +8,38 @@ use harness_core::config::workflow::{WorkflowActivityPolicy, WorkflowDefinitionP
 use std::collections::BTreeMap;
 
 pub(super) const DECLARATIVE_DEFINITION_METADATA_KIND: &str = "declarative_workflow";
-const METADATA_SCHEMA_VERSION: u64 = 1;
+/// Metadata layout for definitions without agent contracts. Unchanged from the
+/// pre-contract runtime so existing persisted rows keep hydrating.
+const METADATA_SCHEMA_VERSION_V1: u64 = 1;
+/// Metadata layout that adds the resolved `agent_contracts` map. A reader that
+/// does not know this version fails explicitly instead of recomputing a hash
+/// without the contracts.
+const METADATA_SCHEMA_VERSION_V2: u64 = 2;
+
+pub fn is_persisted_declarative_definition(definition: &DurableWorkflowDefinition) -> bool {
+    definition
+        .metadata
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        == Some(DECLARATIVE_DEFINITION_METADATA_KIND)
+}
 
 pub fn declarative_definition_identity(
     policy: &WorkflowDefinitionPolicy,
+    activity_contracts: &BTreeMap<String, PinnedAgentContractActivity>,
 ) -> anyhow::Result<(u32, String)> {
-    declarative_definition_identity_with_classifier_policies(policy, &BTreeMap::new())
-}
-
-pub(super) fn declarative_definition_identity_with_classifier_policies(
-    policy: &WorkflowDefinitionPolicy,
-    classifier_activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
-) -> anyhow::Result<(u32, String)> {
-    let identity = if classifier_activity_policies.is_empty() {
+    // Definitions without agent contracts keep the original policy-only hash
+    // so every existing pinned instance and persisted definition stays valid.
+    let identity_json = if activity_contracts.is_empty() {
         serde_json::to_value(policy)?
     } else {
         serde_json::json!({
+            "schema": "declarative_workflow_identity.v2",
             "policy": policy,
-            "classifier_activity_policies": classifier_activity_policies,
+            "agent_contracts": activity_contracts,
         })
     };
-    let definition_hash = stable_remote_fact_hash(&identity);
+    let definition_hash = stable_remote_fact_hash(&identity_json);
     let version_hex = definition_hash
         .get(definition_hash.len().saturating_sub(8)..)
         .ok_or_else(|| anyhow::anyhow!("declarative definition hash is too short"))?;
@@ -44,18 +56,27 @@ pub fn persisted_declarative_definition(
     definition: &DeclarativeWorkflowDefinition,
     source_path: Option<&str>,
 ) -> DurableWorkflowDefinition {
+    let metadata = if definition.activity_contracts().is_empty() {
+        serde_json::json!({
+            "kind": DECLARATIVE_DEFINITION_METADATA_KIND,
+            "schema_version": METADATA_SCHEMA_VERSION_V1,
+            "policy": definition.policy(),
+        })
+    } else {
+        serde_json::json!({
+            "kind": DECLARATIVE_DEFINITION_METADATA_KIND,
+            "schema_version": METADATA_SCHEMA_VERSION_V2,
+            "policy": definition.policy(),
+            "agent_contracts": definition.activity_contracts(),
+        })
+    };
     let mut persisted = DurableWorkflowDefinition::new(
         definition.policy().id.clone(),
         definition.definition_version(),
         definition.policy().id.clone(),
     )
     .with_definition_hash(definition.definition_hash())
-    .with_metadata(serde_json::json!({
-        "kind": DECLARATIVE_DEFINITION_METADATA_KIND,
-        "schema_version": METADATA_SCHEMA_VERSION,
-        "policy": definition.policy(),
-        "classifier_activity_policies": definition.classifier_activity_policies(),
-    }));
+    .with_metadata(metadata);
     if let Some(source_path) = source_path {
         persisted = persisted.with_source_path(source_path);
     }
@@ -66,36 +87,40 @@ pub fn hydrate_declarative_definition(
     definition: &DurableWorkflowDefinition,
     activity_policies: &BTreeMap<String, WorkflowActivityPolicy>,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
-    let policy = persisted_declarative_policy(definition)?;
-    hydrate_declarative_definition_with_policy(definition, &policy, activity_policies)
+    let persisted = persisted_declarative_policy(definition)?;
+    hydrate_declarative_definition_with_policy(definition, &persisted.policy, activity_policies)
 }
 
 pub fn hydrate_persisted_declarative_definition(
     definition: &DurableWorkflowDefinition,
 ) -> anyhow::Result<DeclarativeWorkflowDefinition> {
-    let policy = persisted_declarative_policy(definition)?;
-    let mut activity_policies: BTreeMap<String, WorkflowActivityPolicy> = policy
+    let persisted = persisted_declarative_policy(definition)?;
+    let activity_policies = persisted
+        .policy
         .states
         .values()
         .filter_map(|state| state.activity.as_ref())
-        .map(|activity| (activity.clone(), WorkflowActivityPolicy::default()))
-        .collect();
-    if let Some(policies) = definition
-        .metadata
-        .get("classifier_activity_policies")
-        .map(|value| {
-            serde_json::from_value::<BTreeMap<String, WorkflowActivityPolicy>>(value.clone())
+        .map(|activity| {
+            let pinned = persisted.agent_contracts.get(activity);
+            let activity_policy = WorkflowActivityPolicy {
+                prompt: pinned.map(|pinned| pinned.prompt.clone()),
+                agent_contract: pinned.map(|pinned| pinned.contract.clone()),
+                ..WorkflowActivityPolicy::default()
+            };
+            (activity.clone(), activity_policy)
         })
-        .transpose()?
-    {
-        activity_policies.extend(policies);
-    }
-    hydrate_declarative_definition_with_policy(definition, &policy, &activity_policies)
+        .collect();
+    hydrate_declarative_definition_with_policy(definition, &persisted.policy, &activity_policies)
+}
+
+struct PersistedDeclarativePolicy {
+    policy: WorkflowDefinitionPolicy,
+    agent_contracts: BTreeMap<String, PinnedAgentContractActivity>,
 }
 
 fn persisted_declarative_policy(
     definition: &DurableWorkflowDefinition,
-) -> anyhow::Result<WorkflowDefinitionPolicy> {
+) -> anyhow::Result<PersistedDeclarativePolicy> {
     let metadata = definition.metadata.as_object().ok_or_else(|| {
         anyhow::anyhow!(
             "persisted workflow definition '{}@{}' metadata must be an object",
@@ -112,10 +137,11 @@ fn persisted_declarative_policy(
             definition.version
         );
     }
-    if metadata
+    let schema_version = metadata
         .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        != Some(METADATA_SCHEMA_VERSION)
+        .and_then(serde_json::Value::as_u64);
+    if schema_version != Some(METADATA_SCHEMA_VERSION_V1)
+        && schema_version != Some(METADATA_SCHEMA_VERSION_V2)
     {
         anyhow::bail!(
             "persisted declarative workflow definition '{}@{}' has an unsupported metadata schema",
@@ -130,7 +156,15 @@ fn persisted_declarative_policy(
             definition.version
         )
     })?;
-    serde_json::from_value(policy_value.clone()).map_err(Into::into)
+    let policy = serde_json::from_value(policy_value.clone())?;
+    let agent_contracts = match metadata.get("agent_contracts") {
+        Some(contracts_value) => serde_json::from_value(contracts_value.clone())?,
+        None => BTreeMap::new(),
+    };
+    Ok(PersistedDeclarativePolicy {
+        policy,
+        agent_contracts,
+    })
 }
 
 fn hydrate_declarative_definition_with_policy(

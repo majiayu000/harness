@@ -1,5 +1,6 @@
 use super::{
-    declarative_pinning::declarative_definition_identity_with_classifier_policies,
+    declarative_agent_contract::{resolve_referenced_agent_contracts, PinnedAgentContractActivity},
+    declarative_pinning::declarative_definition_identity,
     model::{ActivityArtifact, WorkflowCommandType, WorkflowEvidence},
     pr_feedback::PR_FEEDBACK_DEFINITION_ID,
     prompt_task::PROMPT_TASK_DEFINITION_ID,
@@ -40,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub struct DeclarativeWorkflowDefinition {
     registered: RegisteredWorkflowDefinition,
     policy: WorkflowDefinitionPolicy,
-    classifier_activity_policies: BTreeMap<String, WorkflowActivityPolicy>,
+    activity_contracts: BTreeMap<String, PinnedAgentContractActivity>,
     definition_version: u32,
     definition_hash: String,
 }
@@ -54,28 +55,23 @@ impl DeclarativeWorkflowDefinition {
         &self.policy
     }
 
+    /// Resolved agent contracts (with their pinned effective prompts) for
+    /// activities referenced by this definition, resolved at compile time and
+    /// included in the definition identity.
+    pub fn activity_contracts(&self) -> &BTreeMap<String, PinnedAgentContractActivity> {
+        &self.activity_contracts
+    }
+
+    pub fn agent_contract(&self, activity: &str) -> Option<&PinnedAgentContractActivity> {
+        self.activity_contracts.get(activity)
+    }
+
     pub fn definition_version(&self) -> u32 {
         self.definition_version
     }
 
     pub fn definition_hash(&self) -> &str {
         &self.definition_hash
-    }
-
-    pub fn classifier_activity_policy(&self, activity: &str) -> Option<&WorkflowActivityPolicy> {
-        self.classifier_activity_policies.get(activity)
-    }
-
-    pub fn classifier_activity_policies(&self) -> &BTreeMap<String, WorkflowActivityPolicy> {
-        &self.classifier_activity_policies
-    }
-
-    pub fn requires_classifier_assessment(&self, state: &str) -> bool {
-        self.policy
-            .states
-            .get(state)
-            .and_then(|state| state.activity.as_deref())
-            .is_some_and(|activity| self.classifier_activity_policies.contains_key(activity))
     }
 
     pub fn into_registered(self) -> RegisteredWorkflowDefinition {
@@ -92,26 +88,19 @@ pub fn build_declarative_definition(
 
     let terminal_states = parse_terminal_states(policy)?;
     validate_active_states(policy, activity_policies)?;
+    let activity_contracts = resolve_referenced_agent_contracts(policy, activity_policies)?;
     validate_targets(policy, &terminal_states)?;
     validate_reachability(policy, &terminal_states)?;
 
     let states = compile_states(policy, &terminal_states);
     let allowlist = compile_allowlist(policy, &terminal_states);
-    let classifier_activity_policies = activity_policies
-        .iter()
-        .filter(|(_, policy)| policy.classifier.is_some())
-        .map(|(activity, policy)| (activity.clone(), policy.clone()))
-        .collect::<BTreeMap<_, _>>();
     let (definition_version, definition_hash) =
-        declarative_definition_identity_with_classifier_policies(
-            policy,
-            &classifier_activity_policies,
-        )?;
+        declarative_definition_identity(policy, &activity_contracts)?;
 
     Ok(DeclarativeWorkflowDefinition {
         registered: RegisteredWorkflowDefinition::new(&policy.id, states, allowlist),
         policy: policy.clone(),
-        classifier_activity_policies,
+        activity_contracts,
         definition_version,
         definition_hash,
     })
@@ -126,6 +115,15 @@ pub(crate) fn build_builtin_declarative_definition(
 
     let terminal_states = parse_terminal_states(policy)?;
     validate_active_states(policy, activity_policies)?;
+    let activity_contracts = resolve_referenced_agent_contracts(policy, activity_policies)?;
+    if let Some(activity) = activity_contracts.keys().next() {
+        anyhow::bail!(
+            "built-in workflow definition '{}' references activity '{}' with an agent_contract; \
+             agent contracts require a declarative definition so the contract participates in the pinned identity",
+            policy.id,
+            activity
+        );
+    }
     validate_targets(policy, &terminal_states)?;
     validate_reachability(policy, &terminal_states)?;
 
@@ -133,7 +131,7 @@ pub(crate) fn build_builtin_declarative_definition(
     Ok(DeclarativeWorkflowDefinition {
         registered: RegisteredWorkflowDefinition::new(&policy.id, states, allowlist),
         policy: policy.clone(),
-        classifier_activity_policies: BTreeMap::new(),
+        activity_contracts,
         definition_version: 1,
         definition_hash: format!("builtin:{}:v1", policy.id),
     })
@@ -334,22 +332,13 @@ fn validate_active_states(
                     state_name
                 );
             }
-            let Some(activity_policy) = activity_policies.get(activity) else {
+            if !activity_policies.contains_key(activity) {
                 anyhow::bail!(
                     "declarative workflow definition '{}' active state '{}' references activity '{}' absent from the workflow activities policy map",
                     policy.id,
                     state_name,
                     activity
                 );
-            };
-            if let Some(classifier) = activity_policy.classifier.as_ref() {
-                classifier.validate(activity)?;
-                classifier.validate_routes(
-                    activity,
-                    state.on_success.as_deref(),
-                    state.on_failure.as_deref(),
-                    &state.on_signal,
-                )?;
             }
         }
         if let Some(signal_type) = state
