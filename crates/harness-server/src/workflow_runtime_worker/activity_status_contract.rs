@@ -136,7 +136,11 @@ fn activity_status_contract_blockers(
 
     if !local_review_outcome_accepts_blockers {
         for artifact in &result.artifacts {
-            collect_structured_blockers(&artifact.artifact, &mut blockers, pr_feedback_repair);
+            collect_structured_blockers(
+                &artifact.artifact,
+                &mut blockers,
+                pr_feedback_repair && artifact.artifact_type == "pr_repair_snapshot",
+            );
         }
     }
 
@@ -209,6 +213,11 @@ fn collect_structured_blockers(
 ) {
     match value {
         Value::Object(object) => {
+            let blocked_merge_is_pending_checks = pr_feedback_repair
+                && object_value(object, "pending_checks").is_some_and(json_value_reports_blocker)
+                && object_value(object, "failed_checks")
+                    .or_else(|| object_value(object, "failing_checks"))
+                    .is_some_and(|value| !json_value_reports_blocker(value));
             for (key, value) in object {
                 let normalized_key = key.to_ascii_lowercase();
                 if BLOCKING_COUNT_FIELDS.contains(&normalized_key.as_str()) {
@@ -223,7 +232,8 @@ fn collect_structured_blockers(
                     }
                 } else if normalized_key == "merge_state_status" {
                     if json_string_is_one_of(value, BLOCKING_MERGE_STATES)
-                        && !(pr_feedback_repair && json_string_equals(value, "blocked"))
+                        && !(json_string_equals(value, "blocked")
+                            && blocked_merge_is_pending_checks)
                     {
                         push_unique(blockers, "field:merge_state_status_blocked");
                     }
@@ -240,6 +250,12 @@ fn collect_structured_blockers(
         }
         _ => {}
     }
+}
+
+fn object_value<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a Value> {
+    object
+        .iter()
+        .find_map(|(candidate, value)| candidate.eq_ignore_ascii_case(key).then_some(value))
 }
 
 fn json_value_reports_blocker(value: &Value) -> bool {
@@ -323,14 +339,10 @@ fn collect_textual_blockers(text: &str, blockers: &mut Vec<String>) {
 }
 
 fn contains_affirmative_blocker(normalized_text: &str, needle: &str) -> bool {
-    normalized_text
-        .split(['.', ';', '\n'])
-        .filter(|clause| clause.contains(needle))
-        .any(|clause| {
-            !clause.contains(&format!("no {needle}"))
-                && !clause.contains(&format!("no new {needle}"))
-                && !clause.contains(&format!("without {needle}"))
-        })
+    normalized_text.match_indices(needle).any(|(index, _)| {
+        let prefix = normalized_text[..index].trim_end();
+        !prefix.ends_with("no") && !prefix.ends_with("no new") && !prefix.ends_with("without")
+    })
 }
 
 fn push_unique(blockers: &mut Vec<String>, blocker: impl Into<String>) {

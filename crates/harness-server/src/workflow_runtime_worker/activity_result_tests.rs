@@ -392,6 +392,49 @@ fn pr_feedback_repair_keeps_actual_check_and_merge_blockers() {
 }
 
 #[test]
+fn pr_feedback_repair_allows_blocked_merge_state_only_for_proven_pending_checks() {
+    let pending = ActivityResult::succeeded("address_pr_feedback", "Repair pushed.").with_artifact(
+        ActivityArtifact::new(
+            "pr_repair_snapshot",
+            json!({
+                "fresh_pr_state": {
+                    "merge_state_status": "BLOCKED",
+                    "pending_checks": 2,
+                    "failed_checks": 0
+                }
+            }),
+        ),
+    );
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), pending);
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+
+    for fresh_pr_state in [
+        json!({ "merge_state_status": "BLOCKED", "failed_checks": 0 }),
+        json!({
+            "merge_state_status": "BLOCKED",
+            "pending_checks": 2
+        }),
+        json!({
+            "merge_state_status": "BLOCKED",
+            "pending_checks": 2,
+            "failed_checks": 1
+        }),
+    ] {
+        let claimed = ActivityResult::succeeded("address_pr_feedback", "Repair pushed.")
+            .with_artifact(ActivityArtifact::new(
+                "pr_repair_snapshot",
+                json!({ "fresh_pr_state": fresh_pr_state }),
+            ));
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    }
+}
+
+#[test]
 fn pr_feedback_repair_keeps_failed_checks_reported_only_in_summary() {
     let claimed = ActivityResult::succeeded(
         "address_pr_feedback",
@@ -444,6 +487,23 @@ fn negated_check_delta_does_not_hide_a_remaining_failed_check_clause() {
     let claimed = ActivityResult::succeeded(
         "address_pr_feedback",
         "No new failed checks were introduced; two failed checks remain.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:failing_checks"));
+}
+
+#[test]
+fn comma_joined_negated_check_delta_does_not_hide_a_remaining_failed_check_clause() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "No new failed checks were introduced, two failed checks remain.",
     );
 
     let (changed, result) =
