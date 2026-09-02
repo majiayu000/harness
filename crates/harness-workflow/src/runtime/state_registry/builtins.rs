@@ -161,6 +161,7 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
         terminal: terminal_states("done"),
         evidence_required: BTreeMap::new(),
         recovery_targets: vec![
+            "planning".to_string(),
             "implementing".to_string(),
             "replanning".to_string(),
             "local_review_gate".to_string(),
@@ -493,6 +494,15 @@ mod tests {
 
     #[test]
     fn github_issue_pr_builtin_preserves_the_transition_contract() {
+        let declarative = super::github_issue_pr_definition();
+        assert!(
+            declarative
+                .policy()
+                .recovery_targets
+                .iter()
+                .any(|target| target == "planning"),
+            "planning must be exposed as a recovery target"
+        );
         let definition = WorkflowDefinitionRegistry::with_builtins()
             .definition(crate::runtime::GITHUB_ISSUE_PR_DEFINITION_ID)
             .expect("github_issue_pr built-in must be registered");

@@ -142,10 +142,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         let workflow_document =
             harness_core::config::workflow::load_workflow_document(&source_project_root)?;
         let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
-        let agent_backend = agent_backend_for_runtime_kind(
-            &self.state.core.server.agent_registry,
-            job.runtime_kind,
-        )?;
         let runtime_profile = runtime_profile_with_timeout_fallback(
             runtime_profile_for_job(&job)?,
             &workflow_document.config,
@@ -267,6 +263,22 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     permission_profile.permission_mode,
                     &env_vars,
                 );
+                let force_code_agent_for_attempt = force_code_agent || correction_only;
+                let agent_backend = if force_code_agent_for_attempt {
+                    self.state
+                        .core
+                        .server
+                        .agent_registry
+                        .get(agent_name)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("runtime agent `{agent_name}` is not registered")
+                        })?
+                } else {
+                    agent_backend_for_runtime_kind(
+                        &self.state.core.server.agent_registry,
+                        job.runtime_kind,
+                    )?
+                };
                 if let Some(result) =
                     egress_evidence.provider_connectivity_failure(&activity, agent_backend.name())
                 {
@@ -338,7 +350,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         env_vars,
                         permission_mode: permission_profile.permission_mode,
                         allowed_tools: permission_profile.allowed_tools.clone(),
-                        force_code_agent: force_code_agent || correction_only,
+                        force_code_agent: force_code_agent_for_attempt,
                         runtime_usage: runtime_usage_context(
                             self.state,
                             &job,
