@@ -222,7 +222,7 @@ async fn runtime_recovery_unblocks_legacy_blocked_without_stop_metadata() -> any
     if resolve_database_url(None).is_err() { return Ok(()); }
     let dir = tempfile::tempdir()?; let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let legacy = project_issue_instance("/project-a", 1693, "blocked").with_server_data(json!({"project_id": "/project-a", "issue_number": 1693, "blocked_reason": "legacy blocked row without structured stop metadata", "source": "github"}));
-    store.force_upsert_lifecycle_state_for_test(&legacy).await?; let workflow = recovered_workflow(recover(&store, &legacy.id, super::WorkflowRuntimeRecoveryAction::Unblock).await?, "legacy unblock")?; assert_eq!(workflow.state, "implementing"); assert_eq!(workflow.data["blocked_reason"], legacy.data["blocked_reason"]); assert!(workflow.data.get("last_stop").is_none()); assert_operator_recovery_audit(&store, &legacy.id, "WorkflowRuntimeUnblocked", "unblock", "blocked", "implementing").await?;
+    store.force_upsert_lifecycle_state_for_test(&legacy).await?; let workflow = recovered_workflow(recover(&store, &legacy.id, super::WorkflowRuntimeRecoveryAction::Unblock).await?, "legacy unblock")?; assert_eq!(workflow.state, "implementing"); assert!(workflow.data.get("blocked_reason").is_none()); assert!(workflow.data.get("last_stop").is_none()); assert_operator_recovery_audit(&store, &legacy.id, "WorkflowRuntimeUnblocked", "unblock", "blocked", "implementing").await?;
     let commands = store.commands_for(&legacy.id).await?; assert_eq!(commands.len(), 1); assert_eq!(commands[0].status, WorkflowCommandStatus::Pending); let command = &commands[0].command; assert_eq!(command.command_type, WorkflowCommandType::EnqueueActivity); assert_eq!(command.activity_name(), Some("implement_issue")); assert_eq!(command.command["project_id"], "/project-a"); assert_eq!(command.command["issue_number"], 1693); assert_eq!(command.command["dispatch_gate"]["reason"], "operator_workflow_runtime_unblock"); assert!(command.command["additional_prompt"].as_str().is_some_and(|prompt| prompt.contains("Recovery reason: operator fixed transient failure"))); Ok(())
 }
 
@@ -580,6 +580,13 @@ async fn successful_runtime_recovery_clears_resolved_stop_metadata() -> anyhow::
             DataProvenance::Server,
         ),
         WorkflowDataWrite::set("reason_class", json!("terminal"), DataProvenance::Server),
+        WorkflowDataWrite::set("blocked_reason", json!("blocked"), DataProvenance::Agent),
+        WorkflowDataWrite::set("unblock_hint", json!("unblock"), DataProvenance::Agent),
+        WorkflowDataWrite::set("failure_reason", json!("failed"), DataProvenance::Agent),
+        WorkflowDataWrite::set("retry_hint", json!("retry"), DataProvenance::Agent),
+        WorkflowDataWrite::set("previous_error", json!("previous"), DataProvenance::Server),
+        WorkflowDataWrite::set("last_error", json!("last"), DataProvenance::Server),
+        WorkflowDataWrite::set("error", json!("error"), DataProvenance::Server),
         WorkflowDataWrite::set("last_stop", last_stop, DataProvenance::Server),
     ])?;
     store
@@ -600,6 +607,13 @@ async fn successful_runtime_recovery_clears_resolved_stop_metadata() -> anyhow::
         "stop_reason_code",
         "reason_class",
         "error_kind",
+        "blocked_reason",
+        "unblock_hint",
+        "failure_reason",
+        "retry_hint",
+        "previous_error",
+        "last_error",
+        "error",
     ] {
         assert!(
             recovered.data.get(field).is_none(),

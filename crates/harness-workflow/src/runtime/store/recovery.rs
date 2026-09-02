@@ -501,6 +501,20 @@ fn persist_operator_recovery_data(
             crate::runtime::DataProvenance::Server,
         ),
     ];
+    for field in [
+        "blocked_reason",
+        "unblock_hint",
+        "failure_reason",
+        "retry_hint",
+        "previous_error",
+        "last_error",
+        "error",
+    ] {
+        writes.push(crate::runtime::WorkflowDataWrite::remove(
+            field,
+            crate::runtime::DataProvenance::Server,
+        ));
+    }
     if reset_feedback_repair {
         for field in [
             "feedback_repair_round",
