@@ -141,16 +141,13 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         let workflow_document =
             harness_core::config::workflow::load_workflow_document(&source_project_root)?;
         let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
-        if self
+        let agent_backend = self
             .state
             .core
             .server
             .agent_registry
             .get(agent_name)
-            .is_none()
-        {
-            anyhow::bail!("runtime agent `{agent_name}` is not registered");
-        }
+            .ok_or_else(|| anyhow::anyhow!("runtime agent `{agent_name}` is not registered"))?;
         let runtime_profile = runtime_profile_with_timeout_fallback(
             runtime_profile_for_job(&job)?,
             &workflow_document.config,
@@ -295,7 +292,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     permission_profile.permission_mode,
                     &env_vars,
                 );
-                if let Some(result) = egress_evidence.provider_connectivity_failure(&activity) {
+                if let Some(result) =
+                    egress_evidence.provider_connectivity_failure(&activity, agent_backend.name())
+                {
                     return Ok(result
                         .with_artifact(
                             permission_profile

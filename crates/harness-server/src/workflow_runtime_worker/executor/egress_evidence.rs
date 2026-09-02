@@ -77,11 +77,13 @@ impl AgentEgressEvidence {
         }
     }
 
-    pub(super) fn validate_provider_connectivity(&self) -> anyhow::Result<()> {
-        if matches!(
-            self.runtime_kind,
-            RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
-        ) && self.mode == RecordedEgressMode::DenyAll
+    pub(super) fn validate_provider_connectivity(&self, backend_name: &str) -> anyhow::Result<()> {
+        if backend_name == "codex"
+            && matches!(
+                self.runtime_kind,
+                RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
+            )
+            && self.mode == RecordedEgressMode::DenyAll
         {
             anyhow::bail!(
                 "scoped Codex runtime cannot reach its model provider with deny-all egress; configure exact provider hosts in isolation.network_allowlist"
@@ -90,15 +92,21 @@ impl AgentEgressEvidence {
         Ok(())
     }
 
-    pub(super) fn provider_connectivity_failure(&self, activity: &str) -> Option<ActivityResult> {
-        self.validate_provider_connectivity().err().map(|error| {
-            ActivityResult::failed(
-                activity,
-                "Runtime provider connectivity preflight failed.",
-                error.to_string(),
-            )
-            .with_error_kind(ActivityErrorKind::Configuration)
-        })
+    pub(super) fn provider_connectivity_failure(
+        &self,
+        activity: &str,
+        backend_name: &str,
+    ) -> Option<ActivityResult> {
+        self.validate_provider_connectivity(backend_name)
+            .err()
+            .map(|error| {
+                ActivityResult::failed(
+                    activity,
+                    "Runtime provider connectivity preflight failed.",
+                    error.to_string(),
+                )
+                .with_error_kind(ActivityErrorKind::Configuration)
+            })
     }
 
     pub(super) fn artifact(
@@ -201,7 +209,7 @@ mod tests {
         );
 
         let result = evidence
-            .provider_connectivity_failure("run_local_review")
+            .provider_connectivity_failure("run_local_review", "codex")
             .expect("scoped Codex cannot reach its provider through deny-all egress");
 
         assert_eq!(
@@ -216,6 +224,19 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("network_allowlist")));
+    }
+
+    #[test]
+    fn codex_runtime_profile_does_not_reclassify_a_simulated_backend() {
+        let evidence = AgentEgressEvidence::from_spawn_env(
+            RuntimeKind::CodexJsonrpc,
+            AgentPermissionMode::Scoped,
+            &HashMap::new(),
+        );
+
+        assert!(evidence
+            .provider_connectivity_failure("implement_issue", "runtime-stream-agent")
+            .is_none());
     }
 
     #[test]
