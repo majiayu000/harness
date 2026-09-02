@@ -350,6 +350,48 @@ fn activity_result_from_turn_downgrades_succeeded_with_textual_blockers() {
 }
 
 #[test]
+fn pr_feedback_repair_can_return_while_new_checks_are_pending() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Pushed the repair. No new failed checks; CI is still in progress.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "pr_repair_snapshot",
+        json!({
+            "fresh_pr_state": {
+                "mergeable": "MERGEABLE",
+                "merge_state_status": "BLOCKED",
+                "pending_checks": 5,
+                "failed_checks": 0
+            }
+        }),
+    ));
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+}
+
+#[test]
+fn pr_feedback_repair_keeps_actual_check_and_merge_blockers() {
+    for artifact in [
+        json!({ "failed_checks": 1 }),
+        json!({ "merge_state_status": "DIRTY" }),
+    ] {
+        let claimed = ActivityResult::succeeded("address_pr_feedback", "Repair result recorded.")
+            .with_artifact(ActivityArtifact::new("pr_repair_snapshot", artifact));
+
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    }
+}
+
+#[test]
 fn activity_result_from_turn_preserves_prompt_nonzero_validation_report() {
     let job = RuntimeJob::pending(
         "command-1",

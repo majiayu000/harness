@@ -46,6 +46,7 @@ const BLOCKING_MERGE_STATES: &[&str] = &["blocked", "dirty", "unknown", "unstabl
 
 /// The reconciled outcome name recorded in the contract artifact.
 const RECONCILED_OUTCOME: &str = "succeeded_with_blockers";
+const PR_FEEDBACK_REPAIR_ACTIVITY: &str = "address_pr_feedback";
 
 pub(super) fn enforce_activity_status_contract(
     workflow_definition: Option<&str>,
@@ -119,6 +120,8 @@ fn activity_status_contract_blockers(
         local_review_outcome,
         Some(LocalReviewOutcome::ChangesRequested | LocalReviewOutcome::Blocked)
     );
+    let pr_feedback_repair = workflow_definition == Some(GITHUB_ISSUE_PR_DEFINITION_ID)
+        && result.activity == PR_FEEDBACK_REPAIR_ACTIVITY;
 
     for signal in &result.signals {
         if local_review_outcome.is_some()
@@ -133,12 +136,12 @@ fn activity_status_contract_blockers(
 
     if !local_review_outcome_accepts_blockers {
         for artifact in &result.artifacts {
-            collect_structured_blockers(&artifact.artifact, &mut blockers);
+            collect_structured_blockers(&artifact.artifact, &mut blockers, pr_feedback_repair);
         }
     }
 
     let mut summary_blockers = Vec::new();
-    if !local_review_outcome_accepts_blockers {
+    if !local_review_outcome_accepts_blockers && !pr_feedback_repair {
         collect_textual_blockers(&result.summary, &mut summary_blockers);
     }
     if workflow_definition == Some(PROMPT_TASK_DEFINITION_ID)
@@ -196,13 +199,19 @@ fn is_local_review_outcome_signal(signal_type: &str) -> bool {
     )
 }
 
-fn collect_structured_blockers(value: &Value, blockers: &mut Vec<String>) {
+fn collect_structured_blockers(
+    value: &Value,
+    blockers: &mut Vec<String>,
+    pr_feedback_repair: bool,
+) {
     match value {
         Value::Object(object) => {
             for (key, value) in object {
                 let normalized_key = key.to_ascii_lowercase();
                 if BLOCKING_COUNT_FIELDS.contains(&normalized_key.as_str()) {
-                    if json_value_reports_blocker(value) {
+                    if !(pr_feedback_repair && normalized_key == "pending_checks")
+                        && json_value_reports_blocker(value)
+                    {
                         push_unique(blockers, format!("field:{normalized_key}"));
                     }
                 } else if normalized_key == "review_decision" {
@@ -210,18 +219,20 @@ fn collect_structured_blockers(value: &Value, blockers: &mut Vec<String>) {
                         push_unique(blockers, "field:review_decision_changes_requested");
                     }
                 } else if normalized_key == "merge_state_status" {
-                    if json_string_is_one_of(value, BLOCKING_MERGE_STATES) {
+                    if json_string_is_one_of(value, BLOCKING_MERGE_STATES)
+                        && !(pr_feedback_repair && json_string_equals(value, "blocked"))
+                    {
                         push_unique(blockers, "field:merge_state_status_blocked");
                     }
                 } else if normalized_key == "mergeable" && value.as_bool() == Some(false) {
                     push_unique(blockers, "field:mergeable_false");
                 }
-                collect_structured_blockers(value, blockers);
+                collect_structured_blockers(value, blockers, pr_feedback_repair);
             }
         }
         Value::Array(values) => {
             for value in values {
-                collect_structured_blockers(value, blockers);
+                collect_structured_blockers(value, blockers, pr_feedback_repair);
             }
         }
         _ => {}
