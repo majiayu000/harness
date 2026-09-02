@@ -122,6 +122,7 @@ pub(super) async fn execute_contract_attempts(
                             }
                             Err(error) => (error, String::new(), None),
                         };
+                    let error_kind = contract_attempt_failure_kind(&error);
                     let error = error.to_string();
                     record_attempt_completed(
                         store,
@@ -157,7 +158,7 @@ pub(super) async fn execute_contract_attempts(
                         "Agent contract attempt failed before producing a verdict.",
                         &error,
                     )
-                    .with_error_kind(contract_attempt_failure_kind(&error));
+                    .with_error_kind(error_kind);
                     result.artifacts = observations;
                     return Ok(result);
                 }

@@ -38,6 +38,9 @@ pub enum HarnessError {
     #[error("agent execution failed: {0}")]
     AgentExecution(String),
 
+    #[error("agent upstream failure: {0}")]
+    Upstream(String),
+
     #[error("agent quota exhausted: {0}")]
     QuotaExhausted(String),
 
@@ -149,6 +152,13 @@ impl HarnessError {
             }),
             HarnessError::BillingFailed(message) => Some(TurnFailure {
                 kind: TurnFailureKind::Billing,
+                provider: provider_from_message(message),
+                upstream_status: parse_upstream_status(message),
+                message: Some(message.clone()),
+                body_excerpt: excerpt_after_colon(message),
+            }),
+            HarnessError::Upstream(message) => Some(TurnFailure {
+                kind: TurnFailureKind::Upstream,
                 provider: provider_from_message(message),
                 upstream_status: parse_upstream_status(message),
                 message: Some(message.clone()),
@@ -277,12 +287,6 @@ pub fn is_quota_failure_message(message: &str) -> bool {
         || lower.contains("quota reset")
 }
 
-pub fn is_provider_capacity_failure_message(message: &str) -> bool {
-    message
-        .to_ascii_lowercase()
-        .contains("selected model is at capacity")
-}
-
 fn provider_from_message(message: &str) -> Option<String> {
     if let Some(rest) = message.strip_prefix("failed to run ") {
         return rest
@@ -387,12 +391,14 @@ mod tests {
     }
 
     #[test]
-    fn selected_model_capacity_is_a_transient_provider_failure() {
-        assert!(is_provider_capacity_failure_message(
-            "Selected model is at capacity. Please try a different model."
-        ));
-        assert!(!is_provider_capacity_failure_message(
-            "model configuration is invalid"
-        ));
+    fn structured_upstream_failure_preserves_transport_classification() {
+        let failure = HarnessError::Upstream(
+            "codex structured error: provider temporarily unavailable".to_string(),
+        )
+        .turn_failure()
+        .expect("turn failure");
+
+        assert_eq!(failure.kind, TurnFailureKind::Upstream);
+        assert_eq!(failure.provider.as_deref(), Some("codex"));
     }
 }

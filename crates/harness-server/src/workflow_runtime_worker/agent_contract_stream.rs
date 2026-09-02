@@ -1,5 +1,6 @@
 //! Stream execution and accounting for one pinned agent-contract attempt.
 
+use anyhow::Context as _;
 use harness_core::agent::{AgentBackend, AgentEvent, AgentRequest, AGENT_OUTPUT_SCHEMA_PATH_ENV};
 use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::workflow::agent_contract_output_schema_document;
@@ -215,7 +216,8 @@ pub(super) async fn execute_agent_contract_attempt(
     }
     if let Err(error) = stream_result
         .map_err(|error| anyhow::anyhow!("contract attempt stream task panicked: {error}"))?
-        .map_err(|error| anyhow::anyhow!("contract attempt launch failed: {error}"))
+        .map_err(anyhow::Error::new)
+        .context("contract attempt launch failed")
     {
         return Err(ContractAttemptFailure::new(attempt, error).into());
     }

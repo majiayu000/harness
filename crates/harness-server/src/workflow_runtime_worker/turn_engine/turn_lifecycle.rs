@@ -325,6 +325,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     "Agent stream stalled: no output for {}s",
                     stall_timeout.as_secs()
                 ))));
+                terminate_execution_after_drop = executes_via_adapter;
                 break 'outer;
             }
             _ = async {
@@ -402,7 +403,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 tracing::error!(
                     thread_id = %thread_id,
                     turn_id = %turn_id,
-                    "failed to force-stop and drain agent after lease loss: {error}"
+                    "failed to force-stop and drain interrupted agent execution: {error}"
                 );
             }
         }

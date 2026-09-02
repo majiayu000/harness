@@ -32,7 +32,8 @@ use super::prompt_packet::{
 };
 use super::repo_memory_prompt::{repo_memory_config_artifact, repo_memory_for_prompt_packet};
 use super::runtime_profile::{
-    agent_name_for_runtime_kind, resolve_runtime_settings, runtime_profile_for_job,
+    agent_backend_for_runtime_kind, agent_name_for_runtime_kind, resolve_runtime_settings,
+    runtime_profile_for_job,
 };
 use super::runtime_turn_control::{force_code_agent_for_runtime_turn, RuntimeTurnAliasGuard};
 use super::runtime_usage::runtime_usage_context;
@@ -141,13 +142,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         let workflow_document =
             harness_core::config::workflow::load_workflow_document(&source_project_root)?;
         let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
-        let agent_backend = self
-            .state
-            .core
-            .server
-            .agent_registry
-            .get(agent_name)
-            .ok_or_else(|| anyhow::anyhow!("runtime agent `{agent_name}` is not registered"))?;
+        let agent_backend = agent_backend_for_runtime_kind(
+            &self.state.core.server.agent_registry,
+            job.runtime_kind,
+        )?;
         let runtime_profile = runtime_profile_with_timeout_fallback(
             runtime_profile_for_job(&job)?,
             &workflow_document.config,
@@ -190,7 +188,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         lease_lost.send_replace(true);
                     })
                 });
-        let activity = async {
+        let execution = async {
             let project_root = runtime_workspace.run_project.clone();
             let memory_enabled = workflow_document.config.memory.enabled;
             let repo_memory = repo_memory_for_prompt_packet(
@@ -243,29 +241,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     &prompt,
                 )
                 .await;
-                let thread_id = self
-                    .state
-                    .core
-                    .server
-                    .thread_manager
-                    .start_thread(project_root.clone());
-                let turn_id = self.state.core.server.thread_manager.start_turn(
-                    &thread_id,
-                    prompt.clone(),
-                    AgentId::from_str(agent_name),
-                )?;
-                let _runtime_turn_alias_guard = workflow
-                    .as_ref()
-                    .and_then(|workflow| {
-                        crate::workflow_runtime_submission::runtime_issue_task_handle(workflow)
-                    })
-                    .map(|submission_id| {
-                        RuntimeTurnAliasGuard::register(
-                            self.state.core.server.clone(),
-                            submission_id.0,
-                            turn_id.clone(),
-                        )
-                    });
                 let correction_only = attempt > 0 && correction_retry.is_some();
                 let mut env_vars = if correction_only {
                     correction_spawn_env_vars(&job)
@@ -302,6 +277,29 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         )
                         .with_artifact(egress_evidence.artifact(&[], false, attempt + 1)));
                 }
+                let thread_id = self
+                    .state
+                    .core
+                    .server
+                    .thread_manager
+                    .start_thread(project_root.clone());
+                let turn_id = self.state.core.server.thread_manager.start_turn(
+                    &thread_id,
+                    prompt.clone(),
+                    AgentId::from_str(agent_name),
+                )?;
+                let _runtime_turn_alias_guard = workflow
+                    .as_ref()
+                    .and_then(|workflow| {
+                        crate::workflow_runtime_submission::runtime_issue_task_handle(workflow)
+                    })
+                    .map(|submission_id| {
+                        RuntimeTurnAliasGuard::register(
+                            self.state.core.server.clone(),
+                            submission_id.0,
+                            turn_id.clone(),
+                        )
+                    });
                 let egress_verified_at_dispatch = Arc::new(AtomicBool::new(false));
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
@@ -452,7 +450,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             }
             unreachable!("bounded structured-output retry loop always returns")
         };
-        let activity_result: anyhow::Result<ActivityResult> = activity.await;
+        let activity_result: anyhow::Result<ActivityResult> = execution.await;
         if let Some(forwarder) = repository_lease_forwarder {
             forwarder.abort();
         }

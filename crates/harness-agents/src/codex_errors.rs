@@ -16,7 +16,7 @@ pub(super) fn codex_structured_error(
     if harness_core::error::is_quota_failure_message(&message) {
         return harness_core::error::HarnessError::QuotaExhausted(message);
     }
-    harness_core::error::HarnessError::AgentExecution(message)
+    harness_core::error::HarnessError::Upstream(message)
 }
 
 pub(super) fn codex_nonzero_exit_error(
@@ -37,12 +37,11 @@ pub(super) fn codex_nonzero_exit_error(
 
     if let Some(message) = structured_error {
         let mut error = codex_structured_error(format!("exit {status}: {message}"));
-        if matches!(error, harness_core::error::HarnessError::AgentExecution(_))
+        if matches!(error, harness_core::error::HarnessError::Upstream(_))
             && !stderr.trim().is_empty()
         {
-            error = harness_core::error::HarnessError::AgentExecution(format!(
-                "{error}; stderr=[{stderr}]"
-            ));
+            error =
+                harness_core::error::HarnessError::Upstream(format!("{error}; stderr=[{stderr}]"));
         }
         return error;
     }

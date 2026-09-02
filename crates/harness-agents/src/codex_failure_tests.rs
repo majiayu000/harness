@@ -93,3 +93,36 @@ exit 1
         harness_core::types::TurnFailureKind::Quota
     );
 }
+
+#[tokio::test]
+async fn execute_stream_preserves_non_quota_structured_error_as_upstream() {
+    let (dir, script) = write_executable_script(
+        r#"
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-1"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"error","message":"provider cannot currently serve this request"}'
+exit 1
+"#,
+    );
+    let agent = CodexAgent::new(script, SandboxMode::DangerFullAccess);
+    let request = AgentRequest {
+        prompt: "ignored".to_string(),
+        project_root: dir.path().to_path_buf(),
+        ..AgentRequest::default()
+    };
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let err = agent
+        .execute_stream(request, tx)
+        .await
+        .expect_err("stream execution should fail");
+
+    assert!(matches!(
+        err,
+        harness_core::error::HarnessError::Upstream(_)
+    ));
+    assert_eq!(
+        err.turn_failure().expect("turn failure").kind,
+        harness_core::types::TurnFailureKind::Upstream
+    );
+}

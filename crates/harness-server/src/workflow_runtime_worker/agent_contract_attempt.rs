@@ -18,7 +18,8 @@ use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 #[cfg(test)]
 use harness_core::config::workflow::agent_contract_output_schema_document;
 use harness_core::config::workflow::{validate_agent_contract_output, WorkflowAgentContract};
-use harness_core::types::Item;
+use harness_core::error::HarnessError;
+use harness_core::types::{Item, TurnFailureKind};
 use harness_workflow::runtime::ActivityErrorKind;
 #[cfg(test)]
 use harness_workflow::runtime::ActivityResult;
@@ -61,8 +62,18 @@ pub(super) struct ContractVerdict {
     pub(super) raw: Value,
 }
 
-pub(super) fn contract_attempt_failure_kind(error: &str) -> ActivityErrorKind {
-    if harness_core::error::is_provider_capacity_failure_message(error) {
+pub(super) fn contract_attempt_failure_kind(error: &anyhow::Error) -> ActivityErrorKind {
+    if error
+        .chain()
+        .find_map(|source| source.downcast_ref::<HarnessError>())
+        .and_then(HarnessError::turn_failure)
+        .is_some_and(|failure| {
+            matches!(
+                failure.kind,
+                TurnFailureKind::Timeout | TurnFailureKind::Quota | TurnFailureKind::Upstream
+            )
+        })
+    {
         ActivityErrorKind::Retryable
     } else {
         ActivityErrorKind::Fatal
@@ -192,15 +203,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_capacity_failure_is_retryable_without_relaxing_contract_attempts() {
+    fn typed_upstream_failure_is_retryable_without_matching_provider_prose() {
+        let upstream = anyhow::Error::new(HarnessError::Upstream(
+            "codex structured error: provider cannot currently serve this request".to_string(),
+        ))
+        .context("contract attempt launch failed");
         assert_eq!(
-            contract_attempt_failure_kind(
-                "contract attempt launch failed: Selected model is at capacity. Please try a different model."
-            ),
+            contract_attempt_failure_kind(&upstream),
             ActivityErrorKind::Retryable
         );
         assert_eq!(
-            contract_attempt_failure_kind("contract attempt launch failed: malformed response"),
+            contract_attempt_failure_kind(&anyhow::anyhow!("malformed response")),
             ActivityErrorKind::Fatal
         );
     }

@@ -6,11 +6,16 @@ use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
 use harness_core::config::HarnessConfig;
 use harness_core::error::HarnessError;
 use harness_core::types::{AgentId, Capability, Item, TokenUsage, TurnStatus};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 struct SilentLifecycleAgent;
 
-struct WarningSpamLifecycleAgent;
+struct WarningSpamLifecycleAgent {
+    terminate_calls: Option<Arc<AtomicUsize>>,
+}
 
 #[async_trait]
 impl CodeAgent for SilentLifecycleAgent {
@@ -71,6 +76,21 @@ impl CodeAgent for WarningSpamLifecycleAgent {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
+
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.execute_stream(req, tx).await
+    }
+
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        if let Some(calls) = self.terminate_calls.as_ref() {
+            calls.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -130,7 +150,19 @@ async fn lifecycle_diagnostics_do_not_hide_a_stream_stall() -> anyhow::Result<()
     config.agents.default_agent = "codex".to_string();
 
     let mut registry = AgentRegistry::new("codex");
-    registry.register("codex", Arc::new(WarningSpamLifecycleAgent));
+    registry.register(
+        "codex",
+        Arc::new(WarningSpamLifecycleAgent {
+            terminate_calls: None,
+        }),
+    );
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_factory = Arc::clone(&terminate_calls);
+    registry.register_turn_backend_factory("codex", move || {
+        Arc::new(WarningSpamLifecycleAgent {
+            terminate_calls: Some(Arc::clone(&calls_for_factory)),
+        })
+    })?;
     let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
     let thread_id = server
         .thread_manager
@@ -153,7 +185,6 @@ async fn lifecycle_diagnostics_do_not_hide_a_stream_stall() -> anyhow::Result<()
         TurnLifecycleOptions {
             timeout_secs: Some(2),
             stall_timeout_secs: Some(1),
-            force_code_agent: true,
             ..TurnLifecycleOptions::default()
         },
     )
@@ -172,6 +203,11 @@ async fn lifecycle_diagnostics_do_not_hide_a_stream_stall() -> anyhow::Result<()
         item,
         Item::Error { message, .. } if message.contains("Agent turn timed out")
     )));
+    assert_eq!(
+        terminate_calls.load(Ordering::Acquire),
+        1,
+        "a stalled turn adapter must terminate before the turn is marked failed"
+    );
     Ok(())
 }
 
