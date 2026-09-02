@@ -256,7 +256,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         }
                     }
                     Some(item) => {
-                        last_activity = Instant::now();
+                        if stream_item_resets_stall_timer(&item) {
+                            last_activity = Instant::now();
+                        }
                         if let StreamItem::Error { message } = &item {
                             stream_error.get_or_insert_with(|| message.clone());
                         }
@@ -501,4 +503,11 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             .await;
         }
     }
+}
+
+fn stream_item_resets_stall_timer(item: &StreamItem) -> bool {
+    !matches!(
+        item,
+        StreamItem::Warning { .. } | StreamItem::Diagnostic { .. }
+    )
 }

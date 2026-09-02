@@ -1,7 +1,7 @@
 use harness_core::agent::{AgentEgressMode, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
 use harness_core::config::agents::AgentPermissionMode;
 use harness_core::types::Item;
-use harness_workflow::runtime::{ActivityArtifact, RuntimeKind};
+use harness_workflow::runtime::{ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeKind};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -75,6 +75,30 @@ impl AgentEgressEvidence {
             network_allowlist,
             isolation_tier,
         }
+    }
+
+    pub(super) fn validate_provider_connectivity(&self) -> anyhow::Result<()> {
+        if matches!(
+            self.runtime_kind,
+            RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
+        ) && self.mode == RecordedEgressMode::DenyAll
+        {
+            anyhow::bail!(
+                "scoped Codex runtime cannot reach its model provider with deny-all egress; configure exact provider hosts in isolation.network_allowlist"
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn provider_connectivity_failure(&self, activity: &str) -> Option<ActivityResult> {
+        self.validate_provider_connectivity().err().map(|error| {
+            ActivityResult::failed(
+                activity,
+                "Runtime provider connectivity preflight failed.",
+                error.to_string(),
+            )
+            .with_error_kind(ActivityErrorKind::Configuration)
+        })
     }
 
     pub(super) fn artifact(
@@ -166,6 +190,32 @@ mod tests {
                 "runtime_kind": "codex_jsonrpc",
             })
         );
+    }
+
+    #[test]
+    fn scoped_codex_turn_rejects_empty_provider_allowlist_before_launch() {
+        let evidence = AgentEgressEvidence::from_spawn_env(
+            RuntimeKind::CodexExec,
+            AgentPermissionMode::Scoped,
+            &HashMap::new(),
+        );
+
+        let result = evidence
+            .provider_connectivity_failure("run_local_review")
+            .expect("scoped Codex cannot reach its provider through deny-all egress");
+
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert_eq!(
+            result.error_kind,
+            Some(harness_workflow::runtime::ActivityErrorKind::Configuration)
+        );
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("network_allowlist")));
     }
 
     #[test]

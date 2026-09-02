@@ -295,6 +295,14 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     permission_profile.permission_mode,
                     &env_vars,
                 );
+                if let Some(result) = egress_evidence.provider_connectivity_failure(&activity) {
+                    return Ok(result
+                        .with_artifact(
+                            permission_profile
+                                .artifact(resolved_settings.capability_profile, attempt + 1),
+                        )
+                        .with_artifact(egress_evidence.artifact(&[], false, attempt + 1)));
+                }
                 let egress_verified_at_dispatch = Arc::new(AtomicBool::new(false));
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(

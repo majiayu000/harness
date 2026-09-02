@@ -19,8 +19,9 @@ use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::workflow::agent_contract_output_schema_document;
 use harness_core::config::workflow::{validate_agent_contract_output, WorkflowAgentContract};
 use harness_core::types::Item;
+use harness_workflow::runtime::ActivityErrorKind;
 #[cfg(test)]
-use harness_workflow::runtime::{ActivityErrorKind, ActivityResult};
+use harness_workflow::runtime::ActivityResult;
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
@@ -58,6 +59,14 @@ impl ContractAttempt {
 pub(super) struct ContractVerdict {
     pub(super) outcome: String,
     pub(super) raw: Value,
+}
+
+pub(super) fn contract_attempt_failure_kind(error: &str) -> ActivityErrorKind {
+    if harness_core::error::is_provider_capacity_failure_message(error) {
+        ActivityErrorKind::Retryable
+    } else {
+        ActivityErrorKind::Fatal
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +190,20 @@ pub(super) fn parse_contract_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_capacity_failure_is_retryable_without_relaxing_contract_attempts() {
+        assert_eq!(
+            contract_attempt_failure_kind(
+                "contract attempt launch failed: Selected model is at capacity. Please try a different model."
+            ),
+            ActivityErrorKind::Retryable
+        );
+        assert_eq!(
+            contract_attempt_failure_kind("contract attempt launch failed: malformed response"),
+            ActivityErrorKind::Fatal
+        );
+    }
     use async_trait::async_trait;
     use harness_workflow::runtime::ActivityStatus;
     use std::sync::atomic::{AtomicBool, Ordering};

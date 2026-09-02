@@ -277,6 +277,12 @@ pub fn is_quota_failure_message(message: &str) -> bool {
         || lower.contains("quota reset")
 }
 
+pub fn is_provider_capacity_failure_message(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("selected model is at capacity")
+}
+
 fn provider_from_message(message: &str) -> Option<String> {
     if let Some(rest) = message.strip_prefix("failed to run ") {
         return rest
@@ -378,5 +384,15 @@ mod tests {
             failure.message.as_deref(),
             Some("Agent stream stalled: no output for 600s")
         );
+    }
+
+    #[test]
+    fn selected_model_capacity_is_a_transient_provider_failure() {
+        assert!(is_provider_capacity_failure_message(
+            "Selected model is at capacity. Please try a different model."
+        ));
+        assert!(!is_provider_capacity_failure_message(
+            "model configuration is invalid"
+        ));
     }
 }

@@ -10,7 +10,9 @@ use harness_workflow::runtime::{
 use std::sync::Arc;
 
 use super::agent_contract_assessment::attach_server_assessment;
-use super::agent_contract_attempt::{contract_violations, parse_contract_verdict};
+use super::agent_contract_attempt::{
+    contract_attempt_failure_kind, contract_violations, parse_contract_verdict,
+};
 use super::agent_contract_enforcement::{turn_observation_artifact, PinnedJobAgentContract};
 use super::agent_contract_stream::{
     budget_stop_artifact, enforced_budget_cost_error, execute_agent_contract_attempt,
@@ -153,9 +155,9 @@ pub(super) async fn execute_contract_attempts(
                     let mut result = ActivityResult::failed(
                         activity,
                         "Agent contract attempt failed before producing a verdict.",
-                        error,
+                        &error,
                     )
-                    .with_error_kind(ActivityErrorKind::Fatal);
+                    .with_error_kind(contract_attempt_failure_kind(&error));
                     result.artifacts = observations;
                     return Ok(result);
                 }
