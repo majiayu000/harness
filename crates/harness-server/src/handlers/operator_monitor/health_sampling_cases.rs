@@ -377,11 +377,7 @@ async fn endpoint_includes_failed_runtime_workflows_without_legacy_tasks() -> an
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-failed-runtime-")?;
     let mut state = test_helpers::make_test_state(dir.path()).await?;
     let workflow_runtime_store = Arc::new(
-        WorkflowRuntimeStore::open_with_database_url(
-            &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-            Some(&test_helpers::test_database_url()?),
-        )
-        .await?,
+        open_operator_workflow_store(dir.path()).await?,
     );
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &workflow_runtime_store,
@@ -435,11 +431,7 @@ async fn endpoint_includes_config_enabled_stuck_workflows() -> anyhow::Result<()
     )?;
     let mut state = test_helpers::make_test_state(dir.path()).await?;
     let workflow_runtime_store = Arc::new(
-        WorkflowRuntimeStore::open_with_database_url(
-            &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-            Some(&test_helpers::test_database_url()?),
-        )
-        .await?,
+        open_operator_workflow_store(dir.path()).await?,
     );
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &workflow_runtime_store,
@@ -498,11 +490,7 @@ async fn endpoint_surfaces_malformed_workflow_config_as_degraded_health() -> any
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-bad-config-")?;
     let mut state = test_helpers::make_test_state(dir.path()).await?;
     state.core.workflow_runtime_store = Some(Arc::new(
-        WorkflowRuntimeStore::open_with_database_url(
-            &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-            Some(&test_helpers::test_database_url()?),
-        )
-        .await?,
+        open_operator_workflow_store(dir.path()).await?,
     ));
     std::fs::write(dir.path().join("WORKFLOW.md"), "---\nstorage: [\n---\n")?;
 
@@ -538,11 +526,7 @@ async fn endpoint_surfaces_malformed_workflow_config_as_degraded_health() -> any
 async fn recent_failed_workflow_sampling_prefers_newest_rows() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-recent-failed-")?;
-    let workflow_runtime_store = WorkflowRuntimeStore::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-        Some(&test_helpers::test_database_url()?),
-    )
-    .await?;
+    let workflow_runtime_store = open_operator_workflow_store(dir.path()).await?;
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &workflow_runtime_store,
         &WorkflowInstance::new(
@@ -592,11 +576,7 @@ async fn runtime_workflow_sampling_fetches_action_states_before_definition_cap(
 ) -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-action-cap-")?;
-    let workflow_runtime_store = WorkflowRuntimeStore::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-        Some(&test_helpers::test_database_url()?),
-    )
-    .await?;
+    let workflow_runtime_store = open_operator_workflow_store(dir.path()).await?;
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
         &workflow_runtime_store,
         &workflow(

@@ -277,11 +277,7 @@ async fn stopped_action_eligibility_matches_recovery_contract_rejections() -> an
 
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-stopped-action-eligibility-")?;
-    let store = WorkflowRuntimeStore::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-        Some(&test_helpers::test_database_url()?),
-    )
-    .await?;
+    let store = open_operator_workflow_store(dir.path()).await?;
 
     let legacy_blocked = store_workflow(
         &store,
@@ -581,11 +577,7 @@ async fn attach_recovery_source_job(
 async fn operator_action_age_uses_store_updated_at() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-action-age-")?;
-    let workflow_runtime_store = WorkflowRuntimeStore::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-        Some(&test_helpers::test_database_url()?),
-    )
-    .await?;
+    let workflow_runtime_store = open_operator_workflow_store(dir.path()).await?;
     let mut ready = workflow(
         "ready_to_merge",
         json!({

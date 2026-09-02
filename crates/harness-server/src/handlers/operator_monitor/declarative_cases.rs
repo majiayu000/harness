@@ -238,10 +238,7 @@ async fn declarative_operator_gate_sampling_uses_registry_progress() -> anyhow::
         .expect("visibility fixture definition should be registered");
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-gate-progress-")?;
-    let store = WorkflowRuntimeStore::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-        Some(&test_helpers::test_database_url()?),
-    )
+    let store = open_operator_workflow_store(dir.path())
     .await?
     .with_definition_registry(registry.into_shared());
     crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
@@ -277,10 +274,7 @@ async fn declarative_definition_instances_are_visible_in_operator_monitor() -> a
 
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-declarative-")?;
-    let store = WorkflowRuntimeStore::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-        Some(&test_helpers::test_database_url()?),
-    )
+    let store = open_operator_workflow_store(dir.path())
     .await?
     .with_definition_registry(registry.into_shared());
 
@@ -323,10 +317,7 @@ async fn declarative_terminal_queries_use_pinned_versions_and_outcomes() -> anyh
 
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-operator-monitor-terminal-outcomes-")?;
-    let store = WorkflowRuntimeStore::open_with_database_url(
-        &harness_core::config::dirs::default_db_path(dir.path(), "workflow_runtime"),
-        Some(&test_helpers::test_database_url()?),
-    )
+    let store = open_operator_workflow_store(dir.path())
     .await?
     .with_definition_registry(registry.into_shared());
     for (id, definition, state) in [
