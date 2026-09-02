@@ -1,5 +1,6 @@
 use super::{has_no_structured_stop_metadata, select_instance_tx};
 use crate::runtime::model::{WorkflowCommand, WorkflowCommandType};
+use crate::runtime::plan_issue::ISSUE_PLAN_ACTIVITY;
 use crate::runtime::pr_feedback::{
     LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
@@ -44,6 +45,10 @@ pub(super) fn recovery_dispatch_target(
         return Ok(Err(activity));
     };
     let target = match activity_name {
+        ISSUE_PLAN_ACTIVITY => RecoveryDispatchTarget {
+            state: "planning".to_string(),
+            activity: Some(ISSUE_PLAN_ACTIVITY.to_string()),
+        },
         "implement_issue" => RecoveryDispatchTarget {
             state: "implementing".to_string(),
             activity: Some("implement_issue".to_string()),

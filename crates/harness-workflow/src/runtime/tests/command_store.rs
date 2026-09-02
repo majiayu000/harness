@@ -226,6 +226,66 @@ async fn runtime_recovery_unblocks_legacy_blocked_without_stop_metadata() -> any
     let commands = store.commands_for(&legacy.id).await?; assert_eq!(commands.len(), 1); assert_eq!(commands[0].status, WorkflowCommandStatus::Pending); let command = &commands[0].command; assert_eq!(command.command_type, WorkflowCommandType::EnqueueActivity); assert_eq!(command.activity_name(), Some("implement_issue")); assert_eq!(command.command["project_id"], "/project-a"); assert_eq!(command.command["issue_number"], 1693); assert_eq!(command.command["dispatch_gate"]["reason"], "operator_workflow_runtime_unblock"); assert!(command.command["additional_prompt"].as_str().is_some_and(|prompt| prompt.contains("Recovery reason: operator fixed transient failure"))); Ok(())
 }
 
+#[tokio::test]
+async fn runtime_recovery_unblocks_stopped_issue_planning() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let issue_number = 1740;
+    let mut instance = project_issue_instance("/project-a", issue_number, "planning");
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+    let original = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "plan-issue-1740",
+        json!({
+            "activity": "plan_issue",
+            "project_id": "/project-a",
+            "repo": "owner/repo",
+            "issue_number": issue_number,
+        }),
+    );
+    let (_command_id, runtime_job_id) =
+        enqueue_original_runtime_job(&store, &instance.id, &original).await?;
+    instance.state = "blocked".to_string();
+    instance = instance.with_server_data(json!({
+        "project_id": "/project-a",
+        "repo": "owner/repo",
+        "issue_number": issue_number,
+        "last_stop": {
+            "state": "blocked",
+            "activity": "plan_issue",
+            "runtime_job_id": runtime_job_id,
+        },
+    }));
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+
+    let workflow = recovered_workflow(
+        recover(
+            &store,
+            &instance.id,
+            super::WorkflowRuntimeRecoveryAction::Unblock,
+        )
+        .await?,
+        "issue planning recovery",
+    )?;
+
+    assert_eq!(workflow.state, "planning");
+    let commands = store.commands_for(&instance.id).await?;
+    let replayed = commands
+        .iter()
+        .find(|command| command.status == WorkflowCommandStatus::Pending)
+        .expect("replayed planning command should be pending");
+    assert_eq!(replayed.command.command, original.command);
+    Ok(())
+}
+
 #[rustfmt::skip]
 #[tokio::test]
 async fn runtime_recovery_legacy_fallback_requires_absent_or_null_last_stop() -> anyhow::Result<()> {

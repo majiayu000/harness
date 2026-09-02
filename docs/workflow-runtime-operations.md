@@ -138,6 +138,7 @@ and returns the corresponding active state:
 
 | Stopped activity | New state |
 |------------------|-----------|
+| `plan_issue` | `planning` |
 | `implement_issue` | `implementing` |
 | `replan_issue` | `replanning` |
 | `merge_pr` | `merging` |

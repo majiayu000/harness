@@ -412,6 +412,7 @@ mod tests {
         (Some("failed"), "awaiting_feedback", &[E, S, W]),
         (Some("failed"), "addressing_feedback", &[E, S, W]),
         (Some("failed"), "merging", &[E]),
+        (Some("blocked"), "planning", &[E, W]),
         (Some("blocked"), "implementing", &[E, W]),
         (Some("blocked"), "replanning", &[E, W]),
         (Some("blocked"), "local_review_gate", &[E, W]),
