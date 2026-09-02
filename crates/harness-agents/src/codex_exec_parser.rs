@@ -33,6 +33,7 @@ pub(crate) enum ParsedCodexExecEvent {
     },
     Error {
         message: String,
+        kind: CodexStructuredErrorKind,
     },
     TurnCompleted {
         usage: Option<TokenUsage>,
@@ -43,6 +44,12 @@ pub(crate) enum ParsedCodexExecEvent {
     Ignore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexStructuredErrorKind {
+    Provider,
+    Permanent,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ParsedCodexExecOutput {
     pub(crate) output: String,
@@ -50,6 +57,7 @@ pub(crate) struct ParsedCodexExecOutput {
     pub(crate) token_usage: TokenUsage,
     pub(crate) warnings: Vec<String>,
     pub(crate) structured_error: Option<String>,
+    pub(crate) structured_error_kind: Option<CodexStructuredErrorKind>,
     pub(crate) explicit_failure: bool,
 }
 
@@ -157,6 +165,7 @@ pub(crate) fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecE
                 })
                 .unwrap_or("unknown error")
                 .to_string(),
+            kind: CodexStructuredErrorKind::Provider,
         }),
         "turn.completed" => Some(ParsedCodexExecEvent::TurnCompleted {
             usage: value.get("usage").and_then(parse_codex_token_usage),
@@ -178,7 +187,10 @@ pub(crate) fn parse_codex_exec_event_line(line: &str) -> Option<ParsedCodexExecE
                 });
             };
             if let Some(message) = parse_codex_error_item_message(item_value) {
-                return Some(ParsedCodexExecEvent::Error { message });
+                return Some(ParsedCodexExecEvent::Error {
+                    message,
+                    kind: CodexStructuredErrorKind::Permanent,
+                });
             }
             let Some(item) = parse_codex_item(item_value) else {
                 // Unknown kinds surface so enforcement observers never treat
@@ -260,8 +272,9 @@ fn apply_codex_exec_event(
             parsed.warnings.push(message.clone());
             emitted_items.push(StreamItem::Warning { message });
         }
-        ParsedCodexExecEvent::Error { message } => {
+        ParsedCodexExecEvent::Error { message, kind } => {
             parsed.structured_error = Some(message.clone());
+            parsed.structured_error_kind = Some(kind);
             emitted_items.push(StreamItem::Diagnostic {
                 severity: AgentDiagnosticSeverity::Error,
                 message,
@@ -284,6 +297,7 @@ fn apply_codex_exec_event(
         }
         ParsedCodexExecEvent::TurnFailed { message } => {
             parsed.structured_error = Some(message);
+            parsed.structured_error_kind = Some(CodexStructuredErrorKind::Provider);
             apply_codex_terminal(parsed, emitted_items, terminal, CodexExecTerminal::Failed);
         }
         ParsedCodexExecEvent::Ignore => {}
@@ -303,6 +317,7 @@ fn apply_codex_terminal(
 
     let message = "codex emitted contradictory terminal events".to_string();
     parsed.structured_error = Some(message.clone());
+    parsed.structured_error_kind = Some(CodexStructuredErrorKind::Permanent);
     parsed.explicit_failure = true;
     *terminal = CodexExecTerminal::Failed;
     emitted_items.push(StreamItem::Error { message });
@@ -315,6 +330,9 @@ fn finish_codex_exec_output(parsed: &mut ParsedCodexExecOutput, terminal: CodexE
             parsed.structured_error.get_or_insert_with(|| {
                 "codex stream ended without an authoritative terminal event".to_string()
             });
+            parsed
+                .structured_error_kind
+                .get_or_insert(CodexStructuredErrorKind::Provider);
         }
         CodexExecTerminal::Completed => parsed.explicit_failure = false,
         CodexExecTerminal::Failed => parsed.explicit_failure = true,

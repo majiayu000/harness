@@ -129,7 +129,10 @@ exit 1
 
 #[test]
 fn classifies_authentication_failure_as_configuration() {
-    let err = codex_structured_error("authentication failed");
+    let err = codex_errors::codex_structured_error(
+        "authentication failed",
+        codex_exec_parser::CodexStructuredErrorKind::Provider,
+    );
 
     assert!(
         matches!(err, harness_core::error::HarnessError::Config(_)),
@@ -138,5 +141,22 @@ fn classifies_authentication_failure_as_configuration() {
     assert!(
         err.turn_failure().is_none(),
         "configuration failures must remain non-retryable"
+    );
+}
+
+#[test]
+fn keeps_permanent_structured_cli_errors_non_retryable() {
+    let err = codex_errors::codex_structured_error(
+        "bad config",
+        codex_exec_parser::CodexStructuredErrorKind::Permanent,
+    );
+
+    assert!(matches!(
+        err,
+        harness_core::error::HarnessError::AgentExecution(_)
+    ));
+    assert_ne!(
+        err.turn_failure().expect("turn failure").kind,
+        harness_core::types::TurnFailureKind::Upstream
     );
 }

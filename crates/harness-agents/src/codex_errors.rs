@@ -1,13 +1,20 @@
 //! Classification of `codex exec` failures into harness error kinds.
 
+use super::codex_exec_parser::{CodexStructuredErrorKind, ParsedCodexExecOutput};
 use super::parse_codex_exec_output;
 
-pub(super) fn codex_structured_error_from_stdout(stdout: &str) -> Option<String> {
-    parse_codex_exec_output(stdout).ok()?.structured_error
+pub(super) struct CodexStructuredError {
+    message: String,
+    kind: CodexStructuredErrorKind,
+}
+
+pub(super) fn codex_structured_error_from_stdout(stdout: &str) -> Option<CodexStructuredError> {
+    structured_error_from_parsed(&parse_codex_exec_output(stdout).ok()?)
 }
 
 pub(super) fn codex_structured_error(
     message: impl Into<String>,
+    kind: CodexStructuredErrorKind,
 ) -> harness_core::error::HarnessError {
     let message = format!("codex structured error: {}", message.into());
     if harness_core::error::is_billing_failure_message(&message) {
@@ -19,7 +26,41 @@ pub(super) fn codex_structured_error(
     if is_codex_authentication_failure_message(&message) {
         return harness_core::error::HarnessError::Config(message);
     }
-    harness_core::error::HarnessError::Upstream(message)
+    match kind {
+        CodexStructuredErrorKind::Provider => harness_core::error::HarnessError::Upstream(message),
+        CodexStructuredErrorKind::Permanent => {
+            harness_core::error::HarnessError::AgentExecution(message)
+        }
+    }
+}
+
+pub(super) fn codex_explicit_failure_error(
+    parsed: ParsedCodexExecOutput,
+) -> harness_core::error::HarnessError {
+    codex_structured_error(
+        parsed
+            .structured_error
+            .unwrap_or_else(|| "codex turn failed".to_string()),
+        parsed
+            .structured_error_kind
+            .unwrap_or(CodexStructuredErrorKind::Permanent),
+    )
+}
+
+pub(super) fn codex_nonzero_exit_error_from_parsed(
+    status: std::process::ExitStatus,
+    stderr: &str,
+    parsed: &ParsedCodexExecOutput,
+) -> harness_core::error::HarnessError {
+    let structured_error = structured_error_from_parsed(parsed);
+    codex_nonzero_exit_error(status, stderr, structured_error.as_ref())
+}
+
+fn structured_error_from_parsed(parsed: &ParsedCodexExecOutput) -> Option<CodexStructuredError> {
+    Some(CodexStructuredError {
+        message: parsed.structured_error.clone()?,
+        kind: parsed.structured_error_kind?,
+    })
 }
 
 fn is_codex_authentication_failure_message(message: &str) -> bool {
@@ -35,7 +76,7 @@ fn is_codex_authentication_failure_message(message: &str) -> bool {
 pub(super) fn codex_nonzero_exit_error(
     status: std::process::ExitStatus,
     stderr: &str,
-    structured_error: Option<&str>,
+    structured_error: Option<&CodexStructuredError>,
 ) -> harness_core::error::HarnessError {
     if harness_core::error::is_billing_failure_message(stderr) {
         return harness_core::error::HarnessError::BillingFailed(format!(
@@ -48,8 +89,11 @@ pub(super) fn codex_nonzero_exit_error(
         ));
     }
 
-    if let Some(message) = structured_error {
-        let mut error = codex_structured_error(format!("exit {status}: {message}"));
+    if let Some(structured_error) = structured_error {
+        let mut error = codex_structured_error(
+            format!("exit {status}: {}", structured_error.message),
+            structured_error.kind,
+        );
         if matches!(error, harness_core::error::HarnessError::Upstream(_))
             && !stderr.trim().is_empty()
         {
