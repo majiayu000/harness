@@ -95,7 +95,6 @@ anyhow = "1"
 # Async trait
 async-trait = "0.1"
 
-# Capability-scoped filesystem access (repository-observed stack inventory)
 libc = "0.2"
 
 # Futures
