@@ -4,35 +4,9 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::Path;
 use thiserror::Error;
-pub mod capability_evidence;
-pub mod capability_extraction;
-pub mod inventory;
-#[cfg(test)]
-mod inventory_tests;
-mod protective_control_diff;
-#[cfg(test)]
-mod protective_control_diff_tests;
 mod source_locator;
 #[cfg(test)]
 mod tests;
-pub use capability_extraction::{
-    extract_repository_capability_evidence, AgentStackCapabilityExtraction,
-    AgentStackCapabilityExtractionConfidence, AgentStackCapabilityExtractionError,
-    AgentStackCapabilityExtractionEvidence, AgentStackCapabilityExtractionFailure,
-    AgentStackCapabilityExtractionFailureKind, AgentStackCapabilityExtractionOptions,
-};
-pub use inventory::{
-    inventory_repository_stack, AgentStackEntryClass, AgentStackInventory,
-    AgentStackInventoryEntry, AgentStackInventoryError, AgentStackInventoryErrorKind,
-    AgentStackInventoryOptions,
-};
-pub use protective_control_diff::{
-    protective_control_diff, AgentStackProtectionConfidence, AgentStackProtectionControl,
-    AgentStackProtectionControlDiff, AgentStackProtectionControlError,
-    AgentStackProtectionControlEvidence, AgentStackProtectionControlReason,
-    AgentStackProtectionDiffKind, AgentStackProtectionFailureMode, AgentStackProtectionRole,
-    AgentStackProtectionScope,
-};
 #[cfg(test)]
 use source_locator::root_keys_match_for_test;
 use source_locator::{
