@@ -1,4 +1,5 @@
 use super::*;
+use harness_core::types::TurnFailureKind;
 use harness_workflow::runtime::{
     ActivityStatus, RuntimeKind, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
     LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
@@ -994,6 +995,7 @@ fn activity_result_from_turn_classifies_timeout_error_kind() {
     let items = vec![Item::Error {
         code: 1,
         message: "Agent turn timed out after 30s".to_string(),
+        failure_kind: None,
     }];
 
     let result = activity_result_from_turn(
@@ -1017,6 +1019,43 @@ fn activity_result_from_turn_classifies_timeout_error_kind() {
     let envelope = envelope_artifact(&result);
     assert_eq!(envelope["outcome"], "turn_failed");
     assert_eq!(envelope["extraction_strategy"], "not_attempted");
+}
+
+#[test]
+fn activity_result_from_turn_preserves_typed_upstream_failure_kind() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexExec,
+        "codex-default",
+        json!({
+            "activity": "implement_issue"
+        }),
+    );
+    let items = vec![Item::typed_error(
+        "agent upstream failure: provider temporarily unavailable",
+        TurnFailureKind::Upstream,
+    )];
+
+    let result = activity_result_from_turn(
+        &job,
+        &TurnStatus::Failed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    );
+
+    assert_eq!(result.status, ActivityStatus::Failed);
+    assert_eq!(
+        result.error_kind,
+        Some(ActivityErrorKind::ExternalDependency)
+    );
+    assert_eq!(
+        result.error.as_deref(),
+        Some("agent upstream failure: provider temporarily unavailable")
+    );
 }
 
 fn envelope_artifact(result: &ActivityResult) -> &serde_json::Value {

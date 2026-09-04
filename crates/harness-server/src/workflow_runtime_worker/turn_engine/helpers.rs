@@ -169,7 +169,7 @@ pub(crate) async fn process_stream_item(
             if let Err(err) = server.thread_manager.add_item(
                 thread_id,
                 turn_id,
-                harness_core::types::Item::Error { code: -1, message },
+                harness_core::types::Item::error(message),
             ) {
                 tracing::warn!("failed to append stream error item to turn: {err}");
             }

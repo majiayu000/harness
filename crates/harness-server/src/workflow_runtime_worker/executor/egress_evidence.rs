@@ -248,6 +248,7 @@ mod tests {
         let items = [Item::Error {
             code: -1,
             message: "first-party egress proxy did not become healthy".to_string(),
+            failure_kind: None,
         }];
 
         assert_eq!(
@@ -277,6 +278,7 @@ mod tests {
                 &[Item::Error {
                     code: -1,
                     message: "agent protocol closed unexpectedly".to_string(),
+                    failure_kind: None,
                 }],
                 true,
             )["verification_result"],
@@ -299,6 +301,7 @@ mod tests {
                 &[Item::Error {
                     code: -1,
                     message: "egress proxy connection closed during the turn".to_string(),
+                    failure_kind: None,
                 }],
                 true,
             )["verification_result"],
@@ -321,6 +324,7 @@ mod tests {
                 &[Item::Error {
                     code: -1,
                     message: "agent executable was not found".to_string(),
+                    failure_kind: None,
                 }],
                 false,
             )["verification_result"],

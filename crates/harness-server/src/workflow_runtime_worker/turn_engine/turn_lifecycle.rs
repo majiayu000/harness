@@ -74,10 +74,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         if let Err(e) = server.thread_manager.add_item(
             &thread_id,
             &turn_id,
-            harness_core::types::Item::Error {
-                code: -1,
-                message: msg.clone(),
-            },
+            harness_core::types::Item::error(msg.clone()),
         ) {
             tracing::warn!("failed to add agent-not-found error item: {e}");
         }
@@ -462,10 +459,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     if let Err(e) = server.thread_manager.add_item(
                         &thread_id,
                         &turn_id,
-                        harness_core::types::Item::Error {
-                            code: -1,
-                            message: format!("Failed to complete turn: {error_msg}"),
-                        },
+                        harness_core::types::Item::error(format!(
+                            "Failed to complete turn: {error_msg}"
+                        )),
                     ) {
                         tracing::warn!("failed to add error item to turn: {e}");
                     }
@@ -483,14 +479,16 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         }
         Err(err) => {
             let error_msg = err.to_string();
-            if let Err(e) = server.thread_manager.add_item(
-                &thread_id,
-                &turn_id,
-                harness_core::types::Item::Error {
-                    code: -1,
-                    message: error_msg.clone(),
-                },
-            ) {
+            let error_item = match err.turn_failure() {
+                Some(failure) => {
+                    harness_core::types::Item::typed_error(error_msg.clone(), failure.kind)
+                }
+                None => harness_core::types::Item::error(error_msg.clone()),
+            };
+            if let Err(e) = server
+                .thread_manager
+                .add_item(&thread_id, &turn_id, error_item)
+            {
                 tracing::warn!("failed to add error item to turn: {e}");
             }
             mark_turn_failed(
