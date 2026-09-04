@@ -2,8 +2,9 @@ use super::evidence::{
     activity_result_from_job, collect_eval_case_evidence_from_records, EvalCaseEvidence,
     EvalEvidenceStatus,
 };
+use super::family::{workflow_family_instances, MissingWorkflowFamilyMember};
 use crate::runtime::completion_evidence::ARTIFACT_EVAL_BASE_CHECKOUT;
-use crate::runtime::{RuntimeJob, WorkflowInstance, WorkflowRuntimeStore};
+use crate::runtime::{RuntimeJob, WorkflowRuntimeStore};
 use serde_json::Value;
 
 pub async fn collect_eval_case_evidence(
@@ -14,7 +15,8 @@ pub async fn collect_eval_case_evidence(
     expected_base_commit: &str,
 ) -> anyhow::Result<EvalCaseEvidence> {
     let workflow = store.get_instance(workflow_id).await?;
-    let workflows = workflow_family(store, workflow_id).await?;
+    let workflows =
+        workflow_family_instances(store, workflow_id, MissingWorkflowFamilyMember::Skip).await?;
     let workflow_ids = workflows
         .iter()
         .map(|workflow| workflow.id.clone())
@@ -102,28 +104,6 @@ fn collected_evidence_status(
         return EvalEvidenceStatus::Failed;
     }
     EvalEvidenceStatus::EvidenceIncomplete
-}
-
-async fn workflow_family(
-    store: &WorkflowRuntimeStore,
-    root_workflow_id: &str,
-) -> anyhow::Result<Vec<WorkflowInstance>> {
-    let mut family = Vec::new();
-    let mut pending = vec![root_workflow_id.to_string()];
-    while let Some(workflow_id) = pending.pop() {
-        let Some(instance) = store.get_instance(&workflow_id).await? else {
-            continue;
-        };
-        pending.extend(
-            store
-                .list_instances_by_parent(&workflow_id, None)
-                .await?
-                .into_iter()
-                .map(|child| child.id),
-        );
-        family.push(instance);
-    }
-    Ok(family)
 }
 
 fn apply_base_checkout_evidence(
