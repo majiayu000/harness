@@ -305,7 +305,10 @@ fn collect_textual_blockers(text: &str, blockers: &mut Vec<String>) {
                 "failed checks",
             ],
         ),
-        ("text:requested_changes", &["changes requested"]),
+        (
+            "text:requested_changes",
+            &["requested changes", "changes requested"],
+        ),
         (
             "text:unresolved_review_threads",
             &[
@@ -336,10 +339,29 @@ fn collect_textual_blockers(text: &str, blockers: &mut Vec<String>) {
 }
 
 fn contains_affirmative_blocker(normalized_text: &str, needle: &str) -> bool {
-    normalized_text.match_indices(needle).any(|(index, _)| {
-        let prefix = normalized_text[..index].trim_end();
-        !prefix.ends_with("no") && !prefix.ends_with("no new") && !prefix.ends_with("without")
-    })
+    normalized_text
+        .match_indices(needle)
+        .any(|(index, _)| !blocker_clause_is_resolved_or_negated(&normalized_text[..index]))
+}
+
+fn blocker_clause_is_resolved_or_negated(prefix: &str) -> bool {
+    let clause = prefix
+        .rsplit_once(['.', ';', ',', '!', '?', '\n'])
+        .map_or(prefix, |(_, rest)| rest);
+    let words: Vec<&str> = clause.split_whitespace().collect();
+    if words.ends_with(&["no", "new"]) {
+        return true;
+    }
+    words
+        .iter()
+        .rev()
+        .find(|word| !matches!(**word, "the" | "all" | "any" | "those" | "these"))
+        .is_some_and(|word| {
+            matches!(
+                *word,
+                "no" | "without" | "addressed" | "resolved" | "fixed" | "cleared" | "closed"
+            )
+        })
 }
 
 fn push_unique(blockers: &mut Vec<String>, blocker: impl Into<String>) {

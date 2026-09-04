@@ -498,6 +498,37 @@ fn pr_feedback_repair_does_not_treat_addressed_requested_changes_as_a_blocker() 
 }
 
 #[test]
+fn pr_feedback_repair_does_not_treat_resolved_review_threads_as_a_blocker() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Resolved all unresolved review threads and pushed the repair.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+}
+
+#[test]
+fn pr_feedback_repair_keeps_requested_changes_remain_blocking() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "The repair was pushed, but requested changes remain.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:requested_changes"));
+}
+
+#[test]
 fn negated_check_delta_does_not_hide_a_remaining_failed_check_clause() {
     let claimed = ActivityResult::succeeded(
         "address_pr_feedback",
