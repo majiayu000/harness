@@ -32,6 +32,37 @@ fn usage_aggregate_requires_configured_price_for_cost() {
     assert_eq!(usage.estimated_cost_json(true), None);
 }
 
+#[test]
+fn usage_aggregate_sums_reported_record_totals() {
+    let mut usage = UsageAggregate::default();
+    usage.add(
+        &UsageMetrics {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 3,
+            cache_creation_input_tokens: 2,
+            reported_total_tokens: Some(14),
+        },
+        Some(0.1),
+    );
+    usage.add(
+        &UsageMetrics {
+            input_tokens: 4,
+            output_tokens: 2,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            reported_total_tokens: Some(11),
+        },
+        Some(0.2),
+    );
+
+    assert_eq!(usage.input_tokens, 14);
+    assert_eq!(usage.output_tokens, 7);
+    assert_eq!(usage.cache_read_input_tokens, 3);
+    assert_eq!(usage.cache_creation_input_tokens, 2);
+    assert_eq!(usage.total_tokens(), 25);
+}
+
 #[tokio::test]
 async fn usage_monitor_response_includes_postgres_catalog_census() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
@@ -264,6 +295,50 @@ fn runtime_usage_record_becomes_usage_record_with_candidate() -> anyhow::Result<
             .map(|candidate| candidate.candidate_id.as_str()),
         Some("workflow-1449:candidate-group:issue-1449:c2")
     );
+    Ok(())
+}
+
+#[test]
+fn runtime_usage_record_keeps_cache_components_with_zero_reported_total() -> anyhow::Result<()> {
+    let runtime_record = RuntimeUsageRecord {
+        id: "usage-cache-only".to_string(),
+        runtime_job_id: "runtime-job-1".to_string(),
+        usage_key: "turn:turn-1".to_string(),
+        command_id: "command-1".to_string(),
+        workflow_id: "workflow-1".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        agent_run_id: None,
+        runtime_kind: "codex_exec".to_string(),
+        runtime_profile: "codex-default".to_string(),
+        agent: "codex".to_string(),
+        model: "gpt-5".to_string(),
+        project: "/repo".to_string(),
+        task_id: None,
+        candidate_group_id: None,
+        candidate_id: None,
+        candidate_index: None,
+        candidate_count: None,
+        metrics: UsageMetrics {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 5,
+            cache_creation_input_tokens: 0,
+            reported_total_tokens: Some(0),
+        },
+        cost_usd_micros: 0,
+        cost_usd_observed: false,
+        reported_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let record = usage_record_from_runtime_usage(
+        runtime_record,
+        &PriceCatalog::default(),
+        &candidate_attribution_index(&[]),
+    )?;
+
+    assert_eq!(record.metrics.cache_read_input_tokens, 5);
+    assert_eq!(record.metrics.total_tokens(), 0);
     Ok(())
 }
 
