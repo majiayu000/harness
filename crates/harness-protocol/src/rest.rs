@@ -285,6 +285,61 @@ pub struct WorkflowEvidenceExportResponse {
     pub records: Vec<WorkflowEvidenceArtifact>,
 }
 
+/// Query parameters accepted by `POST /reconcile`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReconcileParams {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ReconciliationTransition {
+    pub task_id: String,
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct WorkflowReconciliationTransition {
+    pub workflow_id: String,
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+    pub applied: bool,
+    pub repo: Option<String>,
+    pub issue_number: Option<u64>,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct WorkflowReconciliationAlert {
+    pub workflow_id: String,
+    pub state: String,
+    pub reason: String,
+    pub age_secs: u64,
+    pub ttl_secs: u64,
+    pub repo: Option<String>,
+    pub issue_number: Option<u64>,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+}
+
+/// Report returned by `POST /reconcile`.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ReconciliationReport {
+    pub candidates: usize,
+    pub skipped_terminal: usize,
+    #[serde(default)]
+    pub transitions: Vec<ReconciliationTransition>,
+    #[serde(default)]
+    pub workflow_transitions: Vec<WorkflowReconciliationTransition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflow_alerts: Vec<WorkflowReconciliationAlert>,
+}
+
 mod private {
     pub trait Sealed {}
 }
@@ -354,3 +409,9 @@ impl RestDto for WorkflowEvidenceArtifact {}
 
 impl private::Sealed for WorkflowEvidenceExportResponse {}
 impl RestDto for WorkflowEvidenceExportResponse {}
+
+impl private::Sealed for ReconcileParams {}
+impl RestDto for ReconcileParams {}
+
+impl private::Sealed for ReconciliationReport {}
+impl RestDto for ReconciliationReport {}
