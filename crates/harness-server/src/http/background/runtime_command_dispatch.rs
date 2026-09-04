@@ -234,7 +234,7 @@ fn enforceable_agent_contract_profile(
     if !has_agent_contract {
         return None;
     }
-    if !profile.timeout_secs.is_some_and(|timeout| timeout > 0) {
+    if profile.timeout_secs.is_none_or(|timeout| timeout == 0) {
         return None;
     }
     let backend = crate::workflow_runtime_worker::agent_backend_for_runtime_kind(

@@ -247,10 +247,10 @@ impl TurnStreamObservations {
             AgentEvent::ModelReported { model, source } => {
                 self.reported_models.push((model.clone(), *source));
             }
-            AgentEvent::ItemStartedKind { item_type } => {
-                if !OBSERVED_BENIGN_ITEM_KINDS.contains(&item_type.as_str()) {
-                    self.unknown_item_kinds.push(item_type.clone());
-                }
+            AgentEvent::ItemStartedKind { item_type }
+                if !OBSERVED_BENIGN_ITEM_KINDS.contains(&item_type.as_str()) =>
+            {
+                self.unknown_item_kinds.push(item_type.clone());
             }
             AgentEvent::ItemStarted { item } => {
                 self.started_item_kinds.push(item_kind_label(item));
