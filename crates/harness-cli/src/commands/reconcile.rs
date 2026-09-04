@@ -1,7 +1,7 @@
 use super::status;
 use anyhow::{bail, Context as _, Result};
 use harness_core::config::HarnessConfig;
-use harness_server::reconciliation::ReconciliationReport;
+use harness_protocol::rest::ReconciliationReport;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -163,7 +163,7 @@ fn render_report(report: &ReconciliationReport, dry_run: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_server::reconciliation::{
+    use harness_protocol::rest::{
         ReconciliationTransition, WorkflowReconciliationAlert, WorkflowReconciliationTransition,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
