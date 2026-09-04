@@ -550,13 +550,7 @@ fn evidence_infrastructure_status(
 
 fn evidence_usage_totals(evidence: &EvalCaseEvidence) -> (u64, u64) {
     evidence.usage.iter().fold((0_u64, 0_u64), |acc, usage| {
-        let tokens = usage.total_tokens.unwrap_or_else(|| {
-            usage
-                .input_tokens
-                .unwrap_or(0)
-                .saturating_add(usage.output_tokens.unwrap_or(0))
-                .saturating_add(usage.cached_input_tokens.unwrap_or(0))
-        });
+        let tokens = usage.derived_total_tokens().unwrap_or(0);
         (
             acc.0.saturating_add(tokens),
             acc.1.saturating_add(usage.cost_usd_micros.unwrap_or(0)),

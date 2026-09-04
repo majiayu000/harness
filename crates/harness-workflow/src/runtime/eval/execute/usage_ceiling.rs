@@ -51,13 +51,7 @@ pub(super) fn suite_usage_exhaustion_reason(
                 case.usage.iter().fold(
                     (total_tokens, cost_usd_micros),
                     |(total_tokens, cost_usd_micros), usage| {
-                        let tokens = usage.total_tokens.unwrap_or_else(|| {
-                            usage
-                                .input_tokens
-                                .unwrap_or(0)
-                                .saturating_add(usage.output_tokens.unwrap_or(0))
-                                .saturating_add(usage.cached_input_tokens.unwrap_or(0))
-                        });
+                        let tokens = usage.derived_total_tokens().unwrap_or(0);
                         (
                             total_tokens.saturating_add(tokens),
                             cost_usd_micros.saturating_add(usage.cost_usd_micros.unwrap_or(0)),
