@@ -1,19 +1,13 @@
 use super::*;
 
 pub(super) fn command_status_is_active(status: WorkflowCommandStatus) -> bool {
-    matches!(
-        status,
-        WorkflowCommandStatus::Pending
-            | WorkflowCommandStatus::Dispatching
-            | WorkflowCommandStatus::Deferred
-            | WorkflowCommandStatus::Dispatched
-    )
+    status.is_active()
 }
 
 pub(super) fn cancellation_ack_matches(job: &RuntimeJob, result: &ActivityResult) -> bool {
     job.input.get("cancellation_requested").is_some()
         && job.runtime_kind == RuntimeKind::RemoteHost
-        && (job.input.get("eval").is_some() || job.input.pointer("/command/eval").is_some())
+        && job.is_eval_job()
         && result.status == ActivityStatus::Cancelled
         && result.artifacts.iter().any(|artifact| {
             artifact.artifact_type
