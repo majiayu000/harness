@@ -1,6 +1,6 @@
 use super::super::EvalVerifyCommandMode;
 use super::*;
-use crate::runtime::{EvalTrustedVerifier, RuntimeKind, WorkflowRuntimeStore};
+use crate::runtime::{EvalTrustedVerifier, RuntimeJobStatus, RuntimeKind, WorkflowRuntimeStore};
 
 #[test]
 fn eval_run_plan_marks_issue_submission_for_draft_prs() -> anyhow::Result<()> {

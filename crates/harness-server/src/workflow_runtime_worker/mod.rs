@@ -112,11 +112,11 @@ impl RuntimeJobWorkerTick {
                 cancelled: 1,
                 ..Self::default()
             },
-            Some(RuntimeJobStatus::Pending | RuntimeJobStatus::Running) => Self::default(),
             None => Self {
                 idle: true,
                 ..Self::default()
             },
+            Some(RuntimeJobStatus::Pending | RuntimeJobStatus::Running) => Self::default(),
         }
     }
 
