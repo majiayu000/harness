@@ -67,7 +67,10 @@ fn parse_exec_warning_and_error() {
     ));
     assert!(matches!(
         error,
-        ParsedCodexExecEvent::Error { ref message } if message == "something failed"
+        ParsedCodexExecEvent::Error {
+            ref message,
+            kind: CodexStructuredErrorKind::Provider,
+        } if message == "something failed"
     ));
 }
 
@@ -79,7 +82,10 @@ fn parse_exec_item_completed_error() {
 
     assert!(matches!(
         event,
-        ParsedCodexExecEvent::Error { ref message } if message == "bad config"
+        ParsedCodexExecEvent::Error {
+            ref message,
+            kind: CodexStructuredErrorKind::Permanent,
+        } if message == "bad config"
     ));
 }
 
@@ -116,6 +122,10 @@ fn parse_exec_output_surfaces_item_completed_error() {
     let parsed = parse_codex_exec_output(stdout).expect("stdout should parse");
 
     assert_eq!(parsed.structured_error.as_deref(), Some("bad config"));
+    assert_eq!(
+        parsed.structured_error_kind,
+        Some(CodexStructuredErrorKind::Permanent)
+    );
 }
 
 #[test]
@@ -147,6 +157,26 @@ fn missing_terminal_fails_with_preceding_error_evidence() {
     assert_eq!(
         parsed.structured_error.as_deref(),
         Some("authentication failed")
+    );
+    assert_eq!(
+        parsed.structured_error_kind,
+        Some(CodexStructuredErrorKind::Provider)
+    );
+}
+
+#[test]
+fn missing_terminal_without_provider_evidence_is_permanent() {
+    let parsed = parse_codex_exec_output(r#"{"type":"thread.started","thread_id":"thread-1"}"#)
+        .expect("stdout should parse");
+
+    assert!(parsed.explicit_failure);
+    assert_eq!(
+        parsed.structured_error.as_deref(),
+        Some("codex stream ended without an authoritative terminal event")
+    );
+    assert_eq!(
+        parsed.structured_error_kind,
+        Some(CodexStructuredErrorKind::Permanent)
     );
 }
 

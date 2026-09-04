@@ -39,7 +39,8 @@ use self::codex_args::{
 #[path = "codex_errors.rs"]
 mod codex_errors;
 use self::codex_errors::{
-    codex_nonzero_exit_error, codex_structured_error, codex_structured_error_from_stdout,
+    codex_explicit_failure_error, codex_nonzero_exit_error, codex_nonzero_exit_error_from_parsed,
+    codex_structured_error_from_stdout,
 };
 
 #[path = "codex_spawn.rs"]
@@ -556,17 +557,13 @@ impl CodeAgent for CodexAgent {
             return Err(codex_nonzero_exit_error(
                 output.status,
                 &stderr,
-                structured_error.as_deref(),
+                structured_error.as_ref(),
             ));
         }
 
         let parsed = parse_codex_exec_output(&stdout)?;
         if parsed.explicit_failure {
-            return Err(codex_structured_error(
-                parsed
-                    .structured_error
-                    .unwrap_or_else(|| "codex turn failed".to_string()),
-            ));
+            return Err(codex_explicit_failure_error(parsed));
         }
         if let Some(message) = parsed.structured_error.as_deref() {
             tracing::error!(
@@ -763,18 +760,12 @@ impl CodeAgent for CodexAgent {
         };
         if !status.success() {
             let stderr = captured_stderr_tail(&stderr_capture);
-            return Err(codex_nonzero_exit_error(
-                status,
-                &stderr,
-                parsed.structured_error.as_deref(),
+            return Err(codex_nonzero_exit_error_from_parsed(
+                status, &stderr, &parsed,
             ));
         }
         if parsed.explicit_failure {
-            return Err(codex_structured_error(
-                parsed
-                    .structured_error
-                    .unwrap_or_else(|| "codex turn failed".to_string()),
-            ));
+            return Err(codex_explicit_failure_error(parsed));
         }
         send_stream_item(
             &tx,

@@ -1,7 +1,7 @@
 use harness_core::agent::{AgentEgressMode, AGENT_ISOLATION_TIER_ENV, AGENT_NETWORK_ALLOWLIST_ENV};
 use harness_core::config::agents::AgentPermissionMode;
 use harness_core::types::Item;
-use harness_workflow::runtime::{ActivityArtifact, RuntimeKind};
+use harness_workflow::runtime::{ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeKind};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -75,6 +75,38 @@ impl AgentEgressEvidence {
             network_allowlist,
             isolation_tier,
         }
+    }
+
+    pub(super) fn validate_provider_connectivity(&self, backend_name: &str) -> anyhow::Result<()> {
+        if backend_name == "codex"
+            && matches!(
+                self.runtime_kind,
+                RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
+            )
+            && self.mode == RecordedEgressMode::DenyAll
+        {
+            anyhow::bail!(
+                "scoped Codex runtime cannot reach its model provider with deny-all egress; configure exact provider hosts in isolation.network_allowlist"
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn provider_connectivity_failure(
+        &self,
+        activity: &str,
+        backend_name: &str,
+    ) -> Option<ActivityResult> {
+        self.validate_provider_connectivity(backend_name)
+            .err()
+            .map(|error| {
+                ActivityResult::failed(
+                    activity,
+                    "Runtime provider connectivity preflight failed.",
+                    error.to_string(),
+                )
+                .with_error_kind(ActivityErrorKind::Configuration)
+            })
     }
 
     pub(super) fn artifact(
@@ -169,6 +201,45 @@ mod tests {
     }
 
     #[test]
+    fn scoped_codex_turn_rejects_empty_provider_allowlist_before_launch() {
+        let evidence = AgentEgressEvidence::from_spawn_env(
+            RuntimeKind::CodexExec,
+            AgentPermissionMode::Scoped,
+            &HashMap::new(),
+        );
+
+        let result = evidence
+            .provider_connectivity_failure("run_local_review", "codex")
+            .expect("scoped Codex cannot reach its provider through deny-all egress");
+
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert_eq!(
+            result.error_kind,
+            Some(harness_workflow::runtime::ActivityErrorKind::Configuration)
+        );
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("network_allowlist")));
+    }
+
+    #[test]
+    fn codex_runtime_profile_does_not_reclassify_a_simulated_backend() {
+        let evidence = AgentEgressEvidence::from_spawn_env(
+            RuntimeKind::CodexJsonrpc,
+            AgentPermissionMode::Scoped,
+            &HashMap::new(),
+        );
+
+        assert!(evidence
+            .provider_connectivity_failure("implement_issue", "runtime-stream-agent")
+            .is_none());
+    }
+
+    #[test]
     fn proxy_setup_error_records_failed_verification() {
         let env_vars = HashMap::from([(
             AGENT_NETWORK_ALLOWLIST_ENV.to_string(),
@@ -177,6 +248,7 @@ mod tests {
         let items = [Item::Error {
             code: -1,
             message: "first-party egress proxy did not become healthy".to_string(),
+            failure_kind: None,
         }];
 
         assert_eq!(
@@ -206,6 +278,7 @@ mod tests {
                 &[Item::Error {
                     code: -1,
                     message: "agent protocol closed unexpectedly".to_string(),
+                    failure_kind: None,
                 }],
                 true,
             )["verification_result"],
@@ -228,6 +301,7 @@ mod tests {
                 &[Item::Error {
                     code: -1,
                     message: "egress proxy connection closed during the turn".to_string(),
+                    failure_kind: None,
                 }],
                 true,
             )["verification_result"],
@@ -250,6 +324,7 @@ mod tests {
                 &[Item::Error {
                     code: -1,
                     message: "agent executable was not found".to_string(),
+                    failure_kind: None,
                 }],
                 false,
             )["verification_result"],

@@ -1,4 +1,5 @@
 use super::*;
+use harness_core::types::TurnFailureKind;
 use harness_workflow::runtime::{
     ActivityStatus, RuntimeKind, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
     LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
@@ -347,6 +348,218 @@ fn activity_result_from_turn_downgrades_succeeded_with_textual_blockers() {
         envelope["final_result"]["status"],
         "succeeded_with_blockers"
     );
+}
+
+#[test]
+fn pr_feedback_repair_can_return_while_new_checks_are_pending() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Pushed the repair. No new failed checks; CI is still in progress.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "pr_repair_snapshot",
+        json!({
+            "fresh_pr_state": {
+                "mergeable": "MERGEABLE",
+                "merge_state_status": "BLOCKED",
+                "pending_checks": 5,
+                "failed_checks": 0
+            }
+        }),
+    ));
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+}
+
+#[test]
+fn pr_feedback_repair_keeps_actual_check_and_merge_blockers() {
+    for artifact in [
+        json!({ "failed_checks": 1 }),
+        json!({ "merge_state_status": "DIRTY" }),
+    ] {
+        let claimed = ActivityResult::succeeded("address_pr_feedback", "Repair result recorded.")
+            .with_artifact(ActivityArtifact::new("pr_repair_snapshot", artifact));
+
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    }
+}
+
+#[test]
+fn pr_feedback_repair_allows_blocked_merge_state_only_for_proven_pending_checks() {
+    let pending = ActivityResult::succeeded("address_pr_feedback", "Repair pushed.").with_artifact(
+        ActivityArtifact::new(
+            "pr_repair_snapshot",
+            json!({
+                "fresh_pr_state": {
+                    "merge_state_status": "BLOCKED",
+                    "pending_checks": 2,
+                    "failed_checks": 0
+                }
+            }),
+        ),
+    );
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), pending);
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+
+    for fresh_pr_state in [
+        json!({ "merge_state_status": "BLOCKED", "failed_checks": 0 }),
+        json!({
+            "merge_state_status": "BLOCKED",
+            "pending_checks": 2
+        }),
+        json!({
+            "merge_state_status": "BLOCKED",
+            "pending_checks": 2,
+            "failed_checks": 1
+        }),
+    ] {
+        let claimed = ActivityResult::succeeded("address_pr_feedback", "Repair pushed.")
+            .with_artifact(ActivityArtifact::new(
+                "pr_repair_snapshot",
+                json!({ "fresh_pr_state": fresh_pr_state }),
+            ));
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    }
+}
+
+#[test]
+fn pr_feedback_repair_keeps_failed_checks_reported_only_in_summary() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "The repair was pushed, but hosted CI still has failed checks.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "pr_repair_snapshot",
+        json!({
+            "fresh_pr_state": {
+                "mergeable": "MERGEABLE",
+                "merge_state_status": "BLOCKED",
+                "pending_checks": 2
+            }
+        }),
+    ));
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:failing_checks"));
+}
+
+#[test]
+fn pr_feedback_repair_keeps_non_ci_blockers_reported_in_summary() {
+    for blocker_summary in [
+        "The repair was pushed, but the review state remains changes requested.",
+        "The repair was pushed, but an unresolved review thread remains.",
+        "The repair was pushed, but the PR is not merge-ready.",
+        "The repair was pushed, but a quota notice blocks review.",
+    ] {
+        let claimed = ActivityResult::succeeded("address_pr_feedback", blocker_summary);
+
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+        assert!(
+            changed,
+            "summary blocker must be preserved: {blocker_summary}"
+        );
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    }
+}
+
+#[test]
+fn pr_feedback_repair_does_not_treat_addressed_requested_changes_as_a_blocker() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Addressed the requested changes and pushed the repair.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+}
+
+#[test]
+fn pr_feedback_repair_does_not_treat_resolved_review_threads_as_a_blocker() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Resolved all unresolved review threads and pushed the repair.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+}
+
+#[test]
+fn pr_feedback_repair_keeps_requested_changes_remain_blocking() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "The repair was pushed, but requested changes remain.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:requested_changes"));
+}
+
+#[test]
+fn negated_check_delta_does_not_hide_a_remaining_failed_check_clause() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "No new failed checks were introduced; two failed checks remain.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:failing_checks"));
+}
+
+#[test]
+fn comma_joined_negated_check_delta_does_not_hide_a_remaining_failed_check_clause() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "No new failed checks were introduced, two failed checks remain.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:failing_checks"));
 }
 
 #[test]
@@ -813,6 +1026,7 @@ fn activity_result_from_turn_classifies_timeout_error_kind() {
     let items = vec![Item::Error {
         code: 1,
         message: "Agent turn timed out after 30s".to_string(),
+        failure_kind: None,
     }];
 
     let result = activity_result_from_turn(
@@ -836,6 +1050,43 @@ fn activity_result_from_turn_classifies_timeout_error_kind() {
     let envelope = envelope_artifact(&result);
     assert_eq!(envelope["outcome"], "turn_failed");
     assert_eq!(envelope["extraction_strategy"], "not_attempted");
+}
+
+#[test]
+fn activity_result_from_turn_preserves_typed_upstream_failure_kind() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexExec,
+        "codex-default",
+        json!({
+            "activity": "implement_issue"
+        }),
+    );
+    let items = vec![Item::typed_error(
+        "agent upstream failure: provider temporarily unavailable",
+        TurnFailureKind::Upstream,
+    )];
+
+    let result = activity_result_from_turn(
+        &job,
+        &TurnStatus::Failed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    );
+
+    assert_eq!(result.status, ActivityStatus::Failed);
+    assert_eq!(
+        result.error_kind,
+        Some(ActivityErrorKind::ExternalDependency)
+    );
+    assert_eq!(
+        result.error.as_deref(),
+        Some("agent upstream failure: provider temporarily unavailable")
+    );
 }
 
 fn envelope_artifact(result: &ActivityResult) -> &serde_json::Value {

@@ -8,9 +8,11 @@ pub(super) fn validate_decision(
     if decision.observed_state != "implementing" || decision.next_state != "implementing" {
         return Ok(());
     }
-    if decision.decision != "continue_prompt_task" {
+    let is_continuation = decision.decision == "continue_prompt_task";
+    let is_runtime_retry = decision.decision == "retry_failed_prompt_task";
+    if !is_continuation && !is_runtime_retry {
         return Err(invalid_contract(
-            "prompt_task implementing self-transitions require decision continue_prompt_task",
+            "prompt_task implementing self-transitions require decision continue_prompt_task or retry_failed_prompt_task",
         ));
     }
     let enqueue_commands = decision
@@ -25,8 +27,38 @@ pub(super) fn validate_decision(
     }
     if enqueue_commands[0].activity_name() != Some(PROMPT_TASK_IMPLEMENT_ACTIVITY) {
         return Err(invalid_contract(
-            "continue_prompt_task must enqueue implement_prompt",
+            "prompt_task implementing self-transitions must enqueue implement_prompt",
         ));
+    }
+    if is_runtime_retry {
+        let command = &enqueue_commands[0].command;
+        let retry_attempt = command
+            .get("retry_attempt")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|attempt| *attempt > 0)
+            .ok_or_else(|| {
+                invalid_contract("retry_failed_prompt_task requires a positive retry_attempt")
+            })?;
+        command
+            .get("max_failed_activity_retries")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|limit| *limit >= retry_attempt)
+            .ok_or_else(|| {
+                invalid_contract(
+                    "retry_failed_prompt_task requires max_failed_activity_retries at least retry_attempt",
+                )
+            })?;
+        for field in ["previous_command_id", "previous_runtime_job_id"] {
+            if command
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(invalid_contract(
+                    "retry_failed_prompt_task requires non-empty previous command and runtime job ids",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -101,6 +133,41 @@ mod tests {
                 &ValidationContext::new("runtime", Utc::now()),
             )
             .expect_err("arbitrary self-transition must fail");
+        assert_eq!(
+            error.kind,
+            WorkflowDecisionRejectionKind::InvalidDecisionContract
+        );
+    }
+
+    #[test]
+    fn prompt_task_validator_requires_complete_runtime_retry_evidence() {
+        let instance = instance();
+        let retry = WorkflowDecision::new(
+            &instance.id,
+            "implementing",
+            "retry_failed_prompt_task",
+            "implementing",
+            "retry",
+        )
+        .with_command(WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "retry-1",
+            json!({
+                "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "retry_attempt": 2,
+                "max_failed_activity_retries": 1,
+                "previous_command_id": "command-1",
+                "previous_runtime_job_id": "job-1",
+            }),
+        ));
+
+        let error = DecisionValidator::prompt_task()
+            .validate(
+                &instance,
+                &retry,
+                &ValidationContext::new("runtime", Utc::now()),
+            )
+            .expect_err("retry attempts beyond the declared limit must fail closed");
         assert_eq!(
             error.kind,
             WorkflowDecisionRejectionKind::InvalidDecisionContract

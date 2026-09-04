@@ -46,6 +46,7 @@ const BLOCKING_MERGE_STATES: &[&str] = &["blocked", "dirty", "unknown", "unstabl
 
 /// The reconciled outcome name recorded in the contract artifact.
 const RECONCILED_OUTCOME: &str = "succeeded_with_blockers";
+const PR_FEEDBACK_REPAIR_ACTIVITY: &str = "address_pr_feedback";
 
 pub(super) fn enforce_activity_status_contract(
     workflow_definition: Option<&str>,
@@ -119,6 +120,8 @@ fn activity_status_contract_blockers(
         local_review_outcome,
         Some(LocalReviewOutcome::ChangesRequested | LocalReviewOutcome::Blocked)
     );
+    let pr_feedback_repair = workflow_definition == Some(GITHUB_ISSUE_PR_DEFINITION_ID)
+        && result.activity == PR_FEEDBACK_REPAIR_ACTIVITY;
 
     for signal in &result.signals {
         if local_review_outcome.is_some()
@@ -133,13 +136,20 @@ fn activity_status_contract_blockers(
 
     if !local_review_outcome_accepts_blockers {
         for artifact in &result.artifacts {
-            collect_structured_blockers(&artifact.artifact, &mut blockers);
+            collect_structured_blockers(
+                &artifact.artifact,
+                &mut blockers,
+                pr_feedback_repair && artifact.artifact_type == "pr_repair_snapshot",
+            );
         }
     }
 
     let mut summary_blockers = Vec::new();
     if !local_review_outcome_accepts_blockers {
         collect_textual_blockers(&result.summary, &mut summary_blockers);
+    }
+    if pr_feedback_repair {
+        summary_blockers.retain(|blocker| blocker != "text:pending_ci");
     }
     if workflow_definition == Some(PROMPT_TASK_DEFINITION_ID)
         && result.activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
@@ -196,13 +206,24 @@ fn is_local_review_outcome_signal(signal_type: &str) -> bool {
     )
 }
 
-fn collect_structured_blockers(value: &Value, blockers: &mut Vec<String>) {
+fn collect_structured_blockers(
+    value: &Value,
+    blockers: &mut Vec<String>,
+    pr_feedback_repair: bool,
+) {
     match value {
         Value::Object(object) => {
+            let blocked_merge_is_pending_checks = pr_feedback_repair
+                && object_value(object, "pending_checks").is_some_and(json_value_reports_blocker)
+                && object_value(object, "failed_checks")
+                    .or_else(|| object_value(object, "failing_checks"))
+                    .is_some_and(|value| !json_value_reports_blocker(value));
             for (key, value) in object {
                 let normalized_key = key.to_ascii_lowercase();
                 if BLOCKING_COUNT_FIELDS.contains(&normalized_key.as_str()) {
-                    if json_value_reports_blocker(value) {
+                    if !(pr_feedback_repair && normalized_key == "pending_checks")
+                        && json_value_reports_blocker(value)
+                    {
                         push_unique(blockers, format!("field:{normalized_key}"));
                     }
                 } else if normalized_key == "review_decision" {
@@ -210,22 +231,31 @@ fn collect_structured_blockers(value: &Value, blockers: &mut Vec<String>) {
                         push_unique(blockers, "field:review_decision_changes_requested");
                     }
                 } else if normalized_key == "merge_state_status" {
-                    if json_string_is_one_of(value, BLOCKING_MERGE_STATES) {
+                    if json_string_is_one_of(value, BLOCKING_MERGE_STATES)
+                        && !(json_string_equals(value, "blocked")
+                            && blocked_merge_is_pending_checks)
+                    {
                         push_unique(blockers, "field:merge_state_status_blocked");
                     }
                 } else if normalized_key == "mergeable" && value.as_bool() == Some(false) {
                     push_unique(blockers, "field:mergeable_false");
                 }
-                collect_structured_blockers(value, blockers);
+                collect_structured_blockers(value, blockers, pr_feedback_repair);
             }
         }
         Value::Array(values) => {
             for value in values {
-                collect_structured_blockers(value, blockers);
+                collect_structured_blockers(value, blockers, pr_feedback_repair);
             }
         }
         _ => {}
     }
+}
+
+fn object_value<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a Value> {
+    object
+        .iter()
+        .find_map(|(candidate, value)| candidate.eq_ignore_ascii_case(key).then_some(value))
 }
 
 fn json_value_reports_blocker(value: &Value) -> bool {
@@ -309,9 +339,29 @@ fn collect_textual_blockers(text: &str, blockers: &mut Vec<String>) {
 }
 
 fn contains_affirmative_blocker(normalized_text: &str, needle: &str) -> bool {
-    normalized_text.contains(needle)
-        && !normalized_text.contains(&format!("no {needle}"))
-        && !normalized_text.contains(&format!("without {needle}"))
+    normalized_text
+        .match_indices(needle)
+        .any(|(index, _)| !blocker_clause_is_resolved_or_negated(&normalized_text[..index]))
+}
+
+fn blocker_clause_is_resolved_or_negated(prefix: &str) -> bool {
+    let clause = prefix
+        .rsplit_once(['.', ';', ',', '!', '?', '\n'])
+        .map_or(prefix, |(_, rest)| rest);
+    let words: Vec<&str> = clause.split_whitespace().collect();
+    if words.ends_with(&["no", "new"]) {
+        return true;
+    }
+    words
+        .iter()
+        .rev()
+        .find(|word| !matches!(**word, "the" | "all" | "any" | "those" | "these"))
+        .is_some_and(|word| {
+            matches!(
+                *word,
+                "no" | "without" | "addressed" | "resolved" | "fixed" | "cleared" | "closed"
+            )
+        })
 }
 
 fn push_unique(blockers: &mut Vec<String>, blocker: impl Into<String>) {

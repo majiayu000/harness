@@ -188,7 +188,11 @@ fn retry_failed_activity_decision_inner(
         WorkflowDecision::new(
             &instance.id,
             &instance.state,
-            "retry_failed_runtime_activity",
+            if instance.definition_id == PROMPT_TASK_DEFINITION_ID {
+                "retry_failed_prompt_task"
+            } else {
+                "retry_failed_runtime_activity"
+            },
             &instance.state,
             format!(
                 "Runtime activity `{activity}` failed; retrying attempt {next_attempt} of {retry_limit}. Last error: {reason}"

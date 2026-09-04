@@ -270,7 +270,7 @@ impl ThreadManager {
         message: String,
     ) -> harness_core::error::Result<Option<TokenUsage>> {
         record_usage(UsageProbeSurface::ThreadManager);
-        if let Err(e) = self.add_item(thread_id, turn_id, Item::Error { code: -1, message }) {
+        if let Err(e) = self.add_item(thread_id, turn_id, Item::error(message)) {
             tracing::warn!("thread manager: failed to add error item for turn {turn_id}: {e}");
         }
         self.fail_turn(thread_id, turn_id)
