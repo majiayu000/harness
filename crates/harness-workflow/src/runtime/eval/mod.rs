@@ -11,6 +11,7 @@ pub mod evidence;
 mod evidence_collection;
 mod evidence_usage;
 pub mod execute;
+mod family;
 pub mod historical_replay;
 pub mod manifest;
 pub mod model;
