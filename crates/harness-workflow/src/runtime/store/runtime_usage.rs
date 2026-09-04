@@ -277,8 +277,8 @@ impl WorkflowRuntimeStore {
                 COALESCE(SUM(output_tokens), 0)::BIGINT,
                 COALESCE(SUM(cache_read_input_tokens), 0)::BIGINT,
                 COALESCE(SUM(cache_creation_input_tokens), 0)::BIGINT,
-                COALESCE(SUM(GREATEST(
-                    COALESCE(reported_total_tokens, 0),
+                COALESCE(SUM(COALESCE(
+                    reported_total_tokens,
                     input_tokens + output_tokens
                         + cache_read_input_tokens + cache_creation_input_tokens
                 )), 0)::BIGINT,
@@ -501,7 +501,7 @@ fn runtime_usage_record_from_row(row: RuntimeUsageDbRow) -> anyhow::Result<Runti
 }
 
 fn usage_metrics_are_zero(metrics: &RuntimeUsageMetrics) -> bool {
-    metrics.input_tokens == 0 && metrics.output_tokens == 0 && metrics.total_tokens() == 0
+    metrics.is_zero_token_usage()
 }
 
 fn aggregate_usage_records(
@@ -566,4 +566,22 @@ fn i64_to_u64(value: i64, field: &str) -> anyhow::Result<u64> {
 
 fn i64_to_u32(value: i64, field: &str) -> anyhow::Result<u32> {
     u32::try_from(value).map_err(|_| anyhow::anyhow!("{field} is outside u32 range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_metrics_are_zero_counts_cache_tokens() {
+        let metrics = UsageMetrics {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 5,
+            cache_creation_input_tokens: 0,
+            reported_total_tokens: Some(0),
+        };
+
+        assert!(!usage_metrics_are_zero(&metrics));
+    }
 }

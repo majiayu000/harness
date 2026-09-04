@@ -22,7 +22,7 @@ pub(super) fn usage_snapshots(
         };
         let payload = &artifact.artifact;
         let cost_usd_micros = payload.get("cost_usd_micros").and_then(Value::as_u64);
-        let snapshot = UsageSnapshot {
+        let mut snapshot = UsageSnapshot {
             agent_invocation_id: None,
             runtime_job_id: Some(job.id.clone()),
             workflow_id: workflow_id.map(ToOwned::to_owned),
@@ -33,7 +33,7 @@ pub(super) fn usage_snapshots(
             reasoning_effort: None,
             input_tokens: payload.get("input_tokens").and_then(Value::as_u64),
             output_tokens: payload.get("output_tokens").and_then(Value::as_u64),
-            cached_input_tokens: payload.get("cached_input_tokens").and_then(Value::as_u64),
+            cached_input_tokens: cached_input_tokens_from_payload(payload),
             total_tokens: payload.get("total_tokens").and_then(Value::as_u64),
             cost_usd_micros,
             token_confidence: Confidence::Observed,
@@ -43,6 +43,7 @@ pub(super) fn usage_snapshots(
                 Confidence::Unknown
             },
         };
+        snapshot.total_tokens = derived_total_tokens_from_payload(payload, &snapshot);
         if usage_snapshot_has_measurement(&snapshot) {
             usage.push(snapshot);
         }
@@ -80,23 +81,9 @@ pub(super) fn usage_snapshot_from_event(
     let payload = event.get("usage").unwrap_or(event);
     let input_tokens = first_u64_field(payload, &["input_tokens", "input"]);
     let output_tokens = first_u64_field(payload, &["output_tokens", "output"]);
-    let cached_input_tokens = first_u64_field(
-        payload,
-        &[
-            "cached_input_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-        ],
-    );
-    let total_tokens = first_u64_field(payload, &["total_tokens"]).or_else(|| {
-        (input_tokens.is_some() || output_tokens.is_some()).then(|| {
-            input_tokens
-                .unwrap_or(0)
-                .saturating_add(output_tokens.unwrap_or(0))
-        })
-    });
+    let cached_input_tokens = cached_input_tokens_from_payload(payload);
     let cost_usd_micros = first_u64_field(payload, &["cost_usd_micros"]);
-    UsageSnapshot {
+    let mut snapshot = UsageSnapshot {
         agent_invocation_id: payload
             .get("agent_invocation_id")
             .and_then(Value::as_str)
@@ -114,7 +101,7 @@ pub(super) fn usage_snapshot_from_event(
         input_tokens,
         output_tokens,
         cached_input_tokens,
-        total_tokens,
+        total_tokens: first_u64_field(payload, &["total_tokens"]),
         cost_usd_micros,
         token_confidence: Confidence::Observed,
         cost_confidence: if cost_usd_micros.is_some() {
@@ -122,11 +109,50 @@ pub(super) fn usage_snapshot_from_event(
         } else {
             Confidence::Unknown
         },
-    }
+    };
+    snapshot.total_tokens = derived_total_tokens_from_payload(payload, &snapshot);
+    snapshot
 }
 
 fn first_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|key| value.get(*key)?.as_u64())
+}
+
+fn cached_input_tokens_from_payload(payload: &Value) -> Option<u64> {
+    payload
+        .get("cached_input_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| additive_cached_input_tokens_from_payload(payload))
+}
+
+fn additive_cached_input_tokens_from_payload(payload: &Value) -> Option<u64> {
+    let cache_read = payload
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64);
+    let cache_creation = payload
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    (cache_read.is_some() || cache_creation.is_some()).then(|| {
+        cache_read
+            .unwrap_or(0)
+            .saturating_add(cache_creation.unwrap_or(0))
+    })
+}
+
+fn derived_total_tokens_from_payload(payload: &Value, snapshot: &UsageSnapshot) -> Option<u64> {
+    let has_components = snapshot.input_tokens.is_some()
+        || snapshot.output_tokens.is_some()
+        || snapshot.cached_input_tokens.is_some();
+    snapshot.total_tokens.or_else(|| {
+        has_components.then(|| {
+            harness_observe::usage::derived_total_tokens(
+                None,
+                snapshot.input_tokens.unwrap_or(0),
+                snapshot.output_tokens.unwrap_or(0),
+                additive_cached_input_tokens_from_payload(payload).unwrap_or(0),
+            )
+        })
+    })
 }
 
 fn usage_snapshot_has_measurement(snapshot: &UsageSnapshot) -> bool {
@@ -176,5 +202,42 @@ mod tests {
         assert_eq!(usage[0].total_tokens, Some(15));
         assert_eq!(usage[0].token_confidence, Confidence::Observed);
         assert_eq!(usage[0].cost_confidence, Confidence::Observed);
+    }
+
+    #[test]
+    fn event_usage_derives_total_from_cache_read_and_creation_aliases() {
+        let snapshot = usage_snapshot_from_event(
+            Some("workflow-1"),
+            "job-1",
+            &json!({
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 2
+                }
+            }),
+        );
+
+        assert_eq!(snapshot.cached_input_tokens, Some(5));
+        assert_eq!(snapshot.total_tokens, Some(20));
+    }
+
+    #[test]
+    fn event_usage_does_not_add_subset_cached_input_tokens_to_total() {
+        let snapshot = usage_snapshot_from_event(
+            Some("workflow-1"),
+            "job-1",
+            &json!({
+                "usage": {
+                    "input_tokens": 10,
+                    "cached_input_tokens": 4,
+                    "output_tokens": 3
+                }
+            }),
+        );
+
+        assert_eq!(snapshot.cached_input_tokens, Some(4));
+        assert_eq!(snapshot.total_tokens, Some(13));
     }
 }
