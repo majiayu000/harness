@@ -510,6 +510,7 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             "on_succeeded": {
                 "reducer_next_state": "local_review_gate",
                 "success_requires": "A succeeded address_pr_feedback result MUST include pr_repair_snapshot with final head, observed_at, action proof, and passing validation evidence, unless IssueClosed/IssueAlreadyResolved or issue_state proves the issue or PR is already closed/resolved.",
+                "blocker_evidence": "Report remaining blockers through structured status, signals, and pr_repair_snapshot fields. Summary and error prose are descriptive and do not determine PR repair blockers. A succeeded repair still requires action evidence and proceeds through local review and server-owned remote PR inspection before readiness.",
                 "required_summary": "Describe addressed review feedback, pushed/no-code action, validation evidence, or closed issue evidence. If the fresh PR merge_state_status is DIRTY or BEHIND, update or rebase the PR branch and push it before returning; a no-code result is invalid while mergeability remains blocked. For command_input.source=pr_hygiene, also describe the configured rebase-needed label action on update/rebase failure and the stale comment/escalation threshold decision. Harness will run local review before remote feedback unless terminal closed evidence finishes the workflow."
             },
             "on_failed": {
