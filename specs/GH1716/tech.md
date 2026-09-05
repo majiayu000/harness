@@ -9,7 +9,7 @@ GH-1716
 See `specs/GH1716/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1716,"complete":true,"paths":["crates/harness-server/src/event_replay.rs","crates/harness-server/src/event_replay_tests.rs","crates/harness-server/src/task_db.rs","crates/harness-server/src/task_db/queries_recovery.rs","crates/harness-server/src/task_db/queries_recovery_tests.rs","crates/harness-server/src/task_runner/store/startup.rs","crates/harness-server/tests/checkpoint_recovery.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010"]}
+{"issue":1716,"complete":true,"paths":["crates/harness-server/src/event_replay/mod.rs","crates/harness-server/src/event_replay/tests.rs","crates/harness-server/src/task_db.rs","crates/harness-server/src/task_db/queries_recovery.rs","crates/harness-server/src/task_db/queries_recovery_tests.rs","crates/harness-server/src/task_runner/store/startup.rs","crates/harness-server/tests/checkpoint_recovery.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010"]}
 -->
 
 ## Current System
@@ -28,7 +28,7 @@ See `specs/GH1716/product.md`.
 - `crates/harness-server/src/task_db/queries_recovery.rs:180-208` increments
   `resumed` or `failed` after the ignored result, while `:242-249` derives
   `transient_failed` from the selected-row count rather than committed writes.
-- `crates/harness-server/src/event_replay.rs:725-736` increments `updated`
+- `crates/harness-server/src/event_replay/mod.rs:725-736` increments `updated`
   after every apparently successful method call. It then compacts terminal
   replay evidence at `:739-752`.
 - `crates/harness-server/src/task_db/types.rs:52-60` exposes only applied
@@ -105,10 +105,10 @@ or artifact is added.
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
 | B-001 | `task_db.rs`, `task_db/queries_recovery.rs` | `cargo test -p harness-server --lib task_db::queries_recovery_tests::write_outcomes_are_closed_and_exclusive` |
-| B-002 | `task_db/queries_recovery.rs`, `event_replay.rs` | `cargo test -p harness-server --lib task_db::queries_recovery_tests::recovery_counts_and_success_logs_require_applied_write` captures tracing output and counters |
+| B-002 | `task_db/queries_recovery.rs`, `event_replay/mod.rs` | `cargo test -p harness-server --lib task_db::queries_recovery_tests::recovery_counts_and_success_logs_require_applied_write` captures tracing output and counters |
 | B-003 | action-specific fresh-read classifiers | `cargo test -p harness-server --lib task_db::queries_recovery_tests::lost_cas_is_superseded_only_with_authoritative_evidence` |
 | B-004 | conflict outcome and error conversion | `cargo test -p harness-server --lib task_db::queries_recovery_tests::contradictory_or_still_eligible_stale_write_is_conflict` covers a different PR URL and nonmatching terminal result |
-| B-005 | `event_replay.rs`, `event_replay_tests.rs`, `task_runner/store/startup.rs` | `cargo test -p harness-server --lib event_replay::tests::replay_conflict_preserves_terminal_log`; `cargo test -p harness-server --lib task_runner::store::startup::tests::replay_conflict_fails_startup_before_checkpoint_recovery` |
+| B-005 | `event_replay/mod.rs`, `event_replay/tests.rs`, `task_runner/store/startup.rs` | `cargo test -p harness-server --lib event_replay::tests::replay_conflict_preserves_terminal_log`; `cargo test -p harness-server --lib task_runner::store::startup::tests::replay_conflict_fails_startup_before_checkpoint_recovery` |
 | B-006 | no in-call retry and repeat behavior | `cargo test -p harness-server --lib task_db::queries_recovery_tests::repeated_recovery_converges_without_rewrite` |
 | B-007 | existing SQL/decode propagation plus new classifier | `cargo test -p harness-server --test task_db_rounds`; existing corrupted scheduler-state tests remain green |
 | B-008 | existing recovery policy | `cargo test -p harness-server --test checkpoint_recovery` |

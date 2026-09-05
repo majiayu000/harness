@@ -100,7 +100,7 @@
         "specs/GH1716/tech.md",
         "specs/GH1716/tasks.md",
         "crates/harness-server/src/task_db/queries_recovery_tests.rs",
-        "crates/harness-server/src/event_replay_tests.rs"
+        "crates/harness-server/src/event_replay/tests.rs"
       ],
       "replay": {
         "command": "cargo test -p harness-server write_outcomes_are_closed_and_exclusive --lib",

@@ -770,5 +770,4 @@ pub async fn replay_and_recover(db: &TaskDb, log_path: &Path) -> anyhow::Result<
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[path = "event_replay_tests.rs"]
 mod tests;

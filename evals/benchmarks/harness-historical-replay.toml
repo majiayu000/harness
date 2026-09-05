@@ -45,8 +45,8 @@ verify_commands = [
     "test -n \"$HARNESS_DATABASE_URL\" && cargo test -p harness-server --test checkpoint_recovery",
 ]
 paths = [
-    "crates/harness-server/src/event_replay.rs",
-    "crates/harness-server/src/event_replay_tests.rs",
+    "crates/harness-server/src/event_replay/mod.rs",
+    "crates/harness-server/src/event_replay/tests.rs",
     "crates/harness-server/src/task_db.rs",
     "crates/harness-server/src/task_db/queries_recovery.rs",
     "crates/harness-server/src/task_db/queries_recovery_tests.rs",

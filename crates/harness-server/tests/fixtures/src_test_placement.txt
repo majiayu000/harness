@@ -39,7 +39,7 @@ file src/workflow_runtime_pr_feedback/tests/mod.rs
 file src/workflow_runtime_pr_feedback/tests/restart_suppression.rs
 file src/workflow_runtime_pr_feedback/tests/suppression.rs
 file src/eval_credentials_tests.rs
-file src/event_replay_tests.rs
+file src/event_replay/tests.rs
 file src/github_pr_snapshot_tests.rs
 file src/handlers/cross_review_tests.rs
 file src/handlers/operator_monitor/tests.rs
