@@ -75,8 +75,8 @@ file src/services/execution_continuation_tests.rs
 file src/services/execution_declarative_tests.rs
 file src/services/execution_runtime_policy_tests.rs
 file src/task_db/queries_recovery_tests.rs
-file src/task_queue_aging_tests.rs
-file src/task_queue_tests.rs
+file src/task_queue/aging_tests.rs
+file src/task_queue/tests.rs
 file src/task_runner/store_tests.rs
 file src/thread_manager_tests.rs
 file src/webhook/tests.rs

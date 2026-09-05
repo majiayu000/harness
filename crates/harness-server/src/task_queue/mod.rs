@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 
-#[path = "task_queue_permits.rs"]
 mod permits;
 
 pub(crate) use permits::PriorityWaitStats;
@@ -639,9 +638,7 @@ impl TaskQueue {
 }
 
 #[cfg(test)]
-#[path = "task_queue_tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "task_queue_aging_tests.rs"]
 mod aging_tests;

@@ -2,7 +2,7 @@
 //! GH-1583 invariants B-001..B-008. All tests use the paused tokio clock
 //! (`start_paused = true`) so aging is fully deterministic.
 // The enclosing `mod aging_tests` is already declared `#[cfg(test)]` in
-// task_queue.rs; the inner `#[cfg(test)] mod cases` marker keeps the file
+// task_queue/mod.rs; the inner `#[cfg(test)] mod cases` marker keeps the file
 // self-describing as test-only code.
 #[cfg(test)]
 mod cases {
