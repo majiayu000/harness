@@ -33,6 +33,7 @@ fn danger_seatbelt_policy_allows_only_the_local_proxy() {
     assert!(
         policy.contains("(deny network-outbound (require-not (remote tcp \"localhost:18080\")))")
     );
+    assert!(policy.contains("(deny network-inbound)"));
     assert!(!policy.contains("(allow network-outbound)"));
 }
 

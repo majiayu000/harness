@@ -46,9 +46,10 @@ impl NetworkPolicy {
                 ]
             }
             (Self::Deny, _) | (Self::InheritSandboxMode, SandboxMode::ReadOnly) => Vec::new(),
-            (Self::LocalProxy { port }, SandboxMode::DangerFullAccess) => vec![format!(
-                "(deny network-outbound (require-not (remote tcp \"localhost:{port}\")))"
-            )],
+            (Self::LocalProxy { port }, SandboxMode::DangerFullAccess) => vec![
+                format!("(deny network-outbound (require-not (remote tcp \"localhost:{port}\")))"),
+                "(deny network-inbound)".to_string(),
+            ],
             (Self::LocalProxy { port }, _) => vec![format!(
                 "(allow network-outbound (remote tcp \"localhost:{port}\"))"
             )],
