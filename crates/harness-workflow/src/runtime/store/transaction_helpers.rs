@@ -352,7 +352,10 @@ pub(super) async fn commit_decision_instance_tx(
     {
         anyhow::bail!("workflow decision instance write identifiers do not match");
     }
-    if target == current {
+    // Persistence owns updated_at; callers replay the original accepted instance.
+    let mut comparable_target = target.clone();
+    comparable_target.updated_at = current.updated_at;
+    if comparable_target == *current {
         if allow_idempotent_replay && current.state == record.decision.next_state {
             return Ok(());
         }
@@ -570,7 +573,7 @@ async fn upsert_instance_row_tx(
             subject_type = EXCLUDED.subject_type,
             subject_key = EXCLUDED.subject_key,
             parent_workflow_id = EXCLUDED.parent_workflow_id,
-            data = EXCLUDED.data,
+            data = jsonb_set(EXCLUDED.data, '{updated_at}', to_jsonb(CURRENT_TIMESTAMP)),
             version = EXCLUDED.version,
             updated_at = CURRENT_TIMESTAMP",
     )
