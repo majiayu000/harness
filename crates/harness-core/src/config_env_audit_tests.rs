@@ -85,7 +85,7 @@ const ALLOWED_RAW_ENV_READS: &[AllowedRawEnvRead] = &[
         "Cargo build-script process environment",
     ),
     allowed(
-        "crates/harness-server/src/event_replay_tests.rs",
+        "crates/harness-server/src/event_replay/tests.rs",
         1,
         "Postgres integration test gate",
     ),
