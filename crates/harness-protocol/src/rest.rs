@@ -163,7 +163,7 @@ pub struct RuntimeTaskDetailResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_usage: Option<harness_core::types::TokenUsage>,
+    pub token_usage: Option<RuntimeTaskTokenUsageResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd_observed: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -176,6 +176,17 @@ pub struct RuntimeTaskDetailResponse {
     pub subtask_ids: Vec<harness_core::types::TaskId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow: Option<RuntimeTaskWorkflowResponse>,
+}
+
+/// Persisted token usage returned by the workflow submission detail API.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeTaskTokenUsageResponse {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

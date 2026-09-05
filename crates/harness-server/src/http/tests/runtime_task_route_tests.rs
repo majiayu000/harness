@@ -246,6 +246,153 @@ async fn get_task_runtime_issue_exposes_tracker_identity_and_cost_observation() 
 }
 
 #[tokio::test]
+async fn get_task_runtime_detail_reports_persisted_cache_usage_after_store_reopen(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let task_id = "runtime-cache-usage-detail";
+    let workflow_id = "runtime-cache-usage-detail-workflow";
+    {
+        let state = make_test_state_with_workflow_runtime_and_registry(
+            dir.path(),
+            &project_root,
+            harness_agents::registry::AgentRegistry::new("test"),
+        )
+        .await?;
+        let store = state
+            .core
+            .workflow_runtime_store
+            .as_ref()
+            .expect("workflow runtime store should be configured");
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "issue:65"),
+        )
+        .with_id(workflow_id)
+        .with_server_data(serde_json::json!({
+            "project_id": project_root,
+            "repo": "owner/repo",
+            "issue_number": 65,
+            "submission_id": task_id,
+        }));
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
+        store
+            .upsert_runtime_usage(&RuntimeUsageUpsert {
+                runtime_job_id: "cache-usage-job".to_string(),
+                command_id: "cache-usage-command".to_string(),
+                workflow_id: workflow_id.to_string(),
+                turn_id: Some("cache-usage-turn".to_string()),
+                agent_run_id: None,
+                runtime_kind: RuntimeKind::CodexJsonrpc,
+                runtime_profile: "codex-default".to_string(),
+                agent: "codex".to_string(),
+                model: "gpt-5.6-sol".to_string(),
+                project: project_root.display().to_string(),
+                task_id: Some(task_id.to_string()),
+                candidate_group_id: None,
+                candidate_id: None,
+                candidate_index: None,
+                candidate_count: None,
+                metrics: RuntimeUsageMetrics {
+                    input_tokens: 204_546,
+                    output_tokens: 35_969,
+                    cache_read_input_tokens: 8_332_288,
+                    cache_creation_input_tokens: 4_096,
+                    reported_total_tokens: Some(9_000_000),
+                },
+                cost_usd_micros: 0,
+                cost_usd_observed: false,
+                reported_at: Utc::now(),
+            })
+            .await?;
+    }
+
+    let reopened = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test-reopened"),
+    )
+    .await?;
+    let response = runtime_submission_app(reopened)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/workflows/runtime/submissions/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert_eq!(body["token_usage"]["input_tokens"], 204_546);
+    assert_eq!(body["token_usage"]["output_tokens"], 35_969);
+    assert_eq!(body["token_usage"]["cache_read_input_tokens"], 8_332_288);
+    assert_eq!(body["token_usage"]["cache_creation_input_tokens"], 4_096);
+    assert_eq!(body["token_usage"]["total_tokens"], 9_000_000);
+    assert_eq!(body["token_usage"]["cost_usd"], 0.0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_task_runtime_detail_omits_token_usage_when_usage_is_absent() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let state = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("issue", "issue:66"),
+    )
+    .with_id("runtime-absent-usage-detail-workflow")
+    .with_server_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 66,
+        "submission_id": "runtime-absent-usage-detail",
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+
+    let response = runtime_submission_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/submissions/runtime-absent-usage-detail")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await?;
+    assert!(body.get("token_usage").is_none());
+    assert!(body.get("cost_usd_observed").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn get_task_runtime_issue_projects_detail_status_from_shared_projection() -> anyhow::Result<()>
 {
     if !crate::test_helpers::db_tests_enabled().await {
