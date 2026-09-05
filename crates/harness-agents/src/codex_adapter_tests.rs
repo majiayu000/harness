@@ -189,15 +189,21 @@ fn parse_turn_completed_without_status_fails_closed() {
 
 #[test]
 fn otel_turn_spans_parse_token_usage_notification() {
-    let line = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":15},"total":{"inputTokens":25,"cachedInputTokens":9,"outputTokens":8,"reasoningOutputTokens":5,"totalTokens":38}}}}"#;
+    let line = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":13},"total":{"inputTokens":25,"cachedInputTokens":9,"outputTokens":8,"reasoningOutputTokens":5,"totalTokens":33}}}}"#;
     let message = parse_codex_message(line).unwrap();
+    let ParsedCodexMessage::Event(AgentEvent::TokenUsage { ref usage, .. }) = message else {
+        panic!("expected usage notification");
+    };
+    let metrics = harness_observe::usage::UsageMetrics::from_token_usage(usage);
+    assert_eq!(metrics.cache_read_input_tokens, 9);
+    assert_eq!(metrics.total_tokens(), 33);
     assert_eq!(
         message,
         ParsedCodexMessage::Event(AgentEvent::TokenUsage {
             usage: harness_core::types::TokenUsage {
-                input_tokens: 25,
+                input_tokens: 16,
                 output_tokens: 8,
-                total_tokens: 38,
+                total_tokens: 33,
                 cost_usd: 0.0,
             },
             cost_usd_observed: false,

@@ -135,9 +135,16 @@ pub(crate) fn parse_codex_token_usage(usage: &Value) -> Option<TokenUsage> {
         .or_else(|| usage.get("totalTokens"))
         .and_then(|field| field.as_u64())
         .unwrap_or(input_tokens.saturating_add(output_tokens));
+    let cached_input_tokens = usage
+        .get("cached_input_tokens")
+        .or_else(|| usage.get("cachedInputTokens"))
+        .and_then(|field| field.as_u64())
+        .unwrap_or(0);
 
     Some(TokenUsage {
-        input_tokens,
+        // Codex includes cache hits in input; Harness stores uncached input and
+        // derives the cached component from the unchanged provider total.
+        input_tokens: input_tokens.saturating_sub(cached_input_tokens),
         output_tokens,
         total_tokens,
         cost_usd: 0.0,
