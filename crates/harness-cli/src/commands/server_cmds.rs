@@ -85,22 +85,6 @@ pub async fn run_serve(
     }
 }
 
-pub async fn run_reconcile(
-    dry_run: bool,
-    project: Option<PathBuf>,
-    config: &HarnessConfig,
-) -> anyhow::Result<()> {
-    #[cfg(feature = "server")]
-    {
-        super::reconcile::run(dry_run, project, config).await
-    }
-    #[cfg(not(feature = "server"))]
-    {
-        let _ = (dry_run, project, config);
-        Err(missing_server_feature("reconcile"))
-    }
-}
-
 #[cfg(all(test, not(feature = "server")))]
 mod tests {
     use super::*;
@@ -125,18 +109,6 @@ mod tests {
         let message = err.to_string();
         assert!(
             message.contains("`harness serve` requires the `server` cargo feature"),
-            "{message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconcile_without_server_feature_explains_rebuild() {
-        let err = run_reconcile(true, None, &HarnessConfig::default())
-            .await
-            .expect_err("reconcile should fail without the server feature");
-        let message = err.to_string();
-        assert!(
-            message.contains("`harness reconcile` requires the `server` cargo feature"),
             "{message}"
         );
     }

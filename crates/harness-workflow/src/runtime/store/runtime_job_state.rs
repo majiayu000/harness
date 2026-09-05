@@ -357,15 +357,12 @@ impl WorkflowRuntimeStore {
             return Ok(WorkflowCancellationCleanupOutcome::NoCancellationCommand);
         }
 
-        let active_statuses = [
-            WorkflowCommandStatus::Pending.as_str(),
-            WorkflowCommandStatus::Dispatching.as_str(),
-            WorkflowCommandStatus::Deferred.as_str(),
-            WorkflowCommandStatus::Dispatched.as_str(),
-        ];
         let cancellations = commands
             .iter()
-            .filter(|(_, status, _)| active_statuses.contains(&status.as_str()))
+            .filter(|(_, status, _)| {
+                WorkflowCommandStatus::try_from(status.as_str())
+                    .is_ok_and(WorkflowCommandStatus::is_active)
+            })
             .map(|(command_id, _, _)| RuntimeJobCancellation::new(command_id, activity, summary))
             .collect::<Vec<_>>();
         if !cancellations.is_empty() {
@@ -548,7 +545,7 @@ pub(super) async fn cancel_unfinished_runtime_jobs_for_commands_tx(
         let mut job: RuntimeJob = serde_json::from_str(data)?;
         let remote_eval_cancellation = job.status == RuntimeJobStatus::Running
             && job.runtime_kind == RuntimeKind::RemoteHost
-            && (job.input.get("eval").is_some() || job.input.pointer("/command/eval").is_some());
+            && job.is_eval_job();
         if remote_eval_cancellation {
             job.input["cancellation_requested"] = serde_json::json!({
                 "reason": cancellation.summary,

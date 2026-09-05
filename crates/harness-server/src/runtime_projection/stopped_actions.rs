@@ -1,8 +1,8 @@
 use super::{RuntimeRecoveryTargetProjection, RuntimeStoppedActionEligibility};
 use harness_workflow::runtime::{
     ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowDefinitionRegistry,
-    WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_PLAN_ACTIVITY,
+    LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -234,6 +234,9 @@ fn optional_error_kind(value: Option<&Value>) -> Option<Option<ActivityErrorKind
 
 fn recovery_dispatch_target(activity: &str) -> Option<RecoveryDispatchTarget> {
     match activity {
+        ISSUE_PLAN_ACTIVITY => Some(RecoveryDispatchTarget {
+            activity: ISSUE_PLAN_ACTIVITY,
+        }),
         "implement_issue" => Some(RecoveryDispatchTarget {
             activity: "implement_issue",
         }),
@@ -323,6 +326,16 @@ mod tests {
         for payload in [Value::Null, Value::String("implement_issue".to_string())] {
             assert!(!enqueue_payload_matches_target(&payload));
         }
+    }
+
+    #[test]
+    fn operator_monitor_recognizes_stopped_issue_planning() {
+        assert_eq!(
+            recovery_dispatch_target(ISSUE_PLAN_ACTIVITY),
+            Some(RecoveryDispatchTarget {
+                activity: ISSUE_PLAN_ACTIVITY,
+            })
+        );
     }
 
     #[test]

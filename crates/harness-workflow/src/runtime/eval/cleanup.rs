@@ -1,6 +1,10 @@
-use super::{data::eval_cleanup_data, transition_outcome::accepted_transition_record};
+use super::{
+    data::eval_cleanup_data,
+    family::{workflow_family_instances, MissingWorkflowFamilyMember},
+    transition_outcome::accepted_transition_record,
+};
 use crate::runtime::{
-    DataProvenance, RuntimeJobStatus, ValidationContext, WorkflowCommand, WorkflowCommandRecord,
+    DataProvenance, ValidationContext, WorkflowCommand, WorkflowCommandRecord,
     WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition,
     WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore,
 };
@@ -31,45 +35,41 @@ pub async fn cancel_eval_workflow_family(
     root_workflow_id: &str,
     reason: &str,
 ) -> anyhow::Result<()> {
-    let mut pending = vec![root_workflow_id.to_string()];
     let mut processed = BTreeSet::new();
-    while let Some(workflow_id) = pending.pop() {
-        if !processed.insert(workflow_id.clone()) {
-            continue;
-        }
-        let children = store.list_instances_by_parent(&workflow_id, None).await?;
-        pending.extend(children.into_iter().map(|child| child.id));
-        for command in store.commands_for(&workflow_id).await? {
-            if matches!(
-                command.status,
-                WorkflowCommandStatus::Pending
-                    | WorkflowCommandStatus::Dispatching
-                    | WorkflowCommandStatus::Deferred
-                    | WorkflowCommandStatus::Dispatched
-            ) {
-                store
-                    .cancel_command_and_unfinished_runtime_jobs(
-                        &command.id,
-                        command.command.runtime_activity_key(),
-                        reason,
-                    )
-                    .await?;
+    loop {
+        let mut progressed = false;
+        for instance in
+            workflow_family_instances(store, root_workflow_id, MissingWorkflowFamilyMember::Reject)
+                .await?
+        {
+            if processed.contains(&instance.id) {
+                continue;
+            }
+            progressed = true;
+            let workflow_id = instance.id;
+            for command in store.commands_for(&workflow_id).await? {
+                if command.status.is_active() {
+                    store
+                        .cancel_command_and_unfinished_runtime_jobs(
+                            &command.id,
+                            command.command.runtime_activity_key(),
+                            reason,
+                        )
+                        .await?;
+                }
+            }
+            let Some(current_instance) = store.get_instance(&workflow_id).await? else {
+                anyhow::bail!("eval workflow family member disappeared: {workflow_id}");
+            };
+            if current_instance.is_terminal()
+                || cancel_workflow_instance(store, &current_instance, eval_run_id, case_id, reason)
+                    .await?
+            {
+                processed.insert(workflow_id);
             }
         }
-        let Some(instance) = store.get_instance(&workflow_id).await? else {
-            anyhow::bail!("eval workflow disappeared during cancellation: {workflow_id}");
-        };
-        if !instance.is_terminal() {
-            cancel_workflow_instance(store, &instance, eval_run_id, case_id, reason).await?;
-        }
-        if pending.is_empty() {
-            pending.extend(
-                workflow_family_instances(store, root_workflow_id)
-                    .await?
-                    .into_iter()
-                    .map(|instance| instance.id)
-                    .filter(|workflow_id| !processed.contains(workflow_id)),
-            );
+        if !progressed {
+            break;
         }
     }
     wait_for_cancelled_workflow_family_clean(store, root_workflow_id).await
@@ -99,7 +99,7 @@ async fn cancel_workflow_instance(
     eval_run_id: &str,
     case_id: &str,
     reason: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let observed_state = instance.state.clone();
     let mut final_instance = instance.clone();
     final_instance.state = "cancelled".to_string();
@@ -155,7 +155,7 @@ async fn cancel_workflow_instance(
         &decision,
         &ValidationContext::new("eval-cleanup", Utc::now()),
     )?;
-    accepted_transition_record(
+    let accepted = accepted_transition_record(
         store
             .apply_decision_transition(
                 WorkflowDecisionTransition {
@@ -178,8 +178,8 @@ async fn cancel_workflow_instance(
         &instance.id,
         "eval family cleanup",
     )?
-    .ok_or_else(|| anyhow::anyhow!("eval workflow changed during cancellation: {}", instance.id))?;
-    Ok(())
+    .is_some();
+    Ok(accepted)
 }
 
 pub async fn finalize_eval_case_cleanup(
@@ -196,18 +196,12 @@ pub async fn finalize_eval_case_cleanup(
         return Ok(());
     }
 
-    let mut workflow_ids = Vec::new();
-    let mut pending = vec![root_workflow_id.to_string()];
-    while let Some(workflow_id) = pending.pop() {
-        pending.extend(
-            store
-                .list_instances_by_parent(&workflow_id, None)
-                .await?
-                .into_iter()
-                .map(|child| child.id),
-        );
-        workflow_ids.push(workflow_id);
-    }
+    let workflow_ids =
+        workflow_family_instances(store, root_workflow_id, MissingWorkflowFamilyMember::Reject)
+            .await?
+            .into_iter()
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>();
 
     ensure_completed_workflow_family_clean(store, root_workflow_id).await?;
 
@@ -231,19 +225,14 @@ async fn ensure_cancelled_workflow_family_clean(
     store: &WorkflowRuntimeStore,
     root_workflow_id: &str,
 ) -> anyhow::Result<()> {
-    let mut workflow_ids = Vec::new();
-    let mut pending = vec![root_workflow_id.to_string()];
-    while let Some(workflow_id) = pending.pop() {
-        let Some(instance) = store.get_instance(&workflow_id).await? else {
-            anyhow::bail!("eval workflow family member disappeared: {workflow_id}");
-        };
-        pending.extend(
-            store
-                .list_instances_by_parent(&workflow_id, None)
-                .await?
-                .into_iter()
-                .map(|child| child.id),
-        );
+    let instances =
+        workflow_family_instances(store, root_workflow_id, MissingWorkflowFamilyMember::Reject)
+            .await?;
+    let workflow_ids = instances
+        .iter()
+        .map(|instance| instance.id.clone())
+        .collect::<Vec<_>>();
+    for instance in &instances {
         if !instance.is_terminal() {
             anyhow::bail!(
                 "workflow family still has nonterminal workflow {} ({})",
@@ -251,7 +240,6 @@ async fn ensure_cancelled_workflow_family_clean(
                 instance.state
             );
         }
-        workflow_ids.push(workflow_id);
     }
 
     let commands: Vec<WorkflowCommandRecord> = store
@@ -262,13 +250,7 @@ async fn ensure_cancelled_workflow_family_clean(
         .collect();
     let mut jobs_by_command = runtime_jobs_by_command_id(store, &commands).await?;
     for command in commands {
-        if matches!(
-            command.status,
-            WorkflowCommandStatus::Pending
-                | WorkflowCommandStatus::Dispatching
-                | WorkflowCommandStatus::Deferred
-                | WorkflowCommandStatus::Dispatched
-        ) {
+        if command.status.is_active() {
             anyhow::bail!(
                 "workflow family still has active command {} ({})",
                 command.id,
@@ -276,10 +258,7 @@ async fn ensure_cancelled_workflow_family_clean(
             );
         }
         for job in jobs_by_command.remove(&command.id).unwrap_or_default() {
-            if matches!(
-                job.status,
-                RuntimeJobStatus::Pending | RuntimeJobStatus::Running
-            ) {
+            if job.status.is_active() {
                 anyhow::bail!(
                     "workflow family still has active runtime job {} ({})",
                     job.id,
@@ -302,7 +281,9 @@ async fn ensure_completed_workflow_family_clean(
     store: &WorkflowRuntimeStore,
     root_workflow_id: &str,
 ) -> anyhow::Result<()> {
-    let instances = workflow_family_instances(store, root_workflow_id).await?;
+    let instances =
+        workflow_family_instances(store, root_workflow_id, MissingWorkflowFamilyMember::Reject)
+            .await?;
     let workflow_ids = instances
         .iter()
         .map(|instance| instance.id.clone())
@@ -339,7 +320,7 @@ async fn ensure_completed_workflow_family_clean(
 fn eval_job_requires_cleanup_proof(job: &crate::runtime::RuntimeJob) -> bool {
     job.runtime_kind == crate::runtime::RuntimeKind::RemoteHost
         && job.lease_generation > 0
-        && (job.input.get("eval").is_some() || job.input.pointer("/command/eval").is_some())
+        && job.is_eval_job()
 }
 
 fn runtime_job_has_cleanup_proof(job: &crate::runtime::RuntimeJob) -> bool {
@@ -361,28 +342,6 @@ fn runtime_job_has_cleanup_proof(job: &crate::runtime::RuntimeJob) -> bool {
         })
 }
 
-async fn workflow_family_instances(
-    store: &WorkflowRuntimeStore,
-    root_workflow_id: &str,
-) -> anyhow::Result<Vec<WorkflowInstance>> {
-    let mut instances = Vec::new();
-    let mut pending = vec![root_workflow_id.to_string()];
-    while let Some(workflow_id) = pending.pop() {
-        let Some(instance) = store.get_instance(&workflow_id).await? else {
-            anyhow::bail!("eval workflow family member disappeared: {workflow_id}");
-        };
-        pending.extend(
-            store
-                .list_instances_by_parent(&workflow_id, None)
-                .await?
-                .into_iter()
-                .map(|child| child.id),
-        );
-        instances.push(instance);
-    }
-    Ok(instances)
-}
-
 async fn ensure_no_active_work(
     store: &WorkflowRuntimeStore,
     workflow_ids: &[String],
@@ -395,13 +354,7 @@ async fn ensure_no_active_work(
         .collect();
     let mut jobs_by_command = runtime_jobs_by_command_id(store, &commands).await?;
     for command in commands {
-        if matches!(
-            command.status,
-            WorkflowCommandStatus::Pending
-                | WorkflowCommandStatus::Dispatching
-                | WorkflowCommandStatus::Deferred
-                | WorkflowCommandStatus::Dispatched
-        ) {
+        if command.status.is_active() {
             anyhow::bail!(
                 "workflow family still has active command {} ({})",
                 command.id,
@@ -409,10 +362,7 @@ async fn ensure_no_active_work(
             );
         }
         for job in jobs_by_command.remove(&command.id).unwrap_or_default() {
-            if matches!(
-                job.status,
-                RuntimeJobStatus::Pending | RuntimeJobStatus::Running
-            ) {
+            if job.status.is_active() {
                 anyhow::bail!(
                     "workflow family still has active runtime job {} ({:?})",
                     job.id,

@@ -1,14 +1,8 @@
-use crate::http::rest_contract::{LegacyJson as Json, LegacyQuery as Query};
+use crate::http::rest_contract::{ContractJson as Json, ContractQuery as Query};
 use crate::http::AppState;
 use axum::{extract::State, http::StatusCode};
-use serde::Deserialize;
+use harness_protocol::rest::{ReconcileParams, ReconciliationReport};
 use std::sync::Arc;
-
-#[derive(Debug, Deserialize)]
-pub struct ReconcileParams {
-    #[serde(default)]
-    pub dry_run: bool,
-}
 
 /// POST /reconcile[?dry_run=true]
 ///
@@ -17,7 +11,7 @@ pub struct ReconcileParams {
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ReconcileParams>,
-) -> Result<Json<crate::reconciliation::ReconciliationReport>, StatusCode> {
+) -> Result<Json<ReconciliationReport>, StatusCode> {
     let report = crate::reconciliation::run_once_with_runtime_config(
         state.core.workflow_runtime_store.as_deref(),
         state.core.issue_workflow_store.as_deref(),

@@ -1,12 +1,15 @@
 use crate::http::AppState;
 use harness_core::config::misc::ReconciliationConfig;
+pub use harness_protocol::rest::{
+    ReconciliationReport, ReconciliationTransition, WorkflowReconciliationAlert,
+    WorkflowReconciliationTransition,
+};
 use harness_workflow::issue_lifecycle::IssueWorkflowStore;
 use harness_workflow::runtime::{
     DecisionValidator, ValidationContext, WorkflowCommand, WorkflowCommandStatus,
     WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition, WorkflowEvidence,
     WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     path::PathBuf,
@@ -66,53 +69,6 @@ impl RuntimeWorkflowReconciliationSettings {
             ready_to_merge_alert_ttl_secs: config.ready_to_merge_alert_ttl_secs,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReconciliationTransition {
-    pub task_id: String,
-    pub from: String,
-    pub to: String,
-    pub reason: String,
-    pub applied: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowReconciliationTransition {
-    pub workflow_id: String,
-    pub from: String,
-    pub to: String,
-    pub reason: String,
-    pub applied: bool,
-    pub repo: Option<String>,
-    pub issue_number: Option<u64>,
-    pub pr_number: Option<u64>,
-    pub pr_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowReconciliationAlert {
-    pub workflow_id: String,
-    pub state: String,
-    pub reason: String,
-    pub age_secs: u64,
-    pub ttl_secs: u64,
-    pub repo: Option<String>,
-    pub issue_number: Option<u64>,
-    pub pr_number: Option<u64>,
-    pub pr_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReconciliationReport {
-    pub candidates: usize,
-    pub skipped_terminal: usize,
-    #[serde(default)]
-    pub transitions: Vec<ReconciliationTransition>,
-    #[serde(default)]
-    pub workflow_transitions: Vec<WorkflowReconciliationTransition>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub workflow_alerts: Vec<WorkflowReconciliationAlert>,
 }
 
 struct RateLimiter {

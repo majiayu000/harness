@@ -68,7 +68,7 @@ impl WorkflowRuntimeStore {
             if job.input.get("cancellation_requested").is_some() {
                 continue;
             }
-            if job.input.get("eval").is_some() || job.input.pointer("/command/eval").is_some() {
+            if job.is_eval_job() {
                 let activity = job
                     .input
                     .get("activity")

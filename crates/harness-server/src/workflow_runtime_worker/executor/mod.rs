@@ -1,9 +1,11 @@
 use crate::http::AppState;
+use harness_agents::registry::AgentRegistry;
+use harness_core::agent::AgentBackend;
 use harness_core::agent::AGENT_OUTPUT_SCHEMA_PATH_ENV;
 use harness_core::config::workflow::WorkflowConfig;
 use harness_core::types::AgentId;
 use harness_workflow::runtime::{
-    ActivityResult, RuntimeJob, WorkflowInstance, WorkflowTerminalState,
+    ActivityResult, RuntimeJob, RuntimeKind, WorkflowInstance, WorkflowTerminalState,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -32,7 +34,8 @@ use super::prompt_packet::{
 };
 use super::repo_memory_prompt::{repo_memory_config_artifact, repo_memory_for_prompt_packet};
 use super::runtime_profile::{
-    agent_name_for_runtime_kind, resolve_runtime_settings, runtime_profile_for_job,
+    agent_backend_for_runtime_kind, agent_name_for_runtime_kind, resolve_runtime_settings,
+    runtime_profile_for_job,
 };
 use super::runtime_turn_control::{force_code_agent_for_runtime_turn, RuntimeTurnAliasGuard};
 use super::runtime_usage::runtime_usage_context;
@@ -141,16 +144,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         let workflow_document =
             harness_core::config::workflow::load_workflow_document(&source_project_root)?;
         let agent_name = agent_name_for_runtime_kind(job.runtime_kind)?;
-        if self
-            .state
-            .core
-            .server
-            .agent_registry
-            .get(agent_name)
-            .is_none()
-        {
-            anyhow::bail!("runtime agent `{agent_name}` is not registered");
-        }
         let runtime_profile = runtime_profile_with_timeout_fallback(
             runtime_profile_for_job(&job)?,
             &workflow_document.config,
@@ -193,7 +186,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         lease_lost.send_replace(true);
                     })
                 });
-        let activity = async {
+        let execution = async {
             let project_root = runtime_workspace.run_project.clone();
             let memory_enabled = workflow_document.config.memory.enabled;
             let repo_memory = repo_memory_for_prompt_packet(
@@ -246,29 +239,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     &prompt,
                 )
                 .await;
-                let thread_id = self
-                    .state
-                    .core
-                    .server
-                    .thread_manager
-                    .start_thread(project_root.clone());
-                let turn_id = self.state.core.server.thread_manager.start_turn(
-                    &thread_id,
-                    prompt.clone(),
-                    AgentId::from_str(agent_name),
-                )?;
-                let _runtime_turn_alias_guard = workflow
-                    .as_ref()
-                    .and_then(|workflow| {
-                        crate::workflow_runtime_submission::runtime_issue_task_handle(workflow)
-                    })
-                    .map(|submission_id| {
-                        RuntimeTurnAliasGuard::register(
-                            self.state.core.server.clone(),
-                            submission_id.0,
-                            turn_id.clone(),
-                        )
-                    });
                 let correction_only = attempt > 0 && correction_retry.is_some();
                 let mut env_vars = if correction_only {
                     correction_spawn_env_vars(&job)
@@ -295,6 +265,46 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                     permission_profile.permission_mode,
                     &env_vars,
                 );
+                let force_code_agent_for_attempt = force_code_agent || correction_only;
+                let agent_backend = agent_backend_for_attempt(
+                    &self.state.core.server.agent_registry,
+                    agent_name,
+                    job.runtime_kind,
+                    force_code_agent_for_attempt,
+                )?;
+                if let Some(result) =
+                    egress_evidence.provider_connectivity_failure(&activity, agent_backend.name())
+                {
+                    return Ok(result
+                        .with_artifact(
+                            permission_profile
+                                .artifact(resolved_settings.capability_profile, attempt + 1),
+                        )
+                        .with_artifact(egress_evidence.artifact(&[], false, attempt + 1)));
+                }
+                let thread_id = self
+                    .state
+                    .core
+                    .server
+                    .thread_manager
+                    .start_thread(project_root.clone());
+                let turn_id = self.state.core.server.thread_manager.start_turn(
+                    &thread_id,
+                    prompt.clone(),
+                    AgentId::from_str(agent_name),
+                )?;
+                let _runtime_turn_alias_guard = workflow
+                    .as_ref()
+                    .and_then(|workflow| {
+                        crate::workflow_runtime_submission::runtime_issue_task_handle(workflow)
+                    })
+                    .map(|submission_id| {
+                        RuntimeTurnAliasGuard::register(
+                            self.state.core.server.clone(),
+                            submission_id.0,
+                            turn_id.clone(),
+                        )
+                    });
                 let egress_verified_at_dispatch = Arc::new(AtomicBool::new(false));
                 if let Some(schema_file) = output_schema_file.as_ref() {
                     env_vars.insert(
@@ -333,7 +343,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         env_vars,
                         permission_mode: permission_profile.permission_mode,
                         allowed_tools: permission_profile.allowed_tools.clone(),
-                        force_code_agent: force_code_agent || correction_only,
+                        force_code_agent: force_code_agent_for_attempt,
                         runtime_usage: runtime_usage_context(
                             self.state,
                             &job,
@@ -445,7 +455,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             }
             unreachable!("bounded structured-output retry loop always returns")
         };
-        let activity_result: anyhow::Result<ActivityResult> = activity.await;
+        let activity_result: anyhow::Result<ActivityResult> = execution.await;
         if let Some(forwarder) = repository_lease_forwarder {
             forwarder.abort();
         }
@@ -531,6 +541,29 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
         )
     }
 }
+fn agent_backend_for_attempt(
+    registry: &AgentRegistry,
+    agent_name: &str,
+    runtime_kind: RuntimeKind,
+    force_code_agent: bool,
+) -> anyhow::Result<Arc<dyn AgentBackend>> {
+    if force_code_agent {
+        return registry
+            .get(agent_name)
+            .ok_or_else(|| anyhow::anyhow!("runtime agent `{agent_name}` is not registered"));
+    }
+    if matches!(
+        runtime_kind,
+        RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc | RuntimeKind::OpenCode
+    ) {
+        return registry.turn_execution_adapter(agent_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "runtime agent `{agent_name}` has no turn backend for runtime kind `{runtime_kind:?}`"
+            )
+        });
+    }
+    agent_backend_for_runtime_kind(registry, runtime_kind)
+}
 pub(super) fn is_internal_non_agent_activity(job: &RuntimeJob) -> bool {
     is_builtin_lifecycle_activity(job) || is_server_owned_pr_feedback_inspection(job)
 }
@@ -557,6 +590,16 @@ mod tests {
     use harness_core::config::workflow::RuntimeDispatchProfileOverride;
     use harness_workflow::runtime::{RuntimeKind, RuntimeProfile, WorkflowSubject};
     use serde_json::json;
+
+    struct NamedBackend(&'static str);
+
+    #[async_trait::async_trait]
+    impl AgentBackend for NamedBackend {
+        fn name(&self) -> &str {
+            self.0
+        }
+    }
+
     fn runtime_job(activity: &str) -> RuntimeJob {
         RuntimeJob::pending(
             "command-1",
@@ -688,5 +731,19 @@ mod tests {
         assert!(!is_internal_non_agent_activity(&runtime_job(
             "implement_issue"
         )));
+    }
+
+    #[test]
+    fn interactive_codex_exec_preflight_uses_the_turn_backend() {
+        let mut registry = AgentRegistry::new("codex");
+        registry.register("codex", Arc::new(NamedBackend("codex-oneshot")));
+        registry
+            .register_turn_backend_factory("codex", || Arc::new(NamedBackend("codex-turn")))
+            .expect("turn factory should register");
+
+        let selected = agent_backend_for_attempt(&registry, "codex", RuntimeKind::CodexExec, false)
+            .expect("interactive CodexExec should resolve its turn backend");
+
+        assert_eq!(selected.name(), "codex-turn");
     }
 }

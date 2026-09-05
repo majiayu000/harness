@@ -174,6 +174,7 @@ impl TransitionAllowlist {
                 [EnqueueActivity, StartChildWorkflow, Wait],
             )
             .allow("failed", "merging", [EnqueueActivity])
+            .allow("blocked", "planning", [EnqueueActivity, Wait])
             .allow("blocked", "implementing", [EnqueueActivity, Wait])
             .allow("blocked", "replanning", [EnqueueActivity, Wait])
             .allow("blocked", "local_review_gate", [EnqueueActivity, Wait])

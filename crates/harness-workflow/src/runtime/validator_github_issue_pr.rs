@@ -23,7 +23,8 @@ fn validate_operator_recovery_transition(
         ),
         (
             "blocked",
-            "implementing"
+            "planning"
+                | "implementing"
                 | "replanning"
                 | "local_review_gate"
                 | "awaiting_feedback"

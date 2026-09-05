@@ -14,6 +14,7 @@ fn activity_result_from_turn_marks_quota_failure_non_retryable() {
     let items = vec![Item::Error {
         code: -1,
         message: "agent quota exhausted: codex structured error: usage limit reached".to_string(),
+        failure_kind: None,
     }];
 
     let result = activity_result_from_turn(
@@ -58,6 +59,7 @@ fn failed_turn_never_accepts_stale_structured_activity_result() {
         Item::Error {
             code: 1,
             message: "Codex reported turn/failed".to_string(),
+            failure_kind: None,
         },
     ];
 
@@ -106,6 +108,7 @@ fn failed_timeout_ignores_stale_structured_activity_result() {
         Item::Error {
             code: 1,
             message: "Agent turn timed out after 30s".to_string(),
+            failure_kind: None,
         },
     ];
 
@@ -145,6 +148,7 @@ fn failed_real_error_is_truncated_before_envelope_storage() {
     let items = vec![Item::Error {
         code: 1,
         message: long_error,
+        failure_kind: None,
     }];
 
     let result = activity_result_from_turn(

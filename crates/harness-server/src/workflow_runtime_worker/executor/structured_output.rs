@@ -158,7 +158,7 @@ mod tests {
     #[rustfmt::skip]
     #[test]
     fn previous_output_tail_keeps_recent_relevant_bounded_context() {
-        assert_eq!(previous_output_tail(&[reasoning("first"), Item::Error { code: 1, message: "last error".to_string() }]), "first\n\nlast error");
+        assert_eq!(previous_output_tail(&[reasoning("first"), Item::Error { code: 1, message: "last error".to_string(), failure_kind: None }]), "first\n\nlast error");
         let latest = format!("{}LATEST_SENTINEL", "x".repeat(CORRECTION_TRANSCRIPT_EXCERPT_LIMIT + 1000));
         let items = vec![reasoning("OLD_SENTINEL".repeat(1000)), reasoning(latest)];
         let excerpt = previous_output_tail(&items);

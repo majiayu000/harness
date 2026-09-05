@@ -18,9 +18,11 @@ use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 #[cfg(test)]
 use harness_core::config::workflow::agent_contract_output_schema_document;
 use harness_core::config::workflow::{validate_agent_contract_output, WorkflowAgentContract};
-use harness_core::types::Item;
+use harness_core::error::HarnessError;
+use harness_core::types::{Item, TurnFailureKind};
+use harness_workflow::runtime::ActivityErrorKind;
 #[cfg(test)]
-use harness_workflow::runtime::{ActivityErrorKind, ActivityResult};
+use harness_workflow::runtime::ActivityResult;
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
@@ -36,7 +38,7 @@ use super::agent_contract_enforcement::TurnStreamObservations;
 #[cfg(test)]
 use super::agent_contract_prompt::contract_attempt_prompt;
 #[cfg(test)]
-use super::agent_contract_stream::execute_agent_contract_attempt;
+use super::agent_contract_stream::{execute_agent_contract_attempt, ContractAttemptFailure};
 #[derive(Debug)]
 pub(super) struct ContractAttempt {
     pub(super) output: String,
@@ -58,6 +60,24 @@ impl ContractAttempt {
 pub(super) struct ContractVerdict {
     pub(super) outcome: String,
     pub(super) raw: Value,
+}
+
+pub(super) fn contract_attempt_failure_kind(error: &anyhow::Error) -> ActivityErrorKind {
+    if error
+        .chain()
+        .find_map(|source| source.downcast_ref::<HarnessError>())
+        .and_then(HarnessError::turn_failure)
+        .is_some_and(|failure| {
+            matches!(
+                failure.kind,
+                TurnFailureKind::Timeout | TurnFailureKind::Quota | TurnFailureKind::Upstream
+            )
+        })
+    {
+        ActivityErrorKind::Retryable
+    } else {
+        ActivityErrorKind::Fatal
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +201,22 @@ pub(super) fn parse_contract_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_upstream_failure_is_retryable_without_matching_provider_prose() {
+        let upstream = anyhow::Error::new(HarnessError::Upstream(
+            "codex structured error: provider cannot currently serve this request".to_string(),
+        ))
+        .context("contract attempt launch failed");
+        assert_eq!(
+            contract_attempt_failure_kind(&upstream),
+            ActivityErrorKind::Retryable
+        );
+        assert_eq!(
+            contract_attempt_failure_kind(&anyhow::anyhow!("malformed response")),
+            ActivityErrorKind::Fatal
+        );
+    }
     use async_trait::async_trait;
     use harness_workflow::runtime::ActivityStatus;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -535,6 +571,15 @@ mod tests {
         .expect_err("a hung backend must hit the pinned wall-clock boundary");
 
         assert!(error.to_string().contains("timed out after 1s"), "{error}");
+        let (_, source, _) = error
+            .downcast::<ContractAttemptFailure>()
+            .expect("attempt failures preserve observations")
+            .into_parts();
+        assert_eq!(
+            contract_attempt_failure_kind(&source),
+            ActivityErrorKind::Retryable,
+            "executor deadline timeouts must retain their typed retry classification"
+        );
         assert!(
             cancelled.load(Ordering::SeqCst),
             "the timed-out stream task must be cancelled before returning"

@@ -1,4 +1,4 @@
-use harness_core::types::{Item, ThreadId, TurnId, TurnStatus};
+use harness_core::types::{Item, ThreadId, TurnFailureKind, TurnId, TurnStatus};
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, RuntimeJob,
 };
@@ -284,9 +284,17 @@ impl ActivityResultEnvelope {
         }
     }
 
-    fn failed(raw_status: TurnStatus, activity: String, summary: String, error: String) -> Self {
+    fn failed(
+        raw_status: TurnStatus,
+        activity: String,
+        summary: String,
+        error: String,
+        failure_kind: Option<TurnFailureKind>,
+    ) -> Self {
         let mut result = ActivityResult::failed(activity, summary, error.clone());
-        if turn_error_is_timeout(&error) {
+        if let Some(kind) = failure_kind {
+            result = result.with_error_kind(activity_error_kind_from_turn_failure(kind));
+        } else if turn_error_is_timeout(&error) {
             result = result.with_error_kind(ActivityErrorKind::Timeout);
         } else if turn_error_is_non_retryable_agent_limit(&error) {
             result = result.with_error_kind(ActivityErrorKind::Configuration);
@@ -427,11 +435,23 @@ fn activity_result_envelope_from_turn(
         }
         TurnStatus::Failed => {
             let error = last_error(items).unwrap_or_else(|| "agent turn failed".to_string());
-            ActivityResultEnvelope::failed(*status, activity.to_string(), summary, error)
+            ActivityResultEnvelope::failed(
+                *status,
+                activity.to_string(),
+                summary,
+                error,
+                last_error_failure_kind(items),
+            )
         }
         TurnStatus::Running => {
             let error = last_error(items).unwrap_or_else(|| "agent turn failed".to_string());
-            ActivityResultEnvelope::failed(*status, activity.to_string(), summary, error)
+            ActivityResultEnvelope::failed(
+                *status,
+                activity.to_string(),
+                summary,
+                error,
+                last_error_failure_kind(items),
+            )
         }
     }
 }
@@ -610,12 +630,33 @@ pub(super) fn last_agent_summary(items: &[Item]) -> Option<String> {
 }
 
 pub(super) fn last_error(items: &[Item]) -> Option<String> {
+    last_error_item(items).map(|(message, _)| message)
+}
+
+fn last_error_failure_kind(items: &[Item]) -> Option<TurnFailureKind> {
+    last_error_item(items).and_then(|(_, kind)| kind)
+}
+
+fn last_error_item(items: &[Item]) -> Option<(String, Option<TurnFailureKind>)> {
     items.iter().rev().find_map(|item| match item {
-        Item::Error { message, .. } if !message.trim().is_empty() => {
-            Some(truncate_summary(message.trim()))
-        }
+        Item::Error {
+            message,
+            failure_kind,
+            ..
+        } if !message.trim().is_empty() => Some((truncate_summary(message.trim()), *failure_kind)),
         _ => None,
     })
+}
+
+fn activity_error_kind_from_turn_failure(kind: TurnFailureKind) -> ActivityErrorKind {
+    match kind {
+        TurnFailureKind::Timeout => ActivityErrorKind::Timeout,
+        TurnFailureKind::Quota | TurnFailureKind::Billing => ActivityErrorKind::Configuration,
+        TurnFailureKind::Upstream => ActivityErrorKind::ExternalDependency,
+        TurnFailureKind::LocalProcess => ActivityErrorKind::SpawnFailure,
+        TurnFailureKind::Protocol => ActivityErrorKind::Retryable,
+        TurnFailureKind::Unknown => ActivityErrorKind::Unknown,
+    }
 }
 
 fn truncate_summary(value: &str) -> String {

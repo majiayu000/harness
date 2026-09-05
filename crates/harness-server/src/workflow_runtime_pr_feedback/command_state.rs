@@ -1,13 +1,7 @@
 use super::*;
 
 pub(super) fn is_active_pr_feedback_command_status(status: WorkflowCommandStatus) -> bool {
-    matches!(
-        status,
-        WorkflowCommandStatus::Pending
-            | WorkflowCommandStatus::Dispatching
-            | WorkflowCommandStatus::Deferred
-            | WorkflowCommandStatus::Dispatched
-    )
+    status.is_active()
 }
 
 pub(super) async fn has_active_local_review_command(

@@ -252,6 +252,30 @@ fn eval_credentials_runtime_host_policy_marks_eval_jobs_secretless() {
 }
 
 #[test]
+fn eval_credentials_runtime_host_policy_accepts_top_level_eval_payload() {
+    let mut job = RuntimeJob::pending(
+        "command-1",
+        harness_workflow::runtime::RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "implement_issue",
+            "eval": {
+                "eval_run_id": "run-1",
+                "plain_env_allowlist": ["SAFE_FLAG", "GITHUB_TOKEN"]
+            }
+        }),
+    );
+    job.id = "runtime-job-1".to_string();
+
+    let environment = runtime_host_eval_environment(&job).unwrap().unwrap();
+    let policy = environment.audit();
+
+    assert_eq!(policy.secret_inheritance, "empty_by_default");
+    assert_eq!(policy.plain_env_allowlist, ["GITHUB_TOKEN", "SAFE_FLAG"]);
+    assert_eq!(policy.stripped_env[0].key, "GITHUB_TOKEN");
+}
+
+#[test]
 fn eval_credentials_attaches_policy_to_eval_runtime_job_payload() {
     let mut job = RuntimeJob::pending(
         "command-1",
