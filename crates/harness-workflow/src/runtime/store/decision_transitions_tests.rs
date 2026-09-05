@@ -97,7 +97,9 @@ async fn apply_decision_transition_accepts_an_allowlisted_transition() -> anyhow
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
 
-    let initial = instance("gh1784-apply-decision-accepts", "addressing_feedback");
+    let mut initial = instance("gh1784-apply-decision-accepts", "addressing_feedback");
+    initial.created_at = Utc::now() - Duration::hours(1);
+    initial.updated_at = initial.created_at;
     let decision = WorkflowDecision::new(
         &initial.id,
         "addressing_feedback",
@@ -136,6 +138,14 @@ async fn apply_decision_transition_accepts_an_allowlisted_transition() -> anyhow
         .await?
         .expect("instance should exist");
     assert_eq!(stored.state, "local_review_gate");
+    assert_eq!(stored.created_at, initial.created_at);
+    assert!(stored.updated_at > initial.updated_at);
+    let row_updated_at: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM workflow_instances WHERE id = $1")
+            .bind(&initial.id)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(stored.updated_at, row_updated_at);
     assert_eq!(store.commands_for(&initial.id).await?.len(), 1);
     Ok(())
 }

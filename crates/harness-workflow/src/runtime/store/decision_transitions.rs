@@ -419,6 +419,15 @@ mod submission_guard_tests {
             anyhow::bail!("initial same-state transition should commit");
         };
 
+        let first_persisted = store
+            .get_instance(&initial.id)
+            .await?
+            .expect("the first submission must persist its instance");
+        assert!(first_persisted.updated_at > initial.updated_at);
+        let mut expected = final_instance.clone();
+        expected.updated_at = first_persisted.updated_at;
+        assert_eq!(first_persisted, expected);
+
         let Some(replay) = store
             .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
                 workflow_id: &initial.id,
@@ -444,7 +453,10 @@ mod submission_guard_tests {
 
         assert_eq!(replay.record.id, first.record.id);
         assert_eq!(replay.command_ids, first.command_ids);
-        assert_eq!(store.get_instance(&initial.id).await?, Some(final_instance));
+        assert_eq!(
+            store.get_instance(&initial.id).await?,
+            Some(first_persisted)
+        );
         assert_eq!(store.events_for(&initial.id).await?.len(), 1);
         assert_eq!(store.decisions_for(&initial.id).await?.len(), 1);
         assert_eq!(store.commands_for(&initial.id).await?.len(), 1);
@@ -568,7 +580,13 @@ mod submission_guard_tests {
             .expect("rejected submission should be committed atomically");
 
         assert!(!outcome.record.accepted);
-        assert_eq!(store.get_instance(&initial.id).await?, Some(final_instance));
+        let stored = store
+            .get_instance(&initial.id)
+            .await?
+            .expect("the rejected submission must persist its failed instance");
+        assert!(stored.updated_at > initial.updated_at);
+        final_instance.updated_at = stored.updated_at;
+        assert_eq!(stored, final_instance);
         assert_eq!(store.events_for(&initial.id).await?.len(), 1);
         assert_eq!(store.decisions_for(&initial.id).await?.len(), 1);
         Ok(())

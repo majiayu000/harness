@@ -553,6 +553,7 @@ mod tests {
             })
             .await?
             .expect("initial transition should commit");
+        let first_persisted = store.get_instance(&initial.id).await?;
 
         let mut substituted = final_instance.clone();
         substituted.parent_workflow_id = Some("substituted-parent".to_string());
@@ -581,7 +582,7 @@ mod tests {
         )
         .await;
         assert!(error.to_string().contains("expected `1`"));
-        assert_eq!(store.get_instance(&initial.id).await?, Some(final_instance));
+        assert_eq!(store.get_instance(&initial.id).await?, first_persisted);
         Ok(())
     }
 
