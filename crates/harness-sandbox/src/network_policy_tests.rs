@@ -9,6 +9,7 @@ fn danger_mode_with_denied_network_is_not_a_passthrough() {
 
     assert!(policy.contains("(allow default)"));
     assert!(policy.contains("(deny network-outbound)"));
+    assert!(policy.contains("(deny network-inbound)"));
 }
 
 #[test]
