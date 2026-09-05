@@ -1,5 +1,11 @@
 # Runtime Submission Identity Contract
 
+> Architecture relationship (2026-08-28): the public `submission_id`, `workflow_id`, and `request_id`
+> rules in this document remain normative. `docs/workflow-first-autonomous-change-rfc.md` proposes
+> extending internal identity with compiled definition, activity attempt, assignment, Evidence,
+> child relation, and remote change binding identities; none would replace the public submission
+> handle. The proposal is not yet approved and creates no current compatibility promise.
+
 Issue: #1127
 
 This document defines the identity model after removal of the legacy task HTTP
