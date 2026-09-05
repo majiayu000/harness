@@ -351,6 +351,51 @@ fn activity_result_from_turn_downgrades_succeeded_with_textual_blockers() {
 }
 
 #[test]
+fn pr_feedback_repair_uses_structured_facts_independently_of_prose() {
+    for summary in [
+        "The failed checks were repaired; changes requested was the previous review state.",
+        "Changes requested: addressed. Unresolved review threads: resolved.",
+        "No new failed checks were introduced; two failed checks remain.",
+        "The PR is not merge-ready; requested changes remain.",
+    ] {
+        let mut claimed = ActivityResult::succeeded("address_pr_feedback", summary).with_artifact(
+            ActivityArtifact::new(
+                "pr_repair_snapshot",
+                json!({
+                    "fresh_pr_state": {
+                        "merge_state_status": "CLEAN",
+                        "failed_checks": 0,
+                        "open_review_threads": 0,
+                        "review_decision": "APPROVED"
+                    }
+                }),
+            ),
+        );
+        claimed.error = Some(summary.to_string());
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+        assert!(
+            !changed,
+            "prose must not override structured facts: {summary}"
+        );
+        assert_eq!(result.status, ActivityStatus::Succeeded);
+    }
+}
+
+#[test]
+fn pr_feedback_repair_preserves_structured_signals_despite_positive_prose() {
+    for signal in ["ChangesRequested", "ChecksFailed"] {
+        let claimed = ActivityResult::succeeded("address_pr_feedback", "Everything is resolved.")
+            .with_signal(ActivitySignal::new(signal, json!({})));
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+        assert!(status_contract_blockers_from_result(&result).contains(&format!("signal:{signal}")));
+    }
+}
+
+#[test]
 fn pr_feedback_repair_can_return_while_new_checks_are_pending() {
     let claimed = ActivityResult::succeeded(
         "address_pr_feedback",
@@ -381,7 +426,7 @@ fn pr_feedback_repair_keeps_actual_check_and_merge_blockers() {
         json!({ "failed_checks": 1 }),
         json!({ "merge_state_status": "DIRTY" }),
     ] {
-        let claimed = ActivityResult::succeeded("address_pr_feedback", "Repair result recorded.")
+        let claimed = ActivityResult::succeeded("address_pr_feedback", "Everything is resolved.")
             .with_artifact(ActivityArtifact::new("pr_repair_snapshot", artifact));
 
         let (changed, result) =
@@ -436,9 +481,9 @@ fn pr_feedback_repair_allows_blocked_merge_state_only_for_proven_pending_checks(
 }
 
 #[test]
-fn pr_feedback_repair_keeps_failed_checks_reported_only_in_summary() {
+fn issue_implementation_keeps_failed_checks_reported_only_in_summary() {
     let claimed = ActivityResult::succeeded(
-        "address_pr_feedback",
+        "implement_issue",
         "The repair was pushed, but hosted CI still has failed checks.",
     )
     .with_artifact(ActivityArtifact::new(
@@ -463,14 +508,14 @@ fn pr_feedback_repair_keeps_failed_checks_reported_only_in_summary() {
 }
 
 #[test]
-fn pr_feedback_repair_keeps_non_ci_blockers_reported_in_summary() {
+fn issue_implementation_keeps_non_ci_blockers_reported_in_summary() {
     for blocker_summary in [
         "The repair was pushed, but the review state remains changes requested.",
         "The repair was pushed, but an unresolved review thread remains.",
         "The repair was pushed, but the PR is not merge-ready.",
         "The repair was pushed, but a quota notice blocks review.",
     ] {
-        let claimed = ActivityResult::succeeded("address_pr_feedback", blocker_summary);
+        let claimed = ActivityResult::succeeded("implement_issue", blocker_summary);
 
         let (changed, result) =
             enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
@@ -512,9 +557,9 @@ fn pr_feedback_repair_does_not_treat_resolved_review_threads_as_a_blocker() {
 }
 
 #[test]
-fn pr_feedback_repair_keeps_requested_changes_remain_blocking() {
+fn issue_implementation_keeps_requested_changes_remain_blocking() {
     let claimed = ActivityResult::succeeded(
-        "address_pr_feedback",
+        "implement_issue",
         "The repair was pushed, but requested changes remain.",
     );
 
@@ -531,7 +576,7 @@ fn pr_feedback_repair_keeps_requested_changes_remain_blocking() {
 #[test]
 fn negated_check_delta_does_not_hide_a_remaining_failed_check_clause() {
     let claimed = ActivityResult::succeeded(
-        "address_pr_feedback",
+        "implement_issue",
         "No new failed checks were introduced; two failed checks remain.",
     );
 
@@ -548,7 +593,7 @@ fn negated_check_delta_does_not_hide_a_remaining_failed_check_clause() {
 #[test]
 fn comma_joined_negated_check_delta_does_not_hide_a_remaining_failed_check_clause() {
     let claimed = ActivityResult::succeeded(
-        "address_pr_feedback",
+        "implement_issue",
         "No new failed checks were introduced, two failed checks remain.",
     );
 

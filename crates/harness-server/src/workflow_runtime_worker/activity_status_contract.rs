@@ -144,12 +144,16 @@ fn activity_status_contract_blockers(
         }
     }
 
+    // Repair prose describes what happened; structured signals and artifacts
+    // determine blockers. The reducer still requires repair action evidence,
+    // then local review and a server-owned PR snapshot before merge readiness.
+    if pr_feedback_repair {
+        return blockers;
+    }
+
     let mut summary_blockers = Vec::new();
     if !local_review_outcome_accepts_blockers {
         collect_textual_blockers(&result.summary, &mut summary_blockers);
-    }
-    if pr_feedback_repair {
-        summary_blockers.retain(|blocker| blocker != "text:pending_ci");
     }
     if workflow_definition == Some(PROMPT_TASK_DEFINITION_ID)
         && result.activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
