@@ -2,6 +2,37 @@ use super::*;
 use harness_core::types::{Item, TokenUsage};
 
 #[test]
+fn codex_cached_usage_preserves_total_and_cache_metrics() {
+    for value in [
+        serde_json::json!({
+            "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 10
+        }),
+        serde_json::json!({
+            "inputTokens": 100, "cachedInputTokens": 80,
+            "outputTokens": 10, "totalTokens": 110
+        }),
+        serde_json::json!({
+            "inputTokens": 100, "cachedInputTokens": 100,
+            "outputTokens": 10, "totalTokens": 110
+        }),
+    ] {
+        let usage = parse_codex_token_usage(&value).expect("valid Codex usage");
+        let cached = value
+            .get("cached_input_tokens")
+            .or_else(|| value.get("cachedInputTokens"))
+            .and_then(serde_json::Value::as_u64)
+            .expect("fixture includes cached input");
+        let metrics = harness_observe::usage::UsageMetrics::from_token_usage(&usage);
+        assert_eq!(metrics.input_tokens, 100 - cached);
+        assert_eq!(metrics.cache_read_input_tokens, cached);
+        assert_eq!(metrics.output_tokens, 10);
+        assert_eq!(metrics.total_tokens(), 110);
+        assert_eq!(metrics.component_total_tokens(), 110);
+        assert_eq!(usage.cost_usd, 0.0);
+    }
+}
+
+#[test]
 fn parse_exec_agent_message_completion() {
     let line =
         r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hi"}}"#;
@@ -226,7 +257,7 @@ fn parse_exec_turn_completed_usage() {
             assert_eq!(
                 usage,
                 TokenUsage {
-                    input_tokens: 10,
+                    input_tokens: 6,
                     output_tokens: 3,
                     total_tokens: 13,
                     cost_usd: 0.0,
