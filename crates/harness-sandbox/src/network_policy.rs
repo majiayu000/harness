@@ -40,7 +40,10 @@ impl NetworkPolicy {
     pub(crate) fn seatbelt_rules(self, mode: SandboxMode) -> Vec<String> {
         match (self, mode) {
             (Self::Deny, SandboxMode::DangerFullAccess) => {
-                vec!["(deny network-outbound)".to_string()]
+                vec![
+                    "(deny network-outbound)".to_string(),
+                    "(deny network-inbound)".to_string(),
+                ]
             }
             (Self::Deny, _) | (Self::InheritSandboxMode, SandboxMode::ReadOnly) => Vec::new(),
             (Self::LocalProxy { port }, SandboxMode::DangerFullAccess) => vec![format!(
