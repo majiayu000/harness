@@ -1,13 +1,15 @@
 # PR #2008 Recovery Audit
 
-> Audit date: 2026-08-27
+> Historical audit date: 2026-08-27
+> Current disposition: closed as superseded on 2026-09-05; baseline `121df4e4`.
+> The dated findings below describe the old branch, not current main.
 > Target: `feat/declarative-model-guard` at `99c7fe38`
 > Baseline: `origin/main` at `93a642b3`
 > Method: commit-shape analysis, cross-layer data-flow tracing, saved Codex session review, and CI evidence
 
 ## Summary
 
-PR #2008 should not be repaired in place or merged. It contains useful design
+PR #2008 is closed and must not be repaired in place or merged. It contains useful design
 work, but the branch combines four independently reviewable changes: a generic
 model classifier, GitHub scope fact collection, built-in workflow versioning,
 and merge/lease hardening. The combined change is still failing CI after 30
@@ -154,19 +156,19 @@ Observed branch size:
 | Independent security work | `server_merge.rs`, `merge_completion.rs`, `job_claim.rs`, leases, server-owned routing, atomic base authorization | Move findings to separate issues/PRs with their own threat model |
 | Discard from recovery | fixture-only compatibility commits and merge-behavior assertion rewrites | Recreate only tests required by each bounded contract |
 
-## Recovery Roadmap
+## Current Decision (2026-09-05)
 
-| Phase | Scope | Dependencies | Validation |
-|---|---|---|---|
-| 0 | Freeze PR #2008 and preserve it as evidence | None | Branch clean; no further commits |
-| 1 | Reuse the delivered `agent_contract` primitive | Current `main` | Existing contract tests and production dogfood evidence |
-| 2 | Behavior-neutral built-in definition version registry | Existing persisted definition fields | Version-only v1 lookup/replay/query tests; no `github_issue_pr` behavior change |
-| 3 | Prompt-driven GitHub facts and `github_issue_pr@2` scope gate | Phases 1 and 2 | Snapshot race/completeness tests and real Harness workflow submission |
-| 4 | Separate merge security remediation | Explicitly approved security scope | Dedicated threat-model tests and fresh review |
+PR #2008 is historical evidence, not a merge candidate. Its generic classifier
+was superseded by the delivered `WorkflowAgentContract` path. No commit from it
+should be cherry-picked wholesale.
 
-## Decision
-
-PR #2008 is evidence and a source of test cases, not a merge candidate. No
-commit from it should be cherry-picked wholesale. Recovery starts from current
-`main`, reuses `agent_contract`, and must preserve the boundaries in
+The prerequisite/versioning suggestions and classification table above are
+historical audit recommendations, not an approved implementation plan. In
+particular, a multi-version built-in registry and historical-row compatibility
+are not prerequisites for the current reliability work. The remaining PR scope
+integration is deferred and described in
 [`model-scope-classifier-plan.md`](model-scope-classifier-plan.md).
+
+Current work is limited to structured PR repair outcomes, live evaluation
+(#1768), and cost observation/budget verification (#1770). Merge-lifecycle and
+vNext proposals remain outside this queue.
