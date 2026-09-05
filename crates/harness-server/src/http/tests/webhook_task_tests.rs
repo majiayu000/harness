@@ -1,5 +1,34 @@
 use super::*;
 
+struct PromptPullRequestExecutor;
+
+#[async_trait]
+impl harness_workflow::runtime::RuntimeJobExecutor for PromptPullRequestExecutor {
+    async fn execute(
+        &self,
+        _job: harness_workflow::runtime::RuntimeJob,
+    ) -> harness_workflow::runtime::ActivityResult {
+        harness_workflow::runtime::ActivityResult::succeeded(
+            "implement_prompt",
+            "Implemented the requested change and opened a pull request.",
+        )
+        .with_artifact(harness_workflow::runtime::ActivityArtifact::new(
+            "validation_report",
+            serde_json::json!([{
+                "command": "cargo test -p harness-server completed_prompt_submission_reports_pr_url_after_store_reopen",
+                "exit_code": 0,
+            }]),
+        ))
+        .with_artifact(harness_workflow::runtime::ActivityArtifact::new(
+            "pull_request",
+            serde_json::json!({
+                "pr_number": 2044,
+                "pr_url": "https://github.com/owner/repo/pull/2044",
+            }),
+        ))
+    }
+}
+
 #[tokio::test]
 async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -569,6 +598,120 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
         canonical_project_root.to_string_lossy().as_ref()
     );
     assert!(detail["workflow"].get("data").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_prompt_submission_reports_pr_url_after_store_reopen() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("prompt-pr-project");
+    std::fs::create_dir_all(&project_root)?;
+    init_fake_git_repo(&project_root)?;
+    let (task_id, workflow_id) = {
+        let state = make_test_state_with_workflow_runtime_and_registry(
+            dir.path(),
+            &project_root,
+            harness_agents::registry::AgentRegistry::new("test"),
+        )
+        .await?;
+        let response = runtime_submission_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workflows/runtime/submissions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project": project_root.display().to_string(),
+                            "prompt": "Fix the reporting bug and open a pull request.",
+                            "external_id": "prompt-pr-reopen-regression",
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let created = response_json(response).await?;
+        let task_id = created["task_id"].as_str().expect("task id").to_string();
+        let workflow_id = created["workflow_id"]
+            .as_str()
+            .expect("workflow id")
+            .to_string();
+        let store = state
+            .core
+            .workflow_runtime_store
+            .as_ref()
+            .expect("workflow runtime store");
+        let command = store
+            .commands_for(&workflow_id)
+            .await?
+            .into_iter()
+            .next()
+            .expect("implementation command");
+        store
+            .enqueue_runtime_job(
+                &command.id,
+                harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                serde_json::json!({ "activity": "implement_prompt" }),
+            )
+            .await?;
+        harness_workflow::runtime::RuntimeWorker::new(store, "prompt-pr-test-worker")
+            .run_once(&PromptPullRequestExecutor)
+            .await?
+            .expect("worker should complete the prompt job");
+
+        let detail = runtime_submission_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/workflows/runtime/submissions/{task_id}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(detail.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(detail).await?["pr_url"],
+            "https://github.com/owner/repo/pull/2044"
+        );
+        (task_id, workflow_id)
+    };
+
+    let reopened = make_test_state_with_workflow_runtime_and_registry(
+        dir.path(),
+        &project_root,
+        harness_agents::registry::AgentRegistry::new("test-reopened"),
+    )
+    .await?;
+    let persisted = reopened
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("reopened workflow runtime store")
+        .get_instance(&workflow_id)
+        .await?
+        .expect("completed prompt workflow should survive reopen");
+    assert_eq!(persisted.state, "done");
+    assert_eq!(
+        persisted.data["pr_url"],
+        "https://github.com/owner/repo/pull/2044"
+    );
+
+    let detail = runtime_submission_app(reopened)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/workflows/runtime/submissions/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(detail.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(detail).await?["pr_url"],
+        "https://github.com/owner/repo/pull/2044"
+    );
     Ok(())
 }
 

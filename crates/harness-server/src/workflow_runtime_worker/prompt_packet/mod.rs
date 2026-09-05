@@ -582,12 +582,10 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
             "on_succeeded": {
                 "reducer_next_state": "done",
                 "success_requires": "A succeeded implement_prompt result MUST carry either a validation_report artifact — a non-empty array of {command, exit_code} entries — or a no_change_rationale string artifact explaining why no change was made. Free-text validation records do not satisfy this; completion is rejected without one of the two artifacts. Reporting a non-zero exit_code is allowed: report truthfully rather than omitting a failing command.",
+                "optional_pr_binding": "When the activity created or reused a pull request, include one pull_request artifact with pr_number and pr_url. Harness records that structured binding before marking the prompt task done; prompt tasks that do not produce a PR remain valid.",
                 "required_summary": "Include changed files, validation commands, and remaining blockers."
             },
-            "on_failed": {
-                "reducer_next_state": "failed_or_retry",
-                "retry_policy": "runtime_retry_policy may retry this activity before failure."
-            }
+            "on_failed": {"reducer_next_state": "failed_or_retry", "retry_policy": "runtime_retry_policy may retry this activity before failure."}
         }),
         (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => json!({
             "on_succeeded": {
@@ -666,7 +664,8 @@ fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
                     "required_when": "The prompt task is ready to complete and no repository change was needed; use this or validation_report.",
                     "type": "string",
                     "non_blank": true
-                }
+                },
+                "pull_request": {"required_when": "A PR was created or reused by the activity.", "fields": ["pr_number", "pr_url"]}
             }
         }),
         ("github_issue_pr", "replan_issue") => json!({

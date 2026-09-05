@@ -177,8 +177,21 @@ fn single_shot_done_decision(
         "done",
         "prompt implementation activity completed successfully",
     )
-    .with_command(mark_done_command(instance, result, None))
     .with_evidence(runtime_completion_evidence(event, result));
+    let decision = match with_prompt_pr_binding(decision, event, result) {
+        Ok(decision) => decision,
+        Err(detail) => {
+            return blocked_decision(
+                instance,
+                event,
+                result,
+                "prompt_pr_binding_invalid",
+                &detail,
+                None,
+            )
+        }
+    }
+    .with_command(mark_done_command(instance, result, None));
     with_completion_evidence(decision, completion).high_confidence()
 }
 
@@ -212,10 +225,58 @@ fn settled_done_decision(
             signal.state
         ),
     )
-    .with_command(mark_done_command(instance, result, Some(continuation)))
     .with_evidence(runtime_completion_evidence(event, result))
     .with_evidence(signal.evidence());
+    let decision = match with_prompt_pr_binding(decision, event, result) {
+        Ok(decision) => decision,
+        Err(detail) => {
+            return blocked_decision(
+                instance,
+                event,
+                result,
+                "prompt_pr_binding_invalid",
+                &detail,
+                Some((signal, continuation)),
+            )
+        }
+    }
+    .with_command(mark_done_command(instance, result, Some(continuation)));
     with_completion_evidence(decision, completion).high_confidence()
+}
+
+fn with_prompt_pr_binding(
+    decision: WorkflowDecision,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+) -> Result<WorkflowDecision, String> {
+    let mut artifacts = result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "pull_request");
+    let Some(artifact) = artifacts.next() else {
+        return Ok(decision);
+    };
+    if artifacts.next().is_some() {
+        return Err("implement_prompt result contains multiple pull_request artifacts".to_string());
+    }
+    let pr_number = artifact
+        .artifact
+        .get("pr_number")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "pull_request artifact must contain numeric pr_number".to_string())?;
+    let pr_url = artifact
+        .artifact
+        .get("pr_url")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "pull_request artifact must contain non-empty pr_url".to_string())?;
+    Ok(decision
+        .with_command(WorkflowCommand::bind_pr(
+            pr_number,
+            pr_url,
+            format!("runtime-completion:{}:bind-pr:{pr_number}", event.id),
+        ))
+        .with_evidence(WorkflowEvidence::new("pull_request", pr_url)))
 }
 
 fn continue_decision(

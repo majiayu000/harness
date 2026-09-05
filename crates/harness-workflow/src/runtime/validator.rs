@@ -338,7 +338,7 @@ impl TransitionAllowlist {
 
     pub fn prompt_task_defaults() -> Self {
         use WorkflowCommandType::{
-            EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
+            BindPr, EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
             RequestOperatorAttention, Wait,
         };
 
@@ -358,7 +358,7 @@ impl TransitionAllowlist {
             .allow("implementing", "implementing", [EnqueueActivity])
             .allow("blocked", "awaiting_dependencies", [Wait])
             .allow("blocked", "implementing", [EnqueueActivity, Wait])
-            .allow("implementing", "done", [MarkDone])
+            .allow("implementing", "done", [BindPr, MarkDone])
             // A prompt task may mint Done only with structured self-declared
             // evidence; the reducer resolves validation-report-or-no-change and
             // mints this kind (GH-1817).

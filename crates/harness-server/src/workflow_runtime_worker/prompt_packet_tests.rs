@@ -535,6 +535,13 @@ fn prompt_task_packet_describes_disjunctive_completion_evidence_contract() {
     );
     assert_eq!(artifacts["no_change_rationale"]["type"], "string");
     assert_eq!(artifacts["no_change_rationale"]["non_blank"], true);
+    assert_eq!(
+        artifacts["pull_request"]["fields"],
+        json!(["pr_number", "pr_url"])
+    );
+    assert!(schema["activity_contract"]["accepted_artifacts"]
+        .as_array()
+        .is_some_and(|items| items.contains(&json!("pull_request"))));
     assert!(
         schema["transition_contract"]["on_succeeded"]["success_requires"]
             .as_str()
