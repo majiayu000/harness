@@ -2,7 +2,7 @@
 ARG NODE_BASE_IMAGE=docker.io/library/node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4
 FROM ${NODE_BASE_IMAGE}
 
-ARG CODEX_CLI_PACKAGE=@openai/codex@0.142.5
+ARG CODEX_CLI_PACKAGE=@openai/codex@0.153.4
 ARG CLAUDE_CODE_PACKAGE=@anthropic-ai/claude-code@2.1.201
 
 RUN apt-get update \
