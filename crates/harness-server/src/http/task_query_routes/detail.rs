@@ -7,7 +7,8 @@ use crate::workflow_runtime_submission::{
 };
 use harness_protocol::rest::{
     RuntimeTaskDetailErrorResponse, RuntimeTaskDetailResponse, RuntimeTaskSchedulerOwnerResponse,
-    RuntimeTaskSchedulerResponse, RuntimeTaskTerminalResponse, RuntimeTaskWorkflowResponse,
+    RuntimeTaskSchedulerResponse, RuntimeTaskTerminalResponse, RuntimeTaskTokenUsageResponse,
+    RuntimeTaskWorkflowResponse,
 };
 
 enum RuntimeProofLookup {
@@ -97,9 +98,11 @@ async fn runtime_task_response_by_handle(
     let terminal = TaskTerminalInfo::from_status_error(&task_status, error.as_deref());
     let runtime_usage = store.runtime_usage_for_workflow(&workflow.id).await?;
     let cost_usd_observed = runtime_usage.as_ref().map(|usage| usage.cost_usd_observed);
-    let token_usage = runtime_usage.map(|usage| harness_core::types::TokenUsage {
+    let token_usage = runtime_usage.map(|usage| RuntimeTaskTokenUsageResponse {
         input_tokens: usage.metrics.input_tokens,
         output_tokens: usage.metrics.output_tokens,
+        cache_read_input_tokens: usage.metrics.cache_read_input_tokens,
+        cache_creation_input_tokens: usage.metrics.cache_creation_input_tokens,
         total_tokens: usage.metrics.total_tokens(),
         cost_usd: harness_workflow::runtime::cost_usd_from_micros(usage.cost_usd_micros),
     });
