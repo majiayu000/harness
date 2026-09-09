@@ -6,12 +6,14 @@
 //! `retry.stalled_tasks` and `recent_failures` merge TaskStore rows with
 //! workflow-runtime instances so runtime-only work is visible to operators.
 
-use crate::http::rest_contract::LegacyJson as Json;
+use crate::http::rest_contract::ContractJson;
 use crate::http::AppState;
 use crate::runtime_projection::RuntimeWorkflowProjection;
+use crate::task_runner::TaskStatus;
 use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
 use harness_core::types::EventFilters;
+use harness_protocol::rest::OperatorSnapshotResponse;
 use harness_workflow::runtime::{
     WorkflowDefinitionRegistry, WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState,
 };
@@ -30,6 +32,12 @@ const MAX_TASKS: usize = 20;
 
 /// Maximum length of a task error string before truncation.
 const MAX_ERROR_LEN: usize = 200;
+
+type SnapshotJson = ContractJson<OperatorSnapshotResponse>;
+
+fn snapshot_json(value: Value) -> SnapshotJson {
+    ContractJson(OperatorSnapshotResponse(value))
+}
 
 fn stalled_task_json(t: &crate::task_runner::TaskState) -> Value {
     json!({
@@ -169,6 +177,17 @@ fn parse_rfc3339(value: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|parsed| parsed.with_timezone(&Utc))
 }
 
+fn is_stalled_runtime_candidate(
+    registry: &WorkflowDefinitionRegistry,
+    workflow: &WorkflowInstance,
+) -> bool {
+    // Match TaskStore stalled semantics: queued / dependency-blocked work is
+    // backlog, not a stuck execution.
+    let status =
+        RuntimeWorkflowProjection::from_workflow_with_registry(registry, workflow).task_status;
+    !matches!(status, TaskStatus::Pending | TaskStatus::AwaitingDeps)
+}
+
 fn merge_stalled_json(
     tasks: &[crate::task_runner::TaskState],
     workflows: &[WorkflowInstance],
@@ -196,7 +215,8 @@ fn merge_stalled_json(
         ));
     }
 
-    rows.sort_by_key(|(updated_at, _)| *updated_at);
+    // Known timestamps first (oldest first); missing timestamps sort last.
+    rows.sort_by_key(|(updated_at, _)| (updated_at.is_none(), *updated_at));
     rows.truncate(MAX_TASKS);
     rows.into_iter().map(|(_, row)| row).collect()
 }
@@ -241,19 +261,16 @@ async fn list_stalled_runtime_workflows(
     let cutoff = Utc::now() - chrono::Duration::from_std(stale)?;
     let definition_ids =
         crate::handlers::definition_ids::operator_definition_ids(store.definition_registry())?;
-    let mut workflows = Vec::new();
-    // No per-definition LIMIT: list_nonterminal orders by updated_at DESC, so a
-    // small window would be filled by fresh work and hide genuinely stalled rows.
-    for definition_id in &definition_ids {
-        for workflow in store
-            .list_nonterminal_instances_by_definition(definition_id, None, None)
-            .await?
-        {
-            if workflow.updated_at < cutoff {
-                workflows.push(workflow);
-            }
-        }
-    }
+    let futures = definition_ids
+        .iter()
+        .map(|id| store.list_aged_root_nonterminal_instances_by_definition(id, cutoff, None));
+    let results = futures::future::try_join_all(futures).await?;
+    let registry = store.definition_registry();
+    let mut workflows = results
+        .into_iter()
+        .flatten()
+        .filter(|workflow| is_stalled_runtime_candidate(registry, workflow))
+        .collect::<Vec<_>>();
     workflows.sort_by_key(|workflow| workflow.updated_at);
     workflows.truncate(MAX_TASKS);
     Ok(workflows)
@@ -264,24 +281,27 @@ async fn list_recent_failed_runtime_workflows(
 ) -> anyhow::Result<Vec<WorkflowInstance>> {
     let definition_ids =
         crate::handlers::definition_ids::operator_definition_ids(store.definition_registry())?;
-    let mut workflows = Vec::new();
-    for definition_id in &definition_ids {
-        workflows.extend(
-            store
-                .list_recent_terminal_instances_by_definition(
-                    definition_id,
-                    WorkflowTerminalState::Failed,
-                    MAX_TASKS as i64,
-                )
-                .await?,
-        );
-    }
+    let futures = definition_ids.iter().map(|id| {
+        store.list_recent_terminal_instances_by_definition(
+            id,
+            WorkflowTerminalState::Failed,
+            MAX_TASKS as i64,
+        )
+    });
+    let results = futures::future::try_join_all(futures).await?;
+    let mut workflows = results
+        .into_iter()
+        .flatten()
+        // Child quality-gate failures already propagate to the parent; keep one
+        // operator-visible row by enumerating root workflows only.
+        .filter(|workflow| workflow.parent_workflow_id.is_none())
+        .collect::<Vec<_>>();
     workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
     workflows.truncate(MAX_TASKS);
     Ok(workflows)
 }
 
-pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCode, SnapshotJson) {
     let generated_at = Utc::now();
     let stale = Duration::from_secs(SNAPSHOT_STALE_MINS * 60);
 
@@ -404,14 +424,14 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
         },
     });
 
-    (StatusCode::OK, Json(body))
+    (StatusCode::OK, snapshot_json(body))
 }
 
-fn error_response(message: String) -> (StatusCode, Json<Value>) {
+fn error_response(message: String) -> (StatusCode, SnapshotJson) {
     tracing::error!("operator_snapshot: {message}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": message })),
+        snapshot_json(json!({ "error": message })),
     )
 }
 

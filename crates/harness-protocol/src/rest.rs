@@ -126,6 +126,11 @@ pub struct RuntimeHostLeaseResponse(pub serde_json::Value);
 #[serde(transparent)]
 pub struct RuntimeHostClaimResponse(pub serde_json::Value);
 
+/// JSON response envelope for `/api/operator-snapshot`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct OperatorSnapshotResponse(pub serde_json::Value);
+
 /// Runtime task detail returned by the workflow submission API.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeTaskDetailResponse {
@@ -405,6 +410,9 @@ impl RestDto for RuntimeHostLeaseResponse {}
 
 impl private::Sealed for RuntimeHostClaimResponse {}
 impl RestDto for RuntimeHostClaimResponse {}
+
+impl private::Sealed for OperatorSnapshotResponse {}
+impl RestDto for OperatorSnapshotResponse {}
 
 impl private::Sealed for RuntimeTaskDetailResponse {}
 impl RestDto for RuntimeTaskDetailResponse {}
