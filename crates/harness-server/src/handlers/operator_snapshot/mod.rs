@@ -16,6 +16,7 @@ use harness_core::types::EventFilters;
 use harness_protocol::rest::OperatorSnapshotResponse;
 use harness_workflow::runtime::{
     WorkflowDefinitionRegistry, WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState,
+    PR_FEEDBACK_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::cmp::Reverse;
@@ -281,21 +282,31 @@ async fn list_recent_failed_runtime_workflows(
 ) -> anyhow::Result<Vec<WorkflowInstance>> {
     let definition_ids =
         crate::handlers::definition_ids::operator_definition_ids(store.definition_registry())?;
-    let futures = definition_ids.iter().map(|id| {
-        store.list_recent_terminal_instances_by_definition(
-            id,
-            WorkflowTerminalState::Failed,
-            MAX_TASKS as i64,
-        )
+    let futures = definition_ids.iter().map(|id| async move {
+        // PR-feedback children do not propagate terminal failure, so they must
+        // remain visible while the parent stays in awaiting_feedback. Every
+        // other definition filters roots in SQL before LIMIT so same-definition
+        // children cannot crowd older root failures out of the window.
+        if id == PR_FEEDBACK_DEFINITION_ID {
+            store
+                .list_recent_terminal_instances_by_definition(
+                    id,
+                    WorkflowTerminalState::Failed,
+                    MAX_TASKS as i64,
+                )
+                .await
+        } else {
+            store
+                .list_recent_root_terminal_instances_by_definition(
+                    id,
+                    WorkflowTerminalState::Failed,
+                    MAX_TASKS as i64,
+                )
+                .await
+        }
     });
     let results = futures::future::try_join_all(futures).await?;
-    let mut workflows = results
-        .into_iter()
-        .flatten()
-        // Child quality-gate failures already propagate to the parent; keep one
-        // operator-visible row by enumerating root workflows only.
-        .filter(|workflow| workflow.parent_workflow_id.is_none())
-        .collect::<Vec<_>>();
+    let mut workflows = results.into_iter().flatten().collect::<Vec<_>>();
     workflows.sort_by_key(|workflow| Reverse(workflow.updated_at));
     workflows.truncate(MAX_TASKS);
     Ok(workflows)
@@ -436,4 +447,7 @@ fn error_response(message: String) -> (StatusCode, SnapshotJson) {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    include!("snapshot_cases.rs");
+    include!("snapshot_runtime_cases.rs");
+}
