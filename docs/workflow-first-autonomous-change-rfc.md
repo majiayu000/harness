@@ -949,7 +949,7 @@ definition:
         evidence_kind: authorization_receipt
         requested_action: integrate_children
       on_signal:
-        authorized: integrating
+        authorized: preparing_integration_execution_subject
         expired: authorizing_integration
         denied: blocked
     integrating:
@@ -1119,12 +1119,26 @@ definition:
       on_failure: blocked
     awaiting_parent_handoff:
       progress: parent_handoff
+      required_evidence:
+        by_publication:
+          unbound: []
+          published: [remote_change_binding]
+      wait:
+        fact_kind: published_child_remote_observation
+        refresh_contract: registered.remote_reconciliation.v1
+        nonterminal_facts: [premature_merge_quarantined]
+        preserve_wait_identity_on: [premature_merge_quarantined]
+        max_refreshes: 120
+        deadline: 24h
+        backoff: {initial: 30s, maximum: 10m, multiplier: 2}
       on_signal:
         release_independent: merge_gate
         stack_entry_landed: recording_stack_entry_landing
         integration_contribution_accepted: done
         re_review_required: refreshing_child_review_facts
         parent_failed: blocked
+        premature_merge_quarantined: awaiting_parent_handoff
+        premature_merge_before_release: blocked
     recording_stack_entry_landing:
       activity: record_stack_entry_landing
       on_success: done
@@ -1436,8 +1450,8 @@ definition:
       wait:
         fact_kind: external_stack_entry_merge
         refresh_contract: registered.stack_entry_reconciliation.v1
-        nonterminal_facts: [authorization_stale, stack_child_outcome_stale, review_stale]
-        preserve_wait_identity_on: [authorization_stale, stack_child_outcome_stale, review_stale]
+        nonterminal_facts: [authorization_stale, stack_child_outcome_stale, review_stale, rebase_quarantined]
+        preserve_wait_identity_on: [authorization_stale, stack_child_outcome_stale, review_stale, rebase_quarantined]
         max_refreshes: 120
         deadline: 24h
         backoff: {initial: 30s, maximum: 10m, multiplier: 2}
@@ -1452,7 +1466,10 @@ definition:
         review_stale: awaiting_external_stack_merge
         stale_review_subject_quarantined: requesting_stack_child_reviews
         merge_after_review_stale: reconciling_external_stack_entry
-        rebase_required: stack_rebase_gate
+        rebase_required: awaiting_external_stack_merge
+        rebase_quarantined: awaiting_external_stack_merge
+        rebase_subject_closed_unmerged: stack_rebase_gate
+        merge_during_rebase_quarantine: reconciling_external_stack_entry
         remote_failed: blocked
         deadline_exceeded: blocked
         budget_exhausted: blocked
@@ -1463,6 +1480,7 @@ definition:
         merge_after_authorization_stale: blocked
         merge_after_stack_outcome_stale: blocked
         merge_after_review_stale: blocked
+        merge_during_rebase_quarantine: releasing_landed_stack_child
         divergence: blocked
       on_failure: blocked
     landing_stack_entry:
@@ -1578,7 +1596,15 @@ definition:
         evidence_kind: operator_recovery_receipt
         requested_action: recover_blocked_work_item
       on_signal:
+        retry_failed_gate: restoring_failed_gate
         replan: evaluating_replan_safety
+    restoring_failed_gate:
+      progress: control_return
+      activity: restore_failed_gate
+      control_route: recover_blocked_work_item
+      on_signal:
+        unsafe: blocked
+      on_failure: blocked
     evaluating_replan_safety:
       activity: evaluate_replan_safety
       on_signal:
@@ -1617,6 +1643,11 @@ definition:
         integration_parent_merged: releasing_integration_children
         stack_entry_merged: reconciling_cancellation_stack_entry
         external_stack_entry_merged: reconciling_cancellation_external_stack_entry
+        merge_after_authorization_stale: blocked
+        merge_after_direct_review_stale: blocked
+        merge_after_integration_review_stale: blocked
+        merge_after_integration_outcome_stale: blocked
+        merge_after_invalidation: blocked
         continuation_required: blocked
         facts_unavailable: blocked
         divergence: blocked
@@ -1632,6 +1663,9 @@ definition:
       on_signal:
         entry_confirmed: releasing_landed_stack_child
         merge_after_authorization_stale: blocked
+        merge_after_stack_outcome_stale: blocked
+        merge_after_review_stale: blocked
+        merge_during_rebase_quarantine: blocked
         divergence: blocked
       on_failure: blocked
     cancelling_child_set:
@@ -1688,9 +1722,14 @@ activities:
       fresh_context: true
     input_schema: semantic_risk_input.v1
     output_schema: semantic_risk_output.v1
-    required_evidence: [intake_subject_snapshot, code_change_snapshot]
+    required_evidence:
+      all: [intake_subject_snapshot, code_change_snapshot]
+      by_override:
+        none: []
+        present: [human_risk_override]
     allowed_decisions: [low, medium, high, abstain]
     produces: [semantic_risk_assessment]
+    effective_risk_inputs: [server_universal_floor, operator_non_lowerable_floor, operator_escalation, human_risk_override, project_assessment]
 
   plan_change:
     executor: agent
@@ -1746,6 +1785,7 @@ activities:
     authority: execution_authorization
     requested_action: materialize_children
     required_evidence: [decomposition_validation, authorization_gate_result, authorization_receipt]
+    preserved_child_adoption: update_relation_and_handoff_driver_without_restart
     produces: [child_materialization]
 
   materialize_parent_review_subject:
@@ -2034,6 +2074,18 @@ activities:
     required_evidence: [cancellation_receipt]
     produces: [child_cancellation_request, cancellation_receipt]
 
+  restore_failed_gate:
+    executor: registered_server
+    contract: registered.failed_gate_retry.v1
+    requested_action: recover_blocked_work_item
+    required_evidence:
+      all: [operator_recovery_receipt]
+      by_child_graph:
+        none: []
+        existing: [child_materialization]
+    produces: [failed_gate_retry_snapshot]
+    restores: exact_failed_state_and_driver
+
   evaluate_replan_safety:
     executor: registered_server
     contract: registered.replan_safety.v1
@@ -2052,6 +2104,7 @@ activities:
       all: [cancellation_receipt]
       by_continuation_driver:
         ordinary: []
+        ordinary_published: [remote_change_binding]
         external_merge_wait: [external_merge_wait_snapshot]
       by_overlay:
         none: []
@@ -2066,6 +2119,7 @@ activities:
       all: [cancellation_receipt, cancellation_driver_snapshot]
       by_continuation_driver:
         ordinary: []
+        ordinary_published: [remote_change_binding, remote_merge_confirmation]
         external_merge_wait: [external_merge_wait_snapshot, remote_merge_confirmation]
       by_overlay:
         none: []
@@ -2358,6 +2412,12 @@ evidence:
   semantic_risk_assessment:
     payload_schema: .harness/schemas/semantic-risk-assessment.v1.json
     allowed_producers: [agent_author]
+  human_risk_override:
+    payload_schema: .harness/schemas/human-risk-override.v1.json
+    allowed_producers: [human_operator]
+  failed_gate_retry_snapshot:
+    payload_schema: .harness/schemas/failed-gate-retry-snapshot.v1.json
+    allowed_producers: [server_policy_engine]
   change_set:
     payload_schema: .harness/schemas/change-set.v1.json
     allowed_producers: [agent_author]
@@ -2655,7 +2715,9 @@ stateDiagram-v2
     awaiting_external_stack_merge --> awaiting_external_stack_merge: review stale; preserve wait identity
     awaiting_external_stack_merge --> requesting_stack_child_reviews: stale-review subject closed unmerged
     awaiting_external_stack_merge --> reconciling_external_stack_entry: merge after review stale
-    awaiting_external_stack_merge --> stack_rebase_gate: rebase required
+    awaiting_external_stack_merge --> awaiting_external_stack_merge: rebase required; preserve wait in rebase quarantine
+    awaiting_external_stack_merge --> stack_rebase_gate: rebase subject closed unmerged
+    awaiting_external_stack_merge --> reconciling_external_stack_entry: merge during rebase quarantine
     reconciling_external_stack_entry --> releasing_landed_stack_child: entry confirmed
     reconciling_external_stack_entry --> blocked: merge after authorization stale
     reconciling_external_stack_entry --> blocked: merge after stack child outcome stale
@@ -2702,6 +2764,8 @@ stateDiagram-v2
     authorizing_child_repair --> awaiting_child_repair_authorization: human required
     awaiting_child_repair_authorization --> repairing_child_change: repair approved
     leaf_review_child --> awaiting_parent_handoff: approved
+    awaiting_parent_handoff --> awaiting_parent_handoff: published child remote observation; premature merge quarantined
+    awaiting_parent_handoff --> blocked: premature merge before release
     awaiting_parent_handoff --> merge_gate: independent released
     awaiting_parent_handoff --> recording_stack_entry_landing: stack entry landed
     awaiting_parent_handoff --> done: integration contribution accepted
@@ -2911,6 +2975,9 @@ stateDiagram-v2
     reconciling --> blocked
     releasing_integration_children --> blocked
     awaiting_integration_child_acknowledgements --> blocked
+    blocked --> restoring_failed_gate: retry failed gate
+    blocked --> restoring_failed_gate: retry failed gate
+    restoring_failed_gate --> blocked: unsafe to restore
     blocked --> evaluating_replan_safety: authorized replan
     evaluating_replan_safety --> collecting_facts: no active child graph
     evaluating_replan_safety --> blocked: active or ambiguous child outcome
@@ -3092,10 +3159,16 @@ refresh against its local change before leaf review. A publication whose reconci
 differs from the produced change invalidates the prior Evidence and cannot advance to review.
 
 A human risk override substitutes only for `project_assessment`; it never lowers the universal or
-operator floor and never cancels an explicit operator escalation. It is valid only when bound to
-the exact Workflow definition, input-fact revision, affected scope, plan revision when present,
-code identity when code exists, issuer, reason, issue time, and expiry. Any bound change invalidates
-the override before another mutating or merge action.
+operator floor and never cancels an explicit operator escalation. It is a typed
+`human_risk_override` Evidence kind produced only by `human_operator`. An operator gate with
+`requested_action: override_project_risk` persists that Evidence; `assess_risk` and every later
+authorization or merge gate consume a current override ID when present, and the effective-risk
+formula reads `valid_human_override` only from that pinned Evidence. The override is valid only when
+bound to the exact Workflow definition, input-fact revision, affected scope, plan revision when
+present, code identity when code exists, issuer, reason, override level, issue time, and expiry.
+Any bound change, revocation, or expiry invalidates the override before another mutating or merge
+action. Compilers MUST NOT invent override semantics from mutable operator state outside the pinned
+evidence graph.
 
 ### 13.2 Risk floor inputs
 
@@ -3271,6 +3344,12 @@ The `materializing_children` state is the sole caller of
 `registered.decomposition_materialization.v1`. It consumes the validated proposal revision and its
 bound execution authorization, then writes all child relations, child start commands, and the
 parent barrier in one transaction. Agent output is only a proposal and cannot write these records.
+When an independent-set or stack repair preserves an unchanged child across a new decomposition
+revision, materialization performs an atomic preserved-child adoption: it updates that child's
+relation membership, handoff continuation, and expected parent command/signal set to the new
+revision without issuing another start command and without leaving the child bound to the prior
+revision's release or outcome. A preserved child already at `parent_handoff` therefore accepts the
+new revision's release path; the parent never starts the same child twice.
 
 ### 14.5 Revision
 
@@ -3284,17 +3363,23 @@ increases.
 ### 15.1 `independent_prs`
 
 Use when each child is independently valid on the target base. Each child passes its own merge gate.
-After leaf review each child waits at `parent_handoff`. The parent reviews the complete independent
-set, releases eligible children to their own merge gates, then waits for typed remote-merge outcomes.
-The parent does not create or merge an integration change and closes only after all required child
-merges and set-level acceptance are reconciled.
+After leaf review each child waits at `parent_handoff`. A published child also opens a durable
+`published_child_remote_observation` wait on its `remote_change_binding`; parent commands alone are
+never sufficient observation. A merge observed before the matching `parent_release_snapshot` or
+stack-entry authorization is a premature-merge policy violation and blocks rather than counting as
+an authorized landing. The parent reviews the complete independent set, releases eligible children
+to their own merge gates, then waits for typed remote-merge outcomes. The parent does not create or
+merge an integration change and closes only after all required child merges and set-level
+acceptance are reconciled.
 
 ### 15.2 `stacked_prs`
 
 Use when child B depends on child A. The plan persists base/head relationships and landing order.
-After leaf review, children wait at `parent_handoff`; the parent reviews the ordered binding set and
-owns the ordered merge action. Approval of a lower stack head is invalidated when its effective diff
-changes after rebasing. The parent merge subject is the ordered child binding set, not a synthetic
+After leaf review, children wait at `parent_handoff` under the same published-child remote
+observation rule; the parent reviews the ordered binding set and owns the ordered merge action. A
+merge that predates the matching stack-entry authorization is quarantined or blocked, not treated as
+`stack_entry_landed`. Approval of a lower stack head is invalidated when its effective diff changes
+after rebasing. The parent merge subject is the ordered child binding set, not a synthetic
 integration PR.
 
 ### 15.3 `integration_pr`
@@ -3579,7 +3664,12 @@ each review activity consume that assessment, so quorum never falls back to the 
 Before integration writes begin, the same subject materialization, parent-composition fact
 collection, and risk assessment run over the complete child set. Integration execution authority
 requires that current aggregate subject and its derived assessment, so cross-child interactions can
-raise the execution tier before the integration workspace is mutated.
+raise the execution tier before the integration workspace is mutated. A human
+`awaiting_integration_execution_authorization` receipt never routes directly to `integrating`; it
+returns through `preparing_integration_execution_subject` so the aggregate subject and every bound
+child outcome are rematerialized and revalidated after the wait. Cancellation, supersession, or
+identity change of any contributing child during the wait therefore fails closed before mutation
+dispatch rather than being discovered only at the later merge gate.
 
 ### 18.4 Integration review
 
@@ -3746,14 +3836,20 @@ buffered-completion consumption atomically. Authorization commits `active -> inv
 route to cancellation reconciliation atomically before any driver fence. Replay of either committed
 transition is a no-op; it cannot restore and invalidate the same continuation.
 
-An operator recovery receipt may retry only a declared failed gate or authorize `replan`. `replan`
-first enters `evaluating_replan_safety`. Its registered server activity locks the current child
-relation, reconciles every existing child to current terminal truth, and emits `safe_to_replan` only
-when no child remains active, waiting at parent handoff, externally mutable, or outcome-ambiguous.
-Otherwise it returns to `blocked` with `replan_safety_snapshot`; it never discards a child barrier or
-starts a direct/new decomposition beside an earlier revision. Only the safe signal returns to
-`collecting_facts`, where server-owned facts and risk are recomputed. Recovery never jumps directly
-from `blocked` to implementation, review, or merge.
+An operator recovery receipt may retry a declared failed gate or authorize `replan`. The
+`retry_failed_gate` signal enters `restoring_failed_gate`, whose registered
+`registered.failed_gate_retry.v1` contract restores the exact failed state, progress driver, retry
+identity, deadline remainder, and budget reservation without cancelling children or opening a new
+decomposition revision. It is distinct from `replan` and is the only recovery that may resume a
+parent stranded by a retryable activity or provider failure while children remain active, at
+`parent_handoff`, or externally mutable. `replan` first enters `evaluating_replan_safety`. Its
+registered server activity locks the current child relation, reconciles every existing child to
+current terminal truth, and emits `safe_to_replan` only when no child remains active, waiting at
+parent handoff, externally mutable, or outcome-ambiguous. Otherwise it returns to `blocked` with
+`replan_safety_snapshot`; it never discards a child barrier or starts a direct/new decomposition
+beside an earlier revision. Only the safe signal returns to `collecting_facts`, where server-owned
+facts and risk are recomputed. Recovery never jumps directly from `blocked` to implementation,
+review, or merge.
 
 Cancellation uses its own `cancel_work_item` action and `cancellation_receipt`; an operator recovery
 receipt cannot authorize it. The compiled `request_cancellation` control may preempt any
@@ -3789,24 +3885,34 @@ returned, committed-unknown, or buffered provider outcome enters ordinary reconc
 overlay attached. It never restores the original merge driver. Cancellation authorization retains
 the overlay for cancellation admission. The `refreshing_cancellation_admission_facts` activity
 consumes the preserved continuation identity and, for an external-merge driver, its immutable wait
-snapshot plus any release-invalidation overlay. It records a fresh `remote_merge_confirmation` and
-a `cancellation_driver_snapshot` before `evaluate_cancellation_admission` can run. That admission
-consumes the same conditional Evidence; missing or mismatched wait, overlay, or confirmation
-Evidence cannot emit `safe_to_cancel`. Restart
-reconstructs the overlay and its fenced driver from the continuation row; command ordering cannot
-erase it.
+snapshot plus any release-invalidation overlay. For an `ordinary_published` driver it consumes the
+current `remote_change_binding` and records a fresh provider confirmation proving closed-unmerged
+quarantine. It records a fresh `remote_merge_confirmation` and a `cancellation_driver_snapshot`
+before `evaluate_cancellation_admission` can run. That admission consumes the same conditional
+Evidence; missing or mismatched wait, overlay, published binding, or confirmation Evidence cannot
+emit `safe_to_cancel`. Restart reconstructs the overlay and its fenced driver from the continuation
+row; command ordering cannot erase it.
 
 After human authorization, and immediately for a parent-issued child command,
 `refreshing_cancellation_admission_facts` and `evaluate_cancellation_admission` fence new dispatch
 for the current Work Item, interrupt or cancel local jobs, and reconcile its own in-flight provider
-or external-merge driver. Only `safe_to_cancel` reaches
+or external-merge driver. An ordinary continuation whose Work Item already published a remote change
+is classified `ordinary_published`: admission requires the current `remote_change_binding`, one fresh
+provider confirmation, and a durable closed-unmerged quarantine before `safe_to_cancel`. A published
+subject at `merge_gate`, `parent_handoff`, or any other post-publication ordinary state therefore
+cannot terminalize while its PR remains open and unmonitored. Only `safe_to_cancel` reaches
 `cancel_child_set`. A confirmed direct merge follows the truthful success route, a confirmed
 integration-parent merge releases and awaits its children, and a confirmed stack-entry merge enters
-`reconciling_cancellation_stack_entry`. That cancellation-aware reconciliation records the landed
-entry without returning to rebase or landing: a complete stack follows normal successful child-set
-reconciliation, while remaining entries proceed directly to cancellation fan-out. A committed
-nonterminal mutation, unavailable fact, ambiguity, or divergence remains nonterminal and routes to
-`blocked`; none is labelled cancelled.
+`reconciling_cancellation_stack_entry`. When cancellation is authorized while an external-merge wait
+is already quarantining stale authorization, review, child-outcome, or independent-release evidence,
+the shared cancellation reconciler carries that preserved wait mode forward: every post-staleness
+merge routes to `blocked` through the same `merge_after_*` policy-violation signals used by ordinary
+external reconciliation, including stack review- and child-outcome-stale merges. That
+cancellation-aware reconciliation records a clean landing without returning to rebase only when the
+wait mode is not post-stale; a complete stack follows normal successful child-set reconciliation,
+while remaining entries proceed directly to cancellation fan-out. A committed nonterminal mutation,
+unavailable fact, ambiguity, or divergence remains nonterminal and routes to `blocked`; none is
+labelled cancelled.
 
 `cancel_child_set` then locks the pinned child set and atomically enqueues one idempotent
 `cancel_child_work_item` command plus a server-derived, child-specific cancellation receipt for
@@ -3885,7 +3991,9 @@ stack-entry gate generation/cursor snapshot. A remote confirmation routes only t
 external reconciliation activity that consumes this snapshot; it cannot enter ordinary or stack
 reconciliation against a mutable current cursor. Release invalidation stores its Evidence ID on an
 affected wait, switches that same wait to fenced invalidation mode, and schedules an immediate
-reconciliation refresh. An open but currently unmerged remote change is nonterminal: it remains
+reconciliation refresh. Concurrent authorization-, review-, or outcome-staleness appends to the
+wait's `invalidation_cause_set` instead of replacing a single cause, so replay retains every active
+quarantine reason. An open but currently unmerged remote change is nonterminal: it remains
 quarantined on the same wait, preserves webhook routing and scheduled refresh, and prevents a later
 parent release. Only provider facts proving the exact remote change is closed unmerged and cannot
 be merged emit `invalidated_release_quarantined` and permit `awaiting_parent_handoff`. Identity drift
@@ -3908,6 +4016,13 @@ A stack-child outcome change uses the same durable-wait rule for
 unmerged and child reviews are refreshed. A merge observed after cancellation, failure, or
 supersession consumes current child outcomes and blocks before cursor advance or landing
 acknowledgement.
+
+A `rebase_required` observation on that same wait likewise preserves the wait identity in
+`rebase_quarantined` mode rather than discarding it before `stack_rebase_gate`. The remote subject
+remains monitored while Harness awaits rebase/republication authorization. Exact closed-unmerged
+provider facts discharge the quarantine into `stack_rebase_gate`; a concurrent external merge during
+rebase quarantine is reconciled as an external landing through
+`merge_during_rebase_quarantine` and cannot leave an unobserved landed child.
 
 Every direct and stack external-merge refresh also revalidates the exact authorization receipt
 bound by its wait snapshot. Expiry or revocation switches the same wait to authorization-stale mode;
@@ -4184,6 +4299,18 @@ Required metrics include:
 - only an exact closed-unmerged provider confirmation releases that quarantine to parent handoff;
 - cancellation admission with an external-merge continuation rejects a missing or mismatched wait
   snapshot, release-invalidation overlay, driver snapshot, or fresh remote confirmation;
+- cancellation admission for an ordinary published subject rejects missing binding or open/unmerged
+  remote confirmation and cannot emit `safe_to_cancel` without closed-unmerged quarantine;
+- cancellation reconciler carrying a post-staleness wait mode routes every `merge_after_*` signal to
+  `blocked` rather than success or child release;
+- published children at `parent_handoff` keep a remote observation wait and block premature merges
+  before parent release or stack-entry authorization;
+- an external stack wait preserves identity through rebase quarantine until closed-unmerged discharge
+  or reconciles a concurrent merge as an external landing;
+- blocked-parent `retry_failed_gate` restores the exact failed state/driver without requiring child
+  cancellation, while `replan` remains refused while children are active or at handoff;
+- human risk override is accepted only as typed `human_risk_override` Evidence bound into effective
+  risk evaluation;
 - provider confirmation is required before terminal `done`.
 
 ### 28.6 Crash and reconciliation tests
@@ -4214,7 +4341,7 @@ and explicit human-authorized adoption creates only new vNext identities.
 
 At minimum:
 
-1. low-risk documentation-only change through automatic merge;
+1. low-risk documentation-only change through an operator/provider-owned GitHub merge that Harness observes and reconciles (GitHub v1 remains observation-only; automatic merge requires a future full-atomic provider descriptor);
 2. medium-risk code change through human merge confirmation;
 3. high-risk protected-path change blocked before mutation until plan approval;
 4. large task decomposed into two non-overlapping children;

@@ -486,7 +486,8 @@ workflow_external_waits
   subject jsonb
   bound_evidence_ids jsonb
   wait_snapshot_evidence_id foreign key workflow_evidence(id)
-  invalidation_evidence_id nullable foreign key workflow_evidence(id)
+  invalidation_evidence_id nullable foreign key workflow_evidence(id)  # legacy single cause; prefer cause set
+  invalidation_cause_set jsonb nullable  # [{cause, evidence_id}, ...] active quarantine causes
   invalidation_mode nullable       # fenced_open | quarantined_closed_unmerged | violated
   last_fact_identity jsonb nullable
   refresh_contract_id
@@ -889,10 +890,13 @@ An external-merge wait also persists one immutable wait snapshot containing ever
 binding, review, risk, authorization, and stack-progress Evidence ID. Its confirmation can dispatch
 only the dedicated external reconciliation contract. Independent-release invalidation stores its
 Evidence on the same wait, switches it to fenced invalidation mode, and schedules an immediate
-reconciliation refresh. The parent cannot create a later release while that quarantine remains
-open. Only a provider-confirmed closed-unmerged subject releases the child to parent handoff; a
-post-invalidation merge is reported as a policy violation rather than accepted against the old
-generation.
+reconciliation refresh. When multiple stale conditions arise on one open wait, the record persists
+the full `invalidation_cause_set` of cause tags and Evidence IDs rather than overwriting a single
+`invalidation_evidence_id`; restart/replay therefore retains every active cause needed to choose the
+closed-unmerged refresh route or post-staleness merge violation. The parent cannot create a later
+release while that quarantine remains open. Only a provider-confirmed closed-unmerged subject
+releases the child to parent handoff; a post-invalidation merge is reported as a policy violation
+rather than accepted against the old generation.
 
 An integration-child outcome change likewise switches the same external wait to a fenced mode
 without replacing its webhook identity, deadline, or budget. The open PR remains monitored until it
