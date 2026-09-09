@@ -44,12 +44,16 @@ mod tests {
                 "eval": {
                     "required_runtime_host_capabilities": [
                         "eval_resource_limits",
+                        "eval_network_policy",
                         "trusted_eval_verifier_v1"
                     ]
                 }
             }
         });
-        let supported = vec!["eval_resource_limits".to_string()];
+        let supported = vec![
+            "eval_resource_limits".to_string(),
+            "eval_network_policy".to_string(),
+        ];
 
         assert_eq!(
             missing_required_eval_capabilities(&input, &supported),

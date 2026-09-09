@@ -107,6 +107,40 @@ mod tests {
     }
 
     #[test]
+    fn eval_isolation_command_policy_normalizes_network_allowlist() -> anyhow::Result<()> {
+        let command = command_record(WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "eval-implement",
+            json!({
+                "activity": "implement_issue",
+                "eval": {
+                    "timeout_secs": 1800,
+                    "isolation": {
+                        "tier": "container",
+                        "runtime_kind": "remote_host",
+                        "runtime_profile": "eval-isolated-runtime-host",
+                        "sandbox": "workspace-write",
+                        "backend": "container_runtime_host",
+                        "image": "harness-eval-runner:local",
+                        "lifecycle": "ephemeral",
+                        "cleanup_required": true,
+                        "network_allowlist": [" GitHub.COM. ", "api.github.com"]
+                    }
+                }
+            }),
+        ));
+
+        let resolution =
+            isolation_resolution_for_command(None, &command, &IsolationConfig::default())?;
+
+        assert_eq!(
+            resolution.network_allowlist,
+            vec!["github.com".to_string(), "api.github.com".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn eval_isolation_command_policy_selects_remote_host_profile() -> anyhow::Result<()> {
         let command = command_record(WorkflowCommand::new(
             WorkflowCommandType::EnqueueActivity,

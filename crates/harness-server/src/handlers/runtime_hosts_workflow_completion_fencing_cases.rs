@@ -186,7 +186,7 @@ async fn draining_host_completion_revalidates_required_eval_capabilities() -> an
     register_host_with_capabilities(
         &app,
         "host-a",
-        vec!["eval_resource_limits", "trusted_eval_verifier_v1"],
+        vec!["eval_resource_limits", "eval_network_policy", "trusted_eval_verifier_v1"],
     )
     .await?;
     let job = enqueue_runtime_host_test_job(
@@ -201,6 +201,7 @@ async fn draining_host_completion_revalidates_required_eval_capabilities() -> an
                     "timeout_secs": 45,
                     "required_runtime_host_capabilities": [
                         "eval_resource_limits",
+                        "eval_network_policy",
                         "trusted_eval_verifier_v1"
                     ]
                 }
@@ -242,7 +243,7 @@ async fn draining_host_completion_revalidates_required_eval_capabilities() -> an
     );
     assert_eq!(
         body["missing_capabilities"],
-        json!(["eval_resource_limits", "trusted_eval_verifier_v1"])
+        json!(["eval_resource_limits", "eval_network_policy", "trusted_eval_verifier_v1"])
     );
     Ok(())
 }
@@ -626,7 +627,7 @@ async fn runtime_job_completion_preflight_error_preserves_the_client_lease_fence
         return Ok(());
     };
     let app = runtime_hosts_workflow_app(state);
-    register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+    register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits", "eval_network_policy"]).await?;
     let job = enqueue_runtime_host_test_job(
         &store,
         "completion-preflight-fence",

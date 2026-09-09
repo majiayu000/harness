@@ -266,7 +266,12 @@ async fn draining_host_can_acknowledge_eval_cancellation_then_finish_deregister(
     let dir = tempfile::tempdir()?;
     let (state, store) = required_runtime_store_state(dir.path()).await?;
     let app = support::runtime_hosts_workflow_app(state.clone());
-    support::register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+    support::register_host_with_capabilities(
+        &app,
+        "host-a",
+        vec!["eval_resource_limits", "eval_network_policy"],
+    )
+    .await?;
     let job = support::enqueue_runtime_host_test_job(
         &store,
         "draining-cancellation-ack",
