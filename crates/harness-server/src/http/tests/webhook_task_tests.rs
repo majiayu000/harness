@@ -660,6 +660,8 @@ async fn completed_prompt_submission_reports_pr_url_after_store_reopen() -> anyh
                 serde_json::json!({ "activity": "implement_prompt" }),
             )
             .await?;
+        // GH-2050: an unverified agent pull_request claim must fail closed —
+        // no BindPr persistence into workflow data or submission detail.
         harness_workflow::runtime::RuntimeWorker::new(store, "prompt-pr-test-worker")
             .run_once(&PromptPullRequestExecutor)
             .await?
@@ -673,9 +675,16 @@ async fn completed_prompt_submission_reports_pr_url_after_store_reopen() -> anyh
             )
             .await?;
         assert_eq!(detail.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(detail).await?["pr_url"],
-            "https://github.com/owner/repo/pull/2044"
+        let detail_body = response_json(detail).await?;
+        assert!(
+            detail_body.get("pr_url").is_none()
+                || detail_body["pr_url"].is_null()
+                || detail_body["pr_url"] == "",
+            "unverified pull_request claim must not persist pr_url into submission detail: {detail_body}"
+        );
+        assert_ne!(
+            detail_body["status"], "done",
+            "unverified claim must not mark the submission done: {detail_body}"
         );
         (task_id, workflow_id)
     };
@@ -693,11 +702,17 @@ async fn completed_prompt_submission_reports_pr_url_after_store_reopen() -> anyh
         .expect("reopened workflow runtime store")
         .get_instance(&workflow_id)
         .await?
-        .expect("completed prompt workflow should survive reopen");
-    assert_eq!(persisted.state, "done");
+        .expect("prompt workflow should survive reopen");
     assert_eq!(
-        persisted.data["pr_url"],
-        "https://github.com/owner/repo/pull/2044"
+        persisted.state, "blocked",
+        "unverified prompt PR claim must fail closed into blocked"
+    );
+    assert!(
+        persisted.data.get("pr_url").is_none()
+            || persisted.data["pr_url"].is_null()
+            || persisted.data["pr_url"] == "",
+        "unverified claim must not persist pr_url into workflow data: {:?}",
+        persisted.data.get("pr_url")
     );
 
     let detail = runtime_submission_app(reopened)
@@ -708,9 +723,12 @@ async fn completed_prompt_submission_reports_pr_url_after_store_reopen() -> anyh
         )
         .await?;
     assert_eq!(detail.status(), StatusCode::OK);
-    assert_eq!(
-        response_json(detail).await?["pr_url"],
-        "https://github.com/owner/repo/pull/2044"
+    let detail_body = response_json(detail).await?;
+    assert!(
+        detail_body.get("pr_url").is_none()
+            || detail_body["pr_url"].is_null()
+            || detail_body["pr_url"] == "",
+        "reopened store must still omit unverified pr_url: {detail_body}"
     );
     Ok(())
 }

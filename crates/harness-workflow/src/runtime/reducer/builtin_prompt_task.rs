@@ -1,5 +1,6 @@
 use super::prompt_completion_evidence::{prompt_completion_evidence, PromptCompletionEvidence};
 use super::support::{runtime_blocked_command, runtime_completion_evidence};
+use super::verified_pr_binding_evidence_with_registry;
 use crate::runtime::model::{
     ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvent,
     WorkflowEvidence, WorkflowInstance,
@@ -178,7 +179,7 @@ fn single_shot_done_decision(
         "prompt implementation activity completed successfully",
     )
     .with_evidence(runtime_completion_evidence(event, result));
-    let decision = match with_prompt_pr_binding(decision, event, result) {
+    let decision = match with_prompt_pr_binding(registry, decision, event, result) {
         Ok(decision) => decision,
         Err(detail) => {
             return blocked_decision(
@@ -227,7 +228,7 @@ fn settled_done_decision(
     )
     .with_evidence(runtime_completion_evidence(event, result))
     .with_evidence(signal.evidence());
-    let decision = match with_prompt_pr_binding(decision, event, result) {
+    let decision = match with_prompt_pr_binding(registry, decision, event, result) {
         Ok(decision) => decision,
         Err(detail) => {
             return blocked_decision(
@@ -245,6 +246,7 @@ fn settled_done_decision(
 }
 
 fn with_prompt_pr_binding(
+    registry: &WorkflowDefinitionRegistry,
     decision: WorkflowDecision,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -270,13 +272,20 @@ fn with_prompt_pr_binding(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "pull_request artifact must contain non-empty pr_url".to_string())?;
+    // GH-2050 / GH-1766: require server-verified PR binding evidence before
+    // minting BindPr; persist the canonical verified URL when present.
+    let binding = verified_pr_binding_evidence_with_registry(registry, result, pr_number, pr_url)?;
     Ok(decision
         .with_command(WorkflowCommand::bind_pr(
             pr_number,
-            pr_url,
+            binding.canonical_pr_url.clone(),
             format!("runtime-completion:{}:bind-pr:{pr_number}", event.id),
         ))
-        .with_evidence(WorkflowEvidence::new("pull_request", pr_url)))
+        .with_evidence(WorkflowEvidence::new(
+            "pull_request",
+            &binding.canonical_pr_url,
+        ))
+        .with_evidence(binding.evidence))
 }
 
 fn continue_decision(

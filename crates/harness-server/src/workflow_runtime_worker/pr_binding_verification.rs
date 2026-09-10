@@ -24,7 +24,7 @@ const PR_BINDING_RETRY_DELAY_MS: u64 = 500;
 
 /// Activities whose successful results may claim a new PR binding for a
 /// `github_issue_pr` workflow in `implementing`.
-const PR_BINDING_ACTIVITIES: [&str; 2] = ["implement_issue", "promote_candidate_pr"];
+const GITHUB_ISSUE_PR_BINDING_ACTIVITIES: [&str; 2] = ["implement_issue", "promote_candidate_pr"];
 
 pub(super) fn result_claims_pr_binding(
     job: &RuntimeJob,
@@ -34,11 +34,24 @@ pub(super) fn result_claims_pr_binding(
     let Some(workflow) = workflow else {
         return false;
     };
-    workflow.definition_id == harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID
-        && workflow.state == "implementing"
-        && result.status == ActivityStatus::Succeeded
-        && PR_BINDING_ACTIVITIES.contains(&super::data_helpers::activity_name(job).as_str())
-        && claimed_pull_request(result).is_some()
+    if workflow.state != "implementing"
+        || result.status != ActivityStatus::Succeeded
+        || claimed_pull_request(result).is_none()
+    {
+        return false;
+    }
+    let activity = super::data_helpers::activity_name(job);
+    match workflow.definition_id.as_str() {
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID => {
+            GITHUB_ISSUE_PR_BINDING_ACTIVITIES.contains(&activity.as_str())
+        }
+        // GH-2050: prompt_task BindPr must receive the same server verification
+        // attach path as github_issue_pr (GH-1766).
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID => {
+            activity == harness_workflow::runtime::PROMPT_TASK_IMPLEMENT_ACTIVITY
+        }
+        _ => false,
+    }
 }
 
 /// Verify the claimed PR against GitHub and attach the verdict artifact.
@@ -360,5 +373,66 @@ mod tests {
             Some("octo/repo".to_string())
         );
         assert_eq!(repo_slug_from_url("https://example.com/x"), None);
+    }
+
+    fn runtime_job(activity: &str) -> RuntimeJob {
+        RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "test",
+            json!({ "activity": activity }),
+        )
+    }
+
+    fn workflow(definition_id: &str, state: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            definition_id,
+            1,
+            state,
+            harness_workflow::runtime::WorkflowSubject::new("subject", "key-1"),
+        )
+        .with_id("workflow-1")
+    }
+
+    fn pull_request_result(activity: &str) -> ActivityResult {
+        ActivityResult::succeeded(activity, "claimed a PR").with_artifact(
+            harness_workflow::runtime::ActivityArtifact::new(
+                "pull_request",
+                json!({
+                    "pr_number": 42,
+                    "pr_url": "https://github.com/octo/repo/pull/42",
+                }),
+            ),
+        )
+    }
+
+    #[test]
+    fn result_claims_pr_binding_covers_prompt_task_implement_prompt() {
+        let job = runtime_job("implement_prompt");
+        let wf = workflow(
+            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
+        );
+        let result = pull_request_result("implement_prompt");
+        assert!(result_claims_pr_binding(&job, Some(&wf), &result));
+    }
+
+    #[test]
+    fn result_claims_pr_binding_still_covers_github_issue_implement_issue() {
+        let job = runtime_job("implement_issue");
+        let wf = workflow(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            "implementing",
+        );
+        let result = pull_request_result("implement_issue");
+        assert!(result_claims_pr_binding(&job, Some(&wf), &result));
+    }
+
+    #[test]
+    fn result_claims_pr_binding_ignores_unrelated_definitions() {
+        let job = runtime_job("implement_prompt");
+        let wf = workflow("quality_gate", "implementing");
+        let result = pull_request_result("implement_prompt");
+        assert!(!result_claims_pr_binding(&job, Some(&wf), &result));
     }
 }
