@@ -120,3 +120,96 @@ fn runtime_completion_reducer_finishes_prompt_task_after_implementation() {
         )
         .expect("prompt completion decision should validate");
 }
+
+/// GH-2050: an unverified agent pull_request claim must not mint BindPr.
+#[test]
+fn runtime_completion_reducer_blocks_unverified_prompt_pull_request_claim() {
+    let instance = prompt_task_instance("implementing");
+    let result = ActivityResult::succeeded(
+        PROMPT_TASK_IMPLEMENT_ACTIVITY,
+        "Prompt implementation completed.",
+    )
+    .with_validation(ValidationRecord::new("cargo test", "passed"))
+    .with_artifact(ActivityArtifact::new(
+        "validation_report",
+        json!([{ "command": "cargo test", "exit_code": 0 }]),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "pull_request",
+        json!({
+            "pr_number": 2044,
+            "pr_url": "https://github.com/owner/repo/pull/2044"
+        }),
+    ));
+    let event = runtime_completion_event(&instance, PROMPT_TASK_IMPLEMENT_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("unverified prompt PR claim should still produce a decision");
+
+    assert_eq!(decision.decision, "prompt_pr_binding_invalid");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision
+        .commands
+        .iter()
+        .all(|command| command.command_type != WorkflowCommandType::BindPr));
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("blocked prompt decision should validate");
+}
+
+/// GH-2050: a server-verified pull_request claim binds the canonical URL.
+#[test]
+fn runtime_completion_reducer_binds_verified_prompt_pull_request() {
+    let instance = prompt_task_instance("implementing");
+    let result = ActivityResult::succeeded(
+        PROMPT_TASK_IMPLEMENT_ACTIVITY,
+        "Prompt implementation completed.",
+    )
+    .with_validation(ValidationRecord::new("cargo test", "passed"))
+    .with_artifact(ActivityArtifact::new(
+        "validation_report",
+        json!([{ "command": "cargo test", "exit_code": 0 }]),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "pull_request",
+        json!({
+            "pr_number": 2044,
+            "pr_url": "https://github.com/owner/repo/pull/2044"
+        }),
+    ))
+    .with_artifact(verified_pr_binding(2044));
+    let event = runtime_completion_event(&instance, PROMPT_TASK_IMPLEMENT_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("verified prompt PR claim should produce a decision");
+
+    assert_eq!(decision.decision, "finish_prompt_task");
+    assert_eq!(decision.next_state, "done");
+    let bind_pr = decision
+        .commands
+        .iter()
+        .find(|command| command.command_type == WorkflowCommandType::BindPr)
+        .expect("verified claim should mint BindPr");
+    assert_eq!(bind_pr.command["pr_number"], 2044);
+    assert_eq!(
+        bind_pr.command["pr_url"],
+        "https://github.com/owner/repo/pull/2044"
+    );
+    assert!(decision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "verified_pr_binding"));
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("verified prompt PR completion should validate");
+}
