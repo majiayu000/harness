@@ -280,10 +280,14 @@ pub struct AppState {
     /// Set once during `build_app_state`; read-only thereafter.
     pub degraded_subsystems: Vec<&'static str>,
 
-    // ── Service layer ────────────────────────────────────────────────────────
-    // Trait-based abstractions for independent testability. Each service owns
-    // its dependencies; the fields above are preserved for handlers that have
-    // not yet been migrated to the service interfaces.
+    // ── Service layer (frozen — GH-1976) ─────────────────────────────────────
+    // Existing ProjectService / TaskService / ExecutionService fields stay for
+    // the minority of call sites that already use them. This surface is frozen:
+    // do not add new *_svc traits/methods, and do not migrate handlers that
+    // reach state.core.* merely to improve the ratio. New handlers should use
+    // the dominant state.core.* pattern until a concrete execution, isolation,
+    // or testing need requires a service boundary (see crates/harness-server/
+    // src/services/mod.rs).
     /// Project registry operations and default-root lookup.
     pub project_svc: Arc<dyn crate::services::project::ProjectService>,
     /// Task lifecycle queries and stream subscriptions.
