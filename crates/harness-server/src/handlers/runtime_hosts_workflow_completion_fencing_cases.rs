@@ -666,7 +666,7 @@ async fn runtime_job_completion_preflight_error_preserves_the_client_lease_fence
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         body["error"],
-        "eval runtime job completion requires resource_limit_report artifact"
+        "eval runtime job completion requires network_policy_report artifact"
     );
     assert!(body.get("lease_reserved").is_none());
 

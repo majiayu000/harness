@@ -26,11 +26,32 @@ fn ordinary_eval_input() -> serde_json::Value {
 }
 
 fn ordinary_eval_completion_request(claimed: &serde_json::Value) -> serde_json::Value {
+    let network_policy = claimed.get("network_policy").cloned().unwrap_or_else(|| {
+        json!({
+            "inbound": "deny",
+            "outbound": "deny",
+            "network_allowlist": [],
+        })
+    });
+    let result = ActivityResult::succeeded("implement_issue", "ordinary completion").with_artifact(
+        ActivityArtifact::new(
+            "network_policy_report",
+            json!({
+                "runtime_job_id": claimed["runtime_job_id"],
+                "enforced": true,
+                "policy": network_policy,
+                "grants": [],
+                "connections": [],
+                "payloads_recorded": false,
+                "reason": "runtime host enforced eval network policy",
+            }),
+        ),
+    );
     json!({
         "lease_generation": claimed["lease_generation"],
         "lease_expires_at": claimed["lease_expires_at"],
         "lease_proof": claimed["lease_proof"],
-        "result": ActivityResult::succeeded("implement_issue", "ordinary completion"),
+        "result": result,
         "execution_evidence": {
             "checked_out_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "resource_limit_report": {
