@@ -195,6 +195,9 @@ fn eval_network_policy_rejects_ambiguous_dns_allowlist_entries() {
         "127.1",
         "127.0.0.01",
         "0177.0.0.1",
+        "0x7f.0.0.1",
+        "0x7f.1",
+        "0X7F.0.0.1",
         "localhost",
         "github.com:443",
         "github.com/path",
@@ -207,6 +210,35 @@ fn eval_network_policy_rejects_ambiguous_dns_allowlist_entries() {
             NetworkPolicyReportError::InvalidAllowlistHost { .. }
         ));
     }
+}
+
+#[test]
+fn eval_network_policy_revalidated_rejects_injected_numeric_aliases() {
+    let injected = EvalNetworkPolicy {
+        inbound: EvalNetworkAccess::Allowlist,
+        outbound: EvalNetworkAccess::Allowlist,
+        network_allowlist: vec!["0x7f.0.0.1".to_string()],
+    };
+    let error = injected
+        .revalidated()
+        .expect_err("claim-time alias injection must fail closed");
+    assert!(matches!(
+        error,
+        NetworkPolicyReportError::InvalidAllowlistHost { .. }
+    ));
+}
+
+#[test]
+fn eval_network_policy_revalidated_rebuilds_secure_shape() {
+    let injected = EvalNetworkPolicy {
+        inbound: EvalNetworkAccess::Allowlist,
+        outbound: EvalNetworkAccess::Deny,
+        network_allowlist: vec![" API.GitHub.COM. ".to_string()],
+    };
+    let policy = injected.revalidated().unwrap();
+    assert_eq!(policy.inbound, EvalNetworkAccess::Deny);
+    assert_eq!(policy.outbound, EvalNetworkAccess::Allowlist);
+    assert_eq!(policy.network_allowlist, vec!["api.github.com".to_string()]);
 }
 
 #[test]

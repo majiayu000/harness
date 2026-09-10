@@ -86,6 +86,13 @@ impl EvalNetworkPolicy {
             network_allowlist,
         })
     }
+
+    /// Re-normalize a deserialized claim/report policy through the same allowlist
+    /// gate used by manifest and dispatcher paths. Rejects IP/alias injection that
+    /// raw serde acceptance would otherwise preserve.
+    pub fn revalidated(self) -> Result<Self, NetworkPolicyReportError> {
+        Self::for_allowlist(&self.network_allowlist)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,11 +345,27 @@ fn looks_like_numeric_address(candidate: &str) -> bool {
     if candidate.parse::<std::net::IpAddr>().is_ok() {
         return true;
     }
-    // Reject non-canonical numeric aliases such as `127.1`, `127.0.0.01`, and
-    // `0177.0.0.1` that can resolve to loopback on Linux.
-    let labels = candidate.split('.').collect::<Vec<_>>();
-    !labels.is_empty()
-        && labels
-            .iter()
-            .all(|label| !label.is_empty() && label.bytes().all(|byte| byte.is_ascii_digit()))
+    // Reject non-canonical numeric aliases such as `127.1`, `127.0.0.01`,
+    // `0177.0.0.1`, and hex forms like `0x7f.0.0.1` / `0x7f.1` that can resolve
+    // to loopback on Linux via inet_aton-style parsing.
+    let mut labels = candidate.split('.');
+    let Some(first) = labels.next() else {
+        return false;
+    };
+    std::iter::once(first)
+        .chain(labels)
+        .all(is_numeric_or_hex_label)
+}
+
+fn is_numeric_or_hex_label(label: &str) -> bool {
+    if label.is_empty() {
+        return false;
+    }
+    if let Some(hex) = label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"))
+    {
+        return !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    label.bytes().all(|byte| byte.is_ascii_digit())
 }
