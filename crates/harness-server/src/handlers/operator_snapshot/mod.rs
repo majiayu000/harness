@@ -16,7 +16,7 @@ use harness_core::types::EventFilters;
 use harness_protocol::rest::OperatorSnapshotResponse;
 use harness_workflow::runtime::{
     WorkflowDefinitionRegistry, WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState,
-    PR_FEEDBACK_DEFINITION_ID,
+    QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::cmp::Reverse;
@@ -283,13 +283,13 @@ async fn list_recent_failed_runtime_workflows(
     let definition_ids =
         crate::handlers::definition_ids::operator_definition_ids(store.definition_registry())?;
     let futures = definition_ids.iter().map(|id| async move {
-        // PR-feedback children do not propagate terminal failure, so they must
-        // remain visible while the parent stays in awaiting_feedback. Every
-        // other definition filters roots in SQL before LIMIT so same-definition
-        // children cannot crowd older root failures out of the window.
-        if id == PR_FEEDBACK_DEFINITION_ID {
+        // Quality-gate child failures propagate to the parent, so roots-only
+        // avoids duplicate rows and child crowding. Other child definitions
+        // (prompt_task, nested github_issue_pr, pr_feedback) do not propagate
+        // terminal failure — keep those child rows visible.
+        if id == QUALITY_GATE_DEFINITION_ID {
             store
-                .list_recent_terminal_instances_by_definition(
+                .list_recent_root_terminal_instances_by_definition(
                     id,
                     WorkflowTerminalState::Failed,
                     MAX_TASKS as i64,
@@ -297,7 +297,7 @@ async fn list_recent_failed_runtime_workflows(
                 .await
         } else {
             store
-                .list_recent_root_terminal_instances_by_definition(
+                .list_recent_terminal_instances_by_definition(
                     id,
                     WorkflowTerminalState::Failed,
                     MAX_TASKS as i64,

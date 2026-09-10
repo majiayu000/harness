@@ -255,16 +255,18 @@ async fn collapses_child_workflow_failure_into_parent_row() -> anyhow::Result<()
         }),
     )
     .with_id("runtime-parent-fail-workflow".to_string());
-    let child = runtime_workflow(
+    let child = WorkflowInstance::new(
+        QUALITY_GATE_DEFINITION_ID,
+        1,
         "failed",
-        "issue:runtime-child-fail",
-        serde_json::json!({
-            "project_id": "/tmp/harness-runtime-parent-fail",
-            "failure_reason": "child quality gate failed",
-        }),
+        WorkflowSubject::new("issue", "issue:runtime-child-fail"),
     )
     .with_id("runtime-child-fail-workflow".to_string())
-    .with_parent("runtime-parent-fail-workflow");
+    .with_parent("runtime-parent-fail-workflow")
+    .with_server_data(serde_json::json!({
+        "project_id": "/tmp/harness-runtime-parent-fail",
+        "failure_reason": "child quality gate failed",
+    }));
     test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
 
@@ -292,13 +294,14 @@ async fn collapses_child_workflow_failure_into_parent_row() -> anyhow::Result<()
             .iter()
             .all(|row| row["task_id"] != "runtime-child-fail-workflow"
                 && row["task_id"] != "runtime-child-fail"),
-        "child failure must not consume a recent_failures slot: {failures:?}"
+        "quality_gate child failure must not consume a recent_failures slot: {failures:?}"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn recent_failures_keep_older_root_when_newer_children_fill_limit() -> anyhow::Result<()> {
+async fn recent_failures_keep_older_root_when_newer_quality_gate_children_fill_limit(
+) -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-op-snap-runtime-root-limit-")?;
     let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
@@ -308,29 +311,33 @@ async fn recent_failures_keep_older_root_when_newer_children_fill_limit() -> any
         .as_ref()
         .expect("workflow runtime store");
 
-    let root = runtime_workflow(
+    let root = WorkflowInstance::new(
+        QUALITY_GATE_DEFINITION_ID,
+        1,
         "failed",
-        "issue:runtime-root-limit",
-        serde_json::json!({
-            "project_id": "/tmp/harness-runtime-root-limit",
-            "submission_id": "runtime-root-limit",
-            "failure_reason": "older root failure",
-        }),
+        WorkflowSubject::new("issue", "issue:runtime-root-limit"),
     )
-    .with_id("runtime-root-limit-workflow".to_string());
+    .with_id("runtime-root-limit-workflow".to_string())
+    .with_server_data(serde_json::json!({
+        "project_id": "/tmp/harness-runtime-root-limit",
+        "submission_id": "runtime-root-limit",
+        "failure_reason": "older root quality gate failure",
+    }));
     test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &root).await?;
     age_workflow(store, "runtime-root-limit-workflow").await?;
 
     for index in 0..MAX_TASKS {
-        let child = runtime_workflow(
+        let child = WorkflowInstance::new(
+            QUALITY_GATE_DEFINITION_ID,
+            1,
             "failed",
-            &format!("issue:runtime-child-limit-{index}"),
-            serde_json::json!({
-                "failure_reason": "newer same-definition child failure",
-            }),
+            WorkflowSubject::new("issue", format!("issue:runtime-child-limit-{index}")),
         )
         .with_id(format!("runtime-child-limit-{index}"))
-        .with_parent("runtime-root-limit-workflow");
+        .with_parent("runtime-root-limit-workflow")
+        .with_server_data(serde_json::json!({
+            "failure_reason": "newer quality_gate child failure",
+        }));
         test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     }
 
@@ -351,7 +358,7 @@ async fn recent_failures_keep_older_root_when_newer_children_fill_limit() -> any
         failures
             .iter()
             .any(|row| row["task_id"] == "runtime-root-limit"),
-        "older root failure must survive the per-definition limit: {failures:?}"
+        "older quality_gate root failure must survive the per-definition limit: {failures:?}"
     );
     Ok(())
 }
@@ -416,6 +423,69 @@ async fn recent_failures_include_non_propagating_pr_feedback_child() -> anyhow::
             .iter()
             .all(|row| row["task_id"] != "pr-feedback-parent"),
         "awaiting_feedback parent must not appear as a recent failure: {failures:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recent_failures_include_non_propagating_prompt_task_child() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-op-snap-runtime-prompt-child-")?;
+    let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store");
+
+    let parent = runtime_workflow(
+        "awaiting_dependencies",
+        "issue:prompt-task-parent",
+        serde_json::json!({
+            "project_id": "/tmp/harness-prompt-task-parent",
+            "submission_id": "prompt-task-parent",
+        }),
+    )
+    .with_id("prompt-task-parent-workflow".to_string());
+    let child = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "failed",
+        WorkflowSubject::new("prompt", "prompt:child-fail"),
+    )
+    .with_id("prompt-task-child-failed".to_string())
+    .with_parent("prompt-task-parent-workflow")
+    .with_server_data(serde_json::json!({
+        "failure_reason": "prompt_task child failed without parent propagation",
+    }));
+    test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
+    test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
+
+    let app = Router::new()
+        .route("/api/operator-snapshot", get(operator_snapshot))
+        .with_state(state);
+    let req = axum::http::Request::builder()
+        .uri("/api/operator-snapshot")
+        .body(axum::body::Body::empty())?;
+    let resp = tower::ServiceExt::oneshot(app, req).await?;
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let failures = body["recent_failures"]
+        .as_array()
+        .expect("recent_failures array");
+    assert!(
+        failures.iter().any(|row| {
+            row["task_id"] == "prompt-task-child-failed"
+                && row["error"] == "prompt_task child failed without parent propagation"
+        }),
+        "non-propagating prompt_task child failure must stay visible: {failures:?}"
+    );
+    assert!(
+        failures
+            .iter()
+            .all(|row| row["task_id"] != "prompt-task-parent"),
+        "non-failed parent must not appear as a recent failure: {failures:?}"
     );
     Ok(())
 }

@@ -2,7 +2,8 @@ use super::*;
 use crate::test_helpers;
 use axum::{body::to_bytes, routing::get, Router};
 use harness_workflow::runtime::{
-    WorkflowInstance, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
+    WorkflowInstance, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
+    PR_FEEDBACK_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
 };
 
 fn runtime_workflow(state: &str, subject_key: &str, data: serde_json::Value) -> WorkflowInstance {
