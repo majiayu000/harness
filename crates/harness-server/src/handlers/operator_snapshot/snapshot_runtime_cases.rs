@@ -364,6 +364,66 @@ async fn recent_failures_keep_older_root_when_newer_quality_gate_children_fill_l
 }
 
 #[tokio::test]
+async fn recent_failures_keep_older_root_when_newer_github_issue_pr_children_fill_limit(
+) -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let dir = test_helpers::tempdir_in_home("harness-test-op-snap-runtime-issue-root-limit-")?;
+    let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store");
+
+    let root = runtime_workflow(
+        "failed",
+        "issue:runtime-issue-root-limit",
+        serde_json::json!({
+            "project_id": "/tmp/harness-runtime-issue-root-limit",
+            "submission_id": "runtime-issue-root-limit",
+            "failure_reason": "older github_issue_pr root failure",
+        }),
+    )
+    .with_id("runtime-issue-root-limit-workflow".to_string());
+    test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &root).await?;
+    age_workflow(store, "runtime-issue-root-limit-workflow").await?;
+
+    for index in 0..MAX_TASKS {
+        let child = runtime_workflow(
+            "failed",
+            &format!("issue:runtime-issue-child-limit-{index}"),
+            serde_json::json!({
+                "failure_reason": "newer github_issue_pr child failure",
+            }),
+        )
+        .with_id(format!("runtime-issue-child-limit-{index}"))
+        .with_parent("runtime-issue-root-limit-workflow");
+        test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
+    }
+
+    let app = Router::new()
+        .route("/api/operator-snapshot", get(operator_snapshot))
+        .with_state(state);
+    let req = axum::http::Request::builder()
+        .uri("/api/operator-snapshot")
+        .body(axum::body::Body::empty())?;
+    let resp = tower::ServiceExt::oneshot(app, req).await?;
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let failures = body["recent_failures"]
+        .as_array()
+        .expect("recent_failures array");
+    assert!(
+        failures
+            .iter()
+            .any(|row| row["task_id"] == "runtime-issue-root-limit"),
+        "older github_issue_pr root failure must survive the per-definition limit: {failures:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn recent_failures_include_non_propagating_pr_feedback_child() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-op-snap-runtime-pr-feedback-")?;

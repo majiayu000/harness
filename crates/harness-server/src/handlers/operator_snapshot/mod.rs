@@ -16,7 +16,7 @@ use harness_core::types::EventFilters;
 use harness_protocol::rest::OperatorSnapshotResponse;
 use harness_workflow::runtime::{
     WorkflowDefinitionRegistry, WorkflowInstance, WorkflowRuntimeStore, WorkflowTerminalState,
-    QUALITY_GATE_DEFINITION_ID,
+    PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::cmp::Reverse;
@@ -283,13 +283,14 @@ async fn list_recent_failed_runtime_workflows(
     let definition_ids =
         crate::handlers::definition_ids::operator_definition_ids(store.definition_registry())?;
     let futures = definition_ids.iter().map(|id| async move {
-        // Quality-gate child failures propagate to the parent, so roots-only
-        // avoids duplicate rows and child crowding. Other child definitions
-        // (prompt_task, nested github_issue_pr, pr_feedback) do not propagate
-        // terminal failure — keep those child rows visible.
-        if id == QUALITY_GATE_DEFINITION_ID {
+        // Non-propagating child definitions must stay visible while the parent
+        // remains non-failed. Every other definition (github_issue_pr,
+        // quality_gate, declarative roots) filters roots in SQL before LIMIT so
+        // same-definition children cannot crowd older root failures out of the
+        // window.
+        if id == PROMPT_TASK_DEFINITION_ID || id == PR_FEEDBACK_DEFINITION_ID {
             store
-                .list_recent_root_terminal_instances_by_definition(
+                .list_recent_terminal_instances_by_definition(
                     id,
                     WorkflowTerminalState::Failed,
                     MAX_TASKS as i64,
@@ -297,7 +298,7 @@ async fn list_recent_failed_runtime_workflows(
                 .await
         } else {
             store
-                .list_recent_terminal_instances_by_definition(
+                .list_recent_root_terminal_instances_by_definition(
                     id,
                     WorkflowTerminalState::Failed,
                     MAX_TASKS as i64,
