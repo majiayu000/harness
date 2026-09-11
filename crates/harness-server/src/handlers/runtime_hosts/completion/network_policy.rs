@@ -41,23 +41,11 @@ pub(in crate::handlers::runtime_hosts) fn validate_eval_network_policy_report(
         return Ok(());
     };
 
-    let report_artifacts = result
+    let mut report_artifacts = result
         .artifacts
         .iter()
-        .filter(|artifact| artifact.artifact_type == "network_policy_report")
-        .collect::<Vec<_>>();
-    if report_artifacts.len() > 1 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            json!({
-                "error": "eval runtime job completion must include exactly one network_policy_report artifact"
-            }),
-        ));
-    }
-    let Some(report_value) = report_artifacts
-        .first()
-        .map(|artifact| artifact.artifact.clone())
-    else {
+        .filter(|artifact| artifact.artifact_type == "network_policy_report");
+    let Some(first_artifact) = report_artifacts.next() else {
         return Err((
             StatusCode::BAD_REQUEST,
             json!({
@@ -65,6 +53,15 @@ pub(in crate::handlers::runtime_hosts) fn validate_eval_network_policy_report(
             }),
         ));
     };
+    if report_artifacts.next().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "eval runtime job completion must include exactly one network_policy_report artifact"
+            }),
+        ));
+    }
+    let report_value = first_artifact.artifact.clone();
     let report: harness_sandbox::EvalNetworkPolicyReport = serde_json::from_value(report_value)
         .map_err(|error| {
             (

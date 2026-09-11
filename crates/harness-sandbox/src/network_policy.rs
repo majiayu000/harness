@@ -322,18 +322,23 @@ fn normalize_dns_name(value: &str) -> Result<String, NetworkPolicyReportError> {
             host: value.to_string(),
         });
     }
-    let labels = candidate.split('.').collect::<Vec<_>>();
-    if labels.len() < 2
-        || labels.iter().any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || label.starts_with('-')
-                || label.ends_with('-')
-                || !label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-    {
+    let mut label_count = 0;
+    for label in candidate.split('.') {
+        label_count += 1;
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(NetworkPolicyReportError::InvalidAllowlistHost {
+                host: value.to_string(),
+            });
+        }
+    }
+    if label_count < 2 {
         return Err(NetworkPolicyReportError::InvalidAllowlistHost {
             host: value.to_string(),
         });
