@@ -65,6 +65,8 @@ pub struct EvalIsolationProfile {
     #[serde(default = "default_eval_isolation_image")]
     pub image: String,
     #[serde(default)]
+    pub network_allowlist: Vec<String>,
+    #[serde(default)]
     pub lifecycle: EvalIsolationLifecycle,
     #[serde(default = "default_cleanup_required")]
     pub cleanup_required: bool,
@@ -79,6 +81,7 @@ impl Default for EvalIsolationProfile {
             sandbox: default_eval_isolation_sandbox(),
             backend: default_eval_isolation_backend(),
             image: default_eval_isolation_image(),
+            network_allowlist: Vec::new(),
             lifecycle: EvalIsolationLifecycle::default(),
             cleanup_required: true,
         }
@@ -335,6 +338,10 @@ fn normalize_manifest(raw: RawManifest) -> Result<EvalBenchmarkManifest, Manifes
 mod command_tests;
 
 #[cfg(test)]
+#[path = "manifest_network_allowlist_tests.rs"]
+mod network_allowlist_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -468,6 +475,7 @@ resource_limits = { memory_bytes = 0 }
         assert_eq!(case.isolation.lifecycle, EvalIsolationLifecycle::Ephemeral);
         assert_eq!(case.isolation.backend, "container_runtime_host");
         assert_eq!(case.isolation.image, "harness-eval-runner:local");
+        assert!(case.isolation.network_allowlist.is_empty());
         assert!(case.isolation.cleanup_required);
     }
 

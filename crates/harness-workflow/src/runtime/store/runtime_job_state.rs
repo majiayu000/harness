@@ -238,6 +238,18 @@ impl WorkflowRuntimeStore {
             .map_err(Into::into)
     }
 
+    pub async fn persist_runtime_job_data(&self, job: &RuntimeJob) -> anyhow::Result<()> {
+        let data = to_jsonb_string(job)?;
+        sqlx::query(
+            "UPDATE runtime_jobs SET data = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        )
+        .bind(&data)
+        .bind(&job.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn runtime_job_matches_running_lease(
         &self,
         expected: &RuntimeJob,

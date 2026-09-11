@@ -49,7 +49,7 @@ pub(in crate::handlers::runtime_hosts) fn eval_resource_limit_preflight_failure(
     ))
 }
 
-fn runtime_job_activity(job: &RuntimeJob) -> String {
+pub(super) fn runtime_job_activity(job: &RuntimeJob) -> String {
     job.input
         .get("activity")
         .and_then(Value::as_str)
