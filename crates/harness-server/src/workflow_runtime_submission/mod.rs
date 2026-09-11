@@ -72,8 +72,9 @@ pub(crate) use prompt_memory::{
 pub(crate) struct PromptSubmissionRuntimeContext<'a> {
     pub project_root: &'a Path,
     /// Server-trusted repository slug (`owner/repo`) for PR-binding verification.
-    /// Prefer an explicit caller value (task request / parent workflow); otherwise
-    /// submission resolves it from the project filesystem before persisting.
+    /// On first submit this may come from the task request or project detect;
+    /// on resubmit, already-persisted workflow `repo` wins over auto-filled
+    /// request values.
     pub repo: Option<&'a str>,
     pub task_id: &'a TaskId,
     pub prompt: &'a str,
@@ -393,21 +394,15 @@ fn prompt_subject_key(external_id: Option<&str>, task_id: &TaskId) -> String {
 
 /// Resolve a server-trusted repo slug for prompt workflows (GH-2054).
 ///
-/// Order: explicit submission context → already-persisted workflow data →
-/// project filesystem remote detection. Never derive ownership from an
-/// agent-claimed PR URL.
+/// Order: already-persisted workflow data → submission context → project
+/// filesystem remote detection. Persisted ownership wins on resubmit because
+/// `prepare_enqueue` / `fill_missing_repo_from_project` often auto-fills
+/// `ctx.repo` from the current remote; that must not silently repin trust.
+/// Never derive ownership from an agent-claimed PR URL.
 async fn resolve_prompt_trusted_repo(
     ctx: &PromptSubmissionRuntimeContext<'_>,
     existing_data: &serde_json::Value,
 ) -> Option<String> {
-    let explicit = ctx
-        .repo
-        .map(str::trim)
-        .filter(|repo| !repo.is_empty())
-        .map(str::to_string);
-    if let Some(repo) = explicit {
-        return canonical_github_repo_identity(Some(&repo));
-    }
     let persisted = existing_data
         .get("repo")
         .and_then(serde_json::Value::as_str)
@@ -415,6 +410,14 @@ async fn resolve_prompt_trusted_repo(
         .filter(|repo| !repo.is_empty())
         .map(str::to_string);
     if let Some(repo) = persisted {
+        return canonical_github_repo_identity(Some(&repo));
+    }
+    let from_ctx = ctx
+        .repo
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+        .map(str::to_string);
+    if let Some(repo) = from_ctx {
         return canonical_github_repo_identity(Some(&repo));
     }
     let detected =
@@ -686,6 +689,29 @@ mod trust_tests {
         assert_eq!(
             resolve_prompt_trusted_repo(&ctx, &json!({})).await,
             Some("octo/detected".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_prompt_trusted_repo_prefers_persisted_over_autofilled_ctx() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task_id = TaskId::from_str("resubmit-repo");
+        let ctx = PromptSubmissionRuntimeContext {
+            project_root: dir.path(),
+            // Simulates prepare_enqueue auto-fill from a mutated/current remote.
+            repo: Some("octo/autofilled"),
+            task_id: &task_id,
+            prompt: "x",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+            continuation: None,
+        };
+        assert_eq!(
+            resolve_prompt_trusted_repo(&ctx, &json!({ "repo": "octo/persisted" })).await,
+            Some("octo/persisted".to_string())
         );
     }
 }

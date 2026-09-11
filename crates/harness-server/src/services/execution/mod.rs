@@ -540,18 +540,18 @@ impl DefaultExecutionService {
     fn normalize_remote_subject_identity(
         req: &mut CreateTaskRequest,
     ) -> Result<(), EnqueueTaskError> {
-        if req.issue.is_none() && req.pr.is_none() {
-            return Ok(());
-        }
-        let repo = req
-            .repo
-            .as_deref()
-            .filter(|repo| !repo.is_empty())
-            .ok_or_else(|| {
-                EnqueueTaskError::BadRequest(
+        let requires_repo = req.issue.is_some() || req.pr.is_some();
+        let Some(repo) = req.repo.as_deref().filter(|repo| !repo.is_empty()) else {
+            return if requires_repo {
+                Err(EnqueueTaskError::BadRequest(
                     "GitHub issue/PR submissions require a repository slug".to_string(),
-                )
-            })?;
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        // Prompt and issue/PR paths both persist repo as trusted ownership
+        // (GH-2054); validate at the request boundary before promotion.
         if repo != repo.trim() || !valid_github_repo_slug(repo) {
             return Err(EnqueueTaskError::BadRequest(format!(
                 "invalid GitHub repository slug: {repo}"

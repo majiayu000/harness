@@ -69,7 +69,7 @@ pub(super) async fn attach_pr_binding_verification(
     let Some((pr_number, pr_url)) = claimed_pull_request(&result) else {
         return result;
     };
-    let Some(repo_slug) = resolve_expected_repo_slug(workflow).await else {
+    let Some(repo_slug) = resolve_expected_repo_slug(workflow) else {
         return result.with_artifact(ActivityArtifact::new(
             ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
             json!({
@@ -246,18 +246,12 @@ fn claimed_pull_request(result: &ActivityResult) -> Option<(u64, String)> {
 
 /// Trusted repository ownership for PR-binding verification (GH-2054).
 ///
-/// Only server-trusted sources are accepted: `workflow.data.repo`, or the
-/// project filesystem remote resolved from server-owned `project_id`.
-/// Parsing the agent-claimed `pr_url` must not supply the expected slug.
-async fn resolve_expected_repo_slug(workflow: &WorkflowInstance) -> Option<String> {
-    if let Some(repo) = expected_repo_slug(workflow) {
-        return Some(repo);
-    }
-    let project_id = workflow.data.get("project_id").and_then(Value::as_str)?;
-    crate::workflow_runtime_pr_feedback::pr_detection::detect_repo_slug(std::path::Path::new(
-        project_id,
-    ))
-    .await
+/// Only a persisted `workflow.data.repo` is accepted. Do not reread the
+/// agent-writable project `.git` remote after activity — a mutated remote
+/// must not become ownership proof. Parsing the agent-claimed `pr_url` must
+/// not supply the expected slug either.
+fn resolve_expected_repo_slug(workflow: &WorkflowInstance) -> Option<String> {
+    expected_repo_slug(workflow)
 }
 
 fn expected_repo_slug(workflow: &WorkflowInstance) -> Option<String> {
@@ -397,8 +391,8 @@ mod tests {
         assert_eq!(expected_repo_slug(&wf), None);
     }
 
-    #[tokio::test]
-    async fn resolve_expected_repo_slug_uses_project_filesystem_when_repo_missing() {
+    #[test]
+    fn resolve_expected_repo_slug_fails_closed_when_repo_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = dir.path().join(".git");
         std::fs::create_dir(&git).expect("mkdir .git");
@@ -414,14 +408,11 @@ mod tests {
         )
         .with_server_data(json!({ "project_id": dir.path().to_string_lossy() }));
 
-        assert_eq!(
-            resolve_expected_repo_slug(&wf).await,
-            Some("octo/from-project".to_string())
-        );
+        assert_eq!(resolve_expected_repo_slug(&wf), None);
     }
 
-    #[tokio::test]
-    async fn resolve_expected_repo_slug_prefers_persisted_repo_over_project_detect() {
+    #[test]
+    fn resolve_expected_repo_slug_uses_persisted_repo_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = dir.path().join(".git");
         std::fs::create_dir(&git).expect("mkdir .git");
@@ -441,7 +432,7 @@ mod tests {
         }));
 
         assert_eq!(
-            resolve_expected_repo_slug(&wf).await,
+            resolve_expected_repo_slug(&wf),
             Some("octo/persisted".to_string())
         );
     }
