@@ -267,15 +267,20 @@ pub(super) fn bind_pr_from_activity_result(
         return None;
     }
     let (pr_number, pr_url) = pull_request_artifact(result)?;
-    let binding =
-        match verified_pr_binding_evidence_with_registry(registry, result, pr_number, &pr_url) {
-            Ok(binding) => binding,
-            Err(reason) => {
-                return Some(pr_binding_verification_blocked_decision(
-                    instance, event, result, &reason,
-                ));
-            }
-        };
+    let binding = match verified_pr_binding_evidence_with_registry(
+        registry,
+        result,
+        pr_number,
+        &pr_url,
+        Some((GITHUB_ISSUE_PR_DEFINITION_ID, "implementing", "pr_open")),
+    ) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            return Some(pr_binding_verification_blocked_decision(
+                instance, event, result, &reason,
+            ));
+        }
+    };
     let pr_url = binding.canonical_pr_url;
     Some(
         WorkflowDecision::new(
@@ -307,11 +312,21 @@ pub(crate) struct VerifiedPrBindingEvidence {
     pub(crate) canonical_pr_url: String,
 }
 
+/// Build `verified_pr_binding` evidence for a claimed PR.
+///
+/// `enforcement_transition` selects which transition table entry may waive
+/// verification when the operator kill switch strips evidence requirements.
+/// Pass `Some((definition_id, from, to))` for transitions that declare
+/// `verified_pr_binding` (e.g. `github_issue_pr` `implementing → pr_open`).
+/// Pass `None` when BindPr is a side-effect outside that declaration (prompt
+/// task): verification stays required and must not inherit another workflow's
+/// waiver (GH-2054).
 pub(crate) fn verified_pr_binding_evidence_with_registry(
     registry: &WorkflowDefinitionRegistry,
     result: &ActivityResult,
     claimed_pr_number: u64,
     claimed_pr_url: &str,
+    enforcement_transition: Option<(&str, &str, &str)>,
 ) -> Result<VerifiedPrBindingEvidence, String> {
     if let Some(failure) = pr_binding_verification_failure(result) {
         return Err(format!(
@@ -359,15 +374,21 @@ pub(crate) fn verified_pr_binding_evidence_with_registry(
             ),
         });
     }
-    if !transition_evidence_enforced_with_registry(
-        registry,
-        GITHUB_ISSUE_PR_DEFINITION_ID,
-        "implementing",
-        "pr_open",
-        EVIDENCE_VERIFIED_PR_BINDING,
-    ) {
-        // The transition table no longer demands it, so neither does this
-        // reducer: one authority, no drift.
+    let enforced = match enforcement_transition {
+        Some((definition_id, from_state, to_state)) => transition_evidence_enforced_with_registry(
+            registry,
+            definition_id,
+            from_state,
+            to_state,
+            EVIDENCE_VERIFIED_PR_BINDING,
+        ),
+        // No declaring transition: BindPr must not silently waive with another
+        // workflow's kill switch (GH-2054 / prompt_task).
+        None => true,
+    };
+    if !enforced {
+        // The caller's transition table no longer demands it, so neither does
+        // this reducer: one authority, no drift.
         return Ok(VerifiedPrBindingEvidence {
             evidence: WorkflowEvidence::new(
                 EVIDENCE_VERIFIED_PR_BINDING,
