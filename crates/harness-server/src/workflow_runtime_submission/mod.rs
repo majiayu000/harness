@@ -71,10 +71,9 @@ pub(crate) use prompt_memory::{
 
 pub(crate) struct PromptSubmissionRuntimeContext<'a> {
     pub project_root: &'a Path,
-    /// Server-trusted repository slug (`owner/repo`) for PR-binding verification.
-    /// On first submit this may come from the task request or project detect;
-    /// on resubmit, already-persisted workflow `repo` wins over auto-filled
-    /// request values.
+    /// Caller- or parent-supplied repository slug (`owner/repo`) for PR-binding
+    /// verification. Never an auto-detected checkout remote — those are mutable
+    /// across shared project checkouts (GH-2054).
     pub repo: Option<&'a str>,
     pub task_id: &'a TaskId,
     pub prompt: &'a str,
@@ -161,7 +160,7 @@ async fn persist_prompt_submission(
     let prompt_ref =
         prompt_ref_for_submission(&project_id, ctx.external_id, ctx.task_id, ctx.prompt);
     let depends_on = prompt_submission_dependency_ids(ctx);
-    let trusted_repo = resolve_prompt_trusted_repo(ctx, &instance.data, new_instance).await;
+    let trusted_repo = resolve_prompt_trusted_repo(ctx, &instance.data, new_instance);
     let submitted_data = prompt_submission_data(
         ctx,
         execution_policy,
@@ -395,14 +394,14 @@ fn prompt_subject_key(external_id: Option<&str>, task_id: &TaskId) -> String {
 /// Resolve a server-trusted repo slug for prompt workflows (GH-2054).
 ///
 /// Order: already-persisted workflow data, then (new workflows only)
-/// submission context / project filesystem remote detection.
+/// caller-/parent-supplied `ctx.repo`.
 ///
-/// Legacy instances without a pinned `data.repo` fail closed on resubmit:
-/// `prepare_enqueue` / `fill_missing_repo_from_project` often auto-fills
-/// `ctx.repo` from the current remote, and agents can rewrite that remote.
-/// Remote detection is accepted only when creating a new workflow.
-/// Never derive ownership from an agent-claimed PR URL.
-async fn resolve_prompt_trusted_repo(
+/// Never promote checkout remotes (`.git/config` / `detect_repo_slug`) or
+/// `prepare_enqueue` auto-fill into trusted ownership — shared project
+/// checkouts are agent-writable. Legacy instances without a pinned
+/// `data.repo` fail closed on resubmit. Never derive ownership from an
+/// agent-claimed PR URL.
+fn resolve_prompt_trusted_repo(
     ctx: &PromptSubmissionRuntimeContext<'_>,
     existing_data: &serde_json::Value,
     new_instance: bool,
@@ -423,14 +422,8 @@ async fn resolve_prompt_trusted_repo(
         .repo
         .map(str::trim)
         .filter(|repo| !repo.is_empty())
-        .map(str::to_string);
-    if let Some(repo) = from_ctx {
-        return canonical_github_repo_identity(Some(&repo));
-    }
-    let detected =
-        crate::workflow_runtime_pr_feedback::pr_detection::detect_repo_slug(ctx.project_root)
-            .await?;
-    canonical_github_repo_identity(Some(&detected))
+        .map(str::to_string)?;
+    canonical_github_repo_identity(Some(&from_ctx))
 }
 
 fn prompt_submission_data(
@@ -670,8 +663,8 @@ mod trust_tests {
         assert!(data.get("prompt_ref").is_some());
     }
 
-    #[tokio::test]
-    async fn resolve_prompt_trusted_repo_detects_origin_from_project() {
+    #[test]
+    fn resolve_prompt_trusted_repo_fails_closed_without_caller_repo_on_new_instance() {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = dir.path().join(".git");
         std::fs::create_dir(&git).expect("mkdir .git");
@@ -694,13 +687,36 @@ mod trust_tests {
             continuation: None,
         };
         assert_eq!(
-            resolve_prompt_trusted_repo(&ctx, &json!({}), true).await,
-            Some("octo/detected".to_string())
+            resolve_prompt_trusted_repo(&ctx, &json!({}), true),
+            None,
+            "checkout remotes must not become trusted ownership for new prompt workflows"
         );
     }
 
-    #[tokio::test]
-    async fn resolve_prompt_trusted_repo_prefers_persisted_over_autofilled_ctx() {
+    #[test]
+    fn resolve_prompt_trusted_repo_accepts_caller_repo_on_new_instance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task_id = TaskId::from_str("caller-repo");
+        let ctx = PromptSubmissionRuntimeContext {
+            project_root: dir.path(),
+            repo: Some("Octo/Caller"),
+            task_id: &task_id,
+            prompt: "x",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+            continuation: None,
+        };
+        assert_eq!(
+            resolve_prompt_trusted_repo(&ctx, &json!({}), true),
+            Some("octo/caller".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_trusted_repo_prefers_persisted_over_autofilled_ctx() {
         let dir = tempfile::tempdir().expect("tempdir");
         let task_id = TaskId::from_str("resubmit-repo");
         let ctx = PromptSubmissionRuntimeContext {
@@ -717,13 +733,13 @@ mod trust_tests {
             continuation: None,
         };
         assert_eq!(
-            resolve_prompt_trusted_repo(&ctx, &json!({ "repo": "octo/persisted" }), false).await,
+            resolve_prompt_trusted_repo(&ctx, &json!({ "repo": "octo/persisted" }), false),
             Some("octo/persisted".to_string())
         );
     }
 
-    #[tokio::test]
-    async fn resolve_prompt_trusted_repo_fails_closed_on_legacy_resubmit_without_pinned_repo() {
+    #[test]
+    fn resolve_prompt_trusted_repo_fails_closed_on_legacy_resubmit_without_pinned_repo() {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = dir.path().join(".git");
         std::fs::create_dir(&git).expect("mkdir .git");
@@ -746,9 +762,6 @@ mod trust_tests {
             external_id: None,
             continuation: None,
         };
-        assert_eq!(
-            resolve_prompt_trusted_repo(&ctx, &json!({}), false).await,
-            None
-        );
+        assert_eq!(resolve_prompt_trusted_repo(&ctx, &json!({}), false), None);
     }
 }

@@ -403,7 +403,13 @@ impl DefaultExecutionService {
         self.check_allowed_roots(&canonical)?;
         let project_id = canonical.to_string_lossy().into_owned();
         req.project = Some(canonical.clone());
-        workflow_runtime_submission::fill_missing_repo_from_project(&mut req).await;
+        // Issue/PR subjects need a GitHub slug; auto-detect from the checkout is
+        // acceptable there because ownership is pinned by issue/PR number.
+        // Prompt workflows must not promote mutable `.git` remotes into trusted
+        // `workflow.data.repo` (GH-2054) — callers supply repo explicitly.
+        if req.issue.is_some() || req.pr.is_some() {
+            workflow_runtime_submission::fill_missing_repo_from_project(&mut req).await;
+        }
         Self::normalize_remote_subject_identity(&mut req)?;
         Self::populate_external_id(&mut req);
 
