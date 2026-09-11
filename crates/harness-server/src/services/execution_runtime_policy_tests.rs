@@ -105,6 +105,39 @@ fn remote_subject_identity_normalizes_repository_case() {
     assert_eq!(req.repo.as_deref(), Some("owner/repo"));
 }
 
+#[test]
+fn prompt_repo_identity_is_validated_and_canonicalized_at_intake() {
+    let mut req = CreateTaskRequest {
+        prompt: Some("implement something".to_string()),
+        repo: Some("Owner/Repo".to_string()),
+        ..CreateTaskRequest::default()
+    };
+    DefaultExecutionService::normalize_remote_subject_identity(&mut req)
+        .expect("valid prompt repo should canonicalize");
+    assert_eq!(req.repo.as_deref(), Some("owner/repo"));
+
+    let mut invalid = CreateTaskRequest {
+        prompt: Some("implement something".to_string()),
+        repo: Some("owner".to_string()),
+        ..CreateTaskRequest::default()
+    };
+    let err = DefaultExecutionService::normalize_remote_subject_identity(&mut invalid)
+        .expect_err("bare owner must be rejected before trusted persistence");
+    assert!(matches!(err, EnqueueTaskError::BadRequest(_)));
+}
+
+#[test]
+fn prompt_without_repo_still_normalizes() {
+    let mut req = CreateTaskRequest {
+        prompt: Some("implement something".to_string()),
+        repo: None,
+        ..CreateTaskRequest::default()
+    };
+    DefaultExecutionService::normalize_remote_subject_identity(&mut req)
+        .expect("prompt without repo remains allowed");
+    assert!(req.repo.is_none());
+}
+
 #[tokio::test]
 async fn remote_subject_gate_rejects_before_workflow_creation() -> anyhow::Result<()> {
     let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {

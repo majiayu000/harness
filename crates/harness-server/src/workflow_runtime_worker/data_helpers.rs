@@ -621,6 +621,7 @@ mod tests {
             &store,
             crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
                 project_root: &project_root,
+                repo: None,
                 task_id: &task_id,
                 prompt: "restart safe prompt",
                 depends_on: &[],

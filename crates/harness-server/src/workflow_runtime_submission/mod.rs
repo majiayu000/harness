@@ -71,6 +71,10 @@ pub(crate) use prompt_memory::{
 
 pub(crate) struct PromptSubmissionRuntimeContext<'a> {
     pub project_root: &'a Path,
+    /// Caller- or parent-supplied repository slug (`owner/repo`) for PR-binding
+    /// verification. Never an auto-detected checkout remote — those are mutable
+    /// across shared project checkouts (GH-2054).
+    pub repo: Option<&'a str>,
     pub task_id: &'a TaskId,
     pub prompt: &'a str,
     pub depends_on: &'a [TaskId],
@@ -156,6 +160,7 @@ async fn persist_prompt_submission(
     let prompt_ref =
         prompt_ref_for_submission(&project_id, ctx.external_id, ctx.task_id, ctx.prompt);
     let depends_on = prompt_submission_dependency_ids(ctx);
+    let trusted_repo = resolve_prompt_trusted_repo(ctx, &instance.data, new_instance);
     let submitted_data = prompt_submission_data(
         ctx,
         execution_policy,
@@ -163,6 +168,7 @@ async fn persist_prompt_submission(
         &instance.data,
         &prompt_ref,
         &depends_on,
+        trusted_repo.as_deref(),
     );
     let output = build_prompt_submission_decision(
         &instance,
@@ -385,6 +391,41 @@ fn prompt_subject_key(external_id: Option<&str>, task_id: &TaskId) -> String {
         .to_string()
 }
 
+/// Resolve a server-trusted repo slug for prompt workflows (GH-2054).
+///
+/// Order: already-persisted workflow data, then (new workflows only)
+/// caller-/parent-supplied `ctx.repo`.
+///
+/// Never promote checkout remotes (`.git/config` / `detect_repo_slug`) or
+/// `prepare_enqueue` auto-fill into trusted ownership — shared project
+/// checkouts are agent-writable. Legacy instances without a pinned
+/// `data.repo` fail closed on resubmit. Never derive ownership from an
+/// agent-claimed PR URL.
+fn resolve_prompt_trusted_repo(
+    ctx: &PromptSubmissionRuntimeContext<'_>,
+    existing_data: &serde_json::Value,
+    new_instance: bool,
+) -> Option<String> {
+    let persisted = existing_data
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+        .map(str::to_string);
+    if let Some(repo) = persisted {
+        return canonical_github_repo_identity(Some(&repo));
+    }
+    if !new_instance {
+        return None;
+    }
+    let from_ctx = ctx
+        .repo
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+        .map(str::to_string)?;
+    canonical_github_repo_identity(Some(&from_ctx))
+}
+
 fn prompt_submission_data(
     ctx: &PromptSubmissionRuntimeContext<'_>,
     execution_policy: &runtime_models::PromptExecutionPolicy,
@@ -392,6 +433,7 @@ fn prompt_submission_data(
     existing_data: &serde_json::Value,
     prompt_ref: &str,
     depends_on: &[TaskId],
+    trusted_repo: Option<&str>,
 ) -> serde_json::Value {
     let mut data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
@@ -412,6 +454,9 @@ fn prompt_submission_data(
             "execution_policy": execution_policy,
         }),
     );
+    if let (Some(object), Some(repo)) = (data.as_object_mut(), trusted_repo) {
+        object.insert("repo".to_string(), json!(repo));
+    }
     if let (Some(object), Some(policy)) = (data.as_object_mut(), ctx.continuation) {
         object.insert("continuation".to_string(), continuation_value(policy));
     }
@@ -585,5 +630,138 @@ mod trust_tests {
             json!(IsolationTrustClass::NonCollaborator)
         );
         Ok(())
+    }
+
+    #[test]
+    fn prompt_submission_data_persists_trusted_repo_when_resolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root).expect("mkdir");
+        let task_id = TaskId::from_str("prompt-repo");
+        let ctx = PromptSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("Octo/Repo"),
+            task_id: &task_id,
+            prompt: "implement something",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: Some("dashboard"),
+            external_id: Some("manual:1"),
+            continuation: None,
+        };
+        let data = prompt_submission_data(
+            &ctx,
+            &runtime_models::PromptExecutionPolicy::default(),
+            &project_root.to_string_lossy(),
+            &json!({}),
+            "prompt-ref-1",
+            &[],
+            Some("octo/repo"),
+        );
+        assert_eq!(data["repo"], "octo/repo");
+        assert!(data.get("prompt_ref").is_some());
+    }
+
+    #[test]
+    fn resolve_prompt_trusted_repo_fails_closed_without_caller_repo_on_new_instance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).expect("mkdir .git");
+        std::fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/Octo/Detected.git\n",
+        )
+        .expect("write git config");
+        let task_id = TaskId::from_str("detect-repo");
+        let ctx = PromptSubmissionRuntimeContext {
+            project_root: dir.path(),
+            repo: None,
+            task_id: &task_id,
+            prompt: "x",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+            continuation: None,
+        };
+        assert_eq!(
+            resolve_prompt_trusted_repo(&ctx, &json!({}), true),
+            None,
+            "checkout remotes must not become trusted ownership for new prompt workflows"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_trusted_repo_accepts_caller_repo_on_new_instance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task_id = TaskId::from_str("caller-repo");
+        let ctx = PromptSubmissionRuntimeContext {
+            project_root: dir.path(),
+            repo: Some("Octo/Caller"),
+            task_id: &task_id,
+            prompt: "x",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+            continuation: None,
+        };
+        assert_eq!(
+            resolve_prompt_trusted_repo(&ctx, &json!({}), true),
+            Some("octo/caller".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_trusted_repo_prefers_persisted_over_autofilled_ctx() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task_id = TaskId::from_str("resubmit-repo");
+        let ctx = PromptSubmissionRuntimeContext {
+            project_root: dir.path(),
+            // Simulates prepare_enqueue auto-fill from a mutated/current remote.
+            repo: Some("octo/autofilled"),
+            task_id: &task_id,
+            prompt: "x",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+            continuation: None,
+        };
+        assert_eq!(
+            resolve_prompt_trusted_repo(&ctx, &json!({ "repo": "octo/persisted" }), false),
+            Some("octo/persisted".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_trusted_repo_fails_closed_on_legacy_resubmit_without_pinned_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).expect("mkdir .git");
+        std::fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/octo/mutated.git\n",
+        )
+        .expect("write git config");
+        let task_id = TaskId::from_str("legacy-resubmit");
+        let ctx = PromptSubmissionRuntimeContext {
+            project_root: dir.path(),
+            // Auto-filled from agent-mutable remote after prepare_enqueue.
+            repo: Some("octo/mutated"),
+            task_id: &task_id,
+            prompt: "x",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+            continuation: None,
+        };
+        assert_eq!(resolve_prompt_trusted_repo(&ctx, &json!({}), false), None);
     }
 }
