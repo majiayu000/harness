@@ -161,7 +161,7 @@ async fn persist_prompt_submission(
     let prompt_ref =
         prompt_ref_for_submission(&project_id, ctx.external_id, ctx.task_id, ctx.prompt);
     let depends_on = prompt_submission_dependency_ids(ctx);
-    let trusted_repo = resolve_prompt_trusted_repo(ctx, &instance.data).await;
+    let trusted_repo = resolve_prompt_trusted_repo(ctx, &instance.data, new_instance).await;
     let submitted_data = prompt_submission_data(
         ctx,
         execution_policy,
@@ -394,14 +394,18 @@ fn prompt_subject_key(external_id: Option<&str>, task_id: &TaskId) -> String {
 
 /// Resolve a server-trusted repo slug for prompt workflows (GH-2054).
 ///
-/// Order: already-persisted workflow data → submission context → project
-/// filesystem remote detection. Persisted ownership wins on resubmit because
+/// Order: already-persisted workflow data, then (new workflows only)
+/// submission context / project filesystem remote detection.
+///
+/// Legacy instances without a pinned `data.repo` fail closed on resubmit:
 /// `prepare_enqueue` / `fill_missing_repo_from_project` often auto-fills
-/// `ctx.repo` from the current remote; that must not silently repin trust.
+/// `ctx.repo` from the current remote, and agents can rewrite that remote.
+/// Remote detection is accepted only when creating a new workflow.
 /// Never derive ownership from an agent-claimed PR URL.
 async fn resolve_prompt_trusted_repo(
     ctx: &PromptSubmissionRuntimeContext<'_>,
     existing_data: &serde_json::Value,
+    new_instance: bool,
 ) -> Option<String> {
     let persisted = existing_data
         .get("repo")
@@ -411,6 +415,9 @@ async fn resolve_prompt_trusted_repo(
         .map(str::to_string);
     if let Some(repo) = persisted {
         return canonical_github_repo_identity(Some(&repo));
+    }
+    if !new_instance {
+        return None;
     }
     let from_ctx = ctx
         .repo
@@ -687,7 +694,7 @@ mod trust_tests {
             continuation: None,
         };
         assert_eq!(
-            resolve_prompt_trusted_repo(&ctx, &json!({})).await,
+            resolve_prompt_trusted_repo(&ctx, &json!({}), true).await,
             Some("octo/detected".to_string())
         );
     }
@@ -710,8 +717,38 @@ mod trust_tests {
             continuation: None,
         };
         assert_eq!(
-            resolve_prompt_trusted_repo(&ctx, &json!({ "repo": "octo/persisted" })).await,
+            resolve_prompt_trusted_repo(&ctx, &json!({ "repo": "octo/persisted" }), false).await,
             Some("octo/persisted".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_prompt_trusted_repo_fails_closed_on_legacy_resubmit_without_pinned_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).expect("mkdir .git");
+        std::fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/octo/mutated.git\n",
+        )
+        .expect("write git config");
+        let task_id = TaskId::from_str("legacy-resubmit");
+        let ctx = PromptSubmissionRuntimeContext {
+            project_root: dir.path(),
+            // Auto-filled from agent-mutable remote after prepare_enqueue.
+            repo: Some("octo/mutated"),
+            task_id: &task_id,
+            prompt: "x",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+            continuation: None,
+        };
+        assert_eq!(
+            resolve_prompt_trusted_repo(&ctx, &json!({}), false).await,
+            None
         );
     }
 }
