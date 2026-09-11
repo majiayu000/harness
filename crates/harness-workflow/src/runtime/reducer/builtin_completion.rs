@@ -63,6 +63,30 @@ pub(super) fn reduce_builtin_completion(
         }
     }
     if result.status != ActivityStatus::Succeeded {
+        if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+            && instance.state == "merging"
+            && result.activity == "merge_pr"
+            && matches!(
+                result.status,
+                ActivityStatus::Failed | ActivityStatus::Blocked
+            )
+            && matches!(
+                result.error_kind,
+                Some(
+                    crate::runtime::model::ActivityErrorKind::ExternalDependency
+                        | crate::runtime::model::ActivityErrorKind::Retryable
+                )
+            )
+        {
+            return Some(Ok(Some(WorkflowDecision::new(
+                &instance.id, "merging", "review_after_merge_rejection", "local_review_gate",
+                "Merge did not complete; independently inspect the current PR before retrying.",
+            ).with_command(WorkflowCommand::new(
+                WorkflowCommandType::EnqueueActivity,
+                format!("merge-rejection-review:{}", event.id),
+                json!({"activity": LOCAL_REVIEW_ACTIVITY, "pr_number": instance.data["pr_number"], "repo": instance.data["repo"], "pr_url": instance.data["pr_url"], "merge_failure": result.summary}),
+            )).with_evidence(runtime_completion_evidence(event, result)))));
+        }
         if let Some(decision) = github_issue_closed_decision(instance, event, result) {
             return Some(Ok(Some(decision)));
         }

@@ -20,6 +20,12 @@ pub trait RuntimeJobExecutor: Send + Sync {
         None
     }
 
+    /// Reserve execution capacity without waiting while holding a worker slot.
+    /// Returning a deadline releases the claim back to the pending queue.
+    async fn prepare_execution(&self, _job: &RuntimeJob) -> anyhow::Result<Option<DateTime<Utc>>> {
+        Ok(None)
+    }
+
     async fn execute(&self, job: RuntimeJob) -> ActivityResult;
 
     /// Cancel the in-flight execution of `job`: the executor interrupts the
@@ -149,7 +155,41 @@ impl<'a> RuntimeWorker<'a> {
             None => match executor.preflight_result(&job).await {
                 Some(result) => result,
                 None => {
-                    if let Some(result) = self
+                    let preparation_error = match executor.prepare_execution(&job).await {
+                        Ok(Some(not_before)) => {
+                            let outcome = self
+                                .store
+                                .defer_runtime_job_claim_if_owned(
+                                    &job.id,
+                                    &self.owner,
+                                    lease_expires_at,
+                                    not_before,
+                                )
+                                .await?;
+                            if matches!(outcome, RuntimeJobClaimDeferOutcome::Deferred(_)) {
+                                self.store
+                                    .record_runtime_event(
+                                        &job.id,
+                                        "RuntimeJobClaimDeferred",
+                                        json!({
+                                            "owner": self.owner, "not_before": not_before,
+                                            "reason": "execution capacity unavailable",
+                                        }),
+                                    )
+                                    .await?;
+                            }
+                            return Ok(None);
+                        }
+                        Ok(None) => None,
+                        Err(error) => Some(ActivityResult::failed(
+                            runtime_job_activity_name(&job),
+                            "Execution admission failed.",
+                            error.to_string(),
+                        )),
+                    };
+                    if let Some(result) = preparation_error {
+                        result
+                    } else if let Some(result) = self
                         .reserve_runtime_turn_started(&job, consumes_runtime_turn)
                         .await?
                     {

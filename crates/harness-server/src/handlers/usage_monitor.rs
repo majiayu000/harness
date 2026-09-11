@@ -470,7 +470,7 @@ async fn load_runtime_usage_rows(
              ) latest_event ON true
              LEFT JOIN LATERAL (
                  SELECT sequence FROM runtime_events event
-                 WHERE event.runtime_job_id = job.id AND event.event_type = 'RuntimeTurnStarted'
+                 WHERE event.runtime_job_id = job.id AND event.event_type = 'RuntimeAgentStarted'
                  ORDER BY sequence DESC LIMIT 1
              ) latest_turn ON true
              LEFT JOIN LATERAL (
@@ -510,7 +510,7 @@ async fn load_runtime_usage_rows(
                  LEFT JOIN LATERAL (
                      SELECT sequence FROM runtime_events event
                      WHERE event.runtime_job_id = job.id
-                       AND event.event_type = 'RuntimeTurnStarted'
+                       AND event.event_type = 'RuntimeAgentStarted'
                      ORDER BY sequence DESC LIMIT 1
                  ) latest_turn ON true
                  LEFT JOIN LATERAL (

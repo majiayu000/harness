@@ -245,7 +245,14 @@ impl TransitionAllowlist {
                 "local_review_gate",
                 [EnqueueActivity, Wait],
             )
-            .allow("local_review_gate", "awaiting_feedback", [Wait])
+            .allow(
+                "local_review_gate",
+                "quality_gate_pending",
+                [StartChildWorkflow],
+            )
+            .allow("local_review_gate", "ready_to_merge", std::iter::empty())
+            .allow("ready_to_merge", "local_review_gate", [EnqueueActivity])
+            .allow("merging", "local_review_gate", [EnqueueActivity])
             .allow(
                 "local_review_gate",
                 "addressing_feedback",
@@ -750,42 +757,6 @@ impl DecisionValidator {
             return Err(WorkflowDecisionRejection::new(
                 WorkflowDecisionRejectionKind::InvalidCommandPayload,
                 "BindPr command must include non-empty pr_url",
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn validate_dedupe(
-        &self,
-        command: &WorkflowCommand,
-        seen_dedupe_keys: &mut BTreeSet<String>,
-        context: &ValidationContext,
-    ) -> Result<(), WorkflowDecisionRejection> {
-        if command.dedupe_key.trim().is_empty() {
-            return Err(WorkflowDecisionRejection::new(
-                WorkflowDecisionRejectionKind::MissingDedupeKey,
-                "workflow commands must include a non-empty dedupe key",
-            ));
-        }
-
-        if !seen_dedupe_keys.insert(command.dedupe_key.clone()) {
-            return Err(WorkflowDecisionRejection::new(
-                WorkflowDecisionRejectionKind::DuplicateCommandDedupeKey,
-                format!(
-                    "decision contains duplicate command dedupe key '{}'",
-                    command.dedupe_key
-                ),
-            ));
-        }
-
-        if context.active_dedupe_keys.contains(&command.dedupe_key) {
-            return Err(WorkflowDecisionRejection::new(
-                WorkflowDecisionRejectionKind::ActiveDuplicateCommand,
-                format!(
-                    "an active command already owns dedupe key '{}'",
-                    command.dedupe_key
-                ),
             ));
         }
 

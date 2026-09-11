@@ -80,13 +80,12 @@ fn normalize_pr_url(value: &str) -> &str {
 pub enum FeedbackRepairStop {
     RoundLimit { completed_rounds: u64 },
     MissingBaseline { completed_rounds: u64 },
-    NoProgress { previous: u64, current: u64 },
 }
 
 pub fn next_feedback_repair_round(
     data: &Value,
-    current_blockers: u64,
-    lane: FeedbackRepairLane,
+    _current_blockers: u64,
+    _lane: FeedbackRepairLane,
 ) -> Result<u64, FeedbackRepairStop> {
     let completed_rounds = data
         .get("feedback_repair_round")
@@ -101,17 +100,8 @@ pub fn next_feedback_repair_round(
     if completed_rounds > 0 && previous.is_none() {
         return Err(FeedbackRepairStop::MissingBaseline { completed_rounds });
     }
-    let previous_lane = data.get("feedback_repair_lane").and_then(Value::as_str);
-    if previous_lane == Some(lane.as_str()) {
-        if let Some(previous) = previous {
-            if current_blockers >= previous {
-                return Err(FeedbackRepairStop::NoProgress {
-                    previous,
-                    current: current_blockers,
-                });
-            }
-        }
-    }
+    // Equal counts may describe different findings after a successful repair.
+    // The round limit bounds execution without assuming count monotonicity.
     Ok(completed_rounds.saturating_add(1))
 }
 
@@ -371,16 +361,41 @@ pub fn build_local_review_completed_decision(
 ) -> PrFeedbackDecisionOutput {
     match input.outcome {
         LocalReviewOutcome::Passed => {
+            if super::server_owned_eval_metadata(instance).is_none() {
+                return PrFeedbackDecisionOutput {
+                    action: PrFeedbackWorkflowAction::LocalReviewPassed,
+                    decision: WorkflowDecision::new(
+                        &instance.id,
+                        &instance.state,
+                        "local_review_passed",
+                        "ready_to_merge",
+                        input.summary,
+                    )
+                    .with_evidence(local_review_evidence(input))
+                    .high_confidence(),
+                };
+            }
             let decision = WorkflowDecision::new(
                 &instance.id,
                 &instance.state,
                 "local_review_passed",
-                "awaiting_feedback",
+                "quality_gate_pending",
                 input.summary,
             )
-            .with_command(WorkflowCommand::wait(
-                "Local review passed; waiting for remote review, checks, and mergeability.",
-                format!("local-review:{}:{}:passed", input.task_id, input.pr_number),
+            .with_command(WorkflowCommand::new(
+                super::model::WorkflowCommandType::StartChildWorkflow,
+                format!(
+                    "quality-gate:{}:{}:local-pass:{}",
+                    input.task_id, input.pr_number, instance.version
+                ),
+                serde_json::json!({
+                    "definition_id": QUALITY_GATE_DEFINITION_ID,
+                    "subject_key": format!("pr:{}", input.pr_number),
+                    "child_activity": QUALITY_GATE_ACTIVITY,
+                    "pr_number": input.pr_number,
+                    "pr_url": input.pr_url,
+                    "validation_commands": [],
+                }),
             ))
             .with_evidence(local_review_evidence(input))
             .high_confidence();

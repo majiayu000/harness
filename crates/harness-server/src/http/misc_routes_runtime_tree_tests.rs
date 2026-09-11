@@ -241,10 +241,17 @@ fn runtime_job_has_in_flight_model_turn_uses_latest_turn_sequence() {
         "worker-1",
         chrono::Utc::now() + chrono::Duration::minutes(5),
     );
+    let reserved = vec![RuntimeEvent::new(
+        &job.id,
+        1,
+        "RuntimeTurnStarted",
+        json!({}),
+    )];
+    assert!(!runtime_job_has_in_flight_model_turn(&job, &reserved));
     let events = vec![
-        RuntimeEvent::new(&job.id, 1, "RuntimeTurnStarted", json!({})),
+        RuntimeEvent::new(&job.id, 1, "RuntimeAgentStarted", json!({})),
         RuntimeEvent::new(&job.id, 2, "ActivityResultReady", json!({})),
-        RuntimeEvent::new(&job.id, 3, "RuntimeTurnStarted", json!({})),
+        RuntimeEvent::new(&job.id, 3, "RuntimeAgentStarted", json!({})),
     ];
 
     assert!(runtime_job_has_in_flight_model_turn(&job, &events));
@@ -263,9 +270,9 @@ fn runtime_job_has_in_flight_model_turn_ends_after_result_for_latest_turn() {
         chrono::Utc::now() + chrono::Duration::minutes(5),
     );
     let events = vec![
-        RuntimeEvent::new(&job.id, 1, "RuntimeTurnStarted", json!({})),
+        RuntimeEvent::new(&job.id, 1, "RuntimeAgentStarted", json!({})),
         RuntimeEvent::new(&job.id, 2, "ActivityResultReady", json!({})),
-        RuntimeEvent::new(&job.id, 3, "RuntimeTurnStarted", json!({})),
+        RuntimeEvent::new(&job.id, 3, "RuntimeAgentStarted", json!({})),
         RuntimeEvent::new(&job.id, 4, "ActivityResultReady", json!({})),
     ];
 

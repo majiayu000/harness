@@ -67,6 +67,7 @@ pub(super) struct ServerRuntimeJobExecutor<'a> {
     /// lost (GH-1877).
     lease_lost: Arc<tokio::sync::watch::Sender<bool>>,
     lease_lost_receiver: tokio::sync::watch::Receiver<bool>,
+    pub(super) execution_permit: std::sync::Mutex<Option<crate::task_queue::TaskPermit>>,
 }
 impl<'a> ServerRuntimeJobExecutor<'a> {
     pub(super) fn new(state: &'a Arc<AppState>) -> Self {
@@ -75,6 +76,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             state,
             lease_lost: Arc::new(lease_lost),
             lease_lost_receiver,
+            execution_permit: std::sync::Mutex::new(None),
         }
     }
 
@@ -110,11 +112,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 });
             }
         }
-        let _queue_permit = super::runtime_execution_queue::acquire_runtime_execution_queue_permit(
-            self.state,
-            workflow.as_ref(),
-        )
-        .await?;
         // A pinned agent contract never runs through the ordinary workspace
         // and tool surface: it takes the dedicated enforcement path (empty
         // ephemeral workspace, pinned prompt only, deny-all launch, pinned

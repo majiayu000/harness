@@ -306,7 +306,7 @@ fn parse_gh_output_filters_dispatched_issues() {
 }
 
 #[test]
-fn parse_gh_output_filters_pull_requests_from_issue_endpoint() {
+fn parse_gh_output_discovers_issues_and_native_pull_requests() {
     let json = br#"[
         {
             "number": 10,
@@ -335,10 +335,15 @@ fn parse_gh_output_filters_pull_requests_from_issue_endpoint() {
     let dispatched = DashMap::new();
     let parsed = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
 
-    assert_eq!(parsed.new_issues.len(), 1);
+    assert_eq!(parsed.new_issues.len(), 2);
     assert_eq!(parsed.new_issues[0].external_id, "10");
     assert!(parsed.open_issue_ids.contains("10"));
-    assert!(!parsed.open_issue_ids.contains("11"));
+    assert_eq!(parsed.new_issues[1].external_id, "pr:11");
+    assert!(parsed.open_issue_ids.contains("pr:11"));
+    dispatched.insert("pr:11".to_string(), TaskId::from_str("native-pr-11"));
+    let again = parse_gh_output(json, "owner/repo", &dispatched, None).unwrap();
+    assert_eq!(again.new_issues.len(), 1);
+    assert!(again.open_issue_ids.contains("pr:11"));
 }
 
 #[test]

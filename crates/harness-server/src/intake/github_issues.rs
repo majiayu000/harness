@@ -413,6 +413,16 @@ struct GhIssue {
     created_at: Option<DateTime<Utc>>,
 }
 
+impl GhIssue {
+    fn external_id(&self) -> String {
+        if self.pull_request.is_some() {
+            format!("pr:{}", self.number)
+        } else {
+            self.number.to_string()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GhLabel {
     name: String,
@@ -435,20 +445,16 @@ fn parse_gh_output(
     project_root: Option<&std::path::Path>,
 ) -> anyhow::Result<ParsedGhOutput> {
     let issues: Vec<GhIssue> = serde_json::from_slice(json)?;
-    let issues: Vec<GhIssue> = issues
-        .into_iter()
-        .filter(|issue| issue.pull_request.is_none())
-        .collect();
-    let open_issue_ids: HashSet<String> = issues.iter().map(|i| i.number.to_string()).collect();
+    let open_issue_ids: HashSet<String> = issues.iter().map(GhIssue::external_id).collect();
     let new_issues = issues
         .into_iter()
         .filter(|issue| {
-            let issue_id = issue.number.to_string();
+            let issue_id = issue.external_id();
             !dispatched_contains_issue(dispatched, &issue_id)
         })
         .map(|issue| IncomingIssue {
             source: "github".to_string(),
-            external_id: issue.number.to_string(),
+            external_id: issue.external_id(),
             identifier: format!("#{}", issue.number),
             title: issue.title,
             description: issue.body,

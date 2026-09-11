@@ -41,7 +41,8 @@ impl StreamCompletionState {
                 Some(StreamItem::Warning { message })
             }
             StreamItem::TurnCompleted { output } => {
-                if self.emitted_agent_completion {
+                if self.emitted_agent_completion && (output.is_empty() || output == self.output_buf)
+                {
                     self.output_buf.clear();
                     return None;
                 }

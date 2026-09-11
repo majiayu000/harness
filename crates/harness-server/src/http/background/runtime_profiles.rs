@@ -8,6 +8,7 @@ fn runtime_kind_from_config(value: &str) -> Option<RuntimeKind> {
         "anthropic_api" => Some(RuntimeKind::AnthropicApi),
         "remote_host" => Some(RuntimeKind::RemoteHost),
         "opencode" => Some(RuntimeKind::OpenCode),
+        "cursor" => Some(RuntimeKind::Cursor),
         _ => None,
     }
 }
@@ -33,6 +34,11 @@ fn runtime_profile_from_kind(
             profile.model = Some(config.agents.anthropic_api.default_model.clone());
             profile
         }
+        RuntimeKind::Cursor => {
+            let mut profile = RuntimeProfile::new("cursor-default", kind);
+            profile.model = Some(config.agents.cursor.default_model.clone());
+            profile
+        }
         RuntimeKind::OpenCode => {
             let mut profile = RuntimeProfile::new("opencode-default", kind);
             if !config.agents.opencode.default_model.is_empty() {
@@ -53,6 +59,7 @@ pub(super) fn runtime_profile_from_agent(
         "claude" => Some(runtime_profile_from_kind(config, RuntimeKind::ClaudeCode)),
         "anthropic-api" => Some(runtime_profile_from_kind(config, RuntimeKind::AnthropicApi)),
         "opencode" => Some(runtime_profile_from_kind(config, RuntimeKind::OpenCode)),
+        "cursor" => Some(runtime_profile_from_kind(config, RuntimeKind::Cursor)),
         _ => None,
     }
 }
@@ -429,6 +436,21 @@ fn runtime_kind_supports_approval_policy(kind: RuntimeKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_runtime_dispatch_selects_cursor() {
+        let config = harness_core::config::HarnessConfig::default();
+        let base = runtime_profile_from_agent(&config, "cursor").unwrap();
+        assert_eq!(base.kind, RuntimeKind::Cursor);
+        let policy = harness_core::config::workflow::RuntimeDispatchPolicy {
+            runtime_kind: Some("cursor".into()),
+            ..Default::default()
+        };
+        let profile = runtime_dispatch_profile(&config, &policy, &base).unwrap();
+        assert_eq!(profile.kind, RuntimeKind::Cursor);
+        assert_eq!(profile.model.as_deref(), Some("auto"));
+        assert_eq!(profile.approval_policy, None);
+    }
 
     #[test]
     fn prompt_agent_policy_preserves_configured_codex_surface() -> anyhow::Result<()> {

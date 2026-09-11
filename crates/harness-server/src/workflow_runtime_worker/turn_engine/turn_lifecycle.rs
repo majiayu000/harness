@@ -253,6 +253,18 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         }
                     }
                     Some(item) => {
+                        if matches!(item, StreamItem::TurnStarted) {
+                            if let Some(context) = options.runtime_usage.as_ref() {
+                                if let Err(error) = context.store.record_runtime_event(
+                                    &context.runtime_job_id, "RuntimeAgentStarted",
+                                    serde_json::json!({ "thread_id": thread_id, "turn_id": turn_id }),
+                                ).await {
+                                    terminate_execution_after_drop = executes_via_adapter;
+                                    execution_result = Some(Err(HarnessError::AgentExecution(format!("failed to persist agent start: {error}"))));
+                                    break 'outer;
+                                }
+                            }
+                        }
                         if stream_item_resets_stall_timer(&item) {
                             last_activity = Instant::now();
                         }

@@ -253,7 +253,19 @@ impl DefaultExecutionService {
             .await?;
 
         let outcome = if let Some(instance) = maybe_instance {
-            if instance.state == "pr_open" {
+            let project_root = prepared.req.project.as_deref().ok_or_else(|| {
+                EnqueueTaskError::BadRequest("PR submission requires a project root".to_string())
+            })?;
+            let workflow_config = harness_core::config::workflow::load_workflow_document(
+                project_root,
+            )
+            .map_err(|error| {
+                EnqueueTaskError::BadRequest(format!("invalid workflow configuration: {error}"))
+            })?;
+            if instance.state == "pr_open"
+                || (instance.state == "awaiting_feedback"
+                    && !workflow_config.config.pr_feedback.enabled)
+            {
                 crate::workflow_runtime_pr_feedback::request_local_review_with_admission(
                     store,
                     &instance.id,

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useTasks, useDashboard, useWorkflowRuntimeTree } from "@/lib/queries";
+import { useAllTasks, useDashboard, useWorkflowRuntimeTree } from "@/lib/queries";
 import { apiFetch } from "@/lib/api";
 import { TaskDetailSlideover } from "@/components/TaskDetailSlideover";
 import { workflowLabel } from "@/lib/format";
@@ -31,25 +31,25 @@ const COLUMNS: Column[] = [
   {
     key: "pending",
     label: "Pending",
-    workflowStates: ["discovered", "scheduled"],
+    workflowStates: ["discovered", "scheduled", "awaiting_dependencies"],
     fallbackTaskStatuses: ["pending", "queued", "awaiting_deps"],
+  },
+  {
+    key: "planning",
+    label: "Planning",
+    workflowStates: ["planning", "replanning"],
+    fallbackTaskStatuses: ["planning", "plan", "planner_generating", "planner_waiting"],
   },
   {
     key: "implementing",
     label: "Implementing",
     workflowStates: ["implementing"],
-    fallbackTaskStatuses: ["implementing", "running", "triaging", "planning", "triage", "plan"],
-  },
-  {
-    key: "planning",
-    label: "Planning",
-    workflowStates: [],
-    fallbackTaskStatuses: ["planner_generating", "planner_waiting"],
+    fallbackTaskStatuses: ["implementing", "running", "triaging", "triage"],
   },
   {
     key: "review",
     label: "Review",
-    workflowStates: [],
+    workflowStates: ["local_review_gate"],
     fallbackTaskStatuses: ["review_generating", "review_waiting"],
   },
   {
@@ -57,6 +57,12 @@ const COLUMNS: Column[] = [
     label: "Feedback",
     workflowStates: ["pr_open", "awaiting_feedback", "addressing_feedback"],
     fallbackTaskStatuses: ["agent_review", "reviewing_agent", "waiting", "reviewing"],
+  },
+  {
+    key: "validation",
+    label: "Validation",
+    workflowStates: ["quality_gate_pending"],
+    fallbackTaskStatuses: [],
   },
   {
     key: "ready",
@@ -71,6 +77,44 @@ const COLUMNS: Column[] = [
     fallbackTaskStatuses: [],
   },
 ];
+
+const TASK_CATEGORIES = [["all", "All work"], ["issue", "Issue fixes"], ["pr", "PR reviews"], ["periodic", "Scheduled reviews"], ["other", "Other tasks"]];
+
+function taskCategory(task: Task): string {
+  if (task.source === "periodic_review") return "periodic";
+  if (task.id.startsWith("github-pr-feedback::") || task.task_kind === "review") return "pr";
+  if (task.task_kind === "issue" || task.workflow?.definition_id === "github_issue_pr") return "issue";
+  return "other";
+}
+
+const STAGE_HELP: Record<string, string> = {
+  pending: "Waiting to start or waiting for dependencies.",
+  implementing: "Implementation stage; check each task's execution status.",
+  planning: "Preparing or revising an implementation plan.",
+  review: "Repository scans and local code reviews; tasks may still be queued.",
+  feedback: "Waiting for PR feedback or working on requested changes.",
+  validation: "Checking tests and merge requirements.",
+  ready: "Ready for the required merge approval.",
+  blocked: "Requires a decision, dependency or error resolution.",
+};
+
+function executionLabel(task: Task, node?: WorkflowRuntimeTreeNode): string {
+  const state = task.workflow?.state;
+  if (["blocked", "degraded", "paused"].includes(state ?? "")) return "Blocked · open details for the reason";
+  if (state === "awaiting_dependencies") return "Waiting for dependencies";
+  if (state === "awaiting_feedback") return "Waiting for PR feedback";
+  if (state === "ready_to_merge") return "Waiting for merge approval";
+  const jobs = node?.commands.flatMap((command) => command.runtime_jobs) ?? [];
+  const latest = jobs.reduce<WorkflowRuntimeJob | undefined>((a, b) =>
+    !a || timestampValue(b.created_at) > timestampValue(a.created_at) ? b : a, undefined);
+  if (latest?.status === "running") {
+    if (latest.lease_state !== "active_leased") return "Worker lease unconfirmed";
+    return latest.in_flight_model_turn ? "Model active · reported by runtime" : "Worker assigned · model activity unconfirmed";
+  }
+  if (latest?.status === "pending") return "Queued · waiting for a worker";
+  if (task.scheduler.authority_state === "queued") return "Queued by scheduler";
+  return "Execution unconfirmed · open details";
+}
 
 const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
 
@@ -368,27 +412,40 @@ function TaskCard({
   onClick,
   onMerge,
   merging,
+  runtimeNode,
 }: {
   task: Task;
   workflow?: WorkflowSummary | null;
   onClick: () => void;
   onMerge?: (taskId: string, workflow?: WorkflowSummary | null) => void;
   merging?: boolean;
+  runtimeNode?: WorkflowRuntimeTreeNode;
 }) {
   const handle = taskSubmissionHandle(task);
-  const title = task.description?.trim() || task.repo || handle.slice(0, 8);
+  const repo = task.repo || (task.pr_url?.match(/github\.com\/([^/]+\/[^/]+)/)?.[1])
+    || task.project?.split("/").filter(Boolean).at(-1) || "Unknown repository";
+  const title = task.description?.trim() && task.description !== "prompt task"
+    ? task.description : taskCategory(task) === "periodic" ? "Scheduled repository review"
+    : taskCategory(task) === "pr" ? "Pull request review" : "Repository task";
+  const execution = executionLabel(task, runtimeNode);
+  const observed = runtimeNode?.commands.flatMap((command) => command.runtime_jobs)
+    .map((job) => job.last_runtime_observation_at)
+    .filter((value): value is string => Boolean(value))
+    .sort((a, b) => timestampValue(b) - timestampValue(a))[0];
+  const updated = observed || runtimeNode?.workflow.updated_at || task.updated_at;
   return (
     <div
       className="w-full text-left border border-line bg-bg px-2.5 py-2 mb-2 last:mb-0 hover:border-line-3 transition-colors cursor-pointer"
     >
       <button type="button" className="block w-full text-left" onClick={onClick}>
+        <div className="mb-1 truncate text-sm font-semibold text-ink" title={task.project ?? repo}>{repo}</div>
         <div className="text-[12.5px] text-ink leading-snug line-clamp-2" title={title}>
           {title}
         </div>
         {workflow && (
           <div className="mt-1 flex flex-wrap items-center gap-1">
             <span className="border border-line bg-bg-1 px-1.5 py-[1px] font-mono text-[10px] text-ink-2">
-              wf {workflowLabel(workflow.state)}
+              wf {task.source === "periodic_review" && workflow.state === "implementing" ? "Repository Review" : workflowLabel(workflow.state)}
             </span>
             {workflow.pr_number ? (
               <span className="font-mono text-[10px] text-ink-3">PR #{workflow.pr_number}</span>
@@ -401,9 +458,14 @@ function TaskCard({
           </div>
         )}
         <div className="mt-1.5 flex items-center justify-between gap-2 font-mono text-[10px] text-ink-3">
-          <span className="truncate">{task.repo ?? "—"}</span>
+          <span className="truncate">{taskCategory(task) === "periodic" ? "Scheduled scan" : task.source || "Task"}</span>
           {task.turn > 0 && <span>turn {task.turn}</span>}
         </div>
+        <div className="mt-2 border-t border-line pt-2 text-[11px] text-ink-2">{execution}</div>
+        <div className="mt-1 text-[10px] text-ink-3">
+          {updated ? <>Updated <time dateTime={updated}>{new Date(updated).toLocaleString()}</time></> : "Update time unavailable"}
+        </div>
+        {task.error && <p className="mt-2 text-xs text-rust break-words">{task.error}</p>}
         {workflow?.plan_concern && (
           <div
             className="mt-1 block font-mono text-[10px] text-rust truncate"
@@ -445,6 +507,8 @@ interface Props {
 }
 
 export function Active({ projectFilter }: Props) {
+  const [category, setCategory] = useState("all");
+  const [search, setSearch] = useState("");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [merging, setMerging] = useState<Set<string>>(new Set());
   const [mergeError, setMergeError] = useState<string | null>(null);
@@ -513,20 +577,33 @@ export function Active({ projectFilter }: Props) {
   const resolvedRoot = projectFilter
     ? (dashboard?.projects.find((p) => p.id === projectFilter)?.root ?? projectFilter)
     : null;
-  const { data, isLoading, isError } = useTasks({
+  const { data, isLoading, isError } = useAllTasks({
     active: true,
     limit: 200,
     project_id: resolvedRoot ?? undefined,
   });
   const workflowRuntime = useWorkflowRuntimeTree(resolvedRoot);
 
-  const active = (data?.data ?? []).filter(shouldShowTask);
+  const allActive = (data?.data ?? []).filter(shouldShowTask);
+  const runtimeNodes = new Map<string, WorkflowRuntimeTreeNode>();
+  const visit = (node: WorkflowRuntimeTreeNode) => {
+    runtimeNodes.set(node.workflow.id, node);
+    node.children.forEach(visit);
+  };
+  workflowRuntime.data?.workflows.forEach(visit);
+  const active = allActive.filter((task) =>
+    (category === "all" || taskCategory(task) === category) &&
+    [task.description, task.repo, task.project, task.pr_url, task.id].some(
+      (value) => value?.toLowerCase().includes(search.toLowerCase()),
+    ),
+  );
   const grouped: Record<string, Task[]> = {};
   for (const c of COLUMNS) grouped[c.key] = [];
   const other: Task[] = [];
   for (const t of active) {
     const workflow = t.workflow ?? null;
-    const col = columnOf(t.status, workflow?.state ?? null);
+    const col = t.source === "periodic_review" && workflow?.state === "implementing"
+      ? "review" : columnOf(t.status, workflow?.state ?? null);
     if (col === "other") other.push(t);
     else grouped[col].push(t);
   }
@@ -534,21 +611,48 @@ export function Active({ projectFilter }: Props) {
 
   return (
     <div className="space-y-3">
-      <WorkflowRuntimePanel
+      <header className="border-b border-line pb-4">
+        <h1 className="text-2xl text-ink">Work in progress</h1>
+        <p className="mt-2 text-sm text-ink-3">Choose a work type, then open a task for its logs and results. Stages do not indicate live agent processes.</p>
+        <div className="mt-4 flex flex-wrap gap-6 text-sm text-ink-2" aria-label="Task summary">
+          <span><strong className="text-xl text-ink">{isError ? "Unavailable" : isLoading ? "…" : allActive.length}</strong> unfinished tasks</span>
+          <span><strong className="text-xl text-rust">{isError ? "Unavailable" : allActive.filter((t) => ["blocked", "degraded", "paused"].includes(t.workflow?.state ?? "")).length}</strong> need attention</span>
+          <a className="text-rust underline" href="?tab=history">Completed tasks and review results →</a>
+        </div>
+      </header>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap gap-2" aria-label="Work type">
+          {TASK_CATEGORIES.map(([key, label]) => (
+            <button key={key} type="button" aria-pressed={category === key} onClick={() => setCategory(key)}
+              className={`border px-3 py-2 text-xs ${category === key ? "border-ink bg-ink text-bg" : "border-line text-ink-2 hover:border-line-3"}`}>
+              {label} <span className="ml-2 font-mono">{allActive.filter((t) => key === "all" || taskCategory(t) === key).length}</span>
+            </button>
+          ))}
+        </div>
+        <input aria-label="Filter tasks" placeholder="Filter by repository or task…" value={search} onChange={(e) => setSearch(e.target.value)}
+          className="min-w-0 w-full sm:w-72 border border-line bg-bg px-3 py-2 text-sm text-ink" />
+      </div>
+      {isError && <p role="alert" className="text-rust">Task data unavailable. Counts and stages cannot be confirmed.</p>}
+      {isLoading && <p role="status" className="text-ink-3">Loading tasks…</p>}
+      {!isLoading && !isError && active.length === 0 && <p className="text-sm text-ink-3">No unfinished tasks match this view.</p>}
+      <details className="border border-line p-3 text-xs text-ink-3">
+        <summary className="cursor-pointer">Scheduler diagnostics · jobs, leases and workflow events</summary>
+        <p className="my-3">Worker leases are not live Cursor processes. This diagnostic view may contain only part of the workflow history.</p>
+        <WorkflowRuntimePanel
         payload={workflowRuntime.data}
         isLoading={workflowRuntime.isLoading}
         isError={workflowRuntime.isError}
         onCancel={handleCancelWorkflow}
         cancellingWorkflowIds={cancellingWorkflows}
       />
+      </details>
       {mergeError ? (
         <div role="alert" className="border border-rust/40 bg-rust/10 px-3 py-2 text-xs text-rust">
           {mergeError}
         </div>
       ) : null}
       <div
-        className="grid gap-3"
-        style={{ gridTemplateColumns: `repeat(${COLUMNS.length + (showOther ? 1 : 0)}, 1fr)` }}
+        className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3"
       >
         {COLUMNS.map((col) => {
           const rows = grouped[col.key];
@@ -558,7 +662,8 @@ export function Active({ projectFilter }: Props) {
                 <span>{col.label}</span>
                 <span className="text-ink-2">{rows.length}</span>
               </div>
-              <div className="p-2 flex-1 overflow-auto">
+              <p className="px-3 pt-2 text-[11px] text-ink-3">{STAGE_HELP[col.key]}</p>
+              <div className="p-2 flex-1 max-h-[480px] overflow-auto">
                 {rows.length === 0 && (
                   <div className="text-ink-4 font-mono text-[11px] p-1">
                     {isLoading ? "loading…" : isError ? "error" : "—"}
@@ -568,6 +673,7 @@ export function Active({ projectFilter }: Props) {
                   <TaskCard
                     key={t.id}
                     task={t}
+                    runtimeNode={runtimeNodes.get(t.workflow?.id ?? "")}
                     workflow={t.workflow ?? null}
                     onClick={() => setSelectedTaskId(taskSubmissionHandle(t))}
                     onMerge={handleMerge}
@@ -589,6 +695,7 @@ export function Active({ projectFilter }: Props) {
                 <TaskCard
                   key={t.id}
                   task={t}
+                  runtimeNode={runtimeNodes.get(t.workflow?.id ?? "")}
                   workflow={t.workflow ?? null}
                   onClick={() => setSelectedTaskId(taskSubmissionHandle(t))}
                 />

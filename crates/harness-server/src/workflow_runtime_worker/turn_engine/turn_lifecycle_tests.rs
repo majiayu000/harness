@@ -740,3 +740,20 @@ async fn lifecycle_interrupts_registered_control_backend_when_turn_factory_exist
     assert_eq!(turn.status, TurnStatus::Failed);
     Ok(())
 }
+
+#[test]
+fn intermediate_message_does_not_suppress_distinct_final_report() {
+    let mut state = StreamCompletionState::default();
+    let interim = StreamItem::ItemCompleted {
+        item: Item::AgentReasoning {
+            content: "Inspecting files.".into(),
+        },
+    };
+    assert!(state.normalize(interim).is_some());
+    let final_item = state.normalize(StreamItem::TurnCompleted {
+        output: "Fixed and tested.".into(),
+    });
+    assert!(
+        matches!(final_item, Some(StreamItem::ItemCompleted { item: Item::AgentReasoning { content } }) if content == "Fixed and tested.")
+    );
+}

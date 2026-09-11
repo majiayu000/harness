@@ -101,6 +101,11 @@ cli_path = "codex"
 default_model = "gpt-5.5"
 reasoning_effort = "xhigh"
 
+# Optional Cursor Agent backend; see docs/cursor-agent.md for workflow setup.
+[agents.cursor]
+cli_path = "cursor-agent"
+default_model = "auto"
+
 [agents.anthropic_api]
 base_url = "https://api.anthropic.com"
 default_model = "claude-sonnet-4-20250514"

@@ -520,13 +520,13 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         }),
         ("github_issue_pr", harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY) => json!({
             "on_succeeded": {
-                "reducer_next_state": "awaiting_feedback_or_addressing_feedback_or_blocked_from_signals",
+                "reducer_next_state": "derived_from_local_review_signal; report the review outcome and let Harness select the next state",
                 "accepted_signals": [
                     harness_workflow::runtime::LOCAL_REVIEW_PASSED_SIGNAL,
                     harness_workflow::runtime::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
                     harness_workflow::runtime::LOCAL_REVIEW_BLOCKED_SIGNAL
                 ],
-                "required_summary": "Describe the local agent review result, blocking findings if any, and validation evidence inspected."
+                "required_summary": "Review the current PR head independently and report its SHA. For merge readiness, inspect current GitHub checks and mergeability: BEHIND/DIRTY or failed/cancelled required CI requires LocalReviewChangesRequested so Cursor can update the branch or fix CI; missing required validation requires LocalReviewBlocked. Pending CI alone is not a blocker: if the code review passes, emit LocalReviewPassed and let Harness wait for GitHub checks before merging. Do not merge during review."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",

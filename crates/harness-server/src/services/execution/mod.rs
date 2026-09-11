@@ -576,6 +576,13 @@ impl DefaultExecutionService {
         else {
             return Ok(None);
         };
+        // Polling discovers open PRs even after local review has passed. Keep
+        // that discovery attached to the existing merge decision.
+        if req.source.as_deref() == Some("github") && instance.state == "ready_to_merge" {
+            return Ok(Some(TaskId::from_str(
+                &crate::workflow_runtime_pr_feedback::runtime_task_id_from_instance(&instance),
+            )));
+        }
         let active =
             crate::workflow_runtime_pr_feedback::pr_feedback_submission_is_active(store, &instance)
                 .await

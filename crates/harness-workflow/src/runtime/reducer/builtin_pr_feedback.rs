@@ -113,10 +113,7 @@ fn feedback_repair_convergence_blocked_decision(
             "PR feedback repair progress cannot be measured because the prior blocker baseline is missing; automatic repair is stopped."
                 .to_string(),
         ),
-        Err(FeedbackRepairStop::NoProgress { previous, current }) => (
-            "block_feedback_repair_oscillation",
-            format!("PR feedback repair did not decrease actionable blockers ({previous} before, {current} now); automatic repair is stopped to prevent oscillation."),
-        ),
+
     };
     Some(feedback_repair_blocked_decision(
         instance,

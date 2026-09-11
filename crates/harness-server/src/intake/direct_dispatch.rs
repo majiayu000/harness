@@ -164,7 +164,7 @@ pub(super) async fn run_direct_issue_dispatch(
                 issue_number,
                 task_id: &task_id,
                 labels: &issue.labels,
-                force_execute: true,
+                force_execute: false,
                 additional_prompt: None,
                 depends_on: &depends_on,
                 dependencies_blocked: !depends_on.is_empty(),

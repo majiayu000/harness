@@ -308,7 +308,9 @@ fn recovery_rejection(
         }));
     }
 
-    if request.action == WorkflowRuntimeRecoveryAction::Retry {
+    if request.action == WorkflowRuntimeRecoveryAction::Retry
+        && !requests_local_review_recovery(instance, request)
+    {
         if let Some(error_kind) = stopped_error_kind(&instance.data)?.filter(|kind| {
             matches!(
                 kind,
@@ -325,6 +327,36 @@ fn recovery_rejection(
     Ok(None)
 }
 
+fn requests_local_review_recovery(
+    instance: &WorkflowInstance,
+    request: &WorkflowRuntimeRecoveryRequest<'_>,
+) -> bool {
+    request.actor == "operator"
+        && request.target_state == Some("local_review_gate")
+        && instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && crate::runtime::server_owned_eval_metadata(instance).is_none()
+        && instance
+            .data
+            .get("pr_number")
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0)
+        && (instance
+            .data
+            .pointer("/last_stop/activity")
+            .and_then(Value::as_str)
+            == Some("merge_pr")
+            || (instance
+                .data
+                .pointer("/last_stop/activity")
+                .and_then(Value::as_str)
+                == Some("start_child_workflow")
+                && instance
+                    .data
+                    .get("failure_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| reason.starts_with("validation_commands_missing"))))
+}
+
 async fn recovery_dispatch_plan_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     registry: &WorkflowDefinitionRegistry,
@@ -335,6 +367,15 @@ async fn recovery_dispatch_plan_tx(
         return declarative_recovery_dispatch_plan(request, &definition, instance);
     }
     validate_stopped_metadata(&instance.data)?;
+    if requests_local_review_recovery(instance, request) {
+        return Ok(Ok(RecoveryDispatchPlan {
+            target: RecoveryDispatchTarget {
+                state: "local_review_gate".to_string(),
+                activity: Some("run_local_review".to_string()),
+            },
+            command_source: RecoveryDispatchCommandSource::LocalReview,
+        }));
+    }
     let activity = stopped_activity(&instance.data)?;
     let mut target = match recovery_dispatch_target(&instance.data, activity.as_deref())? {
         Ok(target) => target,
@@ -501,6 +542,17 @@ fn persist_operator_recovery_data(
             crate::runtime::DataProvenance::Server,
         ),
     ];
+    for field in [
+        "failure_reason",
+        "blocked_reason",
+        "unblock_hint",
+        "retry_hint",
+    ] {
+        writes.push(crate::runtime::WorkflowDataWrite::remove(
+            field,
+            crate::runtime::DataProvenance::Server,
+        ));
+    }
     if reset_feedback_repair {
         for field in [
             "feedback_repair_round",

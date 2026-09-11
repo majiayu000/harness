@@ -397,6 +397,9 @@ fn fallback_intake_task_request(
         .filter(|priority| *priority <= MAX_TASK_PRIORITY)
         .unwrap_or_default();
     CreateTaskRequest {
+        pr: (source_name == "github")
+            .then(|| issue.external_id.strip_prefix("pr:")?.parse::<u64>().ok())
+            .flatten(),
         prompt: Some(build_prompt_from_issue(issue)),
         project: Some(issue.project_root.clone().unwrap_or(default_project_root)),
         source: Some(source_name.to_string()),
@@ -503,6 +506,17 @@ mod tests {
             author_trust_class: harness_core::config::isolation::IsolationTrustClass::Trusted,
             project_root: None,
         }
+    }
+
+    #[test]
+    fn github_poll_pull_request_uses_native_pr_intake() {
+        let issue = incoming_issue("github", "pr:42");
+        let req = fallback_intake_task_request(&issue, "github", "/tmp/project".into());
+        assert_eq!(req.pr, Some(42));
+        assert_eq!(req.issue, None);
+        assert_eq!(github_direct_issue_number("github", &issue), None);
+        let other = fallback_intake_task_request(&issue, "feishu", "/tmp/project".into());
+        assert_eq!(other.pr, None);
     }
 
     #[test]

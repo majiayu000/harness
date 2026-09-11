@@ -298,7 +298,7 @@ impl WorkflowRuntimeStore {
              FROM unnest($1::text[]) AS selected(runtime_job_id)
              LEFT JOIN LATERAL (
                  SELECT COUNT(*) AS runtime_event_count,
-                        MAX(sequence) FILTER (WHERE event_type = 'RuntimeTurnStarted')
+                        MAX(sequence) FILTER (WHERE event_type = 'RuntimeAgentStarted')
                             AS latest_turn_sequence,
                         MAX(sequence) FILTER (WHERE event_type = 'ActivityResultReady')
                             AS latest_activity_result_sequence

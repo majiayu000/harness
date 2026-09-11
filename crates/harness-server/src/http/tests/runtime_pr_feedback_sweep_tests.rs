@@ -549,3 +549,42 @@ async fn runtime_pr_feedback_sweep_caps_auto_merge_remote_probes() -> anyhow::Re
     assert_eq!(received.lock().await.len(), 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn runtime_pr_feedback_disabled_still_runs_local_review() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let _env_guard = crate::workspace::test_support::async_env_lock()
+        .lock()
+        .await;
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("local-review-only");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(project_root.join("WORKFLOW.md"),
+        "---\npr_feedback:\n  enabled: false\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n")?;
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state.core.workflow_runtime_store.as_ref().unwrap();
+    for (id, phase) in [
+        ("local-only", "pr_open"),
+        ("remote-disabled", "awaiting_feedback"),
+    ] {
+        let workflow = harness_workflow::runtime::WorkflowInstance::new(
+            "github_issue_pr", 1, phase,
+            harness_workflow::runtime::WorkflowSubject::new("pr", id),
+        ).with_id(id).with_server_data(serde_json::json!({
+            "project_id": project_root, "repo": "owner/repo", "pr_number": if id == "local-only" { 77 } else { 78 },
+            "pr_url": format!("https://github.com/owner/repo/pull/{}", if id == "local-only" { 77 } else { 78 }), "task_id": id,
+        }));
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
+    }
+    let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 2).await?;
+    assert_eq!(tick.requested, 1);
+    assert_eq!(tick.remote_request_attempts, 0);
+    let commands = store.commands_for("local-only").await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.command["activity"], "run_local_review");
+    assert!(store.commands_for("remote-disabled").await?.is_empty());
+    Ok(())
+}

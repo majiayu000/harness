@@ -539,6 +539,19 @@ pub(crate) async fn request_local_review(
     request_local_review_with_admission(store, workflow_id, || async { Ok(()) }).await
 }
 
+pub(crate) async fn request_merge_readiness_review(
+    store: &WorkflowRuntimeStore,
+    mut instance: WorkflowInstance,
+    head_sha: &str,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    instance.apply_data_writes([harness_workflow::runtime::WorkflowDataWrite::set(
+        "merge_review_head_sha",
+        json!(head_sha),
+        DataProvenance::Server,
+    )])?;
+    persist_local_review_request(store, instance, false, || async { Ok(()) }).await
+}
+
 pub(crate) async fn request_local_review_with_admission<F, Fut>(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,

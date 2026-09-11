@@ -470,3 +470,43 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
         .any(|record| record.decision.decision == "resume_implementation_after_replan"));
     Ok(())
 }
+
+#[tokio::test]
+async fn runtime_worker_defers_busy_execution_without_reserving_a_turn() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() { return Ok(()); }
+    struct BusyExecutor;
+    #[async_trait::async_trait]
+    impl RuntimeJobExecutor for BusyExecutor {
+        async fn prepare_execution(&self, _: &RuntimeJob) -> anyhow::Result<Option<chrono::DateTime<Utc>>> {
+            Ok(Some(Utc::now() + Duration::minutes(1)))
+        }
+        async fn execute(&self, _: RuntimeJob) -> ActivityResult { panic!("busy execution must not start"); }
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = enqueue_test_runtime_job(&store, "busy-command", RuntimeKind::Cursor, "cursor", json!({"activity":"check"})).await?;
+    let worker = RuntimeWorker::new(&store, "busy-worker");
+    assert!(worker.run_once(&BusyExecutor).await?.is_none());
+    let pending = store.get_runtime_job(&job.id).await?.expect("pending job");
+    assert_eq!(pending.status, RuntimeJobStatus::Pending);
+    assert!(pending.lease.is_none());
+    let events = store.runtime_events_for(&job.id).await?;
+    assert!(!events.iter().any(|event| event.event_type == "RuntimeTurnStarted"));
+    assert!(events.iter().any(|event| event.event_type == "RuntimeJobClaimDeferred"));
+    let next = enqueue_test_runtime_job(&store, "available-command", RuntimeKind::Cursor, "cursor", json!({"activity":"check"})).await?;
+    let result = worker.run_once(&StaticRuntimeExecutor { result: ActivityResult::succeeded("check", "done") }).await?.expect("another job should proceed");
+    assert_eq!(result.id, next.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_prioritizes_issue_work_over_periodic_scans() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() { return Ok(()); }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    enqueue_test_runtime_job(&store, "scan-command", RuntimeKind::Cursor, "cursor", json!({"activity":"implement_prompt", "command":{"source":"periodic_review"}})).await?;
+    let issue = enqueue_test_runtime_job(&store, "issue-command", RuntimeKind::Cursor, "cursor", json!({"activity":"plan_issue"})).await?;
+    let completed = RuntimeWorker::new(&store, "worker").run_once(&StaticRuntimeExecutor { result: ActivityResult::succeeded("plan_issue", "planned") }).await?.expect("issue should execute");
+    assert_eq!(completed.id, issue.id);
+    Ok(())
+}

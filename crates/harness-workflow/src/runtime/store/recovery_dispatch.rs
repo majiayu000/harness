@@ -23,6 +23,7 @@ pub(super) enum RecoveryDispatchCommandSource {
     Replay(WorkflowCommand),
     LegacyFallback,
     HygieneRepair,
+    LocalReview,
     /// Fully built progress command for a declarative recovery target, built
     /// through the pinned-command path so an agent-contract activity keeps its
     /// contract, prompt, and definition hash; only the dedupe key is assigned

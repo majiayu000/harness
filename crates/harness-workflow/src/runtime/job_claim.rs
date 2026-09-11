@@ -125,6 +125,7 @@ impl WorkflowRuntimeStore {
              )
              ORDER BY
                  CASE
+                     WHEN job.data #>> '{input,command,source}' = 'periodic_review' THEN 2
                      WHEN COALESCE(job.data #>> '{input,activity}', '') IN (
                          'implement_issue',
                          'implement_prompt',

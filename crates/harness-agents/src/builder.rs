@@ -14,6 +14,7 @@
 use crate::claude::{ClaudeCodeAgent, ANTHROPIC_API_KEY_ENV};
 use crate::codex::CodexAgent;
 use crate::codex_adapter::CodexAdapter;
+use crate::cursor::CursorAgent;
 use crate::opencode::OpenCodeAgent;
 use crate::opencode_adapter::OpenCodeAcpAdapter;
 use crate::provider_backpressure::ProviderBackpressureGate;
@@ -179,6 +180,14 @@ pub fn registry_from_config(
         })
         .map_err(|error| anyhow::anyhow!("failed to attach the opencode turn backend: {error}"))?;
 
+    registry.register(
+        "cursor",
+        Arc::new(
+            CursorAgent::from_config(config.cursor.clone(), sandbox_mode)
+                .with_stream_timeout(config.stream_timeout_secs),
+        ),
+    );
+
     if let Ok(api_key) = harness_core::config::process_env::var(ANTHROPIC_API_KEY_ENV) {
         registry.register(
             "anthropic-api",
@@ -312,6 +321,7 @@ mod tests {
         names.sort_unstable();
         assert!(names.contains(&"claude"));
         assert!(names.contains(&"codex"));
+        assert!(names.contains(&"cursor"));
         assert!(
             registry.get_adapter("claude").is_none(),
             "GH-1786 removed the unreachable ClaudeAdapter; claude has no adapter"

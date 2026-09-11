@@ -17,6 +17,7 @@ pub(crate) fn agent_name_for_runtime_kind(kind: RuntimeKind) -> anyhow::Result<&
         RuntimeKind::ClaudeCode => Ok("claude"),
         RuntimeKind::AnthropicApi => Ok("anthropic-api"),
         RuntimeKind::OpenCode => Ok("opencode"),
+        RuntimeKind::Cursor => Ok("cursor"),
         RuntimeKind::RemoteHost => {
             anyhow::bail!("remote_host runtime jobs must be claimed by an external runtime host")
         }
@@ -32,9 +33,10 @@ pub(crate) fn agent_backend_for_runtime_kind(
         RuntimeKind::CodexJsonrpc | RuntimeKind::OpenCode => {
             registry.turn_execution_adapter(agent_name)
         }
-        RuntimeKind::CodexExec | RuntimeKind::ClaudeCode | RuntimeKind::AnthropicApi => {
-            registry.get(agent_name)
-        }
+        RuntimeKind::CodexExec
+        | RuntimeKind::ClaudeCode
+        | RuntimeKind::AnthropicApi
+        | RuntimeKind::Cursor => registry.get(agent_name),
         RuntimeKind::RemoteHost => None,
     };
     backend.ok_or_else(|| {
@@ -94,7 +96,8 @@ impl ToolAllowlistEnforcement {
             | RuntimeKind::CodexJsonrpc
             | RuntimeKind::AnthropicApi
             | RuntimeKind::RemoteHost
-            | RuntimeKind::OpenCode => Self::NotEnforcedByHarness,
+            | RuntimeKind::OpenCode
+            | RuntimeKind::Cursor => Self::NotEnforcedByHarness,
         }
     }
 }
@@ -224,6 +227,7 @@ fn resolve_model(
             _ => agents.claude.default_model.clone(),
         }),
         RuntimeKind::AnthropicApi => Ok(agents.anthropic_api.default_model.clone()),
+        RuntimeKind::Cursor => Ok(agents.cursor.default_model.clone()),
         RuntimeKind::OpenCode => {
             let model = agents.opencode.default_model.clone();
             if model.is_empty() {
@@ -258,7 +262,10 @@ fn resolve_reasoning_effort(
         // The Anthropic API runtime has no reasoning-effort contract, so no
         // effort value is recorded for it. OpenCode's ACP v1 has no
         // reasoning-effort option either.
-        RuntimeKind::AnthropicApi | RuntimeKind::OpenCode | RuntimeKind::RemoteHost => None,
+        RuntimeKind::AnthropicApi
+        | RuntimeKind::OpenCode
+        | RuntimeKind::Cursor
+        | RuntimeKind::RemoteHost => None,
     }
 }
 
@@ -298,6 +305,7 @@ fn resolve_approval_policy(
             RuntimeKind::ClaudeCode
             | RuntimeKind::AnthropicApi
             | RuntimeKind::OpenCode
+            | RuntimeKind::Cursor
             | RuntimeKind::RemoteHost => ResolvedApprovalPolicy::NotApplicable,
         }),
     }
@@ -340,6 +348,37 @@ mod tests {
         let mut profile = RuntimeProfile::new(name, kind);
         profile.timeout_secs = Some(3600);
         profile
+    }
+
+    #[test]
+    fn cursor_runtime_resolves_registered_cli_and_model() {
+        let mut agents = AgentsConfig::default();
+        agents.cursor.default_model = "auto".into();
+        agents.capability_profile = CapabilityProfile::Full;
+        let registry =
+            harness_agents::builder::registry_from_config(&agents, SandboxMode::DangerFullAccess)
+                .unwrap();
+        assert_eq!(
+            agent_backend_for_runtime_kind(&registry, RuntimeKind::Cursor)
+                .unwrap()
+                .name(),
+            "cursor"
+        );
+        let profile = profile_with_timeout("cursor-default", RuntimeKind::Cursor);
+        let settings = resolve_runtime_settings(
+            &profile,
+            RuntimeKind::Cursor,
+            None,
+            &agents,
+            &ConcurrencyConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(settings.model, "auto");
+        assert_eq!(settings.allowed_tools, None);
+        assert_eq!(
+            settings.approval_policy,
+            ResolvedApprovalPolicy::NotApplicable
+        );
     }
 
     #[test]

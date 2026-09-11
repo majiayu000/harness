@@ -97,12 +97,7 @@ fn hygiene_repair_stop(stop: FeedbackRepairStop) -> (&'static str, String) {
                 "PR hygiene repair progress cannot be measured after {completed_rounds} repair rounds because the prior blocker baseline is missing; automatic repair is stopped."
             ),
         ),
-        FeedbackRepairStop::NoProgress { previous, current } => (
-            "block_feedback_repair_oscillation",
-            format!(
-                "PR hygiene repair did not decrease actionable blockers ({previous} before, {current} now); automatic repair is stopped to prevent oscillation."
-            ),
-        ),
+
     }
 }
 

@@ -161,7 +161,7 @@ fn blocking_feedback_result(actionable_blocker_count: u64) -> ActivityResult {
 }
 
 #[test]
-fn repeated_feedback_without_fewer_blockers_stops_repair_oscillation() {
+fn repeated_feedback_without_fewer_blockers_allows_another_bounded_repair() {
     let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -174,15 +174,18 @@ fn repeated_feedback_without_fewer_blockers_stops_repair_oscillation() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("non-converging feedback should stop the workflow");
+        .expect("same-count feedback should request repair");
 
-    assert_eq!(decision.decision, "block_feedback_repair_oscillation");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
     assert_eq!(
         decision.commands[0].command_type,
-        WorkflowCommandType::MarkBlocked
+        WorkflowCommandType::EnqueueActivity
     );
-    assert!(decision.reason.contains("did not decrease"));
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
 }
 
 #[test]
@@ -480,8 +483,8 @@ fn structured_address_decision_cannot_bypass_feedback_convergence() {
         .expect("event should parse")
         .expect("structured decision must still pass convergence policy");
 
-    assert_eq!(decision.decision, "block_feedback_repair_oscillation");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
 }
 
 #[test]
