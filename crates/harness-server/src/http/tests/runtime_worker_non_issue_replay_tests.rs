@@ -71,6 +71,7 @@ async fn concurrent_prompt_child_start_records_one_provenanced_event() -> anyhow
                     .as_str()
                     .expect("parent project_id"),
             ),
+            repo: None,
             task_id: &task_id,
             prompt: "Handle unresolved review feedback for PR 1784.",
             depends_on: &[],
@@ -194,6 +195,7 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
         store,
         crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
             project_root: std::path::Path::new(&project_id),
+            repo: None,
             task_id: &task_id,
             prompt: "Handle unresolved review feedback for PR 1120.",
             depends_on: &[],

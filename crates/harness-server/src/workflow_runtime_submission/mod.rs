@@ -71,6 +71,10 @@ pub(crate) use prompt_memory::{
 
 pub(crate) struct PromptSubmissionRuntimeContext<'a> {
     pub project_root: &'a Path,
+    /// Server-trusted repository slug (`owner/repo`) for PR-binding verification.
+    /// Prefer an explicit caller value (task request / parent workflow); otherwise
+    /// submission resolves it from the project filesystem before persisting.
+    pub repo: Option<&'a str>,
     pub task_id: &'a TaskId,
     pub prompt: &'a str,
     pub depends_on: &'a [TaskId],
@@ -156,6 +160,7 @@ async fn persist_prompt_submission(
     let prompt_ref =
         prompt_ref_for_submission(&project_id, ctx.external_id, ctx.task_id, ctx.prompt);
     let depends_on = prompt_submission_dependency_ids(ctx);
+    let trusted_repo = resolve_prompt_trusted_repo(ctx, &instance.data).await;
     let submitted_data = prompt_submission_data(
         ctx,
         execution_policy,
@@ -163,6 +168,7 @@ async fn persist_prompt_submission(
         &instance.data,
         &prompt_ref,
         &depends_on,
+        trusted_repo.as_deref(),
     );
     let output = build_prompt_submission_decision(
         &instance,
@@ -385,6 +391,38 @@ fn prompt_subject_key(external_id: Option<&str>, task_id: &TaskId) -> String {
         .to_string()
 }
 
+/// Resolve a server-trusted repo slug for prompt workflows (GH-2054).
+///
+/// Order: explicit submission context → already-persisted workflow data →
+/// project filesystem remote detection. Never derive ownership from an
+/// agent-claimed PR URL.
+async fn resolve_prompt_trusted_repo(
+    ctx: &PromptSubmissionRuntimeContext<'_>,
+    existing_data: &serde_json::Value,
+) -> Option<String> {
+    let explicit = ctx
+        .repo
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+        .map(str::to_string);
+    if let Some(repo) = explicit {
+        return canonical_github_repo_identity(Some(&repo));
+    }
+    let persisted = existing_data
+        .get("repo")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+        .map(str::to_string);
+    if let Some(repo) = persisted {
+        return canonical_github_repo_identity(Some(&repo));
+    }
+    let detected =
+        crate::workflow_runtime_pr_feedback::pr_detection::detect_repo_slug(ctx.project_root)
+            .await?;
+    canonical_github_repo_identity(Some(&detected))
+}
+
 fn prompt_submission_data(
     ctx: &PromptSubmissionRuntimeContext<'_>,
     execution_policy: &runtime_models::PromptExecutionPolicy,
@@ -392,6 +430,7 @@ fn prompt_submission_data(
     existing_data: &serde_json::Value,
     prompt_ref: &str,
     depends_on: &[TaskId],
+    trusted_repo: Option<&str>,
 ) -> serde_json::Value {
     let mut data = crate::workflow_runtime_policy::merge_runtime_retry_policy(
         ctx.project_root,
@@ -412,6 +451,9 @@ fn prompt_submission_data(
             "execution_policy": execution_policy,
         }),
     );
+    if let (Some(object), Some(repo)) = (data.as_object_mut(), trusted_repo) {
+        object.insert("repo".to_string(), json!(repo));
+    }
     if let (Some(object), Some(policy)) = (data.as_object_mut(), ctx.continuation) {
         object.insert("continuation".to_string(), continuation_value(policy));
     }
@@ -585,5 +627,65 @@ mod trust_tests {
             json!(IsolationTrustClass::NonCollaborator)
         );
         Ok(())
+    }
+
+    #[test]
+    fn prompt_submission_data_persists_trusted_repo_when_resolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root).expect("mkdir");
+        let task_id = TaskId::from_str("prompt-repo");
+        let ctx = PromptSubmissionRuntimeContext {
+            project_root: &project_root,
+            repo: Some("Octo/Repo"),
+            task_id: &task_id,
+            prompt: "implement something",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: Some("dashboard"),
+            external_id: Some("manual:1"),
+            continuation: None,
+        };
+        let data = prompt_submission_data(
+            &ctx,
+            &runtime_models::PromptExecutionPolicy::default(),
+            &project_root.to_string_lossy(),
+            &json!({}),
+            "prompt-ref-1",
+            &[],
+            Some("octo/repo"),
+        );
+        assert_eq!(data["repo"], "octo/repo");
+        assert!(data.get("prompt_ref").is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_prompt_trusted_repo_detects_origin_from_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).expect("mkdir .git");
+        std::fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/Octo/Detected.git\n",
+        )
+        .expect("write git config");
+        let task_id = TaskId::from_str("detect-repo");
+        let ctx = PromptSubmissionRuntimeContext {
+            project_root: dir.path(),
+            repo: None,
+            task_id: &task_id,
+            prompt: "x",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: None,
+            external_id: None,
+            continuation: None,
+        };
+        assert_eq!(
+            resolve_prompt_trusted_repo(&ctx, &json!({})).await,
+            Some("octo/detected".to_string())
+        );
     }
 }

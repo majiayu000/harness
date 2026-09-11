@@ -69,7 +69,7 @@ pub(super) async fn attach_pr_binding_verification(
     let Some((pr_number, pr_url)) = claimed_pull_request(&result) else {
         return result;
     };
-    let Some(repo_slug) = expected_repo_slug(workflow) else {
+    let Some(repo_slug) = resolve_expected_repo_slug(workflow).await else {
         return result.with_artifact(ActivityArtifact::new(
             ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
             json!({
@@ -246,9 +246,20 @@ fn claimed_pull_request(result: &ActivityResult) -> Option<(u64, String)> {
 
 /// Trusted repository ownership for PR-binding verification (GH-2054).
 ///
-/// Only `workflow.data.repo` is accepted. Parsing the agent-claimed `pr_url`
-/// must not supply the expected slug: that would prove an open PR exists at
-/// the claimed URL, not that it belongs to this project.
+/// Only server-trusted sources are accepted: `workflow.data.repo`, or the
+/// project filesystem remote resolved from server-owned `project_id`.
+/// Parsing the agent-claimed `pr_url` must not supply the expected slug.
+async fn resolve_expected_repo_slug(workflow: &WorkflowInstance) -> Option<String> {
+    if let Some(repo) = expected_repo_slug(workflow) {
+        return Some(repo);
+    }
+    let project_id = workflow.data.get("project_id").and_then(Value::as_str)?;
+    crate::workflow_runtime_pr_feedback::pr_detection::detect_repo_slug(std::path::Path::new(
+        project_id,
+    ))
+    .await
+}
+
 fn expected_repo_slug(workflow: &WorkflowInstance) -> Option<String> {
     workflow
         .data
@@ -384,6 +395,55 @@ mod tests {
         )
         .with_server_data(json!({ "repo": "   " }));
         assert_eq!(expected_repo_slug(&wf), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_expected_repo_slug_uses_project_filesystem_when_repo_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).expect("mkdir .git");
+        std::fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/octo/from-project.git\n",
+        )
+        .expect("write git config");
+
+        let wf = workflow(
+            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
+        )
+        .with_server_data(json!({ "project_id": dir.path().to_string_lossy() }));
+
+        assert_eq!(
+            resolve_expected_repo_slug(&wf).await,
+            Some("octo/from-project".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_expected_repo_slug_prefers_persisted_repo_over_project_detect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).expect("mkdir .git");
+        std::fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/octo/from-project.git\n",
+        )
+        .expect("write git config");
+
+        let wf = workflow(
+            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
+        )
+        .with_server_data(json!({
+            "repo": "octo/persisted",
+            "project_id": dir.path().to_string_lossy(),
+        }));
+
+        assert_eq!(
+            resolve_expected_repo_slug(&wf).await,
+            Some("octo/persisted".to_string())
+        );
     }
 
     fn runtime_job(activity: &str) -> RuntimeJob {
