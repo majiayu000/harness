@@ -278,6 +278,7 @@ async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyho
         .await?;
     let ctx = PromptSubmissionRuntimeContext {
         project_root: &project_root,
+        repo: None,
         task_id: &task_id,
         prompt,
         depends_on: &[],
@@ -295,6 +296,7 @@ async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyho
         &stale_instance.data,
         &prompt_ref,
         &[],
+        None,
     );
     let output = build_prompt_submission_decision(
         &stale_instance,
@@ -344,6 +346,7 @@ async fn accepted_prompt_replay_with_new_prompt_keeps_referenced_payload() -> an
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: first_prompt,
             depends_on: &[],
@@ -374,6 +377,7 @@ async fn accepted_prompt_replay_with_new_prompt_keeps_referenced_payload() -> an
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: replay_prompt,
             depends_on: &[],

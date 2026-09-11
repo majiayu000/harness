@@ -87,6 +87,7 @@ async fn prompt_submission_records_explicit_submission_id() -> anyhow::Result<()
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: "keep prompt submission identity explicit",
             depends_on: &[],

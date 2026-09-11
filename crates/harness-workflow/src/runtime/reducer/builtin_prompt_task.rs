@@ -272,9 +272,11 @@ fn with_prompt_pr_binding(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "pull_request artifact must contain non-empty pr_url".to_string())?;
-    // GH-2050 / GH-1766: require server-verified PR binding evidence before
-    // minting BindPr; persist the canonical verified URL when present.
-    let binding = verified_pr_binding_evidence_with_registry(registry, result, pr_number, pr_url)?;
+    // GH-2050 / GH-1766 / GH-2054: require server-verified PR binding evidence
+    // before minting BindPr. Pass `None` so this path never inherits the
+    // github_issue_pr implementing→pr_open kill-switch waiver.
+    let binding =
+        verified_pr_binding_evidence_with_registry(registry, result, pr_number, pr_url, None)?;
     Ok(decision
         .with_command(WorkflowCommand::bind_pr(
             pr_number,

@@ -213,3 +213,52 @@ fn runtime_completion_reducer_binds_verified_prompt_pull_request() {
         )
         .expect("verified prompt PR completion should validate");
 }
+
+/// GH-2054: lifting github_issue_pr verified_pr_binding enforcement must not
+/// silently waive prompt_task BindPr verification.
+#[test]
+fn prompt_bind_pr_stays_required_when_github_issue_pr_evidence_is_lifted() {
+    let mut registry = WorkflowDefinitionRegistry::with_builtins();
+    registry
+        .apply_builtin_evidence_enforcement(false)
+        .expect("kill switch should apply");
+    assert!(
+        !registry.transition_requires_evidence(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            "implementing",
+            "pr_open",
+            "verified_pr_binding",
+        ),
+        "test setup: github_issue_pr enforcement must be lifted"
+    );
+
+    let instance = prompt_task_instance("implementing");
+    let result = ActivityResult::succeeded(
+        PROMPT_TASK_IMPLEMENT_ACTIVITY,
+        "Prompt implementation completed.",
+    )
+    .with_validation(ValidationRecord::new("cargo test", "passed"))
+    .with_artifact(ActivityArtifact::new(
+        "validation_report",
+        json!([{ "command": "cargo test", "exit_code": 0 }]),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "pull_request",
+        json!({
+            "pr_number": 2044,
+            "pr_url": "https://github.com/owner/repo/pull/2044"
+        }),
+    ));
+    let event = runtime_completion_event(&instance, PROMPT_TASK_IMPLEMENT_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed_with_registry(&registry, &instance, &event)
+        .expect("event should parse")
+        .expect("unverified prompt PR claim should still produce a decision");
+
+    assert_eq!(decision.decision, "prompt_pr_binding_invalid");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision
+        .commands
+        .iter()
+        .all(|command| command.command_type != WorkflowCommandType::BindPr));
+}
