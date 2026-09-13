@@ -11,6 +11,7 @@ mod defaults;
 mod intake_binding;
 mod reserved_keys;
 mod runtime_completion;
+mod shared;
 mod storage;
 pub use agent_contract::{
     AgentContractMutationPolicy, AgentContractToolPolicy, AgentContractWorkspacePolicy,
@@ -51,6 +52,8 @@ pub enum WorkflowSourceRole {
     CentralBase,
     /// The repository `{project_root}/WORKFLOW.md` override.
     RepositoryOverride,
+    /// Reusable workflow selected by the project's workflow.file setting.
+    SelectedWorkflow,
 }
 
 /// Observation-only fact about one configured workflow source file that was
@@ -67,6 +70,8 @@ pub struct WorkflowSourceObservation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowIdentityPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(default = "default_workflow_version")]
@@ -481,6 +486,7 @@ impl Default for RuntimeWorkerPolicy {
 impl Default for WorkflowIdentityPolicy {
     fn default() -> Self {
         Self {
+            file: None,
             id: None,
             version: default_workflow_version(),
         }
@@ -640,6 +646,10 @@ pub(super) fn load_workflow_document_with_base(
 ) -> anyhow::Result<WorkflowDocument> {
     let repo_path = project_root.join("WORKFLOW.md");
     let repo = read_workflow_file(&repo_path)?;
+    let project_policy = repo
+        .as_ref()
+        .map(|file| file.front_matter.clone())
+        .unwrap_or_default();
 
     // The base only applies when it is a distinct file from the repo's own
     // WORKFLOW.md (otherwise a repo that *is* the config dir would merge with
@@ -667,7 +677,7 @@ pub(super) fn load_workflow_document_with_base(
         });
     }
 
-    let (merged_value, prompt_template, source_path) = match (base, repo) {
+    let (mut merged_value, mut prompt_template, source_path) = match (base, repo) {
         (None, None) => return Ok(WorkflowDocument::default()),
         (Some((base_path, base_file)), None) => (
             base_file.front_matter,
@@ -691,6 +701,13 @@ pub(super) fn load_workflow_document_with_base(
         }
     };
 
+    shared::resolve(
+        project_root,
+        &project_policy,
+        &mut merged_value,
+        &mut prompt_template,
+        &mut sources,
+    )?;
     let mut config: WorkflowConfig = match merged_value {
         serde_yaml::Value::Null => WorkflowConfig::default(),
         value => serde_yaml::from_value(value).map_err(|e| {
