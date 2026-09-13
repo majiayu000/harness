@@ -384,7 +384,7 @@ mod tests {
             &server,
             dir,
             dir,
-            storage.tasks.as_ref().expect("tasks store"),
+            storage.tasks.as_ref(),
         )
         .await
         .expect("registry");
@@ -494,7 +494,7 @@ mod tests {
             &server,
             dir.path(),
             dir.path(),
-            storage.tasks.as_ref().expect("tasks store"),
+            storage.tasks.as_ref(),
         )
         .await
         .expect("registry");
@@ -552,7 +552,7 @@ mod tests {
             &server,
             dir.path(),
             dir.path(),
-            storage.tasks.as_ref().expect("tasks store"),
+            storage.tasks.as_ref(),
         )
         .await
         .expect("registry");

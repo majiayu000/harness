@@ -47,7 +47,7 @@ async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -76,7 +76,10 @@ async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     assert_eq!(json["status"], "planning");
     assert_eq!(json["workflow_state"], "planning");
     assert_eq!(json["execution_path"], "workflow_runtime");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     let task_id = json["task_id"]
         .as_str()
         .expect("task id should be present")
@@ -144,7 +147,7 @@ async fn webhook_review_on_pr_requests_runtime_pr_feedback() -> anyhow::Result<(
     .await?;
     let (workflow_id, runtime_task_id) =
         seed_bound_runtime_pr_workflow(&state, dir.path(), "majiayu000/harness", 42, 42).await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -174,7 +177,10 @@ async fn webhook_review_on_pr_requests_runtime_pr_feedback() -> anyhow::Result<(
     assert_eq!(json["workflow_state"], "local_review_gate");
     assert_eq!(json["execution_path"], "workflow_runtime");
     assert_eq!(json["task_id"], runtime_task_id);
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     assert_runtime_local_review_requested(&state, &workflow_id, &runtime_task_id).await?;
     Ok(())
 }
@@ -201,7 +207,7 @@ async fn webhook_fix_ci_on_pr_creates_runtime_prompt_submission() -> anyhow::Res
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -238,7 +244,10 @@ async fn webhook_fix_ci_on_pr_creates_runtime_prompt_submission() -> anyhow::Res
     assert_eq!(json["workflow_state"], "implementing");
     assert_eq!(json["execution_path"], "workflow_runtime");
     let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     assert_runtime_prompt_submission(&state, dir.path(), runtime_task_id).await?;
     Ok(())
 }
@@ -458,7 +467,7 @@ async fn webhook_body_limit_rejects_large_payload() -> anyhow::Result<()> {
 async fn create_task_with_prompt_requires_workflow_runtime_store() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({ "prompt": "fix the bug" });
@@ -475,7 +484,10 @@ async fn create_task_with_prompt_requires_workflow_runtime_store() -> anyhow::Re
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let resp = response_json(response).await?;
     assert_eq!(resp["error"], "workflow runtime store unavailable");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     Ok(())
 }
 
@@ -495,7 +507,7 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({
@@ -524,10 +536,15 @@ async fn create_task_with_prompt_returns_workflow_runtime_submission() -> anyhow
     assert!(state
         .core
         .tasks
+        .as_ref()
+        .expect("tasks")
         .get_with_db_fallback(&task_id)
         .await?
         .is_none());
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
 
     let store = state
         .core
@@ -720,7 +737,7 @@ async fn create_task_with_issue_requires_workflow_runtime_store() -> anyhow::Res
     let dir = tempfile::tempdir()?;
     init_fake_git_repo(dir.path())?;
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some("s")).await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({
@@ -741,7 +758,10 @@ async fn create_task_with_issue_requires_workflow_runtime_store() -> anyhow::Res
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let resp = response_json(response).await?;
     assert_eq!(resp["error"], "workflow runtime store unavailable");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
 
     Ok(())
 }
@@ -762,7 +782,7 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({
@@ -791,10 +811,15 @@ async fn create_task_with_issue_returns_workflow_runtime_submission() -> anyhow:
     assert!(state
         .core
         .tasks
+        .as_ref()
+        .expect("tasks")
         .get_with_db_fallback(&task_id)
         .await?
         .is_none());
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
 
     let store = state
         .core
@@ -839,7 +864,7 @@ async fn create_task_with_terminal_issue_retry_returns_stable_submission_handle(
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = runtime_submission_app(state.clone());
 
     let body = serde_json::json!({
@@ -899,7 +924,10 @@ async fn create_task_with_terminal_issue_retry_returns_stable_submission_handle(
     assert_eq!(retry_json["submission_id"], stable_submission_id);
     assert_eq!(retry_json["workflow_id"], workflow_id);
     assert_eq!(retry_json["execution_path"], "workflow_runtime");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
 
     let retry_instance = store
         .get_instance(&workflow_id)

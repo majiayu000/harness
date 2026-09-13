@@ -3,11 +3,10 @@ use std::sync::Arc;
 
 use crate::server::HarnessServer;
 
-use super::{engines::EnginesBundle, registry::RegistryBundle, storage::StorageBundle};
+use super::{registry::RegistryBundle, storage::StorageBundle};
 
 /// Outputs of the service layer initialization phase.
 pub(crate) struct ServicesBundle {
-    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     pub project_svc: Arc<dyn crate::services::project::ProjectService>,
     pub task_svc: Arc<dyn crate::services::task::TaskService>,
     pub execution_svc: Arc<dyn crate::services::execution::ExecutionService>,
@@ -19,58 +18,33 @@ pub(crate) struct ServicesBundle {
     pub snapshot_load_failed: bool,
 }
 
-/// Initialize interceptors, service impls, runtime host/project-cache managers,
+/// Initialize service impls, runtime host/project-cache managers,
 /// and restore any persisted runtime state snapshot.
 ///
 /// Also spawns the background task-recovery validator.
 ///
-/// Depends on: `storage`, `engines`, and `registry` — must follow all three.
+/// Depends on initialized storage and registry services.
 pub(crate) async fn build_services(
     server: &Arc<HarnessServer>,
     storage: &StorageBundle,
-    engines: &EnginesBundle,
     registry: &RegistryBundle,
     project_root: &Path,
 ) -> anyhow::Result<ServicesBundle> {
-    let tasks = storage
-        .tasks
-        .as_ref()
-        .expect("build_services requires a ready task store")
-        .clone();
-    let events = engines
-        .events
-        .as_ref()
-        .expect("build_services requires a ready event store")
-        .clone();
     let project_registry = registry
         .project_registry
         .as_ref()
         .expect("build_services requires a ready project registry")
         .clone();
 
-    // ── Interceptor stack ─────────────────────────────────────────────────────
-    let hook_enforcement = server.config.rules.hook_enforcement;
-    let interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>> = vec![
-        Arc::new(crate::contract_validator::ContractValidator::new()),
-        Arc::new(crate::hook_enforcer::HookEnforcer::new(
-            engines.rules.clone(),
-            events.clone(),
-            hook_enforcement,
-        )),
-        Arc::new(
-            crate::post_validator::PostExecutionValidator::new_with_github_token(
-                server.config.validation.clone(),
-                server.config.server.github_token.clone(),
-            ),
-        ),
-    ];
-
     // ── Service layer ─────────────────────────────────────────────────────────
     let project_svc = crate::services::project::DefaultProjectService::new(
         project_registry.clone(),
         project_root.to_path_buf(),
     );
-    let task_svc = crate::services::task::DefaultTaskService::new(tasks.clone());
+    let task_svc: Arc<dyn crate::services::task::TaskService> = match storage.tasks.as_ref() {
+        Some(tasks) => crate::services::task::DefaultTaskService::new(tasks.clone()),
+        None => crate::services::task::UnavailableTaskService::new(),
+    };
     let execution_svc = crate::services::execution::DefaultExecutionService::new(
         Arc::new(server.config.clone()),
         registry.workflow_runtime_store.clone(),
@@ -130,7 +104,6 @@ pub(crate) async fn build_services(
     }
 
     Ok(ServicesBundle {
-        interceptors,
         project_svc,
         task_svc,
         execution_svc,
@@ -138,53 +111,4 @@ pub(crate) async fn build_services(
         runtime_project_cache,
         snapshot_load_failed,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{server::HarnessServer, thread_manager::ThreadManager};
-    use harness_agents::registry::AgentRegistry;
-    use harness_core::config::HarnessConfig;
-
-    async fn make_all_bundles(
-        dir: &std::path::Path,
-    ) -> (
-        Arc<HarnessServer>,
-        StorageBundle,
-        EnginesBundle,
-        RegistryBundle,
-    ) {
-        let server = Arc::new(HarnessServer::new(
-            HarnessConfig::default(),
-            ThreadManager::new(),
-            AgentRegistry::new("test"),
-        ));
-        let storage = crate::http::builders::storage::build_storage(dir)
-            .await
-            .expect("storage");
-        let engines = crate::http::builders::engines::build_engines(&server, dir, dir)
-            .await
-            .expect("engines");
-        let registry = crate::http::builders::registry::build_registry(
-            &server,
-            dir,
-            dir,
-            storage.tasks.as_ref().expect("tasks store"),
-        )
-        .await
-        .expect("registry");
-        (server, storage, engines, registry)
-    }
-
-    #[tokio::test]
-    async fn interceptor_count_matches_registered() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (server, storage, engines, registry) = make_all_bundles(dir.path()).await;
-        let bundle = build_services(&server, &storage, &engines, &registry, dir.path())
-            .await
-            .expect("build_services");
-        // 3 interceptors: ContractValidator, HookEnforcer, PostExecutionValidator
-        assert_eq!(bundle.interceptors.len(), 3, "expected 3 interceptors");
-    }
 }

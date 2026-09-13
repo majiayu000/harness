@@ -167,17 +167,17 @@ struct FailureGroupKey {
 async fn build_operator_monitor(state: &AppState) -> anyhow::Result<OperatorMonitorPayload> {
     let generated_at = Utc::now();
     let workflows = list_runtime_workflows(state).await?;
-    let active_tasks = state.core.tasks.list_active_summaries().await?;
-    let stalled_tasks = state
-        .core
-        .tasks
-        .list_stalled_tasks(Duration::from_secs(STALLED_AFTER_MINS * 60), None)
-        .await?;
-    let recent_failures = state
-        .core
-        .tasks
-        .list_recent_failed(MAX_RECENT_FAILURES)
-        .await?;
+    let (active_tasks, stalled_tasks, recent_failures) = match state.core.tasks.as_ref() {
+        Some(tasks) => {
+            let active_tasks = tasks.list_active_summaries().await?;
+            let stalled_tasks = tasks
+                .list_stalled_tasks(Duration::from_secs(STALLED_AFTER_MINS * 60), None)
+                .await?;
+            let recent_failures = tasks.list_recent_failed(MAX_RECENT_FAILURES).await?;
+            (active_tasks, stalled_tasks, recent_failures)
+        }
+        None => (Vec::new(), Vec::new(), Vec::new()),
+    };
     let worktree_cards = crate::handlers::worktrees::list_worktrees(state).await?;
 
     let dashboard_counts = state.task_svc.count_for_dashboard().await;

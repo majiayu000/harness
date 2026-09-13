@@ -92,14 +92,17 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
         ..Default::default()
     };
     // Collect all subsections concurrently — they are independent.
-    let (retry_events_res, stalled_res, failed_res) = tokio::join!(
-        state.observability.events.query(&recent_retry_filter),
-        state
-            .core
-            .tasks
-            .list_stalled_tasks(Duration::from_secs(SNAPSHOT_STALE_MINS * 60), None),
-        state.core.tasks.list_recent_failed(MAX_TASKS as i64),
-    );
+    let retry_events_res = state.observability.events.query(&recent_retry_filter).await;
+    let (stalled_res, failed_res) = match state.core.tasks.as_ref() {
+        Some(tasks) => {
+            let (stalled, failed) = tokio::join!(
+                tasks.list_stalled_tasks(Duration::from_secs(SNAPSHOT_STALE_MINS * 60), None),
+                tasks.list_recent_failed(MAX_TASKS as i64),
+            );
+            (stalled, failed)
+        }
+        None => (Ok(Vec::new()), Ok(Vec::new())),
+    };
 
     let mut retry_events = match retry_events_res {
         Ok(events) => events,
@@ -473,7 +476,13 @@ mod tests {
                 version: 0,
             };
             task.status = crate::task_runner::TaskStatus::Failed;
-            state.core.tasks.insert(&task).await;
+            state
+                .core
+                .tasks
+                .as_ref()
+                .expect("tasks")
+                .insert(&task)
+                .await;
         }
 
         let app = Router::new()
@@ -535,7 +544,13 @@ mod tests {
 
             version: 0,
         };
-        state.core.tasks.insert(&task).await;
+        state
+            .core
+            .tasks
+            .as_ref()
+            .expect("tasks")
+            .insert(&task)
+            .await;
 
         let app = Router::new()
             .route("/api/operator-snapshot", get(operator_snapshot))
@@ -602,7 +617,13 @@ mod tests {
 
             version: 0,
         };
-        state.core.tasks.insert(&task).await;
+        state
+            .core
+            .tasks
+            .as_ref()
+            .expect("tasks")
+            .insert(&task)
+            .await;
 
         let app = Router::new()
             .route("/api/operator-snapshot", get(operator_snapshot))

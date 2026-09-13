@@ -757,3 +757,33 @@ fn intermediate_message_does_not_suppress_distinct_final_report() {
         matches!(final_item, Some(StreamItem::ItemCompleted { item: Item::AgentReasoning { content } }) if content == "Fixed and tested.")
     );
 }
+
+#[tokio::test]
+async fn lifecycle_reuses_preselected_backend_without_resolving_again() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let agent_calls = Arc::new(AtomicUsize::new(0));
+    let registry_adapter_calls = Arc::new(AtomicUsize::new(0));
+    let selected_calls = Arc::new(AtomicUsize::new(0));
+    let server = server_with_codex_counts(
+        root.path(),
+        agent_calls.clone(),
+        registry_adapter_calls.clone(),
+    )?;
+    let turn_id = start_test_turn(&server, root.path())?;
+    run_test_turn(
+        server,
+        root.path(),
+        turn_id,
+        TurnLifecycleOptions {
+            selected_backend: Some(Arc::new(CountingAdapter {
+                calls: selected_calls.clone(),
+            })),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(selected_calls.load(Ordering::Acquire), 1);
+    assert_eq!(registry_adapter_calls.load(Ordering::Acquire), 0);
+    assert_eq!(agent_calls.load(Ordering::Acquire), 0);
+    Ok(())
+}

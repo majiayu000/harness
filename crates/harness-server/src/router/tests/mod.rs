@@ -143,6 +143,8 @@ async fn gc_adopt_returns_runtime_submission_without_registered_agent() -> anyho
     assert!(state
         .core
         .tasks
+        .as_ref()
+        .expect("tasks")
         .get(&harness_core::types::TaskId(submission_id.to_string()))
         .is_none());
     Ok(())
@@ -258,6 +260,8 @@ async fn gc_adopt_spawns_task_when_agent_registered() -> anyhow::Result<()> {
     assert!(state
         .core
         .tasks
+        .as_ref()
+        .expect("tasks")
         .get(&harness_core::types::TaskId(submission_id.to_string()))
         .is_none());
     Ok(())

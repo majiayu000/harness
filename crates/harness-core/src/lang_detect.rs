@@ -215,7 +215,6 @@ pub fn validation_prompt_instructions(lang: Language, project_root: &Path) -> St
 /// Default pre-commit validation commands for the detected language.
 ///
 /// Used by `validation_prompt_instructions` to generate agent prompt text.
-/// Also used by `PostExecutionValidator` when explicit config commands are set.
 pub fn default_pre_commit_commands(lang: Language, project_root: &Path) -> Vec<String> {
     match lang {
         Language::Rust => {

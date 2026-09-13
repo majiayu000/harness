@@ -17,7 +17,7 @@ use std::sync::{
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct TurnLifecycleOptions {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -27,6 +27,8 @@ pub(crate) struct TurnLifecycleOptions {
     pub timeout_secs: Option<u64>,
     pub stall_timeout_secs: Option<u64>,
     pub force_code_agent: bool,
+    /// Reuse the backend selected and checked by the workflow worker.
+    pub selected_backend: Option<Arc<dyn harness_core::agent::AgentBackend>>,
     pub permission_mode: AgentPermissionMode,
     pub allowed_tools: Option<Vec<String>>,
     pub env_vars: HashMap<String, String>,
@@ -69,7 +71,11 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         }
     }
 
-    let Some(agent) = server.agent_registry.get(&agent_name) else {
+    let Some(agent) = options
+        .selected_backend
+        .clone()
+        .or_else(|| server.agent_registry.get(&agent_name))
+    else {
         let msg = format!("agent `{agent_name}` not found in registry");
         if let Err(e) = server.thread_manager.add_item(
             &thread_id,
@@ -120,7 +126,10 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let execution_adapter = if options.force_code_agent {
         None
     } else {
-        server.agent_registry.turn_execution_adapter(&agent_name)
+        options
+            .selected_backend
+            .clone()
+            .or_else(|| server.agent_registry.turn_execution_adapter(&agent_name))
     };
     let adapter_opt = if options.force_code_agent {
         None

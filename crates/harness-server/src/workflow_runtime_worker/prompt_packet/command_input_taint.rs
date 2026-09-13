@@ -130,8 +130,15 @@ fn collect_tainted_pointers(
 
 fn field_origin(field: &str, value: &Value) -> Option<CommandInputOrigin> {
     match field {
-        "agent_summary" | "feedback_summary" | "last_summary" | "plan_summary"
-        | "review_summary" | "summary" => Some(CommandInputOrigin::Agent),
+        "agent_summary"
+        | "feedback_summary"
+        | "last_summary"
+        | "plan_summary"
+        | "review_summary"
+        | "summary"
+        | "local_review_result"
+        | "issue_plan"
+        | "issue_plan_summary" => Some(CommandInputOrigin::Agent),
         "active_states"
         | "additional_prompt"
         | "body"

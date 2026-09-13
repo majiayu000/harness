@@ -139,7 +139,8 @@ fn activity_status_contract_blockers(
             collect_structured_blockers(
                 &artifact.artifact,
                 &mut blockers,
-                pr_feedback_repair && artifact.artifact_type == "pr_repair_snapshot",
+                (pr_feedback_repair && artifact.artifact_type == "pr_repair_snapshot")
+                    || local_review_outcome == Some(LocalReviewOutcome::Passed),
             );
         }
     }
@@ -216,19 +217,14 @@ fn is_local_review_outcome_signal(signal_type: &str) -> bool {
 fn collect_structured_blockers(
     value: &Value,
     blockers: &mut Vec<String>,
-    pr_feedback_repair: bool,
+    remote_readiness_deferred: bool,
 ) {
     match value {
         Value::Object(object) => {
-            let blocked_merge_is_pending_checks = pr_feedback_repair
-                && object_value(object, "pending_checks").is_some_and(json_value_reports_blocker)
-                && object_value(object, "failed_checks")
-                    .or_else(|| object_value(object, "failing_checks"))
-                    .is_some_and(|value| !json_value_reports_blocker(value));
             for (key, value) in object {
                 let normalized_key = key.to_ascii_lowercase();
                 if BLOCKING_COUNT_FIELDS.contains(&normalized_key.as_str()) {
-                    if !(pr_feedback_repair && normalized_key == "pending_checks")
+                    if !(remote_readiness_deferred && normalized_key == "pending_checks")
                         && json_value_reports_blocker(value)
                     {
                         push_unique(blockers, format!("field:{normalized_key}"));
@@ -239,30 +235,24 @@ fn collect_structured_blockers(
                     }
                 } else if normalized_key == "merge_state_status" {
                     if json_string_is_one_of(value, BLOCKING_MERGE_STATES)
-                        && !(json_string_equals(value, "blocked")
-                            && blocked_merge_is_pending_checks)
+                        && !(remote_readiness_deferred
+                            && json_string_is_one_of(value, &["blocked", "unknown", "unstable"]))
                     {
                         push_unique(blockers, "field:merge_state_status_blocked");
                     }
                 } else if normalized_key == "mergeable" && value.as_bool() == Some(false) {
                     push_unique(blockers, "field:mergeable_false");
                 }
-                collect_structured_blockers(value, blockers, pr_feedback_repair);
+                collect_structured_blockers(value, blockers, remote_readiness_deferred);
             }
         }
         Value::Array(values) => {
             for value in values {
-                collect_structured_blockers(value, blockers, pr_feedback_repair);
+                collect_structured_blockers(value, blockers, remote_readiness_deferred);
             }
         }
         _ => {}
     }
-}
-
-fn object_value<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a Value> {
-    object
-        .iter()
-        .find_map(|(candidate, value)| candidate.eq_ignore_ascii_case(key).then_some(value))
 }
 
 fn json_value_reports_blocker(value: &Value) -> bool {

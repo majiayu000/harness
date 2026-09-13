@@ -56,7 +56,16 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             .map(|project| project.root.to_string_lossy().into_owned())
             .collect::<HashSet<_>>()
     });
-    let active_counts = dashboard_active_counts(&state, visible_project_ids.as_ref()).await;
+    let active_counts = match dashboard_active_counts(&state, visible_project_ids.as_ref()).await {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::error!("dashboard: active workflow counts unavailable: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "active workflow counts unavailable"})),
+            );
+        }
+    };
 
     // Grade from the global quality event store.
     // Derive violation_count from the most recent rule_scan session so we don't
@@ -436,7 +445,13 @@ mod tests {
         let task_id = TaskId::from_str("legacy-dashboard-active");
         let mut task = TaskState::new(task_id.clone());
         task.project_root = Some(canonical_root);
-        state.core.tasks.insert(&task).await;
+        state
+            .core
+            .tasks
+            .as_ref()
+            .expect("tasks")
+            .insert(&task)
+            .await;
 
         let store = state
             .core
@@ -471,7 +486,13 @@ mod tests {
         let mut task = TaskState::new(TaskId::from_str("legacy-dashboard-recovering"));
         task.project_root = Some(canonical_root);
         task.scheduler.mark_recovering("test-scheduler");
-        state.core.tasks.insert(&task).await;
+        state
+            .core
+            .tasks
+            .as_ref()
+            .expect("tasks")
+            .insert(&task)
+            .await;
 
         let body = dashboard_body(state).await?;
 
@@ -503,7 +524,13 @@ mod tests {
         let mut task = TaskState::new(TaskId::from_str("legacy-dashboard-unregistered"));
         task.project_root = Some(unregistered_dir.canonicalize()?);
         task.scheduler.claim_scheduler("test-scheduler");
-        state.core.tasks.insert(&task).await;
+        state
+            .core
+            .tasks
+            .as_ref()
+            .expect("tasks")
+            .insert(&task)
+            .await;
 
         let body = dashboard_body(state).await?;
 
@@ -550,7 +577,13 @@ mod tests {
         let mut task = TaskState::new(TaskId::from_str("legacy-dashboard-allowed-root"));
         task.project_root = Some(unregistered_dir.canonicalize()?);
         task.scheduler.claim_scheduler("test-scheduler");
-        state.core.tasks.insert(&task).await;
+        state
+            .core
+            .tasks
+            .as_ref()
+            .expect("tasks")
+            .insert(&task)
+            .await;
 
         let body = dashboard_body(state).await?;
 
@@ -626,7 +659,13 @@ mod tests {
 
         let mut task = TaskState::new(TaskId::from_str("legacy-dashboard-background-waiter"));
         task.project_root = Some(canonical_root);
-        state.core.tasks.insert(&task).await;
+        state
+            .core
+            .tasks
+            .as_ref()
+            .expect("tasks")
+            .insert(&task)
+            .await;
 
         let waiter_queue = queue.clone();
         let waiter_project = project_root.clone();

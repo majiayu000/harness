@@ -258,7 +258,7 @@ fn fewer_feedback_blockers_allows_the_next_repair_round() {
 }
 
 #[test]
-fn feedback_repair_history_without_blocker_baseline_stops() {
+fn feedback_repair_history_without_blocker_baseline_still_repairs() {
     let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -269,10 +269,10 @@ fn feedback_repair_history_without_blocker_baseline_stops() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("missing blocker baseline should stop the workflow");
+        .expect("missing blocker baseline must not stop repair");
 
-    assert_eq!(decision.decision, "block_feedback_repair_unmeasured");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
 }
 
 #[test]
@@ -308,7 +308,7 @@ fn structured_only_quality_gate_decision_requires_feedback_outcome_signal() {
 }
 
 #[test]
-fn feedback_repair_round_limit_stops_even_when_blockers_decrease() {
+fn feedback_repair_continues_past_former_round_limit() {
     let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -321,11 +321,10 @@ fn feedback_repair_round_limit_stops_even_when_blockers_decrease() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("repair round limit should stop the workflow");
+        .expect("former round limit must not stop repair");
 
-    assert_eq!(decision.decision, "block_feedback_repair_round_limit");
-    assert_eq!(decision.next_state, "blocked");
-    assert!(decision.reason.contains("3 repair rounds"));
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
 }
 
 #[test]

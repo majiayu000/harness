@@ -44,7 +44,16 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
 
     // ---- global task queue counts (reuse existing services) ----
     let tq = &state.concurrency.task_queue;
-    let active_counts = active_task_overview_counts(&state).await;
+    let active_counts = match active_task_overview_counts(&state).await {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::error!("overview: active workflow counts unavailable: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "active workflow counts unavailable"})),
+            );
+        }
+    };
     let running = active_counts.running;
     let queued = active_counts.queued;
     let max_concurrent = tq.global_limit();
@@ -479,54 +488,30 @@ impl ActiveTaskOverviewCounts {
     }
 }
 
-pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCounts {
+pub(crate) async fn active_task_overview_counts(
+    state: &AppState,
+) -> anyhow::Result<ActiveTaskOverviewCounts> {
     let mut counts = ActiveTaskOverviewCounts::default();
-    let runtime_counts_available = state.core.workflow_runtime_store.is_some();
-
-    if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-        match crate::handlers::definition_ids::active_count_definition_ids(
-            store.definition_registry(),
-        ) {
-            Ok(definition_ids) => {
-                for definition_id in &definition_ids {
-                    match store
-                        .list_nonterminal_instances_by_definition(definition_id, None, None)
-                        .await
-                    {
-                        Ok(workflows) => {
-                            for workflow in workflows {
-                                add_active_runtime_workflow_with_registry(
-                                    store.definition_registry(),
-                                    &mut counts,
-                                    &workflow,
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                definition_id = definition_id.as_str(),
-                                "overview: failed to list runtime workflows for active counts: {error}"
-                            );
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::error!("overview: {error}; runtime workflow active counts unavailable");
-            }
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("workflow runtime store unavailable"))?;
+    for definition_id in
+        crate::handlers::definition_ids::active_count_definition_ids(store.definition_registry())?
+    {
+        let workflows = store
+            .list_nonterminal_instances_by_definition(&definition_id, None, None)
+            .await?;
+        for workflow in workflows {
+            add_active_runtime_workflow_with_registry(
+                store.definition_registry(),
+                &mut counts,
+                &workflow,
+            );
         }
     }
-
-    if !runtime_counts_available {
-        for _ in 0..state.concurrency.task_queue.running_count() {
-            counts.add(None, ActiveTaskBucket::Running);
-        }
-        for _ in 0..state.concurrency.task_queue.queued_count() {
-            counts.add(None, ActiveTaskBucket::Queued);
-        }
-    }
-
-    counts
+    Ok(counts)
 }
 
 fn add_active_runtime_workflow_with_registry(

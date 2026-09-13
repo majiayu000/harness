@@ -9,12 +9,10 @@ pub const PR_FEEDBACK_INSPECT_ACTIVITY: &str = "inspect_pr_feedback";
 pub const PR_FEEDBACK_SNAPSHOT_ARTIFACT: &str = "pr_feedback_snapshot";
 pub const PR_REPAIR_SNAPSHOT_ARTIFACT: &str = "pr_repair_snapshot";
 pub const SERVER_PR_SNAPSHOT_ARTIFACT: &str = "server_pr_snapshot";
-pub const PR_HYGIENE_CONVERGENCE_STOP_SOURCE: &str = "pr_hygiene_convergence";
 pub const LOCAL_REVIEW_ACTIVITY: &str = "run_local_review";
 pub const LOCAL_REVIEW_PASSED_SIGNAL: &str = "LocalReviewPassed";
 pub const LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL: &str = "LocalReviewChangesRequested";
 pub const LOCAL_REVIEW_BLOCKED_SIGNAL: &str = "LocalReviewBlocked";
-pub const MAX_FEEDBACK_REPAIR_ROUNDS: u64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedbackRepairLane {
@@ -76,33 +74,12 @@ fn normalize_pr_url(value: &str) -> &str {
     value.trim().trim_end_matches('/')
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FeedbackRepairStop {
-    RoundLimit { completed_rounds: u64 },
-    MissingBaseline { completed_rounds: u64 },
-}
-
-pub fn next_feedback_repair_round(
-    data: &Value,
-    _current_blockers: u64,
-    _lane: FeedbackRepairLane,
-) -> Result<u64, FeedbackRepairStop> {
-    let completed_rounds = data
-        .get("feedback_repair_round")
+/// Repair rounds are telemetry only — never a gate for addressing findings.
+pub fn next_feedback_repair_round(data: &Value) -> u64 {
+    data.get("feedback_repair_round")
         .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if completed_rounds >= MAX_FEEDBACK_REPAIR_ROUNDS {
-        return Err(FeedbackRepairStop::RoundLimit { completed_rounds });
-    }
-    let previous = data
-        .get("feedback_repair_blocker_count")
-        .and_then(Value::as_u64);
-    if completed_rounds > 0 && previous.is_none() {
-        return Err(FeedbackRepairStop::MissingBaseline { completed_rounds });
-    }
-    // Equal counts may describe different findings after a successful repair.
-    // The round limit bounds execution without assuming count monotonicity.
-    Ok(completed_rounds.saturating_add(1))
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -262,13 +262,17 @@ impl DefaultExecutionService {
             .map_err(|error| {
                 EnqueueTaskError::BadRequest(format!("invalid workflow configuration: {error}"))
             })?;
-            if instance.state == "pr_open"
+            if matches!(
+                instance.state.as_str(),
+                "pr_open" | "cancelled" | "ready_to_merge"
+            ) || (instance.state == "awaiting_feedback" && prepared.req.prompt.is_some())
                 || (instance.state == "awaiting_feedback"
                     && !workflow_config.config.pr_feedback.enabled)
             {
                 crate::workflow_runtime_pr_feedback::request_local_review_with_admission(
                     store,
                     &instance.id,
+                    prepared.req.prompt.as_deref(),
                     || async {
                         self.ensure_remote_subject_open(&prepared.req)
                             .await
@@ -303,6 +307,7 @@ impl DefaultExecutionService {
                     pr_number,
                     pr_url: None,
                 },
+                prepared.req.prompt.as_deref(),
                 || async {
                     self.ensure_remote_subject_open(&prepared.req)
                         .await

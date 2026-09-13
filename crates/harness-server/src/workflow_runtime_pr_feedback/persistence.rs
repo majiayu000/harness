@@ -217,28 +217,17 @@ pub(super) async fn persist_pr_hygiene_repair_request(
             "Comment asking whether the PR should be closed when dirty_age_secs is at least dirty_age_to_comment_secs and no recent activity explains the stale state."
         ],
     });
-    let next_round = match evaluate_hygiene_repair_convergence(
-        store,
-        &instance,
-        new_instance,
-        issue_number,
-        &ctx,
-    )
-    .await?
-    {
-        HygieneRepairConvergence::Continue { next_round } => next_round,
-        HygieneRepairConvergence::Stop(outcome) => return Ok(outcome),
-    };
+    let next_round = next_feedback_repair_round(&instance.data);
     let mut accepted_data = instance.data.clone();
     if let Some(object) = accepted_data.as_object_mut() {
         object.insert("hygiene_context".to_string(), hygiene_context.clone());
         object.insert("feedback_summary".to_string(), json!(summary));
         object.insert("feedback_repair_round".to_string(), json!(next_round));
-        object.insert("feedback_repair_blocker_count".to_string(), json!(1));
         object.insert(
             "feedback_repair_lane".to_string(),
             json!(FeedbackRepairLane::RemoteFeedback.as_str()),
         );
+        object.remove("feedback_repair_blocker_count");
     }
     let repair_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let output = build_pr_hygiene_repair_decision(
@@ -490,8 +479,8 @@ pub(super) async fn persist_pr_merged(
         "done",
         ctx.summary,
     )
-    .with_command(WorkflowCommand::new(
-        WorkflowCommandType::MarkDone,
+    .with_command(harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::MarkDone,
         format!("pr-merged:{}:{}", ctx.task_id.as_str(), ctx.pr_number),
         json!({
             "task_id": ctx.task_id.as_str(),
@@ -665,21 +654,23 @@ pub(super) async fn approve_runtime_merge(
 }
 
 fn trusted_merge_head_sha(instance: &WorkflowInstance) -> Option<String> {
-    ["pr_head_sha", "head_sha"].into_iter().find_map(|field| {
-        let provenance = instance
-            .data_provenance
-            .as_ref()?
-            .provenance_for(&format!("/{field}"));
-        if !matches!(
-            provenance,
-            Some(DataProvenance::Server | DataProvenance::External)
-        ) {
-            return None;
-        }
-        optional_string_field(&instance.data, field)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })
+    ["pr_head_sha", "head_sha", "merge_review_head_sha"]
+        .into_iter()
+        .find_map(|field| {
+            let provenance = instance
+                .data_provenance
+                .as_ref()?
+                .provenance_for(&format!("/{field}"));
+            if !matches!(
+                provenance,
+                Some(DataProvenance::Server | DataProvenance::External)
+            ) {
+                return None;
+            }
+            optional_string_field(&instance.data, field)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
 }
 
 pub(super) async fn commit_runtime_decision(
@@ -694,11 +685,14 @@ pub(super) async fn commit_runtime_decision(
 ) -> anyhow::Result<RuntimeDecisionCommitOutcome> {
     let expected_state = instance.state.clone();
     let validator = DecisionValidator::github_issue_pr();
-    let validation = validator.validate(
-        &instance,
-        &decision,
-        &ValidationContext::new("workflow-policy", chrono::Utc::now()),
-    );
+    let resubmission = instance.state == "cancelled" && event_type == "PrResubmitted";
+    let context = ValidationContext::new("workflow-policy", chrono::Utc::now());
+    let context = if resubmission {
+        context.allow_terminal_reopen()
+    } else {
+        context
+    };
+    let validation = validator.validate(&instance, &decision, &context);
     if let Err(error) = validation {
         let reason = error.to_string();
         let record = store
@@ -723,6 +717,32 @@ pub(super) async fn commit_runtime_decision(
     final_instance.version = final_instance.version.saturating_add(1);
     let data = merge_last_decision(accepted_data, &decision.decision);
     replace_pr_runtime_data(&mut final_instance, data)?;
+    if resubmission {
+        let committed = store
+            .commit_submission_decision_transition(
+                harness_workflow::runtime::WorkflowSubmissionDecisionTransition {
+                    workflow_id: &instance.id,
+                    expected_state: &expected_state,
+                    expected_version: instance.version,
+                    create_if_missing: None,
+                    event_id: None,
+                    new_event_id: None,
+                    event_type,
+                    source,
+                    payload: event_payload,
+                    decision: &decision,
+                    existing_record: None,
+                    rejection_reason: None,
+                    final_instance: Some(&final_instance),
+                    command_status: WorkflowCommandStatus::Pending,
+                    prompt_payload: None,
+                },
+            )
+            .await?;
+        return Ok(outcome_from_atomic_record(
+            committed.map(|commit| commit.record),
+        ));
+    }
     let create_if_missing = new_instance.then_some(&instance);
     let record = store
         .apply_decision_transition(

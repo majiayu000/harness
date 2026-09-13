@@ -33,17 +33,12 @@ impl Drop for RuntimeTurnAliasGuard {
     }
 }
 
-pub(super) fn force_code_agent_for_runtime_turn(
-    runtime_kind: RuntimeKind,
-    approval_policy: Option<&str>,
-) -> bool {
-    matches!(
-        runtime_kind,
-        RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc
-    ) && !matches!(
-        approval_policy,
-        Some("untrusted" | "on-failure" | "on-request")
-    )
+/// Authority A: `RuntimeKind` alone selects the execution surface.
+/// Approval policy configures the selected agent; it must not switch
+/// oneshot ↔ turn. Only `CodexExec` forces oneshot for the shared `"codex"`
+/// agent name (which also registers a turn factory for `CodexJsonrpc`).
+pub(super) fn force_oneshot_surface(runtime_kind: RuntimeKind) -> bool {
+    matches!(runtime_kind, RuntimeKind::CodexExec)
 }
 
 #[cfg(test)]
@@ -51,28 +46,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interactive_codex_approval_uses_turn_adapter() {
-        for policy in ["untrusted", "on-failure", "on-request"] {
-            assert!(!force_code_agent_for_runtime_turn(
-                RuntimeKind::CodexExec,
-                Some(policy)
-            ));
+    fn runtime_kind_selects_surface_independent_of_approval() {
+        for policy in [None, Some("never"), Some("on-request"), Some("untrusted")] {
+            assert!(
+                force_oneshot_surface(RuntimeKind::CodexExec),
+                "CodexExec stays oneshot for approval={policy:?}"
+            );
+            assert!(
+                !force_oneshot_surface(RuntimeKind::CodexJsonrpc),
+                "CodexJsonrpc stays turn for approval={policy:?}"
+            );
         }
-    }
-
-    #[test]
-    fn non_interactive_codex_keeps_exec_path() {
-        assert!(force_code_agent_for_runtime_turn(
-            RuntimeKind::CodexExec,
-            None
-        ));
-        assert!(force_code_agent_for_runtime_turn(
-            RuntimeKind::CodexJsonrpc,
-            Some("never")
-        ));
-        assert!(!force_code_agent_for_runtime_turn(
-            RuntimeKind::ClaudeCode,
-            Some("on-request")
-        ));
+        assert!(!force_oneshot_surface(RuntimeKind::ClaudeCode));
+        assert!(!force_oneshot_surface(RuntimeKind::OpenCode));
     }
 }

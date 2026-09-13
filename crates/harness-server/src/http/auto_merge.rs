@@ -135,7 +135,23 @@ fn snapshot_satisfies_policy(
     {
         return false;
     }
-    if !snapshot_string_eq(snapshot, "status_check_rollup_state", "SUCCESS")
+    // An explicitly empty GitHub rollup is different from missing/incomplete
+    // check data. Require current local approval and CLEAN even under a relaxed
+    // merge policy before admitting the no-check case.
+    let reviewed_without_checks = local_review_approved
+        && snapshot_string_eq(snapshot, "merge_state_status", "CLEAN")
+        && snapshot.get("statusCheckRollup") == Some(&Value::Null)
+        && snapshot.get("status_check_rollup_state") == Some(&Value::Null)
+        && snapshot
+            .get("status_check_contexts_complete")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && snapshot
+            .get("status_check_contexts")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+    if !(snapshot_string_eq(snapshot, "status_check_rollup_state", "SUCCESS")
+        || reviewed_without_checks)
         || (!local_review_approved && !snapshot_string_eq(snapshot, "review_decision", "APPROVED"))
         || snapshot.get("is_draft").and_then(Value::as_bool) != Some(false)
     {

@@ -147,16 +147,22 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     if let Some(error) = startup_failure_error(&startup_statuses) {
         return Err(error);
     }
-    let tasks = storage
-        .tasks
-        .as_ref()
-        .expect("critical task store should be present after startup validation")
-        .clone();
-    let postgres_catalog = crate::postgres_catalog::PostgresCatalogMonitor::new(
-        tasks.postgres_pool(),
-        crate::postgres_catalog::PostgresCatalogThresholds::from_server(&server.config.server),
-    )
-    .await;
+    let tasks = storage.tasks.clone();
+    let postgres_catalog = match tasks.as_ref() {
+        Some(tasks) => {
+            crate::postgres_catalog::PostgresCatalogMonitor::new(
+                tasks.postgres_pool(),
+                crate::postgres_catalog::PostgresCatalogThresholds::from_server(
+                    &server.config.server,
+                ),
+            )
+            .await
+        }
+        None => crate::postgres_catalog::PostgresCatalogMonitor::unavailable(
+            crate::postgres_catalog::PostgresCatalogThresholds::from_server(&server.config.server),
+            "task store unavailable",
+        ),
+    };
 
     // Phase 2: engines — rule engine, event store (+purge task), GC agent, skill store.
     // Depends on: storage (none directly, but must precede registry which uses storage.tasks).
@@ -167,8 +173,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     }
     // Phase 3: registry — thread DB, plan DB + cache, project registry, workspace manager,
     // runtime state store.
-    // Depends on: storage.tasks (orphan-worktree cleanup reads terminal task IDs).
-    let registry = builders::registry::build_registry(&server, &dir, &project_root, &tasks).await?;
+    // Depends on: storage.tasks (orphan-worktree cleanup reads terminal task IDs when present).
+    let registry =
+        builders::registry::build_registry(&server, &dir, &project_root, tasks.as_ref()).await?;
     startup_statuses.extend(registry.startup_results.clone());
     if let Some(error) = startup_failure_error(&startup_statuses) {
         return Err(error);
@@ -208,8 +215,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     //             registry.workspace_mgr + registry.project_registry (execution service),
     //             intake.task_queue + intake.completion_callback (execution service).
     let services =
-        builders::services::build_services(&server, &storage, &engines, &registry, &project_root)
-            .await?;
+        builders::services::build_services(&server, &storage, &registry, &project_root).await?;
 
     let configured_capacity = server.config.server.notification_broadcast_capacity;
     let notification_broadcast_capacity = configured_capacity.max(1);
@@ -285,7 +291,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             plan_cache: registry.plan_cache,
             issue_workflow_store: registry.issue_workflow_store,
             project_workflow_store: registry.project_workflow_store,
-            workflow_runtime_store: registry.workflow_runtime_store,
+            workflow_runtime_store: Some(registry.workflow_runtime_store.expect(
+                "critical workflow runtime store should be present after startup validation",
+            )),
             project_registry: Some(
                 registry
                     .project_registry
@@ -332,7 +340,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             initialized: Arc::new(AtomicBool::new(false)),
             ws_shutdown_tx: broadcast::channel(1).0,
         },
-        interceptors: services.interceptors,
         startup_statuses,
         degraded_subsystems,
         intake: {
@@ -675,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_app_state_aborts_on_pool_timeout_for_critical_task_store() {
+    async fn build_app_state_continues_when_optional_task_store_fails() {
         if resolve_database_url(None).is_err() {
             return;
         }
@@ -689,11 +696,34 @@ mod tests {
             build_app_state(server),
         )
         .await;
+        let state = match result {
+            Ok(state) => state,
+            Err(err) => panic!("optional task store failure must not abort startup: {err}"),
+        };
+        assert!(state.core.tasks.is_none());
+        assert!(state.degraded_subsystems.contains(&"tasks"));
+    }
+
+    #[tokio::test]
+    async fn build_app_state_aborts_on_critical_workflow_runtime_store_failure() {
+        if resolve_database_url(None).is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = make_test_server(dir.path());
+        let result = builders::with_forced_startup_failures(
+            &[(
+                "workflow_runtime_store",
+                "pool timed out while waiting for an open connection",
+            )],
+            build_app_state(server),
+        )
+        .await;
         let err = match result {
-            Ok(_) => panic!("critical task store failure must abort startup"),
+            Ok(_) => panic!("critical workflow runtime store failure must abort startup"),
             Err(err) => err,
         };
         assert!(crate::test_helpers::is_pool_timeout(&err));
-        assert!(err.to_string().contains("tasks"));
+        assert!(err.to_string().contains("workflow_runtime_store"));
     }
 }

@@ -192,6 +192,7 @@ impl TransitionAllowlist {
             .allow("blocked", "done", [MarkDone])
             .allow("cancelled", "scheduled", [EnqueueActivity, Wait])
             .allow("cancelled", "planning", [EnqueueActivity, Wait])
+            .allow("cancelled", "local_review_gate", [EnqueueActivity])
             .allow("cancelled", "implementing", [EnqueueActivity, Wait])
             .allow("scheduled", "planning", [EnqueueActivity, Wait])
             .allow(

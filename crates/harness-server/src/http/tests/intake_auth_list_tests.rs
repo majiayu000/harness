@@ -401,7 +401,13 @@ async fn intake_status_merges_runtime_dispatches_by_recency_before_limit() -> an
         task.source = Some("github".to_string());
         task.external_id = Some(format!("issue:{index}"));
         task.created_at = Some((old_created_at - chrono::Duration::minutes(index)).to_rfc3339());
-        state.core.tasks.insert(&task).await;
+        state
+            .core
+            .tasks
+            .as_ref()
+            .expect("tasks")
+            .insert(&task)
+            .await;
     }
     let store = state
         .core

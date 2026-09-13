@@ -12,7 +12,7 @@ pub(crate) struct StorageBundle {
 }
 
 fn failed_storage_startup_results(error: &str) -> Vec<StoreStartupResult> {
-    vec![StoreStartupResult::critical("tasks").failed(error)]
+    vec![StoreStartupResult::optional("tasks").failed(error)]
 }
 
 fn failed_storage_bundle(error: &str) -> StorageBundle {
@@ -76,7 +76,7 @@ pub(crate) async fn build_storage_with_database_url(
     let task_context = crate::task_db::TaskDb::shared_schema_context(Some(&database_url))?;
     super::ensure_startup_context_not_path_derived("tasks", &task_context)?;
     let (tasks, task_result) = match super::forced_startup_error("tasks") {
-        Some(error) => (None, StoreStartupResult::critical("tasks").failed(error)),
+        Some(error) => (None, StoreStartupResult::optional("tasks").failed(error)),
         None => match TaskStore::open_shared_with_data_dir(
             &db_path,
             &task_context,
@@ -86,10 +86,10 @@ pub(crate) async fn build_storage_with_database_url(
         )
         .await
         {
-            Ok(store) => (Some(store), StoreStartupResult::critical("tasks")),
+            Ok(store) => (Some(store), StoreStartupResult::optional("tasks")),
             Err(error) => (
                 None,
-                StoreStartupResult::critical("tasks").failed(error.to_string()),
+                StoreStartupResult::optional("tasks").failed(error.to_string()),
             ),
         },
     };
@@ -150,7 +150,7 @@ mod tests {
         let statuses = failed_storage_startup_results("database unavailable");
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].name, "tasks");
-        assert!(statuses[0].is_critical());
+        assert!(!statuses[0].is_critical());
         assert!(!statuses[0].ready);
     }
 

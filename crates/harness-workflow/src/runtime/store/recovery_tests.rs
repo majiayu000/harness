@@ -202,63 +202,22 @@ fn automatic_unblock_preserves_feedback_repair_budget() {
 }
 
 #[test]
-fn marked_hygiene_convergence_recovers_address_pr_feedback() {
-    let instance = WorkflowInstance::new(
-        "github_issue_pr",
-        1,
-        "blocked",
-        WorkflowSubject::new("pr", "pr:77"),
-    )
-    .with_server_data(serde_json::json!({
+fn address_pr_feedback_stop_still_has_recovery_target() {
+    let data = serde_json::json!({
         "repo": "owner/repo",
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
-        "feedback_summary": "Runtime PR hygiene found mergeability repair is needed for PR #77.",
-        "feedback_repair_round": 3,
-        "feedback_repair_blocker_count": 1,
-        "feedback_repair_lane": "remote_feedback",
         "last_stop": {
             "state": "blocked",
-            "activity": "address_pr_feedback",
-            "source": "pr_hygiene_convergence"
-        },
-        "hygiene_context": {
-            "source": "pr_hygiene",
-            "repo": "owner/repo",
-            "pr_number": 77,
-            "pr_url": "https://github.com/owner/repo/pull/77",
-            "merge_state_status": "DIRTY"
+            "activity": "address_pr_feedback"
         }
-    }));
+    });
 
-    let activity =
-        stopped_activity(&instance.data).expect("hygiene convergence activity should parse");
-    assert!(is_hygiene_convergence_stop(&instance.data)
-        .expect("hygiene convergence marker should validate"));
-    let target = recovery_dispatch_target(&instance.data, activity.as_deref())
-        .expect("hygiene recovery metadata should parse")
-        .expect("hygiene convergence should have a recovery target");
+    let target = recovery_dispatch_target(&data, Some("address_pr_feedback"))
+        .expect("address_pr_feedback recovery metadata should parse")
+        .expect("address_pr_feedback should have a recovery target");
     assert_eq!(target.state, "addressing_feedback");
     assert_eq!(target.activity.as_deref(), Some("address_pr_feedback"));
-
-    let command = recovery_dispatch_command(
-        &instance,
-        WorkflowRuntimeRecoveryAction::Unblock,
-        "operator resolved the convergence stop",
-        &RecoveryDispatchPlan {
-            target,
-            command_source: RecoveryDispatchCommandSource::HygieneRepair,
-        },
-        "event-one",
-    );
-    assert_eq!(command.activity_name(), Some("address_pr_feedback"));
-    assert_eq!(command.command["source"], "pr_hygiene");
-    assert_eq!(command.command["pr_number"], 77);
-    assert_eq!(
-        command.command["review_summary"],
-        "Runtime PR hygiene found mergeability repair is needed for PR #77."
-    );
-    assert_eq!(command.command["hygiene"], instance.data["hygiene_context"]);
 }
 
 #[test]

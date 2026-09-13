@@ -14,8 +14,10 @@ and environment requirements. Eight historical Issue cases reuse source metadata
 from `../benchmarks/harness-historical-replay.toml`; seven cases use actual PRs.
 All 15 began as **source-verified, not calibrated**. A subsequent
 [Loom real Cursor pilot](loom-pilot-20260910.md) reproduced and repaired one case
-and exercised automatic dependency handoff to independent review. No complete
-suite baseline has been executed or claimed. This catalog is evaluator-owned planning data, not a file accepted by
+and exercised automatic dependency handoff to independent review. The [full native development run](full-native-20260912.md) now includes all 15
+cases and has completed its native workflows and independent assessments.
+Missing acceptance evidence, assisted repairs, and CI failures are explicit;
+no calibrated suite baseline or strict autonomous pass rate is claimed. This catalog is evaluator-owned planning data, not a file accepted by
 `harness eval run --manifest`.
 
 The subsequent [Keepline hard-task pilot](keepline-pilot-20260910.md) ran four

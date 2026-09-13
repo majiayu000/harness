@@ -50,7 +50,7 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             home_dir: std::env::var("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| dir.to_path_buf()),
-            tasks,
+            tasks: Some(tasks),
             plan_db: Some(plan_db),
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
@@ -105,7 +105,6 @@ async fn make_test_state_with_plan_db(dir: &std::path::Path) -> anyhow::Result<A
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
-        interceptors: vec![],
         startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {

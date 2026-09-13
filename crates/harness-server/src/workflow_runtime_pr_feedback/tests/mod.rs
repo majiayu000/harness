@@ -510,7 +510,7 @@ async fn pr_hygiene_repair_requests_address_pr_feedback_with_context() -> anyhow
     };
     assert_eq!(instance.state, "addressing_feedback");
     assert_eq!(instance.data["feedback_repair_round"], 1);
-    assert_eq!(instance.data["feedback_repair_blocker_count"], 1);
+    assert!(instance.data.get("feedback_repair_blocker_count").is_none());
     assert_eq!(instance.data["feedback_repair_lane"], "remote_feedback");
     let commands = store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
@@ -626,6 +626,7 @@ async fn concurrent_mixed_case_pr_requests_share_one_canonical_workflow() -> any
                 pr_number: 78,
                 pr_url: Some("https://github.com/Owner/Repo/pull/78"),
             },
+            None,
             move || {
                 let barrier = first_barrier.clone();
                 async move {
@@ -643,6 +644,7 @@ async fn concurrent_mixed_case_pr_requests_share_one_canonical_workflow() -> any
                 pr_number: 78,
                 pr_url: Some("https://github.com/owner/repo/pull/78"),
             },
+            None,
             move || {
                 let barrier = second_barrier.clone();
                 async move {
@@ -819,3 +821,99 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
 
 mod restart_suppression;
 mod suppression;
+
+#[tokio::test]
+async fn pr_requirements_reopen_ready_review_atomically() -> anyhow::Result<()> {
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
+    let task_id = TaskId::from_str("requirements-review");
+    let ctx = || PrFeedbackSweepRuntimeContext {
+        project_root: dir.path(),
+        repo: Some("owner/requirements"),
+        task_id: &task_id,
+        pr_number: 17,
+        pr_url: None,
+    };
+    let id = pr_workflow_id(
+        &dir.path().to_string_lossy(),
+        Some("owner/requirements"),
+        17,
+    );
+    let outcome = request_pr_feedback_sweep_for_pr_with_admission(
+        &store,
+        ctx(),
+        Some("Retain the requested upgrade."),
+        || async { Ok(()) },
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested { .. }
+    ));
+    let first = store
+        .get_instance(&id)
+        .await?
+        .expect("persisted submission");
+    assert_eq!(
+        first.data["additional_prompt"],
+        "Retain the requested upgrade."
+    );
+    assert_eq!(
+        pr_runtime_field_provenance("additional_prompt"),
+        DataProvenance::External
+    );
+
+    // Exercise persistence admission with a ready state, without inventing an Agent verdict.
+    let ready_id = format!("{id}-ready");
+    let ready = pr_scoped_instance(
+        ready_id.clone(),
+        dir.path().to_string_lossy().into_owned(),
+        Some("owner/requirements".into()),
+        &task_id,
+        17,
+        None,
+        "ready_to_merge",
+    )
+    .with_server_data(json!({"pr_number":17,"task_id":task_id.as_str(),
+            "additional_prompt":"Original requirement", "merge_review_head_sha":"old-head"}));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &ready).await?;
+    let rejected = request_local_review_with_admission(
+        &store,
+        &ready_id,
+        Some("Updated requirement"),
+        || async { anyhow::bail!("remote admission denied") },
+    )
+    .await;
+    assert!(rejected.is_err());
+    let unchanged = store
+        .get_instance(&ready_id)
+        .await?
+        .expect("ready instance");
+    assert_eq!(unchanged.state, "ready_to_merge");
+    assert_eq!(unchanged.data["additional_prompt"], "Original requirement");
+    assert!(store.commands_for(&ready_id).await?.is_empty());
+    let outcome = request_local_review_with_admission(
+        &store,
+        &ready_id,
+        Some("Updated requirement"),
+        || async { Ok(()) },
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested { .. }
+    ));
+    let updated = store
+        .get_instance(&ready_id)
+        .await?
+        .expect("reopened review");
+    assert_eq!(updated.state, "local_review_gate");
+    assert_eq!(updated.data["additional_prompt"], "Updated requirement");
+    assert!(updated.data.get("merge_review_head_sha").is_none());
+    assert_eq!(store.commands_for(&ready_id).await?.len(), 1);
+    Ok(())
+}

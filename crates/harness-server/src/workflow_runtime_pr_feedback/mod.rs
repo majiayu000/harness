@@ -1,5 +1,7 @@
 use crate::workflow_runtime_submission::{canonical_github_repo_identity, TaskId};
 #[cfg(test)]
+pub(super) use harness_workflow::runtime::WorkflowCommand;
+#[cfg(test)]
 use harness_workflow::runtime::{
     build_local_review_completed_decision, build_pr_detected_decision, build_pr_feedback_decision,
     DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrierInput,
@@ -9,13 +11,12 @@ use harness_workflow::runtime::{
 use harness_workflow::runtime::{
     build_local_review_request_decision, build_pr_feedback_sweep_decision,
     build_pr_hygiene_repair_decision, next_feedback_repair_round, DataProvenance,
-    DecisionValidator, FeedbackRepairLane, FeedbackRepairStop, LocalReviewDecisionInput,
-    PrFeedbackSweepDecisionInput, PrHygieneRepairDecisionInput, RemoteFactSnapshot,
-    ValidationContext, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
+    DecisionValidator, FeedbackRepairLane, LocalReviewDecisionInput, PrFeedbackSweepDecisionInput,
+    PrHygieneRepairDecisionInput, RemoteFactSnapshot, ValidationContext, WorkflowCommandStatus,
     WorkflowDecision, WorkflowDecisionRecord, WorkflowDecisionTransition, WorkflowDefinition,
     WorkflowEvidence, WorkflowInstance, WorkflowRejectedDecisionTransition, WorkflowRuntimeStore,
     WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_HYGIENE_CONVERGENCE_STOP_SOURCE,
+    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::json;
 use std::path::Path;
@@ -23,7 +24,6 @@ use std::path::Path;
 const DEFAULT_PR_FEEDBACK_FAILED_CHILD_SUPPRESSION_SECS: u64 = 24 * 60 * 60;
 
 mod command_state;
-mod hygiene_convergence;
 mod persistence;
 pub(crate) mod pr_detection;
 #[cfg(test)]
@@ -32,7 +32,6 @@ mod submission_requests;
 mod targets;
 
 use command_state::*;
-use hygiene_convergence::*;
 use persistence::*;
 #[cfg(test)]
 use pr_lifecycle_persist::{
@@ -166,7 +165,9 @@ fn replace_pr_runtime_data(
 fn pr_runtime_field_provenance(field: &str) -> DataProvenance {
     match field {
         "feedback_summary" | "review_summary" | "summary" => DataProvenance::Agent,
-        "hygiene_context" | "pr_number" | "pr_url" => DataProvenance::External,
+        "additional_prompt" | "hygiene_context" | "pr_number" | "pr_url" => {
+            DataProvenance::External
+        }
         _ => DataProvenance::Server,
     }
 }
@@ -432,12 +433,13 @@ pub(crate) async fn request_pr_feedback_sweep_for_pr(
     store: &WorkflowRuntimeStore,
     ctx: PrFeedbackSweepRuntimeContext<'_>,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
-    request_pr_feedback_sweep_for_pr_with_admission(store, ctx, || async { Ok(()) }).await
+    request_pr_feedback_sweep_for_pr_with_admission(store, ctx, None, || async { Ok(()) }).await
 }
 
 pub(crate) async fn request_pr_feedback_sweep_for_pr_with_admission<F, Fut>(
     store: &WorkflowRuntimeStore,
     ctx: PrFeedbackSweepRuntimeContext<'_>,
+    additional_prompt: Option<&str>,
     admission: F,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome>
 where
@@ -461,7 +463,7 @@ where
     .await?;
 
     match instance.state.as_str() {
-        "pr_open" | "awaiting_feedback" => {}
+        "pr_open" | "awaiting_feedback" | "cancelled" | "ready_to_merge" => {}
         "local_review_gate" => {
             return Ok(PrFeedbackSweepRequestOutcome::ActiveCommandExists {
                 workflow_id: instance.id.clone(),
@@ -482,7 +484,7 @@ where
             task_id: runtime_task_id_from_instance(&instance),
         });
     }
-    persist_local_review_request(store, instance, new_instance, admission).await
+    persist_local_review_request(store, instance, new_instance, additional_prompt, admission).await
 }
 
 pub(crate) async fn request_pr_hygiene_repair(
@@ -536,7 +538,7 @@ pub(crate) async fn request_local_review(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
-    request_local_review_with_admission(store, workflow_id, || async { Ok(()) }).await
+    request_local_review_with_admission(store, workflow_id, None, || async { Ok(()) }).await
 }
 
 pub(crate) async fn request_merge_readiness_review(
@@ -549,12 +551,13 @@ pub(crate) async fn request_merge_readiness_review(
         json!(head_sha),
         DataProvenance::Server,
     )])?;
-    persist_local_review_request(store, instance, false, || async { Ok(()) }).await
+    persist_local_review_request(store, instance, false, None, || async { Ok(()) }).await
 }
 
 pub(crate) async fn request_local_review_with_admission<F, Fut>(
     store: &WorkflowRuntimeStore,
     workflow_id: &str,
+    additional_prompt: Option<&str>,
     admission: F,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome>
 where
@@ -565,7 +568,10 @@ where
         anyhow::bail!("workflow runtime instance `{workflow_id}` was not found");
     };
     if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
-        || !matches!(instance.state.as_str(), "pr_open" | "awaiting_feedback")
+        || !matches!(
+            instance.state.as_str(),
+            "pr_open" | "awaiting_feedback" | "cancelled" | "ready_to_merge"
+        )
     {
         return Ok(PrFeedbackSweepRequestOutcome::NotCandidate {
             workflow_id: instance.id,
@@ -579,7 +585,7 @@ where
             task_id,
         });
     }
-    persist_local_review_request(store, instance, false, admission).await
+    persist_local_review_request(store, instance, false, additional_prompt, admission).await
 }
 
 pub(crate) async fn request_pr_feedback_sweep(

@@ -421,3 +421,22 @@ fn missing_or_custom_workflow_keeps_prompt_named_failed_checks_blocking() {
         );
     }
 }
+
+#[test]
+fn remote_readiness_wait_does_not_hide_actionable_failures() {
+    let mut blockers = Vec::new();
+    collect_structured_blockers(
+        &json!({"pending_checks":2,"merge_state_status":"BLOCKED"}),
+        &mut blockers,
+        true,
+    );
+    assert!(blockers.is_empty());
+    collect_structured_blockers(
+        &json!({"failed_checks":1,"merge_state_status":"DIRTY","unresolved_review_threads":1}),
+        &mut blockers,
+        true,
+    );
+    assert!(blockers.contains(&"field:failed_checks".to_string()));
+    assert!(blockers.contains(&"field:merge_state_status_blocked".to_string()));
+    assert!(blockers.contains(&"field:unresolved_review_threads".to_string()));
+}

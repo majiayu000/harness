@@ -54,7 +54,7 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = Router::new()
         .route(
             "/api/workflows/runtime/submissions",
@@ -86,7 +86,10 @@ async fn list_tasks_includes_runtime_issue_submissions() -> anyhow::Result<()> {
         .as_str()
         .expect("runtime submission should return a task handle")
         .to_string();
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
 
     let list_response = app
         .clone()
@@ -1192,7 +1195,7 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = Router::new()
         .route(
             "/api/workflows/runtime/submissions",
@@ -1224,7 +1227,10 @@ async fn list_tasks_includes_runtime_prompt_submissions() -> anyhow::Result<()> 
         .as_str()
         .expect("runtime submission should return a task handle")
         .to_string();
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
 
     let list_response = app
         .oneshot(

@@ -586,3 +586,20 @@ fn eval_draft_activity_result_requests_evaluator_validation() {
     assert_eq!(result.signals[0].signal_type, "PrReadyToMerge");
     assert!(result.summary.contains("eval draft"));
 }
+
+#[test]
+fn absent_rollup_is_not_evidence_of_no_checks() -> anyhow::Result<()> {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+    let mut pr = ready_pr();
+    pr["statusCheckRollup"] = Value::Null;
+    assert_eq!(
+        normalize_github_pr_snapshot(&target, &pr)?["status_check_contexts_complete"],
+        true
+    );
+    pr.as_object_mut().unwrap().remove("statusCheckRollup");
+    assert_eq!(
+        normalize_github_pr_snapshot(&target, &pr)?["status_check_contexts_complete"],
+        false
+    );
+    Ok(())
+}

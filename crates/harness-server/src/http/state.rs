@@ -60,7 +60,7 @@ pub struct CoreServices {
     /// Home directory captured at startup to avoid TOCTOU when validating
     /// project roots against `$HOME` in concurrent requests.
     pub home_dir: std::path::PathBuf,
-    pub tasks: Arc<task_runner::TaskStore>,
+    pub tasks: Option<Arc<task_runner::TaskStore>>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
     /// In-memory plan cache hydrated from `plan_db` on startup.
     /// Write-through: every mutation must also persist via `plan_db`.
@@ -273,7 +273,6 @@ pub struct AppState {
         Arc<crate::runtime_circuit_breaker::RuntimeCircuitBreakerRegistry>,
     pub notifications: NotificationServices,
     pub intake: IntakeServices,
-    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     /// Structured startup outcomes for stores and optional subsystems.
     pub startup_statuses: Vec<StoreStartupResult>,
     /// Subsystem names that degraded to `None` at startup (optional stores only).

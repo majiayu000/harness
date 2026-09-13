@@ -411,8 +411,6 @@ async fn recovery_dispatch_plan_tx(
                 return Ok(Err(activity));
             }
             RecoveryDispatchCommandSource::Replay(command)
-        } else if is_hygiene_convergence_stop(&instance.data)? {
-            RecoveryDispatchCommandSource::HygieneRepair
         } else {
             return Ok(Err(activity));
         }
@@ -636,11 +634,6 @@ fn recovery_dispatch_command(
     });
     for field in RECOVERY_CONTEXT_FIELDS {
         copy_optional_data_field(&mut payload, &instance.data, field);
-    }
-    if plan.command_source == RecoveryDispatchCommandSource::HygieneRepair {
-        payload["source"] = json!("pr_hygiene");
-        payload["review_summary"] = instance.data["feedback_summary"].clone();
-        payload["hygiene"] = instance.data["hygiene_context"].clone();
     }
     WorkflowCommand::new(WorkflowCommandType::EnqueueActivity, dedupe_key, payload)
 }

@@ -118,6 +118,8 @@ async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result
         state
             .core
             .tasks
+            .as_ref()
+            .expect("tasks")
             .get_with_db_fallback(&task_runner::TaskId::from_str(task_id))
             .await?
             .is_none(),
@@ -354,6 +356,8 @@ pub(super) async fn assert_runtime_issue_submission(
         state
             .core
             .tasks
+            .as_ref()
+            .expect("tasks")
             .get_with_db_fallback(&task_id)
             .await?
             .is_none(),
@@ -464,6 +468,8 @@ pub(super) async fn assert_runtime_local_review_requested(
         state
             .core
             .tasks
+            .as_ref()
+            .expect("tasks")
             .get_with_db_fallback(&task_runner::TaskId::from_str(task_id))
             .await?
             .is_none(),
@@ -481,6 +487,8 @@ pub(super) async fn assert_runtime_prompt_submission(
         state
             .core
             .tasks
+            .as_ref()
+            .expect("tasks")
             .get_with_db_fallback(&task_runner::TaskId::from_str(task_id))
             .await?
             .is_none(),
