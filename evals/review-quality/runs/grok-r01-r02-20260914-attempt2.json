@@ -1,0 +1,126 @@
+{
+  "run_id": "grok-r01-r02-20260914-attempt2",
+  "previous_run": "grok-r01-r02-20260914.json",
+  "source_revision": "d1624586bb0f1ad519df1777c81ee97b0d8abd08",
+  "cli_version": "1.0.30 (04b7ffed98c6)",
+  "execution": "direct_grok_cli",
+  "configuration_change": {
+    "old_tools_argument": "",
+    "new_tools_argument": "read_file",
+    "new_disallowed_tools_argument": "read_file,search_tool,use_tool",
+    "other_flags_unchanged": [
+      "--no-subagents",
+      "--disable-web-search",
+      "--permission-mode plan",
+      "--max-turns 1"
+    ],
+    "candidate_prompt_change": false,
+    "timeout_seconds": 240,
+    "automatic_retries": 0
+  },
+  "diagnosis": {
+    "empty_string_parser_source": "https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/src/headless/cli.rs",
+    "filter_source": "https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-agent/src/builder.rs",
+    "upstream_source_revision": "37949780c144e37df692e3d669051a21fec24f20",
+    "version_caveat": "Upstream source explains the mechanism; it is not claimed to be the exact installed CLI commit. Persisted local tool_definitions.json independently confirms empty registered toolsets."
+  },
+  "attempts": [
+    {
+      "case_id": "probe",
+      "session_id": "15f5b52d-ea12-4032-9904-b810d7b3247c",
+      "exit_code": 0,
+      "elapsed_seconds": 18.24,
+      "source_input_sha256": "f8ccfa6a720d5529141a5ee48e5379b511bda8edaa2987057238f48e9ced92f2",
+      "registered_tool_count": 0,
+      "recorded_tool_section_present": false,
+      "phase_event_counts": {
+        "waiting_for_model": 1,
+        "streaming_reasoning": 20,
+        "streaming_text": 401
+      },
+      "usage": {
+        "inputTokens": 11931,
+        "outputTokens": 1032,
+        "cachedReadTokens": 1152,
+        "cacheCreationTokens": 0,
+        "reasoningTokens": 631,
+        "totalTokens": 12963,
+        "modelCalls": 1,
+        "costUsdTicks": 96308400,
+        "turnCount": 1,
+        "primaryModelId": "grok-4.6-build",
+        "modelUsage": {
+          "grok-4.6-build": {
+            "inputTokens": 11931,
+            "outputTokens": 1032,
+            "cachedReadTokens": 1152,
+            "cacheCreationTokens": 0,
+            "reasoningTokens": 631,
+            "totalTokens": 12963,
+            "modelCalls": 1,
+            "costUsdTicks": 96308400
+          }
+        }
+      },
+      "semantic_verdict": "not_a_review_case",
+      "completion": "completed",
+      "repeated_phrase_count": 0,
+      "assistant_excerpt": "Callable tools in this session:\n\n`bash`, `create_file`, `edit`, `grep`, `list_dir`, `read_file`, `search_replace`, `glob`, `todo`, `image_gen`, `image_edit`, `search_web`, `browse_page`, `browser_navigate`, `browser_click`, `browser_type`, `browser_fill`, `browser_select`, `browser_screenshot`, `browser_scroll`, `browser_hover`, `browser_press`, `browser_wai",
+      "evidence_directory": "/tmp/harness-grok-pair-v2-ete6ea1j/probe"
+    },
+    {
+      "case_id": "R01",
+      "session_id": "a1d49b8d-3916-4216-9179-dcddf01080bf",
+      "exit_code": 124,
+      "elapsed_seconds": 240.02,
+      "source_input_sha256": "85e332dac9c0b73d27e3da55e78e9245b0f2bcd210ee326ca49dc278234943c2",
+      "registered_tool_count": 0,
+      "recorded_tool_section_present": false,
+      "phase_event_counts": {
+        "waiting_for_model": 1,
+        "streaming_reasoning": 66,
+        "streaming_text": 14292
+      },
+      "usage": null,
+      "semantic_verdict": "not_evaluable",
+      "completion": "timeout",
+      "repeated_phrase_count": 127,
+      "assistant_excerpt": "I'll review the supplied workflow resolution against the `workflow.file` vs inherited-definition restriction, starting with the cited code and how merge order applies in this scenario. I won't change files or open issues. I'll start by reading the cited sources and the tests around configuration precedence. < 70% of the way through. 70% of the way through. 7",
+      "evidence_directory": "/tmp/harness-grok-pair-v2-ete6ea1j/R01"
+    },
+    {
+      "case_id": "R02",
+      "session_id": "c64c322c-af09-48c0-ba33-dc0cf4af8fdc",
+      "exit_code": 124,
+      "elapsed_seconds": 240.03,
+      "source_input_sha256": "dcf6f8f81794cd0108462d89924db43b58b8cff6714c26faa73baf39519cff6a",
+      "registered_tool_count": 0,
+      "recorded_tool_section_present": false,
+      "phase_event_counts": {
+        "waiting_for_model": 1,
+        "streaming_reasoning": 33,
+        "streaming_text": 19810
+      },
+      "usage": null,
+      "semantic_verdict": "not_evaluable",
+      "completion": "timeout",
+      "repeated_phrase_count": 0,
+      "assistant_excerpt": "",
+      "evidence_directory": "/tmp/harness-grok-pair-v2-ete6ea1j/R02"
+    }
+  ],
+  "summary": {
+    "review_attempts": 2,
+    "preflight_attempts": 1,
+    "completed_reviews": 0,
+    "semantically_evaluable_reviews": 0,
+    "timed_out_reviews": 2,
+    "known_preflight_tokens": 12963,
+    "review_tokens": null,
+    "total_tokens": null,
+    "precision": null,
+    "recall": null,
+    "completion_rate_this_attempt": 0.0
+  },
+  "assessment": "No tools were registered. R01 produced repeated progress text instead of a review; R02 yielded no exported assistant review. Both were stopped at the timeout. This is observed completion failure under this CLI/configuration, not evidence about review precision or a proven underlying model-only defect. Missing usage is unknown, not zero. No production prompt or rule was changed."
+}

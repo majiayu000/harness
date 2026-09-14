@@ -28,9 +28,18 @@ The [first Grok R01/R02 run](runs/grok-r01-r02-20260914.json) attempted both
 cases once. Neither produced a final review: both reached the one-turn limit
 after recording tool activity despite the requested empty tool allowlist.
 The run has zero semantically evaluable cases, not two failed review judgments.
-It consumed 55,203 CLI-reported tokens across two model calls. No rerun occurred.
-Before another attempt, establish the no-tool execution boundary independently;
-retain these incomplete attempts rather than replacing them with later results.
+It consumed 55,203 CLI-reported tokens across two model calls. No automatic
+rerun occurred; these incomplete attempts remain recorded.
+
+The [authorized second attempt](runs/grok-r01-r02-20260914-attempt2.json)
+corrected the CLI tool selection without changing candidate inputs. A separate
+preflight and both case sessions persisted empty tool definitions. Nevertheless,
+both reviews timed out at 240 seconds. R01's exported assistant text repeated
+the same progress phrase 127 times; R02 exported no assistant review. Completion
+was 0/2 for this attempt; review precision and recall remain unmeasurable.
+Preflight usage was 12,963 tokens; usage for both interrupted reviews is unknown.
+The tool boundary is now evidenced, but this direct CLI setup has not established
+reliable review completion. No production rule change follows from these results.
 
 ## Offline preparation
 
