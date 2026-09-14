@@ -209,23 +209,27 @@ fn blocker_count_from_local_review_does_not_block_remote_feedback_repair() {
 }
 
 #[test]
-fn propagated_child_block_records_the_parent_recovery_command() {
-    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
-        "pr_number": 77,
-        "pr_url": "https://github.com/owner/repo/pull/77",
-        "task_id": "runtime-task-1",
-        "feedback_repair_round": 1,
-        "feedback_repair_blocker_count": 1,
-        "feedback_repair_lane": "remote_feedback",
-    }));
-    let mut event = event_for_result(blocking_feedback_result(1));
+fn parent_block_from_child_result_records_the_parent_recovery_command() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    // Exercise recovery identity when the parent rejects a child result;
+    // unchanged feedback counts alone no longer imply a blocked workflow.
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Inspection claims readiness without the required snapshot.",
+    )
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let mut event = event_for_result(result);
     event.event["recovery_activity"] = json!("start_child_workflow");
     event.event["recovery_runtime_job_id"] = json!("parent-start-child-job");
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("non-converging child feedback should stop the parent");
+        .expect("missing readiness evidence should stop the parent");
 
+    assert_eq!(decision.decision, "block_invalid_agent_output");
     assert_eq!(decision.next_state, "blocked");
     assert_eq!(
         decision.commands[0].command["last_stop"]["activity"],
@@ -235,6 +239,26 @@ fn propagated_child_block_records_the_parent_recovery_command() {
         decision.commands[0].command["last_stop"]["runtime_job_id"],
         "parent-start-child-job"
     );
+}
+
+#[test]
+fn propagated_actionable_feedback_with_recovery_identity_still_repairs() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let mut event = event_for_result(blocking_feedback_result(1));
+    event.event["recovery_activity"] = json!("start_child_workflow");
+    event.event["recovery_runtime_job_id"] = json!("parent-start-child-job");
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("actionable feedback should request repair");
+    assert_eq!(decision.next_state, "addressing_feedback");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
+    assert!(decision
+        .commands
+        .iter()
+        .all(|command| command.command_type != WorkflowCommandType::MarkBlocked));
 }
 
 #[test]
