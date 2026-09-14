@@ -1,0 +1,220 @@
+{
+  "suite": "review-quality-v1",
+  "source_revision": "d1624586bb0f1ad519df1777c81ee97b0d8abd08",
+  "kind": "evaluator_owned_catalog_not_runtime_benchmark",
+  "hypothesis": "A useful reviewer distinguishes an evidenced requirement violation from a design preference or missing requirement, and adjudicates external advice independently.",
+  "baseline_status": "prior Grok trial is exploratory, not comparable: incomplete requirements and different input",
+  "held_out_cases": 0,
+  "default_model_calls": 0,
+  "cases": [
+    {
+      "id": "R01",
+      "pair": "definition-precedence",
+      "split": "development",
+      "requirements": "A workflow.file selection must reject any simultaneously effective inline definition, including one inherited from the central base. Treat this as an explicit deployment restriction. Optional redesign suggestions may be reported separately.",
+      "scenario": "Central base has a valid definition named base_flow. Project sets only workflow.file: ../review.md; the selected file defines shared_review. The project has no inline definition.",
+      "review_scope": "The selected file exists and is valid. Limit the review to the described configuration precedence. Other fields and operational behavior are outside this case.",
+      "external_comment": null,
+      "sources": [
+        {
+          "path": "crates/harness-core/src/config/workflow/shared.rs",
+          "start": 1,
+          "end": 94
+        },
+        {
+          "path": "crates/harness-core/src/config/workflow.rs",
+          "start": 597,
+          "end": 737
+        }
+      ],
+      "oracle": {
+        "expected_findings": [],
+        "false_positive_examples": [
+          "Claiming inherited-definition rejection violates the stated requirement."
+        ],
+        "evidence": [
+          "shared.rs rejects merged value.definition; deep_merge_yaml preserves the base definition when the project omits it."
+        ],
+        "status": "source_traced_not_runtime_reproduced"
+      },
+      "result": null
+    },
+    {
+      "id": "R02",
+      "pair": "definition-precedence",
+      "split": "development",
+      "requirements": "A project must be able to select a workflow file while retaining a central base with its default definition. Selection replaces the inherited definition. An explicit project-inline definition together with workflow.file must still error. This requirement supersedes earlier documentation.",
+      "scenario": "Same valid central and project files as R01: base_flow in central base, shared_review in ../review.md, project sets only workflow.file.",
+      "review_scope": "The selected file exists and is valid. Limit the review to the described configuration precedence. Other fields and operational behavior are outside this case.",
+      "external_comment": null,
+      "sources": [
+        {
+          "path": "crates/harness-core/src/config/workflow/shared.rs",
+          "start": 1,
+          "end": 94
+        },
+        {
+          "path": "crates/harness-core/src/config/workflow.rs",
+          "start": 597,
+          "end": 737
+        }
+      ],
+      "oracle": {
+        "expected_findings": [
+          {
+            "id": "inherited-definition-rejected",
+            "claim": "Merged inherited definition causes an error even though project selection must replace it.",
+            "trigger": "Central definition present; project has workflow.file and no inline definition.",
+            "actual": "resolve returns the inline-definition combination error.",
+            "expected": "Load shared_review successfully."
+          }
+        ],
+        "false_positive_examples": [
+          "Declaring the behavior correct solely because old documentation or tests permit it."
+        ],
+        "evidence": [
+          "shared.rs examines value rather than project_policy for definition conflict."
+        ],
+        "status": "source_traced_not_runtime_reproduced"
+      },
+      "result": null
+    },
+    {
+      "id": "R03",
+      "pair": "validation-precedence",
+      "split": "development",
+      "requirements": "Validation command precedence is explicit project override, then central deployment override, then selected-file default. Central validation is an intentional project default. Activity prompts still come from the selected file.",
+      "scenario": "Central base: activities.inspect.validation: [central-check]. Selected file: activities.inspect.validation: [flow-check]. Project selects that file and omits activities. No inline definition in the base.",
+      "review_scope": "The selected file exists and is valid. Limit the review to the described configuration precedence. Other fields and operational behavior are outside this case.",
+      "external_comment": null,
+      "sources": [
+        {
+          "path": "crates/harness-core/src/config/workflow/shared.rs",
+          "start": 1,
+          "end": 94
+        },
+        {
+          "path": "crates/harness-core/src/config/workflow.rs",
+          "start": 597,
+          "end": 737
+        }
+      ],
+      "oracle": {
+        "expected_findings": [],
+        "false_positive_examples": [
+          "Calling central-check overriding flow-check a blocking defect under this requirement."
+        ],
+        "evidence": [
+          "Merged value retains central validation; shared.rs overlays it onto shared.activities."
+        ],
+        "status": "source_traced_not_runtime_reproduced"
+      },
+      "result": null
+    },
+    {
+      "id": "R04",
+      "pair": "validation-precedence",
+      "split": "development",
+      "requirements": "A selected workflow supplies default validation. Only validation explicitly present in the project file may override it; unrelated central-base activity defaults must not override a selected workflow. This requirement supersedes earlier documentation.",
+      "scenario": "Same configuration as R03: central-check in the base, flow-check in the selected file, no project validation.",
+      "review_scope": "The selected file exists and is valid. Limit the review to the described configuration precedence. Other fields and operational behavior are outside this case.",
+      "external_comment": null,
+      "sources": [
+        {
+          "path": "crates/harness-core/src/config/workflow/shared.rs",
+          "start": 1,
+          "end": 94
+        },
+        {
+          "path": "crates/harness-core/src/config/workflow.rs",
+          "start": 597,
+          "end": 737
+        }
+      ],
+      "oracle": {
+        "expected_findings": [
+          {
+            "id": "inherited-validation-overwrites-flow",
+            "claim": "Merged central validation overwrites selected-file validation even without an explicit project override.",
+            "trigger": "Matching activity validation in central base, project omits validation.",
+            "actual": "Effective validation is central-check.",
+            "expected": "Effective validation remains flow-check."
+          }
+        ],
+        "false_positive_examples": [
+          "Calling the old documented precedence authoritative despite the explicit task requirement."
+        ],
+        "evidence": [
+          "shared.rs takes validation from merged value; project_policy is only inspected for activity names and prompt/agent_contract overrides."
+        ],
+        "status": "source_traced_not_runtime_reproduced"
+      },
+      "result": null
+    },
+    {
+      "id": "R05",
+      "pair": null,
+      "split": "development",
+      "requirements": "Projects can reuse a workflow and configure project-specific validation. The stakeholder has not specified central-base versus selected-file precedence. Identify what can be established and what requires a decision.",
+      "scenario": "Central base contains a definition and matching activity validation. Project selects another valid workflow file. No precedence documentation or decision has been provided.",
+      "review_scope": "The selected file exists and is valid. Limit the review to the described configuration precedence. Other fields and operational behavior are outside this case.",
+      "external_comment": null,
+      "sources": [
+        {
+          "path": "crates/harness-core/src/config/workflow/shared.rs",
+          "start": 1,
+          "end": 94
+        },
+        {
+          "path": "crates/harness-core/src/config/workflow.rs",
+          "start": 597,
+          "end": 737
+        }
+      ],
+      "oracle": {
+        "expected_findings": [],
+        "false_positive_examples": [
+          "Asserting that either disputed precedence is definitely a requirement violation without identifying the missing requirement."
+        ],
+        "evidence": [
+          "Current branches establish observable behavior, but cannot establish the unspecified desired precedence."
+        ],
+        "status": "source_traced_not_runtime_reproduced"
+      },
+      "result": null
+    },
+    {
+      "id": "R06",
+      "pair": null,
+      "split": "development",
+      "requirements": "Actionable feedback can request repair even when the unresolved count is unchanged. Count equality alone is not evidence that repair is impossible. Assess the external recommendation independently. Do not modify code.",
+      "scenario": "Parent is awaiting_feedback with feedback_repair_round=1 and feedback_repair_blocker_count=2. The successful inspection reports FeedbackFound and actionable_blocker_count=2.",
+      "review_scope": "Review only the supplied feedback-to-repair transition and the external recommendation.",
+      "external_comment": "External reviewer: the count did not decrease. Reinstate a hard stop whenever two consecutive feedback counts match; this is a merge blocker.",
+      "sources": [
+        {
+          "path": "crates/harness-workflow/src/runtime/reducer/builtin_pr_feedback.rs",
+          "start": 1,
+          "end": 64
+        },
+        {
+          "path": "crates/harness-workflow/src/runtime/tests/pr_repair_evidence.rs",
+          "start": 130,
+          "end": 190
+        }
+      ],
+      "oracle": {
+        "expected_findings": [],
+        "false_positive_examples": [
+          "Accepting the external recommendation as a mandatory repair without supporting requirements.",
+          "Claiming this case proves unlimited production execution is safe."
+        ],
+        "evidence": [
+          "pr_feedback_sweep_decision_from_activity_result builds a feedback decision without a count-based block; the existing regression test requires addressing_feedback."
+        ],
+        "status": "source_traced_not_runtime_reproduced"
+      },
+      "result": null
+    }
+  ]
+}
