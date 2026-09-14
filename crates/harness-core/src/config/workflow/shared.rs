@@ -35,6 +35,13 @@ pub(super) fn resolve(
     if value.get("definition").is_some_and(|v| !v.is_null()) {
         anyhow::bail!("workflow.file cannot be combined with an inline definition");
     }
+    let overrides: BTreeMap<String, WorkflowActivityPolicy> = value
+        .get("activities")
+        .cloned()
+        .map(serde_yaml::from_value)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid selected workflow activity overrides: {error}"))?
+        .unwrap_or_default();
     if let Some(activities) = project_policy
         .get("activities")
         .and_then(serde_yaml::Value::as_mapping)
@@ -56,20 +63,12 @@ pub(super) fn resolve(
     // Selecting a workflow replaces inherited activity policy. Only validation
     // commands are project parameters; prompts and agent contracts belong to
     // the selected workflow.
-    if let Some(activities) = value
-        .get("activities")
-        .and_then(serde_yaml::Value::as_mapping)
-    {
-        for (name, policy) in activities {
-            let Some(activity) = name
-                .as_str()
-                .and_then(|name| shared.activities.get_mut(name))
-            else {
-                continue;
-            };
-            if let Some(validation) = policy.get("validation") {
-                activity.validation = serde_yaml::from_value(validation.clone())?;
-            }
+    for (name, policy) in overrides {
+        let Some(activity) = shared.activities.get_mut(&name) else {
+            continue;
+        };
+        if value["activities"][&name].get("validation").is_some() {
+            activity.validation = policy.validation;
         }
     }
     value["definition"] = serde_yaml::to_value(&shared.definition)?;
@@ -148,6 +147,26 @@ mod tests {
                 .as_deref(),
             Some("other_review")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_workflow_rejects_malformed_activity_overrides() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("flow.md"), FLOW)?;
+        for activities in [
+            "[inspect]",
+            "{inspect: false}",
+            "{inspect: {validation: false}}",
+        ] {
+            std::fs::write(
+                root.path().join("WORKFLOW.md"),
+                format!("---\nworkflow: {{file: flow.md}}\nactivities: {activities}\n---\n"),
+            )?;
+            let error = load_workflow_document_with_base(root.path(), None)
+                .expect_err("malformed project activities must not disappear during selection");
+            assert!(error.to_string().contains("activity overrides"), "{error}");
+        }
         Ok(())
     }
 
