@@ -19,10 +19,18 @@ requirements for Harness. Passing their review cases does not authorize changing
 production precedence. R01/R03 check false positives, R02/R04 check misses,
 R05 checks uncertainty, and R06 checks external-review deference.
 
-The oracle is source-traced, not newly runtime-reproduced. There are no model
-results yet. These six cases are development cases; no unseen held-out result
+The oracle is source-traced, not newly runtime-reproduced. These six cases are
+development cases; no unseen held-out result
 or general model-quality claim is available. Reserve a separate future case set
 before tuning and evaluating any proposed prompt change.
+
+The [first Grok R01/R02 run](runs/grok-r01-r02-20260914.json) attempted both
+cases once. Neither produced a final review: both reached the one-turn limit
+after recording tool activity despite the requested empty tool allowlist.
+The run has zero semantically evaluable cases, not two failed review judgments.
+It consumed 55,203 CLI-reported tokens across two model calls. No rerun occurred.
+Before another attempt, establish the no-tool execution boundary independently;
+retain these incomplete attempts rather than replacing them with later results.
 
 ## Offline preparation
 
