@@ -41,6 +41,20 @@ Preflight usage was 12,963 tokens; usage for both interrupted reviews is unknown
 The tool boundary is now evidenced, but this direct CLI setup has not established
 reliable review completion. No production rule change follows from these results.
 
+## Configuration reproduction (2026-09-15)
+
+The current implementation now has a deterministic loader regression,
+`selected_workflow_preserves_explicit_central_precedence`, covering the actual
+production contract behind R01 and R03. It verifies rejection of an inherited
+inline definition, central validation overriding shared defaults, explicit
+project validation overriding central commands, and retention of shared
+prompts. All 81 workflow configuration tests passed after baseline integration.
+This corroborates the production behavior; it does not execute the frozen
+counterfactual cases or measure model review quality. R02 and R04 remain
+counterfactual requirements. Independent source review approved the documented
+precedence, and the corresponding external review threads on PR #2058 were
+answered and resolved with this rationale.
+
 ## Offline preparation
 
 From the repository root:
