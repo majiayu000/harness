@@ -188,7 +188,20 @@ impl HarnessServer {
                     project_root.display()
                 )
             })?;
-            definitions.push(definition);
+            if let Some(existing) = definitions.iter().find(
+                |existing: &&harness_workflow::runtime::DeclarativeWorkflowDefinition| {
+                    existing.policy().id == definition.policy().id
+                },
+            ) {
+                if existing.definition_hash() != definition.definition_hash() {
+                    anyhow::bail!(
+                        "workflow '{}' has conflicting definitions across projects",
+                        definition.policy().id
+                    );
+                }
+            } else {
+                definitions.push(definition);
+            }
         }
         Ok(definitions)
     }
@@ -315,6 +328,70 @@ Review documentation.
         registry.register_declarative_current_batch(definitions)?;
         registry.freeze();
         assert!(registry.is_frozen());
+        Ok(())
+    }
+    #[test]
+    fn shared_workflow_registers_once_and_resolves_each_project() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let flow = include_str!("../../../config/workflows/review.md");
+        std::fs::write(root.path().join("review.md"), flow)?;
+        std::fs::write(
+            root.path().join("other.md"),
+            flow.replace("repository_review", "other_review"),
+        )?;
+        let mut config = HarnessConfig::default();
+        config.server.project_root = root.path().join("rust");
+        let mut server =
+            HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("test"));
+        for (name, file, validation) in [
+            ("rust", "review.md", "cargo check"),
+            ("web", "review.md", "bun test"),
+            ("other", "other.md", "npm test"),
+        ] {
+            let project = root.path().join(name);
+            std::fs::create_dir(&project)?;
+            std::fs::write(project.join("WORKFLOW.md"), format!("---\nworkflow: {{file: ../{file}}}\nactivities:\n  inspect_repository:\n    validation: [{validation}]\n---\n"))?;
+            server.startup_projects.push(ProjectEntry {
+                name: name.into(),
+                root: project,
+                default: false,
+                default_agent: None,
+                max_concurrent: None,
+            });
+        }
+        let definitions = server.load_declarative_workflow_definitions()?;
+        assert_eq!(definitions.len(), 2);
+        let mut registry = harness_workflow::runtime::WorkflowDefinitionRegistry::new();
+        registry.register_declarative_current_batch(definitions)?;
+        registry.freeze();
+        for (name, id) in [
+            ("rust", "repository_review"),
+            ("web", "repository_review"),
+            ("other", "other_review"),
+        ] {
+            crate::workflow_runtime_submission::resolve_declarative_definition_for_project(
+                &registry,
+                &root.path().join(name),
+                id,
+            )?;
+        }
+        assert!(
+            crate::workflow_runtime_submission::resolve_declarative_definition_for_project(
+                &registry,
+                &root.path().join("rust"),
+                "other_review"
+            )
+            .is_err()
+        );
+        std::fs::write(
+            root.path().join("other.md"),
+            flow.replace("reviewing", "inspecting"),
+        )?;
+        assert!(server
+            .load_declarative_workflow_definitions()
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting definitions"));
         Ok(())
     }
 }

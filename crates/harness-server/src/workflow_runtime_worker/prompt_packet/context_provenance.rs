@@ -292,6 +292,17 @@ fn workflow_source_entry(
     let content_digest = Sha256Digest::parse(&source.content_sha256)
         .context("workflow source observation carried an invalid content digest")?;
     let (stack_source, reason) = match source.role {
+        WorkflowSourceRole::SelectedWorkflow => {
+            let path_digest =
+                Sha256Digest::from_bytes(source.path.display().to_string().as_bytes());
+            (
+                AgentStackSource::new(
+                    AgentStackSourceScope::Runtime,
+                    &format!("workflow_source/selected/{}", path_digest.as_str()),
+                )?,
+                "workflow_file_selected",
+            )
+        }
         WorkflowSourceRole::CentralBase => {
             let path_digest =
                 Sha256Digest::from_bytes(source.path.display().to_string().as_bytes());

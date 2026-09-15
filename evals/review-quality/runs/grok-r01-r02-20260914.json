@@ -1,0 +1,119 @@
+{
+  "run_id": "grok-r01-r02-20260914",
+  "suite_revision": "c9f03f06",
+  "source_revision": "d1624586bb0f1ad519df1777c81ee97b0d8abd08",
+  "cli_version": "1.0.30 (04b7ffed98c6)",
+  "execution": "direct_grok_cli",
+  "model": "grok-4.6-build",
+  "attempts_per_case": 1,
+  "max_turns_per_case": 1,
+  "automatic_retries": 0,
+  "concurrency": 1,
+  "requested_tools": "empty allowlist via --tools empty string",
+  "requested_subagents": false,
+  "cases": [
+    {
+      "case_id": "R01",
+      "session_id": "69247cbc-0f02-44fe-bd2f-6840bb128f75",
+      "prompt_sha256": "85e332dac9c0b73d27e3da55e78e9245b0f2bcd210ee326ca49dc278234943c2",
+      "prompt_bytes": 11477,
+      "elapsed_seconds": 27.71,
+      "exit_code": 1,
+      "stop_reason": "cancelled",
+      "final_review_present": false,
+      "execution_status": "incomplete_tool_constraint_not_established",
+      "semantic_verdict": "not_evaluable",
+      "assistant_text": "I'll review the supplied workflow resolution against the `workflow.file` vs inline-definition restriction, starting with the review skill and the cited sources.",
+      "recorded_tool_entries": [
+        "Read: /Users/apple/.grok/bundled/skills/review/SKILL.md",
+        "Read: /Users/apple/.agents/skills/iterative-retrieval/SKILL.md",
+        "ListDir: /private/tmp/harness-review-pair-v8je6sz_/R01"
+      ],
+      "usage": {
+        "inputTokens": 27252,
+        "outputTokens": 319,
+        "cachedReadTokens": 1280,
+        "cacheCreationTokens": 0,
+        "reasoningTokens": 198,
+        "totalTokens": 27571,
+        "modelCalls": 1,
+        "costUsdTicks": 185293200,
+        "turnCount": 1,
+        "primaryModelId": "grok-4.6-build",
+        "modelUsage": {
+          "grok-4.6-build": {
+            "inputTokens": 27252,
+            "outputTokens": 319,
+            "cachedReadTokens": 1280,
+            "cacheCreationTokens": 0,
+            "reasoningTokens": 198,
+            "totalTokens": 27571,
+            "modelCalls": 1,
+            "costUsdTicks": 185293200
+          }
+        }
+      },
+      "reported_cost_usd": 0.01852932,
+      "evidence_dir": "/tmp/harness-review-pair-v8je6sz_/R01"
+    },
+    {
+      "case_id": "R02",
+      "session_id": "0d83726f-dee4-4310-94cd-59c95757008e",
+      "prompt_sha256": "dcf6f8f81794cd0108462d89924db43b58b8cff6714c26faa73baf39519cff6a",
+      "prompt_bytes": 11482,
+      "elapsed_seconds": 35.78,
+      "exit_code": 1,
+      "stop_reason": "cancelled",
+      "final_review_present": false,
+      "execution_status": "incomplete_tool_constraint_not_established",
+      "semantic_verdict": "not_evaluable",
+      "assistant_text": "I'll review configuration precedence against the stated requirements only: selected file replaces the inherited definition, central base is retained, and inline definition plus `workflow.file` still errors. I'll read the supplied sources and surrounding load path first.",
+      "recorded_tool_entries": [
+        "Read: /Users/apple/.grok/bundled/skills/review/SKILL.md",
+        "ListDir: /private/tmp/harness-review-pair-v8je6sz_/R02",
+        "Search: workflow\\.file",
+        "Read: /Users/apple/.agents/skills/eval/SKILL.md"
+      ],
+      "usage": {
+        "inputTokens": 27258,
+        "outputTokens": 374,
+        "cachedReadTokens": 5504,
+        "cacheCreationTokens": 0,
+        "reasoningTokens": 212,
+        "totalTokens": 27632,
+        "modelCalls": 1,
+        "costUsdTicks": 164913600,
+        "turnCount": 1,
+        "primaryModelId": "grok-4.6-build",
+        "modelUsage": {
+          "grok-4.6-build": {
+            "inputTokens": 27258,
+            "outputTokens": 374,
+            "cachedReadTokens": 5504,
+            "cacheCreationTokens": 0,
+            "reasoningTokens": 212,
+            "totalTokens": 27632,
+            "modelCalls": 1,
+            "costUsdTicks": 164913600
+          }
+        }
+      },
+      "reported_cost_usd": 0.01649136,
+      "evidence_dir": "/tmp/harness-review-pair-v8je6sz_/R02"
+    }
+  ],
+  "summary": {
+    "scheduled": 2,
+    "executed": 2,
+    "completed_reviews": 0,
+    "semantically_evaluable": 0,
+    "incomplete": 2,
+    "model_calls": 2,
+    "total_tokens": 55203,
+    "reported_cost_usd": 0.03502068,
+    "precision": null,
+    "recall": null,
+    "pass_at_1": null
+  },
+  "interpretation": "The no-tool execution condition was not established. Tool entries are recorded in the CLI export; their presence alone does not establish successful reads. No final review was produced. These attempts cannot be scored as semantic passes or failures. Do not overwrite or silently rerun them."
+}
