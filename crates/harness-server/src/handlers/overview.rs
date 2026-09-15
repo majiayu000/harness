@@ -7,7 +7,7 @@
 //! store. Metrics that harness does not yet track (runtime CPU/RAM) are
 //! returned as `null` so the UI degrades gracefully.
 
-use crate::http::rest_contract::LegacyJson as Json;
+use crate::http::rest_contract::ContractJson as Json;
 use crate::http::AppState;
 use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
 use axum::{extract::State, http::StatusCode};
@@ -15,6 +15,7 @@ use chrono::{DateTime, Duration, Timelike, Utc};
 use harness_core::types::{Decision, Event, EventFilters};
 use harness_observe::quality::QualityGrader;
 use harness_observe::usage::UsageMetrics;
+use harness_protocol::rest::OverviewResponse;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ const THROUGHPUT_BUCKETS: usize = 24;
 const FEED_LIMIT: usize = 40;
 
 /// GET /api/overview — JSON payload driving the system overview page.
-pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<OverviewResponse>) {
     let now = Utc::now();
     // Snap the query window to the start of the oldest bucket on the hour
     // axis so that SQL rows and JS buckets agree. Without this, tasks
@@ -50,7 +51,9 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
             tracing::error!("overview: active workflow counts unavailable: {error}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "active workflow counts unavailable"})),
+                Json(OverviewResponse(
+                    json!({"error": "active workflow counts unavailable"}),
+                )),
             );
         }
     };
@@ -65,7 +68,9 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
                 tracing::error!("overview: workflow runtime metrics query failed: {error}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "workflow runtime metrics unavailable"})),
+                    Json(OverviewResponse(
+                        json!({"error": "workflow runtime metrics unavailable"}),
+                    )),
                 );
             }
         };
@@ -340,7 +345,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         },
     });
 
-    (StatusCode::OK, Json(body))
+    (StatusCode::OK, Json(OverviewResponse(body)))
 }
 
 /// Start of the oldest bucket on the hour axis. Shared by the SQL `since`

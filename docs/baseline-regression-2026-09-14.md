@@ -84,3 +84,9 @@ The first full CI run exposed additional stale fixtures not exercised by the loc
 Fresh isolated PostgreSQL reruns passed 2 continuation tests, 11 worker tests, the runtime-profile timeout test, the probe-cap test, and 7 repair-contract tests. The initial CI run also had poisoned environment-lock cascades after the root assertions failed; those failures are not claimed to be independent product defects.
 
 CI identified RUSTSEC-2026-0285 in rustls 0.23.37. The lockfile now uses rustls 0.23.45 and its required rustls-webpki 0.103.15 patch. Under the unchanged audit configuration, cargo audit reports zero blocking vulnerabilities; pre-existing informational warnings remain. Four Markdown trailing-space violations were removed. Full CI must pass on the updated heads before merge.
+
+## REST response ownership migration
+
+The six remaining legacy handler inventory violations were resolved using the existing protocol-owned transparent response envelope pattern. Dashboard, overview, token usage, health, project queue stats, and intake status now return ContractJson with endpoint-specific harness-protocol response types. JSON construction, status codes, and token-usage error/empty responses remain unchanged. This establishes ownership without claiming field-level schema validation; no legacy inventory fixture or enforcement was changed.
+
+Fresh validation passed cargo check --workspace --all-targets and all five legacy_rest_inventory tests. Filtered server tests passed for dashboard (12), overview (14), token_usage (10), health routes (15), queue stats (1), and intake/auth/list routes (18); the token route test overlaps two filters. Database-dependent cases used disposable PostgreSQL. Independent source review returned APPROVED for the response migration and wire compatibility.

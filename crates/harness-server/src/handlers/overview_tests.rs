@@ -415,6 +415,6 @@ async fn active_counts_fail_when_runtime_query_fails() -> anyhow::Result<()> {
     );
     let (status, body) = overview(State(Arc::new(state))).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body.0["error"], "active workflow counts unavailable");
+    assert_eq!(body.0 .0["error"], "active workflow counts unavailable");
     Ok(())
 }
