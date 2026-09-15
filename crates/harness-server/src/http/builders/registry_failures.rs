@@ -9,7 +9,7 @@ pub(crate) fn failed_registry_startup_results(error: &str) -> Vec<StoreStartupRe
         StoreStartupResult::critical("plan_db").failed(error),
         StoreStartupResult::optional("issue_workflow_store").failed(error),
         StoreStartupResult::optional("project_workflow_store").failed(error),
-        StoreStartupResult::optional("workflow_runtime_store").failed(error),
+        StoreStartupResult::critical("workflow_runtime_store").failed(error),
         StoreStartupResult::critical("project_registry").failed(error),
         StoreStartupResult::optional("workspace_lease_store").failed(error),
         StoreStartupResult::optional("workspace_manager").failed(error),

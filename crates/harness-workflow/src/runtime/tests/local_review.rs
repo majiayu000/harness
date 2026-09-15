@@ -224,7 +224,7 @@ fn local_review_changes_requested_uses_completed_command_dedupe_key() {
 }
 
 #[test]
-fn local_review_same_blocker_count_stops_feedback_repair_oscillation() {
+fn local_review_same_blocker_count_allows_another_bounded_repair() {
     let instance = issue_instance("local_review_gate").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -245,10 +245,25 @@ fn local_review_same_blocker_count_stops_feedback_repair_oscillation() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("non-converging local review should stop the workflow");
+        .expect("same-count local review should request repair");
 
-    assert_eq!(decision.decision, "block_feedback_repair_oscillation");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "address_local_review_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
+}
+
+#[test]
+fn repair_round_policy_counts_rounds_without_requiring_decreasing_findings() {
+    use crate::runtime::pr_feedback::next_feedback_repair_round;
+    for completed in [0, 1, 3, 4, 100, u64::MAX] {
+        for baseline in [serde_json::Value::Null, json!(2)] {
+            let data =
+                json!({"feedback_repair_round":completed,"feedback_repair_blocker_count":baseline});
+            assert_eq!(
+                next_feedback_repair_round(&data),
+                completed.saturating_add(1)
+            );
+        }
+    }
 }
 
 #[test]
@@ -280,7 +295,7 @@ fn local_review_lower_blocker_count_allows_feedback_repair() {
 }
 
 #[test]
-fn local_review_missing_blocker_count_stops_when_repair_history_exists() {
+fn local_review_missing_blocker_count_still_allows_repair() {
     let instance = issue_instance("local_review_gate").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -301,10 +316,10 @@ fn local_review_missing_blocker_count_stops_when_repair_history_exists() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("unmeasured local review should stop the workflow");
+        .expect("missing blocker count must not stop repair");
 
-    assert_eq!(decision.decision, "block_feedback_repair_unmeasured");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "address_local_review_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
 }
 
 #[test]
@@ -347,8 +362,8 @@ fn structured_local_review_decision_cannot_bypass_feedback_convergence() {
         .expect("event should parse")
         .expect("structured decision must still pass convergence policy");
 
-    assert_eq!(decision.decision, "block_feedback_repair_oscillation");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "address_local_review_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
 }
 
 #[test]
@@ -388,37 +403,52 @@ fn structured_only_local_review_decision_requires_outcome_signal() {
 }
 
 #[test]
-fn local_review_passed_result_routes_to_awaiting_feedback() {
-    let instance = issue_instance("local_review_gate").with_server_data(json!({
-        "pr_number": 77,
-        "pr_url": "https://github.com/owner/repo/pull/77",
-    }));
-    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Local review passed.")
-        .with_signal(ActivitySignal::new(
-            super::super::LOCAL_REVIEW_PASSED_SIGNAL,
-            json!({ "pr_number": 77 }),
-        ));
-    let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
-
-    let decision = reduce_runtime_job_completed(&instance, &event)
-        .expect("event should parse")
-        .expect("local review pass should wait for remote feedback");
-
-    assert_eq!(decision.decision, "local_review_passed");
-    assert_eq!(decision.next_state, "awaiting_feedback");
-    assert_eq!(decision.commands.len(), 1);
-    assert_eq!(decision.commands[0].command_type, WorkflowCommandType::Wait);
-    assert_eq!(
-        decision.commands[0].dedupe_key,
-        "local-review:job-1:77:passed"
-    );
-    DecisionValidator::github_issue_pr()
-        .validate(
+fn local_review_passed_decision_waits_for_merge_without_validation_commands() {
+    for benchmark in [false, true] {
+        let mut data = json!({
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+        });
+        if benchmark {
+            data["eval"] = json!({"eval_run_id": "run-1", "case_id": "case-1"});
+        }
+        let instance = issue_instance("local_review_gate").with_server_data(data);
+        let output = build_local_review_completed_decision(
             &instance,
-            &decision,
-            &ValidationContext::new("runtime-1", Utc::now()),
-        )
-        .expect("local review passed decision should validate");
+            LocalReviewCompletedInput {
+                task_id: "job-1",
+                pr_number: 77,
+                pr_url: Some("https://github.com/owner/repo/pull/77"),
+                repair_dedupe_key: "repair-1",
+                outcome: LocalReviewOutcome::Passed,
+                summary: "Local review passed.",
+            },
+        );
+        let decision = output.decision;
+        assert_eq!(decision.decision, "local_review_passed");
+        if benchmark {
+            assert_eq!(decision.next_state, "quality_gate_pending");
+            assert_eq!(decision.commands.len(), 1);
+            assert_eq!(
+                decision.commands[0].command_type,
+                WorkflowCommandType::StartChildWorkflow
+            );
+            assert_eq!(
+                decision.commands[0].dedupe_key,
+                "quality-gate:job-1:77:local-pass:0"
+            );
+        } else {
+            assert_eq!(decision.next_state, "ready_to_merge");
+            assert!(decision.commands.is_empty());
+        }
+        DecisionValidator::github_issue_pr()
+            .validate(
+                &instance,
+                &decision,
+                &ValidationContext::new("runtime-1", Utc::now()),
+            )
+            .expect("local review passed decision should validate");
+    }
 }
 
 #[test]
@@ -704,4 +734,64 @@ fn local_review_after_rework_replay_keeps_command_dedupe_key() {
         first_decision.commands[0].dedupe_key,
         replayed_decision.commands[0].dedupe_key
     );
+}
+
+#[test]
+fn local_review_merge_pass_requires_matching_sha_and_clean_worktree() {
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
+        "pr_number": 77,
+        "merge_review_head_sha": "expected-head",
+    }));
+    for payload in [
+        json!({}),
+        json!({"reviewed_head_sha": "other-head", "working_tree_clean": true}),
+        json!({"reviewed_head_sha": "expected-head", "working_tree_clean": false}),
+        json!({"reviewed_head_sha": "expected-head"}),
+        json!({"reviewed_head_sha": "expected-head", "working_tree_clean": true}),
+    ] {
+        let accepted = payload["reviewed_head_sha"] == "expected-head"
+            && payload["working_tree_clean"] == true;
+        let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Reviewed requested commit")
+            .with_signal(ActivitySignal::new(
+                super::super::LOCAL_REVIEW_PASSED_SIGNAL,
+                payload.clone(),
+            ));
+        let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+        let decision = reduce_runtime_job_completed(&instance, &event)
+            .expect("completion parses")
+            .expect("review produces a decision");
+        if accepted {
+            assert_eq!(decision.next_state, "ready_to_merge", "{payload}");
+        } else {
+            assert_eq!(decision.next_state, "blocked", "{payload}");
+            assert!(
+                decision.reason.contains("reviewed_head_sha"),
+                "{}",
+                decision.reason
+            );
+        }
+    }
+}
+
+#[test]
+fn cancelled_pr_review_requires_explicit_terminal_reopen() {
+    let instance = issue_instance("cancelled");
+    let decision = build_local_review_request_decision(
+        &instance,
+        LocalReviewDecisionInput {
+            dedupe_key: "explicit-resubmission",
+            pr_number: 77,
+            pr_url: None,
+            issue_number: None,
+            repo: Some("owner/repo"),
+            summary: "Explicit PR resubmission",
+        },
+    )
+    .decision;
+    let validator = DecisionValidator::github_issue_pr();
+    let context = ValidationContext::new("workflow-policy", Utc::now());
+    assert!(validator.validate(&instance, &decision, &context).is_err());
+    assert!(validator
+        .validate(&instance, &decision, &context.allow_terminal_reopen())
+        .is_ok());
 }

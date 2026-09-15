@@ -390,3 +390,31 @@ async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()>
 
     Ok(())
 }
+
+#[tokio::test]
+async fn active_counts_fail_when_runtime_query_fails() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = test_helpers::tempdir_in_home("harness-test-active-counts-")?;
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    let store = harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+        &dir.path().join("active-counts.db"),
+        Some(&test_helpers::test_database_url()?),
+    )
+    .await?;
+    // Closing this fixture's pool simulates a query outage without modifying schema or shared state.
+    store.pool().close().await;
+    state.core.workflow_runtime_store = Some(Arc::new(store));
+    assert!(active_task_overview_counts(&state).await.is_err());
+    assert!(
+        crate::handlers::dashboard_active_counts::dashboard_active_counts(&state, None)
+            .await
+            .is_err()
+    );
+    let (status, body) = overview(State(Arc::new(state))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body.0 .0["error"], "active workflow counts unavailable");
+    Ok(())
+}

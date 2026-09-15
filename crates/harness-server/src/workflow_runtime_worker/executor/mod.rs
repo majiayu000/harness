@@ -37,7 +37,7 @@ use super::runtime_profile::{
     agent_backend_for_runtime_kind, agent_name_for_runtime_kind, resolve_runtime_settings,
     runtime_profile_for_job,
 };
-use super::runtime_turn_control::{force_code_agent_for_runtime_turn, RuntimeTurnAliasGuard};
+use super::runtime_turn_control::{force_oneshot_surface, RuntimeTurnAliasGuard};
 use super::runtime_usage::runtime_usage_context;
 use super::server_merge::{execute_server_merge, server_merge_execution_enabled};
 use super::turn_engine::turn_lifecycle::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
@@ -67,6 +67,7 @@ pub(super) struct ServerRuntimeJobExecutor<'a> {
     /// lost (GH-1877).
     lease_lost: Arc<tokio::sync::watch::Sender<bool>>,
     lease_lost_receiver: tokio::sync::watch::Receiver<bool>,
+    pub(super) execution_permit: std::sync::Mutex<Option<crate::task_queue::TaskPermit>>,
 }
 impl<'a> ServerRuntimeJobExecutor<'a> {
     pub(super) fn new(state: &'a Arc<AppState>) -> Self {
@@ -75,6 +76,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             state,
             lease_lost: Arc::new(lease_lost),
             lease_lost_receiver,
+            execution_permit: std::sync::Mutex::new(None),
         }
     }
 
@@ -110,11 +112,6 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 });
             }
         }
-        let _queue_permit = super::runtime_execution_queue::acquire_runtime_execution_queue_permit(
-            self.state,
-            workflow.as_ref(),
-        )
-        .await?;
         // A pinned agent contract never runs through the ordinary workspace
         // and tool surface: it takes the dedicated enforcement path (empty
         // ephemeral workspace, pinned prompt only, deny-all launch, pinned
@@ -217,10 +214,9 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
             let prompt_packet_digest = prompt_packet_digest(&prompt_packet);
             self.record_prompt_packet_prepared(&job, &prompt_packet, &prompt_packet_digest)
                 .await?;
-            let force_code_agent = force_code_agent_for_runtime_turn(
-                job.runtime_kind,
-                resolved_settings.approval_policy.explicit_value(),
-            );
+            // Authority A: RuntimeKind selects surface; approval never switches it.
+            // Correction retries may still force oneshot explicitly.
+            let force_code_agent = force_oneshot_surface(job.runtime_kind);
             let output_schema_file =
                 codex_output_schema_file(true, &job, &project_root, &prompt_packet)?;
             let mut prompt =
@@ -343,7 +339,12 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         env_vars,
                         permission_mode: permission_profile.permission_mode,
                         allowed_tools: permission_profile.allowed_tools.clone(),
-                        force_code_agent: force_code_agent_for_attempt,
+                        force_code_agent: force_code_agent_for_attempt
+                            || !matches!(
+                                job.runtime_kind,
+                                RuntimeKind::CodexJsonrpc | RuntimeKind::OpenCode
+                            ),
+                        selected_backend: Some(agent_backend.clone()),
                         runtime_usage: runtime_usage_context(
                             self.state,
                             &job,
@@ -386,7 +387,10 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                         .as_ref()
                         .map(|workflow| workflow.definition_id.as_str()),
                 );
-                if attempt == 0 {
+                // Cursor rejects the tool allowlist used to enforce a
+                // formatting-only turn. Preserve the original parse failure
+                // instead of replacing its evidence with an unsupported retry.
+                if attempt == 0 && job.runtime_kind != RuntimeKind::Cursor {
                     if let Some(correction) = structured_output_correction(&result) {
                         let retry_budget_available = reserve_structured_output_correction_turn(
                             self.state.core.workflow_runtime_store.as_deref(),
@@ -545,22 +549,12 @@ fn agent_backend_for_attempt(
     registry: &AgentRegistry,
     agent_name: &str,
     runtime_kind: RuntimeKind,
-    force_code_agent: bool,
+    force_oneshot: bool,
 ) -> anyhow::Result<Arc<dyn AgentBackend>> {
-    if force_code_agent {
+    if force_oneshot {
         return registry
             .get(agent_name)
             .ok_or_else(|| anyhow::anyhow!("runtime agent `{agent_name}` is not registered"));
-    }
-    if matches!(
-        runtime_kind,
-        RuntimeKind::CodexExec | RuntimeKind::CodexJsonrpc | RuntimeKind::OpenCode
-    ) {
-        return registry.turn_execution_adapter(agent_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "runtime agent `{agent_name}` has no turn backend for runtime kind `{runtime_kind:?}`"
-            )
-        });
     }
     agent_backend_for_runtime_kind(registry, runtime_kind)
 }
@@ -734,16 +728,38 @@ mod tests {
     }
 
     #[test]
-    fn interactive_codex_exec_preflight_uses_the_turn_backend() {
+    fn codex_exec_preflight_uses_oneshot_backend() {
         let mut registry = AgentRegistry::new("codex");
         registry.register("codex", Arc::new(NamedBackend("codex-oneshot")));
         registry
             .register_turn_backend_factory("codex", || Arc::new(NamedBackend("codex-turn")))
             .expect("turn factory should register");
 
-        let selected = agent_backend_for_attempt(&registry, "codex", RuntimeKind::CodexExec, false)
-            .expect("interactive CodexExec should resolve its turn backend");
+        let selected = agent_backend_for_attempt(
+            &registry,
+            "codex",
+            RuntimeKind::CodexExec,
+            force_oneshot_surface(RuntimeKind::CodexExec),
+        )
+        .expect("CodexExec should resolve oneshot");
+        assert_eq!(selected.name(), "codex-oneshot");
+    }
 
+    #[test]
+    fn codex_jsonrpc_preflight_uses_turn_backend() {
+        let mut registry = AgentRegistry::new("codex");
+        registry.register("codex", Arc::new(NamedBackend("codex-oneshot")));
+        registry
+            .register_turn_backend_factory("codex", || Arc::new(NamedBackend("codex-turn")))
+            .expect("turn factory should register");
+
+        let selected = agent_backend_for_attempt(
+            &registry,
+            "codex",
+            RuntimeKind::CodexJsonrpc,
+            force_oneshot_surface(RuntimeKind::CodexJsonrpc),
+        )
+        .expect("CodexJsonrpc should resolve turn");
         assert_eq!(selected.name(), "codex-turn");
     }
 }

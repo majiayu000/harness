@@ -322,8 +322,7 @@ fn atomic_validation_rejection_is_not_reported_as_accepted() {
 }
 
 #[tokio::test]
-async fn pr_feedback_ready_to_merge_updates_parent_workflow_after_local_review(
-) -> anyhow::Result<()> {
+async fn pr_feedback_does_not_reopen_a_passed_local_review() -> anyhow::Result<()> {
     let Ok(database_url) = resolve_database_url(None) else {
         return Ok(());
     };
@@ -354,9 +353,10 @@ async fn pr_feedback_ready_to_merge_updates_parent_workflow_after_local_review(
     )
     .await;
 
-    record_local_review_passed(
-        Some(&store),
-        LocalReviewPassedRuntimeContext {
+    request_local_review(&store, &workflow_id).await?;
+    persist_local_review_passed(
+        &store,
+        &LocalReviewPassedRuntimeContext {
             project_root: &project_root,
             repo: Some("owner/repo"),
             issue_number: Some(123),
@@ -366,15 +366,25 @@ async fn pr_feedback_ready_to_merge_updates_parent_workflow_after_local_review(
             summary: "Local agent review approved the PR.",
         },
     )
-    .await;
+    .await?;
 
     let commands_after_local_review = store.commands_for(&workflow_id).await?;
-    assert!(
+    assert_eq!(
         commands_after_local_review
             .iter()
-            .all(|command| command.command.activity_name()
-                != Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)),
-        "legacy local review pass must not leave a duplicate run_local_review activity queued"
+            .filter(|command| command.command.activity_name()
+                == Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY))
+            .count(),
+        1,
+        "passing review must not enqueue a second review"
+    );
+    assert_eq!(
+        store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("approved workflow")
+            .state,
+        "ready_to_merge"
     );
 
     record_pr_feedback(
@@ -396,18 +406,15 @@ async fn pr_feedback_ready_to_merge_updates_parent_workflow_after_local_review(
         .get_instance(&workflow_id)
         .await?
         .expect("workflow instance should be persisted");
-    assert_eq!(instance.state, "quality_gate_pending");
+    assert_eq!(instance.state, "ready_to_merge");
     let events = store.events_for(&workflow_id).await?;
-    assert!(events
+    assert!(!events
         .iter()
         .any(|event| event.event_type == "PrReadyToMerge"));
-    let commands = store.commands_for(&workflow_id).await?;
-    assert!(commands.iter().any(|command| {
-        command.command.command_type
-            == harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow
-            && command.command.command["definition_id"]
-                == harness_workflow::runtime::QUALITY_GATE_DEFINITION_ID
-    }));
+    assert_eq!(
+        store.commands_for(&workflow_id).await?.len(),
+        commands_after_local_review.len()
+    );
     Ok(())
 }
 
@@ -510,7 +517,7 @@ async fn pr_hygiene_repair_requests_address_pr_feedback_with_context() -> anyhow
     };
     assert_eq!(instance.state, "addressing_feedback");
     assert_eq!(instance.data["feedback_repair_round"], 1);
-    assert_eq!(instance.data["feedback_repair_blocker_count"], 1);
+    assert!(instance.data.get("feedback_repair_blocker_count").is_none());
     assert_eq!(instance.data["feedback_repair_lane"], "remote_feedback");
     let commands = store.commands_for(&workflow_id).await?;
     assert_eq!(commands.len(), 1);
@@ -626,6 +633,7 @@ async fn concurrent_mixed_case_pr_requests_share_one_canonical_workflow() -> any
                 pr_number: 78,
                 pr_url: Some("https://github.com/Owner/Repo/pull/78"),
             },
+            None,
             move || {
                 let barrier = first_barrier.clone();
                 async move {
@@ -643,6 +651,7 @@ async fn concurrent_mixed_case_pr_requests_share_one_canonical_workflow() -> any
                 pr_number: 78,
                 pr_url: Some("https://github.com/owner/repo/pull/78"),
             },
+            None,
             move || {
                 let barrier = second_barrier.clone();
                 async move {
@@ -819,3 +828,169 @@ async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
 
 mod restart_suppression;
 mod suppression;
+
+#[tokio::test]
+async fn merge_readiness_review_preserves_new_head_through_persistence() -> anyhow::Result<()> {
+    use harness_workflow::runtime::{
+        reduce_runtime_job_completed, ActivityResult, ActivitySignal, WorkflowEvent,
+        LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_PASSED_SIGNAL,
+    };
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
+    let ready = pr_scoped_instance(
+        format!("head-review-{}", uuid::Uuid::new_v4()),
+        dir.path().to_string_lossy().into_owned(),
+        Some("owner/repo".into()),
+        &TaskId::from_str("head-review"),
+        77,
+        None,
+        "ready_to_merge",
+    )
+    .with_server_data(json!({"pr_number":77, "merge_review_head_sha":"old-head"}));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &ready).await?;
+    let outcome = request_merge_readiness_review(&store, ready.clone(), "new-head").await?;
+    assert!(matches!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested { .. }
+    ));
+    let reviewing = store
+        .get_instance(&ready.id)
+        .await?
+        .expect("persisted review");
+    assert_eq!(reviewing.state, "local_review_gate");
+    assert_eq!(reviewing.data["merge_review_head_sha"], "new-head");
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Reviewed new head").with_signal(
+        ActivitySignal::new(
+            LOCAL_REVIEW_PASSED_SIGNAL,
+            json!({"reviewed_head_sha":"new-head", "working_tree_clean":true}),
+        ),
+    );
+    let event =
+        WorkflowEvent::new(&ready.id, 1, "RuntimeJobCompleted", "runtime-1").with_payload(json!({
+            "command_id":"command-1",
+            "command": WorkflowCommand::enqueue_activity(LOCAL_REVIEW_ACTIVITY, "review-1"),
+            "runtime_job_id":"job-1", "activity_result":result
+        }));
+    let decision = reduce_runtime_job_completed(&reviewing, &event)?.expect("review decision");
+    assert_eq!(decision.next_state, "ready_to_merge");
+    let accepted_data = reviewing.data.clone();
+    let outcome = commit_runtime_decision(
+        &store,
+        reviewing,
+        false,
+        decision,
+        "RuntimeJobCompleted",
+        "runtime-1",
+        event.event,
+        accepted_data,
+    )
+    .await?;
+    assert!(matches!(outcome, RuntimeDecisionCommitOutcome::Accepted));
+    let approved = store
+        .get_instance(&ready.id)
+        .await?
+        .expect("approved review");
+    assert_eq!(approved.state, "ready_to_merge");
+    assert_eq!(approved.data["merge_review_head_sha"], "new-head");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pr_requirements_reopen_ready_review_atomically() -> anyhow::Result<()> {
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
+    let task_id = TaskId::from_str("requirements-review");
+    let ctx = || PrFeedbackSweepRuntimeContext {
+        project_root: dir.path(),
+        repo: Some("owner/requirements"),
+        task_id: &task_id,
+        pr_number: 17,
+        pr_url: None,
+    };
+    let id = pr_workflow_id(
+        &dir.path().to_string_lossy(),
+        Some("owner/requirements"),
+        17,
+    );
+    let outcome = request_pr_feedback_sweep_for_pr_with_admission(
+        &store,
+        ctx(),
+        Some("Retain the requested upgrade."),
+        || async { Ok(()) },
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested { .. }
+    ));
+    let first = store
+        .get_instance(&id)
+        .await?
+        .expect("persisted submission");
+    assert_eq!(
+        first.data["additional_prompt"],
+        "Retain the requested upgrade."
+    );
+    assert_eq!(
+        pr_runtime_field_provenance("additional_prompt"),
+        DataProvenance::External
+    );
+
+    // Exercise persistence admission with a ready state, without inventing an Agent verdict.
+    let ready_id = format!("{id}-ready");
+    let ready = pr_scoped_instance(
+        ready_id.clone(),
+        dir.path().to_string_lossy().into_owned(),
+        Some("owner/requirements".into()),
+        &task_id,
+        17,
+        None,
+        "ready_to_merge",
+    )
+    .with_server_data(json!({"pr_number":17,"task_id":task_id.as_str(),
+            "additional_prompt":"Original requirement", "merge_review_head_sha":"old-head"}));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &ready).await?;
+    let rejected = request_local_review_with_admission(
+        &store,
+        &ready_id,
+        Some("Updated requirement"),
+        || async { anyhow::bail!("remote admission denied") },
+    )
+    .await;
+    assert!(rejected.is_err());
+    let unchanged = store
+        .get_instance(&ready_id)
+        .await?
+        .expect("ready instance");
+    assert_eq!(unchanged.state, "ready_to_merge");
+    assert_eq!(unchanged.data["additional_prompt"], "Original requirement");
+    assert!(store.commands_for(&ready_id).await?.is_empty());
+    let outcome = request_local_review_with_admission(
+        &store,
+        &ready_id,
+        Some("Updated requirement"),
+        || async { Ok(()) },
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested { .. }
+    ));
+    let updated = store
+        .get_instance(&ready_id)
+        .await?
+        .expect("reopened review");
+    assert_eq!(updated.state, "local_review_gate");
+    assert_eq!(updated.data["additional_prompt"], "Updated requirement");
+    assert!(updated.data.get("merge_review_head_sha").is_none());
+    assert_eq!(store.commands_for(&ready_id).await?.len(), 1);
+    Ok(())
+}

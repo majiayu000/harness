@@ -47,6 +47,25 @@ impl RuntimeJobExecutor for ServerRuntimeJobExecutor<'_> {
         self.runtime_worker_disabled_result(job).await
     }
 
+    async fn prepare_execution(
+        &self,
+        job: &RuntimeJob,
+    ) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let workflow = super::job_context::workflow_for_job(self.state, job).await?;
+        match super::runtime_execution_queue::try_runtime_execution_queue_permit(
+            self.state,
+            workflow.as_ref(),
+        )? {
+            super::runtime_execution_queue::QueueAdmission::Ready(permit) => {
+                *self.execution_permit.lock().unwrap() = permit;
+                Ok(None)
+            }
+            super::runtime_execution_queue::QueueAdmission::Busy => {
+                Ok(Some(chrono::Utc::now() + chrono::Duration::seconds(5)))
+            }
+        }
+    }
+
     async fn execute(&self, mut job: RuntimeJob) -> ActivityResult {
         if let Err(result) = hydrate_exact_replay_transcript(self.state, &mut job).await {
             return *result;

@@ -95,7 +95,6 @@ impl PostgresCatalogMonitor {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn unavailable(
         thresholds: PostgresCatalogThresholds,
         reason: &'static str,

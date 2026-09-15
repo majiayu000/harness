@@ -438,7 +438,7 @@ fn pr_feedback_repair_keeps_actual_check_and_merge_blockers() {
 }
 
 #[test]
-fn pr_feedback_repair_allows_blocked_merge_state_only_for_proven_pending_checks() {
+fn pr_feedback_repair_defers_remote_readiness_but_keeps_failed_checks() {
     let pending = ActivityResult::succeeded("address_pr_feedback", "Repair pushed.").with_artifact(
         ActivityArtifact::new(
             "pr_repair_snapshot",
@@ -468,6 +468,9 @@ fn pr_feedback_repair_allows_blocked_merge_state_only_for_proven_pending_checks(
             "failed_checks": 1
         }),
     ] {
+        let has_failed_checks = fresh_pr_state["failed_checks"]
+            .as_u64()
+            .is_some_and(|count| count > 0);
         let claimed = ActivityResult::succeeded("address_pr_feedback", "Repair pushed.")
             .with_artifact(ActivityArtifact::new(
                 "pr_repair_snapshot",
@@ -475,8 +478,15 @@ fn pr_feedback_repair_allows_blocked_merge_state_only_for_proven_pending_checks(
             ));
         let (changed, result) =
             enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
-        assert!(changed);
-        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+        assert_eq!(changed, has_failed_checks);
+        assert_eq!(
+            result.status,
+            if has_failed_checks {
+                ActivityStatus::SucceededWithBlockers
+            } else {
+                ActivityStatus::Succeeded
+            }
+        );
     }
 }
 

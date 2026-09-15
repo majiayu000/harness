@@ -17,6 +17,10 @@ use super::activity_contract::activity_contract;
 use super::data_helpers::activity_name;
 use super::runtime_profile::ResolvedRuntimeSettings;
 
+mod model_input;
+mod summary_contract;
+use summary_contract::agent_summary_contract;
+
 mod activity_policy;
 use activity_policy::{append_activity_policy_prompt, apply_activity_policy};
 
@@ -219,6 +223,17 @@ pub(super) fn build_runtime_job_prompt(
         workflow_file.remove("prompt_template");
     }
     strip_model_facing_audit_sections(&mut model_packet);
+    model_input::simplify(&mut model_packet);
+    let result_contract = if model_packet
+        .pointer("/activity_result_schema/decision_owner")
+        .is_some()
+    {
+        model_packet
+            .as_object_mut()
+            .and_then(|packet| packet.remove("activity_result_schema"))
+    } else {
+        None
+    };
     let prompt_packet_json = pretty_json(&model_packet);
     let activity = prompt_packet
         .get("runtime_job")
@@ -240,6 +255,15 @@ pub(super) fn build_runtime_job_prompt(
         .and_then(|runtime_job| runtime_job.get("id"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let output_instruction = if prompt_packet
+        .pointer("/runtime_job/runtime_kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "codex_exec" | "codex_jsonrpc"))
+    {
+        "Return a raw JSON object matching the enforced output schema."
+    } else {
+        "Finish with one fenced `harness-activity-result` JSON object. Use native JSON values for artifact and signal payloads."
+    };
     let mut prompt = format!(
         "You are executing a Harness workflow runtime job.\n\n\
          Runtime contract:\n\
@@ -247,7 +271,7 @@ pub(super) fn build_runtime_job_prompt(
          - Harness server only manages lifecycle. You, the agent, perform repository and GitHub work when the activity requires it.\n\
          - Follow the project instructions loaded by the runtime.\n\
          - Use the prompt packet activity_result_schema to shape your final summary.\n\
-         - When returning structured activity output, return a raw JSON object matching activity_result_schema when your transport enforces output-schema; otherwise put the JSON object in a final fenced `harness-activity-result` block matching activity_result_schema.\n\
+         - {output_instruction}\n\
          - The structured result activity field must match this runtime job activity exactly.\n\
          - Return a concise final summary appropriate to the activity. Include changed files and validation commands only when repository code changes were requested; for discovery and planning activities, report inspected inputs, emitted signals, and remaining blockers.\n\n\
          Project root: {project_root}\n\
@@ -269,6 +293,11 @@ pub(super) fn build_runtime_job_prompt(
     if let Some(template) = workflow_prompt_template {
         prompt.push_str("\nRepository workflow prompt template:\n");
         prompt.push_str(&template);
+        prompt.push('\n');
+    }
+    if let Some(contract) = result_contract {
+        prompt.push_str("\nActivity result contract:\n");
+        prompt.push_str(&pretty_json(&contract));
         prompt.push('\n');
     }
     prompt
@@ -496,6 +525,14 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "retry_policy": "runtime_retry_policy may retry this activity before failure."
             }
         }),
+        ("github_issue_pr", "merge_pr") => json!({
+            "on_succeeded": {
+                "reducer_next_state": "done_after_server_verifies_remote_merge",
+                "accepted_artifacts": ["pull_request"],
+                "success_requires": "Verify the current head matches expected_head_sha and all repository merge requirements are satisfied. Squash merge and re-read GitHub. Return a pull_request artifact proving the remote merged state. Harness independently verifies completion.",
+                "required_summary": "Report the checked head, merge result and any unmet condition. Never report an unperformed merge as succeeded."
+            }
+        }),
         ("github_issue_pr", "replan_issue") => json!({
             "on_succeeded": {
                 "reducer_next_state": "implementing",
@@ -511,7 +548,7 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "reducer_next_state": "local_review_gate",
                 "success_requires": "A succeeded address_pr_feedback result MUST include pr_repair_snapshot with final head, observed_at, action proof, and passing validation evidence, unless IssueClosed/IssueAlreadyResolved or issue_state proves the issue or PR is already closed/resolved.",
                 "blocker_evidence": "Report remaining blockers through structured status, signals, and pr_repair_snapshot fields. Summary and error prose are descriptive and do not determine PR repair blockers. A succeeded repair still requires action evidence and proceeds through local review and server-owned remote PR inspection before readiness.",
-                "required_summary": "Describe addressed review feedback, pushed/no-code action, validation evidence, or closed issue evidence. If the fresh PR merge_state_status is DIRTY or BEHIND, update or rebase the PR branch and push it before returning; a no-code result is invalid while mergeability remains blocked. For command_input.source=pr_hygiene, also describe the configured rebase-needed label action on update/rebase failure and the stale comment/escalation threshold decision. Harness will run local review before remote feedback unless terminal closed evidence finishes the workflow."
+                "required_summary": "Use local_review_result findings and prior repair evidence to identify unresolved work. Describe each finding addressed or rejected with evidence, pushed/no-code action, validation evidence, or closed issue evidence. If the fresh PR merge_state_status is DIRTY or BEHIND, update or rebase the PR branch and push it before returning; a no-code result is invalid while mergeability remains blocked. For command_input.source=pr_hygiene, also describe the configured rebase-needed label action on update/rebase failure and the stale comment/escalation threshold decision. Harness will run local review before remote feedback unless terminal closed evidence finishes the workflow."
             },
             "on_failed": {
                 "reducer_next_state": "local_review_gate",
@@ -520,13 +557,13 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
         }),
         ("github_issue_pr", harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY) => json!({
             "on_succeeded": {
-                "reducer_next_state": "awaiting_feedback_or_addressing_feedback_or_blocked_from_signals",
+                "reducer_next_state": "derived_from_local_review_signal; report the review outcome and let Harness select the next state",
                 "accepted_signals": [
                     harness_workflow::runtime::LOCAL_REVIEW_PASSED_SIGNAL,
                     harness_workflow::runtime::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
                     harness_workflow::runtime::LOCAL_REVIEW_BLOCKED_SIGNAL
                 ],
-                "required_summary": "Describe the local agent review result, blocking findings if any, and validation evidence inspected."
+                "required_summary": "Review the current PR head independently against original requirements and issue_plan, and report its SHA. Treat previous_repair as an author claim to verify. Include concrete findings with locations and evidence in the outcome signal. When workflow data includes merge_review_head_sha, check out and review that exact commit in a clean worktree; verify HEAD and working-tree status again before reporting. LocalReviewPassed must include reviewed_head_sha and working_tree_clean in its signal payload. If the target changed or the worktree is dirty, do not emit LocalReviewPassed. For merge readiness, inspect current GitHub checks and mergeability: BEHIND/DIRTY or failed/cancelled required CI requires LocalReviewChangesRequested so Cursor can update the branch or fix CI; missing required validation requires LocalReviewBlocked. Pending CI alone is not a blocker: if the code review passes, emit LocalReviewPassed and let Harness wait for GitHub checks before merging. Do not merge during review."
             },
             "on_failed": {
                 "reducer_next_state": "failed_or_retry",
@@ -556,7 +593,7 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "reducer_next_state": "feedback_found_or_no_actionable_feedback_or_ready_to_merge_from_signals; parent ready evidence starts quality_gate first",
                 "accepted_signals": ["FeedbackFound", "NoFeedbackFound", "PrReadyToMerge", "ChangesRequested", "ChecksFailed"],
                 "accepted_artifacts": ["workflow_decision", SERVER_PR_SNAPSHOT_ARTIFACT, PR_FEEDBACK_SNAPSHOT_ARTIFACT],
-                "success_requires": "PrReadyToMerge or any child workflow_decision with next_state=ready_to_merge requires server_pr_snapshot collected by Harness with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, complete reviewThreads, and zero active unresolved review threads.",
+                "success_requires": "PrReadyToMerge requires server_pr_snapshot collected by Harness with final head, observed_at, APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, complete reviewThreads, and zero active unresolved review threads.",
                 "parent_propagation": "The same activity result is propagated to the parent github_issue_pr workflow; the parent starts quality_gate before ready_to_merge."
             },
             "structured_decision": {
@@ -609,151 +646,6 @@ fn activity_transition_contract(workflow_definition: &str, activity: &str) -> Va
                 "reducer_next_state": "unchanged",
                 "reason": "No reducer transition is registered for this workflow/activity pair."
             }
-        }),
-    }
-}
-
-fn agent_summary_contract(workflow_definition: &str, activity: &str) -> Value {
-    match (workflow_definition, activity) {
-        ("github_issue_pr", ISSUE_PLAN_ACTIVITY) => json!({
-            "must_include": ["task classification", "minimal implementation slice", "target files or explicit unknown", "validation plan", "blockers or explicit none"],
-            "must_not_include": ["repository code changes", "workflow table mutations", "PR creation", "merge readiness claims"],
-            "artifacts": {
-                "issue_plan": {
-                    "required": true,
-                    "fields": ["summary", "task_class", "target_files", "validation_plan", "blockers"]
-                }
-            },
-            "signals": {
-                "IssuePlanReady": "Use when the issue has a coherent implementation plan. Include summary, task_class, target_files, validation_plan, and blockers if any."
-            }
-        }),
-        ("github_issue_pr", "implement_issue") => json!({
-            "must_include": ["changed files", "validation commands", "PR URL, closed issue evidence, or blocker"],
-            "must_not_include": ["workflow table mutations", "unverified merge claims"],
-            "artifacts": {
-                "pull_request": {
-                    "required_when": "A PR was created or reused by the activity.",
-                    "fields": ["pr_number", "pr_url"]
-                },
-                "issue_state": {
-                    "required_when": "No PR exists because the issue is already closed or resolved.",
-                    "fields": ["issue_number", "state", "issue_url"]
-                }
-            },
-            "signals": {
-                "IssueClosed": "Use when the GitHub issue is confirmed closed and no implementation PR is needed. Include state=closed or state=resolved plus issue_number or issue_url.",
-                "IssueAlreadyResolved": "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url."
-            }
-        }),
-        (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => json!({
-            "must_include": ["changed files", "validation commands", "remaining blockers"],
-            "must_not_include": ["workflow table mutations", "unverified merge claims"],
-            "artifacts": {
-                "validation_report": {
-                    "required_when": "The prompt task is ready to complete and validation commands were run; use this or no_change_rationale.",
-                    "type": "array",
-                    "min_items": 1,
-                    "item_fields": ["command", "exit_code"],
-                    "field_contract": {
-                        "command": "nonblank string",
-                        "exit_code": "integer; report non-zero exits truthfully"
-                    }
-                },
-                "no_change_rationale": {
-                    "required_when": "The prompt task is ready to complete and no repository change was needed; use this or validation_report.",
-                    "type": "string",
-                    "non_blank": true
-                },
-                "pull_request": {"required_when": "A PR was created or reused by the activity.", "fields": ["pr_number", "pr_url"]}
-            }
-        }),
-        ("github_issue_pr", "replan_issue") => json!({
-            "must_include": ["reason for replan", "new implementation plan", "validation plan"],
-            "must_not_include": ["direct workflow state changes"],
-        }),
-        ("github_issue_pr", "address_pr_feedback") => json!({
-            "must_include": ["review feedback addressed or explicit no-code reason", "changed files or explicit no-code-change reason", "validation commands or closed issue evidence", "fresh PR state checked before final response", "when fresh merge_state_status is DIRTY or BEHIND, update or rebase and push the PR branch; no-code is invalid while mergeability remains blocked", "final PR head or closed issue evidence", "one repair batch and push followed by an immediate return to Harness", "pr_hygiene update/rebase, label, escalation, or stale-comment outcome when command_input.source=pr_hygiene"],
-            "must_not_include": ["claiming review approval without a fresh review signal", "marking review threads resolved without current GitHub evidence", "waiting for hosted CI or newly generated feedback after the repair push"],
-            "artifacts": {
-                "pr_repair_snapshot": {
-                    "required_when": "Feedback repair was performed, review-thread action was taken, or a no-code-change repair conclusion is returned.",
-                    "required_unless": "IssueClosed/IssueAlreadyResolved signal or issue_state artifact proves the issue or PR is already closed/resolved.",
-                    "fields": ["pr_number", "pr_url", "head_sha", "head_oid", "observed_at", "changed_files", "action_taken", "no_code_change_reason", "validation_commands"],
-                    "field_contract": {
-                        "validation_commands": "Array of validation records with command and a successful status such as passed, success, succeeded, or ok. Failed, blocked, or not_run records do not satisfy successful repair evidence."
-                    }
-                },
-                "issue_state": {
-                    "required_when": "No repair is needed because the issue or PR is already closed/resolved.",
-                    "fields": ["issue_number", "state", "issue_url"]
-                }
-            },
-            "signals": {
-                "IssueClosed": "Use when the issue or PR is confirmed closed and no feedback repair is needed. Include state=closed or state=resolved plus issue_number or issue_url.",
-                "IssueAlreadyResolved": "Use when the feedback task is already resolved before repair. Include state=closed or state=resolved plus issue_number or issue_url."
-            }
-        }),
-        ("github_issue_pr", harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY) => json!({
-            "must_include": ["PR diff reviewed", "blocking findings or explicit approval", "validation evidence checked", "next workflow action"],
-            "must_not_include": ["repository code changes", "workflow table mutations", "remote review approval claims"],
-            "signals": {
-                "LocalReviewPassed": "Use only when the local agent review finds no blocking issues.",
-                "LocalReviewChangesRequested": "Use when local review finds blocking code, test, regression, or security issues that need a fix round. Include actionable_blocker_count in the signal payload.",
-                "LocalReviewBlocked": "Use when local review cannot complete because required PR context or validation evidence is unavailable."
-            }
-        }),
-        ("github_issue_pr", "sweep_pr_feedback")
-        | ("github_issue_pr", PR_FEEDBACK_INSPECT_ACTIVITY)
-        | (PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY) => json!({
-            "server_owned": true,
-            "must_include": ["server-owned PR snapshot", "review states", "check status", "mergeability", "next workflow action"],
-            "must_not_include": ["repository code changes", "workflow table mutations", "unverified approval claims"],
-            "artifacts": {
-                "workflow_decision": {
-                    "optional": true,
-                    "allowed_decisions": ["address_pr_feedback", "wait_for_pr_feedback"]
-                },
-                "server_pr_snapshot": {
-                    "required_when": "Using PrReadyToMerge.",
-                    "source": "Harness server GitHub GraphQL collector",
-                    "fields": ["schema", "snapshot_source", "pr_number", "pr_url", "head_oid", "observed_at", "active_unresolved_review_threads", "active_unresolved_review_threads_count", "actionable_blocker_count", "review_threads_complete", "status_check_rollup_state", "merge_state_status", "review_decision", "is_draft", "changed_files"]
-                },
-                "pr_feedback_snapshot": {
-                    "required_when": "Harness server emits normalized PR feedback evidence.",
-                    "source": "Normalized view of server_pr_snapshot."
-                }
-            },
-                "signals": {
-                    "FeedbackFound": "Use when actionable feedback, requested changes, failed checks, dirty or behind mergeability, or incomplete server-owned reviewThread evidence require a fix round.",
-                    "NoFeedbackFound": "Use only when complete server-owned evidence shows no actionable feedback is present yet.",
-                    "PrReadyToMerge": "Use only with server_pr_snapshot proving APPROVED reviewDecision, isDraft=false, SUCCESS checks, CLEAN mergeStateStatus, complete reviewThreads, and zero active unresolved review threads for the final head."
-            }
-        }),
-        (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => json!({
-            "must_include": ["validation commands", "pass/fail evidence", "remaining blockers"],
-            "must_not_include": ["workflow table mutations", "unverified pass claims"],
-            "artifacts": {
-                "validation_report": {
-                    "required_when": "The activity records detailed validation results.",
-                    "fields": ["commands", "passed", "failed", "blocked"]
-                }
-            }
-        }),
-        ("github_issue_pr", "merge_pr") => json!({
-            "must_include": ["fresh PR head SHA", "status checks", "review thread state", "mergeability", "delete branch policy", "merge result"],
-            "must_not_include": ["merge without matching expected_head_sha", "unverified merge claims", "workflow table mutations"],
-            "artifacts": {
-                "pull_request": {
-                    "required": true,
-                    "fields": ["pr_number", "pr_url", "state", "merged", "merge_commit_sha", "head_sha"],
-                    "success_requires": "state=merged or merged=true after re-reading GitHub immediately after merge; Harness server independently verifies this before accepting completion"
-                }
-            }
-        }),
-        _ => json!({
-            "must_include": ["summary", "validation commands", "remaining blockers"],
-            "must_not_include": ["direct workflow table mutations"],
         }),
     }
 }

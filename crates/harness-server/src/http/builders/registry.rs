@@ -29,13 +29,13 @@ pub(crate) struct RegistryBundle {
 /// Initialize plan DB, plan cache, project registry, workspace manager, and
 /// runtime state store.
 ///
-/// Must follow `build_storage` (uses `storage.tasks` for orphan cleanup) —
-/// callers must pass `tasks` explicitly for that cleanup step.
+/// Must follow `build_storage` (uses `storage.tasks` for orphan cleanup when
+/// present). Callers pass `tasks` explicitly for that cleanup step.
 pub(crate) async fn build_registry(
     server: &Arc<HarnessServer>,
     data_dir: &Path,
     project_root: &Path,
-    tasks: &Arc<crate::task_runner::TaskStore>,
+    tasks: Option<&Arc<crate::task_runner::TaskStore>>,
 ) -> anyhow::Result<RegistryBundle> {
     let configured_database_url = server.config.server.database_url.as_deref();
     // Fail closed: a malformed WORKFLOW.md must abort startup rather than
@@ -264,7 +264,7 @@ pub(crate) async fn build_registry(
         match super::forced_startup_error("workflow_runtime_store") {
             Some(error) => {
                 startup_results
-                    .push(StoreStartupResult::optional("workflow_runtime_store").failed(error));
+                    .push(StoreStartupResult::critical("workflow_runtime_store").failed(error));
                 None
             }
             None => match async {
@@ -287,17 +287,17 @@ pub(crate) async fn build_registry(
             .await
             {
                 Ok(store) => {
-                    startup_results.push(StoreStartupResult::optional("workflow_runtime_store"));
+                    startup_results.push(StoreStartupResult::critical("workflow_runtime_store"));
                     Some(Arc::new(store))
                 }
                 Err(error) => {
                     startup_results.push(
-                        StoreStartupResult::optional("workflow_runtime_store")
+                        StoreStartupResult::critical("workflow_runtime_store")
                             .failed(error.to_string()),
                     );
-                    tracing::warn!(
+                    tracing::error!(
                         schema = %schema,
-                        "workflow runtime store init failed, generic workflow decisions will not persist: {error}"
+                        "workflow runtime store init failed: {error}"
                     );
                     None
                 }
@@ -499,27 +499,32 @@ pub(crate) async fn build_registry(
 
     // Reconcile stale workspaces from any previous crash before new task admission.
     if let Some(ref wmgr) = workspace_mgr {
-        match tasks.list_all_summaries_with_terminal().await {
-            Ok(task_summaries) => {
-                match wmgr.reconcile_startup(project_root, &task_summaries).await {
-                    Ok(summary) => {
-                        tracing::info!(
-                            removed = summary.removed,
-                            preserved = summary.preserved,
-                            migrated = summary.migrated,
-                            released_leases = summary.released_leases,
-                            "workspace startup reconciliation complete"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("workspace startup reconciliation failed: {e}");
+        match tasks {
+            Some(tasks) => match tasks.list_all_summaries_with_terminal().await {
+                Ok(task_summaries) => {
+                    match wmgr.reconcile_startup(project_root, &task_summaries).await {
+                        Ok(summary) => {
+                            tracing::info!(
+                                removed = summary.removed,
+                                preserved = summary.preserved,
+                                migrated = summary.migrated,
+                                released_leases = summary.released_leases,
+                                "workspace startup reconciliation complete"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("workspace startup reconciliation failed: {e}");
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load task summaries for workspace reconciliation: {e}; skipping cleanup"
-                );
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load task summaries for workspace reconciliation: {e}; skipping cleanup"
+                    );
+                }
+            },
+            None => {
+                tracing::warn!("task store unavailable; skipping workspace startup reconciliation");
             }
         }
     }

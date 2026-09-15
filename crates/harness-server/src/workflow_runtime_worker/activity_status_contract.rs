@@ -7,17 +7,9 @@ use harness_workflow::runtime::{
 };
 use serde_json::{json, Value};
 
-/// Reconciles `succeeded`-claimed activity results that simultaneously report
-/// blockers (GH-1897). The blocker vocabulary below is the explicit contract:
-/// every entry forces the first-class `ActivityStatus::SucceededWithBlockers`
-/// outcome (routed like `blocked` everywhere) and records the evidence in
-/// an `activity_status_contract` artifact.
-///
-/// Per-signal dispositions are declared here, not implied by parsing. Today
-/// every recognized blocker blocks; if a class ever warrants a different
-/// disposition (e.g. auto-remediable merge states), it moves out of these
-/// tables into its own path rather than growing a special case inside the
-/// parser.
+/// Reconciles claimed success with explicit blocker evidence (GH-1897).
+/// Recognized blockers produce SucceededWithBlockers and an audit artifact.
+/// Remediable readiness conditions are handled by their activity-specific path.
 const BLOCKING_SIGNAL_TYPES: &[&str] = &[
     "ChangesRequested",
     "ChecksFailed",
@@ -139,15 +131,19 @@ fn activity_status_contract_blockers(
             collect_structured_blockers(
                 &artifact.artifact,
                 &mut blockers,
-                pr_feedback_repair && artifact.artifact_type == "pr_repair_snapshot",
+                (pr_feedback_repair && artifact.artifact_type == "pr_repair_snapshot")
+                    || local_review_outcome == Some(LocalReviewOutcome::Passed),
             );
         }
     }
 
-    // Repair prose describes what happened; structured signals and artifacts
-    // determine blockers. The reducer still requires repair action evidence,
-    // then local review and a server-owned PR snapshot before merge readiness.
-    if pr_feedback_repair {
+    // PR prose describes what happened; structured contracts determine the
+    // outcome. Merge completion also requires an independent GitHub read.
+    if pr_feedback_repair
+        || local_review_outcome.is_some()
+        || (workflow_definition == Some(GITHUB_ISSUE_PR_DEFINITION_ID)
+            && result.activity == "merge_pr")
+    {
         return blockers;
     }
 
@@ -213,19 +209,14 @@ fn is_local_review_outcome_signal(signal_type: &str) -> bool {
 fn collect_structured_blockers(
     value: &Value,
     blockers: &mut Vec<String>,
-    pr_feedback_repair: bool,
+    remote_readiness_deferred: bool,
 ) {
     match value {
         Value::Object(object) => {
-            let blocked_merge_is_pending_checks = pr_feedback_repair
-                && object_value(object, "pending_checks").is_some_and(json_value_reports_blocker)
-                && object_value(object, "failed_checks")
-                    .or_else(|| object_value(object, "failing_checks"))
-                    .is_some_and(|value| !json_value_reports_blocker(value));
             for (key, value) in object {
                 let normalized_key = key.to_ascii_lowercase();
                 if BLOCKING_COUNT_FIELDS.contains(&normalized_key.as_str()) {
-                    if !(pr_feedback_repair && normalized_key == "pending_checks")
+                    if !(remote_readiness_deferred && normalized_key == "pending_checks")
                         && json_value_reports_blocker(value)
                     {
                         push_unique(blockers, format!("field:{normalized_key}"));
@@ -236,30 +227,24 @@ fn collect_structured_blockers(
                     }
                 } else if normalized_key == "merge_state_status" {
                     if json_string_is_one_of(value, BLOCKING_MERGE_STATES)
-                        && !(json_string_equals(value, "blocked")
-                            && blocked_merge_is_pending_checks)
+                        && !(remote_readiness_deferred
+                            && json_string_is_one_of(value, &["blocked", "unknown", "unstable"]))
                     {
                         push_unique(blockers, "field:merge_state_status_blocked");
                     }
                 } else if normalized_key == "mergeable" && value.as_bool() == Some(false) {
                     push_unique(blockers, "field:mergeable_false");
                 }
-                collect_structured_blockers(value, blockers, pr_feedback_repair);
+                collect_structured_blockers(value, blockers, remote_readiness_deferred);
             }
         }
         Value::Array(values) => {
             for value in values {
-                collect_structured_blockers(value, blockers, pr_feedback_repair);
+                collect_structured_blockers(value, blockers, remote_readiness_deferred);
             }
         }
         _ => {}
     }
-}
-
-fn object_value<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a Value> {
-    object
-        .iter()
-        .find_map(|(candidate, value)| candidate.eq_ignore_ascii_case(key).then_some(value))
 }
 
 fn json_value_reports_blocker(value: &Value) -> bool {
@@ -378,7 +363,6 @@ fn push_unique(blockers: &mut Vec<String>, blocker: impl Into<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_workflow::runtime::LOCAL_REVIEW_PASSED_SIGNAL;
 
     fn prompt_result_with_report(exit_code: Value) -> ActivityResult {
         ActivityResult::succeeded(
@@ -491,7 +475,6 @@ mod tests {
                 ]
             }),
         ));
-
         let (changed, result) =
             enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
 
@@ -499,7 +482,7 @@ mod tests {
         assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
         let blockers = status_contract_blockers_from_result(&result);
         assert!(blockers.contains(&"field:unresolved_review_threads".to_string()));
-        assert!(blockers.contains(&"text:unresolved_review_threads".to_string()));
+        assert!(!blockers.contains(&"text:unresolved_review_threads".to_string()));
     }
 
     #[test]
@@ -524,7 +507,6 @@ mod tests {
                 ]
             }),
         ));
-
         let (changed, result) =
             enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
 
@@ -577,7 +559,6 @@ mod tests {
                 ]
             }),
         ));
-
         let (changed, result) =
             enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
 
@@ -692,7 +673,6 @@ mod tests {
         let claimed = ActivityResult::succeeded("run_local_review", "Review done.").with_signal(
             ActivitySignal::new("LocalReviewChangesRequested", json!({})),
         );
-
         let (changed, result) = enforce_activity_status_contract(None, claimed);
 
         assert!(changed);
@@ -726,7 +706,6 @@ mod tests {
             "run_local_review",
             "Merged cleanly with no failing checks and no unresolved review threads.",
         );
-
         let (changed, result) = enforce_activity_status_contract(None, claimed);
 
         assert!(!changed);
@@ -743,7 +722,6 @@ mod tests {
             "LocalReviewChangesRequested",
             json!({}),
         ));
-
         let (changed, result) = enforce_activity_status_contract(None, blocked);
 
         assert!(!changed);
@@ -799,5 +777,24 @@ mod tests {
                 vec!["text:failing_checks"]
             );
         }
+    }
+
+    #[test]
+    fn remote_readiness_wait_does_not_hide_actionable_failures() {
+        let mut blockers = Vec::new();
+        collect_structured_blockers(
+            &json!({"pending_checks":2,"merge_state_status":"BLOCKED"}),
+            &mut blockers,
+            true,
+        );
+        assert!(blockers.is_empty());
+        collect_structured_blockers(
+            &json!({"failed_checks":1,"merge_state_status":"DIRTY","unresolved_review_threads":1}),
+            &mut blockers,
+            true,
+        );
+        assert!(blockers.contains(&"field:failed_checks".to_string()));
+        assert!(blockers.contains(&"field:merge_state_status_blocked".to_string()));
+        assert!(blockers.contains(&"field:unresolved_review_threads".to_string()));
     }
 }

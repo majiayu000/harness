@@ -8,10 +8,9 @@ use crate::runtime::model::{
     WorkflowInstance,
 };
 use crate::runtime::pr_feedback::{
-    build_local_review_completed_decision, build_pr_feedback_decision, next_feedback_repair_round,
-    FeedbackRepairLane, FeedbackRepairStop, LocalReviewCompletedInput, LocalReviewOutcome,
-    PrFeedbackDecisionInput, PrFeedbackOutcome, LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL,
-    LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL, MAX_FEEDBACK_REPAIR_ROUNDS,
+    build_local_review_completed_decision, build_pr_feedback_decision, LocalReviewCompletedInput,
+    LocalReviewOutcome, PrFeedbackDecisionInput, PrFeedbackOutcome, LOCAL_REVIEW_ACTIVITY,
+    LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, PR_REPAIR_SNAPSHOT_ARTIFACT,
     SERVER_PR_SNAPSHOT_ARTIFACT,
 };
@@ -35,17 +34,6 @@ pub(super) fn pr_feedback_sweep_decision_from_activity_result(
         return None;
     }
     let outcome = pr_feedback_outcome_from_signals(result)?;
-    if outcome == PrFeedbackOutcome::BlockingFeedback {
-        if let Some(decision) = feedback_repair_convergence_blocked_decision(
-            instance,
-            event,
-            result,
-            result_signal_u64(result, "actionable_blocker_count"),
-            FeedbackRepairLane::RemoteFeedback,
-        ) {
-            return Some(decision);
-        }
-    }
     let pr_number = result_signal_u64(result, "pr_number").or_else(|| {
         instance
             .data
@@ -71,85 +59,6 @@ pub(super) fn pr_feedback_sweep_decision_from_activity_result(
         .decision
         .with_evidence(runtime_completion_evidence(event, result)),
     )
-}
-
-fn feedback_repair_convergence_blocked_decision(
-    instance: &WorkflowInstance,
-    event: &WorkflowEvent,
-    result: &ActivityResult,
-    current_blockers: Option<u64>,
-    lane: FeedbackRepairLane,
-) -> Option<WorkflowDecision> {
-    let completed_rounds = instance
-        .data
-        .get("feedback_repair_round")
-        .and_then(json_value_u64)
-        .unwrap_or(0);
-    if completed_rounds == 0 {
-        return None;
-    }
-
-    let Some(current_blockers) = current_blockers else {
-        if completed_rounds == 0 {
-            return None;
-        }
-        return Some(feedback_repair_blocked_decision(
-            instance,
-            event,
-            result,
-            "block_feedback_repair_unmeasured",
-            "PR feedback repair progress cannot be measured because the server-owned blocker count is missing; automatic repair is stopped.",
-        ));
-    };
-    let (decision_name, reason) =
-        match next_feedback_repair_round(&instance.data, current_blockers, lane) {
-        Ok(_) => return None,
-        Err(FeedbackRepairStop::RoundLimit { .. }) => (
-            "block_feedback_repair_round_limit",
-            format!("PR feedback remains actionable after {MAX_FEEDBACK_REPAIR_ROUNDS} repair rounds; operator review is required before more mutations."),
-        ),
-        Err(FeedbackRepairStop::MissingBaseline { .. }) => (
-            "block_feedback_repair_unmeasured",
-            "PR feedback repair progress cannot be measured because the prior blocker baseline is missing; automatic repair is stopped."
-                .to_string(),
-        ),
-        Err(FeedbackRepairStop::NoProgress { previous, current }) => (
-            "block_feedback_repair_oscillation",
-            format!("PR feedback repair did not decrease actionable blockers ({previous} before, {current} now); automatic repair is stopped to prevent oscillation."),
-        ),
-    };
-    Some(feedback_repair_blocked_decision(
-        instance,
-        event,
-        result,
-        decision_name,
-        &reason,
-    ))
-}
-
-fn feedback_repair_blocked_decision(
-    instance: &WorkflowInstance,
-    event: &WorkflowEvent,
-    result: &ActivityResult,
-    decision_name: &str,
-    reason: &str,
-) -> WorkflowDecision {
-    WorkflowDecision::new(
-        &instance.id,
-        &instance.state,
-        decision_name,
-        "blocked",
-        reason,
-    )
-    .with_command(runtime_blocked_command(
-        reason,
-        None,
-        format!("pr-feedback:{}:convergence-block:{}", instance.id, event.id),
-        event,
-        result,
-    ))
-    .with_evidence(runtime_completion_evidence(event, result))
-    .high_confidence()
 }
 
 pub(super) fn pr_feedback_activity_missing_outcome_signal(
@@ -179,6 +88,39 @@ pub(super) fn pr_feedback_success_contract_error(
     result: &ActivityResult,
     structured_decision: Option<&WorkflowDecision>,
 ) -> Option<String> {
+    // Merge-readiness reviews must attest the exact server-selected commit.
+    // Initial local reviews without a merge target cannot authorize auto-merge.
+    if instance.definition_id == GITHUB_ISSUE_PR_DEFINITION_ID
+        && instance.state == "local_review_gate"
+        && result.activity == LOCAL_REVIEW_ACTIVITY
+        && local_review_outcome_from_signals(result) == Some(LocalReviewOutcome::Passed)
+    {
+        if let Some(expected) = instance
+            .data
+            .get("merge_review_head_sha")
+            .and_then(Value::as_str)
+        {
+            let review = result
+                .signals
+                .iter()
+                .find(|signal| signal.signal_type == LOCAL_REVIEW_PASSED_SIGNAL)?;
+            if expected.trim().is_empty()
+                || review
+                    .signal
+                    .get("reviewed_head_sha")
+                    .and_then(Value::as_str)
+                    != Some(expected)
+                || review
+                    .signal
+                    .get("working_tree_clean")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+            {
+                return Some("LocalReviewPassed requires reviewed_head_sha matching merge_review_head_sha and working_tree_clean=true; review the requested commit in a clean worktree".to_string());
+            }
+        }
+    }
+
     if !github_issue_pr_feedback_activity_matches(instance, result) {
         return None;
     }
@@ -228,17 +170,6 @@ pub(super) fn local_review_decision_from_activity_result(
         return None;
     }
     let outcome = local_review_outcome_from_signals(result)?;
-    if outcome == LocalReviewOutcome::ChangesRequested {
-        if let Some(decision) = feedback_repair_convergence_blocked_decision(
-            instance,
-            event,
-            result,
-            result_signal_u64(result, "actionable_blocker_count"),
-            FeedbackRepairLane::LocalReview,
-        ) {
-            return Some(decision);
-        }
-    }
     let pr_number = result_signal_u64(result, "pr_number").or_else(|| {
         instance
             .data
@@ -268,6 +199,15 @@ pub(super) fn local_review_decision_from_activity_result(
         },
     )
     .decision;
+    if outcome == LocalReviewOutcome::ChangesRequested {
+        for command in &mut decision.commands {
+            command.command["local_review_result"] = serde_json::json!({
+                "event_id": event.id, "summary": result.summary,
+                "signals": result.signals, "artifacts": result.artifacts,
+                "validation": result.validation,
+            });
+        }
+    }
     if outcome == LocalReviewOutcome::Blocked {
         let dedupe_key = decision.commands.first()?.dedupe_key.clone();
         decision.commands = vec![runtime_blocked_command(

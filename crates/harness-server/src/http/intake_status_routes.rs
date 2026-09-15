@@ -1,5 +1,6 @@
-use super::rest_contract::LegacyJson as Json;
+use super::rest_contract::ContractJson as Json;
 use axum::extract::State;
+use harness_protocol::rest::IntakeStatusResponse;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -15,9 +16,16 @@ struct IntakeRecentDispatch {
 }
 
 /// GET /api/intake — current status of all intake channels and recent dispatches.
-pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+pub(crate) async fn intake_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<IntakeStatusResponse> {
     let intake_config = &state.core.server.config.intake;
-    let all_tasks = state.core.tasks.list_all();
+    let all_tasks = state
+        .core
+        .tasks
+        .as_ref()
+        .map(|tasks| tasks.list_all())
+        .unwrap_or_default();
     let (runtime_issue_workflows, runtime_degraded) =
         runtime_issue_workflows_for_intake_status(&state).await;
 
@@ -163,7 +171,7 @@ pub(crate) async fn intake_status(State(state): State<Arc<AppState>>) -> Json<se
             "reason": reason,
         });
     }
-    Json(response)
+    Json(IntakeStatusResponse(response))
 }
 
 async fn runtime_issue_workflows_for_intake_status(

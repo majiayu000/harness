@@ -128,6 +128,8 @@ pub(super) async fn persist_local_review_request<F, Fut>(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
     new_instance: bool,
+    additional_prompt: Option<&str>,
+    merge_review_head_sha: Option<&str>,
     admission: F,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome>
 where
@@ -143,7 +145,26 @@ where
         .get("issue_number")
         .and_then(|value| value.as_u64());
     let repo = optional_string_field(&instance.data, "repo");
-    let accepted_data = instance.data.clone();
+    let resubmission = instance.state == "cancelled";
+    let mut accepted_data = instance.data.clone();
+    if let Some(prompt) = additional_prompt {
+        accepted_data["additional_prompt"] = json!(prompt);
+    }
+    if resubmission || instance.state == "ready_to_merge" {
+        if let Some(data) = accepted_data.as_object_mut() {
+            for field in [
+                "cancelled",
+                "last_stop",
+                "merge_review_head_sha",
+                "merge_attempted_head_sha",
+            ] {
+                data.remove(field);
+            }
+        }
+    }
+    if let Some(head_sha) = merge_review_head_sha {
+        accepted_data["merge_review_head_sha"] = json!(head_sha);
+    }
     let review_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let output = build_local_review_request_decision(
         &instance,
@@ -161,6 +182,7 @@ where
         "repo": repo.as_deref(),
         "pr_number": pr_number,
         "pr_url": pr_url.as_deref(),
+        "additional_prompt": additional_prompt,
     });
     admission().await?;
     match commit_runtime_decision(
@@ -168,7 +190,11 @@ where
         instance,
         new_instance,
         output.decision,
-        "LocalReviewRequested",
+        if resubmission {
+            "PrResubmitted"
+        } else {
+            "LocalReviewRequested"
+        },
         "workflow_runtime_pr_feedback",
         event_payload,
         accepted_data,

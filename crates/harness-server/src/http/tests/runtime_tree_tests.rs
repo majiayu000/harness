@@ -975,7 +975,7 @@ async fn workflow_runtime_tree_endpoint_splits_running_lease_states() -> anyhow:
     store
         .record_runtime_event(
             &active.id,
-            "RuntimeTurnStarted",
+            "RuntimeAgentStarted",
             serde_json::json!({ "owner": "active-worker" }),
         )
         .await?;

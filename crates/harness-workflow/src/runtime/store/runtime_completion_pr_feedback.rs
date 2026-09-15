@@ -13,31 +13,10 @@ pub(super) fn apply_pr_feedback_completion_data_side_effect(
 ) -> anyhow::Result<()> {
     if local_review_requests_repair(instance, decision) {
         let blocker_count = local_review_blocker_count(event);
-        let next_round = match blocker_count {
-            Some(blocker_count) => next_feedback_repair_round(
-                &instance.data,
-                blocker_count,
-                FeedbackRepairLane::LocalReview,
-            )
-            .map_err(|stop| {
-                anyhow::anyhow!("local review repair progress was rejected: {stop:?}")
-            })?,
-            None => {
-                let completed_rounds = instance
-                    .data
-                    .get("feedback_repair_round")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                if completed_rounds != 0 {
-                    anyhow::bail!(
-                        "local review repair progress cannot be measured after a prior repair round"
-                    );
-                }
-                1
-            }
-        };
+        let next_round = next_feedback_repair_round(&instance.data);
         ensure_object_data(instance);
         let mut writes = vec![
+            WorkflowDataWrite::remove("merge_review_head_sha", DataProvenance::Server),
             WorkflowDataWrite::set(
                 "feedback_repair_round",
                 json!(next_round),
@@ -148,27 +127,7 @@ fn apply_snapshotless_parent_repair_progress(
     event: &WorkflowEvent,
 ) -> anyhow::Result<()> {
     let blocker_count = pr_feedback_signal_blocker_count(event);
-    let next_round = match blocker_count {
-        Some(blocker_count) => next_feedback_repair_round(
-            &instance.data,
-            blocker_count,
-            FeedbackRepairLane::RemoteFeedback,
-        )
-        .map_err(|stop| anyhow::anyhow!("PR feedback repair progress was rejected: {stop:?}"))?,
-        None => {
-            let completed_rounds = instance
-                .data
-                .get("feedback_repair_round")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if completed_rounds != 0 {
-                anyhow::bail!(
-                    "PR feedback repair progress cannot be measured after a prior repair round"
-                );
-            }
-            1
-        }
-    };
+    let next_round = next_feedback_repair_round(&instance.data);
     ensure_object_data(instance);
     let mut writes = vec![
         WorkflowDataWrite::set(
@@ -225,12 +184,7 @@ fn apply_parent_inspection_progress(
                     "server-owned PR feedback snapshot is missing actionable_blocker_count"
                 )
             })?;
-        let next_round = next_feedback_repair_round(
-            &instance.data,
-            blocker_count,
-            FeedbackRepairLane::RemoteFeedback,
-        )
-        .map_err(|stop| anyhow::anyhow!("PR feedback repair progress was rejected: {stop:?}"))?;
+        let next_round = next_feedback_repair_round(&instance.data);
         writes.push(WorkflowDataWrite::set(
             "feedback_repair_round",
             json!(next_round),

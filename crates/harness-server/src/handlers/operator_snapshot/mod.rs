@@ -327,10 +327,18 @@ pub async fn operator_snapshot(State(state): State<Arc<AppState>>) -> (StatusCod
         ..Default::default()
     };
     // Collect all subsections concurrently — they are independent.
-    let (retry_events_res, stalled_res, failed_res) = tokio::join!(
+    let legacy_tasks = async {
+        match state.core.tasks.as_ref() {
+            Some(tasks) => tokio::join!(
+                tasks.list_stalled_tasks(stale, None),
+                tasks.list_recent_failed(MAX_TASKS as i64),
+            ),
+            None => (Ok(Vec::new()), Ok(Vec::new())),
+        }
+    };
+    let (retry_events_res, (stalled_res, failed_res)) = tokio::join!(
         state.observability.events.query(&recent_retry_filter),
-        state.core.tasks.list_stalled_tasks(stale, None),
-        state.core.tasks.list_recent_failed(MAX_TASKS as i64),
+        legacy_tasks,
     );
 
     let mut retry_events = match retry_events_res {

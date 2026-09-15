@@ -217,10 +217,19 @@ fn normalize_github_pr_snapshot(
         .and_then(|rollup| rollup.get("state"))
         .and_then(|value| value_string(Some(value)));
     let status_check_contexts = status_check_contexts(pr);
-    let status_check_contexts_complete = !pr
-        .pointer("/statusCheckRollup/contexts/pageInfo/hasNextPage")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let status_check_contexts_complete = match pr.get("statusCheckRollup") {
+        Some(Value::Null) => true,
+        Some(rollup) => {
+            rollup
+                .pointer("/contexts/nodes")
+                .is_some_and(Value::is_array)
+                && rollup
+                    .pointer("/contexts/pageInfo/hasNextPage")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+        }
+        None => false,
+    };
     let active_threads = active_unresolved_review_threads(pr);
     let changed_files = changed_files(pr);
     let closing_issues = closing_issues(pr);

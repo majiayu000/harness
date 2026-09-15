@@ -791,7 +791,6 @@ mod tests {
         );
 
         let task_id = issue_task_id_from_command(&command, &job, Some("owner/repo"), 42);
-
         assert_eq!(task_id.as_str(), "prompt-task:owner/repo:issue:42");
         assert_eq!(
             issue_task_prefix_from_task_id(&task_id, 42).as_deref(),

@@ -107,9 +107,9 @@ fn github_issue_pr_definition() -> DeclarativeWorkflowDefinition {
                 "local_review_gate".to_string(),
                 activity(
                     LOCAL_REVIEW_ACTIVITY,
-                    Some("awaiting_feedback"),
+                    Some("ready_to_merge"),
                     [
-                        ("LocalReviewPassed", "awaiting_feedback"),
+                        ("LocalReviewPassed", "ready_to_merge"),
                         ("LocalReviewChangesRequested", "addressing_feedback"),
                         ("LocalReviewBlocked", "blocked"),
                     ],
@@ -439,7 +439,8 @@ mod tests {
         (Some("pr_open"), "awaiting_feedback", &[W]),
         (Some("awaiting_feedback"), "local_review_gate", &[E, W]),
         (Some("local_review_gate"), "local_review_gate", &[E, W]),
-        (Some("local_review_gate"), "awaiting_feedback", &[W]),
+        (Some("local_review_gate"), "quality_gate_pending", &[S]),
+        (Some("local_review_gate"), "ready_to_merge", &[]),
         (
             Some("local_review_gate"),
             "addressing_feedback",
@@ -466,6 +467,8 @@ mod tests {
         (Some("quality_gate_pending"), "quality_gate_pending", &[W]),
         (Some("ready_to_merge"), "ready_to_merge", &[W]),
         (Some("ready_to_merge"), "merging", &[E]),
+        (Some("ready_to_merge"), "local_review_gate", &[E]),
+        (Some("merging"), "local_review_gate", &[E]),
         (Some("merging"), "done", &[MD]),
         (Some("ready_to_merge"), "done", &[MD]),
         (None, "blocked", &[MB, O, W]),

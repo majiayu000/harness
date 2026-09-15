@@ -5,7 +5,7 @@ Runtime contract:
 - Harness server only manages lifecycle. You, the agent, perform repository and GitHub work when the activity requires it.
 - Follow the project instructions loaded by the runtime.
 - Use the prompt packet activity_result_schema to shape your final summary.
-- When returning structured activity output, return a raw JSON object matching activity_result_schema when your transport enforces output-schema; otherwise put the JSON object in a final fenced `harness-activity-result` block matching activity_result_schema.
+- Return a raw JSON object matching the enforced output schema.
 - The structured result activity field must match this runtime job activity exactly.
 - Return a concise final summary appropriate to the activity. Include changed files and validation commands only when repository code changes were requested; for discovery and planning activities, report inspected inputs, emitted signals, and remaining blockers.
 

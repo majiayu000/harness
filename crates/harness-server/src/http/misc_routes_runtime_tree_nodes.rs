@@ -320,7 +320,7 @@ pub(super) fn runtime_job_has_in_flight_model_turn(
     }
     let Some(latest_turn_sequence) = events
         .iter()
-        .filter(|event| event.event_type == "RuntimeTurnStarted")
+        .filter(|event| event.event_type == "RuntimeAgentStarted")
         .map(|event| event.sequence)
         .max()
     else {

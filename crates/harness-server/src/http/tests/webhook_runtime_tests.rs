@@ -111,7 +111,7 @@ async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow:
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -141,7 +141,10 @@ async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow:
     let json = response_json(response).await?;
     assert_eq!(json["status"], "planning");
     assert_eq!(json["execution_path"], "workflow_runtime");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     assert_runtime_issue_submission(
         &state,
         dir.path(),
@@ -167,7 +170,7 @@ async fn webhook_issues_opened_requires_workflow_runtime_store() -> anyhow::Resu
     });
     let (state, _agent) =
         make_test_state_with_agent_and_config(dir.path(), dir.path(), config).await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -196,7 +199,10 @@ async fn webhook_issues_opened_requires_workflow_runtime_store() -> anyhow::Resu
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let json = response_json(response).await?;
     assert_eq!(json["error"], "workflow runtime store unavailable");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     Ok(())
 }
 
@@ -306,7 +312,7 @@ async fn webhook_routes_runtime_prompt_to_repo_specific_project_root() -> anyhow
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -342,7 +348,10 @@ async fn webhook_routes_runtime_prompt_to_repo_specific_project_root() -> anyhow
     assert_eq!(json["status"], "implementing");
     assert_eq!(json["execution_path"], "workflow_runtime");
     let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     assert_runtime_prompt_submission(&state, repo_b_dir.path(), runtime_task_id).await?;
     Ok(())
 }
@@ -407,7 +416,7 @@ async fn webhook_ignores_issue_tasks_when_repo_is_unmapped() -> anyhow::Result<(
             .contains("not configured"),
         "reason should explain why the repo was ignored"
     );
-    assert_eq!(state.core.tasks.count(), 0);
+    assert_eq!(state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0), 0);
     Ok(())
 }
 
@@ -434,7 +443,7 @@ async fn webhook_pull_request_review_changes_requested_requests_local_review_gat
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -471,7 +480,10 @@ async fn webhook_pull_request_review_changes_requested_requests_local_review_gat
     assert_eq!(json["workflow_state"], "local_review_gate");
     assert_eq!(json["execution_path"], "workflow_runtime");
     let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     let store = state
         .core
         .workflow_runtime_store
@@ -490,7 +502,7 @@ async fn webhook_ping_event_returns_accepted_without_creating_task() -> anyhow::
     let dir = tempfile::tempdir()?;
     let secret = "secret";
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({ "zen": "Design for failure." });
@@ -510,7 +522,10 @@ async fn webhook_ping_event_returns_accepted_without_creating_task() -> anyhow::
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     Ok(())
 }
 

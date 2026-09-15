@@ -241,6 +241,13 @@ impl CodeAgent for FailingStreamAgent {
             self.error.clone(),
         ))
     }
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.execute_stream(req, tx).await
+    }
 }
 
 #[async_trait]
@@ -271,6 +278,13 @@ impl CodeAgent for BlockingAgent {
             .await;
         let _ = tx.send(StreamItem::Done).await;
         Ok(())
+    }
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.execute_stream(req, tx).await
     }
 }
 
@@ -358,7 +372,7 @@ pub(super) async fn make_test_state_with_project_root(
             home_dir: std::env::var("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| project_root.to_path_buf()),
-            tasks,
+            tasks: Some(tasks),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
@@ -412,7 +426,6 @@ pub(super) async fn make_test_state_with_project_root(
             initialized: Arc::new(AtomicBool::new(true)),
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
-        interceptors: vec![],
         startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
@@ -555,7 +568,6 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
             initialized: Arc::new(AtomicBool::new(true)),
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
-        interceptors: vec![],
         startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {

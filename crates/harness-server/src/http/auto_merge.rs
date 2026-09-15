@@ -16,10 +16,23 @@ pub(crate) fn prepare_auto_merge_workflow_from_snapshot(
     policy: &ResolvedGitHubAutoMergePolicy,
 ) -> anyhow::Result<AutoMergeSnapshotGate> {
     let expected_base_ref = expected_base_ref_from_workflow_data(&workflow.data);
-    if !auto_merge_snapshot_satisfies_policy(
+    let local_review_approved = workflow.state == "ready_to_merge"
+        && workflow
+            .data
+            .get("merge_review_head_sha")
+            .and_then(Value::as_str)
+            .is_some_and(|head| {
+                Some(head)
+                    == snapshot
+                        .normalized_snapshot
+                        .get("head_oid")
+                        .and_then(Value::as_str)
+            });
+    if !snapshot_satisfies_policy(
         &snapshot.normalized_snapshot,
         policy,
         expected_base_ref.as_deref(),
+        local_review_approved,
     ) {
         return Ok(AutoMergeSnapshotGate::NotReady);
     }
@@ -108,13 +121,38 @@ pub(crate) fn auto_merge_snapshot_satisfies_policy(
     policy: &ResolvedGitHubAutoMergePolicy,
     expected_base_ref: Option<&str>,
 ) -> bool {
+    snapshot_satisfies_policy(snapshot, policy, expected_base_ref, false)
+}
+
+fn snapshot_satisfies_policy(
+    snapshot: &Value,
+    policy: &ResolvedGitHubAutoMergePolicy,
+    expected_base_ref: Option<&str>,
+    local_review_approved: bool,
+) -> bool {
     if snapshot_string_eq(snapshot, "state", "MERGED")
         || snapshot_string_eq(snapshot, "state", "CLOSED")
     {
         return false;
     }
-    if !snapshot_string_eq(snapshot, "status_check_rollup_state", "SUCCESS")
-        || !snapshot_string_eq(snapshot, "review_decision", "APPROVED")
+    // An explicitly empty GitHub rollup is different from missing/incomplete
+    // check data. Require current local approval and CLEAN even under a relaxed
+    // merge policy before admitting the no-check case.
+    let reviewed_without_checks = local_review_approved
+        && snapshot_string_eq(snapshot, "merge_state_status", "CLEAN")
+        && snapshot.get("statusCheckRollup") == Some(&Value::Null)
+        && snapshot.get("status_check_rollup_state") == Some(&Value::Null)
+        && snapshot
+            .get("status_check_contexts_complete")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && snapshot
+            .get("status_check_contexts")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+    if !(snapshot_string_eq(snapshot, "status_check_rollup_state", "SUCCESS")
+        || reviewed_without_checks)
+        || (!local_review_approved && !snapshot_string_eq(snapshot, "review_decision", "APPROVED"))
         || snapshot.get("is_draft").and_then(Value::as_bool) != Some(false)
     {
         return false;

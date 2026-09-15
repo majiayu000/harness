@@ -866,3 +866,56 @@ fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
     assert!(!prompt.contains("Repo memory:"));
     assert!(!prompt.contains("```repo-memory"));
 }
+
+#[test]
+fn cursor_builtin_prompt_preserves_evidence_and_omits_unrelated_protocol() {
+    let job = RuntimeJob::pending(
+        "cursor-contract",
+        RuntimeKind::Cursor,
+        "cursor",
+        json!({"command":{"activity":LOCAL_REVIEW_ACTIVITY,"local_review_result":{"summary":"Prior finding evidence"}}}),
+    );
+    let workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "local_review_gate",
+        WorkflowSubject::new("issue", "123"),
+    )
+    .with_server_data(
+        json!({"repo":"owner/repo","issue_plan":{"summary":"Original acceptance criteria"}}),
+    );
+    let profile = RuntimeProfile::new("cursor", RuntimeKind::Cursor);
+    let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        &job,
+        Some(&workflow),
+        Path::new("/repo"),
+        Path::new("/repo"),
+        &profile,
+        &resolved_settings_for_tests(&profile),
+        &WorkflowDocument::default(),
+        &[],
+        None,
+    )
+    .expect("Cursor packet");
+    let prompt = build_runtime_job_prompt(&packet, None);
+    assert!(prompt.contains("Original acceptance criteria"));
+    assert!(prompt.contains("Prior finding evidence"));
+    assert!(prompt.contains("LocalReviewChangesRequested"));
+    assert!(prompt.contains("harness-activity-result"));
+    assert!(!prompt.contains("harness.runtime.json_payload.v1"));
+    assert!(!prompt.contains("workflow_decision_contract"));
+    assert!(!prompt.contains("\"command_type\""));
+    assert!(!prompt.contains("runtime_budget_policy"));
+    assert!(
+        prompt.find("Original acceptance criteria").unwrap()
+            < prompt.find("Activity result contract:").unwrap()
+    );
+    assert!(packet
+        .pointer("/activity_result_schema/json_schema")
+        .is_some());
+    assert!(packet.pointer("/workflow_file/config").is_some());
+    assert!(packet
+        .pointer("/untrusted_command_input/agent_fields/command/local_review_result")
+        .is_some());
+}

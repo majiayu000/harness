@@ -22,6 +22,8 @@ pub struct AgentsConfig {
     #[serde(default)]
     pub opencode: OpenCodeAgentConfig,
     #[serde(default)]
+    pub cursor: CursorAgentConfig,
+    #[serde(default)]
     pub review: AgentReviewConfig,
     #[serde(default)]
     pub approval_policy: ApprovalPolicy,
@@ -87,6 +89,7 @@ impl Default for AgentsConfig {
             codex: CodexAgentConfig::default(),
             anthropic_api: AnthropicApiConfig::default(),
             opencode: OpenCodeAgentConfig::default(),
+            cursor: CursorAgentConfig::default(),
             review: AgentReviewConfig::default(),
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
@@ -691,6 +694,23 @@ impl Default for OpenCodeAgentConfig {
         Self {
             cli_path: PathBuf::from("opencode"),
             default_model: String::new(),
+        }
+    }
+}
+
+/// Local Cursor Agent CLI configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CursorAgentConfig {
+    pub cli_path: PathBuf,
+    pub default_model: String,
+}
+
+impl Default for CursorAgentConfig {
+    fn default() -> Self {
+        Self {
+            cli_path: PathBuf::from("cursor-agent"),
+            default_model: "auto".to_string(),
         }
     }
 }

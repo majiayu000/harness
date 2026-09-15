@@ -1,9 +1,10 @@
-use super::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
+use super::rest_contract::{ContractJson, LegacyJson as Json, PrimitivePath as Path};
 use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use harness_protocol::rest::{HealthCheckResponse, ProjectQueueStatsResponse};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -29,8 +30,15 @@ fn startup_error_code(error: Option<&str>) -> Option<&'static str> {
     }
 }
 
-pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let count = state.core.tasks.count();
+pub(crate) async fn health_check(
+    State(state): State<Arc<AppState>>,
+) -> ContractJson<HealthCheckResponse> {
+    let count = state
+        .core
+        .tasks
+        .as_ref()
+        .map(|tasks| tasks.count())
+        .unwrap_or(0);
     let dirty = state.is_runtime_state_dirty();
     let degraded = &state.degraded_subsystems;
     let runtime_logs = &state.core.server.runtime_logs;
@@ -66,7 +74,7 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
     } else {
         "degraded"
     };
-    Json(json!({
+    ContractJson(HealthCheckResponse(json!({
         "status": status,
         "tasks": count,
         "persistence": {
@@ -90,15 +98,26 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
             "tiers": state.isolation_availability.tiers.clone(),
             "unavailable_required_tiers": unavailable_required_tiers,
         }
-    }))
+    })))
 }
 
 /// GET /projects/queue-stats — per-project queue stats alongside the global queue summary.
 pub(crate) async fn project_queue_stats(
     State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+) -> (StatusCode, ContractJson<ProjectQueueStatsResponse>) {
     let tq = &state.concurrency.task_queue;
-    let active_counts = crate::handlers::overview::active_task_overview_counts(&state).await;
+    let active_counts = match crate::handlers::overview::active_task_overview_counts(&state).await {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::error!("queue stats: active workflow counts unavailable: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ContractJson(ProjectQueueStatsResponse(
+                    json!({"error": "active workflow counts unavailable"}),
+                )),
+            );
+        }
+    };
     let queue_project_stats = tq.all_project_stats();
     let mut project_ids: BTreeSet<String> = active_counts.by_project.keys().cloned().collect();
     project_ids.extend(queue_project_stats.iter().map(|(id, _)| id.clone()));
@@ -125,14 +144,17 @@ pub(crate) async fn project_queue_stats(
             )
         })
         .collect();
-    Json(json!({
-        "global": {
-            "running": active_counts.running,
-            "queued": active_counts.queued,
-            "limit": tq.global_limit(),
-        },
-        "projects": projects,
-    }))
+    (
+        StatusCode::OK,
+        ContractJson(ProjectQueueStatsResponse(json!({
+            "global": {
+                "running": active_counts.running,
+                "queued": active_counts.queued,
+                "limit": tq.global_limit(),
+            },
+            "projects": projects,
+        }))),
+    )
 }
 
 pub(crate) async fn reset_runtime_circuit_breaker(

@@ -131,6 +131,36 @@ pub struct RuntimeHostClaimResponse(pub serde_json::Value);
 #[serde(transparent)]
 pub struct OperatorSnapshotResponse(pub serde_json::Value);
 
+/// JSON response envelope for `/api/dashboard`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct DashboardResponse(pub serde_json::Value);
+
+/// JSON response envelope for `/api/overview`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct OverviewResponse(pub serde_json::Value);
+
+/// JSON response envelope for `/api/token-usage`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct TokenUsageResponse(pub serde_json::Value);
+
+/// JSON response envelope for `/health`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct HealthCheckResponse(pub serde_json::Value);
+
+/// JSON response envelope for `/projects/queue-stats`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct ProjectQueueStatsResponse(pub serde_json::Value);
+
+/// JSON response envelope for `/api/intake`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct IntakeStatusResponse(pub serde_json::Value);
+
 /// Runtime task detail returned by the workflow submission API.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeTaskDetailResponse {
@@ -434,3 +464,21 @@ impl RestDto for ReconcileParams {}
 
 impl private::Sealed for ReconciliationReport {}
 impl RestDto for ReconciliationReport {}
+
+impl private::Sealed for DashboardResponse {}
+impl RestDto for DashboardResponse {}
+
+impl private::Sealed for OverviewResponse {}
+impl RestDto for OverviewResponse {}
+
+impl private::Sealed for TokenUsageResponse {}
+impl RestDto for TokenUsageResponse {}
+
+impl private::Sealed for HealthCheckResponse {}
+impl RestDto for HealthCheckResponse {}
+
+impl private::Sealed for ProjectQueueStatsResponse {}
+impl RestDto for ProjectQueueStatsResponse {}
+
+impl private::Sealed for IntakeStatusResponse {}
+impl RestDto for IntakeStatusResponse {}

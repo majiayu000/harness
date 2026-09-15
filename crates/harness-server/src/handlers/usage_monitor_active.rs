@@ -89,6 +89,7 @@ pub(super) fn runtime_kind(kind: RuntimeKind) -> &'static str {
         RuntimeKind::ClaudeCode => "claude_code",
         RuntimeKind::AnthropicApi => "anthropic_api",
         RuntimeKind::OpenCode => "opencode",
+        RuntimeKind::Cursor => "cursor",
         RuntimeKind::RemoteHost => "remote_host",
     }
 }

@@ -1765,3 +1765,46 @@ fn auto_merge_snapshot_gate_allows_unknown_expected_base() -> anyhow::Result<()>
     assert!(prepared.data.get("expected_base_ref").is_none());
     Ok(())
 }
+
+#[test]
+fn auto_merge_no_checks_requires_current_local_review_and_complete_facts() -> anyhow::Result<()> {
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "77"),
+    )
+    .with_server_data(serde_json::json!({"merge_review_head_sha":"abc123"}));
+    let mut snapshot = ready_auto_merge_snapshot("abc123");
+    snapshot.normalized_snapshot["status_check_rollup_state"] = serde_json::Value::Null;
+    snapshot.normalized_snapshot["statusCheckRollup"] = serde_json::Value::Null;
+    snapshot.normalized_snapshot["status_check_contexts"] = serde_json::json!([]);
+    snapshot.normalized_snapshot["status_check_contexts_complete"] = serde_json::json!(true);
+    let policy = auto_merge_policy(true, true);
+    assert!(matches!(
+        super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+            &workflow, &snapshot, &policy
+        )?,
+        super::auto_merge::AutoMergeSnapshotGate::Ready(_)
+    ));
+    for (field, value) in [
+        ("head_oid", serde_json::json!("changed-head")),
+        ("status_check_contexts_complete", serde_json::json!(false)),
+        ("statusCheckRollup", serde_json::json!({"state":"PENDING"})),
+        ("status_check_rollup_state", serde_json::json!("FAILURE")),
+        ("merge_state_status", serde_json::json!("BLOCKED")),
+    ] {
+        let mut incomplete = snapshot.clone();
+        incomplete.normalized_snapshot[field] = value;
+        assert_eq!(
+            super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+                &workflow,
+                &incomplete,
+                &policy
+            )?,
+            super::auto_merge::AutoMergeSnapshotGate::NotReady,
+            "{field}"
+        );
+    }
+    Ok(())
+}

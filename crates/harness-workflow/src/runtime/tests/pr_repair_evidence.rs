@@ -161,7 +161,7 @@ fn blocking_feedback_result(actionable_blocker_count: u64) -> ActivityResult {
 }
 
 #[test]
-fn repeated_feedback_without_fewer_blockers_stops_repair_oscillation() {
+fn repeated_feedback_without_fewer_blockers_allows_another_bounded_repair() {
     let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -174,15 +174,18 @@ fn repeated_feedback_without_fewer_blockers_stops_repair_oscillation() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("non-converging feedback should stop the workflow");
+        .expect("same-count feedback should request repair");
 
-    assert_eq!(decision.decision, "block_feedback_repair_oscillation");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
     assert_eq!(
         decision.commands[0].command_type,
-        WorkflowCommandType::MarkBlocked
+        WorkflowCommandType::EnqueueActivity
     );
-    assert!(decision.reason.contains("did not decrease"));
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
 }
 
 #[test]
@@ -206,23 +209,27 @@ fn blocker_count_from_local_review_does_not_block_remote_feedback_repair() {
 }
 
 #[test]
-fn propagated_child_block_records_the_parent_recovery_command() {
-    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
-        "pr_number": 77,
-        "pr_url": "https://github.com/owner/repo/pull/77",
-        "task_id": "runtime-task-1",
-        "feedback_repair_round": 1,
-        "feedback_repair_blocker_count": 1,
-        "feedback_repair_lane": "remote_feedback",
-    }));
-    let mut event = event_for_result(blocking_feedback_result(1));
+fn parent_block_from_child_result_records_the_parent_recovery_command() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    // Exercise recovery identity when the parent rejects a child result;
+    // unchanged feedback counts alone no longer imply a blocked workflow.
+    let result = ActivityResult::succeeded(
+        PR_FEEDBACK_INSPECT_ACTIVITY,
+        "Inspection claims readiness without the required snapshot.",
+    )
+    .with_signal(ActivitySignal::new(
+        "PrReadyToMerge",
+        json!({ "pr_number": 77 }),
+    ));
+    let mut event = event_for_result(result);
     event.event["recovery_activity"] = json!("start_child_workflow");
     event.event["recovery_runtime_job_id"] = json!("parent-start-child-job");
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("non-converging child feedback should stop the parent");
+        .expect("missing readiness evidence should stop the parent");
 
+    assert_eq!(decision.decision, "block_invalid_agent_output");
     assert_eq!(decision.next_state, "blocked");
     assert_eq!(
         decision.commands[0].command["last_stop"]["activity"],
@@ -232,6 +239,26 @@ fn propagated_child_block_records_the_parent_recovery_command() {
         decision.commands[0].command["last_stop"]["runtime_job_id"],
         "parent-start-child-job"
     );
+}
+
+#[test]
+fn propagated_actionable_feedback_with_recovery_identity_still_repairs() {
+    let instance = pr_workflow_state("awaiting_feedback");
+    let mut event = event_for_result(blocking_feedback_result(1));
+    event.event["recovery_activity"] = json!("start_child_workflow");
+    event.event["recovery_runtime_job_id"] = json!("parent-start-child-job");
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("actionable feedback should request repair");
+    assert_eq!(decision.next_state, "addressing_feedback");
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some("address_pr_feedback")
+    );
+    assert!(decision
+        .commands
+        .iter()
+        .all(|command| command.command_type != WorkflowCommandType::MarkBlocked));
 }
 
 #[test]
@@ -255,7 +282,7 @@ fn fewer_feedback_blockers_allows_the_next_repair_round() {
 }
 
 #[test]
-fn feedback_repair_history_without_blocker_baseline_stops() {
+fn feedback_repair_history_without_blocker_baseline_still_repairs() {
     let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -266,10 +293,10 @@ fn feedback_repair_history_without_blocker_baseline_stops() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("missing blocker baseline should stop the workflow");
+        .expect("missing blocker baseline must not stop repair");
 
-    assert_eq!(decision.decision, "block_feedback_repair_unmeasured");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
 }
 
 #[test]
@@ -305,7 +332,7 @@ fn structured_only_quality_gate_decision_requires_feedback_outcome_signal() {
 }
 
 #[test]
-fn feedback_repair_round_limit_stops_even_when_blockers_decrease() {
+fn feedback_repair_continues_past_former_round_limit() {
     let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
@@ -318,11 +345,10 @@ fn feedback_repair_round_limit_stops_even_when_blockers_decrease() {
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("repair round limit should stop the workflow");
+        .expect("former round limit must not stop repair");
 
-    assert_eq!(decision.decision, "block_feedback_repair_round_limit");
-    assert_eq!(decision.next_state, "blocked");
-    assert!(decision.reason.contains("3 repair rounds"));
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
 }
 
 #[test]
@@ -480,8 +506,8 @@ fn structured_address_decision_cannot_bypass_feedback_convergence() {
         .expect("event should parse")
         .expect("structured decision must still pass convergence policy");
 
-    assert_eq!(decision.decision, "block_feedback_repair_oscillation");
-    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(decision.decision, "address_pr_feedback");
+    assert_eq!(decision.next_state, "addressing_feedback");
 }
 
 #[test]

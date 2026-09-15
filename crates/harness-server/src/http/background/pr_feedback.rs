@@ -112,7 +112,9 @@ pub(in crate::http) async fn run_runtime_pr_feedback_sweep_tick_with_cursor(
                 continue;
             }
         };
-        if !workflow_cfg.pr_feedback.enabled
+        // Local review is required even when remote feedback polling is disabled.
+        if (!workflow_cfg.pr_feedback.enabled
+            && !matches!(workflow.state.as_str(), "pr_open" | "ready_to_merge"))
             || !workflow_cfg.runtime_dispatch.enabled
             || !workflow_cfg.runtime_worker.enabled
         {
@@ -298,6 +300,44 @@ async fn request_auto_merge_if_enabled(
         state.core.server.config.server.github_token.as_deref(),
     )
     .await?;
+    let observed = &snapshot.normalized_snapshot;
+    if observed.get("state").and_then(serde_json::Value::as_str) != Some("OPEN") {
+        return Ok(AutoMergeRequestOutcome::NotReady);
+    }
+    let head = observed.get("head_oid").and_then(serde_json::Value::as_str);
+    let reviewed = workflow
+        .data
+        .get("merge_review_head_sha")
+        .and_then(serde_json::Value::as_str);
+    let needs_repair = matches!(
+        observed
+            .get("merge_state_status")
+            .and_then(serde_json::Value::as_str),
+        Some("BEHIND" | "DIRTY")
+    ) || matches!(
+        observed
+            .get("status_check_rollup_state")
+            .and_then(serde_json::Value::as_str),
+        Some("FAILURE" | "ERROR")
+    ) || (policy.require_review_threads_resolved
+        && observed
+            .get("active_unresolved_review_threads_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0));
+    if let Some(head) = head.filter(|_| reviewed != head || needs_repair) {
+        let outcome = crate::workflow_runtime_pr_feedback::request_merge_readiness_review(
+            store,
+            workflow.clone(),
+            head,
+        )
+        .await?;
+        return Ok(match outcome {
+            crate::workflow_runtime_pr_feedback::PrFeedbackSweepRequestOutcome::Requested {
+                ..
+            } => AutoMergeRequestOutcome::Requested,
+            _ => AutoMergeRequestOutcome::NotReady,
+        });
+    }
     let workflow = match prepare_auto_merge_workflow_from_snapshot(workflow, &snapshot, &policy)? {
         AutoMergeSnapshotGate::Ready(workflow) => workflow,
         AutoMergeSnapshotGate::NotReady => return Ok(AutoMergeRequestOutcome::NotReady),

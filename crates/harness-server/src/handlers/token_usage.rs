@@ -1,6 +1,7 @@
-use crate::http::rest_contract::LegacyJson as Json;
+use crate::http::rest_contract::ContractJson as Json;
 use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Duration, Utc};
+use harness_protocol::rest::TokenUsageResponse;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -90,7 +91,9 @@ fn home_dir() -> Result<PathBuf, String> {
 ///
 /// This endpoint is intentionally strict: malformed source data returns an
 /// explicit error response instead of silently producing partial/empty metrics.
-pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+pub async fn token_usage(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<TokenUsageResponse>) {
     let window = TokenUsageWindow::last_hours(Utc::now(), DEFAULT_TOKEN_USAGE_WINDOW_HOURS);
     let home = match home_dir() {
         Ok(path) => path,
@@ -162,11 +165,14 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
     let mut totals = UsageBucket::default();
     let mut task_usage: HashMap<String, UsageBucket> = HashMap::new();
 
-    let all_tasks = match state.core.tasks.list_all_summaries_with_terminal().await {
-        Ok(tasks) => tasks,
-        Err(e) => {
-            return error_response(format!("failed to list tasks for usage attribution: {e}"))
-        }
+    let all_tasks = match state.core.tasks.as_ref() {
+        Some(tasks) => match tasks.list_all_summaries_with_terminal().await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                return error_response(format!("failed to list tasks for usage attribution: {e}"))
+            }
+        },
+        None => Vec::new(),
     };
     let task_ids: std::collections::HashSet<String> =
         all_tasks.iter().map(|t| t.id.0.clone()).collect();
@@ -314,14 +320,14 @@ pub async fn token_usage(State(state): State<Arc<AppState>>) -> (StatusCode, Jso
         "session_count": totals.session_count,
     });
 
-    (StatusCode::OK, Json(body))
+    (StatusCode::OK, Json(TokenUsageResponse(body)))
 }
 
-fn error_response(message: String) -> (StatusCode, Json<Value>) {
+fn error_response(message: String) -> (StatusCode, Json<TokenUsageResponse>) {
     tracing::error!("token_usage: {message}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": message })),
+        Json(TokenUsageResponse(serde_json::json!({ "error": message }))),
     )
 }
 
@@ -331,7 +337,7 @@ fn error_response(message: String) -> (StatusCode, Json<Value>) {
 /// so callers and monitoring can distinguish "directory absent" (potentially a
 /// misconfiguration) from "directory present but no sessions yet" (expected
 /// in --no-session-persistence environments).
-fn missing_dir_response(window: TokenUsageWindow) -> (StatusCode, Json<Value>) {
+fn missing_dir_response(window: TokenUsageWindow) -> (StatusCode, Json<TokenUsageResponse>) {
     let body = serde_json::json!({
         "window": window.to_json(),
         "by_day": {},
@@ -347,7 +353,7 @@ fn missing_dir_response(window: TokenUsageWindow) -> (StatusCode, Json<Value>) {
         "session_count": 0,
         "source_dir_missing": true,
     });
-    (StatusCode::OK, Json(body))
+    (StatusCode::OK, Json(TokenUsageResponse(body)))
 }
 
 /// Return zeroed metrics with 200 OK when no session files are available.
@@ -355,7 +361,7 @@ fn missing_dir_response(window: TokenUsageWindow) -> (StatusCode, Json<Value>) {
 /// This is the correct response when `--no-session-persistence` is active:
 /// agents do not write JSONL files, so an absent or empty projects directory
 /// is expected, not an error.
-fn empty_usage_response(window: TokenUsageWindow) -> (StatusCode, Json<Value>) {
+fn empty_usage_response(window: TokenUsageWindow) -> (StatusCode, Json<TokenUsageResponse>) {
     let body = serde_json::json!({
         "window": window.to_json(),
         "by_day": {},
@@ -370,7 +376,7 @@ fn empty_usage_response(window: TokenUsageWindow) -> (StatusCode, Json<Value>) {
         "task_usage": [],
         "session_count": 0,
     });
-    (StatusCode::OK, Json(body))
+    (StatusCode::OK, Json(TokenUsageResponse(body)))
 }
 
 fn parse_usage_record(entry: &Value, ctx: &str) -> Result<Option<ParsedUsageRecord>, String> {

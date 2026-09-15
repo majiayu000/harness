@@ -93,7 +93,12 @@ pub(crate) async fn list_worktrees(state: &AppState) -> anyhow::Result<Vec<Workt
     let mut taskless_runtime_task_ids = Vec::new();
 
     for entry in &entries {
-        if let Some(task) = state.core.tasks.get(&entry.task_id) {
+        if let Some(task) = state
+            .core
+            .tasks
+            .as_ref()
+            .and_then(|tasks| tasks.get(&entry.task_id))
+        {
             if entry.runtime_workflow_id.is_none() {
                 if let Some(workflow_id) = runtime_workflow_id_candidate(&task) {
                     workflow_candidates
@@ -660,7 +665,13 @@ mod tests {
             })),
         )
         .await?;
-        state.core.tasks.insert(&task).await;
+        state
+            .core
+            .tasks
+            .as_ref()
+            .expect("tasks")
+            .insert(&task)
+            .await;
         state.concurrency.workspace_mgr = Some(manager);
 
         let app = axum::Router::new()

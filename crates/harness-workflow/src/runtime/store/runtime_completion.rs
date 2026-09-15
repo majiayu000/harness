@@ -466,6 +466,28 @@ fn apply_runtime_completion_data_side_effect(
     decision: &WorkflowDecision,
     event: &WorkflowEvent,
 ) -> anyhow::Result<()> {
+    if instance.definition_id == "github_issue_pr" {
+        let mut writes = Vec::new();
+        for command in &decision.commands {
+            if let Some(plan) = command.command.get("issue_plan") {
+                writes.push(crate::runtime::WorkflowDataWrite::set(
+                    "issue_plan",
+                    plan.clone(),
+                    crate::runtime::DataProvenance::Agent,
+                ));
+            }
+        }
+        if let Some(result) = event.event.get("activity_result") {
+            if result.get("activity").and_then(Value::as_str) == Some("address_pr_feedback") {
+                writes.push(crate::runtime::WorkflowDataWrite::set(
+                    "previous_repair",
+                    serde_json::json!({"event_id":event.id,"result":result}),
+                    crate::runtime::DataProvenance::Agent,
+                ));
+            }
+        }
+        instance.apply_data_writes(writes)?;
+    }
     apply_pr_feedback_completion_data_side_effect(instance, decision, event)
 }
 

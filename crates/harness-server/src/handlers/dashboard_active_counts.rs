@@ -52,60 +52,34 @@ enum DashboardActiveBucket {
 pub(super) async fn dashboard_active_counts(
     state: &AppState,
     visible_project_ids: Option<&HashSet<String>>,
-) -> DashboardActiveCounts {
+) -> anyhow::Result<DashboardActiveCounts> {
     let mut counts = DashboardActiveCounts::default();
-    let runtime_counts_available = state.core.workflow_runtime_store.is_some();
-    let scope_root = &state.core.project_root;
-    let allowed_project_roots = &state.core.server.config.server.allowed_project_roots;
-
-    if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-        match crate::handlers::definition_ids::active_count_definition_ids(
-            store.definition_registry(),
-        ) {
-            Ok(definition_ids) => {
-                for definition_id in &definition_ids {
-                    match store
-                        .list_nonterminal_instances_by_definition(definition_id, None, None)
-                        .await
-                    {
-                        Ok(workflows) => {
-                            for workflow in workflows {
-                                let projection =
-                                    RuntimeWorkflowProjection::from_workflow_with_registry(
-                                        store.definition_registry(),
-                                        &workflow,
-                                    );
-                                add_active_runtime_workflow(
-                                    &mut counts,
-                                    &projection,
-                                    visible_project_ids,
-                                    scope_root,
-                                    allowed_project_roots,
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                definition_id = definition_id.as_str(),
-                                "dashboard: failed to list runtime workflows for active counts: {error}"
-                            );
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::error!("dashboard: {error}; runtime workflow active counts unavailable");
-            }
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("workflow runtime store unavailable"))?;
+    for definition_id in
+        crate::handlers::definition_ids::active_count_definition_ids(store.definition_registry())?
+    {
+        let workflows = store
+            .list_nonterminal_instances_by_definition(&definition_id, None, None)
+            .await?;
+        for workflow in workflows {
+            let projection = RuntimeWorkflowProjection::from_workflow_with_registry(
+                store.definition_registry(),
+                &workflow,
+            );
+            add_active_runtime_workflow(
+                &mut counts,
+                &projection,
+                visible_project_ids,
+                &state.core.project_root,
+                &state.core.server.config.server.allowed_project_roots,
+            );
         }
     }
-
-    if !runtime_counts_available {
-        counts.running = state.concurrency.task_queue.running_count();
-        counts.queued = state.concurrency.task_queue.queued_count();
-        counts.used_task_queue_fallback = true;
-    }
-
-    counts
+    Ok(counts)
 }
 
 fn add_active_runtime_workflow(

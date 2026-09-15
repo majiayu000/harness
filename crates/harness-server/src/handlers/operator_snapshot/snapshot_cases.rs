@@ -305,7 +305,7 @@ async fn recent_failures_capped_at_max() -> anyhow::Result<()> {
             version: 0,
         };
         task.status = crate::task_runner::TaskStatus::Failed;
-        state.core.tasks.insert(&task).await;
+        state.core.tasks.as_ref().expect("legacy task store").insert(&task).await;
     }
 
     let app = Router::new()
@@ -367,7 +367,7 @@ async fn long_error_is_truncated() -> anyhow::Result<()> {
 
         version: 0,
     };
-    state.core.tasks.insert(&task).await;
+    state.core.tasks.as_ref().expect("legacy task store").insert(&task).await;
 
     let app = Router::new()
         .route("/api/operator-snapshot", get(operator_snapshot))
@@ -434,7 +434,7 @@ async fn unicode_error_truncation_does_not_panic() -> anyhow::Result<()> {
 
         version: 0,
     };
-    state.core.tasks.insert(&task).await;
+    state.core.tasks.as_ref().expect("legacy task store").insert(&task).await;
 
     let app = Router::new()
         .route("/api/operator-snapshot", get(operator_snapshot))

@@ -2,7 +2,9 @@
 async fn includes_runtime_only_failed_workflow_in_recent_failures() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     let dir = test_helpers::tempdir_in_home("harness-test-op-snap-runtime-fail-")?;
-    let state = Arc::new(test_helpers::make_test_state(dir.path()).await?);
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    state.core.tasks = None;
+    let state = Arc::new(state);
     let store = state
         .core
         .workflow_runtime_store
@@ -125,7 +127,7 @@ async fn does_not_double_count_workflow_backed_by_task_row() -> anyhow::Result<(
         version: 0,
     };
     task.status = crate::task_runner::TaskStatus::Failed;
-    state.core.tasks.insert(&task).await;
+    state.core.tasks.as_ref().expect("legacy task store").insert(&task).await;
 
     let store = state
         .core

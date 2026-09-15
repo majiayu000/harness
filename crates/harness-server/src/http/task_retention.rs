@@ -40,15 +40,20 @@ pub(super) fn spawn_task_retention(state: &Arc<AppState>) {
             );
             handle.set_interval(interval.as_secs());
             if workflow_cfg.storage.task_retention_enabled {
+                let Some(tasks) = state.core.tasks.as_ref() else {
+                    handle.tick_ok();
+                    tracing::debug!("task retention skipped: task store unavailable");
+                    drop(state);
+                    tokio::time::sleep(interval).await;
+                    continue;
+                };
                 let dry_run_remaining = dry_run_passes_remaining
                     .get_or_insert(workflow_cfg.storage.task_retention_dry_run_passes);
                 let cutoff = Utc::now()
                     - chrono::Duration::days(workflow_cfg.storage.task_retention_days as i64);
                 if *dry_run_remaining > 0 {
                     *dry_run_remaining -= 1;
-                    match state
-                        .core
-                        .tasks
+                    match tasks
                         .count_terminal_tasks_before(
                             cutoff,
                             workflow_cfg.storage.task_retention_batch_size,
@@ -71,9 +76,7 @@ pub(super) fn spawn_task_retention(state: &Arc<AppState>) {
                         }
                     }
                 } else {
-                    match state
-                        .core
-                        .tasks
+                    match tasks
                         .prune_terminal_tasks_before(
                             cutoff,
                             workflow_cfg.storage.task_retention_batch_size,
