@@ -319,7 +319,11 @@ async fn request_auto_merge_if_enabled(
             .get("status_check_rollup_state")
             .and_then(serde_json::Value::as_str),
         Some("FAILURE" | "ERROR")
-    );
+    ) || (policy.require_review_threads_resolved
+        && observed
+            .get("active_unresolved_review_threads_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0));
     if let Some(head) = head.filter(|_| reviewed != head || needs_repair) {
         let outcome = crate::workflow_runtime_pr_feedback::request_merge_readiness_review(
             store,

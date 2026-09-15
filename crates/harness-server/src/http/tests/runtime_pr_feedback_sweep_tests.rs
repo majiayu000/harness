@@ -598,3 +598,85 @@ async fn runtime_pr_feedback_disabled_still_runs_local_review() -> anyhow::Resul
     assert!(store.commands_for("remote-disabled").await?.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn runtime_pr_feedback_sweep_rechecks_required_threads_on_reviewed_head() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    use crate::workspace::test_support::{async_env_lock, ScopedEnvVar};
+    let _env_guard = async_env_lock().lock().await;
+    for (auto_merge, require_threads) in [(true, true), (true, false), (false, true)] {
+        let response = serde_json::json!({
+            "data": {"repository": {
+                "pullRequest": graphql_pr("reviewed-head", "2026-09-16T00:00:00Z")
+            }}
+        });
+        let (graphql_url, received) = spawn_graphql_stub(response.to_string()).await?;
+        let _graphql_guard = ScopedEnvVar::set("HARNESS_GITHUB_GRAPHQL_URL", &graphql_url);
+        let dir = tempfile::tempdir()?;
+        let project_root = dir.path().join("project");
+        std::fs::create_dir(&project_root)?;
+        std::fs::write(
+            project_root.join("WORKFLOW.md"),
+            "---\npr_feedback:\n  enabled: true\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+        )?;
+        let mut config = harness_core::config::HarnessConfig::default();
+        let mut github = harness_core::config::intake::GitHubIntakeConfig::default();
+        github.repo = "owner/repo".into();
+        github.auto_merge.enabled = auto_merge;
+        github.auto_merge.require_review_threads_resolved = require_threads;
+        config.intake.github = Some(github);
+        let state = make_test_state_with_workflow_runtime_config_and_registry(
+            dir.path(),
+            dir.path(),
+            config,
+            harness_agents::registry::AgentRegistry::new("test"),
+        )
+        .await?;
+        let store = state.core.workflow_runtime_store.as_ref().unwrap();
+        let workflow = harness_workflow::runtime::WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "ready_to_merge",
+            harness_workflow::runtime::WorkflowSubject::new("issue", "issue:77"),
+        )
+        .with_id("reviewed-head-with-new-thread")
+        .with_server_data(serde_json::json!({
+            "project_id": project_root,
+            "repo": "owner/repo",
+            "issue_number": 77,
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "task_id": "runtime-task-77",
+            "merge_review_head_sha": "reviewed-head",
+        }));
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
+        let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 1).await?;
+        let persisted = store.get_instance(&workflow.id).await?.unwrap();
+        let commands = store.commands_for(&workflow.id).await?;
+        if auto_merge && require_threads {
+            assert_eq!(tick.auto_merge_requested, 1);
+            assert_eq!(persisted.state, "local_review_gate");
+            assert_eq!(commands.len(), 1);
+            assert_eq!(
+                commands[0].command.activity_name(),
+                Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)
+            );
+        } else {
+            assert_ne!(persisted.state, "local_review_gate");
+            assert!(commands
+                .iter()
+                .all(|command| command.command.activity_name()
+                    != Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)));
+            if !auto_merge {
+                assert_eq!(persisted.state, "ready_to_merge");
+                assert!(commands.is_empty());
+            }
+        }
+        assert_eq!(received.lock().await.len(), usize::from(auto_merge));
+    }
+    Ok(())
+}
