@@ -1,8 +1,8 @@
-use crate::http::rest_contract::LegacyJson as Json;
-use crate::http::AppState;
+use crate::http::{rest_contract::ContractJson as Json, AppState};
 use axum::{extract::State, http::StatusCode};
 use harness_core::types::EventFilters;
 use harness_observe::{quality::QualityGrader, stats};
+use harness_protocol::rest::DashboardResponse;
 use serde_json::{json, Value};
 use std::{collections::HashSet, sync::Arc};
 
@@ -13,19 +13,15 @@ use super::dashboard_active_counts::{dashboard_active_counts, DashboardProjectAc
 /// store materialises all matching rows into memory on every call.
 const DASHBOARD_EVENT_WINDOW_DAYS: i64 = 30;
 
-/// Server start time. Initialized once in `serve()` before accepting connections,
-/// so `uptime_secs` reflects true server uptime rather than time since first dashboard hit.
+/// Initialized in `serve()` before accepting connections to measure server uptime.
 pub(crate) static SERVER_START: std::sync::OnceLock<std::time::Instant> =
     std::sync::OnceLock::new();
 
-/// GET /api/dashboard — JSON summary of all registered projects and global concurrency.
-///
-/// Per-project entries include active runtime work stats
-/// (running/queued) plus historical done/failed counts and the latest PR URL
-/// for the project. Per-host entries include active lease count and assignment
-/// pressure (active_leases / max(watched_projects, 1)).
-/// Global metrics (done, failed, latest_pr, grade, uptime) aggregate all tasks.
-pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+/// GET /api/dashboard — project runtime counts, latest PRs, and global metrics.
+/// Host assignment pressure is active_leases / max(watched_projects, 1).
+pub async fn dashboard(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<DashboardResponse>) {
     let start = SERVER_START.get_or_init(std::time::Instant::now);
     let uptime_secs = start.elapsed().as_secs();
 
@@ -40,7 +36,9 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             tracing::error!("dashboard: workflow runtime metrics query failed: {error}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "workflow runtime metrics unavailable"})),
+                Json(DashboardResponse(
+                    json!({"error": "workflow runtime metrics unavailable"}),
+                )),
             );
         }
     };
@@ -62,7 +60,9 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
             tracing::error!("dashboard: active workflow counts unavailable: {error}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "active workflow counts unavailable"})),
+                Json(DashboardResponse(
+                    json!({"error": "active workflow counts unavailable"}),
+                )),
             );
         }
     };
@@ -250,7 +250,7 @@ pub async fn dashboard(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
         }
     });
 
-    (StatusCode::OK, Json(body))
+    (StatusCode::OK, Json(DashboardResponse(body)))
 }
 
 #[cfg(test)]

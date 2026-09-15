@@ -1,9 +1,10 @@
-use super::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
+use super::rest_contract::{ContractJson, LegacyJson as Json, PrimitivePath as Path};
 use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use harness_protocol::rest::{HealthCheckResponse, ProjectQueueStatsResponse};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -29,7 +30,9 @@ fn startup_error_code(error: Option<&str>) -> Option<&'static str> {
     }
 }
 
-pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+pub(crate) async fn health_check(
+    State(state): State<Arc<AppState>>,
+) -> ContractJson<HealthCheckResponse> {
     let count = state
         .core
         .tasks
@@ -71,7 +74,7 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
     } else {
         "degraded"
     };
-    Json(json!({
+    ContractJson(HealthCheckResponse(json!({
         "status": status,
         "tasks": count,
         "persistence": {
@@ -95,13 +98,13 @@ pub(crate) async fn health_check(State(state): State<Arc<AppState>>) -> Json<ser
             "tiers": state.isolation_availability.tiers.clone(),
             "unavailable_required_tiers": unavailable_required_tiers,
         }
-    }))
+    })))
 }
 
 /// GET /projects/queue-stats — per-project queue stats alongside the global queue summary.
 pub(crate) async fn project_queue_stats(
     State(state): State<Arc<AppState>>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> (StatusCode, ContractJson<ProjectQueueStatsResponse>) {
     let tq = &state.concurrency.task_queue;
     let active_counts = match crate::handlers::overview::active_task_overview_counts(&state).await {
         Ok(counts) => counts,
@@ -109,7 +112,9 @@ pub(crate) async fn project_queue_stats(
             tracing::error!("queue stats: active workflow counts unavailable: {error}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "active workflow counts unavailable"})),
+                ContractJson(ProjectQueueStatsResponse(
+                    json!({"error": "active workflow counts unavailable"}),
+                )),
             );
         }
     };
@@ -141,14 +146,14 @@ pub(crate) async fn project_queue_stats(
         .collect();
     (
         StatusCode::OK,
-        Json(json!({
+        ContractJson(ProjectQueueStatsResponse(json!({
             "global": {
                 "running": active_counts.running,
                 "queued": active_counts.queued,
                 "limit": tq.global_limit(),
             },
             "projects": projects,
-        })),
+        }))),
     )
 }
 
