@@ -36,6 +36,7 @@ async fn prompt_continuation_submit_active_settled_reaches_done() -> anyhow::Res
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: "Continue TEAM-123 until it settles.",
             depends_on: &[],
@@ -142,6 +143,7 @@ async fn cancelled_prompt_continuation_does_not_enqueue_another_attempt() -> any
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: "Continue TEAM-456 until it settles.",
             depends_on: &[],
@@ -207,6 +209,7 @@ async fn prompt_continuation_exhaustion_and_malformed_signal_block_without_new_a
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &exhausted_task_id,
             prompt: "Continue until the attempt bound is reached.",
             depends_on: &[],
@@ -266,6 +269,7 @@ async fn prompt_continuation_exhaustion_and_malformed_signal_block_without_new_a
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &malformed_task_id,
             prompt: "Block if the external-state contract is missing.",
             depends_on: &[],

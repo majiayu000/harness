@@ -126,6 +126,7 @@ impl DefaultExecutionService {
             store,
             crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
                 project_root,
+                repo: prepared.req.repo.as_deref(),
                 task_id: &task_id,
                 prompt,
                 depends_on: &prepared.req.depends_on,

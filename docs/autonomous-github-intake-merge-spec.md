@@ -1,5 +1,11 @@
 # Autonomous GitHub Intake And Merge Closure Spec
 
+> Architecture relationship (2026-08-28): this remains the GitHub fact-collection and merge-profile
+> reference. `docs/workflow-first-autonomous-change-rfc.md` proposes future changes to task/PR
+> orchestration, remote change binding, Evidence authority, review identity, risk tiers, and merge
+> authorization, but is not yet approved and does not supersede shipped behavior. GitHub remains one
+> provider adapter rather than a required core Workflow state machine.
+
 Status: Draft v1
 Author: harness contributor
 Audience: harness maintainers and implementers

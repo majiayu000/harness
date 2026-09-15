@@ -1,5 +1,10 @@
 # Review Integrity — Analysis Report
 
+> Architecture relationship (2026-08-28): this is a historical analysis of the review chain at the
+> commit named below. Proposed vNext contracts for immutable reviewer assignments, fresh-context
+> independence, typed ReviewReceipt Evidence, invalidation, and merge gates are in
+> `docs/workflow-first-autonomous-change-rfc.md`; they are not yet owner-approved.
+
 > Linked issue: GH-1767
 > Date: 2026-07-26
 > Scope: the code-review layer of the harness — cross-agent review, review

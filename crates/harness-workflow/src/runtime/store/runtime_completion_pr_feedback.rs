@@ -16,6 +16,7 @@ pub(super) fn apply_pr_feedback_completion_data_side_effect(
         let next_round = next_feedback_repair_round(&instance.data);
         ensure_object_data(instance);
         let mut writes = vec![
+            WorkflowDataWrite::remove("merge_review_head_sha", DataProvenance::Server),
             WorkflowDataWrite::set(
                 "feedback_repair_round",
                 json!(next_round),

@@ -61,3 +61,18 @@ not measure live agent review quality, repair convergence, token consumption,
 or production reliability. A read-only, isolated live workflow trial remains the
 next gate before enabling a selected workflow in an operational project. No
 live agent trial or production rollout is claimed here.
+
+## Integration follow-up (2026-09-15)
+
+The checkpoint was merged with main while retaining runtime operator snapshots and optional legacy TaskStore access. Fresh verification passed the server all-target check and 21 operator-snapshot tests against disposable PostgreSQL.
+
+Independent source review identified two merge-review target lifecycle defects. Both were reproduced with failing regressions before correction:
+
+- A readiness request wrote the current head before persistence cleared stale ready-state metadata, deleting its own target. Persistence now installs the newly requested target after invalidation; explicit resubmission continues to clear old approval.
+- A changes-requested review retained the pre-repair target. Entering local repair now invalidates that target so the repaired commit can be reviewed before the server selects a fresh merge target.
+
+Fresh validation passed 33 local-review tests, 27 server PR-feedback tests, 36 repair-evidence tests, and 8 runtime-recovery tests. One recovery concurrency test remained explicitly ignored in that filtered run. PostgreSQL tests used an isolated disposable database. The readiness regression covers request persistence, the real completion reducer, and persisted ready state; it is not a live GitHub merge trial.
+
+A stale server test previously attempted a local pass directly from pr_open through a warning-only test wrapper and expected the former remote-review/quality-gate sequence. It now requests review first, propagates persistence errors, asserts ready_to_merge, and verifies late remote feedback creates no additional command. The unused wrapper was removed.
+
+Fresh independent review approved the fixes, integration, and test adjustments without remaining blockers in the inspected paths. The large checkpoint was reviewed by risk area, not exhaustively line by line. CI and a bounded production trial remain separate evidence; no production service was restarted or deployed during integration.

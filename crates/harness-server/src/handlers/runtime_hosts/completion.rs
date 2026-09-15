@@ -125,6 +125,9 @@ pub async fn complete_runtime_job_for_runtime_host(
         Err(response) => return (StatusCode::BAD_REQUEST, completion_json(response)),
     };
     if !cancellation_ack {
+        if let Err((status, response)) = validate_eval_network_policy_report(&job, &result) {
+            return (status, completion_json(response));
+        }
         if let Err((status, response)) = validate_eval_resource_limit_report(&job, &result) {
             return (status, completion_json(response));
         }
@@ -346,6 +349,7 @@ pub async fn complete_runtime_job_for_runtime_host(
 
 mod capabilities;
 mod evidence;
+mod network_policy;
 mod reservation;
 use capabilities::validate_eval_host_capabilities;
 use evidence::{
@@ -354,6 +358,9 @@ use evidence::{
 };
 pub(super) use evidence::{
     eval_resource_limit_preflight_failure, validate_eval_resource_limit_report,
+};
+pub(super) use network_policy::{
+    eval_network_policy_preflight_failure, validate_eval_network_policy_report,
 };
 pub(crate) use reservation::replay_completion_reservation;
 use reservation::reserve_completion_lease;

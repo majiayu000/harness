@@ -403,7 +403,13 @@ impl DefaultExecutionService {
         self.check_allowed_roots(&canonical)?;
         let project_id = canonical.to_string_lossy().into_owned();
         req.project = Some(canonical.clone());
-        workflow_runtime_submission::fill_missing_repo_from_project(&mut req).await;
+        // Issue/PR subjects need a GitHub slug; auto-detect from the checkout is
+        // acceptable there because ownership is pinned by issue/PR number.
+        // Prompt workflows must not promote mutable `.git` remotes into trusted
+        // `workflow.data.repo` (GH-2054) — callers supply repo explicitly.
+        if req.issue.is_some() || req.pr.is_some() {
+            workflow_runtime_submission::fill_missing_repo_from_project(&mut req).await;
+        }
         Self::normalize_remote_subject_identity(&mut req)?;
         Self::populate_external_id(&mut req);
 
@@ -540,18 +546,18 @@ impl DefaultExecutionService {
     fn normalize_remote_subject_identity(
         req: &mut CreateTaskRequest,
     ) -> Result<(), EnqueueTaskError> {
-        if req.issue.is_none() && req.pr.is_none() {
-            return Ok(());
-        }
-        let repo = req
-            .repo
-            .as_deref()
-            .filter(|repo| !repo.is_empty())
-            .ok_or_else(|| {
-                EnqueueTaskError::BadRequest(
+        let requires_repo = req.issue.is_some() || req.pr.is_some();
+        let Some(repo) = req.repo.as_deref().filter(|repo| !repo.is_empty()) else {
+            return if requires_repo {
+                Err(EnqueueTaskError::BadRequest(
                     "GitHub issue/PR submissions require a repository slug".to_string(),
-                )
-            })?;
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        // Prompt and issue/PR paths both persist repo as trusted ownership
+        // (GH-2054); validate at the request boundary before promotion.
         if repo != repo.trim() || !valid_github_repo_slug(repo) {
             return Err(EnqueueTaskError::BadRequest(format!(
                 "invalid GitHub repository slug: {repo}"
@@ -703,8 +709,26 @@ impl ExecutionService for DefaultExecutionService {
 mod continuation_tests;
 
 #[cfg(test)]
-#[path = "../execution_declarative_tests.rs"]
-mod declarative_tests;
+mod declarative_tests {
+    use super::*;
+
+    #[test]
+    fn declarative_submission_requires_a_non_empty_prompt() {
+        for prompt in [None, Some("   ".to_string())] {
+            let request = CreateTaskRequest {
+                definition_id: Some("docs_review".to_string()),
+                prompt,
+                ..Default::default()
+            };
+
+            assert!(matches!(
+                DefaultExecutionService::validate_request(&request),
+                Err(EnqueueTaskError::BadRequest(message))
+                    if message == "declarative workflow submissions require a non-empty prompt"
+            ));
+        }
+    }
+}
 
 #[cfg(test)]
 #[path = "../execution_runtime_policy_tests.rs"]

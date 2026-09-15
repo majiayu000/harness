@@ -26,11 +26,32 @@ fn ordinary_eval_input() -> serde_json::Value {
 }
 
 fn ordinary_eval_completion_request(claimed: &serde_json::Value) -> serde_json::Value {
+    let network_policy = claimed.get("network_policy").cloned().unwrap_or_else(|| {
+        json!({
+            "inbound": "deny",
+            "outbound": "deny",
+            "network_allowlist": [],
+        })
+    });
+    let result = ActivityResult::succeeded("implement_issue", "ordinary completion").with_artifact(
+        ActivityArtifact::new(
+            "network_policy_report",
+            json!({
+                "runtime_job_id": claimed["runtime_job_id"],
+                "enforced": true,
+                "policy": network_policy,
+                "grants": [],
+                "connections": [],
+                "payloads_recorded": false,
+                "reason": "runtime host enforced eval network policy",
+            }),
+        ),
+    );
     json!({
         "lease_generation": claimed["lease_generation"],
         "lease_expires_at": claimed["lease_expires_at"],
         "lease_proof": claimed["lease_proof"],
-        "result": ActivityResult::succeeded("implement_issue", "ordinary completion"),
+        "result": result,
         "execution_evidence": {
             "checked_out_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "resource_limit_report": {
@@ -162,7 +183,12 @@ async fn runtime_job_completion_preserves_cancelled_eval_feedback_cleanup_proof(
         return Ok(());
     };
     let app = support::runtime_hosts_workflow_app(state);
-    support::register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+    support::register_host_with_capabilities(
+        &app,
+        "host-a",
+        vec!["eval_resource_limits", "eval_network_policy"],
+    )
+    .await?;
     let job = support::enqueue_runtime_host_test_job(
         &store,
         "cancelled-eval-feedback",
@@ -246,7 +272,12 @@ async fn completion_reservation_reports_cleanup_ack_when_terminal_fence_wins_rac
         return Ok(());
     };
     let app = support::runtime_hosts_workflow_app(state);
-    support::register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+    support::register_host_with_capabilities(
+        &app,
+        "host-a",
+        vec!["eval_resource_limits", "eval_network_policy"],
+    )
+    .await?;
     let job = support::enqueue_runtime_host_test_job(
         &store,
         "completion-terminal-fence-race",
@@ -320,7 +351,12 @@ async fn completion_commit_reports_cleanup_ack_when_post_reservation_fence_wins_
         return Ok(());
     };
     let app = support::runtime_hosts_workflow_app(state);
-    support::register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+    support::register_host_with_capabilities(
+        &app,
+        "host-a",
+        vec!["eval_resource_limits", "eval_network_policy"],
+    )
+    .await?;
     let key = "post-reservation-terminal-fence-race";
     let workflow_id = format!("runtime-host-test-{key}");
     let job = support::enqueue_runtime_host_test_job(
@@ -415,7 +451,12 @@ async fn stale_dead_letter_reports_cleanup_ack_when_terminal_fence_wins_race() -
         return Ok(());
     };
     let app = support::runtime_hosts_workflow_app(state);
-    support::register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+    support::register_host_with_capabilities(
+        &app,
+        "host-a",
+        vec!["eval_resource_limits", "eval_network_policy"],
+    )
+    .await?;
     let key = "stale-dead-letter-terminal-fence-race";
     let workflow_id = format!("runtime-host-test-{key}");
     let job = support::enqueue_runtime_host_test_job(

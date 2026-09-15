@@ -129,6 +129,7 @@ pub(super) async fn persist_local_review_request<F, Fut>(
     instance: WorkflowInstance,
     new_instance: bool,
     additional_prompt: Option<&str>,
+    merge_review_head_sha: Option<&str>,
     admission: F,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome>
 where
@@ -160,6 +161,9 @@ where
                 data.remove(field);
             }
         }
+    }
+    if let Some(head_sha) = merge_review_head_sha {
+        accepted_data["merge_review_head_sha"] = json!(head_sha);
     }
     let review_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let output = build_local_review_request_decision(

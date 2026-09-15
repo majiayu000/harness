@@ -151,6 +151,44 @@ mod tests {
     }
 
     #[test]
+    fn selected_workflow_preserves_explicit_central_precedence() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("flow.md"), FLOW)?;
+        let base = root.path().join("base.md");
+        std::fs::write(
+            root.path().join("WORKFLOW.md"),
+            "---\nworkflow: {file: flow.md}\n---\n",
+        )?;
+        std::fs::write(&base, "---\ndefinition: {}\n---\n")?;
+        let error = load_workflow_document_with_base(root.path(), Some(&base))
+            .expect_err("inherited inline definitions must not silently disappear");
+        assert!(error.to_string().contains("inline definition"), "{error}");
+
+        std::fs::write(
+            &base,
+            "---\nactivities:\n  inspect:\n    validation: [central-check]\n---\n",
+        )?;
+        let doc = load_workflow_document_with_base(root.path(), Some(&base))?;
+        assert_eq!(
+            doc.config.activities["inspect"].validation,
+            vec!["central-check"]
+        );
+        assert_eq!(
+            doc.config.activities["inspect"].prompt.as_deref(),
+            Some("Inspect without editing files.")
+        );
+
+        std::fs::write(root.path().join("WORKFLOW.md"),
+            "---\nworkflow: {file: flow.md}\nactivities:\n  inspect:\n    validation: [project-check]\n---\n")?;
+        let doc = load_workflow_document_with_base(root.path(), Some(&base))?;
+        assert_eq!(
+            doc.config.activities["inspect"].validation,
+            vec!["project-check"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn selected_workflow_rejects_malformed_activity_overrides() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         std::fs::write(root.path().join("flow.md"), FLOW)?;

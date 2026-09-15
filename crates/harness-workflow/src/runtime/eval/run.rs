@@ -554,13 +554,17 @@ fn eval_isolation_metadata(isolation: &EvalIsolationProfile) -> Value {
         "sandbox": isolation.sandbox,
         "backend": isolation.backend,
         "image": isolation.image,
+        "network_allowlist": isolation.network_allowlist,
         "lifecycle": isolation.lifecycle,
         "cleanup_required": isolation.cleanup_required,
     })
 }
 
 fn eval_required_runtime_host_capabilities(verification_argv: &[Vec<String>]) -> Vec<&'static str> {
-    let mut capabilities = vec![harness_sandbox::EVAL_RESOURCE_LIMITS_CAPABILITY];
+    let mut capabilities = vec![
+        harness_sandbox::EVAL_RESOURCE_LIMITS_CAPABILITY,
+        harness_sandbox::EVAL_NETWORK_POLICY_CAPABILITY,
+    ];
     if verification_argv
         .iter()
         .any(|argv| is_trusted_eval_verifier_argv(argv))

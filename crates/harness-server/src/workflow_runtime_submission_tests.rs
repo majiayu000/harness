@@ -118,6 +118,7 @@ async fn prompt_submission_records_pending_runtime_implementation_command() -> a
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: "fix the prompt-only issue",
             depends_on: &[],
@@ -260,6 +261,7 @@ async fn prompt_resubmission_removes_previous_cached_prompt() -> anyhow::Result<
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: "new prompt body",
             depends_on: &[],
@@ -590,6 +592,7 @@ async fn cancel_prompt_submission_cancels_dispatched_runtime_jobs() -> anyhow::R
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: "cancel this prompt runtime task",
             depends_on: &[],

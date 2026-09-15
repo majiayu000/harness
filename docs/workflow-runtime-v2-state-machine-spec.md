@@ -1,5 +1,11 @@
 # Workflow Runtime V2 State Machine Spec
 
+> Architecture relationship (2026-08-28): this remains the durable orchestration-kernel baseline.
+> `docs/workflow-first-autonomous-change-rfc.md` proposes extending it with compiled Workflow
+> bundles, typed Evidence and receipts, general Child Work Items, external/operator waits, and
+> integration progress. The proposal is not yet approved and does not supersede this baseline.
+> Physical cutover is a separate proposal in `docs/workflow-vnext-cutover-rfc.md`.
+
 > Historical design record: references to `/tasks` and live legacy task rows
 > describe the pre-GH-1434 migration state. The compatibility routes and legacy
 > orchestration branches were removed in PR #1706. Current clients use

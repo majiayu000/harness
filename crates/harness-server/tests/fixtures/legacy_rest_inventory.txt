@@ -1,8 +1,6 @@
 # Generated baseline. Entries may be removed as legacy routes migrate, but additions fail.
 function src/handlers/dashboard.rs::dashboard 752d89287a7fe62609b85913d6dd7ef756a5ab866a5bbf539a94a27bc6c6c86e
 function src/handlers/operator_monitor/response.rs::operator_monitor 55d240d9015ad47ad474a3714ea153902274156892d1c39426b7f761d68aadae
-function src/handlers/operator_snapshot.rs::error_response d6713c45515f3e77efdd4acc0e725dfad942d270fb467175706a6c96cc54139e
-function src/handlers/operator_snapshot.rs::operator_snapshot b296226d60471d20c77ecf8280105d045de2e12a02639d4190e4999b4c7ebfce
 function src/handlers/overview.rs::overview 54bb035b84e8f805cb851c750d2f58064f7cd987683583b8c5f400554638d7e2
 function src/handlers/projects.rs::delete_project 028acfca01b4230d85a92cdb0c8d950162377dd3db15714868df07b0d0bbc29f
 function src/handlers/projects.rs::get_project 6b22146b52cae348ebe522e1af941ca3de6a857d48a96f57a0aaea7cb80595e7
