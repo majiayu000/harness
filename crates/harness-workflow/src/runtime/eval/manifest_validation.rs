@@ -236,6 +236,10 @@ pub(super) fn normalize_isolation_profile(
     profile.sandbox = non_empty(profile.sandbox, "eval isolation sandbox")?;
     profile.backend = non_empty(profile.backend, "eval isolation backend")?;
     profile.image = non_empty(profile.image, "eval isolation image")?;
+    profile.network_allowlist =
+        harness_sandbox::EvalNetworkPolicy::for_allowlist(&profile.network_allowlist)
+            .map_err(|error| ManifestError::new(format!("{context} network_allowlist: {error}")))?
+            .network_allowlist;
 
     match profile.tier {
         IsolationTier::Host => {

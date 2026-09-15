@@ -241,7 +241,15 @@ fn candidate_promotion_success_decision_inner(
     let (pr_number, pr_url) = pull_request_artifact(result)
         .ok_or_else(|| anyhow::anyhow!("promote_candidate_pr succeeded without pull_request"))?;
     let binding = match super::reducer::verified_pr_binding_evidence_with_registry(
-        registry, result, pr_number, &pr_url,
+        registry,
+        result,
+        pr_number,
+        &pr_url,
+        Some((
+            super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID,
+            "implementing",
+            "pr_open",
+        )),
     ) {
         Ok(binding) => binding,
         Err(reason) => {

@@ -1,16 +1,16 @@
 use super::*;
 
-const RESOURCE_LIMIT_CAPABILITY_RETRY_DELAY_SECS: i64 = 30;
+const CAPABILITY_RETRY_DELAY_SECS: i64 = 30;
 
-pub(super) async fn defer_runtime_host_resource_limit_claim(
+pub(super) async fn defer_runtime_host_capability_claim(
     store: &WorkflowRuntimeStore,
     host_id: &str,
     lease_expires_at: DateTime<Utc>,
     job: &RuntimeJob,
     reason: &str,
+    required_capability: &str,
 ) -> (StatusCode, serde_json::Value) {
-    let not_before =
-        Utc::now() + chrono::TimeDelta::seconds(RESOURCE_LIMIT_CAPABILITY_RETRY_DELAY_SECS);
+    let not_before = Utc::now() + chrono::TimeDelta::seconds(CAPABILITY_RETRY_DELAY_SECS);
     match store
         .defer_runtime_job_claim_if_owned(&job.id, host_id, lease_expires_at, not_before)
         .await
@@ -25,7 +25,7 @@ pub(super) async fn defer_runtime_host_resource_limit_claim(
                         "not_before": not_before,
                         "reason": reason,
                         "claim_api": "runtime_host",
-                        "required_capability": EVAL_RESOURCE_LIMITS_CAPABILITY,
+                        "required_capability": required_capability,
                     }),
                 )
                 .await
@@ -34,7 +34,7 @@ pub(super) async fn defer_runtime_host_resource_limit_claim(
                     runtime_job_id = %job.id,
                     host_id = %host_id,
                     %error,
-                    "runtime host resource-limit claim defer succeeded but event recording failed"
+                    "runtime host capability claim defer succeeded but event recording failed"
                 );
             }
             (
@@ -46,7 +46,7 @@ pub(super) async fn defer_runtime_host_resource_limit_claim(
                     "runtime_job": deferred,
                     "not_before": not_before,
                     "reason": reason,
-                    "required_capability": EVAL_RESOURCE_LIMITS_CAPABILITY,
+                    "required_capability": required_capability,
                 }),
             )
         }
@@ -85,7 +85,7 @@ pub(super) async fn defer_runtime_host_resource_limit_claim(
             tracing::warn!(
                 runtime_job_id = %job.id,
                 host_id = %host_id,
-                "runtime host resource-limit claim defer ignored because the host no longer owns the lease"
+                "runtime host capability claim defer ignored because the host no longer owns the lease"
             );
             (StatusCode::OK, json!({ "claimed": false }))
         }
@@ -94,7 +94,7 @@ pub(super) async fn defer_runtime_host_resource_limit_claim(
                 runtime_job_id = %job.id,
                 host_id = %host_id,
                 %error,
-                "runtime host failed to defer resource-limit-incompatible runtime job"
+                "runtime host failed to defer capability-incompatible runtime job"
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

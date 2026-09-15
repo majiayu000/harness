@@ -648,11 +648,31 @@ fn eval_required_isolation_resolution(
         );
     }
 
+    let network_allowlist = isolation
+        .get("network_allowlist")
+        .map(|value| {
+            serde_json::from_value::<Vec<String>>(value.clone()).with_context(|| {
+                format!(
+                    "eval command {} has invalid eval.isolation.network_allowlist: {value}",
+                    command.id
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let network_policy = harness_sandbox::EvalNetworkPolicy::for_allowlist(&network_allowlist)
+        .with_context(|| {
+            format!(
+                "eval command {} has invalid eval.isolation.network_allowlist",
+                command.id
+            )
+        })?;
+
     Ok(Some(IsolationTierResolution {
         tier,
         reason: "eval command required container isolation tier from policy".to_string(),
         trust_class: IsolationTrustClass::NonCollaborator,
-        network_allowlist: Vec::new(),
+        network_allowlist: network_policy.network_allowlist,
     }))
 }
 

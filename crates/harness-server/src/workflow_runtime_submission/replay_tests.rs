@@ -110,6 +110,7 @@ async fn prompt_resubmission_after_completed_command_creates_fresh_attempt() -> 
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: "first prompt body",
             depends_on: &[],
@@ -134,6 +135,7 @@ async fn prompt_resubmission_after_completed_command_creates_fresh_attempt() -> 
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: "second prompt body",
             depends_on: &[],

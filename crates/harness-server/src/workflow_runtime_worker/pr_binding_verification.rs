@@ -24,7 +24,7 @@ const PR_BINDING_RETRY_DELAY_MS: u64 = 500;
 
 /// Activities whose successful results may claim a new PR binding for a
 /// `github_issue_pr` workflow in `implementing`.
-const PR_BINDING_ACTIVITIES: [&str; 2] = ["implement_issue", "promote_candidate_pr"];
+const GITHUB_ISSUE_PR_BINDING_ACTIVITIES: [&str; 2] = ["implement_issue", "promote_candidate_pr"];
 
 pub(super) fn result_claims_pr_binding(
     job: &RuntimeJob,
@@ -34,11 +34,24 @@ pub(super) fn result_claims_pr_binding(
     let Some(workflow) = workflow else {
         return false;
     };
-    workflow.definition_id == harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID
-        && workflow.state == "implementing"
-        && result.status == ActivityStatus::Succeeded
-        && PR_BINDING_ACTIVITIES.contains(&super::data_helpers::activity_name(job).as_str())
-        && claimed_pull_request(result).is_some()
+    if workflow.state != "implementing"
+        || result.status != ActivityStatus::Succeeded
+        || claimed_pull_request(result).is_none()
+    {
+        return false;
+    }
+    let activity = super::data_helpers::activity_name(job);
+    match workflow.definition_id.as_str() {
+        harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID => {
+            GITHUB_ISSUE_PR_BINDING_ACTIVITIES.contains(&activity.as_str())
+        }
+        // GH-2050: prompt_task BindPr must receive the same server verification
+        // attach path as github_issue_pr (GH-1766).
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID => {
+            activity == harness_workflow::runtime::PROMPT_TASK_IMPLEMENT_ACTIVITY
+        }
+        _ => false,
+    }
 }
 
 /// Verify the claimed PR against GitHub and attach the verdict artifact.
@@ -56,12 +69,12 @@ pub(super) async fn attach_pr_binding_verification(
     let Some((pr_number, pr_url)) = claimed_pull_request(&result) else {
         return result;
     };
-    let Some(repo_slug) = expected_repo_slug(workflow, &pr_url) else {
+    let Some(repo_slug) = resolve_expected_repo_slug(workflow) else {
         return result.with_artifact(ActivityArtifact::new(
             ARTIFACT_PR_BINDING_VERIFICATION_FAILED,
             json!({
                 "outcome": "repository_unresolvable",
-                "detail": "the workflow records no repository and the claimed pr_url has no owner/repo slug",
+                "detail": "the workflow records no trusted repository slug; refusing to treat the claimed pr_url as ownership proof",
                 "claimed_pr_number": pr_number,
                 "claimed_pr_url": pr_url,
             }),
@@ -231,13 +244,24 @@ fn claimed_pull_request(result: &ActivityResult) -> Option<(u64, String)> {
         })
 }
 
-fn expected_repo_slug(workflow: &WorkflowInstance, pr_url: &str) -> Option<String> {
+/// Trusted repository ownership for PR-binding verification (GH-2054).
+///
+/// Only a persisted `workflow.data.repo` is accepted. Do not reread the
+/// agent-writable project `.git` remote after activity — a mutated remote
+/// must not become ownership proof. Parsing the agent-claimed `pr_url` must
+/// not supply the expected slug either.
+fn resolve_expected_repo_slug(workflow: &WorkflowInstance) -> Option<String> {
+    expected_repo_slug(workflow)
+}
+
+fn expected_repo_slug(workflow: &WorkflowInstance) -> Option<String> {
     workflow
         .data
         .get("repo")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
         .map(str::to_string)
-        .or_else(|| repo_slug_from_url(pr_url))
 }
 
 fn expected_head_ref(workflow: &WorkflowInstance) -> Option<String> {
@@ -246,11 +270,6 @@ fn expected_head_ref(workflow: &WorkflowInstance) -> Option<String> {
         .find_map(|key| workflow.data.get(*key).and_then(Value::as_str))
         .map(str::to_string)
         .filter(|branch| !branch.trim().is_empty())
-}
-
-fn repo_slug_from_url(url: &str) -> Option<String> {
-    harness_agents::output_parsing::parse_github_pr_url(url)
-        .map(|(owner, repo, _)| format!("{owner}/{repo}"))
 }
 
 #[cfg(test)]
@@ -354,11 +373,128 @@ mod tests {
     }
 
     #[test]
-    fn repo_slug_from_url_parses_pull_urls() {
-        assert_eq!(
-            repo_slug_from_url("https://github.com/octo/repo/pull/42"),
-            Some("octo/repo".to_string())
+    fn expected_repo_slug_requires_trusted_workflow_repo() {
+        let mut wf = workflow(
+            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
         );
-        assert_eq!(repo_slug_from_url("https://example.com/x"), None);
+        assert_eq!(expected_repo_slug(&wf), None);
+
+        wf = wf.with_server_data(json!({ "repo": "octo/repo" }));
+        assert_eq!(expected_repo_slug(&wf), Some("octo/repo".to_string()));
+
+        wf = workflow(
+            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
+        )
+        .with_server_data(json!({ "repo": "   " }));
+        assert_eq!(expected_repo_slug(&wf), None);
+    }
+
+    #[test]
+    fn resolve_expected_repo_slug_fails_closed_when_repo_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).expect("mkdir .git");
+        std::fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/octo/from-project.git\n",
+        )
+        .expect("write git config");
+
+        let wf = workflow(
+            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
+        )
+        .with_server_data(json!({ "project_id": dir.path().to_string_lossy() }));
+
+        assert_eq!(resolve_expected_repo_slug(&wf), None);
+    }
+
+    #[test]
+    fn resolve_expected_repo_slug_uses_persisted_repo_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).expect("mkdir .git");
+        std::fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/octo/from-project.git\n",
+        )
+        .expect("write git config");
+
+        let wf = workflow(
+            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
+        )
+        .with_server_data(json!({
+            "repo": "octo/persisted",
+            "project_id": dir.path().to_string_lossy(),
+        }));
+
+        assert_eq!(
+            resolve_expected_repo_slug(&wf),
+            Some("octo/persisted".to_string())
+        );
+    }
+
+    fn runtime_job(activity: &str) -> RuntimeJob {
+        RuntimeJob::pending(
+            "command-1",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "test",
+            json!({ "activity": activity }),
+        )
+    }
+
+    fn workflow(definition_id: &str, state: &str) -> WorkflowInstance {
+        WorkflowInstance::new(
+            definition_id,
+            1,
+            state,
+            harness_workflow::runtime::WorkflowSubject::new("subject", "key-1"),
+        )
+        .with_id("workflow-1")
+    }
+
+    fn pull_request_result(activity: &str) -> ActivityResult {
+        ActivityResult::succeeded(activity, "claimed a PR").with_artifact(
+            harness_workflow::runtime::ActivityArtifact::new(
+                "pull_request",
+                json!({
+                    "pr_number": 42,
+                    "pr_url": "https://github.com/octo/repo/pull/42",
+                }),
+            ),
+        )
+    }
+
+    #[test]
+    fn result_claims_pr_binding_covers_prompt_task_implement_prompt() {
+        let job = runtime_job("implement_prompt");
+        let wf = workflow(
+            harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+            "implementing",
+        );
+        let result = pull_request_result("implement_prompt");
+        assert!(result_claims_pr_binding(&job, Some(&wf), &result));
+    }
+
+    #[test]
+    fn result_claims_pr_binding_still_covers_github_issue_implement_issue() {
+        let job = runtime_job("implement_issue");
+        let wf = workflow(
+            harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
+            "implementing",
+        );
+        let result = pull_request_result("implement_issue");
+        assert!(result_claims_pr_binding(&job, Some(&wf), &result));
+    }
+
+    #[test]
+    fn result_claims_pr_binding_ignores_unrelated_definitions() {
+        let job = runtime_job("implement_prompt");
+        let wf = workflow("quality_gate", "implementing");
+        let result = pull_request_result("implement_prompt");
+        assert!(!result_claims_pr_binding(&job, Some(&wf), &result));
     }
 }

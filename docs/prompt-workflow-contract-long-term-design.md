@@ -1,5 +1,11 @@
 # Prompt Workflow Contract Long-Term Design
 
+> Architecture relationship (2026-08-28): `docs/workflow-first-autonomous-change-rfc.md` proposes
+> incorporating this design. Prompt packets, bounded repair, and typed activity results remain
+> required shipped directions; the proposed RFC does not govern them until owner approval. Runtime
+> incompatibility and physical cutover are separate proposals in
+> `docs/workflow-vnext-cutover-rfc.md`.
+
 Status: Draft
 Date: 2026-05-13
 

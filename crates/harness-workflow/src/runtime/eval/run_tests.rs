@@ -53,6 +53,14 @@ fn eval_run_plan_marks_issue_submission_for_draft_prs() -> anyhow::Result<()> {
         initial.data["eval"]["isolation"]["runtime_profile"],
         "eval-isolated-runtime-host"
     );
+    assert_eq!(
+        initial.data["eval"]["isolation"]["network_allowlist"],
+        json!([])
+    );
+    assert_eq!(
+        initial.data["eval"]["required_runtime_host_capabilities"],
+        json!(["eval_resource_limits", "eval_network_policy"])
+    );
     assert_eq!(initial.data["eval"]["isolation"]["lifecycle"], "ephemeral");
     assert_eq!(initial.data["eval"]["isolation"]["cleanup_required"], true);
 

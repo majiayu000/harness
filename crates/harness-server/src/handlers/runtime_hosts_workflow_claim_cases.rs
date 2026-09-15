@@ -123,7 +123,7 @@ async fn runtime_job_claim_endpoint_includes_eval_credential_environment_policy(
         return Ok(());
     };
     let app = runtime_hosts_workflow_app(state);
-    register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits"]).await?;
+    register_host_with_capabilities(&app, "host-a", vec!["eval_resource_limits", "eval_network_policy"]).await?;
 
     let job = enqueue_runtime_host_test_job(
         &store,
@@ -204,11 +204,11 @@ async fn trusted_eval_job_is_claimed_only_by_a_capable_runtime_host() -> anyhow:
         return Ok(());
     };
     let app = runtime_hosts_workflow_app(state);
-    register_host_with_capabilities(&app, "host-limited", vec!["eval_resource_limits"]).await?;
+    register_host_with_capabilities(&app, "host-limited", vec!["eval_resource_limits", "eval_network_policy"]).await?;
     register_host_with_capabilities(
         &app,
         "host-trusted",
-        vec!["eval_resource_limits", "trusted_eval_verifier_v1"],
+        vec!["eval_resource_limits", "eval_network_policy", "trusted_eval_verifier_v1"],
     )
     .await?;
     let job = enqueue_runtime_host_test_job(
@@ -225,6 +225,7 @@ async fn trusted_eval_job_is_claimed_only_by_a_capable_runtime_host() -> anyhow:
                     "timeout_secs": 45,
                     "required_runtime_host_capabilities": [
                         "eval_resource_limits",
+                        "eval_network_policy",
                         "trusted_eval_verifier_v1"
                     ]
                 }
@@ -249,6 +250,78 @@ async fn trusted_eval_job_is_claimed_only_by_a_capable_runtime_host() -> anyhow:
     .await?;
     assert_eq!(trusted["claimed"], true);
     assert_eq!(trusted["runtime_job_id"], job.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_job_claim_endpoint_injects_eval_network_policy() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host_with_capabilities(
+        &app,
+        "host-a",
+        vec!["eval_resource_limits", "eval_network_policy"],
+    )
+    .await?;
+
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "command-eval-network-policy",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "implement_issue",
+            "isolation": {
+                "network_allowlist": ["api.github.com"]
+            },
+            "command": {
+                "eval": {
+                    "eval_run_id": "run-1",
+                    "case_id": "case-1",
+                    "timeout_secs": 45
+                }
+            }
+        }),
+    )
+    .await?;
+
+    let json = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    assert_eq!(json["claimed"], true);
+    assert_eq!(json["runtime_job_id"], job.id);
+    assert_eq!(
+        json["network_policy"],
+        json!({
+            "inbound": "deny",
+            "outbound": "allowlist",
+            "network_allowlist": ["api.github.com"],
+        })
+    );
+    assert_eq!(
+        json["runtime_job"]["input"]["command"]["eval"]["network_policy"],
+        json["network_policy"]
+    );
+    let events = store.runtime_events_for(&job.id).await?;
+    assert!(events.iter().any(|event| {
+        event.event_type == "EvalNetworkPolicyApplied"
+            && event.event["network_policy"] == json["network_policy"]
+    }));
+    let persisted = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("claimed job should remain readable");
+    assert_eq!(
+        persisted.input["command"]["eval"]["network_policy"],
+        json["network_policy"]
+    );
     Ok(())
 }
 

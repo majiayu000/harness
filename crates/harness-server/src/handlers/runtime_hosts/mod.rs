@@ -5,7 +5,15 @@ pub(crate) use completion::{
     install_completion_reservation_test_gate, replay_completion_reservation,
 };
 mod claim;
-use claim::defer_runtime_host_resource_limit_claim;
+use claim::defer_runtime_host_capability_claim;
+mod eval_enforcement;
+pub(crate) use eval_enforcement::{
+    applied_eval_network_policy, eval_metadata, eval_resource_limit_enforcement_for_job,
+};
+use eval_enforcement::{
+    eval_network_policy_enforcement_for_job, set_eval_network_policy_enforcement,
+    set_eval_resource_limit_enforcement,
+};
 
 use crate::http::rest_contract::{ContractJson, LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
@@ -18,7 +26,8 @@ use harness_protocol::rest::{
     ClaimRuntimeJobRequest, RuntimeHostClaimResponse, RUNTIME_JOB_LEASE_PROOF_V1_CAPABILITY,
 };
 use harness_sandbox::{
-    CappedResourceLimits, ResourceLimitReport, ResourceLimits, EVAL_RESOURCE_LIMITS_CAPABILITY,
+    CappedResourceLimits, EvalNetworkPolicy, ResourceLimitReport, ResourceLimits,
+    EVAL_NETWORK_POLICY_CAPABILITY, EVAL_RESOURCE_LIMITS_CAPABILITY,
 };
 use harness_workflow::runtime::{
     prepare_runtime_transcript, ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob,
@@ -277,7 +286,9 @@ pub async fn claim_runtime_job_for_runtime_host(
         );
     }
     let host_supports_eval_resource_limits =
-        runtime_host_supports_eval_resource_limits(&state, &host_id);
+        runtime_host_supports_capability(&state, &host_id, EVAL_RESOURCE_LIMITS_CAPABILITY);
+    let host_supports_eval_network_policy =
+        runtime_host_supports_capability(&state, &host_id, EVAL_NETWORK_POLICY_CAPABILITY);
     let host_supports_trusted_eval_verifier =
         runtime_host_supports_capability(&state, &host_id, TRUSTED_EVAL_VERIFIER_V1_CAPABILITY);
     let store = match workflow_runtime_store(&state) {
@@ -403,12 +414,13 @@ pub async fn claim_runtime_job_for_runtime_host(
     let resource_limits = match eval_resource_limit_enforcement_for_job(&job) {
         Ok(Some(resource_limits)) => {
             if !host_supports_eval_resource_limits {
-                let (status, response) = defer_runtime_host_resource_limit_claim(
+                let (status, response) = defer_runtime_host_capability_claim(
                     store.as_ref(),
                     &host_id,
                     lease_expires_at,
                     &job,
                     "runtime host lacks eval_resource_limits capability",
+                    EVAL_RESOURCE_LIMITS_CAPABILITY,
                 )
                 .await;
                 return (status, claim_json(response));
@@ -449,6 +461,72 @@ pub async fn claim_runtime_job_for_runtime_host(
                 host_id = %host_id,
                 %error,
                 "runtime host claim succeeded but eval resource-limit event recording failed"
+            );
+        }
+    }
+
+    let network_policy = match eval_network_policy_enforcement_for_job(&job) {
+        Ok(Some(network_policy)) => {
+            if !host_supports_eval_network_policy {
+                let (status, response) = defer_runtime_host_capability_claim(
+                    store.as_ref(),
+                    &host_id,
+                    lease_expires_at,
+                    &job,
+                    "runtime host lacks eval_network_policy capability",
+                    EVAL_NETWORK_POLICY_CAPABILITY,
+                )
+                .await;
+                return (status, claim_json(response));
+            }
+            Some(network_policy)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            let result = completion::eval_network_policy_preflight_failure(&job, &error, None);
+            return complete_runtime_host_preflight_failure(
+                &state,
+                store.as_ref(),
+                &host_id,
+                lease_expires_at,
+                &job,
+                result,
+            )
+            .await;
+        }
+    };
+
+    if let Some(network_policy) = &network_policy {
+        set_eval_network_policy_enforcement(&mut job, network_policy);
+        if let Err(error) = store.persist_runtime_job_data(&job).await {
+            tracing::error!(
+                runtime_job_id = %job.id,
+                host_id = %host_id,
+                %error,
+                "failed to persist eval network policy on claimed runtime job"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                claim_json(json!({ "error": "failed to persist eval network policy" })),
+            );
+        }
+        if let Err(error) = store
+            .record_runtime_event(
+                &job.id,
+                "EvalNetworkPolicyApplied",
+                json!({
+                    "host_id": host_id.as_str(),
+                    "network_policy": network_policy,
+                    "reason": "runtime host claim",
+                }),
+            )
+            .await
+        {
+            tracing::warn!(
+                runtime_job_id = %job.id,
+                host_id = %host_id,
+                %error,
+                "runtime host claim succeeded but eval network-policy event recording failed"
             );
         }
     }
@@ -532,6 +610,9 @@ pub async fn claim_runtime_job_for_runtime_host(
     }
     if let Some(resource_limits) = resource_limits {
         response["resource_limits"] = json!(resource_limits);
+    }
+    if let Some(network_policy) = network_policy {
+        response["network_policy"] = json!(network_policy);
     }
     (StatusCode::OK, claim_json(response))
 }
@@ -638,72 +719,12 @@ async fn complete_runtime_host_preflight_failure(
     )
 }
 
-fn runtime_host_supports_eval_resource_limits(state: &Arc<AppState>, host_id: &str) -> bool {
-    runtime_host_supports_capability(state, host_id, EVAL_RESOURCE_LIMITS_CAPABILITY)
-}
-
 fn runtime_host_supports_capability(state: &Arc<AppState>, host_id: &str, required: &str) -> bool {
     state.runtime_hosts.hosts.get(host_id).is_some_and(|host| {
         host.capabilities
             .iter()
             .any(|capability| capability == required)
     })
-}
-
-fn eval_resource_limit_enforcement_for_job(
-    job: &RuntimeJob,
-) -> Result<Option<CappedResourceLimits>, String> {
-    let Some(eval) = eval_metadata(&job.input) else {
-        return Ok(None);
-    };
-    if let Some(value) = eval.get("resource_limits") {
-        if value.get("requested").is_some() && value.get("effective").is_some() {
-            return serde_json::from_value(value.clone())
-                .map(Some)
-                .map_err(|error| format!("invalid eval resource_limits: {error}"));
-        }
-        let requested: ResourceLimits = serde_json::from_value(value.clone())
-            .map_err(|error| format!("invalid eval resource_limits: {error}"))?;
-        return requested
-            .cap_by(ResourceLimits::operator_default_maxima())
-            .map(Some)
-            .map_err(|error| format!("invalid eval resource_limits: {error}"));
-    }
-    let timeout_secs = eval
-        .get("timeout_secs")
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            "eval runtime job must include timeout_secs or resource_limits".to_string()
-        })?;
-    ResourceLimits::evaluation_defaults(timeout_secs)
-        .cap_by(ResourceLimits::operator_default_maxima())
-        .map(Some)
-        .map_err(|error| format!("invalid eval resource_limits: {error}"))
-}
-
-fn eval_metadata(input: &Value) -> Option<&Value> {
-    input
-        .pointer("/command/eval")
-        .or_else(|| input.get("eval"))
-        .filter(|value| value.is_object())
-}
-
-fn set_eval_resource_limit_enforcement(
-    job: &mut RuntimeJob,
-    resource_limits: &CappedResourceLimits,
-) {
-    let value = json!(resource_limits);
-    if let Some(eval) = job
-        .input
-        .pointer_mut("/command/eval")
-        .and_then(Value::as_object_mut)
-    {
-        eval.insert("resource_limits".to_string(), value.clone());
-    }
-    if let Some(eval) = job.input.get_mut("eval").and_then(Value::as_object_mut) {
-        eval.insert("resource_limits".to_string(), value);
-    }
 }
 
 fn ensure_runtime_state_persistence_available(

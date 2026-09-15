@@ -60,6 +60,7 @@ pub(super) async fn execute_start_prompt_task_child_workflow(
         store,
         crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
             project_root: Path::new(project_id),
+            repo,
             task_id: &task_id,
             prompt,
             depends_on: &[],
