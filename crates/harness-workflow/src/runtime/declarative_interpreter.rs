@@ -166,9 +166,13 @@ mod tests {
             definition.policy().initial.clone(),
             WorkflowSubject::new("test", "submission"),
         )
-        .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": definition.definition_hash(), "prompt_ref": "submission-task" }));
 
         let decision = build_declarative_submission_decision(&definition, &instance)?;
+        assert_eq!(
+            decision.commands[0].command["prompt_ref"],
+            "submission-task"
+        );
         assert_eq!(decision.decision, DECLARATIVE_SUBMISSION_DECISION);
         assert_eq!(decision.observed_state, "working");
         assert_eq!(decision.next_state, "working");

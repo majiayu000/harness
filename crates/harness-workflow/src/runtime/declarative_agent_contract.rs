@@ -435,7 +435,13 @@ pub(crate) fn declarative_enqueue_activity_command(
                 }),
             ))
         }
-        None => Ok(WorkflowCommand::enqueue_activity(activity, dedupe_key)),
+        None => {
+            let mut command = WorkflowCommand::enqueue_activity(activity, dedupe_key);
+            if let Some(prompt_ref) = instance.data.get("prompt_ref") {
+                command.command["prompt_ref"] = prompt_ref.clone();
+            }
+            Ok(command)
+        }
     }
 }
 
