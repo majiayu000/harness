@@ -401,13 +401,11 @@ pub(super) async fn prompt_task_request_for_job(
     job: &RuntimeJob,
     store: Option<&WorkflowRuntimeStore>,
 ) -> anyhow::Result<PromptTaskRequest> {
-    if activity_name(job) != PROMPT_TASK_IMPLEMENT_ACTIVITY {
+    let prompt_ref = job.input.pointer("/command/prompt_ref");
+    if activity_name(job) != PROMPT_TASK_IMPLEMENT_ACTIVITY && prompt_ref.is_none() {
         return Ok(PromptTaskRequest::NotPromptActivity);
     }
-    let Some(prompt_ref) = job
-        .input
-        .get("command")
-        .and_then(|command| command.get("prompt_ref"))
+    let Some(prompt_ref) = prompt_ref
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
     else {
@@ -563,40 +561,40 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_task_request_blocks_when_cached_payload_is_unavailable() -> anyhow::Result<()> {
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({
-                "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
-                "command": {
-                    "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
-                    "prompt_ref": "prompt-submission:cache-miss-test"
+        for activity in [PROMPT_TASK_IMPLEMENT_ACTIVITY, "inspect_repository"] {
+            let job = RuntimeJob::pending(
+                "command-1",
+                RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                json!({
+                    "activity": activity,
+                    "command": {
+                        "activity": activity,
+                        "prompt_ref": "prompt-submission:cache-miss-test"
+                    }
+                }),
+            );
+
+            let request = prompt_task_request_for_job(&job, None).await?;
+            assert_eq!(
+                request,
+                PromptTaskRequest::PayloadUnavailable {
+                    prompt_ref: "prompt-submission:cache-miss-test".to_string()
                 }
-            }),
-        );
+            );
 
-        let request = prompt_task_request_for_job(&job, None).await?;
-        assert_eq!(
-            request,
-            PromptTaskRequest::PayloadUnavailable {
-                prompt_ref: "prompt-submission:cache-miss-test".to_string()
-            }
-        );
-
-        let result = prompt_payload_unavailable_result(&job, "prompt-submission:cache-miss-test");
-        assert_eq!(result.status, ActivityStatus::Blocked);
-        assert_eq!(result.activity, PROMPT_TASK_IMPLEMENT_ACTIVITY);
-        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("only held in the current Harness process"));
-        assert_eq!(
-            result.artifacts[0].artifact_type,
-            "prompt_payload_unavailable"
-        );
+            let result =
+                prompt_payload_unavailable_result(&job, "prompt-submission:cache-miss-test");
+            assert_eq!(result.status, ActivityStatus::Blocked);
+            assert_eq!(result.activity, activity);
+            assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+            let error = result.error.expect("missing prompt must report an error");
+            assert!(error.contains("only held in the current Harness process"));
+            assert_eq!(
+                result.artifacts[0].artifact_type,
+                "prompt_payload_unavailable"
+            );
+        }
         Ok(())
     }
 
@@ -640,33 +638,35 @@ mod tests {
         let prompt_ref = workflow.data["prompt_ref"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("prompt ref should be persisted"))?;
-        crate::workflow_runtime_submission::clear_prompt_submission_prompt_cache_for_test(
-            prompt_ref,
-        );
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({
-                "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
-                "command": {
-                    "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
-                    "prompt_ref": prompt_ref
-                }
-            }),
-        );
+        for activity in [PROMPT_TASK_IMPLEMENT_ACTIVITY, "inspect_repository"] {
+            crate::workflow_runtime_submission::clear_prompt_submission_prompt_cache_for_test(
+                prompt_ref,
+            );
+            let job = RuntimeJob::pending(
+                "command-1",
+                RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                json!({
+                    "activity": activity,
+                    "command": {
+                        "activity": activity,
+                        "prompt_ref": prompt_ref
+                    }
+                }),
+            );
 
-        let request = prompt_task_request_for_job(&job, Some(&store)).await?;
+            let request = prompt_task_request_for_job(&job, Some(&store)).await?;
 
-        assert_eq!(
-            request,
-            PromptTaskRequest::Ready("restart safe prompt".to_string())
-        );
-        assert_eq!(
-            crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref)
-                .as_deref(),
-            Some("restart safe prompt")
-        );
+            assert_eq!(
+                request,
+                PromptTaskRequest::Ready("restart safe prompt".to_string())
+            );
+            assert_eq!(
+                crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref)
+                    .as_deref(),
+                Some("restart safe prompt")
+            );
+        }
         Ok(())
     }
 
