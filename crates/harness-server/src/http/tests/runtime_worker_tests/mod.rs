@@ -236,7 +236,7 @@ async fn runtime_job_worker_tick_runs_registered_agent_and_completes_job() -> an
     assert!(prompts[0].contains("Activity: implement_issue"));
     assert!(prompts[0].contains("Prompt packet:"));
     assert!(prompts[0].contains("activity_result_schema"));
-    assert!(prompts[0].contains("required_structured_output"));
+    assert!(prompts[0].contains("Harness selects transitions and schedules follow-up work."));
     drop(prompts);
     assert_eq!(
         agent.models.lock().await.as_slice(),
@@ -291,6 +291,8 @@ async fn runtime_job_worker_retries_once_for_invalid_structured_activity_result(
     ]);
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", agent.clone());
+    let turn_agent = agent.clone();
+    registry.register_turn_backend_factory("codex", move || turn_agent.clone())?;
     let mut config = harness_core::config::HarnessConfig::default();
     config.agents.capability_profile = harness_core::config::agents::CapabilityProfile::Full;
     let state = make_test_state_with_workflow_runtime_config_and_registry(
@@ -467,6 +469,8 @@ async fn runtime_job_worker_cleans_on_terminal_workspace_after_failed_runtime_at
     let agent = FailingStreamAgent::new("simulated provider outage");
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", agent.clone());
+    let turn_agent = agent.clone();
+    registry.register_turn_backend_factory("codex", move || turn_agent.clone())?;
     let state = make_test_state_with_workflow_runtime_config_and_registry(
         dir.path(),
         &project_root,
@@ -581,6 +585,8 @@ async fn provenance_failure_prevents_prompt_event_and_agent_start() -> anyhow::R
     let agent = RuntimeStreamAgent::new();
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", agent.clone());
+    let turn_agent = agent.clone();
+    registry.register_turn_backend_factory("codex", move || turn_agent.clone())?;
     let state = make_test_state_with_workflow_runtime_config_and_registry(
         dir.path(),
         &project_root,
@@ -689,6 +695,8 @@ async fn runtime_job_worker_cancels_job_when_workflow_already_terminal() -> anyh
     let agent = RuntimeStreamAgent::new();
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", agent.clone());
+    let turn_agent = agent.clone();
+    registry.register_turn_backend_factory("codex", move || turn_agent.clone())?;
     let state =
         make_test_state_with_workflow_runtime_and_registry(dir.path(), &project_root, registry)
             .await?;
@@ -801,6 +809,8 @@ async fn pr_feedback_dispatcher_partitions_agent_summary_and_external_attack() -
     let agent = RuntimeStreamAgent::new();
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", agent.clone());
+    let turn_agent = agent.clone();
+    registry.register_turn_backend_factory("codex", move || turn_agent.clone())?;
     let state =
         make_test_state_with_workflow_runtime_and_registry(dir.path(), &project_root, registry)
             .await?;

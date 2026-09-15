@@ -543,8 +543,18 @@ async fn runtime_pr_feedback_sweep_caps_auto_merge_remote_probes() -> anyhow::Re
         super::background::run_runtime_pr_feedback_sweep_tick_with_cursor(&state, 1, &mut cursor)
             .await?;
 
-    assert_eq!(tick.auto_merge_requested, 0);
-    assert_eq!(tick.skipped, 1);
+    assert_eq!(tick.auto_merge_requested, 1);
+    assert_eq!(tick.skipped, 0);
+    let requested = store
+        .list_instances(Some(&project_root.to_string_lossy()), 10)
+        .await?;
+    assert_eq!(
+        requested
+            .iter()
+            .filter(|instance| instance.state == "local_review_gate")
+            .count(),
+        1
+    );
     assert_eq!(tick.remote_request_attempts, 1);
     assert_eq!(received.lock().await.len(), 1);
     Ok(())

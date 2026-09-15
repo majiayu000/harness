@@ -58,6 +58,13 @@ impl CodeAgent for SequencedPromptAgent {
         let _ = tx.send(StreamItem::Done).await;
         Ok(())
     }
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.execute_stream(req, tx).await
+    }
 }
 
 fn prompt_result(summary: &str, state: &str, subject: &str, revision: u64) -> Value {
@@ -101,7 +108,8 @@ async fn continuation_test_state(
         "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\nworkspace:\n  strategy: source\n---\n",
     )?;
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
-    registry.register("codex", agent);
+    registry.register("codex", agent.clone());
+    registry.register_turn_backend_factory("codex", move || agent.clone())?;
     make_test_state_with_workflow_runtime_and_registry(dir, project_root, registry).await
 }
 

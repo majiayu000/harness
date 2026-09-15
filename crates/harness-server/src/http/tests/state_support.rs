@@ -241,6 +241,13 @@ impl CodeAgent for FailingStreamAgent {
             self.error.clone(),
         ))
     }
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.execute_stream(req, tx).await
+    }
 }
 
 #[async_trait]
@@ -271,6 +278,13 @@ impl CodeAgent for BlockingAgent {
             .await;
         let _ = tx.send(StreamItem::Done).await;
         Ok(())
+    }
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.execute_stream(req, tx).await
     }
 }
 

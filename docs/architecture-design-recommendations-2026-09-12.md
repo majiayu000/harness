@@ -1,10 +1,10 @@
 # Architecture Design Recommendations
 
-> Date: 2026-09-12  
-> Revised: 2026-09-12 (review pass — tighten severity, priority, and acceptance)  
-> Scope: Store criticality, RuntimeKind selection, PR-feedback stop residue, ownership notes  
+> Date: 2026-09-12
+> Revised: 2026-09-12 (review pass — tighten severity, priority, and acceptance)
+> Scope: Store criticality, RuntimeKind selection, PR-feedback stop residue, ownership notes
 > Method: Read-only static investigation; recommendations are a **discussion draft**, not a
-> copy-execute checklist  
+> copy-execute checklist
 > Status: Discussion draft **and** Phase A–C implemented in-tree (2026-09-12).
 > Implementation note: Authority **A** chosen for D3 (`RuntimeKind` selects surface).
 

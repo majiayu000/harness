@@ -337,6 +337,7 @@ async fn runtime_job_worker_applies_runtime_profile_timeout() -> anyhow::Result<
     )?;
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", BlockingAgent::new());
+    registry.register_turn_backend_factory("codex", || BlockingAgent::new())?;
     let state =
         make_test_state_with_workflow_runtime_and_registry(dir.path(), &project_root, registry)
             .await?;

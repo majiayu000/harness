@@ -76,3 +76,11 @@ Fresh validation passed 33 local-review tests, 27 server PR-feedback tests, 36 r
 A stale server test previously attempted a local pass directly from pr_open through a warning-only test wrapper and expected the former remote-review/quality-gate sequence. It now requests review first, propagates persistence errors, asserts ready_to_merge, and verifies late remote feedback creates no additional command. The unused wrapper was removed.
 
 Fresh independent review approved the fixes, integration, and test adjustments without remaining blockers in the inspected paths. The large checkpoint was reviewed by risk area, not exhaustively line by line. CI and a bounded production trial remain separate evidence; no production service was restarted or deployed during integration.
+
+## CI follow-up
+
+The first full CI run exposed additional stale fixtures not exercised by the local DB-less push gate. JSONRPC worker fixtures registered only the oneshot backend, and three mocks lacked start_turn. They now register the turn factory and use the same in-memory execute_stream bridge as RuntimeStreamAgent. The model-facing prompt test checks the transition-owner instruction while retaining durable schema assertions. The probe-cap test accounts for a scheduled readiness review and still requires exactly one probe. Repair-result tests distinguish deferred remote readiness from explicit failing checks; failing checks and DIRTY merge state remain blocking.
+
+Fresh isolated PostgreSQL reruns passed 2 continuation tests, 11 worker tests, the runtime-profile timeout test, the probe-cap test, and 7 repair-contract tests. The initial CI run also had poisoned environment-lock cascades after the root assertions failed; those failures are not claimed to be independent product defects.
+
+CI identified RUSTSEC-2026-0285 in rustls 0.23.37. The lockfile now uses rustls 0.23.45 and its required rustls-webpki 0.103.15 patch. Under the unchanged audit configuration, cargo audit reports zero blocking vulnerabilities; pre-existing informational warnings remain. Four Markdown trailing-space violations were removed. Full CI must pass on the updated heads before merge.
