@@ -296,6 +296,7 @@ fn local_review_repair_advances_feedback_repair_progress() -> anyhow::Result<()>
     )
     .with_server_data(json!({
         "pr_number": 77,
+        "merge_review_head_sha": "head-before-repair",
         "feedback_repair_round": 1,
         "feedback_repair_blocker_count": 2,
     }));
@@ -324,6 +325,7 @@ fn local_review_repair_advances_feedback_repair_progress() -> anyhow::Result<()>
     assert_eq!(instance.data["feedback_repair_round"], 2);
     assert_eq!(instance.data["feedback_repair_blocker_count"], 1);
     assert_eq!(instance.data["feedback_repair_lane"], "local_review");
+    assert!(instance.data.get("merge_review_head_sha").is_none());
     Ok(())
 }
 

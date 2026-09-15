@@ -358,23 +358,6 @@ pub(crate) async fn record_pr_feedback(
 }
 
 #[cfg(test)]
-pub(crate) async fn record_local_review_passed(
-    store: Option<&WorkflowRuntimeStore>,
-    ctx: LocalReviewPassedRuntimeContext<'_>,
-) {
-    let Some(store) = store else {
-        return;
-    };
-    if let Err(error) = persist_local_review_passed(store, &ctx).await {
-        tracing::warn!(
-            pr = ctx.pr_number,
-            task_id = %ctx.task_id.0,
-            "workflow runtime local review write failed: {error}"
-        );
-    }
-}
-
-#[cfg(test)]
 pub(crate) async fn record_pr_merged(
     store: Option<&WorkflowRuntimeStore>,
     ctx: PrMergedRuntimeContext<'_>,
@@ -484,7 +467,15 @@ where
             task_id: runtime_task_id_from_instance(&instance),
         });
     }
-    persist_local_review_request(store, instance, new_instance, additional_prompt, admission).await
+    persist_local_review_request(
+        store,
+        instance,
+        new_instance,
+        additional_prompt,
+        None,
+        admission,
+    )
+    .await
 }
 
 pub(crate) async fn request_pr_hygiene_repair(
@@ -543,15 +534,13 @@ pub(crate) async fn request_local_review(
 
 pub(crate) async fn request_merge_readiness_review(
     store: &WorkflowRuntimeStore,
-    mut instance: WorkflowInstance,
+    instance: WorkflowInstance,
     head_sha: &str,
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
-    instance.apply_data_writes([harness_workflow::runtime::WorkflowDataWrite::set(
-        "merge_review_head_sha",
-        json!(head_sha),
-        DataProvenance::Server,
-    )])?;
-    persist_local_review_request(store, instance, false, None, || async { Ok(()) }).await
+    persist_local_review_request(store, instance, false, None, Some(head_sha), || async {
+        Ok(())
+    })
+    .await
 }
 
 pub(crate) async fn request_local_review_with_admission<F, Fut>(
@@ -585,7 +574,7 @@ where
             task_id,
         });
     }
-    persist_local_review_request(store, instance, false, additional_prompt, admission).await
+    persist_local_review_request(store, instance, false, additional_prompt, None, admission).await
 }
 
 pub(crate) async fn request_pr_feedback_sweep(
