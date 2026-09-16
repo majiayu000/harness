@@ -70,8 +70,12 @@ first-party proxy; the verifier has `--network none`.
 Both execution containers use a read-only root, non-root UID, dropped capabilities,
 no-new-privileges, 128 PIDs, 2 GiB memory without swap, and a one-CPU rate limit.
 The agent's writable workspace is a 512 MiB tmpfs, home 128 MiB, and temporary
-directory 64 MiB. The host monitors output and wall time; GNU `timeout` separately
-bounds Codex if the host process dies. These are explicit trial limits, **not** a
+directory 64 MiB. The host reads attached Codex stdout/stderr directly into private
+host files, retaining at most 8 MiB across both streams. Exceeding that shared
+limit fails the task and removes its container; transport buffers may contain
+additional unretained bytes. Candidate files cannot replace the captured logs.
+The host monitors wall time; GNU `timeout` separately bounds Codex if the host
+process dies. These are explicit trial limits, **not** a
 claim to implement every `CappedResourceLimits` field (especially aggregate CPU
 time), nor a measured full eval resource report.
 
@@ -87,8 +91,13 @@ run does not invoke the model again. An interrupted execution is cleaned up and
 reported as failed; it is never silently retried. A pending completion resends
 its original persisted payload. If the server rejects an expired/stale lease,
 the command fails and retains evidence for reconciliation; it never claims a new
-job to conceal that failure. Resume promptly: stopped tmpfs containers lose
-candidate files, and the container's post-agent retention window is five minutes.
+job to conceal that failure. Captured log prefixes survive restart without being
+replaced from candidate files; output not received before interruption is lost.
+The idle task container expires 15 minutes after launch. Before candidate export,
+the client kills residual agent processes inside that container's private PID
+namespace, preserving its idle PID 1 and trusted exporter. It removes the task
+container before independent verification. Stopping a tmpfs container loses its
+candidate files, so interrupted runs are never resumed as successful candidates.
 
 A failed task exits nonzero even when reporting its failure to Harness succeeds.
 Missing usage stays missing; observed token counts are retained, and absent

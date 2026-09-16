@@ -11,8 +11,10 @@ import fcntl
 import hashlib
 import json
 import os
+import selectors
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import time
 import urllib.error
@@ -41,6 +43,61 @@ def docker(*args: str, timeout: int = 30) -> str:
     if result.returncode:
         raise RuntimeError(f"docker {args[0]} failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def stream_agent_output(command: list[str], root: Path, timeout: int, renew) -> int:
+    """Keep a shared bounded prefix of both attached streams outside the candidate."""
+    deadline = time.monotonic() + timeout
+    observed = 0
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, bufsize=0)
+    try:
+        with selectors.DefaultSelector() as selector, \
+                (root / "agent.jsonl").open("wb") as stdout, \
+                (root / "agent.stderr").open("wb") as stderr:
+            selector.register(process.stdout, selectors.EVENT_READ, stdout)
+            selector.register(process.stderr, selectors.EVENT_READ, stderr)
+            while selector.get_map() or process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"agent exceeded {timeout}s wall deadline")
+                renew()
+                for key, _ in selector.select(min(0.2, remaining)):
+                    chunk = os.read(key.fd, 64 * 1024)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    retained = chunk[:max(0, OUTPUT_LIMIT - observed)]
+                    key.data.write(retained)
+                    key.data.flush()
+                    observed += len(chunk)
+                    if observed > OUTPUT_LIMIT:
+                        raise RuntimeError(f"agent output exceeded {OUTPUT_LIMIT} bytes")
+            return process.wait(timeout=1)
+    finally:
+        # Disconnecting the CLI does not stop remote exec; the caller must remove
+        # its exact container on failure before completing the job.
+        primary_error = sys.exc_info()[1]
+        cleanup_errors = []
+        try:
+            if process.poll() is None:
+                process.kill()
+        except Exception as error:
+            cleanup_errors.append(f"kill: {error}")
+        try:
+            process.wait(timeout=5)
+        except Exception as error:
+            cleanup_errors.append(f"wait: {error}")
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except Exception as error:
+                cleanup_errors.append(f"close stream: {error}")
+        if cleanup_errors:
+            reason = "agent output cleanup failed: " + "; ".join(cleanup_errors)
+            if primary_error is not None:
+                reason = f"{type(primary_error).__name__}: {primary_error}; {reason}"
+            raise RuntimeError(reason) from primary_error
 
 
 def read_usage(log: Path) -> dict:
@@ -172,51 +229,36 @@ class Host:
             "--mount", f"type=bind,src={args.workspace.resolve()},dst=/input,readonly",
             "--mount", f"type=bind,src={args.auth_file.resolve()},dst=/run/codex-auth.json,readonly",
             "--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080",
-            args.image, "sh", "-c",
-            'set -eu; cp -R /input/. /workspace/; mkdir -p /home/harness/.codex; '
-            'cp /run/codex-auth.json /home/harness/.codex/auth.json; '
-            'set +e; timeout --signal=KILL "$3" codex exec --skip-git-repo-check --json --sandbox danger-full-access '
-            '-m "$1" "$2" > /tmp/agent.jsonl 2> /tmp/agent.stderr; '
-            'code=$?; printf "%s" "$code" > /tmp/agent.exit; sleep 300',
-            "harness-supervised", args.model, self.state["request"]["prompt"], str(args.timeout),
+            args.image, "sleep", "900",
         ]
         docker(*run_args)
         self.state["container_started"] = True
         self.persist()
+        docker("exec", self.name, "sh", "-c",
+               'set -eu; cp -R /input/. /workspace/; mkdir -p /home/harness/.codex; '
+               'cp /run/codex-auth.json /home/harness/.codex/auth.json')
 
     def wait(self) -> int:
-        deadline = time.monotonic() + self.args.timeout
-        while time.monotonic() < deadline:
-            self.renew()
-            size = int(docker("exec", self.name, "sh", "-c",
-                             "cat /tmp/agent.jsonl /tmp/agent.stderr 2>/dev/null | wc -c"))
-            if size > OUTPUT_LIMIT:
-                raise RuntimeError("agent output exceeded 8 MiB")
-            marker = docker("exec", self.name, "sh", "-c",
-                            "if test -f /tmp/agent.exit; then cat /tmp/agent.exit; fi")
-            if marker:
-                return int(marker)
-            time.sleep(1)
-        raise RuntimeError(f"agent exceeded {self.args.timeout}s wall deadline")
-
-    def capture_logs(self) -> None:
-        if not self.state.get("container_started"):
-            return
-        for filename in ["agent.jsonl", "agent.stderr"]:
-            try:
-                output = docker("exec", self.name, "head", "-c", str(OUTPUT_LIMIT), f"/tmp/{filename}")
-                (self.root / filename).write_text(output)
-            except Exception as error:
-                self.state.setdefault("capture_errors", []).append(str(error))
+        return stream_agent_output([
+            "docker", "exec", "--workdir", "/workspace", self.name,
+            "timeout", "--signal=KILL", str(self.args.timeout),
+            "codex", "exec", "--skip-git-repo-check", "--json", "--sandbox", "danger-full-access",
+            "-m", self.args.model, self.state["request"]["prompt"],
+        ], self.root, self.args.timeout, self.renew)
 
     def capture(self) -> None:
-        for filename in ["agent.jsonl", "agent.stderr"]:
-            output = docker("exec", self.name, "cat", f"/tmp/{filename}")
-            (self.root / filename).write_text(output)
         archive = self.root / "candidate.tar"
         with archive.open("wb") as output:
-            subprocess.run(["docker", "exec", self.name, "tar", "-cf", "-", "-C", "/workspace", "."],
+            # The idle PID 1 and this exporter survive kill(-1). All agent processes
+            # share our unprivileged UID in this private PID namespace. Kill them
+            # before exporting tmpfs so background children cannot race acceptance.
+            subprocess.run(["docker", "exec", self.name, "python3", "-I", "-c",
+                            "import os, signal\n"
+                            "try: os.kill(-1, signal.SIGKILL)\n"
+                            "except ProcessLookupError: pass\n"
+                            "os.execvp('tar', ['tar', '-cf', '-', '-C', '/workspace', '.'])"],
                            stdout=output, check=True, timeout=30)
+        docker("rm", "-f", self.name)
         extract_candidate(archive, self.root / "candidate")
 
     def verify(self) -> int:
@@ -260,7 +302,6 @@ class Host:
             print("already completed; no agent invocation")
             return
         if phase in {"executing", "claimed"}:
-            self.capture_logs()
             self.state["result"] = self.result("failed", "host interrupted; candidate was not rerun")
             self.state["phase"] = "cleaning"
             self.persist()
@@ -311,9 +352,9 @@ class Host:
             self.persist()
             self.launch()
             exit_code = self.wait()
-            self.capture()
             if exit_code:
                 raise RuntimeError(f"agent exited with {exit_code}")
+            self.capture()
             usage = {"model": self.args.model, **read_usage(self.root / "agent.jsonl")}
             artifacts.append({"artifact_type": "runtime_host_usage", "artifact": usage})
             verifier_exit = self.verify()
@@ -331,7 +372,6 @@ class Host:
             reason = "host interrupted by keyboard" if isinstance(error, KeyboardInterrupt) else str(error)
             self.state["result"] = self.result("failed", reason, artifacts)
         finally:
-            self.capture_logs()
             self.state["phase"] = "cleaning"
             self.persist()
             self.cleanup()
