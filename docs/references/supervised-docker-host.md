@@ -81,6 +81,14 @@ time), nor a measured full eval resource report.
 
 ## Candidate resource evidence
 
+The candidate's trusted non-root Python PID 1 reaps adopted descendants until
+its fixed 900-second retention deadline. A sleeping PID 1 left orphaned Codex
+children as zombies, so strict cgroup quiescence could never complete even after
+all live agent processes stopped. Reaping fixes that lifecycle defect without
+relaxing the process-count checks. Completed model usage is parsed into the result
+before export, so a later export/resource failure retains known usage; missing
+usage is never synthesized.
+
 The runner now retains candidate cgroup counters in the host-owned
 `candidate-resources.json` and the `supervised_candidate_resources` result
 artifact. It supports the observed Docker **cgroup v2 / cgroupfs** layout at
@@ -191,3 +199,48 @@ the subsequent model request while preserving the exact-host allowlist.
 Private raw evidence for this supervised session was retained at
 `/Users/apple/harness-docker-eval-q966fzbk`. Model auth and server-token copies
 are removed during teardown; they are not part of the report.
+
+
+## Resource-evidence follow-up: 2026-09-17
+
+A fresh disposable server/database used main `54a35ca3` plus the dispatcher fix
+in PR #2069. The initial submission could not dispatch because the Linux control
+plane's local sandbox rejected its network policy. PR #2069 separates that local
+availability probe from remote execution while retaining the isolation contract,
+budget and lease gates. The existing pending submission then dispatched normally;
+no model ran during the initial claim timeout.
+
+The same small preflight source-change task and independent verifier described
+above were used. The unchanged source failed verification before execution.
+
+| Attempt | Result | Evidence |
+| --- | --- | --- |
+| 1 | Model completed; export failed because sleeping PID 1 retained orphan zombies. Kept as failed, with incomplete resource evidence. | Submission `8aec5d24-4fcd-42c3-bccf-649f769d5d15` |
+| 2 | Bounded reaper enabled; candidate export, independent verification and final resource snapshot succeeded. | Submission `c551a718-6a03-4767-a5b3-c30baed42c73` |
+
+The successful candidate changed only `scripts/preflight-eval-nightly.py`.
+Its cgroup snapshot recorded 1,087,475 CPU microseconds, 409,796,608 peak memory
+bytes and 35 peak PIDs, with one remaining PID before and after reading counters.
+No OOM or PID-limit event was recorded. These measurements include candidate
+setup/export overhead and exclude the proxy, observer and verifier.
+
+Attempt 1's retained completed-turn log records 76,168 tokens, including 66,432
+cached input tokens; its old failure result did not attach that usage because
+collection happened after export. The fix now retains known usage before export.
+Attempt 2's completion artifact records 73,040 tokens, including 62,336 cached
+input tokens. Actual USD cost remains unknown. Both attempts are retained; the
+first was not rewritten as a success or silently retried.
+
+Credential-free Docker probes also covered OOM, PID exhaustion, killed candidate
+PID 1, and the old-vs-new orphan-reaping regression. Missing measurements remained
+explicit failures. The model credential copy and task-owned containers/networks
+were removed after each run. Both terminal submission responses were unchanged across a server restart, and
+resuming the completed client left its model log unchanged without another model
+invocation. The disposable server/database and their network were removed after
+archiving; temporary server/database credential files were removed as well.
+Raw operator evidence is retained at
+`/Users/apple/harness-resource-trial-wc17fre7`.
+
+This remains a source-only supervised trial. Formal historical multi-activity
+execution, complete resource/network reporting and a full benchmark baseline
+remain open in #1768.

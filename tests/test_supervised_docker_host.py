@@ -443,3 +443,40 @@ def test_native_metrics_reader_requires_cpu_total(tmp_path):
     assert result.returncode != 0
     assert 'usage_usec' in result.stderr
     assert result.stdout == ''
+
+
+def test_candidate_reaper_collects_exited_children_with_fixed_deadline():
+    module = load()
+    setup = "import os\npid=os.fork()\nif pid==0: os._exit(0)\n"
+    check = "\ntry: os.waitpid(pid,os.WNOHANG)\nexcept ChildProcessError: pass\nelse: raise AssertionError('child was not reaped')\n"
+    script = setup + module.CANDIDATE_REAPER_SCRIPT.replace('+ 900', '+ 0.2') + check
+    subprocess.run([sys.executable, '-I', '-c', script], check=True, timeout=3)
+
+
+def test_capture_failure_retains_completed_model_usage(tmp_path):
+    import hashlib
+    runner = host(tmp_path, 'claiming')
+    runner.name = 'test'
+    from types import SimpleNamespace
+    runner.args = SimpleNamespace(model='scripted-model')
+    runner.state.update(request={'project': str(tmp_path), 'prompt': 'task'},
+                        submission={'task_id': 'task-id', 'workflow_id': 'workflow-id'})
+    digest = hashlib.sha256(b'\0'.join(x.encode() for x in [str(tmp_path), '', 'task-id', 'task'])).hexdigest()
+    claim = {'claimed': True, **runner.state['lease'], 'runtime_job': {
+        'id': 'job', 'input': {'activity': 'modify', 'workflow_id': 'workflow-id',
+                             'command': {'prompt_ref': 'prompt-memory:' + digest}}}}
+    runner.api = Mock(side_effect=[{}, claim])
+    runner.launch = Mock()
+    runner.wait = Mock(return_value=0)
+    runner.capture = Mock(side_effect=RuntimeError('candidate did not quiesce'))
+    runner.cleanup = Mock()
+    runner.complete = Mock()
+    (tmp_path / 'agent.jsonl').write_text(json.dumps({'type': 'turn.completed', 'usage': {
+        'input_tokens': 120, 'output_tokens': 30, 'cached_input_tokens': 80}}) + '\n')
+    runner.run()
+    result = runner.state['result']
+    assert result['status'] == 'failed'
+    assert 'did not quiesce' in result['error']
+    usage = next(a['artifact'] for a in result['artifacts'] if a['artifact_type'] == 'runtime_host_usage')
+    assert usage == {'model': 'scripted-model', 'input_tokens': 120, 'output_tokens': 30,
+                     'cached_input_tokens': 80, 'total_tokens': 150}

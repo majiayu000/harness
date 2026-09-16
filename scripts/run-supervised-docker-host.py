@@ -124,6 +124,19 @@ def extract_candidate(archive: Path, destination: Path) -> None:
         stream.extractall(destination, members=members, filter="data")
 
 
+CANDIDATE_REAPER_SCRIPT = """import os, time
+# PID 1 adopts agent descendants and must reap them before cgroup quiescence.
+deadline = time.monotonic() + 900
+while time.monotonic() < deadline:
+    try:
+        while time.monotonic() < deadline and os.waitpid(-1, os.WNOHANG)[0]:
+            pass
+    except ChildProcessError:
+        pass  # No adopted children are waiting; keep the fixed retention deadline.
+    time.sleep(0.01)
+"""
+
+
 CGROUP_METRICS_SCRIPT = """import json
 from pathlib import Path
 root = Path('/sys/fs/cgroup')
@@ -246,7 +259,7 @@ class Host:
             "--mount", f"type=bind,src={args.workspace.resolve()},dst=/input,readonly",
             "--mount", f"type=bind,src={args.auth_file.resolve()},dst=/run/codex-auth.json,readonly",
             "--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080",
-            args.image, "sleep", "900",
+            args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT,
         ]
         docker(*run_args)
         self.state["container_started"] = True
@@ -452,9 +465,9 @@ class Host:
             exit_code = self.wait()
             if exit_code:
                 raise RuntimeError(f"agent exited with {exit_code}")
-            self.capture()
             usage = {"model": self.args.model, **read_usage(self.root / "agent.jsonl")}
             artifacts.append({"artifact_type": "runtime_host_usage", "artifact": usage})
+            self.capture()
             verifier_exit = self.verify()
             if verifier_exit:
                 raise RuntimeError(f"independent verifier rejected candidate: exit {verifier_exit}")
