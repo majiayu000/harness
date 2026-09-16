@@ -5,6 +5,8 @@ import io
 import json
 from pathlib import Path
 import tarfile
+import sys
+import subprocess
 from unittest.mock import Mock
 
 import pytest
@@ -39,11 +41,14 @@ def test_completed_restart_never_invokes_agent(tmp_path):
 @pytest.mark.parametrize('phase', ['claimed', 'executing'])
 def test_interrupted_run_cleans_up_and_reports_failure_without_reexecution(tmp_path, phase):
     runner = host(tmp_path, phase)
-    runner.capture_logs = Mock()
     runner.cleanup = Mock()
     runner.complete = Mock()
     runner.launch = Mock(side_effect=AssertionError('must not launch'))
+    (tmp_path / 'agent.jsonl').write_bytes(b'captured prefix')
+    (tmp_path / 'agent.stderr').write_bytes(b'error prefix')
     runner.run()
+    assert (tmp_path / 'agent.jsonl').read_bytes() == b'captured prefix'
+    assert (tmp_path / 'agent.stderr').read_bytes() == b'error prefix'
     runner.cleanup.assert_called_once()
     runner.complete.assert_called_once()
     assert runner.state['result']['status'] == 'failed'
@@ -155,7 +160,6 @@ def test_keyboard_interrupt_persists_failure_before_cleanup(tmp_path):
                              'command': {'prompt_ref': 'prompt-memory:' + digest}}}}
     runner.api = Mock(side_effect=[{}, claim])
     runner.launch = Mock(side_effect=KeyboardInterrupt)
-    runner.capture_logs = Mock()
 
     def check_cleanup_state():
         saved = json.loads((tmp_path / 'state.json').read_text())
@@ -168,3 +172,130 @@ def test_keyboard_interrupt_persists_failure_before_cleanup(tmp_path):
     runner.run()
     runner.complete.assert_called_once()
     assert runner.state['phase'] == 'completing'
+
+
+def test_attached_streams_keep_separate_binary_bytes_and_nonzero_exit(tmp_path):
+    module = load()
+    renew = Mock()
+    code = module.stream_agent_output([
+        sys.executable, '-c',
+        "import os; os.write(1, b'out\\x00\\xff'); os.write(2, b'err\\xff'); raise SystemExit(7)",
+    ], tmp_path, 5, renew)
+    assert code == 7
+    assert (tmp_path / 'agent.jsonl').read_bytes() == b'out\x00\xff'
+    assert (tmp_path / 'agent.stderr').read_bytes() == b'err\xff'
+    renew.assert_called()
+
+
+@pytest.mark.parametrize('stdout_size,stderr_size', [(600, 600), (1024 * 1024, 0), (0, 1024 * 1024)])
+def test_shared_output_limit_bounds_retained_prefix_without_newlines(tmp_path, stdout_size, stderr_size):
+    module = load()
+    module.OUTPUT_LIMIT = 1024
+    with pytest.raises(RuntimeError, match='output exceeded 1024 bytes'):
+        module.stream_agent_output([
+            sys.executable, '-c',
+            f"import os; os.write(1, b'a' * {stdout_size}); os.write(2, b'b' * {stderr_size})",
+        ], tmp_path, 5, Mock())
+    assert sum((tmp_path / name).stat().st_size for name in ['agent.jsonl', 'agent.stderr']) == 1024
+
+
+def test_exact_combined_output_limit_succeeds(tmp_path):
+    module = load()
+    module.OUTPUT_LIMIT = 1024
+    assert module.stream_agent_output([
+        sys.executable, '-c', "import os; os.write(1, b'a' * 512); os.write(2, b'b' * 512)",
+    ], tmp_path, 5, Mock()) == 0
+    assert (tmp_path / 'agent.jsonl').read_bytes() == b'a' * 512
+    assert (tmp_path / 'agent.stderr').read_bytes() == b'b' * 512
+
+
+def test_wall_timeout_keeps_output_and_reaps_attached_client(tmp_path, monkeypatch):
+    module = load()
+    popen = subprocess.Popen
+    processes = []
+
+    def start(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(module.subprocess, 'Popen', start)
+    renew = Mock()
+    with pytest.raises(RuntimeError, match='wall deadline'):
+        module.stream_agent_output([
+            sys.executable, '-c', "import os,time; os.write(1,b'prefix'); time.sleep(30)",
+        ], tmp_path, 1, renew)
+    assert (tmp_path / 'agent.jsonl').read_bytes() == b'prefix'
+    assert processes[0].poll() is not None
+    assert renew.call_count > 1
+
+
+def test_lease_failure_keeps_prefix_and_reaps_client(tmp_path):
+    module = load()
+
+    def renew():
+        if (tmp_path / 'agent.jsonl').stat().st_size:
+            raise RuntimeError('lease lost')
+
+    with pytest.raises(RuntimeError, match='lease lost'):
+        module.stream_agent_output([
+            sys.executable, '-c', "import os,time; os.write(1,b'prefix'); time.sleep(30)",
+        ], tmp_path, 5, renew)
+    assert (tmp_path / 'agent.jsonl').read_bytes() == b'prefix'
+
+
+def test_continuous_output_does_not_starve_lease_checks(tmp_path):
+    module = load()
+    module.OUTPUT_LIMIT = 2 * 1024 * 1024
+    renew = Mock()
+    assert module.stream_agent_output([
+        sys.executable, '-c',
+        "import os\nfor _ in range(256): os.write(1,b'a'*4096)",
+    ], tmp_path, 5, renew) == 0
+    assert renew.call_count > 2
+
+
+def test_candidate_export_does_not_replace_logs_and_removes_agent_before_extract(tmp_path, monkeypatch):
+    module = load()
+    runner = module.Host.__new__(module.Host)
+    runner.root, runner.name = tmp_path, 'owned'
+    (tmp_path / 'agent.jsonl').write_bytes(b'original')
+    (tmp_path / 'agent.stderr').write_bytes(b'errors')
+    events = []
+
+    def export(command, **kwargs):
+        assert command[:6] == ['docker', 'exec', 'owned', 'python3', '-I', '-c']
+        assert 'os.kill(-1, signal.SIGKILL)' in command[6]
+        events.append('export')
+
+    monkeypatch.setattr(module.subprocess, 'run', export)
+    monkeypatch.setattr(module, 'docker', lambda *args: events.append(args))
+    monkeypatch.setattr(module, 'extract_candidate', lambda *args: events.append('extract'))
+    runner.capture()
+    assert events == ['export', ('rm', '-f', 'owned'), 'extract']
+    assert (tmp_path / 'agent.jsonl').read_bytes() == b'original'
+    assert (tmp_path / 'agent.stderr').read_bytes() == b'errors'
+
+
+def test_both_streams_larger_than_pipe_buffers_are_drained(tmp_path):
+    module = load()
+    assert module.stream_agent_output([
+        sys.executable, '-c',
+        "import os\nfor _ in range(256):\n os.write(1,b'a'*4096)\n os.write(2,b'b'*4096)",
+    ], tmp_path, 5, Mock()) == 0
+    assert (tmp_path / 'agent.jsonl').read_bytes() == b'a' * (1024 * 1024)
+    assert (tmp_path / 'agent.stderr').read_bytes() == b'b' * (1024 * 1024)
+
+
+def test_keyboard_interrupt_in_stream_keeps_prefix(tmp_path):
+    module = load()
+
+    def renew():
+        if (tmp_path / 'agent.jsonl').stat().st_size:
+            raise KeyboardInterrupt()
+
+    with pytest.raises(KeyboardInterrupt):
+        module.stream_agent_output([
+            sys.executable, '-c', "import os,time; os.write(1,b'prefix'); time.sleep(30)",
+        ], tmp_path, 5, renew)
+    assert (tmp_path / 'agent.jsonl').read_bytes() == b'prefix'
