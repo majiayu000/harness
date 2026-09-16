@@ -618,3 +618,30 @@ fn eval_report_binds_suite_identity_and_rejects_drift() {
     json.as_object_mut().unwrap().remove("suite_digest");
     assert!(serde_json::from_value::<EvalRunReport>(json).is_err());
 }
+
+#[test]
+fn imported_evidence_cannot_relabel_old_passing_cases() {
+    let original = manifest(&["case-pass"]);
+    let imported = EvalImportedEvidence {
+        schema_version: original.schema_version,
+        suite_digest: original.suite_digest(),
+        cases: vec![evidence(
+            "case-pass",
+            EvalEvidenceStatus::Passed,
+            vec![],
+            None,
+        )],
+    };
+    assert!(eval_report_from_imported_evidence(&original, "report", 1, imported.clone()).is_ok());
+    let mut changed = original.clone();
+    changed.cases[0]
+        .verify_commands
+        .push("cargo test stronger_check".into());
+    assert!(eval_report_from_imported_evidence(&changed, "report", 1, imported.clone()).is_err());
+    changed = original.clone();
+    changed.cases[0].base_commit = "abcdef2".into();
+    assert!(eval_report_from_imported_evidence(&changed, "report", 1, imported.clone()).is_err());
+    let mut wrong_version = imported;
+    wrong_version.schema_version = 2;
+    assert!(eval_report_from_imported_evidence(&original, "report", 1, wrong_version).is_err());
+}

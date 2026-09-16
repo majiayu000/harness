@@ -72,3 +72,17 @@ trusted-verifier commands and asset digests. TOML formatting and key order do
 not affect it. Reports without identity fields or with different identities
 cannot be compared. Suite migration approval is a separate operation; the
 current diff command has no bypass for unreviewed drift.
+
+Execution reports bind the effective timeout and resource limits after a
+`--case-timeout-secs` override. An override equal to a case's manifest timeout
+preserves that case's identity and limits. Overrides may tighten resource limits,
+but never increase the manifest's effective resource limits. A longer override
+extends the workflow wait deadline while the original CPU and wall-time resource
+limits still apply; raising those limits requires changing the manifest itself.
+
+`eval run --evidence` accepts an object with required `schema_version`,
+`suite_digest`, and `cases` fields. Evidence producers must retain the identity
+of the manifest used for collection; the importer rejects another manifest's
+identity before building a report. Bare arrays and objects containing only
+`cases` are rejected. This identity check detects accidental stale evidence;
+it does not authenticate a producer or replace attestation verification.

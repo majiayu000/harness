@@ -2,6 +2,7 @@ use super::super::{Cli, Command};
 use super::*;
 use clap::Parser;
 use harness_workflow::runtime::eval::model::{Confidence, EvalGrade, HardGateName, UsageSnapshot};
+use harness_workflow::runtime::{eval_report_from_evidence, EvalCaseEvidence};
 use harness_workflow::runtime::{
     EvalAttestationSummary, EvalEvidenceStatus, EvalIsolationEvidence, EvalQualityGateEvidence,
     EvalReportCase, EvalReportFailedGate, EvalReportMetrics, EvalSubmissionEvidence,
@@ -348,8 +349,10 @@ fn eval_report_evidence_input_downgrades_forged_verified_summary() {
     let evidence_path = tempdir.path().join("evidence.json");
     fs::write(
         &evidence_path,
-        r#"[
-            {
+        format!(
+            r#"{{"schema_version": 1, "suite_digest": "{}", "cases": [{}]}}"#,
+            sample_eval_manifest().suite_digest(),
+            r#"{
                 "eval_run_id": "run-1",
                 "case_id": "case-pass",
                 "workflow_id": "workflow-case-pass",
@@ -365,13 +368,14 @@ fn eval_report_evidence_input_downgrades_forged_verified_summary() {
                 "quality_gate": null,
                 "missing_evidence": []
             }
-        ]"#,
+        "#
+        ),
     )
     .unwrap_or_else(|error| panic!("evidence should write: {error}"));
 
     let evidence = read_evidence(&evidence_path)
         .unwrap_or_else(|error| panic!("evidence should parse: {error}"));
-    let report = eval_report_from_evidence(&sample_eval_manifest(), "run-1", 3, evidence)
+    let report = eval_report_from_imported_evidence(&sample_eval_manifest(), "run-1", 3, evidence)
         .unwrap_or_else(|error| panic!("report should build: {error}"));
 
     assert_eq!(
@@ -796,4 +800,39 @@ fn write_report(path: &Path, report: &EvalRunReport) {
             .unwrap_or_else(|error| panic!("report should serialize: {error}")),
     )
     .unwrap_or_else(|error| panic!("report should write: {error}"));
+}
+
+#[test]
+fn eval_import_rejects_unbound_or_stale_evidence() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("evidence.json");
+    let manifest = sample_eval_manifest();
+    let cases = vec![case_evidence(
+        "case-pass",
+        EvalEvidenceStatus::Passed,
+        vec![],
+        vec![],
+    )];
+    for old in [
+        serde_json::to_value(&cases)?,
+        serde_json::json!({"cases": cases}),
+    ] {
+        fs::write(&path, serde_json::to_vec(&old)?)?;
+        assert!(read_evidence(&path).is_err());
+    }
+    let input = EvalImportedEvidence {
+        schema_version: manifest.schema_version,
+        suite_digest: manifest.suite_digest(),
+        cases,
+    };
+    fs::write(&path, serde_json::to_vec(&input)?)?;
+    let mut changed = manifest.clone();
+    changed.cases[0]
+        .verify_commands
+        .push("cargo test new_acceptance".into());
+    assert!(
+        eval_report_from_imported_evidence(&changed, "candidate", 1, read_evidence(&path)?)
+            .is_err()
+    );
+    Ok(())
 }

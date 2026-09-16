@@ -264,6 +264,30 @@ pub fn eval_report_dry_run(
     Ok(report_from_cases(manifest, run_id, k, cases))
 }
 
+/// Collected evidence must retain the suite identity from its execution.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvalImportedEvidence {
+    pub schema_version: u32,
+    pub suite_digest: String,
+    pub cases: Vec<EvalCaseEvidence>,
+}
+
+pub fn eval_report_from_imported_evidence(
+    manifest: &EvalBenchmarkManifest,
+    run_id: impl Into<String>,
+    k: u32,
+    evidence: EvalImportedEvidence,
+) -> Result<EvalRunReport, EvalReportError> {
+    if evidence.schema_version != manifest.schema_version
+        || evidence.suite_digest != manifest.suite_digest()
+    {
+        return Err(EvalReportError::new(
+            "imported evidence suite identity does not match the manifest",
+        ));
+    }
+    eval_report_from_evidence(manifest, run_id, k, evidence.cases)
+}
+
 pub fn eval_report_from_evidence(
     manifest: &EvalBenchmarkManifest,
     run_id: impl Into<String>,
