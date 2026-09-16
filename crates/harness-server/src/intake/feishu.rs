@@ -335,7 +335,7 @@ pub async fn feishu_webhook(
         ..Default::default()
     };
 
-    let task_id = match crate::http::task_routes::enqueue_task(&state, req).await {
+    let task_id = match state.execution_svc.enqueue(req).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!("feishu: failed to enqueue task: {e:?}");

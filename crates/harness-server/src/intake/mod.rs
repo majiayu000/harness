@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::AppState;
+use crate::services::execution::QueueDomain;
 use crate::workflow_runtime_submission::{
     runtime_models::{TaskFailureKind, TaskId, TaskStatus},
     CreateTaskRequest, MAX_TASK_PRIORITY,
@@ -364,7 +365,11 @@ async fn enqueue_fallback_intake_issue(
 ) {
     let external_id = issue.external_id.clone();
     let req = fallback_intake_task_request(&issue, source.name(), default_project_root);
-    match crate::http::task_routes::enqueue_task_background(Arc::clone(state), req).await {
+    match state
+        .execution_svc
+        .enqueue_in_domain(req, QueueDomain::Primary)
+        .await
+    {
         Ok(task_id) => {
             if let Err(error) = source.mark_dispatched(&external_id, &task_id).await {
                 tracing::warn!(
