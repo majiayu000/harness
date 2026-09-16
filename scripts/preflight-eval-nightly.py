@@ -14,7 +14,9 @@ from typing import Any
 
 
 REQUIRED_RUNTIME_HOST_CAPABILITIES = {
+    "runtime_job_lease_proof_v1",
     "eval_resource_limits",
+    "eval_network_policy",
     "trusted_eval_verifier_v1",
 }
 

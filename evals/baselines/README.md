@@ -12,8 +12,11 @@ set `HARNESS_EVAL_GATE_MODE=enforce`. Enforced runs fail preflight when
 The live workflow also requires `HARNESS_EVAL_ENABLED=true`, the
 `eval-nightly` environment, an isolated `self-hosted` runner labeled
 `harness-eval`, a configured `HARNESS_DATABASE_URL`, an active Harness server,
-and an online runtime host advertising `eval_resource_limits` and
-`trusted_eval_verifier_v1`. Trusted eval verifiers execute as native,
+and an online active runtime host advertising `runtime_job_lease_proof_v1`,
+`eval_resource_limits`, `eval_network_policy`, and `trusted_eval_verifier_v1`.
+The lease-proof capability is required to claim a job; the network-policy
+capability is required to enforce the policy returned with an eval lease.
+Trusted eval verifiers execute as native,
 evaluator-owned code from the versioned declarative contract embedded in the
 Harness binary. Advertising the verifier capability asserts that the runtime
 host has the matching Harness revision. Keeping the workflow disabled before
