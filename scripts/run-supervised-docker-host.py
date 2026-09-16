@@ -14,6 +14,7 @@ import os
 import selectors
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import time
 import urllib.error
@@ -76,11 +77,27 @@ def stream_agent_output(command: list[str], root: Path, timeout: int, renew) -> 
     finally:
         # Disconnecting the CLI does not stop remote exec; the caller must remove
         # its exact container on failure before completing the job.
-        if process.poll() is None:
-            process.kill()
-        process.wait(timeout=5)
-        process.stdout.close()
-        process.stderr.close()
+        primary_error = sys.exc_info()[1]
+        cleanup_errors = []
+        try:
+            if process.poll() is None:
+                process.kill()
+        except Exception as error:
+            cleanup_errors.append(f"kill: {error}")
+        try:
+            process.wait(timeout=5)
+        except Exception as error:
+            cleanup_errors.append(f"wait: {error}")
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except Exception as error:
+                cleanup_errors.append(f"close stream: {error}")
+        if cleanup_errors:
+            reason = "agent output cleanup failed: " + "; ".join(cleanup_errors)
+            if primary_error is not None:
+                reason = f"{type(primary_error).__name__}: {primary_error}; {reason}"
+            raise RuntimeError(reason) from primary_error
 
 
 def read_usage(log: Path) -> dict:

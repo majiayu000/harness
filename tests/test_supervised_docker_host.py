@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import sys
@@ -299,3 +300,33 @@ def test_keyboard_interrupt_in_stream_keeps_prefix(tmp_path):
             sys.executable, '-c', "import os,time; os.write(1,b'prefix'); time.sleep(30)",
         ], tmp_path, 5, renew)
     assert (tmp_path / 'agent.jsonl').read_bytes() == b'prefix'
+
+
+@pytest.mark.parametrize('failure', ['deadline', 'output'])
+def test_stuck_client_cleanup_preserves_primary_failure_and_closes_streams(tmp_path, monkeypatch, failure):
+    module = load()
+    module.OUTPUT_LIMIT = 1
+    streams = []
+    for _ in range(2):
+        reader, writer = os.pipe()
+        os.write(writer, b'xx')
+        os.close(writer)
+        streams.append(os.fdopen(reader, 'rb', buffering=0))
+    process = Mock(stdout=streams[0], stderr=streams[1])
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired(['docker', 'exec'], 5)
+    monkeypatch.setattr(module.subprocess, 'Popen', Mock(return_value=process))
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            module.stream_agent_output(['docker', 'exec'], tmp_path, 0 if failure == 'deadline' else 5, Mock())
+        message = str(raised.value)
+        assert ('wall deadline' if failure == 'deadline' else 'output exceeded') in message
+        assert 'agent output cleanup failed: wait:' in message
+        assert 'timed out after 5 seconds' in message
+        assert raised.value.__cause__ is not None
+        assert all(stream.closed for stream in streams)
+        process.kill.assert_called_once()
+        process.wait.assert_called_once_with(timeout=5)
+    finally:
+        for stream in streams:
+            stream.close()
