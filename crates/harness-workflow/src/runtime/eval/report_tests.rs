@@ -250,6 +250,7 @@ fn effective_outcome_reconstructs_legacy_incomplete_reports() {
 fn gh1454_report_and_diff_retain_verifier_provenance() {
     let manifest = parse_benchmark_manifest_str(
         r#"
+schema_version = 1
 suite = "trusted"
 
 [[cases]]
@@ -287,7 +288,7 @@ base_commit = "9c0099ad458e82fd377fd20a8e288a46722762ef"
     let candidate = eval_report_from_evidence(&manifest, "candidate", 1, vec![case_evidence])
         .expect("report should build");
     let baseline = eval_report_dry_run(&manifest, "baseline", 1).expect("baseline should build");
-    let diff = diff_eval_run_reports(&baseline, &candidate);
+    let diff = diff_eval_run_reports(&baseline, &candidate).unwrap();
 
     assert_eq!(
         candidate.cases[0].verification_evidence[0]
@@ -330,6 +331,7 @@ fn historical_replay_manifest_rejects_evidence_for_pending_case() {
 
 fn manifest_with_case(case: EvalBenchmarkCase) -> EvalBenchmarkManifest {
     EvalBenchmarkManifest {
+        schema_version: 1,
         suite: "harness-historical-replay".to_string(),
         cases: vec![case],
     }
@@ -410,7 +412,7 @@ fn eval_report_diff_counts_every_transition_and_exposes_regressions() {
         ],
     );
 
-    let diff = diff_eval_run_reports(&baseline, &candidate);
+    let diff = diff_eval_run_reports(&baseline, &candidate).unwrap();
     let kinds = diff
         .transitions
         .iter()
@@ -482,6 +484,7 @@ fn eval_report_diff_counts_every_transition_and_exposes_regressions() {
 
 fn manifest(case_ids: &[&str]) -> EvalBenchmarkManifest {
     EvalBenchmarkManifest {
+        schema_version: 1,
         suite: "harness-core".to_string(),
         cases: case_ids
             .iter()
@@ -541,6 +544,8 @@ fn evidence(
 
 fn report(run_id: &str, cases: Vec<EvalReportCase>) -> EvalRunReport {
     EvalRunReport {
+        schema_version: 1,
+        suite_digest: format!("sha256:{}", "a".repeat(64)),
         run_id: run_id.to_string(),
         suite: "harness-core".to_string(),
         k: 3,
@@ -589,4 +594,27 @@ fn case_status_suffix(status: EvalReportCaseStatus) -> &'static str {
         EvalReportCaseStatus::Skipped => "skipped",
         EvalReportCaseStatus::InfraFailed => "infra-failed",
     }
+}
+
+#[test]
+fn eval_report_binds_suite_identity_and_rejects_drift() {
+    let manifest = manifest(&["same-case"]);
+    let baseline = eval_report_dry_run(&manifest, "base", 1).unwrap();
+    assert_eq!(baseline.schema_version, manifest.schema_version);
+    assert_eq!(baseline.suite_digest, manifest.suite_digest());
+    let mut changed = manifest.clone();
+    changed.cases[0]
+        .verify_commands
+        .push("cargo test new_check".into());
+    let candidate = eval_report_dry_run(&changed, "candidate", 1).unwrap();
+    assert!(diff_eval_run_reports(&baseline, &candidate).is_err());
+    let mut candidate = baseline.clone();
+    candidate.schema_version = 2;
+    assert!(diff_eval_run_reports(&baseline, &candidate).is_err());
+    candidate = baseline.clone();
+    candidate.suite_digest.clear();
+    assert!(diff_eval_run_reports(&candidate, &candidate).is_err());
+    let mut json = serde_json::to_value(&baseline).unwrap();
+    json.as_object_mut().unwrap().remove("suite_digest");
+    assert!(serde_json::from_value::<EvalRunReport>(json).is_err());
 }

@@ -10,6 +10,7 @@ use harness_workflow::runtime::{
 fn sample_eval_manifest() -> EvalBenchmarkManifest {
     parse_benchmark_manifest_str(
         r#"
+schema_version = 1
 suite = "harness-core"
 
 [[cases]]
@@ -276,7 +277,7 @@ fn eval_report_diff_text_includes_status_transitions() {
         )],
     )
     .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
-    let diff = diff_eval_run_reports(&baseline, &candidate);
+    let diff = diff_eval_run_reports(&baseline, &candidate).unwrap();
     let rendered = render_diff_report(&diff);
 
     assert!(rendered.contains("pass_to_fail"));
@@ -315,7 +316,7 @@ fn eval_report_diff_text_and_json_include_attestation_changes() {
     )
     .unwrap_or_else(|error| panic!("candidate report should build: {error}"));
 
-    let diff = diff_eval_run_reports(&baseline, &candidate);
+    let diff = diff_eval_run_reports(&baseline, &candidate).unwrap();
     let transition = diff
         .transitions
         .iter()
@@ -763,6 +764,8 @@ fn report_with_pass_count(run_id: &str, total_cases: u64, passed_cases: u64) -> 
         .collect::<Vec<_>>();
 
     EvalRunReport {
+        schema_version: 1,
+        suite_digest: format!("sha256:{}", "a".repeat(64)),
         run_id: run_id.to_string(),
         suite: "harness-core".to_string(),
         k: 1,

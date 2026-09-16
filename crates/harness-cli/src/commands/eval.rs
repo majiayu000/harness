@@ -323,7 +323,7 @@ fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
             candidate.k
         );
     }
-    let diff = diff_eval_run_reports(&baseline, &candidate);
+    let diff = diff_eval_run_reports(&baseline, &candidate)?;
     let regressions = eval_diff_regressions(&baseline, &candidate, &diff, &args)?;
     emit_diff(&diff, args.json, args.output.as_deref())?;
     if regressions.is_empty() {
@@ -398,6 +398,10 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
     output.push_str(&format!(
         "Eval report {} ({})\n",
         report.run_id, report.suite
+    ));
+    output.push_str(&format!(
+        "suite_identity: schema_version={} digest={}\n",
+        report.schema_version, report.suite_digest
     ));
     if let Some(outcome) = report.outcome {
         output.push_str(&format!("run_outcome: {outcome:?}\n"));
@@ -482,6 +486,10 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
     output.push_str(&format!(
         "Eval diff {} -> {} ({})\n",
         diff.baseline_run_id, diff.candidate_run_id, diff.suite
+    ));
+    output.push_str(&format!(
+        "suite_identity: schema_version={} digest={}\n",
+        diff.schema_version, diff.suite_digest
     ));
     if let Some(outcome) = diff.candidate_outcome {
         output.push_str(&format!("candidate_run_outcome: {outcome:?}\n"));

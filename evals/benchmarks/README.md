@@ -5,6 +5,7 @@ resolved issue cases that the eval driver can replay through the normal
 workflow runtime path.
 
 ```toml
+schema_version = 1
 suite = "harness-core"
 default_timeout_secs = 3600
 
@@ -60,3 +61,14 @@ Historical replay cases can also record structured replay metadata:
 - `commit_resolution` is `resolved` or `pending`.
 - `verdict` is `replayable` or `pending`; pending commit pairs must not be
   marked replayable, dispatched, or counted from collected evidence.
+
+### Suite identity
+
+Manifests require `schema_version = 1`. Reports and JSON diffs retain the schema
+version and a `sha256:` suite digest in addition to the readable suite name.
+The digest covers the normalized manifest (including effective defaults, case
+order, commands, expectations, resource limits, and isolation) and registered
+trusted-verifier commands and asset digests. TOML formatting and key order do
+not affect it. Reports without identity fields or with different identities
+cannot be compared. Suite migration approval is a separate operation; the
+current diff command has no bypass for unreviewed drift.
