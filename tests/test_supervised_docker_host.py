@@ -260,6 +260,7 @@ def test_candidate_export_does_not_replace_logs_and_removes_agent_before_extract
     module = load()
     runner = module.Host.__new__(module.Host)
     runner.root, runner.name = tmp_path, 'owned'
+    runner.collect_resources = Mock(side_effect=lambda **kw: events.append('resources'))
     (tmp_path / 'agent.jsonl').write_bytes(b'original')
     (tmp_path / 'agent.stderr').write_bytes(b'errors')
     events = []
@@ -273,7 +274,7 @@ def test_candidate_export_does_not_replace_logs_and_removes_agent_before_extract
     monkeypatch.setattr(module, 'docker', lambda *args: events.append(args))
     monkeypatch.setattr(module, 'extract_candidate', lambda *args: events.append('extract'))
     runner.capture()
-    assert events == ['export', ('rm', '-f', 'owned'), 'extract']
+    assert events == ['export', 'resources', ('rm', '-f', 'owned'), 'extract']
     assert (tmp_path / 'agent.jsonl').read_bytes() == b'original'
     assert (tmp_path / 'agent.stderr').read_bytes() == b'errors'
 
@@ -330,3 +331,115 @@ def test_stuck_client_cleanup_preserves_primary_failure_and_closes_streams(tmp_p
     finally:
         for stream in streams:
             stream.close()
+
+
+def resource_runner(tmp_path, monkeypatch, *, running=True, oom=0, pids_max=0, stop_error=False):
+    module = load()
+    runner = host(tmp_path, 'executing')
+    runner.name = 'owned'
+    runner.state['container_started'] = True
+    runner.state['candidate_id'] = 'a' * 64
+    metrics = {'cpu_time_micros': 2300123, 'current_pids_before': 1, 'peak_memory_bytes': 42000000,
+               'peak_pids': 7, 'current_pids': 1, 'memory_events': {'oom': oom, 'oom_kill': oom},
+               'pids_events': {'max': pids_max}}
+    calls = []
+    def invoke(*args, **kwargs):
+        calls.append(args)
+        if args[0] == 'inspect':
+            return json.dumps({'Running': running, 'OOMKilled': bool(oom)})
+        if args[:2] == ('exec', 'owned') and stop_error:
+            raise RuntimeError('PID exhaustion prevented quiescing')
+        if args[:2] == ('exec', 'owned-observer'):
+            return json.dumps(metrics)
+        return ''
+    # host() loads its own module; patch the method globals, not another import.
+    monkeypatch.setitem(runner.collect_resources.__globals__, 'docker', invoke)
+    return runner, calls, metrics
+
+
+def test_resource_peaks_are_saved_outside_candidate_after_quiescing(tmp_path, monkeypatch):
+    runner, calls, metrics = resource_runner(tmp_path, monkeypatch)
+    runner.collect_resources(stop_agents=True)
+    evidence = json.loads((tmp_path / 'candidate-resources.json').read_text())
+    assert evidence['status'] == 'complete'
+    assert evidence['metrics'] == metrics
+    stop = next(i for i, c in enumerate(calls) if c[:2] == ('exec', 'owned'))
+    sample = next(i for i, c in enumerate(calls) if c[:2] == ('exec', 'owned-observer'))
+    assert stop < sample
+    assert runner.result('succeeded', 'verified')['artifacts'][0]['artifact'] == evidence
+
+
+@pytest.mark.parametrize('failure', ['oom', 'pids', 'dead', 'pid-exec'])
+def test_resource_failures_cannot_be_success_or_fake_zero(tmp_path, monkeypatch, failure):
+    runner, calls, metrics = resource_runner(
+        tmp_path, monkeypatch, running=failure != 'dead', oom=int(failure == 'oom'),
+        pids_max=int(failure in {'pids', 'pid-exec'}), stop_error=failure == 'pid-exec')
+    with pytest.raises(RuntimeError, match='resource evidence incomplete'):
+        runner.collect_resources(stop_agents=True)
+    evidence = json.loads((tmp_path / 'candidate-resources.json').read_text())
+    assert evidence['status'] == 'incomplete'
+    assert evidence['metrics'] == metrics
+    assert evidence['error']
+    assert runner.result('succeeded', 'verifier accepted')['status'] == 'failed'
+    assert runner.result('failed', 'original timeout')['error'] == 'original timeout'
+
+
+def test_missing_observer_keeps_missing_evidence_instead_of_zero(tmp_path, monkeypatch):
+    runner, _, _ = resource_runner(tmp_path, monkeypatch)
+    def unavailable(*args):
+        if args[0] == 'inspect':
+            return json.dumps({'Running': False, 'OOMKilled': False})
+        raise RuntimeError('observer cgroup files missing')
+    monkeypatch.setitem(runner.collect_resources.__globals__, 'docker', unavailable)
+    with pytest.raises(RuntimeError, match='files missing'):
+        runner.collect_resources(stop_agents=True)
+    evidence = runner.state['resource_evidence']
+    assert 'metrics' not in evidence
+    assert evidence['status'] == 'incomplete'
+    assert runner.result('succeeded', 'accepted')['status'] == 'failed'
+
+
+def test_observer_mount_is_candidate_only_and_has_no_extra_privileges(tmp_path, monkeypatch):
+    module = load()
+    runner = module.Host.__new__(module.Host)
+    runner.root, runner.name, runner.state = tmp_path, 'owned', {}
+    from types import SimpleNamespace
+    runner.args = SimpleNamespace(image='sha256:' + 'b' * 64)
+    calls = []
+    def invoke(*args):
+        calls.append(args)
+        if args[0] == 'info':
+            return json.dumps({'CgroupVersion': '2', 'CgroupDriver': 'cgroupfs'})
+        if args[0] == 'inspect':
+            return 'a' * 64
+        return '{}'
+    monkeypatch.setattr(module, 'docker', invoke)
+    monkeypatch.setattr(module.os, 'getuid', lambda: 1001)
+    runner.start_observer()
+    command = next(c for c in calls if c[0] == 'run')
+    mount = command[command.index('--mount') + 1]
+    assert mount == 'type=bind,src=/sys/fs/cgroup/docker/' + 'a' * 64 + ',dst=/sys/fs/cgroup,readonly'
+    assert command[command.index('--network') + 1] == 'none'
+    assert command[command.index('--user') + 1].startswith('1001:')
+    assert '--privileged' not in command and '--pid' not in command
+    assert not any('docker.sock' in argument for argument in command)
+
+
+def test_nonquiescent_candidate_retains_metrics_but_cannot_pass(tmp_path, monkeypatch):
+    runner, _, metrics = resource_runner(tmp_path, monkeypatch)
+    metrics['current_pids'] = 2
+    with pytest.raises(RuntimeError, match='not quiescent'):
+        runner.collect_resources(stop_agents=True)
+    assert runner.state['resource_evidence']['metrics']['current_pids'] == 2
+    assert runner.result('succeeded', 'accepted')['status'] == 'failed'
+
+
+def test_native_metrics_reader_requires_cpu_total(tmp_path):
+    module = load()
+    for name, text in {'pids.current': '1', 'cpu.stat': 'user_usec 12\n'}.items():
+        (tmp_path / name).write_text(text)
+    script = module.CGROUP_METRICS_SCRIPT.replace("Path('/sys/fs/cgroup')", f'Path({str(tmp_path)!r})')
+    result = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'usage_usec' in result.stderr
+    assert result.stdout == ''

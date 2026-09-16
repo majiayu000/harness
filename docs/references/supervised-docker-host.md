@@ -79,6 +79,46 @@ process dies. These are explicit trial limits, **not** a
 claim to implement every `CappedResourceLimits` field (especially aggregate CPU
 time), nor a measured full eval resource report.
 
+## Candidate resource evidence
+
+The runner now retains candidate cgroup counters in the host-owned
+`candidate-resources.json` and the `supervised_candidate_resources` result
+artifact. It supports the observed Docker **cgroup v2 / cgroupfs** layout at
+`/sys/fs/cgroup/docker/<full-container-id>` only. Missing paths, unsupported
+engines, or a root operator UID fail before the model starts; there is no
+alternative measurement fallback.
+
+Immediately after candidate startup, an independent observer using the same
+pinned image and non-root operator UID mounts **only that candidate's cgroup
+subdirectory**, read-only, over its `/sys/fs/cgroup`. This replaces the default
+cgroup mount even with `--cgroupns host`; sibling container cgroups are not
+mounted. The observer has no network, credentials, Docker socket, added
+capabilities, host PID namespace, or privileged mode. Its resource limits are
+separate from the candidate's, so candidate PID exhaustion cannot block the
+observer's reader.
+
+Before removing the candidate, the runner stops agent processes and
+waits up to five seconds for only the exporter and PID 1 to remain, then
+exports and captures aggregate `cpu.stat` CPU microseconds, kernel `memory.peak`, `pids.peak`,
+`pids.current`, `memory.events`, and `pids.events` through the observer. A complete
+snapshot requires the candidate PID 1 still running and exactly one remaining
+PID both before and after reading the other counters. Counters cover the candidate cgroup through export, including setup and
+export overhead; they exclude the verifier, proxy and observer. CPU is recorded
+in the kernel's microseconds, not inferred from a Docker CPU-rate setting.
+
+OOM or PID-limit events fail the task even if the agent or verifier would otherwise
+claim success. Failure and interrupted-run recovery attempt collection before
+cleanup. If quiescing or reading fails, the artifact explicitly records
+`status: incomplete`, any available counters, and the collection error; the
+original task failure is retained. Missing counters are never filled with zeros.
+If candidate PID 1 dies, Docker may remove the cgroup files before collection;
+that remains an incomplete failure, not a recovered final resource measurement.
+Cleanup also removes the exact task-owned observer container.
+
+This adds evidence to the supervised trial. It does **not** implement a complete
+`ResourceLimitReport`, aggregate disk accounting, or a hard lifetime CPU quota,
+and it does not advertise `eval_resource_limits` or enable formal eval jobs.
+
 ## Recovery and evidence
 
 The private state directory contains the lease, task identity, snapshotted
