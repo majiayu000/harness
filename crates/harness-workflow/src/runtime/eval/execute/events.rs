@@ -109,6 +109,7 @@ mod tests {
     fn report() -> EvalRunReport {
         let manifest = parse_benchmark_manifest_str(
             r#"
+schema_version = 1
 suite = "event-contract"
 
 [[cases]]

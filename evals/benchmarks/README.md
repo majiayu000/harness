@@ -5,6 +5,7 @@ resolved issue cases that the eval driver can replay through the normal
 workflow runtime path.
 
 ```toml
+schema_version = 1
 suite = "harness-core"
 default_timeout_secs = 3600
 
@@ -60,3 +61,28 @@ Historical replay cases can also record structured replay metadata:
 - `commit_resolution` is `resolved` or `pending`.
 - `verdict` is `replayable` or `pending`; pending commit pairs must not be
   marked replayable, dispatched, or counted from collected evidence.
+
+### Suite identity
+
+Manifests require `schema_version = 1`. Reports and JSON diffs retain the schema
+version and a `sha256:` suite digest in addition to the readable suite name.
+The digest covers the normalized manifest (including effective defaults, case
+order, commands, expectations, resource limits, and isolation) and registered
+trusted-verifier commands and asset digests. TOML formatting and key order do
+not affect it. Reports without identity fields or with different identities
+cannot be compared. Suite migration approval is a separate operation; the
+current diff command has no bypass for unreviewed drift.
+
+Execution reports bind the effective timeout and resource limits after a
+`--case-timeout-secs` override. An override equal to a case's manifest timeout
+preserves that case's identity and limits. Overrides may tighten resource limits,
+but never increase the manifest's effective resource limits. A longer override
+extends the workflow wait deadline while the original CPU and wall-time resource
+limits still apply; raising those limits requires changing the manifest itself.
+
+`eval run --evidence` accepts an object with required `schema_version`,
+`suite_digest`, and `cases` fields. Evidence producers must retain the identity
+of the manifest used for collection; the importer rejects another manifest's
+identity before building a report. Bare arrays and objects containing only
+`cases` are rejected. This identity check detects accidental stale evidence;
+it does not authenticate a producer or replace attestation verification.

@@ -13,6 +13,8 @@ pub use outcome::{eval_report_effective_outcome, EvalReportCaseOutcome, EvalRunO
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvalRunReport {
+    pub schema_version: u32,
+    pub suite_digest: String,
     pub run_id: String,
     pub suite: String,
     pub k: u32,
@@ -103,6 +105,8 @@ pub enum EvalCaseInfrastructureStatus {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvalRunReportDiff {
+    pub schema_version: u32,
+    pub suite_digest: String,
     pub baseline_run_id: String,
     pub candidate_run_id: String,
     pub suite: String,
@@ -260,6 +264,30 @@ pub fn eval_report_dry_run(
     Ok(report_from_cases(manifest, run_id, k, cases))
 }
 
+/// Collected evidence must retain the suite identity from its execution.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvalImportedEvidence {
+    pub schema_version: u32,
+    pub suite_digest: String,
+    pub cases: Vec<EvalCaseEvidence>,
+}
+
+pub fn eval_report_from_imported_evidence(
+    manifest: &EvalBenchmarkManifest,
+    run_id: impl Into<String>,
+    k: u32,
+    evidence: EvalImportedEvidence,
+) -> Result<EvalRunReport, EvalReportError> {
+    if evidence.schema_version != manifest.schema_version
+        || evidence.suite_digest != manifest.suite_digest()
+    {
+        return Err(EvalReportError::new(
+            "imported evidence suite identity does not match the manifest",
+        ));
+    }
+    eval_report_from_evidence(manifest, run_id, k, evidence.cases)
+}
+
 pub fn eval_report_from_evidence(
     manifest: &EvalBenchmarkManifest,
     run_id: impl Into<String>,
@@ -353,7 +381,19 @@ pub fn eval_report_from_evidence(
 pub fn diff_eval_run_reports(
     baseline: &EvalRunReport,
     candidate: &EvalRunReport,
-) -> EvalRunReportDiff {
+) -> Result<EvalRunReportDiff, EvalReportError> {
+    if baseline.schema_version != 1
+        || candidate.schema_version != 1
+        || baseline.suite_digest != candidate.suite_digest
+        || !baseline
+            .suite_digest
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    {
+        return Err(EvalReportError::new("cannot diff reports with incompatible suite identity; reviewed suite migration evidence is required"));
+    }
     let baseline_cases = baseline
         .cases
         .iter()
@@ -412,7 +452,9 @@ pub fn diff_eval_run_reports(
     let regression_ids = regression_ids_for(&transitions);
     let regression_count = regression_ids.len() as u64;
 
-    EvalRunReportDiff {
+    Ok(EvalRunReportDiff {
+        schema_version: candidate.schema_version,
+        suite_digest: candidate.suite_digest.clone(),
         baseline_run_id: baseline.run_id.clone(),
         candidate_run_id: candidate.run_id.clone(),
         suite: candidate.suite.clone(),
@@ -431,7 +473,7 @@ pub fn diff_eval_run_reports(
         regression_count,
         regression_ids,
         transitions,
-    }
+    })
 }
 
 fn report_case_from_evidence(
@@ -567,6 +609,8 @@ fn report_from_cases(
     let metrics = metrics_for_cases(k, &cases);
     let outcome = inferred_run_outcome(&cases, &metrics);
     EvalRunReport {
+        schema_version: manifest.schema_version,
+        suite_digest: manifest.suite_digest(),
         run_id: run_id.into(),
         suite: manifest.suite.clone(),
         k,

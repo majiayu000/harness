@@ -60,10 +60,11 @@ pub use manifest::{
 };
 pub use report::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_effective_outcome,
-    eval_report_from_evidence, EvalCaseInfrastructureStatus, EvalCaseTransition,
-    EvalCaseTransitionCounts, EvalCaseTransitionKind, EvalReportCase, EvalReportCaseOutcome,
-    EvalReportCaseStatus, EvalReportError, EvalReportFailedGate, EvalReportMetricDelta,
-    EvalReportMetrics, EvalRunOutcome, EvalRunReport, EvalRunReportDiff,
+    eval_report_from_evidence, eval_report_from_imported_evidence, EvalCaseInfrastructureStatus,
+    EvalCaseTransition, EvalCaseTransitionCounts, EvalCaseTransitionKind, EvalImportedEvidence,
+    EvalReportCase, EvalReportCaseOutcome, EvalReportCaseStatus, EvalReportError,
+    EvalReportFailedGate, EvalReportMetricDelta, EvalReportMetrics, EvalRunOutcome, EvalRunReport,
+    EvalRunReportDiff,
 };
 pub use run::{
     cleanup_cancelled_eval_run, enqueue_eval_case_workflow, eval_isolated_runtime_profile,

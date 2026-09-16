@@ -5,13 +5,12 @@ use harness_observe::event_store::EventStore;
 use harness_workflow::runtime::eval::model::EvalGrade;
 use harness_workflow::runtime::{
     diff_eval_run_reports, eval_report_dry_run, eval_report_effective_outcome,
-    eval_report_from_evidence, execute_manifest_with_cancellation, execute_trusted_eval_verifier,
-    parse_benchmark_manifest_str, EvalAttestationDecision, EvalAttestationTrust,
-    EvalBenchmarkManifest, EvalCaseEvidence, EvalCaseInfrastructureStatus, EvalCaseTransition,
-    EvalCaseTransitionKind, EvalExecuteConfig, EvalReportCaseStatus, EvalRunReport,
-    EvalRunReportDiff, EvalTrustedVerifier, EvalUsageCeiling, WorkflowRuntimeStore,
+    eval_report_from_imported_evidence, execute_manifest_with_cancellation,
+    execute_trusted_eval_verifier, parse_benchmark_manifest_str, EvalAttestationDecision,
+    EvalAttestationTrust, EvalBenchmarkManifest, EvalCaseInfrastructureStatus, EvalCaseTransition,
+    EvalCaseTransitionKind, EvalExecuteConfig, EvalImportedEvidence, EvalReportCaseStatus,
+    EvalRunReport, EvalRunReportDiff, EvalTrustedVerifier, EvalUsageCeiling, WorkflowRuntimeStore,
 };
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -161,7 +160,7 @@ async fn run_eval_report(args: EvalRunArgs, config: &HarnessConfig) -> anyhow::R
         eval_report_dry_run(&manifest, run_id, args.k)?
     } else if let Some(evidence_path) = args.evidence.as_ref() {
         let evidence = read_evidence(evidence_path)?;
-        eval_report_from_evidence(&manifest, run_id, args.k, evidence)?
+        eval_report_from_imported_evidence(&manifest, run_id, args.k, evidence)?
     } else if args.execute {
         let report_path = output
             .as_deref()
@@ -323,7 +322,7 @@ fn diff_eval_reports(args: EvalDiffArgs) -> anyhow::Result<()> {
             candidate.k
         );
     }
-    let diff = diff_eval_run_reports(&baseline, &candidate);
+    let diff = diff_eval_run_reports(&baseline, &candidate)?;
     let regressions = eval_diff_regressions(&baseline, &candidate, &diff, &args)?;
     emit_diff(&diff, args.json, args.output.as_deref())?;
     if regressions.is_empty() {
@@ -339,15 +338,12 @@ fn read_eval_manifest(path: &Path) -> anyhow::Result<EvalBenchmarkManifest> {
         .map_err(|error| anyhow::anyhow!("invalid eval manifest {}: {error}", path.display()))
 }
 
-fn read_evidence(path: &Path) -> anyhow::Result<Vec<EvalCaseEvidence>> {
+fn read_evidence(path: &Path) -> anyhow::Result<EvalImportedEvidence> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read eval evidence at {}", path.display()))?;
-    let input: EvidenceInput = serde_json::from_str(&content)
+    let input: EvalImportedEvidence = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse eval evidence at {}", path.display()))?;
-    Ok(match input {
-        EvidenceInput::Cases(cases) => cases,
-        EvidenceInput::Wrapped { cases } => cases,
-    })
+    Ok(input)
 }
 
 fn read_run_report(path: &Path) -> anyhow::Result<EvalRunReport> {
@@ -398,6 +394,10 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
     output.push_str(&format!(
         "Eval report {} ({})\n",
         report.run_id, report.suite
+    ));
+    output.push_str(&format!(
+        "suite_identity: schema_version={} digest={}\n",
+        report.schema_version, report.suite_digest
     ));
     if let Some(outcome) = report.outcome {
         output.push_str(&format!("run_outcome: {outcome:?}\n"));
@@ -482,6 +482,10 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
     output.push_str(&format!(
         "Eval diff {} -> {} ({})\n",
         diff.baseline_run_id, diff.candidate_run_id, diff.suite
+    ));
+    output.push_str(&format!(
+        "suite_identity: schema_version={} digest={}\n",
+        diff.schema_version, diff.suite_digest
     ));
     if let Some(outcome) = diff.candidate_outcome {
         output.push_str(&format!("candidate_run_outcome: {outcome:?}\n"));
@@ -758,13 +762,6 @@ fn new_f_cap_gate_regressions(baseline: &EvalRunReport, candidate: &EvalRunRepor
             })
         })
         .collect()
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum EvidenceInput {
-    Cases(Vec<EvalCaseEvidence>),
-    Wrapped { cases: Vec<EvalCaseEvidence> },
 }
 
 #[cfg(test)]

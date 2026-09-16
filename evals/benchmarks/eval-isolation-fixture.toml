@@ -1,3 +1,4 @@
+schema_version = 1
 suite = "eval-isolation-fixture"
 default_timeout_secs = 1800
 

@@ -97,9 +97,11 @@ impl EvalExecuteConfig {
         }
         if self
             .case_timeout_override
-            .is_some_and(|timeout| timeout.is_zero())
+            .is_some_and(|timeout| timeout.is_zero() || timeout.subsec_nanos() != 0)
         {
-            anyhow::bail!("eval execute case_timeout_override must be greater than zero");
+            anyhow::bail!(
+                "eval execute case_timeout_override must be a positive whole number of seconds"
+            );
         }
         if let Some(ceiling) = &self.suite_usage_ceiling {
             ceiling.validate()?;
@@ -107,9 +109,20 @@ impl EvalExecuteConfig {
         Ok(())
     }
 
-    fn case_timeout(&self, case: &EvalBenchmarkCase) -> Duration {
-        self.case_timeout_override
-            .unwrap_or_else(|| Duration::from_secs(case.timeout_secs))
+    fn execution_manifest(
+        &self,
+        manifest: &EvalBenchmarkManifest,
+    ) -> anyhow::Result<EvalBenchmarkManifest> {
+        let mut effective = manifest.clone();
+        if let Some(timeout) = self.case_timeout_override {
+            for case in &mut effective.cases {
+                if case.timeout_secs != timeout.as_secs() {
+                    case.resource_limits = effective_resource_limits(case, timeout)?;
+                    case.timeout_secs = timeout.as_secs();
+                }
+            }
+        }
+        Ok(effective)
     }
 }
 
@@ -202,6 +215,8 @@ pub async fn execute_manifest_with_cancellation(
     mut cancellation: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<EvalRunReport> {
     config.validate()?;
+    let effective_manifest = config.execution_manifest(manifest)?;
+    let manifest = &effective_manifest;
     let mut evidence = Vec::new();
     let mut budget_exhausted = false;
 
@@ -228,8 +243,7 @@ pub async fn execute_manifest_with_cancellation(
         }
 
         let task_id = eval_case_task_id(&config.run_id, &case.case_id);
-        let case_timeout = config.case_timeout(case);
-        let resource_limits = effective_resource_limits(case, case_timeout)?;
+        let case_timeout = Duration::from_secs(case.timeout_secs);
         let input = super::EvalCaseWorkflowInput {
             eval_run_id: &config.run_id,
             case,
@@ -237,7 +251,7 @@ pub async fn execute_manifest_with_cancellation(
             task_id: &task_id,
             additional_prompt: config.additional_prompt.as_deref(),
             timeout_secs: case_timeout.as_secs(),
-            resource_limits: &resource_limits,
+            resource_limits: &case.resource_limits,
         };
         let enqueue = match enqueue_eval_case_workflow(store, input).await {
             Ok(enqueue) => enqueue,
@@ -542,8 +556,10 @@ fn effective_resource_limits(
             wall_time_secs: Some(timeout_secs),
             ..Default::default()
         });
+    // A timeout override may tighten execution resources, but must not raise
+    // the limits already accepted when the manifest was normalized.
     requested
-        .cap_by(harness_sandbox::ResourceLimits::operator_default_maxima())
+        .cap_by(case.resource_limits.effective)
         .map_err(Into::into)
 }
 
@@ -747,6 +763,41 @@ mod tests {
     }
 
     #[test]
+    fn execution_timeout_identity_matches_effective_manifest() -> anyhow::Result<()> {
+        let manifest = super::super::parse_benchmark_manifest_str(
+            r#"
+            schema_version = 1
+            suite = "timeout-identity"
+            [[cases]]
+            repo = "owner/repo"
+            issue = 1
+            base_commit = "abcdef1"
+            verify_commands = ["cargo test"]
+            timeout_secs = 120
+            [cases.resource_limits]
+            cpu_time_secs = 90
+        "#,
+        )?;
+        let mut config = EvalExecuteConfig::new("run", "project", 1);
+        assert_eq!(config.execution_manifest(&manifest)?, manifest);
+        config.case_timeout_override = Some(Duration::from_secs(120));
+        assert_eq!(config.execution_manifest(&manifest)?, manifest);
+        config.case_timeout_override = Some(Duration::from_secs(45));
+        let effective = config.execution_manifest(&manifest)?;
+        assert_eq!(effective.cases[0].timeout_secs, 45);
+        assert_eq!(
+            effective.cases[0].resource_limits.effective.wall_time_secs,
+            Some(45)
+        );
+        let baseline = super::super::eval_report_dry_run(&manifest, "baseline", 1)?;
+        let candidate = eval_report_from_evidence(&effective, "candidate", 1, vec![])?;
+        assert!(super::super::diff_eval_run_reports(&baseline, &candidate).is_err());
+        config.case_timeout_override = Some(Duration::from_millis(1500));
+        assert!(config.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn timeout_override_updates_effective_resource_deadlines() -> anyhow::Result<()> {
         let case = EvalBenchmarkCase {
             case_id: "case-1".to_string(),
@@ -774,6 +825,28 @@ mod tests {
         assert_eq!(limits.requested.wall_time_secs, Some(45));
         assert_eq!(limits.effective.cpu_time_secs, Some(45));
         assert_eq!(limits.effective.wall_time_secs, Some(45));
+        let mut uncapped_case = case.clone();
+        uncapped_case.resource_limits = harness_sandbox::ResourceLimits::evaluation_defaults(120)
+            .cap_by(harness_sandbox::ResourceLimits {
+            cpu_time_secs: Some(200),
+            wall_time_secs: Some(200),
+            ..harness_sandbox::ResourceLimits::operator_default_maxima()
+        })?;
+        assert!(uncapped_case.resource_limits.caps.is_empty());
+        let extended = effective_resource_limits(&uncapped_case, Duration::from_secs(300))?;
+        assert_eq!(extended.requested.cpu_time_secs, Some(300));
+        assert_eq!(extended.effective.cpu_time_secs, Some(120));
+        assert_eq!(extended.effective.wall_time_secs, Some(120));
+        let mut capped_case = case;
+        capped_case.resource_limits = harness_sandbox::ResourceLimits::evaluation_defaults(120)
+            .cap_by(harness_sandbox::ResourceLimits {
+                cpu_time_secs: Some(30),
+                wall_time_secs: Some(40),
+                ..harness_sandbox::ResourceLimits::operator_default_maxima()
+            })?;
+        let capped = effective_resource_limits(&capped_case, Duration::from_secs(45))?;
+        assert_eq!(capped.effective.cpu_time_secs, Some(30));
+        assert_eq!(capped.effective.wall_time_secs, Some(40));
         Ok(())
     }
 }

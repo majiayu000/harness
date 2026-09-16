@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn eval_manifest_normalizes_trusted_network_allowlist() {
     let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [isolation]
@@ -26,6 +27,7 @@ verify_commands = ["cargo test"]
 #[test]
 fn eval_manifest_rejects_ambiguous_network_allowlist_entries() {
     let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [isolation]

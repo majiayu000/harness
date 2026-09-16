@@ -7,6 +7,7 @@ fn manifest_with(command_mode: Option<&str>, command: &str) -> String {
         .unwrap_or_default();
     format!(
         r#"
+schema_version = 1
 suite = "command-mode"
 
 [[cases]]
@@ -49,6 +50,7 @@ fn explicit_shell_mode_produces_a_governed_shell_argv() {
 #[test]
 fn trusted_verifier_replaces_agent_visible_verify_commands() {
     let input = r#"
+schema_version = 1
 suite = "trusted-verifier"
 
 [[cases]]
@@ -71,6 +73,7 @@ base_commit = "9c0099ad458e82fd377fd20a8e288a46722762ef"
 #[test]
 fn trusted_verifier_rejects_agent_visible_verify_commands() {
     let input = r#"
+schema_version = 1
 suite = "trusted-verifier"
 
 [[cases]]

@@ -53,6 +53,8 @@ mod tests {
 
     fn report(outcome: Option<EvalRunOutcome>) -> EvalRunReport {
         EvalRunReport {
+            schema_version: 1,
+            suite_digest: format!("sha256:{}", "a".repeat(64)),
             run_id: "run-1".to_string(),
             suite: "suite".to_string(),
             k: 1,
@@ -120,7 +122,7 @@ mod tests {
     fn diff_gate_rejects_budget_exhausted_candidate() {
         let baseline = report(None);
         let candidate = report(Some(EvalRunOutcome::BudgetExhausted));
-        let diff = diff_eval_run_reports(&baseline, &candidate);
+        let diff = diff_eval_run_reports(&baseline, &candidate).unwrap();
         let args = EvalDiffArgs {
             baseline: PathBuf::new(),
             candidate: PathBuf::new(),
@@ -144,7 +146,7 @@ mod tests {
         let mut candidate = report(None);
         candidate.metrics.total_cases = 1;
         candidate.metrics.infra_failed_cases = 1;
-        let diff = diff_eval_run_reports(&baseline, &candidate);
+        let diff = diff_eval_run_reports(&baseline, &candidate).unwrap();
         let args = EvalDiffArgs {
             baseline: PathBuf::new(),
             candidate: PathBuf::new(),

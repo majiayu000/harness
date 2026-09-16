@@ -3,6 +3,7 @@ use super::trusted_verifier::trusted_verifier_for_case;
 use harness_core::config::isolation::IsolationTier;
 use harness_sandbox::{CappedResourceLimits, ResourceLimits};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::{error::Error, fmt};
 
@@ -18,8 +19,27 @@ pub const DEFAULT_EVAL_ISOLATION_IMAGE: &str = "harness-eval-runner:local";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EvalBenchmarkManifest {
+    pub schema_version: u32,
     pub suite: String,
     pub cases: Vec<EvalBenchmarkCase>,
+}
+
+impl EvalBenchmarkManifest {
+    /// Hash the normalized manifest and evaluator-owned verification commands.
+    /// TOML formatting, key order, and implicit versus explicit defaults do not affect identity.
+    pub fn suite_digest(&self) -> String {
+        let trusted_verifiers = self
+            .cases
+            .iter()
+            .map(|case| {
+                trusted_verifier_for_case(&case.case_id, &case.repo, case.issue, &case.base_commit)
+                    .map(|verifier| verifier.validation_argv())
+            })
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_vec(&(self, trusted_verifiers))
+            .expect("normalized eval manifest serialization is infallible");
+        format!("sha256:{:x}", Sha256::digest(encoded))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -183,6 +203,7 @@ impl Error for ManifestError {}
 
 #[derive(Deserialize)]
 struct RawManifest {
+    schema_version: u32,
     suite: String,
     #[serde(default)]
     default_timeout_secs: Option<u64>,
@@ -235,6 +256,11 @@ pub fn parse_benchmark_manifest_str(input: &str) -> Result<EvalBenchmarkManifest
 }
 
 fn normalize_manifest(raw: RawManifest) -> Result<EvalBenchmarkManifest, ManifestError> {
+    if raw.schema_version != 1 {
+        return Err(ManifestError::new(
+            "unsupported eval manifest schema_version; expected 1",
+        ));
+    }
     let suite = non_empty(raw.suite, "suite")?;
     if raw.cases.is_empty() {
         return Err(ManifestError::new(
@@ -330,7 +356,11 @@ fn normalize_manifest(raw: RawManifest) -> Result<EvalBenchmarkManifest, Manifes
         });
     }
 
-    Ok(EvalBenchmarkManifest { suite, cases })
+    Ok(EvalBenchmarkManifest {
+        schema_version: raw.schema_version,
+        suite,
+        cases,
+    })
 }
 
 #[cfg(test)]
@@ -346,6 +376,7 @@ mod tests {
     use super::*;
 
     const VALID_MANIFEST: &str = r#"
+schema_version = 1
 suite = "harness-core"
 default_timeout_secs = 7200
 
@@ -373,6 +404,52 @@ base_commit = "956076f02f546058960bf10d7a00157e5f0139dd"
 verify_commands = ["cargo test -p harness-server turn_lifecycle"]
 timeout_secs = 1800
 "#;
+
+    #[test]
+    fn eval_manifest_digest_ignores_formatting_and_explicit_defaults() {
+        let manifest = parse_benchmark_manifest_str(VALID_MANIFEST).unwrap();
+        let formatted = VALID_MANIFEST
+            .replace(
+                "schema_version = 1\nsuite = \"harness-core\"",
+                "# comment\nsuite='harness-core'\nschema_version=1",
+            )
+            .replace(
+                "issue = 1437",
+                "issue = 1437\ntimeout_secs = 7200\nverify_command_mode = 'argv'",
+            );
+        assert_eq!(
+            manifest.suite_digest(),
+            parse_benchmark_manifest_str(&formatted)
+                .unwrap()
+                .suite_digest()
+        );
+        for (old, new) in [
+            ("b308b380", "b308b381"),
+            ("lifecycle_", "different_test"),
+            ("timeout_secs = 1800", "timeout_secs = 1801"),
+            ("risk = \"high\"", "risk = \"low\""),
+        ] {
+            assert_ne!(
+                manifest.suite_digest(),
+                parse_benchmark_manifest_str(&VALID_MANIFEST.replace(old, new))
+                    .unwrap()
+                    .suite_digest(),
+                "change must affect digest: {old}"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_manifest_requires_supported_schema_version() {
+        assert!(parse_benchmark_manifest_str(
+            &VALID_MANIFEST.replace("schema_version = 1", "schema_version = 2")
+        )
+        .is_err());
+        assert!(
+            parse_benchmark_manifest_str(&VALID_MANIFEST.replace("schema_version = 1", ""))
+                .is_err()
+        );
+    }
 
     #[test]
     fn eval_manifest_parses_cases_with_defaults() {
@@ -418,6 +495,7 @@ timeout_secs = 1800
     #[test]
     fn eval_manifest_caps_resource_limits_by_operator_maxima() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 default_timeout_secs = 120
 
@@ -448,6 +526,7 @@ resource_limits = { cpu_time_secs = 120, memory_bytes = 33554432, output_bytes =
     #[test]
     fn eval_manifest_rejects_zero_resource_limits() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [[cases]]
@@ -482,6 +561,7 @@ resource_limits = { memory_bytes = 0 }
     #[test]
     fn eval_isolation_rejects_host_tier() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [isolation]
@@ -501,6 +581,7 @@ verify_commands = ["cargo test"]
     #[test]
     fn eval_isolation_rejects_local_runtime_kind() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [isolation]
@@ -520,6 +601,7 @@ verify_commands = ["cargo test"]
     #[test]
     fn eval_isolation_rejects_missing_cleanup_requirement() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [isolation]
@@ -539,6 +621,7 @@ verify_commands = ["cargo test"]
     #[test]
     fn eval_manifest_rejects_duplicate_case_ids() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [[cases]]
@@ -563,6 +646,7 @@ verify_commands = ["cargo test"]
     #[test]
     fn eval_manifest_rejects_missing_verify_commands() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [[cases]]
@@ -579,6 +663,7 @@ verify_commands = []
     #[test]
     fn eval_manifest_rejects_non_hex_base_commit() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [[cases]]
@@ -595,6 +680,7 @@ verify_commands = ["cargo test"]
     #[test]
     fn eval_manifest_accepts_pending_resolution_without_replayable_verdict() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [[cases]]
@@ -623,6 +709,7 @@ verdict = "pending"
     #[test]
     fn eval_manifest_rejects_replayable_pending_resolution() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [[cases]]
@@ -642,6 +729,7 @@ verdict = "replayable"
     #[test]
     fn eval_manifest_rejects_invalid_paths() {
         let input = r#"
+schema_version = 1
 suite = "harness-core"
 
 [[cases]]
