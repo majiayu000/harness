@@ -124,6 +124,36 @@ def extract_candidate(archive: Path, destination: Path) -> None:
         stream.extractall(destination, members=members, filter="data")
 
 
+CANDIDATE_REAPER_SCRIPT = """import os, time
+# PID 1 adopts agent descendants and must reap them before cgroup quiescence.
+deadline = time.monotonic() + 900
+while time.monotonic() < deadline:
+    try:
+        while time.monotonic() < deadline and os.waitpid(-1, os.WNOHANG)[0]:
+            pass
+    except ChildProcessError:
+        pass  # No adopted children are waiting; keep the fixed retention deadline.
+    time.sleep(0.01)
+"""
+
+
+CGROUP_METRICS_SCRIPT = """import json
+from pathlib import Path
+root = Path('/sys/fs/cgroup')
+def counters(name):
+    return {key: int(value) for key, value in
+            (line.split() for line in (root / name).read_text().splitlines())}
+pids_before = int((root / 'pids.current').read_text())
+cpu = counters('cpu.stat')
+print(json.dumps({'cpu_time_micros': cpu['usage_usec'], 'current_pids_before': pids_before,
+                  'peak_memory_bytes': int((root / 'memory.peak').read_text()),
+                  'peak_pids': int((root / 'pids.peak').read_text()),
+                  'memory_events': counters('memory.events'),
+                  'pids_events': counters('pids.events'),
+                  'current_pids': int((root / 'pids.current').read_text())}))
+"""
+
+
 class Host:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -191,7 +221,7 @@ class Host:
     def cleanup(self) -> None:
         # Only exact names persisted by this invocation; never prune Docker globally.
         errors = []
-        for name in [self.name, self.name + "-verify", self.name + "-proxy"]:
+        for name in [self.name + "-observer", self.name, self.name + "-verify", self.name + "-proxy"]:
             try:
                 found = docker("ps", "-aq", "--filter", f"name=^/{name}$")
                 if found:
@@ -229,14 +259,79 @@ class Host:
             "--mount", f"type=bind,src={args.workspace.resolve()},dst=/input,readonly",
             "--mount", f"type=bind,src={args.auth_file.resolve()},dst=/run/codex-auth.json,readonly",
             "--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080",
-            args.image, "sleep", "900",
+            args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT,
         ]
         docker(*run_args)
         self.state["container_started"] = True
         self.persist()
+        self.start_observer()
         docker("exec", self.name, "sh", "-c",
                'set -eu; cp -R /input/. /workspace/; mkdir -p /home/harness/.codex; '
                'cp /run/codex-auth.json /home/harness/.codex/auth.json')
+
+    def start_observer(self) -> None:
+        engine = json.loads(docker("info", "--format", "{{json .}}"))
+        if engine["CgroupVersion"] != "2" or engine["CgroupDriver"] != "cgroupfs":
+            raise RuntimeError("resource observer requires Docker cgroup v2 with cgroupfs")
+        if os.getuid() == 0:
+            raise RuntimeError("resource observer requires a non-root host UID")
+        candidate_id = docker("inspect", self.name, "--format", "{{.Id}}")
+        if len(candidate_id) != 64 or any(c not in "0123456789abcdef" for c in candidate_id):
+            raise RuntimeError("Docker returned an invalid candidate container ID")
+        self.state["candidate_id"] = candidate_id
+        self.persist()
+        docker("run", "-d", "--name", self.name + "-observer", "--network", "none",
+               *self.base_args(), "--cgroupns", "host", "--mount",
+               f"type=bind,src=/sys/fs/cgroup/docker/{candidate_id},dst=/sys/fs/cgroup,readonly",
+               self.args.image, "sleep", "900")
+        # Fail before model execution when this exact kernel/mount lacks the files.
+        docker("exec", self.name + "-observer", "python3", "-I", "-c", CGROUP_METRICS_SCRIPT)
+
+    def collect_resources(self, stop_agents: bool) -> None:
+        if not self.state.get("container_started") or "resource_evidence" in self.state:
+            return
+        evidence = {"status": "incomplete", "candidate_id": self.state.get("candidate_id"),
+                    "scope": "candidate cgroup through quiesced export; excludes verifier and proxy"}
+        errors = []
+        try:
+            state = json.loads(docker("inspect", self.name, "--format", "{{json .State}}"))
+            evidence["container_state"] = state
+            if not state["Running"]:
+                raise RuntimeError("candidate PID 1 exited before final resource collection")
+            if stop_agents:
+                docker("exec", self.name, "python3", "-I", "-c",
+                       "import os,signal\ntry: os.kill(-1,signal.SIGKILL)\nexcept ProcessLookupError: pass")
+        except Exception as error:
+            errors.append(str(error))
+        # The external reader can still retain kernel evidence when PID exhaustion
+        # prevents candidate exec. Such a sample is explicitly not a final snapshot.
+        try:
+            metrics = json.loads(docker("exec", self.name + "-observer", "python3", "-I", "-c",
+                                        CGROUP_METRICS_SCRIPT))
+            evidence["metrics"] = metrics
+            if metrics["current_pids_before"] != 1 or metrics["current_pids"] != 1:
+                errors.append("candidate cgroup is not quiescent at final resource collection")
+            if (metrics["memory_events"]["oom"] or metrics["memory_events"]["oom_kill"]
+                    or metrics["pids_events"]["max"]):
+                errors.append("candidate hit an OOM or PID limit")
+        except Exception as error:
+            errors.append(str(error))
+        try:
+            state = json.loads(docker("inspect", self.name, "--format", "{{json .State}}"))
+            evidence["container_state"] = state
+            if not state["Running"] or state["OOMKilled"]:
+                errors.append("candidate PID 1 exited or Docker reported OOM")
+        except Exception as error:
+            errors.append(str(error))
+        if errors:
+            evidence["error"] = "; ".join(errors)
+        else:
+            evidence["status"] = "complete"
+        self.state["resource_evidence"] = evidence
+        save(self.root / "candidate-resources.json", evidence)
+        self.persist()
+        if evidence["status"] != "complete":
+            raise RuntimeError("candidate resource evidence incomplete: " + evidence["error"])
 
     def wait(self) -> int:
         return stream_agent_output([
@@ -253,11 +348,16 @@ class Host:
             # share our unprivileged UID in this private PID namespace. Kill them
             # before exporting tmpfs so background children cannot race acceptance.
             subprocess.run(["docker", "exec", self.name, "python3", "-I", "-c",
-                            "import os, signal\n"
+                            "import os, signal, time\nfrom pathlib import Path\n"
                             "try: os.kill(-1, signal.SIGKILL)\n"
                             "except ProcessLookupError: pass\n"
+                            "deadline = time.monotonic() + 5\n"
+                            "while int(Path('/sys/fs/cgroup/pids.current').read_text()) != 2:\n"
+                            " if time.monotonic() >= deadline: raise RuntimeError('candidate did not quiesce before export')\n"
+                            " time.sleep(0.01)\n"
                             "os.execvp('tar', ['tar', '-cf', '-', '-C', '/workspace', '.'])"],
                            stdout=output, check=True, timeout=30)
+        self.collect_resources(stop_agents=False)
         docker("rm", "-f", self.name)
         extract_candidate(archive, self.root / "candidate")
 
@@ -280,6 +380,12 @@ class Host:
         raise RuntimeError("independent verifier exceeded 30s deadline")
 
     def result(self, status: str, reason: str, artifacts: list | None = None) -> dict:
+        artifacts = list(artifacts or [])
+        if self.state.get("container_started"):
+            evidence = self.state.get("resource_evidence", {"status": "incomplete", "error": "not collected"})
+            artifacts.append({"artifact_type": "supervised_candidate_resources", "artifact": evidence})
+            if status == "succeeded" and evidence["status"] != "complete":
+                status, reason = "failed", reason + "; final resource evidence is incomplete"
         return {"activity": self.state["job"]["input"]["activity"], "status": status,
                 "summary": reason, "artifacts": artifacts or [],
                 "error": reason if status != "succeeded" else None}
@@ -302,7 +408,12 @@ class Host:
             print("already completed; no agent invocation")
             return
         if phase in {"executing", "claimed"}:
-            self.state["result"] = self.result("failed", "host interrupted; candidate was not rerun")
+            reason = "host interrupted; candidate was not rerun"
+            try:
+                self.collect_resources(stop_agents=True)
+            except Exception as error:
+                reason += "; " + str(error)
+            self.state["result"] = self.result("failed", reason)
             self.state["phase"] = "cleaning"
             self.persist()
         if self.state["phase"] == "cleaning":
@@ -354,9 +465,9 @@ class Host:
             exit_code = self.wait()
             if exit_code:
                 raise RuntimeError(f"agent exited with {exit_code}")
-            self.capture()
             usage = {"model": self.args.model, **read_usage(self.root / "agent.jsonl")}
             artifacts.append({"artifact_type": "runtime_host_usage", "artifact": usage})
+            self.capture()
             verifier_exit = self.verify()
             if verifier_exit:
                 raise RuntimeError(f"independent verifier rejected candidate: exit {verifier_exit}")
@@ -370,6 +481,10 @@ class Host:
             ])
         except (Exception, KeyboardInterrupt) as error:
             reason = "host interrupted by keyboard" if isinstance(error, KeyboardInterrupt) else str(error)
+            try:
+                self.collect_resources(stop_agents=True)
+            except Exception as collection_error:
+                reason += "; " + str(collection_error)
             self.state["result"] = self.result("failed", reason, artifacts)
         finally:
             self.state["phase"] = "cleaning"
