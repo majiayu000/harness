@@ -249,3 +249,45 @@ def test_baseline_eligibility_requires_complete_report_and_passing_diff() -> Non
         eligibility.validate_eligibility(
             report, baseline_present=True, comparison_outcome="failure"
         )
+
+
+@pytest.mark.parametrize(
+    "cases",
+    [
+        [],
+        [None],
+        [{}],
+        [{"status": "unknown"}],
+        [{"status": "passed", "outcome": "budget_exhausted"}],
+        [{"status": "pending"}],
+        [{"status": "skipped"}],
+        [{"status": "infra_failed"}],
+    ],
+)
+def test_baseline_eligibility_rejects_missing_or_incomplete_case_evidence(cases) -> None:
+    eligibility = _load_eligibility()
+    report = {
+        "metrics": {"pending_cases": 0, "skipped_cases": 0, "infra_failed_cases": 0},
+        "cases": cases,
+    }
+    with pytest.raises(eligibility.EligibilityError):
+        eligibility.validate_eligibility(
+            report, baseline_present=False, comparison_outcome="skipped"
+        )
+
+
+@pytest.mark.parametrize("field", ["pending_cases", "skipped_cases", "infra_failed_cases"])
+@pytest.mark.parametrize("value", [None, False, "0", 0.0, 1])
+def test_baseline_eligibility_requires_explicit_completion_counts(field, value) -> None:
+    eligibility = _load_eligibility()
+    metrics = {"pending_cases": 0, "skipped_cases": 0, "infra_failed_cases": 0}
+    if value is None:
+        del metrics[field]
+    else:
+        metrics[field] = value
+    with pytest.raises(eligibility.EligibilityError):
+        eligibility.validate_eligibility(
+            {"metrics": metrics, "cases": [{"status": "passed"}]},
+            baseline_present=False,
+            comparison_outcome="skipped",
+        )
