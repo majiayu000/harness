@@ -160,7 +160,9 @@ def test_preflight_accepts_online_capable_runtime_host(tmp_path: Path) -> None:
                         "online": True,
                         "lifecycle": "active",
                         "capabilities": [
+                            "runtime_job_lease_proof_v1",
                             "eval_resource_limits",
+                            "eval_network_policy",
                             "trusted_eval_verifier_v1",
                         ],
                     }
@@ -176,6 +178,48 @@ def test_preflight_accepts_online_capable_runtime_host(tmp_path: Path) -> None:
             database_url="postgres://example",
             api_token=None,
         )
+
+
+@pytest.mark.parametrize(
+    "missing", ["runtime_job_lease_proof_v1", "eval_network_policy"]
+)
+def test_preflight_rejects_host_missing_claim_capability(
+    tmp_path: Path, missing: str
+) -> None:
+    preflight = _load_preflight()
+    manifest = tmp_path / "manifest.toml"
+    manifest.write_text('suite = "test"\n', encoding="utf-8")
+    capabilities = {
+        "runtime_job_lease_proof_v1",
+        "eval_resource_limits",
+        "eval_network_policy",
+        "trusted_eval_verifier_v1",
+    } - {missing}
+    with mock.patch.object(
+        preflight,
+        "_read_json",
+        side_effect=[
+            {"status": "ok"},
+            {
+                "hosts": [
+                    {
+                        "online": True,
+                        "lifecycle": "active",
+                        "capabilities": sorted(capabilities),
+                    }
+                ]
+            },
+        ],
+    ):
+        with pytest.raises(preflight.PreflightError, match=missing):
+            preflight.validate_preflight(
+                server_url="http://127.0.0.1:9800",
+                gate_mode="report-only",
+                manifest=manifest,
+                baseline=tmp_path / "latest.json",
+                database_url="postgres://example",
+                api_token=None,
+            )
 
 
 def test_baseline_eligibility_requires_complete_report_and_passing_diff() -> None:
