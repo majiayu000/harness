@@ -1,6 +1,6 @@
 # Budget Enforcement and Spend Evidence
 
-> Verified: 2026-09-16 against `4c2459ca`.
+> Verified: 2026-09-17.
 > Linked issue: [GH-1770](https://github.com/majiayu000/harness/issues/1770).
 > Scope: existing runtime controls, their execution boundaries, and remaining
 > operational acceptance. No production budget is selected here.
@@ -27,7 +27,7 @@ production spend limit.
 | Before dispatch | `runtime/dispatcher.rs::budget_gate_outcome` checks workflow spend and the configured daily profile cap; shadow records events and enforce defers exhausted work | Comparisons use recorded numerical cost, without rejecting an unobserved aggregate |
 | During execution | `workflow_runtime_worker/turn_engine/runtime_usage.rs::budget_stop` checks recorded workflow cost after streamed usage | Unknown or delayed cost cannot prove remaining spend; ordinary stream accounting failures are logged and do not themselves stop execution |
 | At completion | `runtime/store/runtime_completion_budget.rs` can replace a decision with a blocked workflow and operator attention under enforce | Ordinary terminal outcomes are preserved; successful agent-contract completions and explicit budget stops have separate handling |
-| Agent-contract admission | `agent_contract_execution.rs` calls `enforced_budget_cost_error` before launching a cost-blind backend under enforce | This guard is specific to agent-contract execution, not every ordinary agent turn |
+| Backend admission | Agent-contract execution and ordinary `turn_lifecycle.rs` call `enforced_budget_cost_error` on the selected execution backend before launch under enforce | Checks declared cost-reporting capability; later missing or delayed observations still need execution-period handling |
 | Agent-contract completion | `agent_contract_stream.rs` rejects an attempt that did not emit observed USD cost under enforce | Cost-reporting capability and an observed event do not establish account attribution or invoice reconciliation |
 
 Workflow and profile comparisons operate on recorded spend. They do not reserve
@@ -50,13 +50,16 @@ The inspected backend paths differ:
   Selecting that backend alone does not identify the billing account or reconcile
   its reported amounts against billing data.
 
-An ordinary cost-blind turn can therefore persist a zero numerical amount with
-an unobserved flag and continue below a positive numerical budget. The ordinary
-watchdog and later dispatch gate inspect the amount without enforcing cost
-observability. This is an enforcement-coverage gap even though accounting
-retains the unknown flag. Reusing the agent-contract admission guard for other
-execution surfaces would require focused coverage of both oneshot and per-turn
-execution; it must not turn shadow-mode supervised runs into enforced runs.
+Ordinary workflow turns now reject a selected cost-blind oneshot or per-turn
+backend before launch under an enforced budget policy. Shadow mode and explicit
+unlimited policies still permit these backends, while keeping their costs unknown.
+The guard checks the backend actually selected for execution, including per-turn
+factories; an unused alternative backend cannot satisfy the requirement.
+
+This admission check does not guarantee that a backend declaring cost support
+will emit complete, timely observations. The ordinary watchdog and later
+dispatch gate still inspect numerical recorded cost without rejecting an
+unobserved aggregate. That execution-period coverage remains incomplete.
 
 The ordinary stream path in `turn_engine/helpers.rs` logs usage-persistence or
 watchdog errors and continues. A completion comparison against the same ledger
@@ -65,6 +68,12 @@ stream instead stops on accounting errors. Failure-path verification belongs in
 remaining enforcement acceptance.
 
 ## Evidence already available
+
+Three new ordinary-admission tests cover eight backend/policy combinations,
+including opposite capabilities on the selected and unused execution surfaces.
+They and the existing cost-capability guard test passed against an isolated
+PostgreSQL database. The assertions verify zero backend calls on rejection and
+continued admission under shadow or explicit unlimited policies.
 
 The GH-1770 follow-up records 13 targeted tests against an isolated disposable
 PostgreSQL database: cost-blind contract rejection, dispatch gates, completion
