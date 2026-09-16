@@ -251,10 +251,15 @@ impl<'a> RuntimeCommandDispatcher<'a> {
                     command.workflow_id
                 )
             })?;
-        if let Err(error) = self
-            .isolation_availability
-            .ensure_tier_available(isolation.tier)
-        {
+        // Remote hosts enforce the resolved contract on their own machine. The
+        // control plane's local sandbox availability says nothing about theirs.
+        let availability = if runtime_profile.kind == RuntimeKind::RemoteHost {
+            Ok(())
+        } else {
+            self.isolation_availability
+                .ensure_tier_available(isolation.tier)
+        };
+        if let Err(error) = availability {
             let reason = error.to_string();
             let project_id = command_project_id(instance.as_ref(), &command)?;
             let barrier = DispatchBarrierInput::new(
