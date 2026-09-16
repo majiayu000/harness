@@ -9,9 +9,6 @@ from pathlib import Path
 from typing import Any
 
 
-INCOMPLETE_STATUSES = {"pending", "skipped", "infra_failed", "budget_exhausted"}
-
-
 class EligibilityError(RuntimeError):
     """The candidate is not safe to promote as a reviewed baseline."""
 
@@ -24,19 +21,20 @@ def validate_eligibility(
     metrics = report.get("metrics")
     if not isinstance(metrics, dict):
         raise EligibilityError("candidate report is missing metrics")
-    if any(
-        metrics.get(field, 0) != 0
-        for field in ("pending_cases", "skipped_cases", "infra_failed_cases")
-    ):
-        raise EligibilityError("candidate report contains incomplete infrastructure cases")
+    for field in ("pending_cases", "skipped_cases", "infra_failed_cases"):
+        count = metrics.get(field)
+        if type(count) is not int or count < 0:
+            raise EligibilityError(f"candidate report is missing a valid {field} count")
+        if count != 0:
+            raise EligibilityError("candidate report contains incomplete infrastructure cases")
     cases = report.get("cases")
-    if not isinstance(cases, list):
+    if not isinstance(cases, list) or not cases:
         raise EligibilityError("candidate report is missing cases")
-    if any(
-        isinstance(case, dict) and case.get("status") in INCOMPLETE_STATUSES
-        for case in cases
-    ):
-        raise EligibilityError("candidate report contains a non-baseline-eligible case")
+    for case in cases:
+        if not isinstance(case, dict) or case.get("status") not in ("passed", "failed"):
+            raise EligibilityError("candidate report contains a non-baseline-eligible case")
+        if case.get("outcome") is not None:
+            raise EligibilityError("candidate report contains an incomplete case outcome")
     if baseline_present and comparison_outcome != "success":
         raise EligibilityError("candidate did not pass comparison with the reviewed baseline")
 
