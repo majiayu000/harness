@@ -2,6 +2,7 @@ use super::helpers::{
     emit_runtime_notification, mark_turn_cancelled, mark_turn_failed, process_stream_item,
     RuntimeUsageContext, StreamCompletionState,
 };
+use super::runtime_usage::enforced_budget_cost_error;
 use harness_core::agent::{AgentRequest, StreamItem};
 use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
@@ -95,16 +96,6 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         .await;
         return;
     };
-    if let Some(context) = options.runtime_usage.as_ref() {
-        if let Err(error) = context.persist_agent_run_start(&turn_id).await {
-            tracing::error!(
-                runtime_job_id = %context.runtime_job_id,
-                command_id = %context.command_id,
-                workflow_id = %context.workflow_id,
-                "failed to persist workflow runtime agent run start: {error}"
-            );
-        }
-    }
 
     // RAII guard: ensures the adapter is deregistered when the turn scope exits,
     // even if the task is cancelled before reaching the end of this function.
@@ -131,6 +122,41 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             .clone()
             .or_else(|| server.agent_registry.turn_execution_adapter(&agent_name))
     };
+    if let Some(error) = options.runtime_usage.as_ref().and_then(|context| {
+        enforced_budget_cost_error(
+            execution_adapter.as_deref().unwrap_or(agent.as_ref()),
+            &context.budget_policy,
+        )
+    }) {
+        if let Err(record_error) = server.thread_manager.add_item(
+            &thread_id,
+            &turn_id,
+            harness_core::types::Item::error(error.clone()),
+        ) {
+            tracing::error!("failed to record budget admission failure: {record_error}");
+        }
+        mark_turn_failed(
+            &server,
+            &notify_tx,
+            &notification_tx,
+            &thread_id,
+            &turn_id,
+            error,
+        )
+        .await;
+        return;
+    }
+    if let Some(context) = options.runtime_usage.as_ref() {
+        if let Err(error) = context.persist_agent_run_start(&turn_id).await {
+            tracing::error!(
+                runtime_job_id = %context.runtime_job_id,
+                command_id = %context.command_id,
+                workflow_id = %context.workflow_id,
+                "failed to persist workflow runtime agent run start: {error}"
+            );
+        }
+    }
+
     let adapter_opt = if options.force_code_agent {
         None
     } else {

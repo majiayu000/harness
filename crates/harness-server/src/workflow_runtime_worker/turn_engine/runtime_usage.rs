@@ -42,7 +42,7 @@ pub(crate) fn enforced_budget_cost_error(
         && !backend.reports_usage_cost())
     .then(|| {
         format!(
-            "agent backend `{}` does not report USD cost; refusing to launch an agent contract under enforced USD budget policy",
+            "agent backend `{}` does not report USD cost; refusing to launch under enforced USD budget policy",
             backend.name()
         )
     })
