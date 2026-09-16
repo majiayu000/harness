@@ -98,18 +98,7 @@ pub(super) fn attach_eval_checkout_evidence(
     }
     let usage = &execution_evidence.usage;
     let model = usage.model.trim();
-    let measured_total = usage.input_tokens.saturating_add(usage.output_tokens);
-    if model.is_empty()
-        || usage.cached_input_tokens > usage.input_tokens
-        || usage.total_tokens < measured_total
-        || usage.total_tokens == 0
-    {
-        return Err(json!({
-            "error": "eval host usage evidence is invalid",
-            "measured_total_tokens": measured_total,
-            "reported_total_tokens": usage.total_tokens,
-        }));
-    }
+    super::usage::validate_eval_usage(job, usage)?;
     if execution_evidence.isolation_cleanup_status.trim() != "cleaned" {
         return Err(json!({
             "error": "eval host execution evidence must confirm ephemeral isolation cleanup"
