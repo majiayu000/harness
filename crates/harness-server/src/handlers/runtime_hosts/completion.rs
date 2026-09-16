@@ -351,6 +351,7 @@ mod capabilities;
 mod evidence;
 mod network_policy;
 mod reservation;
+mod usage;
 use capabilities::validate_eval_host_capabilities;
 use evidence::{
     attach_eval_cancellation_cleanup_evidence, attach_eval_checkout_evidence,
