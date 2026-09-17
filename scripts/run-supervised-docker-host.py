@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import selectors
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -114,14 +115,27 @@ def read_usage(log: Path) -> dict:
     raise RuntimeError("agent produced no completed-turn usage evidence")
 
 
+def archive_members(stream: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    members = stream.getmembers()
+    if any(not (member.isfile() or member.isdir()) for member in members):
+        raise RuntimeError("source archive contains a link or special file")
+    return members
+
+
 def extract_candidate(archive: Path, destination: Path) -> None:
-    destination.mkdir()
+    destination.mkdir(mode=0o700)
     with tarfile.open(archive) as stream:
-        # Reject links entirely: acceptance must not read outside the candidate.
-        members = stream.getmembers()
-        if any(not (member.isfile() or member.isdir()) for member in members):
-            raise RuntimeError("candidate archive contains a link or special file")
-        stream.extractall(destination, members=members, filter="data")
+        stream.extractall(destination, members=archive_members(stream), filter="data")
+
+
+INPUT_UNPACK_SCRIPT = """import hashlib, subprocess, sys
+with open('/input.tar', 'rb') as stream:
+    if hashlib.file_digest(stream, 'sha256').hexdigest() != sys.argv[1]:
+        raise RuntimeError('input archive digest does not match prepared source')
+    stream.seek(0)
+    subprocess.run(['tar', '--extract', '--file', '-', '--directory', '/workspace',
+                    '--no-same-owner', '--no-same-permissions'], stdin=stream, check=True)
+"""
 
 
 CANDIDATE_REAPER_SCRIPT = """import os, time
@@ -158,6 +172,9 @@ class Host:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.root = args.state_dir.resolve()
+        workspace = self.workspace = args.workspace.resolve()
+        if workspace == self.root or workspace in self.root.parents or self.root in workspace.parents:
+            raise RuntimeError("workspace and state directory must not overlap or contain one another")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.lock = (self.root / "lock").open("w")
         fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -168,7 +185,7 @@ class Host:
         identity = {
             "server_url": args.server_url,
             "image": args.image, "proxy_image": args.proxy_image, "model": args.model,
-            "workspace": str(args.workspace.resolve()), "timeout": args.timeout,
+            "workspace": str(self.workspace), "timeout": args.timeout,
             "synthetic_dns": args.synthetic_dns,
         }
         if "identity" in self.state and self.state["identity"] != identity:
@@ -240,8 +257,33 @@ class Host:
             raise RuntimeError("cleanup incomplete: " + "; ".join(errors))
         self.state.pop("cleanup_errors", None)
 
+    def freeze_input(self) -> None:
+        source = self.workspace
+        if not source.is_dir():
+            raise RuntimeError("workspace must be a source directory")
+        # TarFile.add silently skips sockets, so reject those before archiving.
+        for directory, _, files in os.walk(source, followlinks=False):
+            for name in files:
+                if stat.S_ISSOCK((Path(directory) / name).lstat().st_mode):
+                    raise RuntimeError("input source contains a socket special file")
+        # TarFile.add records FIFO/device/link headers without reading their
+        # contents. Validate the completed archive once before it is accepted.
+        archive = self.root / "input.tar"
+        with archive.open("xb") as stream:
+            os.chmod(archive, 0o600)
+            with tarfile.open(fileobj=stream, mode="w") as bundle:
+                bundle.add(source, arcname=".")
+            stream.flush()
+            os.fsync(stream.fileno())
+        with tarfile.open(archive) as stream:
+            archive_members(stream)
+        with archive.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        self.state["input_snapshot"] = {"archive_sha256": digest}
+
     def launch(self) -> None:
         args = self.args
+        digest = self.state["input_snapshot"]["archive_sha256"]
         docker("network", "create", "--internal", self.name)
         proxy_args = [
             "run", "-d", "--name", self.name + "-proxy", "--network", "bridge",
@@ -256,7 +298,7 @@ class Host:
         run_args = [
             "run", "-d", "--name", self.name, "--network", self.name, *self.base_args(),
             "--tmpfs", f"/workspace:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
-            "--mount", f"type=bind,src={args.workspace.resolve()},dst=/input,readonly",
+            "--mount", f"type=bind,src={self.root / 'input.tar'},dst=/input.tar,readonly",
             "--mount", f"type=bind,src={args.auth_file.resolve()},dst=/run/codex-auth.json,readonly",
             "--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080",
             args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT,
@@ -265,8 +307,9 @@ class Host:
         self.state["container_started"] = True
         self.persist()
         self.start_observer()
+        docker("exec", self.name, "python3", "-I", "-c", INPUT_UNPACK_SCRIPT, digest)
         docker("exec", self.name, "sh", "-c",
-               'set -eu; cp -R /input/. /workspace/; mkdir -p /home/harness/.codex; '
+               'set -eu; mkdir -p /home/harness/.codex; '
                'cp /run/codex-auth.json /home/harness/.codex/auth.json')
 
     def start_observer(self) -> None:
@@ -381,6 +424,9 @@ class Host:
 
     def result(self, status: str, reason: str, artifacts: list | None = None) -> dict:
         artifacts = list(artifacts or [])
+        if "input_snapshot" in self.state:
+            artifacts.append({"artifact_type": "supervised_input_snapshot",
+                              "artifact": self.state["input_snapshot"]})
         if self.state.get("container_started"):
             evidence = self.state.get("resource_evidence", {"status": "incomplete", "error": "not collected"})
             artifacts.append({"artifact_type": "supervised_candidate_resources", "artifact": evidence})
@@ -404,6 +450,9 @@ class Host:
 
     def run(self) -> None:
         phase = self.state["phase"]
+        if phase in {"preparing", "preparation_failed"}:
+            raise RuntimeError("input preparation did not complete; retained state will not recopy or rerun: "
+                               + self.state.get("preparation_error", "host interrupted"))
         if phase == "completed":
             print("already completed; no agent invocation")
             return
@@ -427,6 +476,15 @@ class Host:
             self.state["request"] = json.loads(self.args.request.read_text())
             self.state["submission"] = json.loads(self.args.submission.read_text())
             (self.root / "verifier.py").write_bytes(self.args.verifier.read_bytes())
+            self.state["phase"] = "preparing"
+            self.persist()
+            try:
+                self.freeze_input()
+            except (Exception, KeyboardInterrupt) as error:
+                self.state["phase"] = "preparation_failed"
+                self.state["preparation_error"] = str(error) or "host interrupted by keyboard"
+                self.persist()
+                raise
             self.state["phase"] = "claiming"
             self.persist()
         self.api("/api/runtime-hosts/register", {
