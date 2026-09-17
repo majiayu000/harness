@@ -2,7 +2,7 @@ use super::super::data_helpers::activity_name;
 use harness_core::config::workflow::{RuntimeDispatchProfileOverride, WorkflowConfig};
 use harness_workflow::runtime::{RuntimeJob, RuntimeProfile, WorkflowInstance};
 const DEFAULT_RUNTIME_TURN_TIMEOUT_SECS: u64 = 3600;
-pub(super) fn runtime_profile_with_timeout_fallback(
+pub(in crate::workflow_runtime_worker) fn runtime_profile_with_timeout_fallback(
     mut profile: RuntimeProfile,
     workflow_config: &WorkflowConfig,
     workflow: Option<&WorkflowInstance>,

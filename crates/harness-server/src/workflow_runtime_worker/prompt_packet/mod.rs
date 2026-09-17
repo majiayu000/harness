@@ -69,7 +69,7 @@ pub(super) fn build_runtime_prompt_packet(
     project_root: &Path,
     source_project_root: &Path,
     runtime_profile: &RuntimeProfile,
-    resolved_settings: &ResolvedRuntimeSettings,
+    resolved_settings: Option<&ResolvedRuntimeSettings>,
     workflow_document: &WorkflowDocument,
     repo_memory: &[RetrievedRepoMemoryRecord],
     prompt_task_text: Option<&str>,
@@ -223,6 +223,30 @@ pub(super) fn build_runtime_job_prompt(
         workflow_file.remove("prompt_template");
     }
     strip_model_facing_audit_sections(&mut model_packet);
+    if prompt_packet
+        .pointer("/runtime_job/runtime_kind")
+        .and_then(Value::as_str)
+        == Some("remote_host")
+    {
+        if let Some(project) = model_packet
+            .get_mut("project")
+            .and_then(Value::as_object_mut)
+        {
+            project.remove("source_root");
+        }
+        if let Some(data) = model_packet
+            .pointer_mut("/workflow/data")
+            .and_then(Value::as_object_mut)
+        {
+            data.remove("project_id");
+        }
+        if let Some(file) = model_packet
+            .get_mut("workflow_file")
+            .and_then(Value::as_object_mut)
+        {
+            file.remove("source_path");
+        }
+    }
     model_input::simplify(&mut model_packet);
     let result_contract = if model_packet
         .pointer("/activity_result_schema/decision_owner")

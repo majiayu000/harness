@@ -213,7 +213,7 @@ fn runtime_prompt_packet_omits_duplicated_additional_prompt() {
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
-        &resolved_settings,
+        Some(&resolved_settings),
         &WorkflowDocument::default(),
         &[],
         None,

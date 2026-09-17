@@ -43,7 +43,7 @@ fn build_packet_for_job(workflow: &WorkflowInstance, job: &RuntimeJob) -> anyhow
         Path::new("/workspaces/issue-1771"),
         Path::new("/repo"),
         &runtime_profile,
-        &resolved_settings_for_tests(&runtime_profile),
+        Some(&resolved_settings_for_tests(&runtime_profile)),
         &WorkflowDocument::default(),
         &[],
         None,

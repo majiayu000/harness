@@ -45,7 +45,7 @@ use super::workspace::{
     finish_runtime_workspace, prepare_runtime_workspace, repository_lease_loss_error,
 };
 mod runtime_timeout;
-use runtime_timeout::runtime_profile_with_timeout_fallback;
+pub(super) use runtime_timeout::runtime_profile_with_timeout_fallback;
 mod finalization;
 use finalization::combine_activity_result_with_runtime_workspace_finalization;
 mod egress_evidence;
@@ -206,7 +206,7 @@ impl<'a> ServerRuntimeJobExecutor<'a> {
                 &project_root,
                 &source_project_root,
                 &runtime_profile,
-                &resolved_settings,
+                Some(&resolved_settings),
                 &workflow_document,
                 &repo_memory.records,
                 prompt_task_request.prompt_text(),

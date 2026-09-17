@@ -87,7 +87,7 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 - `online` is computed as `now - last_heartbeat_at <= heartbeat_timeout_secs`
 
 `POST /api/runtime-hosts/{id}/runtime-jobs/claim`
-- request: `{ lease_secs?: number }`
+- request: `{ lease_secs?: number, execution_workspace?: string }`
 - registration prerequisite: the host advertises
   `runtime_job_lease_proof_v1` in `capabilities`
 - success: `{ claimed: true, runtime_job_id, lease_generation, lease_expires_at, lease_proof, runtime_job }`
@@ -95,6 +95,30 @@ Harness is strong as a centralized control plane, but runtime host lifecycle is 
 - incompatible host: `{ claimed: false, upgrade_required: true, required_capability: "runtime_job_lease_proof_v1" }`; this response does not mutate a pending job or issue a lease
 - `runtime_job.input` carries the activity payload and runtime profile manifest needed by the external host.
 - `lease_secs` is a target TTL from server time, defaults to `60`, and must be an integer in `1..=3600`; `null`, zero, and larger values are rejected.
+
+Supplying `execution_workspace` requests a server-rendered activity prompt. The
+value is an absolute path in the runtime host's namespace, such as `/workspace`;
+it must not contain control characters or leading/trailing whitespace. The server
+does not inspect, create, canonicalize or check out that directory. Invalid paths
+are rejected before leasing. Omitting the field requests the raw job envelope,
+including for hosts executing native verification commands. Rendering is not
+available for quality-gate, pinned agent-contract or exact-replay jobs; requesting
+it for those jobs fails preflight instead of substituting an ordinary model prompt.
+
+A successful rendered claim adds
+`prepared_prompt: { prompt, prompt_packet_digest, activity_result_schema }`.
+The prompt reuses the server's workflow document, durable task text, repository
+memory, activity policy and structured result contract. Its execution root is the
+requested remote directory. The durable `RuntimePromptPrepared` event retains
+packet provenance; remote model, sandbox, permission and tool settings are not
+recorded as observed runtime settings.
+
+Required prompt preparation failures use the fenced preflight-failure path and
+return no executable prompt. The server rechecks lease ownership and cancellation
+after preparation and audit persistence. A rendered prompt does not provision a
+checkout, transfer candidate commits, execute a model or prove completed work;
+completion and eval evidence requirements still apply. The supervised source-only
+Docker client continues to use raw claims and its existing bounded task contract.
 
 `POST /api/runtime-hosts/{id}/runtime-jobs/{runtime_job_id}/lease/renew`
 - request: `{ lease_generation, lease_expires_at, lease_proof, renewal_id, lease_secs?: number }`

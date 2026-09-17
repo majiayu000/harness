@@ -5,16 +5,9 @@ pub(crate) use completion::{
     install_completion_reservation_test_gate, replay_completion_reservation,
 };
 mod claim;
+mod prompt;
 use claim::defer_runtime_host_capability_claim;
 mod eval_enforcement;
-pub(crate) use eval_enforcement::{
-    applied_eval_network_policy, eval_metadata, eval_resource_limit_enforcement_for_job,
-};
-use eval_enforcement::{
-    eval_network_policy_enforcement_for_job, set_eval_network_policy_enforcement,
-    set_eval_resource_limit_enforcement,
-};
-
 use crate::http::rest_contract::{ContractJson, LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
 use axum::{
@@ -22,6 +15,13 @@ use axum::{
     http::StatusCode,
 };
 use chrono::{DateTime, Utc};
+pub(crate) use eval_enforcement::{
+    applied_eval_network_policy, eval_metadata, eval_resource_limit_enforcement_for_job,
+};
+use eval_enforcement::{
+    eval_network_policy_enforcement_for_job, set_eval_network_policy_enforcement,
+    set_eval_resource_limit_enforcement,
+};
 use harness_protocol::rest::{
     ClaimRuntimeJobRequest, RuntimeHostClaimResponse, RUNTIME_JOB_LEASE_PROOF_V1_CAPABILITY,
 };
@@ -38,16 +38,12 @@ use harness_workflow::runtime::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Arc};
-
 pub(crate) mod lease;
 pub use lease::renew_runtime_job_lease_for_runtime_host;
-
 type ClaimJson = ContractJson<RuntimeHostClaimResponse>;
-
 fn claim_json(value: serde_json::Value) -> ClaimJson {
     ContractJson(RuntimeHostClaimResponse(value))
 }
-
 #[derive(Debug, Deserialize)]
 pub struct RegisterRuntimeHostRequest {
     pub host_id: String,
@@ -262,6 +258,9 @@ pub async fn claim_runtime_job_for_runtime_host(
             )
         }
     };
+    if let Err(error) = prompt::validate_workspace(req.execution_workspace.as_deref()) {
+        return (StatusCode::BAD_REQUEST, claim_json(json!({"error": error})));
+    }
     let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         return (
@@ -603,7 +602,35 @@ pub async fn claim_runtime_job_for_runtime_host(
             }
         }
     }
+    let prepared = match prompt::prepare_claim_prompt(
+        &state,
+        &job,
+        req.execution_workspace.as_deref(),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(result) => {
+            return complete_runtime_host_preflight_failure(
+                &state,
+                store.as_ref(),
+                &host_id,
+                lease_expires_at,
+                &job,
+                result,
+            )
+            .await
+        }
+    };
+    if prepared.is_some() {
+        if let Err((status, body)) = prompt::check_claim_fence(store.as_ref(), &job).await {
+            return (status, claim_json(body));
+        }
+    }
     let mut response = runtime_host_claim(job, lease_expires_at, lease_proof);
+    if let Some(prepared) = prepared {
+        response["prepared_prompt"] = prepared;
+    }
     if let Some(credential_environment) = credential_environment {
         response["credential_environment"] = json!(credential_environment.audit());
         response["credential_environment_variables"] = json!(credential_environment.variables());
