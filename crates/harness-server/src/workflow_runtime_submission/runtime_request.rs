@@ -96,6 +96,10 @@ pub struct CreateTaskRequest {
     /// Never accepted from or exposed to external HTTP callers.
     #[serde(skip)]
     pub system_input: Option<SystemTaskInput>,
+    /// Isolation trust derived from GitHub `author_association`.
+    /// Never accepted from or exposed to external HTTP callers.
+    #[serde(skip)]
+    pub author_trust_class: Option<harness_core::config::isolation::IsolationTrustClass>,
 }
 
 impl CreateTaskRequest {
@@ -289,6 +293,7 @@ impl Default for CreateTaskRequest {
             priority: 0,
             continuation: None,
             system_input: None,
+            author_trust_class: None,
         }
     }
 }
@@ -439,6 +444,15 @@ mod tests {
             serde_json::from_str(r#"{"issue": 749, "skip_triage": true}"#).expect("deserialize");
         assert_eq!(req.issue, Some(749));
         assert!(req.skip_triage);
+    }
+
+    #[test]
+    fn create_task_request_ignores_http_author_trust_class() {
+        let req: CreateTaskRequest =
+            serde_json::from_str(r#"{"issue": 42, "author_trust_class": "trusted"}"#)
+                .expect("deserialize");
+        assert_eq!(req.issue, Some(42));
+        assert_eq!(req.author_trust_class, None);
     }
 
     #[test]
