@@ -15,7 +15,7 @@ pub(super) async fn prepare_claim_prompt(
     state: &AppState,
     job: &RuntimeJob,
     workspace: Option<&str>,
-) -> Result<Option<Value>, ActivityResult> {
+) -> Result<Option<Value>, Box<ActivityResult>> {
     let Some(workspace) = workspace else {
         return Ok(None);
     };
@@ -23,13 +23,15 @@ pub(super) async fn prepare_claim_prompt(
         .await
         .map(Some)
         .map_err(|error| {
-            ActivityResult::failed(
-                completion::runtime_job_activity(job),
-                "Remote runtime prompt preparation failed.",
-                error.to_string(),
-            )
-            .with_error_kind(
-                crate::workflow_runtime_worker::remote_prompt::error_kind(&error),
+            Box::new(
+                ActivityResult::failed(
+                    completion::runtime_job_activity(job),
+                    "Remote runtime prompt preparation failed.",
+                    error.to_string(),
+                )
+                .with_error_kind(
+                    crate::workflow_runtime_worker::remote_prompt::error_kind(&error),
+                ),
             )
         })
 }
