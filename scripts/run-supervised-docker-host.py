@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import selectors
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -115,7 +116,7 @@ def read_usage(log: Path) -> dict:
 
 
 def extract_candidate(archive: Path, destination: Path) -> None:
-    destination.mkdir()
+    destination.mkdir(mode=0o700)
     with tarfile.open(archive) as stream:
         # Reject links entirely: acceptance must not read outside the candidate.
         members = stream.getmembers()
@@ -158,6 +159,9 @@ class Host:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.root = args.state_dir.resolve()
+        workspace = args.workspace.resolve()
+        if workspace == self.root or workspace in self.root.parents or self.root in workspace.parents:
+            raise RuntimeError("workspace and state directory must not overlap or contain one another")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.lock = (self.root / "lock").open("w")
         fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -240,6 +244,30 @@ class Host:
             raise RuntimeError("cleanup incomplete: " + "; ".join(errors))
         self.state.pop("cleanup_errors", None)
 
+    def freeze_input(self) -> None:
+        source = self.args.workspace.resolve()
+        if not source.is_dir():
+            raise RuntimeError("workspace must be a source directory")
+        # Reject links/FIFOs/devices before tar creation; extraction checks the
+        # archive again. This is not an atomic filesystem snapshot of the source.
+        for directory, directories, files in os.walk(source, followlinks=False):
+            for name in directories + files:
+                path = Path(directory) / name
+                mode = path.lstat().st_mode
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    raise RuntimeError(f"input source contains a link or special file: {path.relative_to(source)}")
+        archive = self.root / "input.tar"
+        with archive.open("xb") as stream:
+            os.chmod(archive, 0o600)
+            with tarfile.open(fileobj=stream, mode="w") as bundle:
+                bundle.add(source, arcname=".")
+            stream.flush()
+            os.fsync(stream.fileno())
+        extract_candidate(archive, self.root / "input-snapshot")
+        with archive.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        self.state["input_snapshot"] = {"archive_sha256": digest}
+
     def launch(self) -> None:
         args = self.args
         docker("network", "create", "--internal", self.name)
@@ -256,7 +284,7 @@ class Host:
         run_args = [
             "run", "-d", "--name", self.name, "--network", self.name, *self.base_args(),
             "--tmpfs", f"/workspace:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
-            "--mount", f"type=bind,src={args.workspace.resolve()},dst=/input,readonly",
+            "--mount", f"type=bind,src={self.root / 'input-snapshot'},dst=/input,readonly",
             "--mount", f"type=bind,src={args.auth_file.resolve()},dst=/run/codex-auth.json,readonly",
             "--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080",
             args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT,
@@ -381,6 +409,9 @@ class Host:
 
     def result(self, status: str, reason: str, artifacts: list | None = None) -> dict:
         artifacts = list(artifacts or [])
+        if "input_snapshot" in self.state:
+            artifacts.append({"artifact_type": "supervised_input_snapshot",
+                              "artifact": self.state["input_snapshot"]})
         if self.state.get("container_started"):
             evidence = self.state.get("resource_evidence", {"status": "incomplete", "error": "not collected"})
             artifacts.append({"artifact_type": "supervised_candidate_resources", "artifact": evidence})
@@ -404,6 +435,9 @@ class Host:
 
     def run(self) -> None:
         phase = self.state["phase"]
+        if phase in {"preparing", "preparation_failed"}:
+            raise RuntimeError("input preparation did not complete; retained state will not recopy or rerun: "
+                               + self.state.get("preparation_error", "host interrupted"))
         if phase == "completed":
             print("already completed; no agent invocation")
             return
@@ -427,6 +461,15 @@ class Host:
             self.state["request"] = json.loads(self.args.request.read_text())
             self.state["submission"] = json.loads(self.args.submission.read_text())
             (self.root / "verifier.py").write_bytes(self.args.verifier.read_bytes())
+            self.state["phase"] = "preparing"
+            self.persist()
+            try:
+                self.freeze_input()
+            except (Exception, KeyboardInterrupt) as error:
+                self.state["phase"] = "preparation_failed"
+                self.state["preparation_error"] = str(error) or "host interrupted by keyboard"
+                self.persist()
+                raise
             self.state["phase"] = "claiming"
             self.persist()
         self.api("/api/runtime-hosts/register", {

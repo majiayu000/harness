@@ -79,6 +79,33 @@ process dies. These are explicit trial limits, **not** a
 claim to implement every `CappedResourceLimits` field (especially aggregate CPU
 time), nor a measured full eval resource report.
 
+## Frozen source input
+
+Before claiming a job, the runner packages the supplied source directory into
+private `input.tar`, rejects symlinks and special files (including FIFOs), and
+extracts `input-snapshot` under its state directory. This input validation is new;
+the earlier live workspace mount did not apply the candidate-export boundary to
+source files. Executable bits are retained; the tar data filter normalizes
+permissions during safe extraction rather than preserving every mode exactly.
+The source and state directories must be separate: equal paths or either directory inside
+the other are rejected before copying.
+
+The candidate mounts only this retained snapshot at `/input`, read-only, and
+copies it into its private writable workspace. Subsequent changes to the original
+`--workspace` do not change the prepared input. The snapshot's archive SHA-256 is
+persisted in run state and in `supervised_input_snapshot` result evidence. It
+identifies the retained archive bytes; it is not a Git commit or a claim that a
+concurrently changing source directory was captured atomically at one instant.
+Use a deliberately prepared source directory; this operation does not filter
+secrets or make arbitrary repository metadata safe to export.
+
+A restart while awaiting a claim reuses the prepared snapshot without copying
+the original source again. Interrupted or failed preparation is retained as an
+explicit preparation failure and cannot claim or rerun from that state directory.
+Existing executing-run recovery still reports failure without another model
+invocation. This remains a single-task source-byte handoff, not historical
+checkout/candidate commit evidence or complete eval support.
+
 ## Candidate resource evidence
 
 The candidate's trusted non-root Python PID 1 reaps adopted descendants until

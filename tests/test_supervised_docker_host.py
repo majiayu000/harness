@@ -480,3 +480,117 @@ def test_capture_failure_retains_completed_model_usage(tmp_path):
     usage = next(a['artifact'] for a in result['artifacts'] if a['artifact_type'] == 'runtime_host_usage')
     assert usage == {'model': 'scripted-model', 'input_tokens': 120, 'output_tokens': 30,
                      'cached_input_tokens': 80, 'total_tokens': 150}
+
+
+def snapshot_runner(tmp_path):
+    from types import SimpleNamespace
+    runner = host(tmp_path / 'state', 'new')
+    runner.root.mkdir(mode=0o700)
+    source = tmp_path / 'source'
+    source.mkdir()
+    runner.args = SimpleNamespace(workspace=source)
+    return runner, source
+
+
+def test_frozen_source_preserves_bytes_and_executable_mode_after_original_changes(tmp_path):
+    runner, source = snapshot_runner(tmp_path)
+    executable = source / 'run.sh'
+    executable.write_text('#!/bin/sh\necho original\n')
+    executable.chmod(0o755)
+    runner.freeze_input()
+    digest = runner.state['input_snapshot']['archive_sha256']
+    executable.write_text('changed')
+    (source / 'later.txt').write_text('not part of input')
+    frozen = runner.root / 'input-snapshot'
+    assert (frozen / 'run.sh').read_text() == '#!/bin/sh\necho original\n'
+    assert (frozen / 'run.sh').stat().st_mode & 0o111 == 0o111
+    assert not (frozen / 'later.txt').exists()
+    import hashlib
+    assert hashlib.sha256((runner.root / 'input.tar').read_bytes()).hexdigest() == digest
+    artifact = runner.result('failed', 'test')['artifacts'][0]
+    assert artifact == {'artifact_type': 'supervised_input_snapshot',
+                        'artifact': {'archive_sha256': digest}}
+
+
+@pytest.mark.parametrize('kind', ['file_link', 'directory_link', 'fifo'])
+def test_input_snapshot_rejects_links_and_special_files_before_archiving(tmp_path, kind):
+    runner, source = snapshot_runner(tmp_path)
+    if kind == 'fifo':
+        os.mkfifo(source / 'invalid')
+    else:
+        (source / 'invalid').symlink_to(tmp_path if kind == 'directory_link' else __file__)
+    with pytest.raises(RuntimeError, match='link or special file'):
+        runner.freeze_input()
+    assert not (runner.root / 'input.tar').exists()
+    assert 'input_snapshot' not in runner.state
+
+
+@pytest.mark.parametrize('kind', ['same', 'state_inside_source', 'source_inside_state'])
+def test_source_and_state_must_not_overlap(tmp_path, kind):
+    from types import SimpleNamespace
+    module = load()
+    source, state = tmp_path / 'source', tmp_path / 'state'
+    if kind == 'same':
+        state = source
+    elif kind == 'state_inside_source':
+        state = source / 'state'
+    else:
+        source = state / 'source'
+    with pytest.raises(RuntimeError, match='must not overlap'):
+        module.Host(SimpleNamespace(workspace=source, state_dir=state))
+    assert not state.exists()
+
+
+@pytest.mark.parametrize('phase', ['preparing', 'preparation_failed'])
+def test_interrupted_snapshot_is_not_recreated_or_claimed(tmp_path, phase):
+    runner = host(tmp_path, phase)
+    runner.freeze_input = Mock()
+    runner.api = Mock()
+    with pytest.raises(RuntimeError, match='will not recopy or rerun'):
+        runner.run()
+    runner.freeze_input.assert_not_called()
+    runner.api.assert_not_called()
+
+
+def test_claiming_restart_reuses_snapshot_without_reading_source(tmp_path):
+    runner = host(tmp_path, 'claiming')
+    runner.name = 'test'
+    runner.freeze_input = Mock(side_effect=AssertionError('must not recopy source'))
+    runner.api = Mock(side_effect=RuntimeError('stop before claim'))
+    with pytest.raises(RuntimeError, match='stop before claim'):
+        runner.run()
+    runner.freeze_input.assert_not_called()
+
+
+def test_launch_mounts_only_frozen_input(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = load()
+    runner = module.Host.__new__(module.Host)
+    runner.root, runner.name, runner.state = tmp_path, 'owned', {}
+    runner.args = SimpleNamespace(workspace=tmp_path / 'mutable', auth_file=tmp_path / 'auth',
+                                  synthetic_dns=False, proxy_image='proxy', image='agent')
+    runner.start_observer = Mock()
+    calls = []
+    monkeypatch.setattr(module, 'docker', lambda *args: calls.append(args))
+    runner.launch()
+    candidate = next(c for c in calls if c[:5] == ('run', '-d', '--name', 'owned', '--network'))
+    assert f'type=bind,src={tmp_path}/input-snapshot,dst=/input,readonly' in candidate
+    assert not any(str(tmp_path / 'mutable') in arg for arg in candidate)
+
+
+def test_failed_preparation_is_persisted_before_any_claim(tmp_path):
+    from types import SimpleNamespace
+    runner = host(tmp_path, 'new')
+    request, submission, verifier = [tmp_path / name for name in ['request.json', 'submission.json', 'verify.py']]
+    request.write_text('{}')
+    submission.write_text('{}')
+    verifier.write_text('pass\n')
+    runner.args = SimpleNamespace(request=request, submission=submission, verifier=verifier)
+    runner.freeze_input = Mock(side_effect=RuntimeError('input contains a FIFO'))
+    runner.api = Mock()
+    with pytest.raises(RuntimeError, match='FIFO'):
+        runner.run()
+    runner.api.assert_not_called()
+    saved = json.loads((tmp_path / 'state.json').read_text())
+    assert saved['phase'] == 'preparation_failed'
+    assert saved['preparation_error'] == 'input contains a FIFO'
