@@ -26,7 +26,7 @@ async fn ready_to_merge_reconciliation_marks_closed_unmerged_pr_cancelled() -> a
         false,
         None,
     )
-    .await;
+    .await?;
     assert_eq!(report.workflow_transitions.len(), 1);
     assert!(report.workflow_alerts.is_empty());
     assert_eq!(report.workflow_transitions[0].from, "ready_to_merge");
