@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import socket
 from pathlib import Path
 import tarfile
 import sys
@@ -489,6 +490,7 @@ def snapshot_runner(tmp_path):
     source = tmp_path / 'source'
     source.mkdir()
     runner.args = SimpleNamespace(workspace=source)
+    runner.workspace = source.resolve()
     return runner, source
 
 
@@ -501,7 +503,8 @@ def test_frozen_source_preserves_bytes_and_executable_mode_after_original_change
     digest = runner.state['input_snapshot']['archive_sha256']
     executable.write_text('changed')
     (source / 'later.txt').write_text('not part of input')
-    frozen = runner.root / 'input-snapshot'
+    frozen = tmp_path / 'extracted-test'
+    load().extract_candidate(runner.root / 'input.tar', frozen)
     assert (frozen / 'run.sh').read_text() == '#!/bin/sh\necho original\n'
     assert (frozen / 'run.sh').stat().st_mode & 0o111 == 0o111
     assert not (frozen / 'later.txt').exists()
@@ -513,7 +516,7 @@ def test_frozen_source_preserves_bytes_and_executable_mode_after_original_change
 
 
 @pytest.mark.parametrize('kind', ['file_link', 'directory_link', 'fifo'])
-def test_input_snapshot_rejects_links_and_special_files_before_archiving(tmp_path, kind):
+def test_input_snapshot_rejects_links_and_special_files_before_accepting(tmp_path, kind):
     runner, source = snapshot_runner(tmp_path)
     if kind == 'fifo':
         os.mkfifo(source / 'invalid')
@@ -521,7 +524,20 @@ def test_input_snapshot_rejects_links_and_special_files_before_archiving(tmp_pat
         (source / 'invalid').symlink_to(tmp_path if kind == 'directory_link' else __file__)
     with pytest.raises(RuntimeError, match='link or special file'):
         runner.freeze_input()
-    assert not (runner.root / 'input.tar').exists()
+    assert not (runner.root / 'input-snapshot').exists()
+    assert 'input_snapshot' not in runner.state
+
+
+def test_input_snapshot_rejects_socket_instead_of_silently_omitting_it(tmp_path):
+    runner, source = snapshot_runner(tmp_path)
+    # Keep the Unix socket pathname within the platform length limit.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='input-socket-', dir='/tmp') as directory:
+        runner.workspace = Path(directory)
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(runner.workspace / 'socket'))
+            with pytest.raises(RuntimeError, match='socket special file'):
+                runner.freeze_input()
     assert 'input_snapshot' not in runner.state
 
 
@@ -567,6 +583,9 @@ def test_launch_mounts_only_frozen_input(tmp_path, monkeypatch):
     module = load()
     runner = module.Host.__new__(module.Host)
     runner.root, runner.name, runner.state = tmp_path, 'owned', {}
+    import hashlib
+    (tmp_path / 'input.tar').write_bytes(b'prepared archive')
+    runner.state['input_snapshot'] = {'archive_sha256': hashlib.sha256(b'prepared archive').hexdigest()}
     runner.args = SimpleNamespace(workspace=tmp_path / 'mutable', auth_file=tmp_path / 'auth',
                                   synthetic_dns=False, proxy_image='proxy', image='agent')
     runner.start_observer = Mock()
@@ -574,7 +593,7 @@ def test_launch_mounts_only_frozen_input(tmp_path, monkeypatch):
     monkeypatch.setattr(module, 'docker', lambda *args: calls.append(args))
     runner.launch()
     candidate = next(c for c in calls if c[:5] == ('run', '-d', '--name', 'owned', '--network'))
-    assert f'type=bind,src={tmp_path}/input-snapshot,dst=/input,readonly' in candidate
+    assert f'type=bind,src={tmp_path}/input.tar,dst=/input.tar,readonly' in candidate
     assert not any(str(tmp_path / 'mutable') in arg for arg in candidate)
 
 
@@ -594,3 +613,65 @@ def test_failed_preparation_is_persisted_before_any_claim(tmp_path):
     saved = json.loads((tmp_path / 'state.json').read_text())
     assert saved['phase'] == 'preparation_failed'
     assert saved['preparation_error'] == 'input contains a FIFO'
+
+
+def test_workspace_alias_retargeting_does_not_change_canonical_source(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = load()
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'original').write_text('original')
+    alias = tmp_path / 'alias'
+    alias.symlink_to(source, target_is_directory=True)
+    state = tmp_path / 'private'
+    args = SimpleNamespace(workspace=alias, state_dir=state, server_url='http://localhost',
+                           image='image', proxy_image='proxy', model='model', timeout=30, synthetic_dns=False)
+    monkeypatch.setenv('HARNESS_API_TOKEN', 'test-only')
+    runner = module.Host(args)
+    try:
+        alias.unlink()
+        alias.symlink_to(state, target_is_directory=True)
+        runner.freeze_input()
+        assert runner.state['identity']['workspace'] == str(source.resolve())
+        with tarfile.open(state / 'input.tar') as archive:
+            assert './original' in archive.getnames()
+            assert not any('input.tar' in name for name in archive.getnames())
+    finally:
+        runner.lock.close()
+
+
+def test_launch_passes_prepared_digest_to_consumer_before_auth_copy(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    runner, _ = snapshot_runner(tmp_path)
+    runner.freeze_input()
+    expected = runner.state['input_snapshot']['archive_sha256']
+    (runner.root / 'input.tar').write_bytes(b'changed bytes')
+    runner.name = 'owned'
+    runner.args = SimpleNamespace(auth_file=tmp_path / 'auth', image='image',
+                                  proxy_image='proxy', synthetic_dns=False)
+    runner.start_observer = Mock()
+    calls = []
+    def docker(*args):
+        calls.append(args)
+        if args[0] == 'exec':
+            assert args[-1] == expected
+            assert 'file_digest' in args[-2]
+            raise RuntimeError('consumer rejected input digest')
+        return ''
+    monkeypatch.setitem(runner.launch.__globals__, 'docker', docker)
+    with pytest.raises(RuntimeError, match='consumer rejected'):
+        runner.launch()
+    assert not any('cp /run/codex-auth' in argument for call in calls for argument in call)
+
+
+def test_unpack_checks_mounted_bytes_before_creating_candidate_files(tmp_path):
+    module = load()
+    archive = tmp_path / 'input.tar'
+    archive.write_bytes(b'changed after host check')
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    script = module.INPUT_UNPACK_SCRIPT.replace("'/input.tar'", repr(str(archive))).replace("'/workspace'", repr(str(workspace)))
+    result = subprocess.run([sys.executable, '-I', '-c', script, '0' * 64], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'digest does not match' in result.stderr
+    assert not list(workspace.iterdir())

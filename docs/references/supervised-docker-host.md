@@ -81,30 +81,41 @@ time), nor a measured full eval resource report.
 
 ## Frozen source input
 
-Before claiming a job, the runner packages the supplied source directory into
-private `input.tar`, rejects symlinks and special files (including FIFOs), and
-extracts `input-snapshot` under its state directory. This input validation is new;
-the earlier live workspace mount did not apply the candidate-export boundary to
-source files. Executable bits are retained; the tar data filter normalizes
-permissions during safe extraction rather than preserving every mode exactly.
-The source and state directories must be separate: equal paths or either directory inside
-the other are rejected before copying.
+Before claiming a job, the runner packages the source directory into private
+`input.tar` and validates that the completed archive contains only regular files
+and directories. A socket-only source scan rejects Unix sockets, which tar
+creation otherwise silently omits. Tar creation records FIFOs and links as headers
+without reading their contents; the archive boundary rejects them before accepting preparation.
+This input protection is new; the earlier live workspace mount did not validate
+source files. The canonical source path is resolved once during initialization
+and reused for identity and preparation, so retargeting the original path alias
+does not switch the copied directory. Source and state directories cannot equal
+or contain each other.
 
-The candidate mounts only this retained snapshot at `/input`, read-only, and
-copies it into its private writable workspace. Subsequent changes to the original
-`--workspace` do not change the prepared input. The snapshot's archive SHA-256 is
-persisted in run state and in `supervised_input_snapshot` result evidence. It
-identifies the retained archive bytes; it is not a Git commit or a claim that a
-concurrently changing source directory was captured atomically at one instant.
-Use a deliberately prepared source directory; this operation does not filter
-secrets or make arbitrary repository metadata safe to export.
+The candidate mounts only the retained archive at `/input.tar`, read-only.
+The trusted container preparation command checks its SHA-256 against run state
+at the consumption boundary and safely extracts from that same file descriptor into writable `/workspace`, before
+model execution. This trusted, self-created relative archive uses GNU tar with
+`--no-same-owner --no-same-permissions`: the non-root container user owns the
+files and its umask applies. Executable bits are retained where the umask permits;
+source read-only modes remain read-only but the owner can change them. Untrusted
+candidate-output extraction continues to use the existing Python data filter. There is no separate mutable host extraction tree to diverge from
+the reported digest. Subsequent original-source edits do not change this input;
+archive corruption before a delayed claim or restart fails explicitly.
 
-A restart while awaiting a claim reuses the prepared snapshot without copying
-the original source again. Interrupted or failed preparation is retained as an
-explicit preparation failure and cannot claim or rerun from that state directory.
-Existing executing-run recovery still reports failure without another model
-invocation. This remains a single-task source-byte handoff, not historical
-checkout/candidate commit evidence or complete eval support.
+The archive SHA-256 is persisted in state and `supervised_input_snapshot` result
+evidence. It identifies source archive bytes, not a Git commit or an atomic
+capture of a concurrently changing source directory. This is not protection
+against an actively malicious operator modifying private state concurrently.
+Prepare the source deliberately: this operation does not scan for secrets or
+make arbitrary repository metadata safe to export.
+
+A restart while awaiting a claim reuses the prepared archive without recopying
+the original source. Interrupted or failed preparation is retained explicitly and
+cannot claim or rerun from that state directory. Existing executing-run recovery
+still reports failure without another model invocation. This remains a
+single-task source-byte handoff, not historical checkout/candidate commit
+proof or complete eval support.
 
 ## Candidate resource evidence
 

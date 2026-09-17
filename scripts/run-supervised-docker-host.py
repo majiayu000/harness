@@ -115,14 +115,27 @@ def read_usage(log: Path) -> dict:
     raise RuntimeError("agent produced no completed-turn usage evidence")
 
 
+def archive_members(stream: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    members = stream.getmembers()
+    if any(not (member.isfile() or member.isdir()) for member in members):
+        raise RuntimeError("source archive contains a link or special file")
+    return members
+
+
 def extract_candidate(archive: Path, destination: Path) -> None:
     destination.mkdir(mode=0o700)
     with tarfile.open(archive) as stream:
-        # Reject links entirely: acceptance must not read outside the candidate.
-        members = stream.getmembers()
-        if any(not (member.isfile() or member.isdir()) for member in members):
-            raise RuntimeError("candidate archive contains a link or special file")
-        stream.extractall(destination, members=members, filter="data")
+        stream.extractall(destination, members=archive_members(stream), filter="data")
+
+
+INPUT_UNPACK_SCRIPT = """import hashlib, subprocess, sys
+with open('/input.tar', 'rb') as stream:
+    if hashlib.file_digest(stream, 'sha256').hexdigest() != sys.argv[1]:
+        raise RuntimeError('input archive digest does not match prepared source')
+    stream.seek(0)
+    subprocess.run(['tar', '--extract', '--file', '-', '--directory', '/workspace',
+                    '--no-same-owner', '--no-same-permissions'], stdin=stream, check=True)
+"""
 
 
 CANDIDATE_REAPER_SCRIPT = """import os, time
@@ -159,7 +172,7 @@ class Host:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.root = args.state_dir.resolve()
-        workspace = args.workspace.resolve()
+        workspace = self.workspace = args.workspace.resolve()
         if workspace == self.root or workspace in self.root.parents or self.root in workspace.parents:
             raise RuntimeError("workspace and state directory must not overlap or contain one another")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -172,7 +185,7 @@ class Host:
         identity = {
             "server_url": args.server_url,
             "image": args.image, "proxy_image": args.proxy_image, "model": args.model,
-            "workspace": str(args.workspace.resolve()), "timeout": args.timeout,
+            "workspace": str(self.workspace), "timeout": args.timeout,
             "synthetic_dns": args.synthetic_dns,
         }
         if "identity" in self.state and self.state["identity"] != identity:
@@ -245,17 +258,16 @@ class Host:
         self.state.pop("cleanup_errors", None)
 
     def freeze_input(self) -> None:
-        source = self.args.workspace.resolve()
+        source = self.workspace
         if not source.is_dir():
             raise RuntimeError("workspace must be a source directory")
-        # Reject links/FIFOs/devices before tar creation; extraction checks the
-        # archive again. This is not an atomic filesystem snapshot of the source.
-        for directory, directories, files in os.walk(source, followlinks=False):
-            for name in directories + files:
-                path = Path(directory) / name
-                mode = path.lstat().st_mode
-                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-                    raise RuntimeError(f"input source contains a link or special file: {path.relative_to(source)}")
+        # TarFile.add silently skips sockets, so reject those before archiving.
+        for directory, _, files in os.walk(source, followlinks=False):
+            for name in files:
+                if stat.S_ISSOCK((Path(directory) / name).lstat().st_mode):
+                    raise RuntimeError("input source contains a socket special file")
+        # TarFile.add records FIFO/device/link headers without reading their
+        # contents. Validate the completed archive once before it is accepted.
         archive = self.root / "input.tar"
         with archive.open("xb") as stream:
             os.chmod(archive, 0o600)
@@ -263,13 +275,15 @@ class Host:
                 bundle.add(source, arcname=".")
             stream.flush()
             os.fsync(stream.fileno())
-        extract_candidate(archive, self.root / "input-snapshot")
+        with tarfile.open(archive) as stream:
+            archive_members(stream)
         with archive.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         self.state["input_snapshot"] = {"archive_sha256": digest}
 
     def launch(self) -> None:
         args = self.args
+        digest = self.state["input_snapshot"]["archive_sha256"]
         docker("network", "create", "--internal", self.name)
         proxy_args = [
             "run", "-d", "--name", self.name + "-proxy", "--network", "bridge",
@@ -284,7 +298,7 @@ class Host:
         run_args = [
             "run", "-d", "--name", self.name, "--network", self.name, *self.base_args(),
             "--tmpfs", f"/workspace:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
-            "--mount", f"type=bind,src={self.root / 'input-snapshot'},dst=/input,readonly",
+            "--mount", f"type=bind,src={self.root / 'input.tar'},dst=/input.tar,readonly",
             "--mount", f"type=bind,src={args.auth_file.resolve()},dst=/run/codex-auth.json,readonly",
             "--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080",
             args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT,
@@ -293,8 +307,9 @@ class Host:
         self.state["container_started"] = True
         self.persist()
         self.start_observer()
+        docker("exec", self.name, "python3", "-I", "-c", INPUT_UNPACK_SCRIPT, digest)
         docker("exec", self.name, "sh", "-c",
-               'set -eu; cp -R /input/. /workspace/; mkdir -p /home/harness/.codex; '
+               'set -eu; mkdir -p /home/harness/.codex; '
                'cp /run/codex-auth.json /home/harness/.codex/auth.json')
 
     def start_observer(self) -> None:
