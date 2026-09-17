@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+mod guard_output;
+
 pub const BUILTIN_BASELINE_GUARD_ID: &str = "BUILTIN-BASELINE-SCAN";
 pub const WARN_NO_GUARDS_REGISTERED: &str = "rule scan warning: no guards registered";
 pub const WARN_EMPTY_SCAN_INPUT: &str = "rule scan warning: empty scan input";
@@ -643,7 +645,11 @@ impl RuleEngine {
                 .arg(project_root)
                 .output()
                 .await?;
-            violations.extend(self.parse_guard_output(&output, guard)?);
+            violations.extend(guard_output::parse_guard_output(
+                &self.rules,
+                &output,
+                guard.id.as_str(),
+            )?);
         }
         Ok(violations)
     }
@@ -663,42 +669,13 @@ impl RuleEngine {
                     .arg(file)
                     .output()
                     .await?;
-                violations.extend(self.parse_guard_output(&output, guard)?);
+                violations.extend(guard_output::parse_guard_output(
+                    &self.rules,
+                    &output,
+                    guard.id.as_str(),
+                )?);
             }
         }
-        Ok(violations)
-    }
-
-    fn parse_guard_output(
-        &self,
-        output: &std::process::Output,
-        _guard: &Guard,
-    ) -> anyhow::Result<Vec<Violation>> {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut violations = Vec::new();
-
-        for line in stdout.lines() {
-            // Expected format: FILE:LINE:RULE_ID:MESSAGE
-            let parts: Vec<&str> = line.splitn(4, ':').collect();
-            if parts.len() >= 4 {
-                let rule_id = RuleId::from_str(parts[2].trim());
-                let severity = self
-                    .rules
-                    .iter()
-                    .find(|r| r.id == rule_id)
-                    .map(|r| r.severity)
-                    .unwrap_or(Severity::Medium);
-
-                violations.push(Violation {
-                    rule_id,
-                    file: PathBuf::from(parts[0]),
-                    line: parts[1].parse().ok(),
-                    message: parts[3].to_string(),
-                    severity,
-                });
-            }
-        }
-
         Ok(violations)
     }
 
@@ -806,7 +783,11 @@ impl RuleScanSnapshot {
                 .arg(project_root)
                 .output()
                 .await?;
-            violations.extend(self.parse_guard_output(&output)?);
+            violations.extend(guard_output::parse_guard_output(
+                &self.rules,
+                &output,
+                guard.id.as_str(),
+            )?);
         }
         Ok(violations)
     }
@@ -826,38 +807,13 @@ impl RuleScanSnapshot {
                     .arg(file)
                     .output()
                     .await?;
-                violations.extend(self.parse_guard_output(&output)?);
+                violations.extend(guard_output::parse_guard_output(
+                    &self.rules,
+                    &output,
+                    guard.id.as_str(),
+                )?);
             }
         }
-        Ok(violations)
-    }
-
-    fn parse_guard_output(&self, output: &std::process::Output) -> anyhow::Result<Vec<Violation>> {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut violations = Vec::new();
-
-        for line in stdout.lines() {
-            // Expected format: FILE:LINE:RULE_ID:MESSAGE
-            let parts: Vec<&str> = line.splitn(4, ':').collect();
-            if parts.len() >= 4 {
-                let rule_id = RuleId::from_str(parts[2].trim());
-                let severity = self
-                    .rules
-                    .iter()
-                    .find(|r| r.id == rule_id)
-                    .map(|r| r.severity)
-                    .unwrap_or(Severity::Medium);
-
-                violations.push(Violation {
-                    rule_id,
-                    file: PathBuf::from(parts[0]),
-                    line: parts[1].parse().ok(),
-                    message: parts[3].to_string(),
-                    severity,
-                });
-            }
-        }
-
         Ok(violations)
     }
 }
