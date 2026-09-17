@@ -15,7 +15,10 @@ pub(super) async fn prepare_claim_prompt(
     state: &AppState,
     job: &RuntimeJob,
     workspace: Option<&str>,
-) -> Result<Option<Value>, Box<ActivityResult>> {
+) -> Result<
+    Option<crate::workflow_runtime_worker::remote_prompt::PreparedRemotePrompt>,
+    Box<ActivityResult>,
+> {
     let Some(workspace) = workspace else {
         return Ok(None);
     };
@@ -34,6 +37,36 @@ pub(super) async fn prepare_claim_prompt(
                 ),
             )
         })
+}
+
+pub(super) async fn record_claim_delivery(
+    store: &WorkflowRuntimeStore,
+    job: &RuntimeJob,
+    prepared: Option<&crate::workflow_runtime_worker::remote_prompt::PreparedRemotePrompt>,
+    credential_audit: Option<Value>,
+) -> Result<(), (StatusCode, Value)> {
+    let result = store
+        .record_remote_host_claim_delivery(
+            job,
+            prepared.map(|prompt| prompt.evidence.clone()),
+            credential_audit,
+        )
+        .await;
+    match result {
+        Ok(true) => check_claim_fence(store, job).await,
+        Ok(false) => {
+            check_claim_fence(store, job).await?;
+            let (status, body) = lease::lease_lost_response();
+            Err((status, body.0))
+        }
+        Err(error) => {
+            tracing::error!(runtime_job_id = %job.id, %error, "remote claim delivery audit failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"failed to persist remote claim delivery audit"}),
+            ))
+        }
+    }
 }
 
 pub(super) async fn check_claim_fence(
@@ -127,6 +160,41 @@ mod tests {
             assert!(!prompt.contains("source_root"));
             assert!(!prompt.contains("source_path"));
             assert_eq!(prepared["activity_result_schema"]["activity"], activity);
+            if activity == "run_local_review" {
+                let wire = json!({
+                    "activity":activity, "status":"succeeded", "summary":"Reviewed the requested commit",
+                    "artifacts":[{"artifact_type":"findings", "artifact":{"items":[{"severity":"info"}]}}],
+                    "signals":[{"signal_type":"LocalReviewPassed", "signal":{"reviewed_head_sha":"expected-head", "working_tree_clean":true}}],
+                    "validation":[], "error":null, "error_kind":null,
+                });
+                let validator =
+                    jsonschema::validator_for(&prepared["activity_result_schema"]["json_schema"])?;
+                assert!(validator.is_valid(&wire));
+                // The remote completion endpoint uses this direct deserialization.
+                let result: ActivityResult = serde_json::from_value(wire)?;
+                assert_eq!(result.artifacts[0].artifact["items"][0]["severity"], "info");
+                let mut instance = store
+                    .get_instance(
+                        &store
+                            .get_command(&job.command_id)
+                            .await?
+                            .expect("command")
+                            .workflow_id,
+                    )
+                    .await?
+                    .expect("workflow");
+                instance.state = "local_review_gate".into();
+                instance = instance.with_server_data(
+                    json!({"pr_number":77,"merge_review_head_sha":"expected-head"}),
+                );
+                let event = harness_workflow::runtime::WorkflowEvent::new(&instance.id, 1, "RuntimeJobCompleted", "remote-test")
+                    .with_payload(json!({"command_id":"command-1", "command":harness_workflow::runtime::WorkflowCommand::enqueue_activity(activity,"review-1"), "runtime_job_id":job.id, "activity_result":result}));
+                let decision =
+                    harness_workflow::runtime::reduce_runtime_job_completed(&instance, &event)?
+                        .expect("review decision");
+                assert_eq!(decision.next_state, "ready_to_merge");
+            }
+
             assert_eq!(
                 prepared["prompt_packet_digest"]
                     .as_str()
@@ -216,6 +284,8 @@ mod tests {
                 "implement_issue",
             ),
             ("native-quality", json!({}), "run_quality_gate"),
+            ("server-child", json!({}), "start_child_workflow"),
+            ("server-feedback", json!({}), "inspect_pr_feedback"),
             (
                 "pinned-contract",
                 json!({"agent_contract":{}}),
@@ -401,6 +471,8 @@ mod tests {
         assert!(prompt.contains("Inspect the actual lease renewal boundary without edits."));
         assert!(prompt.contains("Conduct a read-only review of the requested scope."));
         assert!(prompt.contains("Project root: /isolated/candidate"));
+        assert!(prompt.contains("Use native JSON values for artifact and signal payloads"));
+        assert!(!prompt.contains("The wrapper `json` field MUST"));
         let events = store.runtime_events_for(&job.id).await?;
         let packet = &events
             .iter()
@@ -410,6 +482,139 @@ mod tests {
         assert_eq!(packet["workflow"]["definition_id"], "repository_review");
         assert!(packet.get("activity_policy").is_some());
         assert!(packet.get("prompt_task_request").is_some());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn remote_prompt_claim_waiting_for_payload_does_not_block_other_lease_renewal(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+            return Ok(());
+        };
+        // This test needs concurrent queries; ordinary test stores intentionally use one connection.
+        let context = harness_core::db::PgStoreContext::from_legacy_path_schema(
+            &dir.path().join("concurrent.db"),
+            None,
+        )?;
+        context.ensure_schema(store.pool()).await?;
+        let pool = context.open_runtime_pool_with_max_connections(8).await?;
+        let store = Arc::new(WorkflowRuntimeStore::open_with_shared_pool(pool).await?);
+        let mut state = state;
+        Arc::get_mut(&mut state)
+            .expect("unique state")
+            .core
+            .workflow_runtime_store = Some(store.clone());
+        let app = runtime_hosts_workflow_app(state);
+        register_host(&app, "parallel-host").await?;
+        enqueue_runtime_host_test_job(
+            &store,
+            "already-running",
+            RuntimeKind::RemoteHost,
+            "remote",
+            json!({"activity":"implement_issue"}),
+        )
+        .await?;
+        let first = post_json(
+            &app,
+            "/api/runtime-hosts/parallel-host/runtime-jobs/claim".into(),
+            json!({}),
+        )
+        .await?;
+        let prompt_ref = "prompt-memory:blocked-durable-read";
+        store
+            .insert_prompt_payload(prompt_ref, "Do the independently queued task.")
+            .await?;
+        enqueue_runtime_host_test_job(
+            &store,
+            "waiting-payload",
+            RuntimeKind::RemoteHost,
+            "remote",
+            json!({"activity":"implement_issue", "command":{"prompt_ref":prompt_ref}}),
+        )
+        .await?;
+        let mut blocked = store.pool().begin().await?;
+        sqlx::query("LOCK TABLE workflow_prompt_payloads IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocked)
+            .await?;
+        let waiting_app = app.clone();
+        let waiting = tokio::spawn(async move {
+            post_json_with_status(
+                &waiting_app,
+                "/api/runtime-hosts/parallel-host/runtime-jobs/claim".into(),
+                json!({"execution_workspace":"/workspace"}),
+            )
+            .await
+        });
+        let observed_wait = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='workflow_prompt_payloads'::regclass AND mode='AccessShareLock' AND NOT granted)").fetch_one(store.pool()).await?;
+                if waiting { return Ok::<_, anyhow::Error>(()); }
+                tokio::task::yield_now().await;
+            }
+        }).await;
+        let renewal = tokio::time::timeout(std::time::Duration::from_secs(3), post_json_with_status(
+            &app, format!("/api/runtime-hosts/parallel-host/runtime-jobs/{}/lease/renew", first["runtime_job_id"].as_str().expect("job id")),
+            json!({"lease_generation":first["lease_generation"], "lease_expires_at":first["lease_expires_at"], "lease_proof":first["lease_proof"], "renewal_id":uuid::Uuid::new_v4(), "lease_secs":120}),
+        )).await;
+        blocked.rollback().await?;
+        let (_, prepared) = waiting.await??;
+        observed_wait.map_err(|error| {
+            anyhow::anyhow!("durable lookup did not reach table wait: {error}")
+        })??;
+        let (status, _) =
+            renewal.map_err(|error| anyhow::anyhow!("other lease renewal blocked: {error}"))??;
+        assert_eq!(status, StatusCode::OK);
+        assert!(prepared["prepared_prompt"]["prompt"]
+            .as_str()
+            .expect("prompt")
+            .contains("Do the independently queued task."));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn remote_prompt_claim_optional_memory_failure_keeps_audited_prompt() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("WORKFLOW.md"),
+            "---\nmemory:\n  enabled: true\n---\nFollow the activity instructions.\n",
+        )?;
+        let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+            return Ok(());
+        };
+        let app = runtime_hosts_workflow_app(state);
+        register_host(&app, "memory-host").await?;
+        let job = enqueue_runtime_host_test_job(
+            &store,
+            "memory-unavailable",
+            RuntimeKind::RemoteHost,
+            "remote",
+            json!({"activity":"implement_issue", "repo":"owner/repo"}),
+        )
+        .await?;
+        sqlx::query("ALTER TABLE workflow_repo_memory RENAME TO unavailable_repo_memory")
+            .execute(store.pool())
+            .await?;
+        let response = post_json_with_status(
+            &app,
+            "/api/runtime-hosts/memory-host/runtime-jobs/claim".into(),
+            json!({"execution_workspace":"/workspace"}),
+        )
+        .await;
+        sqlx::query("ALTER TABLE unavailable_repo_memory RENAME TO workflow_repo_memory")
+            .execute(store.pool())
+            .await?;
+        let (status, response) = response?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.get("prepared_prompt").is_some());
+        let events = store.runtime_events_for(&job.id).await?;
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "RuntimePromptPrepared")
+            .expect("prepared event");
+        assert_eq!(
+            event.event["repo_memory_degradation"]["artifact"]["reason"],
+            "repo_memory_retrieval_failed"
+        );
         Ok(())
     }
 }

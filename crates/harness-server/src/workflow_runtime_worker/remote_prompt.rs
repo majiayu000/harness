@@ -8,18 +8,32 @@ use harness_workflow::runtime::{RuntimeJob, QUALITY_GATE_ACTIVITY};
 use serde_json::{json, Value};
 use std::path::Path;
 
+pub(crate) struct PreparedRemotePrompt {
+    pub response: Value,
+    pub evidence: Value,
+}
+
 /// Prepare instructions only: remote workspaces are never accessed by the server.
 pub(crate) async fn prepare(
     state: &AppState,
     job: &RuntimeJob,
     workspace: &str,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<PreparedRemotePrompt> {
     if job.input.pointer("/command/agent_contract").is_some()
         || job.input.pointer("/command/exact_replay").is_some()
-        || activity_name(job) == QUALITY_GATE_ACTIVITY
+        || matches!(activity_name(job).as_str(), QUALITY_GATE_ACTIVITY)
     {
         return Err(PromptPacketConfigurationError::new(
             "this activity requires raw claim execution; omit execution_workspace",
+        )
+        .into());
+    }
+    if matches!(
+        activity_name(job).as_str(),
+        "start_child_workflow" | "inspect_pr_feedback"
+    ) {
+        return Err(PromptPacketConfigurationError::new(
+            "server-owned activity cannot be rendered for a remote agent",
         )
         .into());
     }
@@ -31,6 +45,14 @@ pub(crate) async fn prepare(
     let workflow = super::job_context::workflow_for_job(state, job)
         .await?
         .ok_or_else(|| anyhow::anyhow!("runtime workflow is missing"))?;
+    if activity_name(job) == "merge_pr"
+        && super::server_merge::server_merge_execution_enabled(state, job, Some(&workflow))
+    {
+        return Err(PromptPacketConfigurationError::new(
+            "server-owned merge execution cannot be rendered for a remote agent",
+        )
+        .into());
+    }
     let source_root = super::job_context::project_root_for_job(state, job, Some(&workflow))?;
     let document = harness_core::config::workflow::load_workflow_document(&source_root)
         .map_err(PromptPacketConfigurationError::from)?;
@@ -56,9 +78,6 @@ pub(crate) async fn prepare(
         request.prompt_text(),
     )
     .await;
-    if let Some(degradation) = memory.degradation {
-        anyhow::bail!("remote prompt memory unavailable: {}", degradation.artifact);
-    }
     let packet = build_runtime_prompt_packet(
         store.definition_registry(),
         job,
@@ -73,20 +92,18 @@ pub(crate) async fn prepare(
     )?;
     let digest = prompt_packet_digest(&packet);
     let prompt = build_runtime_job_prompt(&packet, request.prompt_text());
-    store
-        .record_runtime_event(
-            &job.id,
-            "RuntimePromptPrepared",
-            json!({
-                "prompt_packet_digest": digest, "prompt_packet": packet,
-            }),
-        )
-        .await?;
-    Ok(json!({
-        "prompt": prompt,
-        "prompt_packet_digest": digest,
-        "activity_result_schema": packet["activity_result_schema"],
-    }))
+    Ok(PreparedRemotePrompt {
+        response: json!({
+            "prompt": prompt,
+            "prompt_packet_digest": digest,
+            "activity_result_schema": packet["activity_result_schema"],
+        }),
+        evidence: json!({
+            "prompt_packet_digest": digest,
+            "prompt_packet": packet,
+            "repo_memory_degradation": memory.degradation,
+        }),
+    })
 }
 
 pub(crate) fn error_kind(error: &anyhow::Error) -> harness_workflow::runtime::ActivityErrorKind {

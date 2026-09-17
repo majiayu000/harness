@@ -353,11 +353,16 @@ fn activity_result_schema_with_registry(
     let summary_contract = agent_summary_contract(workflow_definition, &activity);
     let decision_contract = workflow_decision_contract(registry, workflow);
     let command_examples = workflow_decision_command_examples(workflow_definition, &activity);
+    let remote = job.runtime_kind == harness_workflow::runtime::RuntimeKind::RemoteHost;
+    let mut output_schema = activity_result_json_schema(&activity);
+    if remote {
+        output_schema["$defs"]["json_payload"] = json!({});
+    }
     let mut schema = json!({
         "schema": "harness.runtime.activity_result.v1",
         "activity": activity,
         "workflow_definition": workflow_definition,
-        "json_schema": activity_result_json_schema(&activity),
+        "json_schema": output_schema,
         "activity_contract": activity_contract.to_prompt_value(),
         "result_type": "ActivityResult",
         "required_fields": ["activity", "status", "summary", "artifacts", "signals", "validation", "error", "error_kind"],
@@ -420,8 +425,8 @@ fn activity_result_schema_with_registry(
                 "`signals` MUST be a JSON array of {signal_type, signal} objects. Never use `kind` or any other discriminator name.",
                 "`validation` MUST be a JSON array of {command, status, reason} objects. Use reason=null when there is no reason. Never emit it as a map.",
                 "`artifacts`, `signals`, and `validation` are required; use [] when empty. `error` and `error_kind` are required; use null when absent.",
-                "When output-schema transport is active, `artifact` and `signal` payloads use the schema's harness.runtime.json_payload.v1 {encoding,json} representation; Harness decodes it before reducers.",
-                "The wrapper `json` field MUST be serialized JSON text, not plain prose; for a scalar no_change_rationale payload use {\"encoding\":\"harness.runtime.json_payload.v1\",\"json\":\"\\\"No changes were needed\\\"\"}.",
+                if remote { "Use native JSON values for artifact and signal payloads, including when enforcing the supplied JSON Schema. Remote completion does not decode payload wrappers." } else { "When output-schema transport is active, `artifact` and `signal` payloads use the schema's harness.runtime.json_payload.v1 {encoding,json} representation; Harness decodes it before reducers." },
+                if remote { "Do not encode payloads as {encoding,json}; preserve objects, arrays, strings, numbers, booleans and null directly." } else { "The wrapper `json` field MUST be serialized JSON text, not plain prose; for a scalar no_change_rationale payload use {\"encoding\":\"harness.runtime.json_payload.v1\",\"json\":\"\\\"No changes were needed\\\"\"}." },
                 "Inside a `workflow_decision` artifact, the next-step activity MUST be expressed as `commands: [{command_type, dedupe_key, command}]` (plural array). Never use a singular `command` field at the artifact level — that field is silently ignored, leaving the workflow stuck in the new state with no follow-up activity enqueued.",
                 "For `command_type: start_child_workflow`, the nested `command` object MUST include `definition_id` and `subject_key`; for GitHub issue workflows use `definition_id: github_issue_pr` and `subject_key: issue:<number>`.",
                 "Do not omit required fields from the ActivityResult JSON."

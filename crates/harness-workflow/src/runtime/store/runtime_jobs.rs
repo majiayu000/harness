@@ -148,6 +148,80 @@ impl WorkflowRuntimeStore {
         Ok(AgentContractAttemptReservation::Reserved)
     }
 
+    /// Persist claim evidence only while the claimed lease still owns
+    /// delivery. Lock the parent first, matching terminal-transition lock order.
+    pub async fn record_remote_host_claim_delivery(
+        &self,
+        claimed_job: &RuntimeJob,
+        prepared_prompt_event: Option<Value>,
+        credential_policy_event: Option<Value>,
+    ) -> anyhow::Result<bool> {
+        let Some(claimed_lease) = claimed_job.lease.as_ref() else {
+            return Ok(false);
+        };
+        let mut tx = self.pool.begin().await?;
+        if !runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(
+            &mut tx,
+            &self.definition_registry,
+            &claimed_job.id,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
+                .bind(&claimed_job.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((data,)) = row else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let current: RuntimeJob = serde_json::from_str(&data)?;
+        if current.status != RuntimeJobStatus::Running
+            || current.runtime_kind != RuntimeKind::RemoteHost
+            || current.lease_generation != claimed_job.lease_generation
+            || current.lease.as_ref().is_none_or(|lease| {
+                lease.owner != claimed_lease.owner
+                    || lease.expires_at != claimed_lease.expires_at
+                    || lease.expires_at <= Utc::now()
+            })
+            || current.input.get("cancellation_requested").is_some()
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        if let Some(mut payload) = prepared_prompt_event {
+            payload["lease_generation"] = json!(current.lease_generation);
+            runtime_job_leases::append_runtime_event_tx(
+                &mut tx,
+                &current.id,
+                "RuntimePromptPrepared",
+                payload,
+            )
+            .await?;
+        }
+        if let Some(payload) = credential_policy_event {
+            let (workflow_id,): (String,) =
+                sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
+                    .bind(&current.command_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            insert_event_tx(
+                &mut tx,
+                &workflow_id,
+                "RuntimeHostEvalCredentialPolicyIssued",
+                "runtime_host_claim",
+                payload,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn record_runtime_event(
         &self,
         runtime_job_id: &str,
@@ -508,5 +582,206 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Option<RuntimeJob>> {
         self.claim_next_runtime_job_matching(None, None, owner, expires_at, true, true)
             .await
+    }
+}
+
+#[cfg(test)]
+mod claim_delivery_tests {
+    use super::*;
+    use crate::runtime::WorkflowSubject;
+
+    #[tokio::test]
+    async fn remote_claim_delivery_audits_only_current_live_uncancelled_lease() -> anyhow::Result<()>
+    {
+        let configured = match std::env::var("HARNESS_DATABASE_URL") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let database_url = harness_core::db::resolve_test_database_url(Some(&configured))?;
+        let dir = tempfile::tempdir()?;
+        let store =
+            WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
+        let workflow = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "remote-claim-delivery"),
+        );
+        store
+            .force_upsert_lifecycle_state_for_test(&workflow)
+            .await?;
+        let command = WorkflowCommand::enqueue_activity(
+            "implement_issue",
+            format!("claim-delivery-{}", workflow.id),
+        );
+        let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+        let job = store
+            .enqueue_runtime_job(
+                &command_id,
+                RuntimeKind::RemoteHost,
+                "remote",
+                json!({"activity":"implement_issue"}),
+            )
+            .await?;
+        let expired = store
+            .claim_next_remote_host_runtime_job(
+                "delivery-old-owner",
+                Utc::now() - chrono::Duration::seconds(1),
+                true,
+                true,
+            )
+            .await?
+            .expect("expired claim");
+        assert_eq!(expired.id, job.id);
+        let stale_prompt = json!({"prompt_packet_digest":"stale"});
+        let stale_policy = json!({"runtime_job_id":job.id,"host_id":"delivery-old-owner"});
+        assert!(
+            !store
+                .record_remote_host_claim_delivery(
+                    &expired,
+                    Some(stale_prompt.clone()),
+                    Some(stale_policy.clone()),
+                )
+                .await?
+        );
+        let current = store
+            .claim_next_remote_host_runtime_job(
+                "delivery-new-owner",
+                Utc::now() + chrono::Duration::minutes(5),
+                true,
+                true,
+            )
+            .await?
+            .expect("reclaimed job");
+        assert_eq!(current.id, job.id);
+        assert!(current.lease_generation > expired.lease_generation);
+        assert!(
+            !store
+                .record_remote_host_claim_delivery(
+                    &expired,
+                    Some(stale_prompt.clone()),
+                    Some(stale_policy.clone()),
+                )
+                .await?
+        );
+        assert!(store
+            .runtime_events_for(&job.id)
+            .await?
+            .iter()
+            .all(|event| event.event_type != "RuntimePromptPrepared"));
+        assert!(store
+            .events_for(&workflow.id)
+            .await?
+            .iter()
+            .all(|event| event.event_type != "RuntimeHostEvalCredentialPolicyIssued"));
+        assert!(
+            store
+                .record_remote_host_claim_delivery(
+                    &current,
+                    Some(json!({"prompt_packet_digest":"current"})),
+                    Some(json!({"runtime_job_id":job.id,"host_id":"delivery-new-owner"})),
+                )
+                .await?
+        );
+        let mut cancelled = current.clone();
+        cancelled.input["cancellation_requested"] = json!({"reason":"operator"});
+        store.persist_runtime_job_data(&cancelled).await?;
+        assert!(
+            !store
+                .record_remote_host_claim_delivery(&current, Some(stale_prompt), Some(stale_policy),)
+                .await?
+        );
+        let events = store.runtime_events_for(&job.id).await?;
+        let prepared: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "RuntimePromptPrepared")
+            .collect();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].event["prompt_packet_digest"], "current");
+        assert_eq!(
+            prepared[0].event["lease_generation"],
+            current.lease_generation
+        );
+        let events = store.events_for(&workflow.id).await?;
+        let issued: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "RuntimeHostEvalCredentialPolicyIssued")
+            .collect();
+        assert_eq!(issued.len(), 1);
+        assert_eq!(issued[0].event["host_id"], "delivery-new-owner");
+
+        let command = store.get_command(&command_id).await?.expect("command");
+        let event = store
+            .append_event(&workflow.id, "ActivityCompleted", "test", json!({}))
+            .await?;
+        let result = ActivityResult::succeeded("implement_issue", "complete");
+        let mut tx = store.pool.begin().await?;
+        let rendered_evidence = super::super::evidence::record_runtime_completion_evidence_tx(
+            &mut tx, &workflow, &command, &current, &event, &result, None,
+        )
+        .await?;
+        assert_eq!(
+            rendered_evidence.location["prompt_packet_digest"],
+            "current"
+        );
+        tx.rollback().await?;
+
+        cancelled
+            .input
+            .as_object_mut()
+            .expect("job input")
+            .remove("cancellation_requested");
+        store.persist_runtime_job_data(&cancelled).await?;
+        assert_eq!(
+            store
+                .revoke_remote_host_runtime_job_leases("delivery-new-owner", Utc::now())
+                .await?,
+            1
+        );
+        let raw = store
+            .claim_next_remote_host_runtime_job(
+                "delivery-raw-owner",
+                Utc::now() + chrono::Duration::minutes(5),
+                true,
+                true,
+            )
+            .await?
+            .expect("raw reclaimed lease");
+        assert_eq!(raw.id, current.id);
+        assert!(raw.lease_generation > current.lease_generation);
+        assert!(
+            store
+                .record_remote_host_claim_delivery(
+                    &raw,
+                    None,
+                    Some(json!({"runtime_job_id":job.id,"host_id":"delivery-raw-owner"})),
+                )
+                .await?
+        );
+        let events = store.runtime_events_for(&job.id).await?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "RuntimePromptPrepared")
+                .count(),
+            1
+        );
+        let events = store.events_for(&workflow.id).await?;
+        let issued: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "RuntimeHostEvalCredentialPolicyIssued")
+            .collect();
+        assert_eq!(issued.len(), 2);
+        assert_eq!(issued[1].event["host_id"], "delivery-raw-owner");
+        let mut tx = store.pool.begin().await?;
+        let raw_evidence = super::super::evidence::record_runtime_completion_evidence_tx(
+            &mut tx, &workflow, &command, &raw, &event, &result, None,
+        )
+        .await?;
+        assert!(raw_evidence.location.get("prompt_packet_digest").is_none());
+        assert!(raw_evidence.payload.as_ref().expect("payload")["prompt_packet_digest"].is_null());
+        tx.commit().await?;
+        Ok(())
     }
 }

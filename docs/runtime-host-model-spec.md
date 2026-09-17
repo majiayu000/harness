@@ -104,9 +104,18 @@ are rejected before leasing. Omitting the field requests the raw job envelope,
 including for hosts executing native verification commands. Rendering is not
 available for quality-gate, pinned agent-contract or exact-replay jobs; requesting
 it for those jobs fails preflight instead of substituting an ordinary model prompt.
+Server-owned child-workflow creation, PR-feedback inspection and enabled server-side
+merge execution also reject rendered claims.
 
 A successful rendered claim adds
 `prepared_prompt: { prompt, prompt_packet_digest, activity_result_schema }`.
+The returned JSON Schema and instructions use native JSON artifact and signal
+payloads, matching the remote completion endpoint. Optional repository-memory
+retrieval failures remain explicit degradation evidence in the prepared audit;
+missing required task text still fails preparation. Prompt and credential-policy
+issuance audits are committed together only for the current, live, uncancelled
+lease. Slow prompt preparation releases the host operation lock so other jobs can
+renew their leases.
 The prompt reuses the server's workflow document, durable task text, repository
 memory, activity policy and structured result contract. Its execution root is the
 requested remote directory. The durable `RuntimePromptPrepared` event retains

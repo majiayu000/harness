@@ -261,7 +261,7 @@ pub async fn claim_runtime_job_for_runtime_host(
     if let Err(error) = prompt::validate_workspace(req.execution_workspace.as_deref()) {
         return (StatusCode::BAD_REQUEST, claim_json(json!({"error": error})));
     }
-    let _host_operation = state.runtime_hosts.lock_operation(&host_id).await;
+    let mut host_operation = Some(state.runtime_hosts.lock_operation(&host_id).await);
     if !state.runtime_hosts.hosts.contains_key(&host_id) {
         return (
             StatusCode::NOT_FOUND,
@@ -544,63 +544,8 @@ pub async fn claim_runtime_job_for_runtime_host(
         .await;
     }
 
-    let credential_environment =
-        match crate::eval_credentials::attach_runtime_host_eval_environment_policy(&mut job) {
-            Ok(environment) => environment,
-            Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    claim_json(
-                        json!({ "error": format!("invalid eval credential environment: {error}") }),
-                    ),
-                );
-            }
-        };
-    if let Some(credential_environment) = credential_environment.as_ref() {
-        match store.get_command(&job.command_id).await {
-            Ok(Some(command)) => {
-                if let Err(error) = store
-                    .append_event(
-                        &command.workflow_id,
-                        "RuntimeHostEvalCredentialPolicyIssued",
-                        "runtime_host_claim",
-                        json!({
-                            "runtime_job_id": job.id.clone(),
-                            "host_id": host_id.clone(),
-                            "credential_environment": credential_environment.audit(),
-                        }),
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        runtime_job_id = %job.id,
-                        host_id = %host_id,
-                        error = %error,
-                        "failed to persist remote eval credential policy audit"
-                    );
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        claim_json(
-                            json!({ "error": "failed to persist eval credential policy audit" }),
-                        ),
-                    );
-                }
-            }
-            Ok(None) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    claim_json(json!({ "error": "runtime job command missing during claim" })),
-                );
-            }
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    claim_json(
-                        json!({ "error": format!("failed to load runtime job command: {error}") }),
-                    ),
-                );
-            }
-        }
+    if req.execution_workspace.is_some() {
+        drop(host_operation.take());
     }
     let prepared = match prompt::prepare_claim_prompt(
         &state,
@@ -622,14 +567,41 @@ pub async fn claim_runtime_job_for_runtime_host(
             .await
         }
     };
-    if prepared.is_some() {
-        if let Err((status, body)) = prompt::check_claim_fence(store.as_ref(), &job).await {
-            return (status, claim_json(body));
+    if req.execution_workspace.is_some() {
+        host_operation = Some(state.runtime_hosts.lock_operation(&host_id).await);
+        if !state.runtime_hosts.is_active(&host_id) {
+            let (status, body) = lease::lease_lost_response();
+            return (status, claim_json(body.0));
         }
+    }
+    let _host_operation = host_operation;
+    let credential_environment =
+        match crate::eval_credentials::attach_runtime_host_eval_environment_policy(&mut job) {
+            Ok(environment) => environment,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    claim_json(
+                        json!({ "error": format!("invalid eval credential environment: {error}") }),
+                    ),
+                );
+            }
+        };
+    let credential_audit = credential_environment.as_ref().map(|environment| {
+        json!({
+            "runtime_job_id": job.id.clone(), "host_id": host_id.clone(),
+            "credential_environment": environment.audit(),
+        })
+    });
+    if let Err((status, body)) =
+        prompt::record_claim_delivery(store.as_ref(), &job, prepared.as_ref(), credential_audit)
+            .await
+    {
+        return (status, claim_json(body));
     }
     let mut response = runtime_host_claim(job, lease_expires_at, lease_proof);
     if let Some(prepared) = prepared {
-        response["prepared_prompt"] = prepared;
+        response["prepared_prompt"] = prepared.response;
     }
     if let Some(credential_environment) = credential_environment {
         response["credential_environment"] = json!(credential_environment.audit());

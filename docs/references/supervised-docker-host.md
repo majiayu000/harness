@@ -79,6 +79,44 @@ process dies. These are explicit trial limits, **not** a
 claim to implement every `CappedResourceLimits` field (especially aggregate CPU
 time), nor a measured full eval resource report.
 
+## Frozen source input
+
+Before claiming a job, the runner packages the source directory into private
+`input.tar` and validates that the completed archive contains only regular files
+and directories. A socket-only source scan rejects Unix sockets, which tar
+creation otherwise silently omits. Tar creation records FIFOs and links as headers
+without reading their contents; the archive boundary rejects them before accepting preparation.
+This input protection is new; the earlier live workspace mount did not validate
+source files. The canonical source path is resolved once during initialization
+and reused for identity and preparation, so retargeting the original path alias
+does not switch the copied directory. Source and state directories cannot equal
+or contain each other.
+
+The candidate mounts only the retained archive at `/input.tar`, read-only.
+The trusted container preparation command checks its SHA-256 against run state
+at the consumption boundary and safely extracts from that same file descriptor into writable `/workspace`, before
+model execution. This trusted, self-created relative archive uses GNU tar with
+`--no-same-owner --no-same-permissions`: the non-root container user owns the
+files and its umask applies. Executable bits are retained where the umask permits;
+source read-only modes remain read-only but the owner can change them. Untrusted
+candidate-output extraction continues to use the existing Python data filter. There is no separate mutable host extraction tree to diverge from
+the reported digest. Subsequent original-source edits do not change this input;
+archive corruption before a delayed claim or restart fails explicitly.
+
+The archive SHA-256 is persisted in state and `supervised_input_snapshot` result
+evidence. It identifies source archive bytes, not a Git commit or an atomic
+capture of a concurrently changing source directory. This is not protection
+against an actively malicious operator modifying private state concurrently.
+Prepare the source deliberately: this operation does not scan for secrets or
+make arbitrary repository metadata safe to export.
+
+A restart while awaiting a claim reuses the prepared archive without recopying
+the original source. Interrupted or failed preparation is retained explicitly and
+cannot claim or rerun from that state directory. Existing executing-run recovery
+still reports failure without another model invocation. This remains a
+single-task source-byte handoff, not historical checkout/candidate commit
+proof or complete eval support.
+
 ## Candidate resource evidence
 
 The candidate's trusted non-root Python PID 1 reaps adopted descendants until
