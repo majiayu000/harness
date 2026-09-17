@@ -25,6 +25,7 @@ mod pr_feedback_inspection;
 mod prompt_input_telemetry;
 mod prompt_packet;
 pub(crate) mod remote_completion;
+pub(crate) mod remote_prompt;
 mod repo_memory_prompt;
 mod runtime_execution_queue;
 mod runtime_profile;
@@ -35,7 +36,6 @@ mod server_validation;
 mod transcript_durability;
 pub(crate) mod turn_engine;
 mod workspace;
-
 pub(crate) use workspace::cleanup_terminal_runtime_workspace_if_uncontended;
 
 pub(crate) use agent_contract_enforcement::{

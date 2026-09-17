@@ -97,6 +97,10 @@ pub struct RenewRuntimeJobLeaseRequest {
 /// Claim request for the next compatible remotely leased workflow runtime job.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ClaimRuntimeJobRequest {
+    /// Request a rendered agent prompt for this path in the remote host namespace.
+    /// Omit for raw jobs, including native trusted-verifier execution.
+    #[serde(default)]
+    pub execution_workspace: Option<String>,
     #[serde(default)]
     pub lease_secs: OptionalLeaseSeconds,
     #[serde(default)]

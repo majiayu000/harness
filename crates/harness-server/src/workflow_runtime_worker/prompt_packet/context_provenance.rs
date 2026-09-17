@@ -93,7 +93,7 @@ struct CanonicalWorkflowDocumentDigestInput<'a> {
 pub(super) fn apply_context_provenance(
     packet: &mut Value,
     job: &RuntimeJob,
-    resolved_settings: &ResolvedRuntimeSettings,
+    resolved_settings: Option<&ResolvedRuntimeSettings>,
     workflow_document: &WorkflowDocument,
     repo_memory: &[RetrievedRepoMemoryRecord],
     prompt_task_text: Option<&str>,
@@ -108,8 +108,10 @@ pub(super) fn apply_context_provenance(
         );
     }
     let provenance = build_context_provenance(resolved_settings, workflow_document, repo_memory)?;
-    packet["resolved_runtime_settings"] = serde_json::to_value(resolved_settings)
-        .context("failed to serialize resolved runtime settings for the prompt packet")?;
+    if let Some(settings) = resolved_settings {
+        packet["resolved_runtime_settings"] = serde_json::to_value(settings)
+            .context("failed to serialize resolved runtime settings for the prompt packet")?;
+    }
     packet["context_provenance"] = serde_json::to_value(&provenance)
         .context("failed to serialize required context provenance for the prompt packet")?;
     if let Some(task_text) = prompt_task_text {
@@ -188,15 +190,14 @@ pub(super) fn strip_model_facing_audit_sections(model_packet: &mut Value) {
 }
 
 fn build_context_provenance(
-    resolved_settings: &ResolvedRuntimeSettings,
+    resolved_settings: Option<&ResolvedRuntimeSettings>,
     workflow_document: &WorkflowDocument,
     repo_memory: &[RetrievedRepoMemoryRecord],
 ) -> anyhow::Result<ContextProvenance> {
     let mut entries = Vec::new();
-    entries.push(resolved_runtime_settings_entry(
-        resolved_settings,
-        entries.len(),
-    )?);
+    if let Some(settings) = resolved_settings {
+        entries.push(resolved_runtime_settings_entry(settings, entries.len())?);
+    }
     append_workflow_entries(&mut entries, workflow_document)?;
     for record in repo_memory {
         entries.push(repo_memory_entry(record, entries.len())?);

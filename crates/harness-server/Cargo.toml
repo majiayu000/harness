@@ -47,6 +47,7 @@ sysinfo = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
+jsonschema = { workspace = true }
 http-body-util = "0.1"
 quote = "1"
 syn = { version = "2", features = ["full", "visit"] }
