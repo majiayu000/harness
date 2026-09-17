@@ -29,10 +29,8 @@ async fn prepare_acp_spawn(
     cli_path: &std::path::Path,
     req: &AgentRequest,
 ) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
-    let args = [OsString::from("acp"), OsString::from("--cwd")];
+    let args = [OsString::from("acp")];
     let sandbox_mode = req.sandbox_mode.unwrap_or(SandboxMode::DangerFullAccess);
-    let mut args = args.to_vec();
-    args.push(OsString::from(&req.project_root));
     let sandbox_spec = if let Some(token) = req.capability_token.as_ref() {
         SandboxSpec::new(sandbox_mode, &req.project_root)
             .with_allowed_write_paths(token.allowed_write_paths.clone())
@@ -262,6 +260,7 @@ impl OpenCodeAcpAdapter {
 
         let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
         let prepared_spawn = prepare_acp_spawn(&self.cli_path, req).await?;
+        let child_workspace = prepared_spawn.child_workspace.clone();
         let spawn_project_root = req.project_root.clone();
         let supervised = crate::spawn_supervisor::spawn_agent(
             crate::spawn_supervisor::AgentSpawnPlan {
@@ -365,11 +364,7 @@ impl OpenCodeAcpAdapter {
             let session_request = Self::send_request(
                 state,
                 "session/new",
-                json!({
-                    "cwd": req.project_root,
-                    "mcpServers": [],
-                    "configOptions": session_config_options(req),
-                }),
+                session_new_params(req, &child_workspace),
             )
             .await?;
 
@@ -428,6 +423,14 @@ impl OpenCodeAcpAdapter {
             }
         }
     }
+}
+
+fn session_new_params(req: &AgentRequest, child_workspace: &std::path::Path) -> Value {
+    json!({
+        "cwd": child_workspace,
+        "mcpServers": [],
+        "configOptions": session_config_options(req),
+    })
 }
 
 fn session_config_options(req: &AgentRequest) -> Vec<Value> {
