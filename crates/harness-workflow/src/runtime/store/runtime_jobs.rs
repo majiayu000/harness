@@ -593,7 +593,7 @@ mod claim_delivery_tests {
     #[tokio::test]
     async fn remote_claim_delivery_audits_only_current_live_uncancelled_lease() -> anyhow::Result<()>
     {
-        let configured = match std::env::var("HARNESS_DATABASE_URL") {
+        let configured = match harness_core::config::process_env::var("HARNESS_DATABASE_URL") {
             Ok(value) => value,
             Err(std::env::VarError::NotPresent) => return Ok(()),
             Err(error) => return Err(error.into()),
