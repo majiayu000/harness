@@ -443,25 +443,6 @@ pub async fn claim_runtime_job_for_runtime_host(
 
     if let Some(resource_limits) = &resource_limits {
         set_eval_resource_limit_enforcement(&mut job, resource_limits);
-        if let Err(error) = store
-            .record_runtime_event(
-                &job.id,
-                "EvalResourceLimitsApplied",
-                json!({
-                    "host_id": host_id.as_str(),
-                    "resource_limits": resource_limits,
-                    "reason": "runtime host claim",
-                }),
-            )
-            .await
-        {
-            tracing::warn!(
-                runtime_job_id = %job.id,
-                host_id = %host_id,
-                %error,
-                "runtime host claim succeeded but eval resource-limit event recording failed"
-            );
-        }
     }
 
     let network_policy = match eval_network_policy_enforcement_for_job(&job) {
@@ -507,25 +488,6 @@ pub async fn claim_runtime_job_for_runtime_host(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 claim_json(json!({ "error": "failed to persist eval network policy" })),
-            );
-        }
-        if let Err(error) = store
-            .record_runtime_event(
-                &job.id,
-                "EvalNetworkPolicyApplied",
-                json!({
-                    "host_id": host_id.as_str(),
-                    "network_policy": network_policy,
-                    "reason": "runtime host claim",
-                }),
-            )
-            .await
-        {
-            tracing::warn!(
-                runtime_job_id = %job.id,
-                host_id = %host_id,
-                %error,
-                "runtime host claim succeeded but eval network-policy event recording failed"
             );
         }
     }
@@ -593,9 +555,25 @@ pub async fn claim_runtime_job_for_runtime_host(
             "credential_environment": environment.audit(),
         })
     });
-    if let Err((status, body)) =
-        prompt::record_claim_delivery(store.as_ref(), &job, prepared.as_ref(), credential_audit)
-            .await
+    let resource_audit = resource_limits.as_ref().map(|limits| {
+        json!({
+            "host_id":host_id, "resource_limits":limits, "reason":"runtime host claim",
+        })
+    });
+    let network_audit = network_policy.as_ref().map(|policy| {
+        json!({
+            "host_id":host_id, "network_policy":policy, "reason":"runtime host claim",
+        })
+    });
+    if let Err((status, body)) = prompt::record_claim_delivery(
+        store.as_ref(),
+        &job,
+        prepared.as_ref(),
+        credential_audit,
+        resource_audit,
+        network_audit,
+    )
+    .await
     {
         return (status, claim_json(body));
     }

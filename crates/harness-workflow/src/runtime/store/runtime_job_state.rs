@@ -16,6 +16,96 @@ pub enum RuntimeJobClaimDeferOutcome {
 }
 
 impl WorkflowRuntimeStore {
+    /// Persist claim evidence only while the claimed lease still owns
+    /// delivery. Lock the parent first, matching terminal-transition lock order.
+    pub async fn record_remote_host_claim_delivery(
+        &self,
+        claimed_job: &RuntimeJob,
+        prepared_prompt_event: Option<Value>,
+        credential_policy_event: Option<Value>,
+        resource_limits_event: Option<Value>,
+        network_policy_event: Option<Value>,
+    ) -> anyhow::Result<bool> {
+        let Some(claimed_lease) = claimed_job.lease.as_ref() else {
+            return Ok(false);
+        };
+        let mut tx = self.pool.begin().await?;
+        if !runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(
+            &mut tx,
+            &self.definition_registry,
+            &claimed_job.id,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
+                .bind(&claimed_job.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((data,)) = row else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let current: RuntimeJob = serde_json::from_str(&data)?;
+        if current.status != RuntimeJobStatus::Running
+            || current.runtime_kind != RuntimeKind::RemoteHost
+            || current.lease_generation != claimed_job.lease_generation
+            || current.lease.as_ref().is_none_or(|lease| {
+                lease.owner != claimed_lease.owner
+                    || lease.expires_at != claimed_lease.expires_at
+                    || lease.expires_at <= Utc::now()
+            })
+            || current.input.get("cancellation_requested").is_some()
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        if let Some(mut payload) = prepared_prompt_event {
+            payload["lease_generation"] = json!(current.lease_generation);
+            runtime_job_leases::append_runtime_event_tx(
+                &mut tx,
+                &current.id,
+                "RuntimePromptPrepared",
+                payload,
+            )
+            .await?;
+        }
+        if let Some(payload) = credential_policy_event {
+            let (workflow_id,): (String,) =
+                sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
+                    .bind(&current.command_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            insert_event_tx(
+                &mut tx,
+                &workflow_id,
+                "RuntimeHostEvalCredentialPolicyIssued",
+                "runtime_host_claim",
+                payload,
+            )
+            .await?;
+        }
+        for (event_type, payload) in [
+            ("EvalResourceLimitsApplied", resource_limits_event),
+            ("EvalNetworkPolicyApplied", network_policy_event),
+        ] {
+            if let Some(payload) = payload {
+                runtime_job_leases::append_runtime_event_tx(
+                    &mut tx,
+                    &current.id,
+                    event_type,
+                    payload,
+                )
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn extend_runtime_job_lease_if_owned(
         &self,
         runtime_job_id: &str,

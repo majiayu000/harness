@@ -44,12 +44,16 @@ pub(super) async fn record_claim_delivery(
     job: &RuntimeJob,
     prepared: Option<&crate::workflow_runtime_worker::remote_prompt::PreparedRemotePrompt>,
     credential_audit: Option<Value>,
+    resource_audit: Option<Value>,
+    network_audit: Option<Value>,
 ) -> Result<(), (StatusCode, Value)> {
     let result = store
         .record_remote_host_claim_delivery(
             job,
             prepared.map(|prompt| prompt.evidence.clone()),
             credential_audit,
+            resource_audit,
+            network_audit,
         )
         .await;
     match result {
@@ -615,6 +619,63 @@ mod tests {
             event.event["repo_memory_degradation"]["artifact"]["reason"],
             "repo_memory_retrieval_failed"
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn remote_prompt_claim_enforcement_audits_require_successful_delivery(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+            return Ok(());
+        };
+        let app = runtime_hosts_workflow_app(state);
+        crate::handlers::runtime_hosts_workflow_api_tests::register_host_with_capabilities(
+            &app,
+            "policy-host",
+            vec!["eval_resource_limits", "eval_network_policy"],
+        )
+        .await?;
+        for (key, render, fail) in [
+            ("raw-policy", false, false),
+            ("rendered-policy", true, false),
+            ("failed-policy", true, true),
+        ] {
+            let mut command = json!({"activity":"implement_issue", "eval":{"eval_run_id":"run-1", "case_id":"case-1", "timeout_secs":45}});
+            if fail {
+                command["prompt_ref"] = json!("prompt-memory:missing-policy-task");
+            }
+            let job = enqueue_runtime_host_test_job(&store, key, RuntimeKind::RemoteHost, "remote", json!({"activity":"implement_issue", "isolation":{"network_allowlist":["api.github.com"]}, "command":command})).await?;
+            let request = if render {
+                json!({"execution_workspace":"/workspace"})
+            } else {
+                json!({})
+            };
+            let (_, response) = post_json_with_status(
+                &app,
+                "/api/runtime-hosts/policy-host/runtime-jobs/claim".into(),
+                request,
+            )
+            .await?;
+            let events = store.runtime_events_for(&job.id).await?;
+            for (kind, field) in [
+                ("EvalResourceLimitsApplied", "resource_limits"),
+                ("EvalNetworkPolicyApplied", "network_policy"),
+            ] {
+                let applied: Vec<_> = events
+                    .iter()
+                    .filter(|event| event.event_type == kind)
+                    .collect();
+                if fail {
+                    assert!(applied.is_empty());
+                    assert!(response.get(field).is_none());
+                    assert_ne!(response["claimed"], true);
+                } else {
+                    assert_eq!(response["claimed"], true);
+                    assert_eq!(applied.len(), 1);
+                    assert_eq!(applied[0].event[field], response[field]);
+                }
+            }
+        }
         Ok(())
     }
 }
