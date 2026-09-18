@@ -11,15 +11,18 @@ use std::sync::Arc;
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ReconcileParams>,
-) -> Result<Json<ReconciliationReport>, StatusCode> {
-    let report = crate::reconciliation::run_once_with_runtime_config(
+) -> Result<Json<ReconciliationReport>, (StatusCode, String)> {
+    crate::reconciliation::run_once_with_runtime_config(
         state.core.workflow_runtime_store.as_deref(),
         state.core.issue_workflow_store.as_deref(),
         &state.core.server.config.reconciliation,
         params.dry_run,
         state.core.server.config.server.github_token.as_deref(),
     )
-    .await;
-
-    Ok(Json(report))
+    .await
+    .map(Json)
+    .map_err(|error| {
+        tracing::error!("workflow runtime reconciliation failed: {error}");
+        (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    })
 }

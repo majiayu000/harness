@@ -66,7 +66,7 @@ async fn blocked_runtime_reconciliation_marks_merged_pr_done() -> anyhow::Result
         false,
         None,
     )
-    .await;
+    .await?;
 
     assert_eq!(report.workflow_transitions.len(), 1);
     assert_eq!(report.workflow_transitions[0].from, "blocked");
@@ -158,7 +158,7 @@ async fn blocked_runtime_reconciliation_marks_slug_only_merged_pr_done() -> anyh
         false,
         None,
     )
-    .await;
+    .await?;
 
     assert_eq!(report.workflow_transitions.len(), 1);
     assert_eq!(report.workflow_transitions[0].from, "blocked");

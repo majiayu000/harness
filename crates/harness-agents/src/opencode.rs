@@ -187,8 +187,13 @@ impl OpenCodeAgent {
         if req.uses_dangerously_skip_permissions() {
             args.push(OsString::from("--auto"));
         }
+        args.push(OsString::from("--"));
         args.push(OsString::from(req.prompt.clone()));
         args
+    }
+
+    fn effective_sandbox_mode(&self, req: &AgentRequest) -> SandboxMode {
+        req.sandbox_mode.unwrap_or(self.sandbox_mode)
     }
 
     fn spawn_env_vars(&self, req: &AgentRequest) -> Vec<(String, String)> {
@@ -245,11 +250,12 @@ impl CodeAgent for OpenCodeAgent {
         }
 
         let base_args = self.base_args(&req);
+        let sandbox_mode = self.effective_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
                 .with_allowed_write_paths(token.allowed_write_paths.clone())
         } else {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
         };
         let mut spawn_env_vars = req.env_vars.clone();
         for (key, value) in self.spawn_env_vars(&req) {
@@ -369,11 +375,12 @@ impl CodeAgent for OpenCodeAgent {
         }
 
         let base_args = self.base_args(&req);
+        let sandbox_mode = self.effective_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
                 .with_allowed_write_paths(token.allowed_write_paths.clone())
         } else {
-            SandboxSpec::new(self.sandbox_mode, &req.project_root)
+            SandboxSpec::new(sandbox_mode, &req.project_root)
         };
         let mut spawn_env_vars = req.env_vars.clone();
         for (key, value) in self.spawn_env_vars(&req) {
@@ -732,5 +739,59 @@ mod tests {
         );
         assert_eq!(permission_env_value(&[]), r#"{"*":"deny"}"#);
         Ok(())
+    }
+
+    fn test_request(prompt: &str) -> AgentRequest {
+        AgentRequest {
+            prompt: prompt.to_string(),
+            prompt_layers: None,
+            project_root: PathBuf::from("/tmp/project"),
+            permission_mode: Default::default(),
+            model: None,
+            reasoning_effort: None,
+            execution_phase: None,
+            sandbox_mode: None,
+            approval_policy: None,
+            allowed_tools: None,
+            max_budget_usd: None,
+            context: Vec::new(),
+            timeout_secs: None,
+            env_vars: std::collections::HashMap::new(),
+            capability_token: None,
+        }
+    }
+
+    #[test]
+    fn base_args_terminate_prompt_so_dash_prompts_are_not_flags() {
+        let agent = OpenCodeAgent::from_config(
+            OpenCodeAgentConfig::default(),
+            SandboxMode::DangerFullAccess,
+        );
+        let args = agent.base_args(&test_request("-looks-like-flag"));
+        let strings: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let terminator = strings.iter().position(|arg| arg == "--").expect("--");
+        assert_eq!(strings[terminator + 1], "-looks-like-flag");
+    }
+
+    #[test]
+    fn request_sandbox_mode_overrides_agent_default() {
+        let agent = OpenCodeAgent::from_config(
+            OpenCodeAgentConfig::default(),
+            SandboxMode::DangerFullAccess,
+        );
+        let mut request = test_request("ping");
+        request.sandbox_mode = Some(SandboxMode::ReadOnly);
+        assert_eq!(
+            agent.effective_sandbox_mode(&request),
+            SandboxMode::ReadOnly
+        );
+        request.sandbox_mode = None;
+        assert_eq!(
+            agent.effective_sandbox_mode(&request),
+            SandboxMode::DangerFullAccess
+        );
     }
 }
