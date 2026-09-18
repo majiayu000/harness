@@ -6,7 +6,7 @@ import { TopBar } from "@/components/TopBar";
 import { PaletteFab } from "@/components/PaletteFab";
 import { DOCS_URL } from "@/lib/links";
 import { useWorktrees, useOverview } from "@/lib/queries";
-import { apiFetch, runtimeSubmissionPath, TOKEN_KEY } from "@/lib/api";
+import { apiFetch, runtimeSubmissionPath } from "@/lib/api";
 import type { WorktreeCard } from "@/lib/queries";
 
 function formatDuration(seconds: number): string {
@@ -48,10 +48,7 @@ function statusColor(status: string): string {
 }
 
 function openStream(submissionId: string): void {
-  const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-  const base = runtimeSubmissionPath(submissionId, "stream");
-  const url = tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
-  window.open(url, "_blank", "noreferrer");
+  window.open(runtimeSubmissionPath(submissionId, "stream"), "_blank", "noreferrer");
 }
 
 interface CardProps {

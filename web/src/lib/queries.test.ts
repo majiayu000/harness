@@ -136,9 +136,7 @@ describe("useWorktrees", () => {
 // Mirrors the logic in openStream() in Worktrees.tsx to prevent regressions.
 
 function buildStreamUrl(taskId: string): string {
-  const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-  const base = `/api/workflows/runtime/submissions/${encodeURIComponent(taskId)}/stream`;
-  return tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
+  return `/api/workflows/runtime/submissions/${encodeURIComponent(taskId)}/stream`;
 }
 
 describe("stream URL construction", () => {
@@ -148,11 +146,12 @@ describe("stream URL construction", () => {
     );
   });
 
-  it("appends token query param when session token is set", () => {
+  it("does not put the session token in the stream URL", () => {
     sessionStorage.setItem(TOKEN_KEY, "mytoken");
     expect(buildStreamUrl("abc-123")).toBe(
-      "/api/workflows/runtime/submissions/abc-123/stream?token=mytoken",
+      "/api/workflows/runtime/submissions/abc-123/stream",
     );
+    expect(buildStreamUrl("abc-123")).not.toContain("token=");
   });
 
   it("omits token param when no session token", () => {

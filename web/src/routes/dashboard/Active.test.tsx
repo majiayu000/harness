@@ -563,7 +563,6 @@ describe("<Active>", () => {
 
   it("refreshes runtime data when workflow cancellation returns a conflict", async () => {
     mockApiFetch.mockRejectedValueOnce(new Error("workflow already terminal"));
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const qc = makeQueryClient();
     const invalidateQueries = vi.spyOn(qc, "invalidateQueries");
     mockUseAllTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
@@ -609,11 +608,7 @@ describe("<Active>", () => {
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["tasks"] });
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["workflow-runtime-tree"] });
     });
-    expect(consoleError).toHaveBeenCalledWith(
-      "Failed to cancel runtime workflow",
-      expect.any(Error),
-    );
-    consoleError.mockRestore();
+    expect(screen.getByRole("alert")).toHaveTextContent("workflow already terminal");
   });
 
   it("clicking a standard task card opens the slide-over with that task's id", () => {

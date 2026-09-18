@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useTaskStream, useCancelWorkflowRuntime } from "@/lib/queries";
-import { runtimeSubmissionPath, TOKEN_KEY } from "@/lib/api";
+import { runtimeSubmissionPath } from "@/lib/api";
 
 interface Props {
   taskId: string;
@@ -24,10 +24,7 @@ export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Pr
   );
 
   function openStream() {
-    const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-    const base = runtimeSubmissionPath(taskId, "stream");
-    const url = tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
-    window.open(url, "_blank", "noreferrer");
+    window.open(runtimeSubmissionPath(taskId, "stream"), "_blank", "noreferrer");
   }
 
   function handleCancel() {
