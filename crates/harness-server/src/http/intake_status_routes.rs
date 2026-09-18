@@ -28,42 +28,18 @@ pub(crate) async fn intake_status(
         .unwrap_or_default();
     let (runtime_issue_workflows, runtime_degraded) =
         runtime_issue_workflows_for_intake_status(&state).await;
+    let (issue_workflows, issue_workflows_degraded) =
+        issue_workflows_for_intake_status(&state).await;
 
-    let github_active: u64 = if let Some(store) = state.core.issue_workflow_store.as_ref() {
-        match store.list().await {
-            Ok(workflows) => workflows
-                .into_iter()
-                .filter(|workflow| {
-                    !matches!(
-                        workflow.state,
-                        harness_workflow::issue_lifecycle::IssueLifecycleState::Done
-                            | harness_workflow::issue_lifecycle::IssueLifecycleState::Failed
-                            | harness_workflow::issue_lifecycle::IssueLifecycleState::Cancelled
-                    )
-                })
-                .count() as u64,
-            Err(_) => all_tasks
-                .iter()
-                .filter(|t| {
-                    t.source.as_deref() == Some("github")
-                        && !matches!(
-                            t.status,
-                            task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
-                        )
-                })
-                .count() as u64,
-        }
-    } else {
-        all_tasks
+    let github_active = match issue_workflows {
+        Some(workflows) => workflows
             .iter()
-            .filter(|t| {
-                t.source.as_deref() == Some("github")
-                    && !matches!(
-                        t.status,
-                        task_runner::TaskStatus::Done | task_runner::TaskStatus::Failed
-                    )
-            })
-            .count() as u64
+            .filter(|workflow| issue_workflow_is_active(workflow.state))
+            .count() as u64,
+        None => all_tasks
+            .iter()
+            .filter(|task| legacy_github_task_is_active(task))
+            .count() as u64,
     } + runtime_issue_workflows
         .iter()
         .filter(|workflow| runtime_workflow_has_tracker_source(workflow, "github"))
@@ -150,28 +126,98 @@ pub(crate) async fn intake_status(
         "channels": [github_channel, feishu_channel, dashboard_channel],
         "recent_dispatches": recent_dispatches,
     });
-    let mut degraded_missing = Vec::new();
-    if runtime_degraded {
-        degraded_missing.push("workflow_runtime_submissions");
-    }
-    if github_webhook_degraded {
-        degraded_missing.push(super::github_intake_status::GITHUB_WEBHOOK_INTAKE_SUBSYSTEM);
-    }
-    if !degraded_missing.is_empty() {
-        let reason = if runtime_degraded && !github_webhook_degraded {
-            "runtime_submission_summaries_unavailable"
-        } else if github_webhook_degraded && !runtime_degraded {
-            "github_webhook_secret_unavailable"
-        } else {
-            "intake_status_degraded"
-        };
-        response["degraded"] = json!({
-            "partial": true,
-            "missing": degraded_missing,
-            "reason": reason,
-        });
+    if let Some(degraded) = intake_status_degraded(
+        runtime_degraded,
+        issue_workflows_degraded,
+        github_webhook_degraded,
+    ) {
+        response["degraded"] = degraded;
     }
     Json(IntakeStatusResponse(response))
+}
+
+const ISSUE_WORKFLOW_INTAKE_SUBSYSTEM: &str = "issue_workflow_store";
+
+fn intake_status_degraded(
+    runtime_degraded: bool,
+    issue_workflows_degraded: bool,
+    github_webhook_degraded: bool,
+) -> Option<serde_json::Value> {
+    let mut missing = Vec::new();
+    if runtime_degraded {
+        missing.push("workflow_runtime_submissions");
+    }
+    if issue_workflows_degraded {
+        missing.push(ISSUE_WORKFLOW_INTAKE_SUBSYSTEM);
+    }
+    if github_webhook_degraded {
+        missing.push(super::github_intake_status::GITHUB_WEBHOOK_INTAKE_SUBSYSTEM);
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    let reason = match missing.as_slice() {
+        ["workflow_runtime_submissions"] => "runtime_submission_summaries_unavailable",
+        [ISSUE_WORKFLOW_INTAKE_SUBSYSTEM] => "issue_workflow_summaries_unavailable",
+        [super::github_intake_status::GITHUB_WEBHOOK_INTAKE_SUBSYSTEM] => {
+            "github_webhook_secret_unavailable"
+        }
+        _ => "intake_status_degraded",
+    };
+    Some(json!({
+        "partial": true,
+        "missing": missing,
+        "reason": reason,
+    }))
+}
+
+async fn issue_workflows_for_intake_status(
+    state: &AppState,
+) -> (
+    Option<Vec<harness_workflow::issue_lifecycle::IssueWorkflowInstance>>,
+    bool,
+) {
+    let Some(store) = state.core.issue_workflow_store.as_ref() else {
+        return (None, false);
+    };
+    issue_workflow_list_outcome(store.list().await)
+}
+
+fn issue_workflow_list_outcome<E: std::fmt::Display>(
+    result: Result<Vec<harness_workflow::issue_lifecycle::IssueWorkflowInstance>, E>,
+) -> (
+    Option<Vec<harness_workflow::issue_lifecycle::IssueWorkflowInstance>>,
+    bool,
+) {
+    match result {
+        Ok(workflows) => (Some(workflows), false),
+        Err(error) => {
+            tracing::error!("intake_status: issue workflow lookup failed: {error}");
+            (None, true)
+        }
+    }
+}
+
+fn issue_workflow_is_active(state: harness_workflow::issue_lifecycle::IssueLifecycleState) -> bool {
+    !matches!(
+        state,
+        harness_workflow::issue_lifecycle::IssueLifecycleState::Done
+            | harness_workflow::issue_lifecycle::IssueLifecycleState::Failed
+            | harness_workflow::issue_lifecycle::IssueLifecycleState::Cancelled
+    )
+}
+
+fn legacy_github_task_is_active(task: &task_runner::TaskState) -> bool {
+    task.source.as_deref() == Some("github") && !legacy_task_status_is_terminal(&task.status)
+}
+
+fn legacy_task_status_is_terminal(status: &task_runner::TaskStatus) -> bool {
+    matches!(
+        status,
+        task_runner::TaskStatus::Done
+            | task_runner::TaskStatus::Failed
+            | task_runner::TaskStatus::Cancelled
+    )
 }
 
 async fn runtime_issue_workflows_for_intake_status(
@@ -280,4 +326,71 @@ fn runtime_workflow_data_string(workflow: &WorkflowInstance, field: &str) -> Opt
         .get(field)
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_workflow::issue_lifecycle::IssueLifecycleState;
+
+    #[test]
+    fn issue_workflow_list_error_is_degraded_and_empty() {
+        let (workflows, degraded) = issue_workflow_list_outcome::<&str>(Err("db down"));
+        assert!(workflows.is_none());
+        assert!(degraded);
+    }
+
+    #[test]
+    fn issue_workflow_list_ok_is_not_degraded() {
+        let (workflows, degraded) = issue_workflow_list_outcome::<&str>(Ok(Vec::new()));
+        assert!(workflows.is_some());
+        assert!(!degraded);
+    }
+
+    #[test]
+    fn cancelled_issue_workflows_are_not_active() {
+        assert!(!issue_workflow_is_active(IssueLifecycleState::Cancelled));
+        assert!(!issue_workflow_is_active(IssueLifecycleState::Done));
+        assert!(!issue_workflow_is_active(IssueLifecycleState::Failed));
+        assert!(issue_workflow_is_active(IssueLifecycleState::Implementing));
+    }
+
+    #[test]
+    fn cancelled_legacy_tasks_are_terminal_for_github_fallback() {
+        assert!(legacy_task_status_is_terminal(
+            &task_runner::TaskStatus::Cancelled
+        ));
+        assert!(legacy_task_status_is_terminal(
+            &task_runner::TaskStatus::Done
+        ));
+        assert!(!legacy_task_status_is_terminal(
+            &task_runner::TaskStatus::Implementing
+        ));
+    }
+
+    #[test]
+    fn intake_status_degraded_marks_issue_workflow_store_failure() {
+        let value = intake_status_degraded(false, true, false).expect("degraded");
+        assert_eq!(value["partial"], true);
+        assert_eq!(value["missing"], json!([ISSUE_WORKFLOW_INTAKE_SUBSYSTEM]));
+        assert_eq!(value["reason"], "issue_workflow_summaries_unavailable");
+    }
+
+    #[test]
+    fn intake_status_degraded_combines_multiple_missing_subsystems() {
+        let value = intake_status_degraded(true, true, false).expect("degraded");
+        assert_eq!(value["reason"], "intake_status_degraded");
+        assert_eq!(
+            value["missing"],
+            json!([
+                "workflow_runtime_submissions",
+                ISSUE_WORKFLOW_INTAKE_SUBSYSTEM
+            ])
+        );
+    }
+
+    #[test]
+    fn intake_status_is_not_degraded_when_lookups_succeed() {
+        assert!(intake_status_degraded(false, false, false).is_none());
+    }
 }
