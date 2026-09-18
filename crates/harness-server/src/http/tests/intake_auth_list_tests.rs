@@ -490,6 +490,24 @@ async fn intake_status_marks_runtime_submissions_degraded_when_store_unavailable
 }
 
 #[tokio::test]
+async fn intake_status_does_not_mark_degraded_when_issue_workflow_store_is_absent(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = make_read_only_route_test_state(dir.path()).await?;
+    assert!(state.core.issue_workflow_store.is_none());
+    let app = intake_app(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/api/intake").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await?;
+    assert!(json.get("degraded").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn intake_status_disables_feishu_when_verification_token_missing() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = make_test_state_with_feishu(dir.path(), None).await?;
