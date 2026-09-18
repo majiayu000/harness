@@ -637,6 +637,29 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_sse_wire_names_are_snake_case() {
+        let cases = [
+            (
+                AgentEvent::MessageDelta {
+                    text: "hello".into(),
+                },
+                "message_delta",
+            ),
+            (
+                AgentEvent::Error {
+                    message: "oops".into(),
+                },
+                "error",
+            ),
+            (AgentEvent::Done, "done"),
+        ];
+        for (event, expected) in cases {
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(json["type"], expected);
+        }
+    }
+
+    #[test]
     fn approval_decision_serde_round_trip() {
         let decisions = vec![
             ApprovalDecision::Accept,
