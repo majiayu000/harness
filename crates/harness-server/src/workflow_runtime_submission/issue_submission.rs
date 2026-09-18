@@ -174,7 +174,13 @@ pub(super) fn issue_submission_data(
     if let (Some(object), Some(candidate_fanout)) = (data.as_object_mut(), candidate_fanout) {
         object.insert("candidate_fanout".to_string(), json!(candidate_fanout));
     }
-    insert_author_trust_class(&mut data, ctx.author_trust_class);
+    insert_author_trust_class(
+        &mut data,
+        Some(
+            ctx.author_trust_class
+                .unwrap_or(IsolationTrustClass::NonCollaborator),
+        ),
+    );
     crate::workflow_runtime_policy::merge_runtime_retry_policy(ctx.project_root, data)
 }
 

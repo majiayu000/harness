@@ -522,7 +522,7 @@ async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> 
         false,
         None,
     )
-    .await;
+    .await?;
 
     assert_eq!(report.workflow_transitions.len(), 1);
     assert_eq!(report.workflow_transitions[0].from, "pr_open");
@@ -611,7 +611,7 @@ async fn run_once_reconciles_runtime_closed_pr_workflow() -> anyhow::Result<()> 
         false,
         None,
     )
-    .await;
+    .await?;
 
     assert_eq!(report.workflow_transitions.len(), 1);
     assert_eq!(report.workflow_transitions[0].to, "cancelled");
@@ -661,7 +661,7 @@ async fn ready_to_merge_reconciliation_waits_for_configured_age() -> anyhow::Res
         false,
         None,
     )
-    .await;
+    .await?;
     assert!(report.workflow_transitions.is_empty());
     assert!(report.workflow_alerts.is_empty());
     let updated = stores
@@ -699,7 +699,7 @@ async fn ready_to_merge_reconciliation_marks_merged_pr_done() -> anyhow::Result<
         false,
         None,
     )
-    .await;
+    .await?;
     assert_eq!(report.workflow_transitions.len(), 1);
     assert_eq!(report.workflow_transitions[0].from, "ready_to_merge");
     assert_eq!(report.workflow_transitions[0].to, "done");
@@ -739,7 +739,7 @@ async fn ready_to_merge_reconciliation_alerts_for_open_pr_after_ttl() -> anyhow:
         false,
         None,
     )
-    .await;
+    .await?;
     assert!(report.workflow_transitions.is_empty());
     assert_eq!(report.workflow_alerts.len(), 1);
     assert_eq!(report.workflow_alerts[0].pr_number, Some(101));

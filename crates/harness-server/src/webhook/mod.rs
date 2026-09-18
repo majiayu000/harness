@@ -1,3 +1,4 @@
+use crate::intake::github_issues::classify_author_association;
 use crate::workflow_runtime_pr_feedback::pr_detection::{
     build_fix_ci_prompt, build_pr_approved_prompt, parse_harness_mention_command,
     HarnessMentionCommand,
@@ -27,6 +28,8 @@ struct GitHubIssueRef {
     pull_request: Option<serde_json::Value>,
     #[serde(default)]
     labels: Vec<GitHubLabelRef>,
+    #[serde(default)]
+    author_association: Option<String>,
 }
 
 impl GitHubIssueRef {
@@ -82,12 +85,17 @@ struct GitHubPullRequestReviewEvent {
     repository: GitHubRepositoryRef,
 }
 
-fn issue_task_request(issue_number: u64, repo: &str) -> CreateTaskRequest {
+fn issue_task_request(
+    issue_number: u64,
+    repo: &str,
+    author_association: Option<&str>,
+) -> CreateTaskRequest {
     let mut req = CreateTaskRequest::default();
     req.issue = Some(issue_number);
     req.repo = Some(repo.to_string());
     req.source = Some("github".to_string());
     req.external_id = Some(format!("issue:{issue_number}"));
+    req.author_trust_class = Some(classify_author_association(author_association));
     req
 }
 
@@ -143,7 +151,13 @@ pub(crate) fn parse_github_webhook_task_request(
             if parsed.issue.pull_request.is_some() {
                 return Ok((None, "issues event references pull request".to_string()));
             }
-            let enqueue = || issue_task_request(parsed.issue.number, &parsed.repository.full_name);
+            let enqueue = || {
+                issue_task_request(
+                    parsed.issue.number,
+                    &parsed.repository.full_name,
+                    parsed.issue.author_association.as_deref(),
+                )
+            };
             match parsed.action.as_str() {
                 "opened" | "reopened" => {
                     match parse_harness_mention_command(parsed.issue.body.as_deref().unwrap_or(""))
@@ -237,6 +251,7 @@ pub(crate) fn parse_github_webhook_task_request(
                     Some(issue_task_request(
                         parsed.issue.number,
                         &parsed.repository.full_name,
+                        parsed.issue.author_association.as_deref(),
                     )),
                     "issue mention command".to_string(),
                 )),
