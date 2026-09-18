@@ -305,7 +305,7 @@ pub(in crate::runtime::store) async fn record_runtime_completion_evidence_tx(
     result: &ActivityResult,
     decision: Option<&WorkflowDecisionRecord>,
 ) -> anyhow::Result<WorkflowRunEvidence> {
-    let prompt = latest_runtime_prompt_packet_tx(tx, &job.id).await?;
+    let prompt = latest_runtime_prompt_packet_tx(tx, job).await?;
     let payload =
         bounded_runtime_completion_payload(event, result, decision, prompt.digest.as_deref())?;
     let digest = evidence_payload_digest(&json!({
@@ -528,18 +528,22 @@ struct RuntimePromptPacketEvidence {
 
 async fn latest_runtime_prompt_packet_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    runtime_job_id: &str,
+    job: &RuntimeJob,
 ) -> anyhow::Result<RuntimePromptPacketEvidence> {
+    let lease_generation =
+        (job.runtime_kind == RuntimeKind::RemoteHost).then(|| job.lease_generation.to_string());
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT data #>> '{event,prompt_packet_digest}',
                 (data #> '{event,prompt_packet}')::text
          FROM runtime_events
          WHERE runtime_job_id = $1
            AND event_type = 'RuntimePromptPrepared'
+           AND ($2::text IS NULL OR data #>> '{event,lease_generation}' = $2)
          ORDER BY sequence DESC
          LIMIT 1",
     )
-    .bind(runtime_job_id)
+    .bind(&job.id)
+    .bind(lease_generation)
     .fetch_optional(&mut **tx)
     .await?;
     let Some((digest, packet_json)) = row else {
