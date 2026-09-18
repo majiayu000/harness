@@ -275,14 +275,14 @@ describe("useTaskDetail", () => {
 // ── useTaskStream ─────────────────────────────────────────────────────────────
 
 describe("useTaskStream", () => {
-  it("calls onChunk for each MessageDelta event", async () => {
+  it("calls onChunk for each message_delta event", async () => {
     const chunks: string[] = [];
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       start(controller) {
-        controller.enqueue(encoder.encode('data: {"type":"MessageDelta","text":"hello "}\n\n'));
-        controller.enqueue(encoder.encode('data: {"type":"MessageDelta","text":"world"}\n\n'));
-        controller.enqueue(encoder.encode('data: {"type":"Done"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"message_delta","text":"hello "}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"message_delta","text":"world"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"done"}\n\n'));
         controller.close();
       },
     });
@@ -296,6 +296,35 @@ describe("useTaskStream", () => {
 
     await waitFor(() => expect(chunks.length).toBe(2));
     expect(chunks).toEqual(["hello ", "world"]);
+  });
+
+  it("calls onError for error events and ignores PascalCase type names", async () => {
+    const chunks: string[] = [];
+    const errors: string[] = [];
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"MessageDelta","text":"ignored"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"error","message":"stream failed"}\n\n'));
+        controller.close();
+      },
+    });
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(stream, { status: 200 }),
+    ) as unknown as typeof fetch;
+
+    renderHook(
+      () =>
+        useTaskStream(
+          "t1",
+          (text) => chunks.push(text),
+          (message) => errors.push(message),
+        ),
+      { wrapper: makeWrapper() },
+    );
+
+    await waitFor(() => expect(errors).toEqual(["stream failed"]));
+    expect(chunks).toEqual([]);
   });
 
   it("aborts the fetch when the hook cleans up", async () => {
