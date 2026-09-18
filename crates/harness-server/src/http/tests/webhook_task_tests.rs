@@ -105,6 +105,7 @@ async fn webhook_issue_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     assert_eq!(instance.data["external_id"], "issue:106");
     assert_eq!(instance.data["tracker_source"], "github");
     assert_eq!(instance.data["tracker_external_id"], "issue:106");
+    assert_eq!(instance.data["author_trust_class"], "non_collaborator");
 
     let detail_response = runtime_submission_app(state.clone())
         .oneshot(

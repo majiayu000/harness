@@ -44,7 +44,7 @@ impl DefaultExecutionService {
                     source: prepared.req.source.as_deref(),
                     external_id: prepared.req.external_id.as_deref(),
                     remote_fact_hash: None,
-                    author_trust_class: None,
+                    author_trust_class: prepared.req.author_trust_class,
                 },
                 || async {
                     self.ensure_remote_subject_open(&prepared.req)

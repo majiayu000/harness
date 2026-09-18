@@ -59,6 +59,10 @@ fn parse_issue_comment_issue_mention_maps_to_issue_request() {
     assert_eq!(request.pr, None);
     assert_eq!(request.prompt, None);
     assert_eq!(request.repo.as_deref(), Some("majiayu000/harness"));
+    assert_eq!(
+        request.author_trust_class,
+        Some(harness_core::config::isolation::IsolationTrustClass::NonCollaborator)
+    );
 }
 
 #[test]
@@ -209,6 +213,54 @@ fn parse_issues_opened_autonomous_enqueues_without_mention() {
     assert_eq!(request.issue, Some(100));
     assert_eq!(request.repo.as_deref(), Some("org/repo"));
     assert_eq!(reason, "autonomous issue intake");
+    assert_eq!(
+        request.author_trust_class,
+        Some(harness_core::config::isolation::IsolationTrustClass::NonCollaborator)
+    );
+}
+
+#[test]
+fn parse_issues_opened_autonomous_classifies_owner_as_trusted() {
+    let payload = serde_json::json!({
+        "action": "opened",
+        "issue": {
+            "number": 100,
+            "body": "plain issue, no mention",
+            "author_association": "OWNER"
+        },
+        "repository": { "full_name": "org/repo" }
+    });
+
+    let (request, _) =
+        parse_github_webhook_task_request("issues", payload.to_string().as_bytes(), true, None)
+            .unwrap();
+    let request = request.expect("autonomous mode should enqueue the issue");
+    assert_eq!(
+        request.author_trust_class,
+        Some(harness_core::config::isolation::IsolationTrustClass::Trusted)
+    );
+}
+
+#[test]
+fn parse_issues_opened_autonomous_classifies_first_timer_as_non_collaborator() {
+    let payload = serde_json::json!({
+        "action": "opened",
+        "issue": {
+            "number": 100,
+            "body": "plain issue, no mention",
+            "author_association": "FIRST_TIME_CONTRIBUTOR"
+        },
+        "repository": { "full_name": "org/repo" }
+    });
+
+    let (request, _) =
+        parse_github_webhook_task_request("issues", payload.to_string().as_bytes(), true, None)
+            .unwrap();
+    let request = request.expect("autonomous mode should enqueue the issue");
+    assert_eq!(
+        request.author_trust_class,
+        Some(harness_core::config::isolation::IsolationTrustClass::NonCollaborator)
+    );
 }
 
 #[test]

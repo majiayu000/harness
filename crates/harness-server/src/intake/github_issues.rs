@@ -489,7 +489,7 @@ fn github_issues_url(api_base_url: &str, repo: &str, label: &str) -> anyhow::Res
     Ok(url.to_string())
 }
 
-fn classify_author_association(author_association: Option<&str>) -> IsolationTrustClass {
+pub(crate) fn classify_author_association(author_association: Option<&str>) -> IsolationTrustClass {
     match author_association
         .map(str::trim)
         .filter(|value| !value.is_empty())
