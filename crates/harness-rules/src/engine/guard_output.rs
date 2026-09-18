@@ -8,17 +8,6 @@ pub(super) fn parse_guard_output(
     output: &Output,
     guard_id: &str,
 ) -> anyhow::Result<Vec<Violation>> {
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        anyhow::bail!(
-            "guard `{guard_id}` exited {}: stderr=[{}] stdout=[{}]",
-            output.status,
-            stderr.trim(),
-            stdout.trim()
-        );
-    }
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut violations = Vec::new();
     for line in stdout.lines() {
@@ -40,6 +29,19 @@ pub(super) fn parse_guard_output(
             });
         }
     }
+
+    // Guards print findings on stdout and exit 1. Fail closed only when a
+    // non-zero exit produced no parseable finding lines (crash / empty stdout).
+    if !output.status.success() && violations.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "guard `{guard_id}` exited {}: stderr=[{}] stdout=[{}]",
+            output.status,
+            stderr.trim(),
+            stdout.trim()
+        );
+    }
+
     Ok(violations)
 }
 
@@ -94,5 +96,28 @@ mod tests {
         assert!(message.contains("guard `CRASH`"));
         assert!(message.contains("crash"));
         assert!(message.contains("exited"));
+    }
+
+    #[test]
+    fn failed_guard_with_finding_lines_returns_violations() {
+        let rules = [Rule {
+            id: RuleId::from_str("RS-03"),
+            title: "test".to_string(),
+            severity: Severity::High,
+            category: harness_core::types::Category::Stability,
+            paths: Vec::new(),
+            description: String::new(),
+            fix_pattern: None,
+        }];
+        let violations = parse_guard_output(
+            &rules,
+            &output(1, "src/lib.rs:9:RS-03:unwrap in library code\n", ""),
+            "RS-03",
+        )
+        .unwrap();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule_id.as_str(), "RS-03");
+        assert_eq!(violations[0].severity, Severity::High);
+        assert_eq!(violations[0].message, "unwrap in library code");
     }
 }
