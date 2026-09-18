@@ -125,6 +125,19 @@ fn create_persists_file_to_disk() {
 }
 
 #[test]
+fn create_refuses_to_persist_parent_dir_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let persist_path = dir.path().join("skills");
+    std::fs::create_dir_all(&persist_path).expect("skills dir");
+    let mut store = SkillStore::new().with_persist_dir(persist_path);
+    store.create("../escape".to_string(), "secret".to_string());
+    assert!(
+        !dir.path().join("escape.md").exists(),
+        "skill persist must not write outside persist_dir"
+    );
+}
+
+#[test]
 fn delete_removes_file_from_disk() {
     let dir = tempfile::tempdir().expect("tempdir");
     let persist_path = dir.path().to_path_buf();

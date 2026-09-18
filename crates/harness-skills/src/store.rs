@@ -9,7 +9,7 @@ use harness_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub use crate::freshness::FreshnessClass;
 
@@ -439,8 +439,7 @@ impl SkillStore {
         if let Some(dir) = &self.persist_dir.clone() {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 tracing::warn!("failed to create skills dir {}: {e}", dir.display());
-            } else {
-                let path = dir.join(format!("{}.md", skill_ref.name));
+            } else if let Some(path) = persist_named_path(dir, &skill_ref.name, ".md") {
                 if let Err(e) = std::fs::write(&path, &skill_ref.content) {
                     tracing::warn!("failed to persist skill {}: {e}", path.display());
                 }
@@ -465,10 +464,11 @@ impl SkillStore {
         let deleted = self.skills.len() < len;
         if deleted {
             if let (Some(dir), Some(name)) = (&self.persist_dir, name) {
-                let path = dir.join(format!("{}.md", name));
-                if path.exists() {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        tracing::warn!("failed to remove skill file {}: {e}", path.display());
+                if let Some(path) = persist_named_path(dir, &name, ".md") {
+                    if path.exists() {
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            tracing::warn!("failed to remove skill file {}: {e}", path.display());
+                        }
                     }
                 }
             }
@@ -513,9 +513,10 @@ impl SkillStore {
         self.skills[idx].version = version;
         self.skills[idx].content_hash = new_hash;
         if let Some(dir) = &self.persist_dir {
-            let path = dir.join(format!("{}.md", name));
-            if let Err(e) = std::fs::write(&path, &new_content) {
-                tracing::warn!("failed to persist skill {}: {e}", path.display());
+            if let Some(path) = persist_named_path(dir, &name, ".md") {
+                if let Err(e) = std::fs::write(&path, &new_content) {
+                    tracing::warn!("failed to persist skill {}: {e}", path.display());
+                }
             }
         }
         Some(&self.skills[idx])
@@ -739,12 +740,25 @@ fn in_canary_bucket(skill_id: &SkillId, prompt: &str, ratio: f64) -> bool {
     bucket < threshold
 }
 
+fn persist_named_path(dir: &Path, name: &str, suffix: &str) -> Option<PathBuf> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Some(dir.join(format!("{name}{suffix}"))),
+        _ => {
+            tracing::warn!("refusing skill path for unsafe name {name}");
+            None
+        }
+    }
+}
+
 fn persist_usage_sidecar(dir: &Path, skill_name: &str, usage: &SkillUsage) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!("failed to create usage dir {}: {e}", dir.display());
         return;
     }
-    let path = dir.join(format!("{}.usage.json", skill_name));
+    let Some(path) = persist_named_path(dir, skill_name, ".usage.json") else {
+        return;
+    };
     match serde_json::to_string(usage) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&path, json) {
@@ -759,7 +773,9 @@ fn persist_usage_sidecar(dir: &Path, skill_name: &str, usage: &SkillUsage) {
 }
 
 fn load_usage_sidecar(dir: &Path, skill_name: &str) -> SkillUsage {
-    let path = dir.join(format!("{}.usage.json", skill_name));
+    let Some(path) = persist_named_path(dir, skill_name, ".usage.json") else {
+        return SkillUsage::default();
+    };
     if !path.exists() {
         return SkillUsage::default();
     }
