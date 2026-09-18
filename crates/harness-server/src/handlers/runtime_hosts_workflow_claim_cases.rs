@@ -198,6 +198,70 @@ async fn runtime_job_claim_endpoint_includes_eval_credential_environment_policy(
 }
 
 #[tokio::test]
+async fn runtime_job_claim_completes_invalid_eval_credentials_as_preflight_failure(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+        return Ok(());
+    };
+    let app = runtime_hosts_workflow_app(state);
+    register_host_with_capabilities(
+        &app,
+        "host-a",
+        vec!["eval_resource_limits", "eval_network_policy"],
+    )
+    .await?;
+
+    let job = enqueue_runtime_host_test_job(
+        &store,
+        "command-eval-credential-missing-grant",
+        RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({
+            "activity": "implement_issue",
+            "workflow_id": "wf-eval",
+            "runtime_profile": {
+                "name": "remote-host-default",
+                "kind": "remote_host"
+            },
+            "command": {
+                "eval": {
+                    "eval_run_id": "run-1",
+                    "timeout_secs": 45,
+                    "credential_requirements": [{
+                        "id": "github-pr-write",
+                        "env_var": "GITHUB_TOKEN",
+                        "scope": ["repo:owner/repo:pull_request:write"],
+                        "audience": "github.com",
+                        "required": true
+                    }]
+                }
+            }
+        }),
+    )
+    .await?;
+
+    let json = post_json(
+        &app,
+        "/api/runtime-hosts/host-a/runtime-jobs/claim".to_string(),
+        json!({ "lease_secs": 60 }),
+    )
+    .await?;
+
+    assert_eq!(json["claimed"], false);
+    assert_eq!(json["preflight_failed"], true);
+    assert_eq!(json["runtime_job_id"], job.id);
+    assert_eq!(json["runtime_job"]["status"], "failed");
+    let persisted = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("preflight-failed job should remain auditable");
+    assert_eq!(persisted.status, RuntimeJobStatus::Failed);
+    assert!(persisted.lease.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn trusted_eval_job_is_claimed_only_by_a_capable_runtime_host() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {

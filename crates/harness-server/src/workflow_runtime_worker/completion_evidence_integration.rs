@@ -12,6 +12,7 @@ use harness_workflow::runtime::quality_gate::QUALITY_GATE_ACTIVITY;
 use harness_workflow::runtime::{
     activity_result_has_closed_issue_evidence, ActivityArtifact, ActivityErrorKind, ActivityResult,
     ActivityStatus, RuntimeJob, WorkflowInstance, GITHUB_ISSUE_PR_DEFINITION_ID,
+    ISSUE_ALREADY_RESOLVED_SIGNAL, ISSUE_CLOSED_SIGNAL, ISSUE_STATE_ARTIFACT,
 };
 #[cfg(test)]
 use serde_json::json;
@@ -155,7 +156,9 @@ async fn attach_issue_state_verification(
                     }),
                 ));
             }
-            GitHubState::Open | GitHubState::PrMerged | GitHubState::PrClosed => return result,
+            observed @ (GitHubState::Open | GitHubState::PrMerged | GitHubState::PrClosed) => {
+                return strip_unverified_closed_issue_claim(result, &repo, issue_number, observed);
+            }
             GitHubState::Unknown => {}
         }
     }
@@ -181,6 +184,48 @@ fn issue_verification_unavailable(
     failed.error_kind = Some(ActivityErrorKind::ExternalDependency);
     failed.status = ActivityStatus::Failed;
     failed
+}
+
+fn strip_unverified_closed_issue_claim(
+    mut result: ActivityResult,
+    repo: &str,
+    issue_number: u64,
+    observed: GitHubState,
+) -> ActivityResult {
+    result.signals.retain(|signal| {
+        signal.signal_type != ISSUE_CLOSED_SIGNAL
+            && signal.signal_type != ISSUE_ALREADY_RESOLVED_SIGNAL
+    });
+    result.artifacts.retain(|artifact| {
+        artifact.artifact_type != ISSUE_STATE_ARTIFACT
+            || !issue_state_artifact_claims_closed(&artifact.artifact)
+    });
+    result.with_artifact(ActivityArtifact::new(
+        "unverified_closed_issue_claim",
+        serde_json::json!({
+            "issue_number": issue_number,
+            "repo": repo,
+            "observed_github_state": format!("{observed:?}"),
+        }),
+    ))
+}
+
+fn issue_state_artifact_claims_closed(value: &Value) -> bool {
+    value
+        .get("closed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("is_closed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || value
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| {
+                state.trim().eq_ignore_ascii_case("closed")
+                    || state.trim().eq_ignore_ascii_case("resolved")
+            })
 }
 
 fn workflow_issue_target(workflow: &WorkflowInstance) -> Option<(String, u64)> {
@@ -421,5 +466,29 @@ mod tests {
             enforced.error_kind,
             Some(ActivityErrorKind::ExternalDependency)
         );
+    }
+
+    #[test]
+    fn unverified_open_github_state_strips_closed_issue_claim() {
+        let result = ActivityResult::succeeded("implement_issue", "closed")
+            .with_signal(ActivitySignal::new(
+                ISSUE_CLOSED_SIGNAL,
+                json!({ "issue_number": 123, "state": "closed" }),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                ISSUE_STATE_ARTIFACT,
+                json!({ "state": "closed", "issue_number": 123 }),
+            ));
+        assert!(activity_result_has_closed_issue_evidence(&result));
+
+        let stripped =
+            strip_unverified_closed_issue_claim(result, "owner/repo", 123, GitHubState::Open);
+
+        assert!(!activity_result_has_closed_issue_evidence(&stripped));
+        assert_eq!(stripped.status, ActivityStatus::Succeeded);
+        assert!(stripped.artifacts.iter().any(|artifact| {
+            artifact.artifact_type == "unverified_closed_issue_claim"
+                && artifact.artifact["observed_github_state"] == "Open"
+        }));
     }
 }

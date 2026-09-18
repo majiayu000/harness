@@ -219,8 +219,7 @@ impl<'a> RuntimeWorker<'a> {
             // The lease was lost mid-turn. The completed work must not
             // vanish: persist it to the dead-letter table so reconciliation
             // can decide whether it still applies (GH-1878).
-            if let Err(dlq_error) = self
-                .store
+            self.store
                 .record_lease_expired_completion(
                     &job.id,
                     &self.owner,
@@ -229,15 +228,7 @@ impl<'a> RuntimeWorker<'a> {
                     &result,
                     transcript.as_ref(),
                 )
-                .await
-            {
-                tracing::error!(
-                    runtime_job_id = %job.id,
-                    owner = %self.owner,
-                    error = %dlq_error,
-                    "failed to record lease-expired completion to dead-letter"
-                );
-            }
+                .await?;
             tracing::warn!(
                 runtime_job_id = %job.id,
                 owner = %self.owner,

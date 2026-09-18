@@ -14,7 +14,7 @@ use super::child_workflow_non_issue::{
 };
 use super::child_workflow_replay::{
     child_start_event_recorded, child_started_by_command, ensure_runtime_job_still_owns_lease,
-    issue_submission_recorded,
+    issue_submission_recorded, rejected_child_submission_result,
 };
 use super::data_helpers::{
     activity_name, dependency_task_ids_from_command, force_execute_from_project_policy,
@@ -206,6 +206,13 @@ pub(super) async fn execute_start_child_workflow(
         }),
     ));
     if let Some(submission) = child_submission {
+        if !submission.accepted {
+            return Ok(rejected_child_submission_result(
+                activity_name(job),
+                "Issue",
+                &submission,
+            ));
+        }
         result = result.with_artifact(ActivityArtifact::new(
             "child_submission",
             json!({

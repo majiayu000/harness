@@ -149,78 +149,63 @@ impl WorkflowRuntimeStore {
         if selectors.definition_ids.is_empty() {
             return Ok(RuntimeHistoryPruneSummary::default());
         }
-        let rows: Vec<(String,)> = sqlx::query_as(&format!(
-            "{PRUNE_ELIGIBLE_ROOTS_CTE} SELECT family.id
-             FROM family
-             JOIN eligible_roots ON eligible_roots.root_id = family.root_id
-             ORDER BY family.root_id ASC, family.id ASC"
-        ))
-        .bind(&selectors.definition_ids)
-        .bind(&selectors.definition_versions)
-        .bind(&selectors.definition_hashes)
-        .bind(&selectors.states)
-        .bind(terminal_before)
-        .bind(batch_limit)
-        .fetch_all(&self.pool)
-        .await?;
-        let workflow_ids: Vec<String> = rows.into_iter().map(|(id,)| id).collect();
-        if workflow_ids.is_empty() {
-            return Ok(RuntimeHistoryPruneSummary::default());
-        }
-        let mut summary = self
-            .runtime_history_counts_for_workflows(&workflow_ids)
-            .await?;
-        let result = sqlx::query("DELETE FROM workflow_instances WHERE id = ANY($1::text[])")
-            .bind(&workflow_ids)
-            .execute(&self.pool)
-            .await?;
-        summary.workflow_instances_deleted = result.rows_affected() as usize;
-        Ok(summary)
-    }
-
-    async fn runtime_history_counts_for_workflows(
-        &self,
-        workflow_ids: &[String],
-    ) -> anyhow::Result<RuntimeHistoryPruneSummary> {
-        let count = |table: &str| {
-            format!("SELECT COUNT(*) FROM {table} WHERE workflow_id = ANY($1::text[])")
-        };
-        let (workflow_instances,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM workflow_instances WHERE id = ANY($1::text[])")
-                .bind(workflow_ids)
-                .fetch_one(&self.pool)
-                .await?;
-        let (workflow_events,): (i64,) = sqlx::query_as(&count("workflow_events"))
-            .bind(workflow_ids)
-            .fetch_one(&self.pool)
-            .await?;
-        let (workflow_decisions,): (i64,) = sqlx::query_as(&count("workflow_decisions"))
-            .bind(workflow_ids)
-            .fetch_one(&self.pool)
-            .await?;
-        let (workflow_commands,): (i64,) = sqlx::query_as(&count("workflow_commands"))
-            .bind(workflow_ids)
-            .fetch_one(&self.pool)
-            .await?;
-        let (runtime_jobs,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM runtime_jobs AS job
-             JOIN workflow_commands AS command ON command.id = job.command_id
-             WHERE command.workflow_id = ANY($1::text[])",
-        )
-        .bind(workflow_ids)
-        .fetch_one(&self.pool)
-        .await?;
-        let (runtime_events,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM runtime_events AS event
-             JOIN runtime_jobs AS job ON job.id = event.runtime_job_id
-             JOIN workflow_commands AS command ON command.id = job.command_id
-             WHERE command.workflow_id = ANY($1::text[])",
-        )
-        .bind(workflow_ids)
-        .fetch_one(&self.pool)
-        .await?;
-        let (workflow_artifacts,): (i64,) = sqlx::query_as(&count("workflow_artifacts"))
-            .bind(workflow_ids)
+        // Eligibility and delete share one statement so a recovered live
+        // instance cannot be removed by a stale ID list.
+        let sql = format!(
+            "{PRUNE_ELIGIBLE_ROOTS_CTE},
+             to_delete AS (
+                 SELECT family.id
+                 FROM family
+                 JOIN eligible_roots ON eligible_roots.root_id = family.root_id
+             ),
+             counts AS (
+                 SELECT
+                     (SELECT COUNT(*) FROM workflow_events
+                      WHERE workflow_id IN (SELECT id FROM to_delete)) AS workflow_events,
+                     (SELECT COUNT(*) FROM workflow_decisions
+                      WHERE workflow_id IN (SELECT id FROM to_delete)) AS workflow_decisions,
+                     (SELECT COUNT(*) FROM workflow_commands
+                      WHERE workflow_id IN (SELECT id FROM to_delete)) AS workflow_commands,
+                     (SELECT COUNT(*) FROM runtime_jobs AS job
+                      JOIN workflow_commands AS command ON command.id = job.command_id
+                      WHERE command.workflow_id IN (SELECT id FROM to_delete)) AS runtime_jobs,
+                     (SELECT COUNT(*) FROM runtime_events AS event
+                      JOIN runtime_jobs AS job ON job.id = event.runtime_job_id
+                      JOIN workflow_commands AS command ON command.id = job.command_id
+                      WHERE command.workflow_id IN (SELECT id FROM to_delete)) AS runtime_events,
+                     (SELECT COUNT(*) FROM workflow_artifacts
+                      WHERE workflow_id IN (SELECT id FROM to_delete)) AS workflow_artifacts
+             ),
+             deleted AS (
+                 DELETE FROM workflow_instances
+                 WHERE id IN (SELECT id FROM to_delete)
+                 RETURNING id
+             )
+             SELECT
+                 (SELECT COUNT(*) FROM deleted),
+                 counts.workflow_events,
+                 counts.workflow_decisions,
+                 counts.workflow_commands,
+                 counts.runtime_jobs,
+                 counts.runtime_events,
+                 counts.workflow_artifacts
+             FROM counts"
+        );
+        let (
+            workflow_instances,
+            workflow_events,
+            workflow_decisions,
+            workflow_commands,
+            runtime_jobs,
+            runtime_events,
+            workflow_artifacts,
+        ): (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(&sql)
+            .bind(&selectors.definition_ids)
+            .bind(&selectors.definition_versions)
+            .bind(&selectors.definition_hashes)
+            .bind(&selectors.states)
+            .bind(terminal_before)
+            .bind(batch_limit)
             .fetch_one(&self.pool)
             .await?;
         Ok(RuntimeHistoryPruneSummary {
