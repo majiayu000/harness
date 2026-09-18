@@ -152,9 +152,12 @@ impl PasswordResetRateLimiter {
 }
 
 /// Per-source rate limiter for `POST /signals` ingestion.
+///
+/// Memory is bounded: at most `max_tracked_keys` sources are tracked at once.
 pub struct SignalRateLimiter {
     counts: Mutex<HashMap<String, (u32, Instant)>>,
     max_per_minute: u32,
+    max_tracked_keys: usize,
 }
 
 impl SignalRateLimiter {
@@ -195,6 +198,16 @@ impl SignalRateLimiter {
         Self {
             counts: Mutex::new(HashMap::new()),
             max_per_minute,
+            max_tracked_keys: 100_000,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_cap(max_per_minute: u32, max_tracked_keys: usize) -> Self {
+        Self {
+            counts: Mutex::new(HashMap::new()),
+            max_per_minute,
+            max_tracked_keys,
         }
     }
 
@@ -216,6 +229,13 @@ impl SignalRateLimiter {
 
         if !counts.contains_key(source) && counts.len().is_multiple_of(Self::FULL_PRUNE_INTERVAL) {
             Self::prune_expired_counts(&mut counts, now);
+        }
+
+        if !counts.contains_key(source) && counts.len() >= self.max_tracked_keys {
+            Self::prune_expired_counts(&mut counts, now);
+        }
+        if !counts.contains_key(source) && counts.len() >= self.max_tracked_keys {
+            return false;
         }
 
         let entry = counts.entry(source.to_string()).or_insert((0, now));
@@ -319,6 +339,26 @@ mod tests {
         let counts = limiter.counts.lock().unwrap_or_else(|p| p.into_inner());
         assert!(counts.contains_key("expired"));
         assert!(counts.contains_key("active"));
+    }
+
+    #[test]
+    fn signal_rejects_new_sources_when_key_cap_reached() {
+        let limiter = SignalRateLimiter::new_with_cap(60, 2);
+        assert!(limiter.check_and_increment("src-a"));
+        assert!(limiter.check_and_increment("src-b"));
+        assert!(!limiter.check_and_increment("src-c"));
+        assert!(limiter.check_and_increment("src-a"));
+    }
+
+    #[test]
+    fn signal_prunes_expired_sources_before_capacity_check() {
+        let limiter = SignalRateLimiter::new_with_cap(60, 1);
+        limiter.insert_for_test("expired", 1, Instant::now() - Duration::from_secs(61));
+
+        assert!(limiter.check_and_increment("fresh"));
+        let counts = limiter.counts.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(counts.len(), 1);
+        assert!(counts.contains_key("fresh"));
     }
 
     #[test]
