@@ -1,8 +1,10 @@
+use crate::workflow_runtime_submission::WorkflowSubmissionRuntimeRecord;
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
-    RuntimeJob, WorkflowDecisionRecord, WorkflowInstance, WorkflowRuntimeStore,
+    ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob, WorkflowDecisionRecord,
+    WorkflowInstance, WorkflowRuntimeStore,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::data_helpers::activity_name;
 
@@ -138,4 +140,66 @@ pub(super) async fn issue_submission_recorded(
     task_id: &TaskId,
 ) -> anyhow::Result<bool> {
     issue_submission_side_effects_recorded(store, child, task_id).await
+}
+
+pub(super) fn rejected_child_submission_result(
+    activity: impl Into<String>,
+    kind: &str,
+    submission: &WorkflowSubmissionRuntimeRecord,
+) -> ActivityResult {
+    rejected_decision_result(
+        activity,
+        format!("{kind} child workflow submission was rejected."),
+        submission.rejection_reason.as_deref(),
+    )
+    .with_artifact(ActivityArtifact::new(
+        "child_submission",
+        json!({
+            "workflow_id": submission.workflow_id,
+            "accepted": submission.accepted,
+            "decision_id": submission.decision_id,
+            "command_ids": submission.command_ids,
+            "rejection_reason": submission.rejection_reason,
+        }),
+    ))
+}
+
+pub(super) fn rejected_decision_result(
+    activity: impl Into<String>,
+    summary: impl Into<String>,
+    rejection_reason: Option<&str>,
+) -> ActivityResult {
+    ActivityResult::failed(
+        activity,
+        summary,
+        rejection_reason.unwrap_or("decision rejected"),
+    )
+    .with_error_kind(ActivityErrorKind::Configuration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_child_submission_fails_the_parent_activity() {
+        let submission = WorkflowSubmissionRuntimeRecord {
+            workflow_id: "child-1".to_string(),
+            accepted: false,
+            decision_id: "decision-1".to_string(),
+            command_ids: Vec::new(),
+            rejection_reason: Some("duplicate subject".to_string()),
+        };
+        let result =
+            rejected_child_submission_result("start_child_workflow", "Prompt task", &submission);
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+        assert_eq!(result.error.as_deref(), Some("duplicate subject"));
+        assert!(result.artifacts.iter().any(|artifact| {
+            artifact.artifact_type == "child_submission" && artifact.artifact["accepted"] == false
+        }));
+    }
 }
