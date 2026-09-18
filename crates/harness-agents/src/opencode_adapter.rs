@@ -16,8 +16,10 @@ type StdoutLines = Lines<BufReader<ChildStdout>>;
 mod protocol;
 #[cfg(test)]
 use self::protocol::request_id_string;
+use self::protocol::{
+    acp_error_message, protocol_line_preview, request_id_from_string, response_id_matches,
+};
 pub use self::protocol::{parse_acp_message, ParsedAcpMessage};
-use self::protocol::{protocol_line_preview, request_id_from_string, response_id_matches};
 
 fn stall_timeout_for(req: &AgentRequest) -> Option<Duration> {
     req.timeout_secs
@@ -339,6 +341,13 @@ impl OpenCodeAcpAdapter {
                     {
                         break;
                     }
+                    Some(ParsedAcpMessage::RpcError { id, error })
+                        if response_id_matches(&id, init_id) =>
+                    {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            acp_error_message(&error, "opencode acp initialize failed"),
+                        ));
+                    }
                     Some(ParsedAcpMessage::Event(AgentEvent::Warning { message })) => {
                         tracing::warn!(agent = "opencode", "{message}");
                     }
@@ -379,6 +388,13 @@ impl OpenCodeAcpAdapter {
                             state.session_id = Some(session_id.to_string());
                             break;
                         }
+                    }
+                    Some(ParsedAcpMessage::RpcError { id, error })
+                        if response_id_matches(&id, session_request) =>
+                    {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            acp_error_message(&error, "opencode acp session/new failed"),
+                        ));
                     }
                     Some(ParsedAcpMessage::Event(AgentEvent::Warning { message })) => {
                         tracing::warn!(agent = "opencode", "{message}");
@@ -516,11 +532,7 @@ impl AgentAdapter for OpenCodeAcpAdapter {
                         // params) must fail the turn, not be treated as a
                         // successful completion.
                         if result.get("error").is_some() || result.get("code").is_some() {
-                            let message = result
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("opencode acp request failed")
-                                .to_string();
+                            let message = acp_error_message(&result, "opencode acp request failed");
                             if tx.send(AgentEvent::Error { message }).await.is_err() {
                                 receiver_closed = true;
                             }
@@ -536,6 +548,14 @@ impl AgentAdapter for OpenCodeAcpAdapter {
                                 .await
                                 .is_err()
                         {
+                            receiver_closed = true;
+                        }
+                        turn_completed = true;
+                        break;
+                    }
+                    ParsedAcpMessage::RpcError { error, .. } => {
+                        let message = acp_error_message(&error, "opencode acp request failed");
+                        if tx.send(AgentEvent::Error { message }).await.is_err() {
                             receiver_closed = true;
                         }
                         turn_completed = true;
