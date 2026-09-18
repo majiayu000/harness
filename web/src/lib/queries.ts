@@ -184,13 +184,13 @@ export function useTaskStream(
             if (!dataLine) continue;
             try {
               const item = JSON.parse(dataLine.slice(6)) as StreamItem;
-              if (item.type === "MessageDelta") {
+              if (item.type === "message_delta") {
                 onChunkRef.current(item.text);
-              } else if (item.type === "Error") {
+              } else if (item.type === "error") {
                 onErrorRef.current?.(item.message);
                 reader.cancel();
                 return;
-              } else if (item.type === "Done") {
+              } else if (item.type === "done") {
                 reader.cancel();
                 return;
               }

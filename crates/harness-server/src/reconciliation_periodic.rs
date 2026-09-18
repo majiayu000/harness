@@ -20,24 +20,30 @@ async fn reconciliation_loop(state: Arc<AppState>, config: ReconciliationConfig)
     sleep(Duration::from_secs(15)).await;
 
     loop {
-        let report = run_once_with_runtime_config(
+        match run_once_with_runtime_config(
             state.core.workflow_runtime_store.as_deref(),
             state.core.issue_workflow_store.as_deref(),
             &config,
             false,
             state.core.server.config.server.github_token.as_deref(),
         )
-        .await;
-        raise_reconciliation_alerts(&state, &report);
-
-        tracing::info!(
-            candidates = report.candidates,
-            skipped_terminal = report.skipped_terminal,
-            transitions = report.transitions.len(),
-            workflow_transitions = report.workflow_transitions.len(),
-            workflow_alerts = report.workflow_alerts.len(),
-            "reconciliation: tick complete"
-        );
+        .await
+        {
+            Ok(report) => {
+                raise_reconciliation_alerts(&state, &report);
+                tracing::info!(
+                    candidates = report.candidates,
+                    skipped_terminal = report.skipped_terminal,
+                    transitions = report.transitions.len(),
+                    workflow_transitions = report.workflow_transitions.len(),
+                    workflow_alerts = report.workflow_alerts.len(),
+                    "reconciliation: tick complete"
+                );
+            }
+            Err(error) => {
+                tracing::warn!("workflow runtime reconciliation failed: {error}");
+            }
+        }
         sleep(interval).await;
     }
 }

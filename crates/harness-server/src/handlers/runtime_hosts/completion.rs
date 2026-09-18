@@ -358,7 +358,7 @@ use evidence::{
     is_eval_cancellation_ack,
 };
 pub(super) use evidence::{
-    eval_resource_limit_preflight_failure, runtime_job_activity,
+    eval_credential_preflight_failure, eval_resource_limit_preflight_failure, runtime_job_activity,
     validate_eval_resource_limit_report,
 };
 pub(super) use network_policy::{

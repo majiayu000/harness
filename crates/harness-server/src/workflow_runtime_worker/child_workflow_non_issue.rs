@@ -2,10 +2,10 @@ use crate::http::AppState;
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
     build_pr_feedback_inspect_decision, build_quality_gate_run_decision, ActivityArtifact,
-    ActivityErrorKind, ActivityResult, DataProvenance, PrFeedbackInspectDecisionInput,
-    QualityGateDecisionInput, RuntimeJob, WorkflowChildStart, WorkflowCommandStatus,
-    WorkflowDefinition, WorkflowInstance, WorkflowSubject, WorkflowSubmissionDecisionTransition,
-    PROMPT_TASK_DEFINITION_ID, PR_FEEDBACK_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
+    ActivityResult, DataProvenance, PrFeedbackInspectDecisionInput, QualityGateDecisionInput,
+    RuntimeJob, WorkflowChildStart, WorkflowCommandStatus, WorkflowDefinition, WorkflowInstance,
+    WorkflowSubject, WorkflowSubmissionDecisionTransition, PROMPT_TASK_DEFINITION_ID,
+    PR_FEEDBACK_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use super::child_workflow_replay::{
     child_event_id_or_append, child_start_event_recorded, child_started_by_command,
-    decision_for_event, ensure_runtime_job_still_owns_lease,
+    decision_for_event, ensure_runtime_job_still_owns_lease, rejected_child_submission_result,
+    rejected_decision_result,
 };
 use super::data_helpers::{
     activity_name, merge_pr_feedback_child_data, optional_string, optional_string_matrix_strict,
@@ -72,6 +73,14 @@ pub(super) async fn execute_start_prompt_task_child_workflow(
         },
     )
     .await?;
+
+    if !submission.accepted {
+        return Ok(rejected_child_submission_result(
+            activity_name(job),
+            "Prompt task",
+            &submission,
+        ));
+    }
 
     let mut child = store
         .get_instance(&submission.workflow_id)
@@ -350,15 +359,11 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
             },
         );
         if let Some(record) = existing_record.as_ref().filter(|record| !record.accepted) {
-            return Ok(ActivityResult::failed(
+            return Ok(rejected_decision_result(
                 activity_name(job),
                 "Quality gate child workflow request was rejected.",
-                record
-                    .rejection_reason
-                    .clone()
-                    .unwrap_or_else(|| "decision rejected".to_string()),
-            )
-            .with_error_kind(ActivityErrorKind::Configuration));
+                record.rejection_reason.as_deref(),
+            ));
         }
         let decision = existing_record
             .as_ref()
@@ -392,16 +397,11 @@ pub(super) async fn execute_start_quality_gate_child_workflow(
                 )
             })?;
         if !commit.record.accepted {
-            return Ok(ActivityResult::failed(
+            return Ok(rejected_decision_result(
                 activity_name(job),
                 "Quality gate child workflow request was rejected.",
-                commit
-                    .record
-                    .rejection_reason
-                    .clone()
-                    .unwrap_or_else(|| "decision rejected".to_string()),
-            )
-            .with_error_kind(ActivityErrorKind::Configuration));
+                commit.record.rejection_reason.as_deref(),
+            ));
         }
         child = final_child;
         commit.command_ids
@@ -600,15 +600,11 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
             },
         );
         if let Some(record) = existing_record.as_ref().filter(|record| !record.accepted) {
-            return Ok(ActivityResult::failed(
+            return Ok(rejected_decision_result(
                 activity_name(job),
                 "PR feedback child workflow inspection request was rejected.",
-                record
-                    .rejection_reason
-                    .clone()
-                    .unwrap_or_else(|| "decision rejected".to_string()),
-            )
-            .with_error_kind(ActivityErrorKind::Configuration));
+                record.rejection_reason.as_deref(),
+            ));
         }
         let decision = existing_record
             .as_ref()
@@ -642,16 +638,11 @@ pub(super) async fn execute_start_pr_feedback_child_workflow(
                 )
             })?;
         if !commit.record.accepted {
-            return Ok(ActivityResult::failed(
+            return Ok(rejected_decision_result(
                 activity_name(job),
                 "PR feedback child workflow inspection request was rejected.",
-                commit
-                    .record
-                    .rejection_reason
-                    .clone()
-                    .unwrap_or_else(|| "decision rejected".to_string()),
-            )
-            .with_error_kind(ActivityErrorKind::Configuration));
+                commit.record.rejection_reason.as_deref(),
+            ));
         }
         child = final_child;
         let mut command_ids = Vec::new();

@@ -128,47 +128,34 @@ pub async fn run_once_with_runtime_config(
     config: &ReconciliationConfig,
     dry_run: bool,
     github_token: Option<&str>,
-) -> ReconciliationReport {
+) -> anyhow::Result<ReconciliationReport> {
     let Some(runtime_store) = runtime_store else {
-        return ReconciliationReport {
+        return Ok(ReconciliationReport {
             candidates: 0,
             skipped_terminal: 0,
             transitions: Vec::new(),
             workflow_transitions: Vec::new(),
             workflow_alerts: Vec::new(),
-        };
+        });
     };
     let mut rate = RateLimiter::new(config.max_gh_calls_per_minute);
-    match run_runtime_workflow_reconciliation_once(
-        runtime_store,
-        issue_workflows,
-        &mut rate,
-        RuntimeWorkflowReconciliationSettings::from_config(config),
-        dry_run,
-        github_token,
-    )
-    .await
-    {
-        Ok((candidates, skipped_terminal, workflow_transitions, workflow_alerts)) => {
-            ReconciliationReport {
-                candidates: candidates + skipped_terminal,
-                skipped_terminal,
-                transitions: Vec::new(),
-                workflow_transitions,
-                workflow_alerts,
-            }
-        }
-        Err(error) => {
-            tracing::warn!("workflow runtime reconciliation failed: {error}");
-            ReconciliationReport {
-                candidates: 0,
-                skipped_terminal: 0,
-                transitions: Vec::new(),
-                workflow_transitions: Vec::new(),
-                workflow_alerts: Vec::new(),
-            }
-        }
-    }
+    let (candidates, skipped_terminal, workflow_transitions, workflow_alerts) =
+        run_runtime_workflow_reconciliation_once(
+            runtime_store,
+            issue_workflows,
+            &mut rate,
+            RuntimeWorkflowReconciliationSettings::from_config(config),
+            dry_run,
+            github_token,
+        )
+        .await?;
+    Ok(ReconciliationReport {
+        candidates: candidates + skipped_terminal,
+        skipped_terminal,
+        transitions: Vec::new(),
+        workflow_transitions,
+        workflow_alerts,
+    })
 }
 
 fn runtime_transition_for_github_state(
@@ -321,6 +308,16 @@ mod payload_tests {
             !json.contains("/workspaces/"),
             "ReconciliationReport JSON must not contain a workspace path, got: {json}"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_runtime_store_returns_empty_ok_report() {
+        let report =
+            run_once_with_runtime_config(None, None, &ReconciliationConfig::default(), false, None)
+                .await
+                .expect("missing store is not a tick failure");
+        assert_eq!(report.candidates, 0);
+        assert!(report.workflow_transitions.is_empty());
     }
 }
 #[cfg(test)]

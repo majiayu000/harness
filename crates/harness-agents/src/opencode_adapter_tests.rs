@@ -195,3 +195,11 @@ fn test_turn_request() -> AgentRequest {
         capability_token: None,
     }
 }
+
+#[test]
+fn session_new_uses_prepared_child_workspace() {
+    let request = test_turn_request();
+    let params = session_new_params(&request, std::path::Path::new("/workspace"));
+    assert_eq!(params["cwd"], "/workspace");
+    assert_eq!(params["mcpServers"], json!([]));
+}

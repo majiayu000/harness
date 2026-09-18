@@ -541,12 +541,17 @@ pub async fn claim_runtime_job_for_runtime_host(
         match crate::eval_credentials::attach_runtime_host_eval_environment_policy(&mut job) {
             Ok(environment) => environment,
             Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    claim_json(
-                        json!({ "error": format!("invalid eval credential environment: {error}") }),
-                    ),
-                );
+                let result =
+                    completion::eval_credential_preflight_failure(&job, &error.to_string());
+                return complete_runtime_host_preflight_failure(
+                    &state,
+                    store.as_ref(),
+                    &host_id,
+                    lease_expires_at,
+                    &job,
+                    result,
+                )
+                .await;
             }
         };
     let credential_audit = credential_environment.as_ref().map(|environment| {
