@@ -25,6 +25,25 @@ pub(super) fn attach_eval_cancellation_cleanup_evidence(
     )))
 }
 
+pub(in crate::handlers::runtime_hosts) fn eval_credential_preflight_failure(
+    job: &RuntimeJob,
+    error: &str,
+) -> ActivityResult {
+    ActivityResult::failed(
+        runtime_job_activity(job),
+        "Evaluation credential environment could not be enforced.",
+        error,
+    )
+    .with_error_kind(ActivityErrorKind::Configuration)
+    .with_artifact(ActivityArtifact::new(
+        "eval_credential_environment",
+        json!({
+            "enforced": false,
+            "reason": error,
+        }),
+    ))
+}
+
 pub(in crate::handlers::runtime_hosts) fn eval_resource_limit_preflight_failure(
     job: &RuntimeJob,
     error: &str,
