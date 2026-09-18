@@ -250,17 +250,20 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<O
 
     let feed = build_feed(&events, now);
     // Exhausted outbound alert deliveries in the window (GH1582 B-008).
-    let alert_delivery_failures = state
+    let alert_delivery_failures = match state
         .observability
         .events
         .query_external_signals(Some(now - chrono::Duration::hours(OVERVIEW_WINDOW_HOURS)))
-        .map(|signals| {
-            signals
-                .iter()
-                .filter(|s| s.source == "alerting" && s.payload["outcome"] == "exhausted")
-                .count()
-        })
-        .unwrap_or(0);
+    {
+        Ok(signals) => signals
+            .iter()
+            .filter(|s| s.source == "alerting" && s.payload["outcome"] == "exhausted")
+            .count(),
+        Err(e) => {
+            tracing::warn!("overview: failed to query exhausted alert deliveries: {e}");
+            0
+        }
+    };
     let alerts = build_alerts(&events, &runtime_hosts, alert_delivery_failures);
 
     let evolution: Value = events
