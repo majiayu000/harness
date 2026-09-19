@@ -38,7 +38,7 @@ pub fn run(cmd: SkillCommand, config: &HarnessConfig) -> anyhow::Result<()> {
         SkillCommand::Create { name, file } => {
             let content = std::fs::read_to_string(&file)?;
             let mut store = configured_skill_store(config)?;
-            store.create(name.clone(), content);
+            store.create(name.clone(), content)?;
             println!("Created skill: {name}");
         }
         SkillCommand::Delete { skill_id } => {

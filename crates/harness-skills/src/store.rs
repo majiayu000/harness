@@ -409,7 +409,14 @@ impl SkillStore {
         }
     }
 
-    pub fn create(&mut self, name: String, content: String) -> &Skill {
+    pub fn create(&mut self, name: String, content: String) -> std::io::Result<&Skill> {
+        let dir = self.persist_dir.as_deref().unwrap_or_else(|| Path::new(""));
+        let path = persist_named_path(dir, &name, ".md").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "skill name must be a single filename without '..', separators, or control characters",
+            )
+        })?;
         let trigger_patterns = parse_trigger_patterns(&content);
         let version = parse_version_from_frontmatter(&content);
         let content_hash = compute_content_hash(&content);
@@ -431,22 +438,13 @@ impl SkillStore {
             canary_ratio: default_canary_ratio(),
             last_scored: None,
         };
-        self.skills.push(skill);
-        let skill_ref = match self.skills.last() {
-            Some(s) => s,
-            None => unreachable!("skill was just pushed, so it must exist"),
-        };
-        if let Some(dir) = &self.persist_dir.clone() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                tracing::warn!("failed to create skills dir {}: {e}", dir.display());
-            } else if let Some(path) = persist_named_path(dir, &skill_ref.name, ".md") {
-                if let Err(e) = std::fs::write(&path, &skill_ref.content) {
-                    tracing::warn!("failed to persist skill {}: {e}", path.display());
-                }
-                self.skill_dirs.insert(name, dir.clone());
-            }
+        if let Some(dir) = &self.persist_dir {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(path, &skill.content)?;
+            self.skill_dirs.insert(name, dir.clone());
         }
-        skill_ref
+        self.skills.push(skill);
+        Ok(self.skills.last().expect("skill was just pushed"))
     }
 
     pub fn get(&self, id: &SkillId) -> Option<&Skill> {
@@ -741,6 +739,13 @@ fn in_canary_bucket(skill_id: &SkillId, prompt: &str, ratio: f64) -> bool {
 }
 
 fn persist_named_path(dir: &Path, name: &str, suffix: &str) -> Option<PathBuf> {
+    if name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.chars().any(|c| c.is_control())
+    {
+        return None;
+    }
     let mut components = Path::new(name).components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(_)), None) => Some(dir.join(format!("{name}{suffix}"))),
