@@ -17,6 +17,7 @@ pub(super) fn protocol_line_preview(line: &str) -> String {
 pub enum ParsedAcpMessage {
     Event(AgentEvent),
     Response { id: Value, result: Value },
+    RpcError { id: Value, error: Value },
     Ignore,
 }
 
@@ -28,9 +29,9 @@ pub fn parse_acp_message(line: &str) -> Option<ParsedAcpMessage> {
     }
     if value.get("id").is_some() {
         if value.get("error").is_some() {
-            return Some(ParsedAcpMessage::Response {
+            return Some(ParsedAcpMessage::RpcError {
                 id: value.get("id").cloned()?,
-                result: value.get("error").cloned()?,
+                error: value.get("error").cloned()?,
             });
         }
         return Some(ParsedAcpMessage::Response {
@@ -132,6 +133,16 @@ pub(super) fn request_id_string(id: &Value) -> String {
         Value::String(value) => value.clone(),
         other => other.to_string(),
     }
+}
+
+pub(super) fn acp_error_message(error: &Value, fallback: &str) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 pub(super) fn response_id_matches(actual: &Value, expected: u64) -> bool {
