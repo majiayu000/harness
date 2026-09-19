@@ -1,6 +1,8 @@
 use crate::{http::AppState, validate_root};
 use harness_core::types::ExecPlanId;
-use harness_protocol::{methods::RpcResponse, methods::INTERNAL_ERROR, methods::NOT_FOUND};
+use harness_protocol::{
+    methods::RpcResponse, methods::INTERNAL_ERROR, methods::INVALID_PARAMS, methods::NOT_FOUND,
+};
 use std::path::PathBuf;
 
 pub async fn exec_plan_init(
@@ -93,6 +95,14 @@ pub async fn exec_plan_update(
         "activate" | "complete" | "abandon" | "add_milestone" | "log_decision" => {}
         _ => return RpcResponse::error(id, INTERNAL_ERROR, format!("unknown action: {action}")),
     }
+    let milestone_description = if action == "add_milestone" {
+        match add_milestone_description(&updates) {
+            Ok(description) => Some(description.to_string()),
+            Err(message) => return RpcResponse::error(id, INVALID_PARAMS, message),
+        }
+    } else {
+        None
+    };
 
     // DB fallback: if plan is not in cache, let update_in_txn load it from DB.
     let result = db
@@ -101,8 +111,8 @@ pub async fn exec_plan_update(
             "complete" => plan.complete(),
             "abandon" => plan.abandon(),
             "add_milestone" => {
-                if let Some(desc) = updates.get("description").and_then(|d| d.as_str()) {
-                    plan.add_milestone(desc.to_string());
+                if let Some(description) = milestone_description.as_ref() {
+                    plan.add_milestone(description.clone());
                 }
             }
             "log_decision" => {
@@ -134,5 +144,38 @@ pub async fn exec_plan_update(
         }
         Ok(None) => RpcResponse::error(id, NOT_FOUND, "plan not found"),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, format!("db error: {e}")),
+    }
+}
+
+fn add_milestone_description(updates: &serde_json::Value) -> Result<&str, &'static str> {
+    match updates.get("description").and_then(|value| value.as_str()) {
+        Some(description) if !description.is_empty() => Ok(description),
+        _ => Err("add_milestone requires a string description"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_milestone_description;
+    use serde_json::json;
+
+    #[test]
+    fn add_milestone_rejects_missing_empty_or_non_string_description() {
+        assert_eq!(
+            add_milestone_description(&json!({"action": "add_milestone"})).unwrap_err(),
+            "add_milestone requires a string description"
+        );
+        assert_eq!(
+            add_milestone_description(&json!({"description": ""})).unwrap_err(),
+            "add_milestone requires a string description"
+        );
+        assert_eq!(
+            add_milestone_description(&json!({"description": 1})).unwrap_err(),
+            "add_milestone requires a string description"
+        );
+        assert_eq!(
+            add_milestone_description(&json!({"description": "ship it"})).unwrap(),
+            "ship it"
+        );
     }
 }
