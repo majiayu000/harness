@@ -148,7 +148,10 @@ pub async fn learn_skills(
                 tracing::warn!("skipping skill with invalid name: {e}");
                 continue;
             }
-            let skill = skills.create(name, content).clone();
+            let skill = match skills.create(name, content) {
+                Ok(skill) => skill.clone(),
+                Err(error) => return RpcResponse::error(id, INTERNAL_ERROR, error.to_string()),
+            };
             created.push(skill);
         }
     }

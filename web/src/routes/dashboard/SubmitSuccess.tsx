@@ -1,6 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useTaskStream, useCancelWorkflowRuntime } from "@/lib/queries";
-import { runtimeSubmissionPath, TOKEN_KEY } from "@/lib/api";
 
 interface Props {
   taskId: string;
@@ -10,6 +9,7 @@ interface Props {
 }
 
 export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Props) {
+  const outputRef = useRef<HTMLPreElement>(null);
   const [output, setOutput] = useState<string>("");
   const [streamError, setStreamError] = useState<string | null>(null);
   const cancelWorkflowRuntime = useCancelWorkflowRuntime();
@@ -24,10 +24,7 @@ export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Pr
   );
 
   function openStream() {
-    const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-    const base = runtimeSubmissionPath(taskId, "stream");
-    const url = tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
-    window.open(url, "_blank", "noreferrer");
+    outputRef.current?.focus();
   }
 
   function handleCancel() {
@@ -84,9 +81,9 @@ export function SubmitSuccess({ taskId, workflowId, executionPath, onReset }: Pr
           Stream error: {streamError}
         </div>
       )}
-      {output && (
-        <pre className="font-mono text-[11px] text-ink bg-bg border border-line p-4 overflow-auto max-h-[400px] rounded-[3px] whitespace-pre-wrap">
-          {output}
+      {canUseRuntimeSubmission && (
+        <pre ref={outputRef} tabIndex={-1} aria-label="Live output" className="font-mono text-[11px] text-ink bg-bg border border-line p-4 overflow-auto max-h-[400px] rounded-[3px] whitespace-pre-wrap">
+          {output || "Waiting for output…"}
         </pre>
       )}
     </div>

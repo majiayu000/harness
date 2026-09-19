@@ -105,9 +105,10 @@ fn parse_error_response() {
     let line = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Invalid params"}}"#;
     let message = parse_acp_message(line).unwrap();
     match message {
-        ParsedAcpMessage::Response { id, result } => {
+        ParsedAcpMessage::RpcError { id, error } => {
             assert_eq!(id, 2);
-            assert_eq!(result["message"], "Invalid params");
+            assert_eq!(error["code"], -32602);
+            assert_eq!(error["message"], "Invalid params");
         }
         other => panic!("unexpected message: {other:?}"),
     }

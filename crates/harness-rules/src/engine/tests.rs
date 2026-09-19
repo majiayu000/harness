@@ -340,6 +340,41 @@ fn apply_fix_rewrites_file_when_pattern_matches() -> anyhow::Result<()> {
 }
 
 #[test]
+fn apply_fix_rejects_parent_dir_path() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project)?;
+    let outside = dir.path().join("outside.rs");
+    std::fs::write(&outside, "let x = foo();\n")?;
+
+    let mut engine = RuleEngine::new();
+    engine.add_rule(Rule {
+        id: RuleId::from_str("FIX-ESCAPE"),
+        title: "Replace foo with bar".to_string(),
+        severity: Severity::Low,
+        category: Category::Style,
+        paths: vec![],
+        description: String::new(),
+        fix_pattern: Some("s/foo/bar/".to_string()),
+    });
+
+    let violation = Violation {
+        rule_id: RuleId::from_str("FIX-ESCAPE"),
+        file: PathBuf::from("../outside.rs"),
+        line: Some(1),
+        message: "use bar".to_string(),
+        severity: Severity::Low,
+    };
+
+    let err = engine
+        .apply_fix(&violation, &project)
+        .expect_err("parent-dir path must not be joined");
+    assert!(err.to_string().contains("escapes the project root"));
+    assert_eq!(std::fs::read_to_string(&outside)?, "let x = foo();\n");
+    Ok(())
+}
+
+#[test]
 fn apply_fix_returns_false_when_no_fix_pattern() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let file_path = dir.path().join("sample.rs");
