@@ -13,7 +13,6 @@ import json
 import os
 import re
 import selectors
-import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -27,6 +26,7 @@ import uuid
 IMAGE_PREFIX = "sha256:"
 LEASE_SECONDS = 300
 OUTPUT_LIMIT = 8 * 1024 * 1024
+GIT_HANDOFF_SCRIPT = Path(__file__).with_name("supervised_git_handoff.py").resolve()
 
 
 def save(path: Path, value: dict) -> None:
@@ -152,16 +152,6 @@ def extract_candidate(archive: Path, destination: Path) -> None:
         stream.extractall(destination, members=archive_members(stream), filter="data")
 
 
-INPUT_UNPACK_SCRIPT = """import hashlib, subprocess, sys
-with open('/input.tar', 'rb') as stream:
-    if hashlib.file_digest(stream, 'sha256').hexdigest() != sys.argv[1]:
-        raise RuntimeError('input archive digest does not match prepared source')
-    stream.seek(0)
-    subprocess.run(['tar', '--extract', '--file', '-', '--directory', '/workspace',
-                    '--no-same-owner', '--no-same-permissions'], stdin=stream, check=True)
-"""
-
-
 CANDIDATE_REAPER_SCRIPT = """import os, time
 # PID 1 adopts agent descendants and must reap them before cgroup quiescence.
 deadline = time.monotonic() + 900
@@ -209,7 +199,7 @@ class Host:
         identity = {
             "server_url": args.server_url,
             "image": args.image, "proxy_image": args.proxy_image, "model": args.model,
-            "workspace": str(self.workspace), "timeout": args.timeout,
+            "workspace": str(self.workspace), "base_commit": args.base_commit, "timeout": args.timeout,
             "synthetic_dns": args.synthetic_dns,
         }
         if "identity" in self.state and self.state["identity"] != identity:
@@ -282,32 +272,18 @@ class Host:
         self.state.pop("cleanup_errors", None)
 
     def freeze_input(self) -> None:
-        source = self.workspace
-        if not source.is_dir():
-            raise RuntimeError("workspace must be a source directory")
-        # TarFile.add silently skips sockets, so reject those before archiving.
-        for directory, _, files in os.walk(source, followlinks=False):
-            for name in files:
-                if stat.S_ISSOCK((Path(directory) / name).lstat().st_mode):
-                    raise RuntimeError("input source contains a socket special file")
-        # TarFile.add records FIFO/device/link headers without reading their
-        # contents. Validate the completed archive once before it is accepted.
-        archive = self.root / "input.tar"
-        with archive.open("xb") as stream:
-            os.chmod(archive, 0o600)
-            with tarfile.open(fileobj=stream, mode="w") as bundle:
-                bundle.add(source, arcname=".")
-            stream.flush()
-            os.fsync(stream.fileno())
-        with tarfile.open(archive) as stream:
-            archive_members(stream)
-        with archive.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        self.state["input_snapshot"] = {"archive_sha256": digest}
+        result = subprocess.run(
+            [sys.executable, "-I", str(GIT_HANDOFF_SCRIPT), "freeze", str(self.workspace),
+             self.args.base_commit, str(self.root / "input.bundle")],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode:
+            raise RuntimeError("input Git snapshot failed: " + result.stderr.strip())
+        self.state["input_snapshot"] = json.loads(result.stdout)
 
     def launch(self) -> None:
         args = self.args
-        digest = self.state["input_snapshot"]["archive_sha256"]
+        snapshot = self.state["input_snapshot"]
         docker("network", "create", "--internal", self.name)
         proxy_args = [
             "run", "-d", "--name", self.name + "-proxy", "--network", "bridge",
@@ -322,7 +298,8 @@ class Host:
         run_args = [
             "run", "-d", "--name", self.name, "--network", self.name, *self.base_args(),
             "--tmpfs", f"/workspace:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
-            "--mount", f"type=bind,src={self.root / 'input.tar'},dst=/input.tar,readonly",
+            "--mount", f"type=bind,src={self.root / 'input.bundle'},dst=/input.bundle,readonly",
+            "--mount", f"type=bind,src={GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly",
             "--mount", f"type=bind,src={args.auth_file.resolve()},dst=/run/codex-auth.json,readonly",
             "--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080",
             args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT,
@@ -331,7 +308,8 @@ class Host:
         self.state["container_started"] = True
         self.persist()
         self.start_observer()
-        docker("exec", self.name, "python3", "-I", "-c", INPUT_UNPACK_SCRIPT, digest)
+        docker("exec", self.name, "python3", "-I", "/git-handoff.py", "prepare",
+               "/input.bundle", snapshot["base_commit"], snapshot["bundle_sha256"], "/workspace")
         docker("exec", self.name, "sh", "-c",
                'set -eu; mkdir -p /home/harness/.codex; '
                'cp /run/codex-auth.json /home/harness/.codex/auth.json')
@@ -415,26 +393,44 @@ class Host:
             # share our unprivileged UID in this private PID namespace. Kill them
             # before exporting tmpfs so background children cannot race acceptance.
             subprocess.run(["docker", "exec", self.name, "python3", "-I", "-c",
-                            "import os, signal, time\nfrom pathlib import Path\n"
+                            "import os, signal, sys, time\nfrom pathlib import Path\n"
                             "try: os.kill(-1, signal.SIGKILL)\n"
                             "except ProcessLookupError: pass\n"
                             "deadline = time.monotonic() + 5\n"
                             "while int(Path('/sys/fs/cgroup/pids.current').read_text()) != 2:\n"
                             " if time.monotonic() >= deadline: raise RuntimeError('candidate did not quiesce before export')\n"
                             " time.sleep(0.01)\n"
-                            "os.execvp('tar', ['tar', '-cf', '-', '-C', '/workspace', '.'])"],
+                            "os.execvp('python3', ['python3', '-I', '/git-handoff.py', 'export', '/workspace', sys.argv[1]])",
+                            self.state["input_snapshot"]["base_commit"]],
                            stdout=output, check=True, timeout=30)
         self.collect_resources(stop_agents=False)
         docker("rm", "-f", self.name)
         extract_candidate(archive, self.root / "candidate")
+        revision = json.loads((self.root / "candidate/revision.json").read_text())
+        if (revision.get("base_commit") != self.state["input_snapshot"]["base_commit"]
+                or not isinstance(revision.get("candidate_commit"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}", revision["candidate_commit"])):
+            raise RuntimeError("candidate Git revision does not match the pinned input")
+        with (self.root / "candidate/candidate.bundle").open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        self.state["git_handoff"] = {**revision, "bundle_sha256": digest, "verified": False}
+        self.persist()
 
     def verify(self) -> int:
-        # No credentials, candidate execution, network, or writable host mount.
+        # Reconstruct only verified Git blobs in a fresh offline container.
+        handoff = self.state["git_handoff"]
         docker("run", "-d", "--name", self.name + "-verify", "--network", "none",
                *self.base_args(),
-               "--mount", f"type=bind,src={self.root / 'candidate'},dst=/candidate,readonly",
+               "--tmpfs", f"/candidate:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
+               "--mount", f"type=bind,src={self.root / 'candidate'},dst=/handoff,readonly",
+               "--mount", f"type=bind,src={GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly",
                "--mount", f"type=bind,src={self.root / 'verifier.py'},dst=/verify.py,readonly",
-               self.args.image, "python3", "-I", "/verify.py", "/candidate")
+               self.args.image, "python3", "-I", "-c",
+               "import subprocess,sys\n"
+               "subprocess.run(['python3','-I','/git-handoff.py','verify',"
+               "'/handoff/candidate.bundle',*sys.argv[1:],'/handoff/workspace','/candidate'],check=True)\n"
+               "sys.exit(subprocess.call(['python3','-I','/verify.py','/candidate']))",
+               handoff["base_commit"], handoff["candidate_commit"], handoff["bundle_sha256"])
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             self.renew()
@@ -452,6 +448,9 @@ class Host:
         if "input_snapshot" in self.state:
             artifacts.append({"artifact_type": "supervised_input_snapshot",
                               "artifact": self.state["input_snapshot"]})
+        if "git_handoff" in self.state:
+            artifacts.append({"artifact_type": "supervised_git_handoff",
+                              "artifact": self.state["git_handoff"]})
         if self.state.get("container_started"):
             evidence = self.state.get("resource_evidence", {"status": "incomplete", "error": "not collected"})
             artifacts.append({"artifact_type": "supervised_candidate_resources", "artifact": evidence})
@@ -567,6 +566,7 @@ class Host:
                 if artifact.get("artifact_type") in {
                     "runtime_host_usage", "supervised_input_snapshot",
                     "supervised_candidate_resources", "supervised_docker_verification",
+                    "supervised_git_handoff",
                 }:
                     raise RuntimeError("agent result contains host-owned artifact: " + artifact["artifact_type"])
             if native["status"] not in {"succeeded", "succeeded_with_blockers"}:
@@ -577,6 +577,8 @@ class Host:
                 verifier_exit = self.verify()
                 if verifier_exit:
                     raise RuntimeError(f"independent verifier rejected candidate: exit {verifier_exit}")
+                self.state["git_handoff"]["verified"] = True
+                self.persist()
                 self.state["result"] = self.result(native["status"], native["summary"], artifacts + [
                     {"artifact_type": "supervised_docker_verification", "artifact": {
                         "image": self.args.image, "verifier_exit_code": verifier_exit,
@@ -607,6 +609,7 @@ def main() -> None:
     parser.add_argument("--server-url", required=True)
     for field in ["request", "submission", "workspace", "verifier", "auth-file", "state-dir"]:
         parser.add_argument("--" + field, required=True, type=Path)
+    parser.add_argument("--base-commit", required=True, help="Full 40-character base commit SHA")
     parser.add_argument("--image", required=True)
     parser.add_argument("--proxy-image", required=True)
     parser.add_argument("--model", default="gpt-5.5")
@@ -618,6 +621,8 @@ def main() -> None:
         parser.error("images must be local sha256 image IDs")
     if not 1 <= args.timeout <= 300:
         parser.error("timeout must be between 1 and 300 seconds")
+    if not re.fullmatch(r"[0-9a-f]{40}", args.base_commit):
+        parser.error("base-commit must be a full lowercase 40-character SHA")
     host = Host(args)
     host.run()
     if host.state.get("result", {}).get("status") != "succeeded":

@@ -4,7 +4,6 @@ import importlib.util
 import io
 import json
 import os
-import socket
 from pathlib import Path
 import tarfile
 import sys
@@ -282,6 +281,7 @@ def test_candidate_export_does_not_replace_logs_and_removes_agent_before_extract
     module = load()
     runner = module.Host.__new__(module.Host)
     runner.root, runner.name = tmp_path, 'owned'
+    runner.state = {'input_snapshot': {'base_commit': 'a' * 40}}
     runner.collect_resources = Mock(side_effect=lambda **kw: events.append('resources'))
     (tmp_path / 'agent.jsonl').write_bytes(b'original')
     (tmp_path / 'agent.stderr').write_bytes(b'errors')
@@ -290,11 +290,21 @@ def test_candidate_export_does_not_replace_logs_and_removes_agent_before_extract
     def export(command, **kwargs):
         assert command[:6] == ['docker', 'exec', 'owned', 'python3', '-I', '-c']
         assert 'os.kill(-1, signal.SIGKILL)' in command[6]
+        assert '/git-handoff.py' in command[6]
+        assert command[-1] == 'a' * 40
         events.append('export')
+
+    def extract(*args):
+        events.append('extract')
+        candidate = tmp_path / 'candidate'
+        candidate.mkdir()
+        (candidate / 'candidate.bundle').write_bytes(b'candidate bundle')
+        (candidate / 'revision.json').write_text(json.dumps({
+            'base_commit': 'a' * 40, 'candidate_commit': 'b' * 40}))
 
     monkeypatch.setattr(module.subprocess, 'run', export)
     monkeypatch.setattr(module, 'docker', lambda *args: events.append(args))
-    monkeypatch.setattr(module, 'extract_candidate', lambda *args: events.append('extract'))
+    monkeypatch.setattr(module, 'extract_candidate', extract)
     runner.capture()
     assert events == ['export', 'resources', ('rm', '-f', 'owned'), 'extract']
     assert (tmp_path / 'agent.jsonl').read_bytes() == b'original'
@@ -503,15 +513,37 @@ def test_capture_failure_retains_completed_model_usage(tmp_path):
                      'cached_input_tokens': 80, 'total_tokens': 150}
 
 
+def git(source, *args):
+    return subprocess.run(['git', '-C', str(source), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def commit_source(source):
+    git(source, 'add', '--all')
+    git(source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+        '-c', 'core.hooksPath=/dev/null', 'commit', '--allow-empty', '-m', 'Fixture')
+    return git(source, 'rev-parse', 'HEAD')
+
+
 def snapshot_runner(tmp_path):
     from types import SimpleNamespace
     runner = host(tmp_path / 'state', 'new')
     runner.root.mkdir(mode=0o700)
     source = tmp_path / 'source'
     source.mkdir()
-    runner.args = SimpleNamespace(workspace=source)
+    git(source, 'init', '--template=')
+    (source / 'original').write_text('original')
+    runner.args = SimpleNamespace(workspace=source, base_commit=commit_source(source))
     runner.workspace = source.resolve()
     return runner, source
+
+
+def prepare_snapshot(runner, destination):
+    snapshot = runner.state['input_snapshot']
+    subprocess.run([sys.executable, '-I', str(load().GIT_HANDOFF_SCRIPT), 'prepare',
+                    str(runner.root / 'input.bundle'), snapshot['base_commit'],
+                    snapshot['bundle_sha256'], str(destination)], check=True,
+                   capture_output=True, text=True)
 
 
 def test_frozen_source_preserves_bytes_and_executable_mode_after_original_changes(tmp_path):
@@ -519,46 +551,45 @@ def test_frozen_source_preserves_bytes_and_executable_mode_after_original_change
     executable = source / 'run.sh'
     executable.write_text('#!/bin/sh\necho original\n')
     executable.chmod(0o755)
+    runner.args.base_commit = commit_source(source)
     runner.freeze_input()
-    digest = runner.state['input_snapshot']['archive_sha256']
+    snapshot = runner.state['input_snapshot']
     executable.write_text('changed')
     (source / 'later.txt').write_text('not part of input')
     frozen = tmp_path / 'extracted-test'
-    load().extract_candidate(runner.root / 'input.tar', frozen)
+    prepare_snapshot(runner, frozen)
     assert (frozen / 'run.sh').read_text() == '#!/bin/sh\necho original\n'
     assert (frozen / 'run.sh').stat().st_mode & 0o111 == 0o111
     assert not (frozen / 'later.txt').exists()
+    assert git(frozen, 'rev-parse', 'HEAD') == runner.args.base_commit
     import hashlib
-    assert hashlib.sha256((runner.root / 'input.tar').read_bytes()).hexdigest() == digest
+    assert hashlib.sha256((runner.root / 'input.bundle').read_bytes()).hexdigest() == snapshot['bundle_sha256']
     artifact = runner.result('failed', 'test')['artifacts'][0]
-    assert artifact == {'artifact_type': 'supervised_input_snapshot',
-                        'artifact': {'archive_sha256': digest}}
+    assert artifact == {'artifact_type': 'supervised_input_snapshot', 'artifact': snapshot}
 
 
 @pytest.mark.parametrize('kind', ['file_link', 'directory_link', 'fifo'])
-def test_input_snapshot_rejects_links_and_special_files_before_accepting(tmp_path, kind):
+def test_untracked_source_files_are_excluded_from_pinned_commit(tmp_path, kind):
     runner, source = snapshot_runner(tmp_path)
     if kind == 'fifo':
-        os.mkfifo(source / 'invalid')
+        os.mkfifo(source / 'untracked')
     else:
-        (source / 'invalid').symlink_to(tmp_path if kind == 'directory_link' else __file__)
-    with pytest.raises(RuntimeError, match='link or special file'):
-        runner.freeze_input()
-    assert not (runner.root / 'input-snapshot').exists()
-    assert 'input_snapshot' not in runner.state
+        (source / 'untracked').symlink_to(tmp_path if kind == 'directory_link' else __file__)
+    runner.freeze_input()
+    frozen = tmp_path / 'frozen'
+    prepare_snapshot(runner, frozen)
+    assert not (frozen / 'untracked').exists()
+    assert (frozen / 'original').read_text() == 'original'
 
 
-def test_input_snapshot_rejects_socket_instead_of_silently_omitting_it(tmp_path):
+def test_tracked_source_symlink_is_rejected_before_agent_execution(tmp_path):
     runner, source = snapshot_runner(tmp_path)
-    # Keep the Unix socket pathname within the platform length limit.
-    import tempfile
-    with tempfile.TemporaryDirectory(prefix='input-socket-', dir='/tmp') as directory:
-        runner.workspace = Path(directory)
-        with socket.socket(socket.AF_UNIX) as listener:
-            listener.bind(str(runner.workspace / 'socket'))
-            with pytest.raises(RuntimeError, match='socket special file'):
-                runner.freeze_input()
-    assert 'input_snapshot' not in runner.state
+    (source / 'link').symlink_to('original')
+    runner.args.base_commit = commit_source(source)
+    runner.freeze_input()
+    with pytest.raises(subprocess.CalledProcessError) as failure:
+        prepare_snapshot(runner, tmp_path / 'frozen')
+    assert 'link' in failure.value.stderr
 
 
 @pytest.mark.parametrize('kind', ['same', 'state_inside_source', 'source_inside_state'])
@@ -604,8 +635,8 @@ def test_launch_mounts_only_frozen_input(tmp_path, monkeypatch):
     runner = module.Host.__new__(module.Host)
     runner.root, runner.name, runner.state = tmp_path, 'owned', {}
     import hashlib
-    (tmp_path / 'input.tar').write_bytes(b'prepared archive')
-    runner.state['input_snapshot'] = {'archive_sha256': hashlib.sha256(b'prepared archive').hexdigest()}
+    (tmp_path / 'input.bundle').write_bytes(b'prepared bundle')
+    runner.state['input_snapshot'] = {'base_commit': 'a' * 40, 'bundle_sha256': hashlib.sha256(b'prepared bundle').hexdigest()}
     runner.args = SimpleNamespace(workspace=tmp_path / 'mutable', auth_file=tmp_path / 'auth',
                                   synthetic_dns=False, proxy_image='proxy', image='agent')
     runner.start_observer = Mock()
@@ -613,7 +644,8 @@ def test_launch_mounts_only_frozen_input(tmp_path, monkeypatch):
     monkeypatch.setattr(module, 'docker', lambda *args: calls.append(args))
     runner.launch()
     candidate = next(c for c in calls if c[:5] == ('run', '-d', '--name', 'owned', '--network'))
-    assert f'type=bind,src={tmp_path}/input.tar,dst=/input.tar,readonly' in candidate
+    assert f'type=bind,src={tmp_path}/input.bundle,dst=/input.bundle,readonly' in candidate
+    assert f'type=bind,src={module.GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly' in candidate
     assert not any(str(tmp_path / 'mutable') in arg for arg in candidate)
 
 
@@ -641,11 +673,13 @@ def test_workspace_alias_retargeting_does_not_change_canonical_source(tmp_path, 
     source = tmp_path / 'source'
     source.mkdir()
     (source / 'original').write_text('original')
+    git(source, 'init', '--template=')
+    base = commit_source(source)
     alias = tmp_path / 'alias'
     alias.symlink_to(source, target_is_directory=True)
     state = tmp_path / 'private'
     args = SimpleNamespace(workspace=alias, state_dir=state, server_url='http://localhost',
-                           image='image', proxy_image='proxy', model='model', timeout=30, synthetic_dns=False)
+                           image='image', proxy_image='proxy', model='model', timeout=30, synthetic_dns=False, base_commit=base)
     monkeypatch.setenv('HARNESS_API_TOKEN', 'test-only')
     runner = module.Host(args)
     try:
@@ -653,9 +687,11 @@ def test_workspace_alias_retargeting_does_not_change_canonical_source(tmp_path, 
         alias.symlink_to(state, target_is_directory=True)
         runner.freeze_input()
         assert runner.state['identity']['workspace'] == str(source.resolve())
-        with tarfile.open(state / 'input.tar') as archive:
-            assert './original' in archive.getnames()
-            assert not any('input.tar' in name for name in archive.getnames())
+        frozen = tmp_path / 'frozen'
+        prepare_snapshot(runner, frozen)
+        assert (frozen / 'original').read_text() == 'original'
+        assert not (frozen / 'input.bundle').exists()
+        assert runner.state['identity']['base_commit'] == base
     finally:
         runner.lock.close()
 
@@ -664,8 +700,8 @@ def test_launch_passes_prepared_digest_to_consumer_before_auth_copy(tmp_path, mo
     from types import SimpleNamespace
     runner, _ = snapshot_runner(tmp_path)
     runner.freeze_input()
-    expected = runner.state['input_snapshot']['archive_sha256']
-    (runner.root / 'input.tar').write_bytes(b'changed bytes')
+    expected = runner.state['input_snapshot']['bundle_sha256']
+    (runner.root / 'input.bundle').write_bytes(b'changed bytes')
     runner.name = 'owned'
     runner.args = SimpleNamespace(auth_file=tmp_path / 'auth', image='image',
                                   proxy_image='proxy', synthetic_dns=False)
@@ -674,8 +710,9 @@ def test_launch_passes_prepared_digest_to_consumer_before_auth_copy(tmp_path, mo
     def docker(*args):
         calls.append(args)
         if args[0] == 'exec':
-            assert args[-1] == expected
-            assert 'file_digest' in args[-2]
+            assert args[2:6] == ('python3', '-I', '/git-handoff.py', 'prepare')
+            assert args[-2:] == (expected, '/workspace')
+            assert args[-3] == runner.state['input_snapshot']['base_commit']
             raise RuntimeError('consumer rejected input digest')
         return ''
     monkeypatch.setitem(runner.launch.__globals__, 'docker', docker)
@@ -684,17 +721,15 @@ def test_launch_passes_prepared_digest_to_consumer_before_auth_copy(tmp_path, mo
     assert not any('cp /run/codex-auth' in argument for call in calls for argument in call)
 
 
-def test_unpack_checks_mounted_bytes_before_creating_candidate_files(tmp_path):
-    module = load()
-    archive = tmp_path / 'input.tar'
-    archive.write_bytes(b'changed after host check')
+def test_prepare_checks_mounted_bytes_before_creating_candidate_files(tmp_path):
+    runner, _ = snapshot_runner(tmp_path)
+    runner.freeze_input()
+    (runner.root / 'input.bundle').write_bytes(b'changed after host check')
     workspace = tmp_path / 'workspace'
-    workspace.mkdir()
-    script = module.INPUT_UNPACK_SCRIPT.replace("'/input.tar'", repr(str(archive))).replace("'/workspace'", repr(str(workspace)))
-    result = subprocess.run([sys.executable, '-I', '-c', script, '0' * 64], capture_output=True, text=True)
-    assert result.returncode != 0
-    assert 'digest does not match' in result.stderr
-    assert not list(workspace.iterdir())
+    with pytest.raises(subprocess.CalledProcessError) as failure:
+        prepare_snapshot(runner, workspace)
+    assert 'digest' in failure.value.stderr
+    assert not workspace.exists()
 
 
 def test_wait_uses_only_persisted_server_prompt(tmp_path, monkeypatch):
@@ -762,7 +797,9 @@ def claimed_runner(tmp_path):
     runner.api = Mock(side_effect=[{}, claim])
     runner.launch = Mock()
     runner.wait = Mock(return_value=0)
-    runner.capture = Mock()
+    runner.capture = Mock(side_effect=lambda: runner.state.update(git_handoff={
+        'base_commit': 'a' * 40, 'candidate_commit': 'b' * 40,
+        'bundle_sha256': 'c' * 64, 'verified': False}))
     runner.verify = Mock(return_value=0)
     runner.collect_resources = Mock()
     runner.cleanup = Mock()
@@ -783,6 +820,10 @@ def test_rendered_claim_and_native_result_survive_completion_and_restart(tmp_pat
     assert saved['prepared_prompt'] == claim['prepared_prompt']
     assert saved['agent_result'] == native
     assert saved['result']['signals'] == native['signals']
+    assert saved['git_handoff']['verified'] is True
+    evidence = next(a['artifact'] for a in saved['result']['artifacts']
+                    if a['artifact_type'] == 'supervised_git_handoff')
+    assert evidence == saved['git_handoff']
     runner.verify.assert_called_once()
     runner.launch.reset_mock()
     runner.run()
@@ -826,12 +867,13 @@ def test_verifier_failure_does_not_forward_success_signal(tmp_path):
     assert runner.state['result']['status'] == 'failed'
     assert runner.state['result']['signals'] == []
     assert 'verifier rejected' in runner.state['result']['error']
+    assert runner.state['git_handoff']['verified'] is False
     assert runner.state['agent_result']['signals']
 
 
 @pytest.mark.parametrize('artifact_type', [
     'runtime_host_usage', 'supervised_input_snapshot',
-    'supervised_candidate_resources', 'supervised_docker_verification',
+    'supervised_candidate_resources', 'supervised_docker_verification', 'supervised_git_handoff',
 ])
 def test_native_artifacts_cannot_impersonate_host_evidence(tmp_path, artifact_type):
     runner, _ = claimed_runner(tmp_path)
@@ -853,3 +895,52 @@ def test_native_artifacts_cannot_impersonate_host_evidence(tmp_path, artifact_ty
     runner.capture.assert_not_called()
     runner.verify.assert_not_called()
     runner.complete.assert_called_once()
+
+
+def test_verifier_reconstructs_pinned_bundle_offline_before_running_verifier(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = load()
+    runner = host(tmp_path, 'executing')
+    runner.name = 'owned'
+    runner.args = SimpleNamespace(image='pinned-image')
+    runner.renew = Mock()
+    handoff = {'base_commit': 'a' * 40, 'candidate_commit': 'b' * 40,
+               'bundle_sha256': 'c' * 64, 'verified': False}
+    runner.state['git_handoff'] = handoff
+    calls = []
+
+    def docker(*args):
+        calls.append(args)
+        if args[0] == 'inspect':
+            return json.dumps({'Running': False, 'ExitCode': 0})
+        return 'verified output'
+
+    monkeypatch.setitem(runner.verify.__globals__, 'docker', docker)
+    assert runner.verify() == 0
+    command = calls[0]
+    assert command[:7] == ('run', '-d', '--name', 'owned-verify', '--network', 'none', '--read-only')
+    assert f'type=bind,src={tmp_path}/candidate,dst=/handoff,readonly' in command
+    assert f'type=bind,src={module.GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly' in command
+    assert any(arg.startswith('/candidate:rw,') for arg in command)
+    assert not any('auth' in arg for arg in command)
+    assert command[-3:] == (handoff['base_commit'], handoff['candidate_commit'], handoff['bundle_sha256'])
+    script = command[command.index('-c') + 1]
+    events = []
+    monkeypatch.setattr(sys, 'argv', ['-c', *command[-3:]])
+    monkeypatch.setattr(subprocess, 'run', lambda args, **kw: events.append(('reconstruct', args, kw)))
+    monkeypatch.setattr(subprocess, 'call', lambda args: events.append(('verify', args)) or 0)
+    with pytest.raises(SystemExit) as outcome:
+        exec(script, {})
+    assert outcome.value.code == 0
+    assert events == [
+        ('reconstruct', ['python3', '-I', '/git-handoff.py', 'verify', '/handoff/candidate.bundle',
+                         *command[-3:], '/handoff/workspace', '/candidate'], {'check': True}),
+        ('verify', ['python3', '-I', '/verify.py', '/candidate']),
+    ]
+    events.clear()
+    monkeypatch.setattr(subprocess, 'run', Mock(side_effect=subprocess.CalledProcessError(1, 'reconstruct')))
+    with pytest.raises(subprocess.CalledProcessError):
+        exec(script, {})
+    assert not events
+    assert (tmp_path / 'verifier.stdout').read_text() == 'verified output'
+    assert handoff['verified'] is False

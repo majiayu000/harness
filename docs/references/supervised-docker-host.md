@@ -26,7 +26,7 @@ by project: do not point this client at a shared server with unrelated jobs.
 
 ## Inputs and operation
 
-Prepare a small source directory from a recorded revision and an evaluator-owned
+Prepare a small Git repository with a full base commit SHA and an evaluator-owned
 Python verifier. Prove that the verifier rejects the unchanged source before the
 run. The verifier receives `/candidate` as its only argument and exits zero only
 when the requested behavior is correct. It must not import acceptance criteria
@@ -35,9 +35,13 @@ credentials or access to the server token.
 
 Use local Docker image IDs (`sha256:...`) for both images. Build the existing
 `docker/agent/Dockerfile` and `docker/egress-proxy/Dockerfile` if necessary. The
-agent image needs Codex, Python, `tar`, and GNU `timeout`; it currently does not
-include the Rust toolchain. Source archives containing links or special files are
-rejected. This first client is intended for small source-only tasks.
+agent image needs Codex, Git, Python, and GNU `timeout`; it currently does not
+include the Rust toolchain. Git trees containing symbolic links or submodules are
+rejected. This client is intended for small repositories that fit its tmpfs limits.
+The submitted task must explicitly require committing all changes and supply the
+authorized Git author identity (for example through `git -c user.name=... -c
+user.email=... commit`). The runner does not invent an author or append instructions
+to the server-rendered prompt. Uncommitted or extra candidate files fail export.
 
 Set `HARNESS_API_TOKEN` in the host environment, and run:
 
@@ -47,6 +51,7 @@ python3 scripts/run-supervised-docker-host.py \
   --request /private/run/request.json \
   --submission /private/run/submission.json \
   --workspace /private/run/source \
+  --base-commit FULL_40_CHARACTER_BASE_SHA \
   --verifier /private/run/verify.py \
   --auth-file /private/run/codex-auth.json \
   --state-dir /private/run/host-state \
@@ -93,52 +98,57 @@ Only host-captured Codex `item.completed` agent messages supply the single fence
 `harness-activity-result` JSON object. Missing, duplicate, malformed or wrong-activity
 results fail; tool output and candidate files cannot substitute for it. Native
 artifacts, signals and validation records remain JSON values, and the completion
-endpoint validates the full result contract. Agent artifacts cannot use the four
+endpoint validates the full result contract. Agent artifacts cannot use the five
 host-owned evidence types (`runtime_host_usage`, `supervised_input_snapshot`,
-`supervised_candidate_resources`, `supervised_docker_verification`); collisions
+`supervised_candidate_resources`, `supervised_docker_verification`,
+`supervised_git_handoff`); collisions
 fail while retaining the original agent result for diagnosis. A successful agent result also needs
 the existing independent offline verifier and resource evidence. A host failure
 reports failure without forwarding success signals. Non-success agent outcomes
 retain their status and evidence and do not become success merely because Codex
 exited zero. Resume retains the delivered prompt and never invokes the model again.
 
-## Frozen source input
+## Pinned Git handoff
 
-Before claiming a job, the runner packages the source directory into private
-`input.tar` and validates that the completed archive contains only regular files
-and directories. A socket-only source scan rejects Unix sockets, which tar
-creation otherwise silently omits. Tar creation records FIFOs and links as headers
-without reading their contents; the archive boundary rejects them before accepting preparation.
-This input protection is new; the earlier live workspace mount did not validate
-source files. The canonical source path is resolved once during initialization
-and reused for identity and preparation, so retargeting the original path alias
-does not switch the copied directory. Source and state directories cannot equal
-or contain each other.
+Before claiming a job, the runner exports `--base-commit` and only its reachable
+history into `input.bundle`. The full lowercase SHA-1 and bundle SHA-256 are
+persisted in `supervised_input_snapshot`. Later branches, worktree modifications,
+and untracked files in the operator's source repository are not exported. The
+canonical source path is resolved once for identity and preparation; source and
+state directories cannot overlap. Existing bundle bytes are reused after a
+restart while awaiting a claim. Failed or interrupted preparation cannot claim
+or recopy from that state directory.
 
-The candidate mounts only the retained archive at `/input.tar`, read-only.
-The trusted container preparation command checks its SHA-256 against run state
-at the consumption boundary and safely extracts from that same file descriptor into writable `/workspace`, before
-model execution. This trusted, self-created relative archive uses GNU tar with
-`--no-same-owner --no-same-permissions`: the non-root container user owns the
-files and its umask applies. Executable bits are retained where the umask permits;
-source read-only modes remain read-only but the owner can change them. Untrusted
-candidate-output extraction continues to use the existing Python data filter. There is no separate mutable host extraction tree to diverge from
-the reported digest. Subsequent original-source edits do not change this input;
-archive corruption before a delayed claim or restart fails explicitly.
+The agent mounts the bundle and trusted helper read-only. Before model execution,
+the helper verifies the digest and exact base ref, imports into a fresh repository,
+and materializes raw Git blobs into `/workspace` with a detached HEAD and index.
+Git attributes, checkout filters, user configuration and hooks are not copied.
+Only regular files and Git executable bits are supported. This includes the
+base's reachable history: the operator must choose a base whose history is safe
+to disclose. It is not a secret scanner or protection against an operator editing
+private run state concurrently.
 
-The archive SHA-256 is persisted in state and `supervised_input_snapshot` result
-evidence. It identifies source archive bytes, not a Git commit or an atomic
-capture of a concurrently changing source directory. This is not protection
-against an actively malicious operator modifying private state concurrently.
-Prepare the source deliberately: this operation does not scan for secrets or
-make arbitrary repository metadata safe to export.
+After stopping agent processes, the exporter reads candidate HEAD and copies only
+Git object files into an isolated repository. It does not execute Git against the
+candidate's configuration, hooks, index, alternates or replacement refs. The base
+must be an ancestor of candidate HEAD. Every workspace file outside root `.git`
+must match the commit's raw blobs and executable bits, including ignored files;
+dirty, extra, linked or special files fail. Ordinary empty directories are ignored.
+The host retains `candidate.tar`, containing `candidate.bundle`, `revision.json`
+and the matching `workspace/` snapshot, then removes the candidate container.
 
-A restart while awaiting a claim reuses the prepared archive without recopying
-the original source. Interrupted or failed preparation is retained explicitly and
-cannot claim or rerun from that state directory. Existing executing-run recovery
-still reports failure without another model invocation. This remains a
-single-task source-byte handoff, not historical checkout/candidate commit
-proof or complete eval support.
+The offline verifier receives that wrapper read-only at `/handoff`. The trusted
+helper checks the pinned candidate bundle, ancestry and snapshot again, then
+reconstructs raw commit files into a fresh `/candidate` tmpfs before invoking the
+operator's verifier. The verifier never reads an agent-controlled working tree or
+Git configuration. `supervised_git_handoff` records base/candidate commit IDs,
+candidate bundle SHA-256 and whether independent verification succeeded. Failed
+verification retains the pins with `verified: false` and drops success signals.
+
+This is a single-task Git handoff. A local candidate commit is not an externally
+published PR head. Multi-activity handoff, historical evaluation contracts and a
+formal baseline remain unsupported; eval and pinned-contract jobs are rejected.
+There is no source-directory-only mode or old-state migration.
 
 ## Candidate resource evidence
 
