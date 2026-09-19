@@ -251,6 +251,25 @@ async fn overview_returns_expected_shape() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn overview_fails_when_alert_delivery_query_fails() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = test_helpers::tempdir_in_home("harness-test-overview-alert-failure-")?;
+    let state = test_helpers::make_test_state(dir.path()).await?;
+    // A directory at the signal log path makes opening or reading it fail,
+    // without relying on filesystem permissions or touching other fixtures.
+    std::fs::create_dir(dir.path().join("signals.jsonl"))?;
+
+    let (status, body) = overview(State(Arc::new(state))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body.0 .0["error"], "exhausted alert deliveries unavailable");
+    assert!(body.0 .0.get("alerts").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn status_stalled_terminal_overview_counts_budget_exhaustion() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     if !test_helpers::db_tests_enabled().await {

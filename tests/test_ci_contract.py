@@ -681,7 +681,7 @@ CI_MUTATIONS = [
     ),
     (
         "audit action",
-        "      - uses: rustsec/audit-check@v2.0.0",
+        "      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0",
         "      - uses: actions/checkout@v4",
     ),
     (

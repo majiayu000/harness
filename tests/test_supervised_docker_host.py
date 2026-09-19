@@ -22,6 +22,27 @@ def load():
     return module
 
 
+def prepared_prompt():
+    return {"prompt": "Server-rendered task and result contract.",
+            "prompt_packet_digest": "a" * 64, "activity_result_schema": {"activity": "modify"}}
+
+
+def native_result(status="succeeded"):
+    return {"activity": "modify", "status": status, "summary": "Observed result",
+            "artifacts": [{"artifact_type": "findings", "artifact": {"items": [1]}}],
+            "signals": [{"signal_type": "Modified", "signal": {"count": 1}}],
+            "validation": [{"command": "check", "status": "passed"}],
+            "error": None, "error_kind": None}
+
+
+def write_result_log(path, result):
+    message = {"type": "item.completed", "item": {"type": "agent_message",
+               "text": "```harness-activity-result\n" + json.dumps(result) + "\n```"}}
+    usage = {"type": "turn.completed", "usage": {
+        "input_tokens": 120, "output_tokens": 30, "cached_input_tokens": 80}}
+    path.write_text(json.dumps(message) + "\n" + json.dumps(usage) + "\n")
+
+
 def host(tmp_path, phase):
     module = load()
     result = module.Host.__new__(module.Host)
@@ -157,7 +178,7 @@ def test_keyboard_interrupt_persists_failure_before_cleanup(tmp_path):
     runner.state.update(request=request, submission=submission)
     runner.name = 'test'
     digest = hashlib.sha256(b'\0'.join(x.encode() for x in [str(tmp_path), '', 'task-id', 'task'])).hexdigest()
-    claim = {'claimed': True, **runner.state['lease'], 'runtime_job': {
+    claim = {'claimed': True, 'prepared_prompt': prepared_prompt(), **runner.state['lease'], 'runtime_job': {
         'id': 'job', 'input': {'activity': 'modify', 'workflow_id': 'workflow-id',
                              'command': {'prompt_ref': 'prompt-memory:' + digest}}}}
     runner.api = Mock(side_effect=[{}, claim])
@@ -463,7 +484,7 @@ def test_capture_failure_retains_completed_model_usage(tmp_path):
     runner.state.update(request={'project': str(tmp_path), 'prompt': 'task'},
                         submission={'task_id': 'task-id', 'workflow_id': 'workflow-id'})
     digest = hashlib.sha256(b'\0'.join(x.encode() for x in [str(tmp_path), '', 'task-id', 'task'])).hexdigest()
-    claim = {'claimed': True, **runner.state['lease'], 'runtime_job': {
+    claim = {'claimed': True, 'prepared_prompt': prepared_prompt(), **runner.state['lease'], 'runtime_job': {
         'id': 'job', 'input': {'activity': 'modify', 'workflow_id': 'workflow-id',
                              'command': {'prompt_ref': 'prompt-memory:' + digest}}}}
     runner.api = Mock(side_effect=[{}, claim])
@@ -472,8 +493,7 @@ def test_capture_failure_retains_completed_model_usage(tmp_path):
     runner.capture = Mock(side_effect=RuntimeError('candidate did not quiesce'))
     runner.cleanup = Mock()
     runner.complete = Mock()
-    (tmp_path / 'agent.jsonl').write_text(json.dumps({'type': 'turn.completed', 'usage': {
-        'input_tokens': 120, 'output_tokens': 30, 'cached_input_tokens': 80}}) + '\n')
+    write_result_log(tmp_path / 'agent.jsonl', native_result())
     runner.run()
     result = runner.state['result']
     assert result['status'] == 'failed'
@@ -675,3 +695,161 @@ def test_unpack_checks_mounted_bytes_before_creating_candidate_files(tmp_path):
     assert result.returncode != 0
     assert 'digest does not match' in result.stderr
     assert not list(workspace.iterdir())
+
+
+def test_wait_uses_only_persisted_server_prompt(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    runner = host(tmp_path, 'executing')
+    runner.name = 'test'
+    runner.args = SimpleNamespace(model='model', timeout=20)
+    runner.state.update(request={'prompt': 'raw task'}, prepared_prompt=prepared_prompt())
+    stream = Mock(return_value=0)
+    monkeypatch.setitem(runner.wait.__globals__, 'stream_agent_output', stream)
+    assert runner.wait() == 0
+    command = stream.call_args.args[0]
+    assert command[-1] == prepared_prompt()['prompt']
+    assert 'raw task' not in command
+
+
+def test_native_payloads_are_preserved_without_encoding(tmp_path):
+    runner = host(tmp_path, 'executing')
+    native = native_result()
+    write_result_log(tmp_path / 'agent.jsonl', native)
+    parsed = runner.wait.__globals__['read_activity_result'](tmp_path / 'agent.jsonl', 'modify')
+    result = runner.result(parsed['status'], parsed['summary'], [{'artifact_type': 'host', 'artifact': {}}], parsed)
+    assert result['signals'] == native['signals']
+    assert result['validation'] == native['validation']
+    assert result['artifacts'][0] == native['artifacts'][0]
+    assert result['summary'] == native['summary']
+
+
+@pytest.mark.parametrize('kind', ['missing', 'duplicate', 'tool_output', 'wrong_activity', 'malformed', 'wrong_arrays'])
+def test_invalid_native_results_fail_clearly(tmp_path, kind):
+    module = load()
+    log = tmp_path / 'agent.jsonl'
+    result = native_result()
+    if kind == 'wrong_activity':
+        result['activity'] = 'different'
+    if kind == 'wrong_arrays':
+        result['signals'] = 'encoded'
+    write_result_log(log, result)
+    text = log.read_text()
+    if kind == 'missing':
+        text = '{"type":"turn.completed","usage":{}}'
+    elif kind == 'duplicate':
+        text *= 2
+    elif kind == 'tool_output':
+        text = text.replace('agent_message', 'command_execution')
+    elif kind == 'malformed':
+        text = text.replace('```harness-activity-result\\n{', '```harness-activity-result\\ninvalid{')
+    log.write_text(text)
+    with pytest.raises((RuntimeError, ValueError)):
+        module.read_activity_result(log, 'modify')
+
+
+def claimed_runner(tmp_path):
+    import hashlib
+    from types import SimpleNamespace
+    runner = host(tmp_path, 'claiming')
+    runner.name = 'test'
+    runner.args = SimpleNamespace(model='model', image='image')
+    runner.state.update(request={'project': str(tmp_path), 'prompt': 'task'},
+                        submission={'task_id': 'task-id', 'workflow_id': 'workflow-id'})
+    digest = hashlib.sha256(b'\0'.join(x.encode() for x in [str(tmp_path), '', 'task-id', 'task'])).hexdigest()
+    claim = {'claimed': True, 'prepared_prompt': prepared_prompt(), **runner.state['lease'],
+             'runtime_job': {'id': 'job', 'input': {'activity': 'modify', 'workflow_id': 'workflow-id',
+                             'command': {'prompt_ref': 'prompt-memory:' + digest}}}}
+    runner.api = Mock(side_effect=[{}, claim])
+    runner.launch = Mock()
+    runner.wait = Mock(return_value=0)
+    runner.capture = Mock()
+    runner.verify = Mock(return_value=0)
+    runner.collect_resources = Mock()
+    runner.cleanup = Mock()
+    runner.complete = Mock()
+    (tmp_path / 'candidate.tar').write_bytes(b'candidate')
+    (tmp_path / 'verifier.py').write_text('pass')
+    return runner, claim
+
+
+def test_rendered_claim_and_native_result_survive_completion_and_restart(tmp_path):
+    runner, claim = claimed_runner(tmp_path)
+    native = native_result()
+    write_result_log(tmp_path / 'agent.jsonl', native)
+    runner.run()
+    assert runner.api.call_args_list[1].args[1]['execution_workspace'] == '/workspace'
+    assert runner.api.call_args_list[0].args[1]['capabilities'] == ['runtime_job_lease_proof_v1']
+    saved = json.loads((tmp_path / 'state.json').read_text())
+    assert saved['prepared_prompt'] == claim['prepared_prompt']
+    assert saved['agent_result'] == native
+    assert saved['result']['signals'] == native['signals']
+    runner.verify.assert_called_once()
+    runner.launch.reset_mock()
+    runner.run()
+    runner.launch.assert_not_called()
+
+
+@pytest.mark.parametrize('defect', ['missing', 'schema', 'digest'])
+def test_invalid_prepared_prompt_fails_before_launch(tmp_path, defect):
+    runner, claim = claimed_runner(tmp_path)
+    if defect == 'missing':
+        del claim['prepared_prompt']
+    elif defect == 'schema':
+        claim['prepared_prompt']['activity_result_schema']['activity'] = 'other'
+    else:
+        claim['prepared_prompt']['prompt_packet_digest'] = ''
+    runner.run()
+    runner.launch.assert_not_called()
+    assert runner.state['result']['status'] == 'failed'
+    runner.complete.assert_called_once()
+
+
+@pytest.mark.parametrize('status', ['failed', 'blocked', 'cancelled'])
+def test_non_success_result_is_not_promoted_by_zero_exit(tmp_path, status):
+    runner, _ = claimed_runner(tmp_path)
+    native = native_result(status)
+    native.update(error='cannot proceed', error_kind='external_dependency')
+    write_result_log(tmp_path / 'agent.jsonl', native)
+    runner.run()
+    assert runner.state['result']['status'] == status
+    assert runner.state['result']['error'] == 'cannot proceed'
+    assert runner.state['result']['error_kind'] == 'external_dependency'
+    runner.verify.assert_not_called()
+    runner.collect_resources.assert_called_once_with(stop_agents=True)
+
+
+def test_verifier_failure_does_not_forward_success_signal(tmp_path):
+    runner, _ = claimed_runner(tmp_path)
+    runner.verify.return_value = 1
+    write_result_log(tmp_path / 'agent.jsonl', native_result())
+    runner.run()
+    assert runner.state['result']['status'] == 'failed'
+    assert runner.state['result']['signals'] == []
+    assert 'verifier rejected' in runner.state['result']['error']
+    assert runner.state['agent_result']['signals']
+
+
+@pytest.mark.parametrize('artifact_type', [
+    'runtime_host_usage', 'supervised_input_snapshot',
+    'supervised_candidate_resources', 'supervised_docker_verification',
+])
+def test_native_artifacts_cannot_impersonate_host_evidence(tmp_path, artifact_type):
+    runner, _ = claimed_runner(tmp_path)
+    native = native_result()
+    forged = {'artifact_type': artifact_type, 'artifact': {'forged': True}}
+    native['artifacts'].insert(0, forged)
+    write_result_log(tmp_path / 'agent.jsonl', native)
+    runner.run()
+    result = runner.state['result']
+    assert result['status'] == 'failed'
+    assert 'host-owned artifact: ' + artifact_type in result['error']
+    assert result['signals'] == []
+    assert forged not in result['artifacts']
+    usage = [a['artifact'] for a in result['artifacts'] if a['artifact_type'] == 'runtime_host_usage']
+    assert len(usage) == 1
+    assert usage[0]['input_tokens'] == 120
+    saved = json.loads((tmp_path / 'state.json').read_text())
+    assert saved['agent_result'] == native
+    runner.capture.assert_not_called()
+    runner.verify.assert_not_called()
+    runner.complete.assert_called_once()

@@ -11,21 +11,11 @@ pub async fn skill_create(
     name: String,
     content: String,
 ) -> RpcResponse {
-    // Reject names that could traverse outside the skills directory when used as a filename.
-    if name.contains('/')
-        || name.contains('\\')
-        || name.contains("..")
-        || name.is_empty()
-        || name.chars().any(|c| c.is_control())
-    {
-        return RpcResponse::error(
-            id,
-            INTERNAL_ERROR,
-            "skill name must not contain path separators, '..', or control characters",
-        );
-    }
     let mut skills = state.engines.skills.write().await;
-    let skill = skills.create(name, content).clone();
+    let skill = match skills.create(name, content) {
+        Ok(skill) => skill.clone(),
+        Err(error) => return RpcResponse::error(id, INTERNAL_ERROR, error.to_string()),
+    };
     match serde_json::to_value(&skill) {
         Ok(v) => RpcResponse::success(id, v),
         Err(e) => RpcResponse::error(id, INTERNAL_ERROR, e.to_string()),
@@ -362,10 +352,12 @@ mod tests {
 
         let skill_id = {
             let mut store = state.engines.skills.write().await;
-            store.create(
-                "view-skill".to_string(),
-                "# view\n<!-- trigger-patterns: view -->".to_string(),
-            );
+            store
+                .create(
+                    "view-skill".to_string(),
+                    "# view\n<!-- trigger-patterns: view -->".to_string(),
+                )
+                .unwrap();
             store
                 .get_by_name("view-skill")
                 .expect("skill should exist")
