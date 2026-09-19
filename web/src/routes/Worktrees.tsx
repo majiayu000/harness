@@ -3,10 +3,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { Sidebar, type SidebarSection } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
+import { TaskDetailSlideover } from "@/components/TaskDetailSlideover";
 import { PaletteFab } from "@/components/PaletteFab";
 import { DOCS_URL } from "@/lib/links";
 import { useWorktrees, useOverview } from "@/lib/queries";
-import { apiFetch, runtimeSubmissionPath } from "@/lib/api";
+import { apiFetch } from "@/lib/api";
 import type { WorktreeCard } from "@/lib/queries";
 
 function formatDuration(seconds: number): string {
@@ -47,17 +48,14 @@ function statusColor(status: string): string {
   }
 }
 
-function openStream(submissionId: string): void {
-  window.open(runtimeSubmissionPath(submissionId, "stream"), "_blank", "noreferrer");
-}
-
 interface CardProps {
   card: WorktreeCard;
   onCancel: (card: WorktreeCard) => void;
   cancelling: boolean;
+  onLogs: (submissionId: string) => void;
 }
 
-function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
+function WorktreeCardItem({ card, onCancel, cancelling, onLogs }: CardProps) {
   const pct = card.maxTurns != null && card.maxTurns > 0 ? Math.round((card.turn / card.maxTurns) * 100) : null;
   const failed = card.status === "failed";
 
@@ -133,7 +131,7 @@ function WorktreeCardItem({ card, onCancel, cancelling }: CardProps) {
           disabled={!card.runtimeSubmissionId}
           title={card.runtimeSubmissionId ? undefined : "Runtime submission id unavailable"}
           onClick={() => {
-            if (card.runtimeSubmissionId) openStream(card.runtimeSubmissionId);
+            if (card.runtimeSubmissionId) onLogs(card.runtimeSubmissionId);
           }}
           className="font-mono text-[11.5px] px-3 py-1 border border-line-2 text-ink-2 rounded-[3px] hover:bg-bg-2 hover:text-ink disabled:opacity-50 disabled:cursor-not-allowed"
         >
@@ -163,6 +161,7 @@ export function Worktrees() {
   const queryClient = useQueryClient();
 
   const [cancelling, setCancelling] = React.useState<Set<string>>(new Set());
+  const [selectedSubmissionId, setSelectedSubmissionId] = React.useState<string | null>(null);
   const [cancelError, setCancelError] = React.useState<string | null>(null);
 
   const handleCancel = async (card: WorktreeCard) => {
@@ -274,6 +273,7 @@ export function Worktrees() {
                     key={card.taskId}
                     card={card}
                     onCancel={handleCancel}
+                    onLogs={setSelectedSubmissionId}
                     cancelling={cancelling.has(cancelStateKey(card))}
                   />
                 ))}
@@ -283,6 +283,12 @@ export function Worktrees() {
         </div>
       </main>
       <PaletteFab />
+      {selectedSubmissionId && (
+        <TaskDetailSlideover
+          taskId={selectedSubmissionId}
+          onClose={() => setSelectedSubmissionId(null)}
+        />
+      )}
     </div>
   );
 }

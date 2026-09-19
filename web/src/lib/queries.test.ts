@@ -3,7 +3,6 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
 import { useAllTasks, useTasks, useWorktrees, useTaskDetail, useTaskStream } from "./queries";
-import { TOKEN_KEY } from "./api";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -129,39 +128,6 @@ describe("useWorktrees", () => {
       "implementing-short",
       "queued",
     ]);
-  });
-});
-
-// ── stream URL construction ───────────────────────────────────────────────────
-// Mirrors the logic in openStream() in Worktrees.tsx to prevent regressions.
-
-function buildStreamUrl(taskId: string): string {
-  return `/api/workflows/runtime/submissions/${encodeURIComponent(taskId)}/stream`;
-}
-
-describe("stream URL construction", () => {
-  it("uses the workflow runtime submission stream path", () => {
-    expect(buildStreamUrl("abc-123")).toBe(
-      "/api/workflows/runtime/submissions/abc-123/stream",
-    );
-  });
-
-  it("does not put the session token in the stream URL", () => {
-    sessionStorage.setItem(TOKEN_KEY, "mytoken");
-    expect(buildStreamUrl("abc-123")).toBe(
-      "/api/workflows/runtime/submissions/abc-123/stream",
-    );
-    expect(buildStreamUrl("abc-123")).not.toContain("token=");
-  });
-
-  it("omits token param when no session token", () => {
-    expect(buildStreamUrl("abc-123")).not.toContain("token=");
-  });
-
-  it("encodes submission handles that contain path separators", () => {
-    expect(buildStreamUrl("github-pr-feedback::/repo::pr:42")).toBe(
-      "/api/workflows/runtime/submissions/github-pr-feedback%3A%3A%2Frepo%3A%3Apr%3A42/stream",
-    );
   });
 });
 
