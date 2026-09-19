@@ -59,8 +59,8 @@ async fn execute_response_reports_launch_model() -> anyhow::Result<()> {
             env_vars: HashMap::new(),
             capability_token: None,
         };
-        let response = tokio::time::timeout(Duration::from_secs(10), agent.execute(request))
-            .await??;
+        let response =
+            tokio::time::timeout(Duration::from_secs(10), agent.execute(request)).await??;
         assert_eq!(response.model, expected);
         assert_eq!(response.output.trim(), expected);
         assert_eq!(response.exit_code, Some(0));
@@ -90,8 +90,8 @@ async fn review_response_reports_launch_model() -> anyhow::Result<()> {
             permission_mode: AgentPermissionMode::Full,
             env_vars: HashMap::new(),
         };
-        let response = tokio::time::timeout(Duration::from_secs(10), agent.execute_review(request))
-            .await??;
+        let response =
+            tokio::time::timeout(Duration::from_secs(10), agent.execute_review(request)).await??;
         assert_eq!(response.model, expected);
         assert_eq!(response.output.trim(), expected);
         assert_eq!(response.exit_code, Some(0));
