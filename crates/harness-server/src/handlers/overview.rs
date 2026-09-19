@@ -260,8 +260,13 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<O
             .filter(|s| s.source == "alerting" && s.payload["outcome"] == "exhausted")
             .count(),
         Err(e) => {
-            tracing::warn!("overview: failed to query exhausted alert deliveries: {e}");
-            0
+            tracing::error!("overview: failed to query exhausted alert deliveries: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OverviewResponse(
+                    json!({"error": "exhausted alert deliveries unavailable"}),
+                )),
+            );
         }
     };
     let alerts = build_alerts(&events, &runtime_hosts, alert_delivery_failures);
