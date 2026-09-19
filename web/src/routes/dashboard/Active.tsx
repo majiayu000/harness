@@ -512,6 +512,7 @@ export function Active({ projectFilter }: Props) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [merging, setMerging] = useState<Set<string>>(new Set());
   const [mergeError, setMergeError] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
   const [cancellingWorkflows, setCancellingWorkflows] = useState<Set<string>>(new Set());
   const { data: dashboard } = useDashboard();
   const queryClient = useQueryClient();
@@ -544,6 +545,7 @@ export function Active({ projectFilter }: Props) {
   };
 
   const handleCancelWorkflow = async (workflowId: string) => {
+    setCancelError(null);
     setCancellingWorkflows((prev) => new Set(prev).add(workflowId));
     try {
       await apiFetch("/api/workflows/runtime/cancel", {
@@ -552,7 +554,7 @@ export function Active({ projectFilter }: Props) {
         body: JSON.stringify({ workflow_id: workflowId }),
       });
     } catch (error) {
-      console.error("Failed to cancel runtime workflow", error);
+      setCancelError(error instanceof Error ? error.message : "Cancel failed");
     } finally {
       const refreshResults = await Promise.allSettled([
         queryClient.invalidateQueries({ queryKey: ["tasks"] }),
@@ -649,6 +651,11 @@ export function Active({ projectFilter }: Props) {
       {mergeError ? (
         <div role="alert" className="border border-rust/40 bg-rust/10 px-3 py-2 text-xs text-rust">
           {mergeError}
+        </div>
+      ) : null}
+      {cancelError ? (
+        <div role="alert" className="border border-rust/40 bg-rust/10 px-3 py-2 text-xs text-rust">
+          {cancelError}
         </div>
       ) : null}
       <div
