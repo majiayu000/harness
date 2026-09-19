@@ -579,7 +579,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "steps": [
             {"uses": "actions/checkout@v4"},
             {
-                "uses": "dorny/paths-filter@v3",
+                "uses": "dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3",
                 "id": "filter",
                 "with": {"filters": FILTERS},
             },
@@ -629,7 +629,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "steps": [
             {"uses": "actions/checkout@v4"},
             {
-                "uses": "dtolnay/rust-toolchain@stable",
+                "uses": "dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable",
                 "with": {"components": "rustfmt"},
             },
             {"run": "cargo fmt --all -- --check"},
@@ -643,7 +643,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "steps": [
             {"uses": "actions/checkout@v4"},
             {
-                "uses": "oven-sh/setup-bun@v2",
+                "uses": "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2",
                 "with": {"bun-version-file": ".bun-version"},
             },
             {
@@ -676,10 +676,10 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "steps": [
             {"uses": "actions/checkout@v4"},
             {
-                "uses": "dtolnay/rust-toolchain@stable",
+                "uses": "dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable",
                 "with": {"components": "clippy"},
             },
-            {"uses": "Swatinem/rust-cache@v2"},
+            {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2"},
             {
                 "uses": "actions/download-artifact@v4",
                 "with": {"name": "web-dist", "path": "web/dist"},
@@ -716,8 +716,8 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         },
         "steps": [
             {"uses": "actions/checkout@v4"},
-            {"uses": "dtolnay/rust-toolchain@stable"},
-            {"uses": "Swatinem/rust-cache@v2"},
+            {"uses": "dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable"},
+            {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2"},
             {
                 "name": "Configure Linux sandbox dependency",
                 "run": block(
@@ -778,7 +778,7 @@ EXPECTED_JOBS: dict[str, YamlValue] = {
         "steps": [
             {"uses": "actions/checkout@v4"},
             {
-                "uses": "rustsec/audit-check@v2.0.0",
+                "uses": "rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0",
                 "with": {"token": "${{ secrets.GITHUB_TOKEN }}"},
             },
         ],
