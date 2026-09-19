@@ -6,6 +6,10 @@ import { PaletteProvider } from "@/lib/palette";
 import { DOCS_URL } from "@/lib/links";
 import { Worktrees } from "./Worktrees";
 
+vi.mock("@/components/TaskDetailSlideover", () => ({
+  TaskDetailSlideover: ({ taskId }: { taskId: string }) => <div role="dialog">{taskId}</div>,
+}));
+
 vi.mock("@/lib/queries", () => ({
   useWorktrees: vi.fn(),
   useOverview: vi.fn(),
@@ -128,7 +132,6 @@ describe("<Worktrees>", () => {
   });
 
   it("opens runtime-owned worktree logs through the submission stream", () => {
-    const open = vi.spyOn(window, "open").mockImplementation(() => null);
     mockUseWorktrees.mockReturnValue({
       cards: [
         worktreeCard({
@@ -146,11 +149,7 @@ describe("<Worktrees>", () => {
     wrap(<Worktrees />);
     fireEvent.click(screen.getByRole("button", { name: "Logs" }));
 
-    expect(open).toHaveBeenCalledWith(
-      "/api/workflows/runtime/submissions/runtime-submission%3A%3A%2Frepo%2Fone/stream",
-      "_blank",
-      "noreferrer",
-    );
+    expect(screen.getByRole("dialog")).toHaveTextContent("runtime-submission::/repo/one");
   });
 
   it("cancels runtime worktrees through the workflow endpoint", async () => {
