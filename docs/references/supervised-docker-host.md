@@ -16,8 +16,10 @@ subprocess is added to Harness crates.
 
 Use a one-activity declarative workflow with `runtime_dispatch.runtime_kind:
 remote_host`. Its activity policy must authorize the supplied request prompt;
-this client does not implement server-side prompt composition, multi-activity
-workflows, pinned agent contracts, historical eval jobs, or PR lifecycle actions.
+the client requests server-rendered instructions for `/workspace` and retains the
+prompt, packet digest and native result schema before model execution. It does not
+implement multi-activity workflows, pinned agent contracts, historical eval jobs,
+or PR lifecycle actions.
 Submit through `POST /api/workflows/runtime/submissions` and retain both the exact
 request JSON and response JSON. The server currently cannot filter host claims
 by project: do not point this client at a shared server with unrelated jobs.
@@ -78,6 +80,27 @@ The host monitors wall time; GNU `timeout` separately bounds Codex if the host
 process dies. These are explicit trial limits, **not** a
 claim to implement every `CappedResourceLimits` field (especially aggregate CPU
 time), nor a measured full eval resource report.
+
+## Rendered activity results
+
+The runner executes the persisted `prepared_prompt.prompt`, not the raw submission
+text. Missing rendered instructions, digest or a mismatched schema activity fail
+before model execution. The raw request remains an identity check for the claimed
+submission. The packet digest is server-provided provenance, not a hash of the
+rendered prompt text.
+
+Only host-captured Codex `item.completed` agent messages supply the single fenced
+`harness-activity-result` JSON object. Missing, duplicate, malformed or wrong-activity
+results fail; tool output and candidate files cannot substitute for it. Native
+artifacts, signals and validation records remain JSON values, and the completion
+endpoint validates the full result contract. Agent artifacts cannot use the four
+host-owned evidence types (`runtime_host_usage`, `supervised_input_snapshot`,
+`supervised_candidate_resources`, `supervised_docker_verification`); collisions
+fail while retaining the original agent result for diagnosis. A successful agent result also needs
+the existing independent offline verifier and resource evidence. A host failure
+reports failure without forwarding success signals. Non-success agent outcomes
+retain their status and evidence and do not become success merely because Codex
+exited zero. Resume retains the delivered prompt and never invokes the model again.
 
 ## Frozen source input
 
