@@ -46,7 +46,9 @@ pub(crate) async fn decide_plan_issue(
                 task_id = %ctx.task_id.0,
                 "workflow runtime PLAN_ISSUE decision write failed: {error}"
             );
-            fallback
+            PlanIssueRuntimeAction::Block {
+                error: format!("PLAN_ISSUE decision write failed: {error}"),
+            }
         }
     }
 }

@@ -212,6 +212,7 @@ impl CodexAgent {
 
         args.push(OsString::from("-C"));
         args.push(OsString::from("."));
+        args.push(OsString::from("--"));
         args.push(OsString::from(req.prompt.clone()));
         args
     }
