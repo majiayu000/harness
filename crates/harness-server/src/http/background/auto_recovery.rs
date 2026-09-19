@@ -121,12 +121,34 @@ pub(in crate::http) fn spawn_auto_recovery(state: &Arc<AppState>) {
     let handle = state
         .background_loops
         .register_loop_with_interval("auto_recovery", github.auto_recovery.tick_interval_secs);
-    let state = state.clone();
+    let weak_state = Arc::downgrade(state);
+    let mut shutdown_rx = state.notifications.ws_shutdown_tx.subscribe();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tick_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                result = shutdown_rx.recv() => {
+                    match result {
+                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::info!(
+                                "workflow runtime auto-recovery stopping for shutdown"
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            tracing::warn!(
+                                "workflow runtime auto-recovery lagged shutdown signal"
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+            let Some(state) = weak_state.upgrade() else {
+                tracing::info!("workflow runtime auto-recovery stopping: app state owner dropped");
+                break;
+            };
             let Some(store) = state.core.workflow_runtime_store.as_ref() else {
                 handle.tick_failed("workflow runtime store unavailable");
                 continue;
