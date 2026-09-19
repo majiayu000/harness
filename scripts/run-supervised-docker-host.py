@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import selectors
 import stat
 from pathlib import Path
@@ -99,6 +100,29 @@ def stream_agent_output(command: list[str], root: Path, timeout: int, renew) -> 
             if primary_error is not None:
                 reason = f"{type(primary_error).__name__}: {primary_error}; {reason}"
             raise RuntimeError(reason) from primary_error
+
+
+def read_activity_result(log: Path, activity: str) -> dict:
+    # Only host-captured assistant messages carry results; tool output is untrusted.
+    messages = []
+    for line in log.read_text(encoding="utf-8").splitlines():
+        event = json.loads(line)
+        if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message":
+            messages.append(event["item"]["text"])
+    blocks = re.findall(r"^```harness-activity-result\s*\n(.*?)^```[ \t]*$",
+                        "\n".join(messages), re.MULTILINE | re.DOTALL)
+    if len(blocks) != 1:
+        raise RuntimeError("agent must emit exactly one harness-activity-result block")
+    result = json.loads(blocks[0])
+    if not isinstance(result, dict) or result.get("activity") != activity:
+        raise RuntimeError("agent result does not match the claimed activity")
+    if not isinstance(result.get("status"), str) or not isinstance(result.get("summary"), str):
+        raise RuntimeError("agent result requires status and summary strings")
+    for field in ("artifacts", "signals", "validation"):
+        if not isinstance(result.get(field, []), list):
+            raise RuntimeError(f"agent result {field} must be an array")
+    # The completion endpoint owns the full ActivityResult contract validation.
+    return result
 
 
 def read_usage(log: Path) -> dict:
@@ -381,7 +405,7 @@ class Host:
             "docker", "exec", "--workdir", "/workspace", self.name,
             "timeout", "--signal=KILL", str(self.args.timeout),
             "codex", "exec", "--skip-git-repo-check", "--json", "--sandbox", "danger-full-access",
-            "-m", self.args.model, self.state["request"]["prompt"],
+            "-m", self.args.model, self.state["prepared_prompt"]["prompt"],
         ], self.root, self.args.timeout, self.renew)
 
     def capture(self) -> None:
@@ -422,19 +446,22 @@ class Host:
             time.sleep(1)
         raise RuntimeError("independent verifier exceeded 30s deadline")
 
-    def result(self, status: str, reason: str, artifacts: list | None = None) -> dict:
-        artifacts = list(artifacts or [])
+    def result(self, status: str, reason: str, artifacts: list | None = None,
+               native: dict | None = None) -> dict:
+        artifacts = list((native or {}).get("artifacts", [])) + list(artifacts or [])
         if "input_snapshot" in self.state:
             artifacts.append({"artifact_type": "supervised_input_snapshot",
                               "artifact": self.state["input_snapshot"]})
         if self.state.get("container_started"):
             evidence = self.state.get("resource_evidence", {"status": "incomplete", "error": "not collected"})
             artifacts.append({"artifact_type": "supervised_candidate_resources", "artifact": evidence})
-            if status == "succeeded" and evidence["status"] != "complete":
+            if status in {"succeeded", "succeeded_with_blockers"} and evidence["status"] != "complete":
                 status, reason = "failed", reason + "; final resource evidence is incomplete"
-        return {"activity": self.state["job"]["input"]["activity"], "status": status,
+        return {**(native or {}), "activity": self.state["job"]["input"]["activity"], "status": status,
                 "summary": reason, "artifacts": artifacts or [],
-                "error": reason if status != "succeeded" else None}
+                "signals": (native or {}).get("signals", []) if native and status == native["status"] else [],
+                "error": (native or {}).get("error") if native and status == native["status"]
+                else reason if status != "succeeded" else None}
 
     def complete(self) -> None:
         payload_path = self.root / "completion.json"
@@ -491,7 +518,7 @@ class Host:
             "host_id": self.name, "capabilities": ["runtime_job_lease_proof_v1"]})
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            claim = self.api(self.endpoint + "/runtime-jobs/claim", {"lease_secs": LEASE_SECONDS})
+            claim = self.api(self.endpoint + "/runtime-jobs/claim", {"lease_secs": LEASE_SECONDS, "execution_workspace": "/workspace"})
             if claim.get("claimed"):
                 break
             time.sleep(1)
@@ -517,6 +544,14 @@ class Host:
         self.persist()
         artifacts = []
         try:
+            prepared = claim.get("prepared_prompt")
+            if not isinstance(prepared, dict) or not isinstance(prepared.get("prompt"), str) or not prepared["prompt"].strip():
+                raise RuntimeError("claim did not deliver a rendered activity prompt")
+            if prepared.get("activity_result_schema", {}).get("activity") != job["input"]["activity"]:
+                raise RuntimeError("rendered result schema does not match the claimed activity")
+            if not re.fullmatch(r"[0-9a-f]{64}", prepared.get("prompt_packet_digest", "")):
+                raise RuntimeError("claim did not deliver a valid prompt packet digest")
+            self.state["prepared_prompt"] = prepared
             self.state["phase"] = "executing"
             self.persist()
             self.launch()
@@ -525,18 +560,31 @@ class Host:
                 raise RuntimeError(f"agent exited with {exit_code}")
             usage = {"model": self.args.model, **read_usage(self.root / "agent.jsonl")}
             artifacts.append({"artifact_type": "runtime_host_usage", "artifact": usage})
-            self.capture()
-            verifier_exit = self.verify()
-            if verifier_exit:
-                raise RuntimeError(f"independent verifier rejected candidate: exit {verifier_exit}")
-            self.state["result"] = self.result("succeeded", "Independent candidate verification passed.", artifacts + [
-                {"artifact_type": "supervised_docker_verification", "artifact": {
-                    "image": self.args.image, "verifier_exit_code": verifier_exit,
-                    "verifier_sha256": hashlib.sha256((self.root / "verifier.py").read_bytes()).hexdigest(),
-                    "candidate_sha256": hashlib.sha256((self.root / "candidate.tar").read_bytes()).hexdigest(),
-                    "full_eval_capabilities": False,
-                }},
-            ])
+            native = read_activity_result(self.root / "agent.jsonl", job["input"]["activity"])
+            self.state["agent_result"] = native
+            self.persist()
+            for artifact in native.get("artifacts", []):
+                if artifact.get("artifact_type") in {
+                    "runtime_host_usage", "supervised_input_snapshot",
+                    "supervised_candidate_resources", "supervised_docker_verification",
+                }:
+                    raise RuntimeError("agent result contains host-owned artifact: " + artifact["artifact_type"])
+            if native["status"] not in {"succeeded", "succeeded_with_blockers"}:
+                self.collect_resources(stop_agents=True)
+                self.state["result"] = self.result(native["status"], native["summary"], artifacts, native)
+            else:
+                self.capture()
+                verifier_exit = self.verify()
+                if verifier_exit:
+                    raise RuntimeError(f"independent verifier rejected candidate: exit {verifier_exit}")
+                self.state["result"] = self.result(native["status"], native["summary"], artifacts + [
+                    {"artifact_type": "supervised_docker_verification", "artifact": {
+                        "image": self.args.image, "verifier_exit_code": verifier_exit,
+                        "verifier_sha256": hashlib.sha256((self.root / "verifier.py").read_bytes()).hexdigest(),
+                        "candidate_sha256": hashlib.sha256((self.root / "candidate.tar").read_bytes()).hexdigest(),
+                        "full_eval_capabilities": False,
+                    }},
+                ], native)
         except (Exception, KeyboardInterrupt) as error:
             reason = "host interrupted by keyboard" if isinstance(error, KeyboardInterrupt) else str(error)
             try:

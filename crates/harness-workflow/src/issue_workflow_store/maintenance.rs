@@ -117,14 +117,23 @@ mod tests {
     use crate::issue_lifecycle::IssueLifecycleState;
 
     async fn open_test_store() -> anyhow::Result<Option<IssueWorkflowStore>> {
-        if std::env::var("DATABASE_URL").is_err() {
-            return Ok(None);
+        let configured = match std::env::var("HARNESS_DATABASE_URL") {
+            Ok(configured) => configured,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if configured.trim().is_empty() {
+            anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
         }
+        let database_url = harness_core::db::resolve_test_database_url(Some(&configured))?;
         let dir = tempfile::tempdir()?;
-        match IssueWorkflowStore::open(&dir.path().join("issue_workflows.db")).await {
-            Ok(store) => Ok(Some(store)),
-            Err(_) => Ok(None),
-        }
+        Ok(Some(
+            IssueWorkflowStore::open_with_database_url(
+                &dir.path().join("issue_workflows.db"),
+                Some(&database_url),
+            )
+            .await?,
+        ))
     }
 
     #[tokio::test]

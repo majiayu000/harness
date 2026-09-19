@@ -265,7 +265,7 @@ pub(super) fn merge_child_issue_data(
 ) -> anyhow::Result<()> {
     let mut writes = vec![
         WorkflowDataWrite::set("project_id", json!(project_id), DataProvenance::Server),
-        WorkflowDataWrite::set("repo", json!(repo), DataProvenance::Agent),
+        WorkflowDataWrite::set("repo", json!(repo), DataProvenance::Server),
         WorkflowDataWrite::set("issue_number", json!(issue_number), DataProvenance::Server),
         WorkflowDataWrite::set(
             "started_by_runtime_job_id",
@@ -317,7 +317,7 @@ pub(super) fn merge_pr_feedback_child_data(
             json!(input.project_id),
             DataProvenance::Server,
         ),
-        WorkflowDataWrite::set("repo", json!(input.repo), DataProvenance::Agent),
+        WorkflowDataWrite::set("repo", json!(input.repo), DataProvenance::Server),
         WorkflowDataWrite::set(
             "issue_number",
             json!(input.issue_number),
@@ -552,6 +552,10 @@ mod tests {
         );
         assert_eq!(
             provenance.provenance_for("/remote_fact_hash"),
+            Some(DataProvenance::Server)
+        );
+        assert_eq!(
+            provenance.provenance_for("/repo"),
             Some(DataProvenance::Server)
         );
         child
