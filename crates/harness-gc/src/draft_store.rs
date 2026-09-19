@@ -1,6 +1,6 @@
 use chrono::Utc;
 use harness_core::{types::Draft, types::DraftId, types::DraftStatus};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 pub struct DraftStore {
@@ -23,7 +23,7 @@ impl DraftStore {
     }
 
     pub fn save(&self, draft: &Draft) -> anyhow::Result<()> {
-        let path = self.draft_path(&draft.id);
+        let path = self.draft_path(&draft.id)?;
         let content = serde_json::to_string_pretty(draft)?;
         std::fs::write(path, content)?;
         Ok(())
@@ -52,7 +52,7 @@ impl DraftStore {
         }
         side_effects(&draft)?;
         draft.status = DraftStatus::Adopted;
-        let path = self.draft_path(&draft.id);
+        let path = self.draft_path(&draft.id)?;
         let content = serde_json::to_string_pretty(&draft)?;
         std::fs::write(path, content)?;
         Ok(())
@@ -75,14 +75,14 @@ impl DraftStore {
                 expected_from
             );
         }
-        let path = self.draft_path(&draft.id);
+        let path = self.draft_path(&draft.id)?;
         let content = serde_json::to_string_pretty(draft)?;
         std::fs::write(path, content)?;
         Ok(())
     }
 
     pub fn get(&self, id: &DraftId) -> anyhow::Result<Option<Draft>> {
-        let path = self.draft_path(id);
+        let path = self.draft_path(id)?;
         if !path.exists() {
             return Ok(None);
         }
@@ -111,7 +111,7 @@ impl DraftStore {
     }
 
     pub fn delete(&self, id: &DraftId) -> anyhow::Result<()> {
-        let path = self.draft_path(id);
+        let path = self.draft_path(id)?;
         if path.exists() {
             std::fs::remove_file(path)?;
         }
@@ -137,8 +137,13 @@ impl DraftStore {
         Ok(expired)
     }
 
-    fn draft_path(&self, id: &DraftId) -> PathBuf {
-        self.data_dir.join(format!("{}.json", id))
+    fn draft_path(&self, id: &DraftId) -> anyhow::Result<PathBuf> {
+        let name = id.as_str();
+        let mut components = Path::new(name).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(_)), None) => Ok(self.data_dir.join(format!("{name}.json"))),
+            _ => anyhow::bail!("draft id {name} is not a single path component"),
+        }
     }
 }
 
@@ -232,6 +237,17 @@ mod tests {
             "draft must be at canonical path {expected:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn save_rejects_parent_dir_draft_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DraftStore::new(dir.path()).unwrap();
+        let mut draft = make_draft(DraftStatus::Pending, Utc::now());
+        draft.id = DraftId::from_str("../escape");
+        assert!(store.save(&draft).is_err());
+        assert!(!dir.path().join("escape.json").exists());
+        assert!(!dir.path().join("drafts").join("escape.json").exists());
     }
 
     #[test]

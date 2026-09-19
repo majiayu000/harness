@@ -9,7 +9,7 @@ use harness_core::types::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 mod guard_output;
 
@@ -359,11 +359,7 @@ impl RuleEngine {
         let (re, replacement) = Self::parse_fix_pattern(fix_pattern)
             .ok_or_else(|| anyhow::anyhow!("invalid fix_pattern syntax: {}", fix_pattern))?;
 
-        let file_path = if violation.file.is_absolute() {
-            violation.file.clone()
-        } else {
-            project_root.join(&violation.file)
-        };
+        let file_path = resolve_fix_path(project_root, &violation.file)?;
 
         let content = std::fs::read_to_string(&file_path)
             .with_context(|| format!("failed to read {}", file_path.display()))?;
@@ -815,6 +811,32 @@ impl RuleScanSnapshot {
             }
         }
         Ok(violations)
+    }
+}
+
+fn resolve_fix_path(project_root: &Path, file: &Path) -> anyhow::Result<PathBuf> {
+    if file
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!(
+            "violation path '{}' escapes the project root",
+            file.display()
+        );
+    }
+    let joined = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        project_root.join(file)
+    };
+    if joined.starts_with(project_root) {
+        Ok(joined)
+    } else {
+        anyhow::bail!(
+            "violation path '{}' is outside project root '{}'",
+            file.display(),
+            project_root.display()
+        );
     }
 }
 

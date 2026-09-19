@@ -108,7 +108,9 @@ async fn persisted_skills_survive_restart() -> anyhow::Result<()> {
     {
         let state = startup(&project_root, &data_dir).await?;
         let mut skills = state.engines.skills.write().await;
-        skills.create("my-test-skill".to_string(), "# My test skill".to_string());
+        skills
+            .create("my-test-skill".to_string(), "# My test skill".to_string())
+            .unwrap();
     }
 
     // Assert the skill file was physically written to data_dir/skills/
