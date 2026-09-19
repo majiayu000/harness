@@ -409,7 +409,10 @@ impl CodexAgent {
             items: Vec::new(),
             token_usage: Default::default(),
             // This is the launch selection, not a provider-reported identity.
-            model: req.model.clone().unwrap_or_else(|| self.default_model.clone()),
+            model: req
+                .model
+                .clone()
+                .unwrap_or_else(|| self.default_model.clone()),
             exit_code: output.status.code(),
         })
     }
