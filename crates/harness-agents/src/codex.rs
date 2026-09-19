@@ -408,7 +408,8 @@ impl CodexAgent {
             stderr,
             items: Vec::new(),
             token_usage: Default::default(),
-            model: "codex".to_string(),
+            // This is the launch selection, not a provider-reported identity.
+            model: req.model.clone().unwrap_or_else(|| self.default_model.clone()),
             exit_code: output.status.code(),
         })
     }
@@ -580,7 +581,8 @@ impl CodeAgent for CodexAgent {
             stderr,
             items: parsed.items,
             token_usage: parsed.token_usage,
-            model: "codex".to_string(),
+            // Keep oneshot responses consistent with the launch-derived stream event.
+            model: self.launch_model(&req).to_string(),
             exit_code: output.status.code(),
         })
     }
@@ -792,3 +794,7 @@ mod failure_tests;
 #[cfg(test)]
 #[path = "codex_review_tests.rs"]
 mod review_tests;
+
+#[cfg(all(test, unix))]
+#[path = "codex_model_response_tests.rs"]
+mod model_response_tests;
