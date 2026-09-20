@@ -89,10 +89,11 @@ first-party proxy; the verifier has `--network none`.
 
 Both execution containers use a read-only root, non-root UID, dropped capabilities,
 no-new-privileges, 128 PIDs, 2 GiB memory without swap, and a one-CPU rate limit.
-The agent's writable workspace is a 512 MiB tmpfs, home 128 MiB, and temporary
-directory 64 MiB. The host reads attached Codex stdout/stderr directly into private
-host files, retaining at most 8 MiB across both streams. Exceeding that shared
-limit fails the task and removes its container; transport buffers may contain
+The agent's writable workspace is a 512 MiB tmpfs, home 128 MiB, temporary directory
+64 MiB, and `/dev/shm` 64 MiB (`--shm-size`; Docker's default shm is otherwise a large
+uncapped agent-writable tmpfs). The host reads attached Codex stdout/stderr directly
+into private host files, retaining at most 8 MiB across both streams. Exceeding that
+shared limit fails the task and removes its container; transport buffers may contain
 additional unretained bytes. Candidate files cannot replace the captured logs.
 The host monitors wall time; GNU `timeout` separately bounds Codex if the host
 process dies. These are explicit trial limits, **not** a
@@ -228,6 +229,17 @@ PID both before and after reading the other counters. Counters cover the candida
 export overhead; they exclude the verifier, proxy and observer. CPU is recorded
 in the kernel's microseconds, not inferred from a Docker CPU-rate setting.
 
+After that cgroup sample, the host runs a terminal `statvfs` measurement inside the
+still-running candidate against the four agent-writable tmpfs roots
+(`/workspace`, `/home/harness`, `/tmp`, `/dev/shm`). Apparent file lengths
+(`du -sb`) are not treated as allocated usage. Each mount records device identity,
+fstype, used bytes, capacity, and fragment size; aggregates sum **distinct**
+filesystems only. The sample is explicitly `sample_kind: terminal` with
+`observed_at` — not a peak — because only an end-of-run observation is available.
+Missing or malformed disk evidence fails closed like missing cgroup counters;
+zeros are never synthesized. `/dev/mqueue` may appear writable for `access()` but
+rejects ordinary file creates, so it is outside this disk accounting scope.
+
 OOM or PID-limit events fail the task even if the agent or verifier would otherwise
 claim success. Failure and interrupted-run recovery attempt collection before
 cleanup. If quiescing or reading fails, the artifact explicitly records
@@ -238,8 +250,18 @@ that remains an incomplete failure, not a recovered final resource measurement.
 Cleanup also removes the exact task-owned observer container.
 
 This adds evidence to the supervised trial. It does **not** implement a complete
-`ResourceLimitReport`, aggregate disk accounting, or a hard lifetime CPU quota,
-and it does not advertise `eval_resource_limits` or enable formal eval jobs.
+`ResourceLimitReport`, invent a `cpu_time_secs` lifetime quota, or map CPU-rate/wall
+timeout into CPU-time usage, and it does not advertise `eval_resource_limits` or
+enable formal eval jobs. Native quality-gate jobs that never start a candidate
+container still omit `supervised_candidate_resources` rather than fabricating a
+mapping.
+
+A credential-free, no-model Docker probe using the pinned local
+`harness-agent:fixture` image and test-sized tmpfs fixtures recorded argv, image
+ID, `statvfs` samples, ENOSPC-at-cap checks, and cleanup in
+[`supervised-tmpfs-disk-probe-2026-09-20.json`](./supervised-tmpfs-disk-probe-2026-09-20.json).
+Observed used bytes are compared against filesystem capacities, not assumed equal
+to payload lengths.
 
 ## Recovery and evidence
 

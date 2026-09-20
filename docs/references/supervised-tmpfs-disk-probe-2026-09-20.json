@@ -1,0 +1,232 @@
+{
+  "schema": "harness.supervised.tmpfs_disk_probe.v1",
+  "observed_at": "2026-09-20T14:08:45Z",
+  "image_id": "sha256:18c571d1e6c71dd36de84f069832fa6a314129df9d7f4935ca767424bc94f79e",
+  "image_ref": "harness-agent:fixture",
+  "docker_argv": [
+    "run",
+    "-d",
+    "--name",
+    "tmpfs-disk-probe-50425",
+    "--network",
+    "none",
+    "--read-only",
+    "--user",
+    "501:20",
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges",
+    "--pids-limit",
+    "32",
+    "--memory",
+    "256m",
+    "--memory-swap",
+    "256m",
+    "--cpus",
+    "0.5",
+    "--shm-size",
+    "4m",
+    "--tmpfs",
+    "/home/harness:rw,nosuid,nodev,size=2m,uid=501,gid=20,mode=700",
+    "--tmpfs",
+    "/tmp:rw,nosuid,nodev,size=2m",
+    "--tmpfs",
+    "/workspace:rw,nosuid,nodev,size=2m,uid=501,gid=20,mode=700",
+    "sha256:18c571d1e6c71dd36de84f069832fa6a314129df9d7f4935ca767424bc94f79e",
+    "sleep",
+    "120"
+  ],
+  "caps": {
+    "workspace": "2m",
+    "home_harness": "2m",
+    "tmp": "2m",
+    "shm": "4m",
+    "note": "test-sized fixture caps; product trial caps remain 512m/128m/64m/64m"
+  },
+  "steps": [
+    {
+      "name": "baseline_statvfs",
+      "ok": true
+    },
+    {
+      "name": "known_allocation",
+      "ok": true
+    },
+    {
+      "name": "enospc_at_caps",
+      "ok": true
+    }
+  ],
+  "cleanup": {
+    "command": [
+      "rm",
+      "-f",
+      "tmpfs-disk-probe-50425"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "tmpfs-disk-probe-50425",
+    "removed": true,
+    "remaining": ""
+  },
+  "container_id": "f2f2ff78024f654e4fb0ba551ef1de694be0cba73cd1eafec8c32b912c51d101",
+  "baseline_disk": {
+    "sample_kind": "terminal",
+    "observed_at": "2026-09-20T14:08:45Z",
+    "scope": "candidate agent-writable tmpfs roots under trial policy",
+    "mounts": [
+      {
+        "root": "/workspace",
+        "device": "0:480",
+        "fstype": "tmpfs",
+        "used_bytes": 0,
+        "capacity_bytes": 2097152,
+        "frsize": 4096
+      },
+      {
+        "root": "/home/harness",
+        "device": "0:481",
+        "fstype": "tmpfs",
+        "used_bytes": 0,
+        "capacity_bytes": 2097152,
+        "frsize": 4096
+      },
+      {
+        "root": "/tmp",
+        "device": "0:479",
+        "fstype": "tmpfs",
+        "used_bytes": 0,
+        "capacity_bytes": 2097152,
+        "frsize": 4096
+      },
+      {
+        "root": "/dev/shm",
+        "device": "0:477",
+        "fstype": "tmpfs",
+        "used_bytes": 0,
+        "capacity_bytes": 4194304,
+        "frsize": 4096
+      }
+    ],
+    "aggregate_used_bytes": 0,
+    "aggregate_capacity_bytes": 10485760,
+    "distinct_filesystems": 4
+  },
+  "known_allocation": {
+    "payload_bytes": 524288,
+    "used_before": 0,
+    "used_after": 524288,
+    "capacity": 2097152,
+    "delta_used": 524288
+  },
+  "after_allocation_disk": {
+    "sample_kind": "terminal",
+    "observed_at": "2026-09-20T14:08:45Z",
+    "scope": "candidate agent-writable tmpfs roots under trial policy",
+    "mounts": [
+      {
+        "root": "/workspace",
+        "device": "0:480",
+        "fstype": "tmpfs",
+        "used_bytes": 0,
+        "capacity_bytes": 2097152,
+        "frsize": 4096
+      },
+      {
+        "root": "/home/harness",
+        "device": "0:481",
+        "fstype": "tmpfs",
+        "used_bytes": 0,
+        "capacity_bytes": 2097152,
+        "frsize": 4096
+      },
+      {
+        "root": "/tmp",
+        "device": "0:479",
+        "fstype": "tmpfs",
+        "used_bytes": 524288,
+        "capacity_bytes": 2097152,
+        "frsize": 4096
+      },
+      {
+        "root": "/dev/shm",
+        "device": "0:477",
+        "fstype": "tmpfs",
+        "used_bytes": 0,
+        "capacity_bytes": 4194304,
+        "frsize": 4096
+      }
+    ],
+    "aggregate_used_bytes": 524288,
+    "aggregate_capacity_bytes": 10485760,
+    "distinct_filesystems": 4
+  },
+  "enospc": {
+    "tmp": {
+      "root": "/tmp",
+      "wrote_bytes": 1572864,
+      "error": {
+        "errno": 28,
+        "enospc": true,
+        "strerror": "[Errno 28] No space left on device"
+      },
+      "used_bytes": 2097152,
+      "capacity_bytes": 2097152
+    },
+    "shm": {
+      "root": "/dev/shm",
+      "wrote_bytes": 4194304,
+      "error": {
+        "errno": 28,
+        "enospc": true,
+        "strerror": "[Errno 28] No space left on device"
+      },
+      "used_bytes": 4194304,
+      "capacity_bytes": 4194304
+    }
+  },
+  "final_disk": {
+    "sample_kind": "terminal",
+    "observed_at": "2026-09-20T14:08:45Z",
+    "scope": "candidate agent-writable tmpfs roots under trial policy",
+    "mounts": [
+      {
+        "root": "/workspace",
+        "device": "0:480",
+        "fstype": "tmpfs",
+        "used_bytes": 0,
+        "capacity_bytes": 2097152,
+        "frsize": 4096
+      },
+      {
+        "root": "/home/harness",
+        "device": "0:481",
+        "fstype": "tmpfs",
+        "used_bytes": 0,
+        "capacity_bytes": 2097152,
+        "frsize": 4096
+      },
+      {
+        "root": "/tmp",
+        "device": "0:479",
+        "fstype": "tmpfs",
+        "used_bytes": 2097152,
+        "capacity_bytes": 2097152,
+        "frsize": 4096
+      },
+      {
+        "root": "/dev/shm",
+        "device": "0:477",
+        "fstype": "tmpfs",
+        "used_bytes": 4194304,
+        "capacity_bytes": 4194304,
+        "frsize": 4096
+      }
+    ],
+    "aggregate_used_bytes": 6291456,
+    "aggregate_capacity_bytes": 10485760,
+    "distinct_filesystems": 4
+  },
+  "status": "passed"
+}

@@ -365,7 +365,8 @@ def test_stuck_client_cleanup_preserves_primary_failure_and_closes_streams(tmp_p
             stream.close()
 
 
-def resource_runner(tmp_path, monkeypatch, *, running=True, oom=0, pids_max=0, stop_error=False):
+def resource_runner(tmp_path, monkeypatch, *, running=True, oom=0, pids_max=0, stop_error=False,
+                    disk=None, disk_error=None):
     module = load()
     runner = host(tmp_path, 'executing')
     runner.name = 'owned'
@@ -374,36 +375,65 @@ def resource_runner(tmp_path, monkeypatch, *, running=True, oom=0, pids_max=0, s
     metrics = {'cpu_time_micros': 2300123, 'current_pids_before': 1, 'peak_memory_bytes': 42000000,
                'peak_pids': 7, 'current_pids': 1, 'memory_events': {'oom': oom, 'oom_kill': oom},
                'pids_events': {'max': pids_max}}
+    if disk is None:
+        disk = {
+            'sample_kind': 'terminal', 'observed_at': '2026-09-20T12:00:00Z',
+            'scope': 'candidate agent-writable tmpfs roots under trial policy',
+            'mounts': [
+                {'root': '/workspace', 'device': '0:1', 'fstype': 'tmpfs',
+                 'used_bytes': 4096, 'capacity_bytes': 512 * 1024 * 1024, 'frsize': 4096},
+                {'root': '/home/harness', 'device': '0:2', 'fstype': 'tmpfs',
+                 'used_bytes': 0, 'capacity_bytes': 128 * 1024 * 1024, 'frsize': 4096},
+                {'root': '/tmp', 'device': '0:3', 'fstype': 'tmpfs',
+                 'used_bytes': 8192, 'capacity_bytes': 64 * 1024 * 1024, 'frsize': 4096},
+                {'root': '/dev/shm', 'device': '0:4', 'fstype': 'tmpfs',
+                 'used_bytes': 0, 'capacity_bytes': 64 * 1024 * 1024, 'frsize': 4096},
+            ],
+            'aggregate_used_bytes': 12288, 'aggregate_capacity_bytes': 768 * 1024 * 1024,
+            'distinct_filesystems': 4,
+        }
     calls = []
     def invoke(*args, **kwargs):
         calls.append(args)
+        joined = '\n'.join(str(arg) for arg in args)
         if args[0] == 'inspect':
             return json.dumps({'Running': running, 'OOMKilled': bool(oom)})
-        if args[:2] == ('exec', 'owned') and stop_error:
-            raise RuntimeError('PID exhaustion prevented quiescing')
+        if args[:2] == ('exec', 'owned') and 'signal.SIGKILL' in joined:
+            if stop_error:
+                raise RuntimeError('PID exhaustion prevented quiescing')
+            return ''
         if args[:2] == ('exec', 'owned-observer'):
             return json.dumps(metrics)
+        if args[:2] == ('exec', 'owned') and 'statvfs' in joined:
+            if disk_error is not None:
+                raise RuntimeError(disk_error)
+            return json.dumps(disk)
         return ''
     # host() loads its own module; patch the method globals, not another import.
     monkeypatch.setitem(runner.collect_resources.__globals__, 'docker', invoke)
-    return runner, calls, metrics
+    return runner, calls, metrics, disk
 
 
 def test_resource_peaks_are_saved_outside_candidate_after_quiescing(tmp_path, monkeypatch):
-    runner, calls, metrics = resource_runner(tmp_path, monkeypatch)
+    runner, calls, metrics, disk = resource_runner(tmp_path, monkeypatch)
     runner.collect_resources(stop_agents=True)
     evidence = json.loads((tmp_path / 'candidate-resources.json').read_text())
     assert evidence['status'] == 'complete'
     assert evidence['metrics'] == metrics
-    stop = next(i for i, c in enumerate(calls) if c[:2] == ('exec', 'owned'))
+    assert evidence['disk'] == disk
+    assert evidence['disk']['sample_kind'] == 'terminal'
+    stop = next(i for i, c in enumerate(calls)
+                if c[:2] == ('exec', 'owned') and 'signal.SIGKILL' in '\n'.join(map(str, c)))
     sample = next(i for i, c in enumerate(calls) if c[:2] == ('exec', 'owned-observer'))
-    assert stop < sample
+    disk_i = next(i for i, c in enumerate(calls)
+                  if c[:2] == ('exec', 'owned') and 'statvfs' in '\n'.join(map(str, c)))
+    assert stop < sample < disk_i
     assert runner.result('succeeded', 'verified')['artifacts'][0]['artifact'] == evidence
 
 
 @pytest.mark.parametrize('failure', ['oom', 'pids', 'dead', 'pid-exec'])
 def test_resource_failures_cannot_be_success_or_fake_zero(tmp_path, monkeypatch, failure):
-    runner, calls, metrics = resource_runner(
+    runner, calls, metrics, disk = resource_runner(
         tmp_path, monkeypatch, running=failure != 'dead', oom=int(failure == 'oom'),
         pids_max=int(failure in {'pids', 'pid-exec'}), stop_error=failure == 'pid-exec')
     with pytest.raises(RuntimeError, match='resource evidence incomplete'):
@@ -417,7 +447,7 @@ def test_resource_failures_cannot_be_success_or_fake_zero(tmp_path, monkeypatch,
 
 
 def test_missing_observer_keeps_missing_evidence_instead_of_zero(tmp_path, monkeypatch):
-    runner, _, _ = resource_runner(tmp_path, monkeypatch)
+    runner, _, _, _ = resource_runner(tmp_path, monkeypatch)
     def unavailable(*args):
         if args[0] == 'inspect':
             return json.dumps({'Running': False, 'OOMKilled': False})
@@ -427,6 +457,7 @@ def test_missing_observer_keeps_missing_evidence_instead_of_zero(tmp_path, monke
         runner.collect_resources(stop_agents=True)
     evidence = runner.state['resource_evidence']
     assert 'metrics' not in evidence
+    assert 'disk' not in evidence
     assert evidence['status'] == 'incomplete'
     assert runner.result('succeeded', 'accepted')['status'] == 'failed'
 
@@ -453,17 +484,93 @@ def test_observer_mount_is_candidate_only_and_has_no_extra_privileges(tmp_path, 
     assert mount == 'type=bind,src=/sys/fs/cgroup/docker/' + 'a' * 64 + ',dst=/sys/fs/cgroup,readonly'
     assert command[command.index('--network') + 1] == 'none'
     assert command[command.index('--user') + 1].startswith('1001:')
+    assert command[command.index('--shm-size') + 1] == '64m'
     assert '--privileged' not in command and '--pid' not in command
     assert not any('docker.sock' in argument for argument in command)
 
 
 def test_nonquiescent_candidate_retains_metrics_but_cannot_pass(tmp_path, monkeypatch):
-    runner, _, metrics = resource_runner(tmp_path, monkeypatch)
+    runner, _, metrics, disk = resource_runner(tmp_path, monkeypatch)
     metrics['current_pids'] = 2
     with pytest.raises(RuntimeError, match='not quiescent'):
         runner.collect_resources(stop_agents=True)
     assert runner.state['resource_evidence']['metrics']['current_pids'] == 2
+    assert runner.state['resource_evidence']['disk'] == disk
     assert runner.result('succeeded', 'accepted')['status'] == 'failed'
+
+
+def test_missing_disk_measurement_cannot_succeed(tmp_path, monkeypatch):
+    runner, _, _, _ = resource_runner(tmp_path, monkeypatch, disk_error='statvfs unavailable')
+    with pytest.raises(RuntimeError, match='statvfs unavailable'):
+        runner.collect_resources(stop_agents=True)
+    evidence = runner.state['resource_evidence']
+    assert evidence['status'] == 'incomplete'
+    assert 'disk' not in evidence
+    assert 'metrics' in evidence
+    assert runner.result('succeeded', 'accepted')['status'] == 'failed'
+
+
+def test_malformed_disk_measurement_cannot_succeed_or_zero_fill(tmp_path, monkeypatch):
+    bad = {
+        'sample_kind': 'peak', 'observed_at': '2026-09-20T12:00:00Z',
+        'scope': 'candidate agent-writable tmpfs roots under trial policy',
+        'mounts': [], 'aggregate_used_bytes': 0, 'aggregate_capacity_bytes': 0,
+        'distinct_filesystems': 0,
+    }
+    runner, _, _, _ = resource_runner(tmp_path, monkeypatch, disk=bad)
+    with pytest.raises(RuntimeError, match='resource evidence incomplete'):
+        runner.collect_resources(stop_agents=True)
+    evidence = runner.state['resource_evidence']
+    assert evidence['status'] == 'incomplete'
+    assert evidence['disk'] == bad
+    assert 'terminal' in evidence['error'] or 'mounts' in evidence['error']
+    assert runner.result('succeeded', 'accepted')['status'] == 'failed'
+
+
+def test_disk_aggregate_counts_distinct_filesystems_only():
+    module = load()
+    shared = {
+        'sample_kind': 'terminal', 'observed_at': '2026-09-20T12:00:00Z',
+        'scope': 'candidate agent-writable tmpfs roots under trial policy',
+        'mounts': [
+            {'root': '/workspace', 'device': '0:9', 'fstype': 'tmpfs',
+             'used_bytes': 100, 'capacity_bytes': 1000, 'frsize': 4096},
+            {'root': '/home/harness', 'device': '0:9', 'fstype': 'tmpfs',
+             'used_bytes': 100, 'capacity_bytes': 1000, 'frsize': 4096},
+            {'root': '/tmp', 'device': '0:10', 'fstype': 'tmpfs',
+             'used_bytes': 50, 'capacity_bytes': 500, 'frsize': 4096},
+            {'root': '/dev/shm', 'device': '0:11', 'fstype': 'tmpfs',
+             'used_bytes': 25, 'capacity_bytes': 250, 'frsize': 4096},
+        ],
+        'aggregate_used_bytes': 175, 'aggregate_capacity_bytes': 1750,
+        'distinct_filesystems': 3,
+    }
+    assert module.disk_evidence_errors(shared) == []
+    shared['aggregate_used_bytes'] = 275
+    assert 'aggregate_used_bytes' in ';'.join(module.disk_evidence_errors(shared))
+
+
+def test_disk_metrics_reader_rejects_missing_root(tmp_path):
+    module = load()
+    mountinfo = (
+        f'1 0 0:1 / {tmp_path}/workspace rw - tmpfs tmpfs rw\n'
+        f'2 0 0:2 / {tmp_path}/home rw - tmpfs tmpfs rw\n'
+        f'3 0 0:3 / {tmp_path}/tmp rw - tmpfs tmpfs rw\n'
+    )
+    (tmp_path / 'workspace').mkdir()
+    (tmp_path / 'home').mkdir()
+    (tmp_path / 'tmp').mkdir()
+    # Intentionally omit /dev/shm directory and mountinfo entry.
+    script = (module.DISK_METRICS_SCRIPT
+              .replace("ROOTS = ('/workspace', '/home/harness', '/tmp', '/dev/shm')",
+                       f"ROOTS = ({str(tmp_path / 'workspace')!r}, {str(tmp_path / 'home')!r}, "
+                       f"{str(tmp_path / 'tmp')!r}, {str(tmp_path / 'shm')!r})")
+              .replace("Path('/proc/self/mountinfo')", f"Path({str(tmp_path / 'mountinfo')!r})"))
+    (tmp_path / 'mountinfo').write_text(mountinfo)
+    result = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'missing mount root' in result.stderr
+    assert result.stdout == ''
 
 
 def test_native_metrics_reader_requires_cpu_total(tmp_path):
@@ -1172,6 +1279,12 @@ def test_native_quality_gate_claim_binds_expected_head_and_submits_evidence(tmp_
     )
     assert handoff_artifact['candidate_commit'] == expected
     assert handoff_artifact['verified'] is True
+    assert not any(
+        a['artifact_type'] == 'supervised_candidate_resources'
+        for a in runner.state['result']['artifacts']
+    )
+    assert evidence['resource_limit_report']['usage'] == {}
+    assert 'eval_resource_limits not advertised' in evidence['resource_limit_report']['reason']
 
 
 def test_native_quality_gate_rejects_mismatched_expected_head(tmp_path):
@@ -1274,3 +1387,88 @@ def test_cli_requires_distinct_pinned_verifier_image(monkeypatch, capsys):
     assert outcome.value.code == 2
     err = capsys.readouterr().err.lower()
     assert 'differ' in err
+
+
+def _docker_image_id(reference: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ['docker', 'images', '--no-trunc', '--format', '{{.ID}}', reference],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode or not result.stdout.strip():
+        return None
+    image_id = result.stdout.strip().splitlines()[0]
+    return image_id if image_id.startswith('sha256:') else None
+
+
+def test_docker_tmpfs_statvfs_enospc_and_cleanup_with_fixture_caps():
+    """Credential-free probe: measure allocation, hit ENOSPC, clean owned container."""
+    module = load()
+    image = _docker_image_id('harness-agent:fixture')
+    if image is None:
+        pytest.skip('pinned local harness-agent:fixture image unavailable')
+    uid, gid = os.getuid(), os.getgid()
+    name = f'tmpfs-disk-test-{os.getpid()}-{os.getuid()}'
+    argv = [
+        'run', '-d', '--name', name, '--network', 'none',
+        '--read-only', '--user', f'{uid}:{gid}', '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges', '--pids-limit', '32',
+        '--memory', '256m', '--memory-swap', '256m', '--cpus', '0.5',
+        '--shm-size', '4m',
+        '--tmpfs', f'/home/harness:rw,nosuid,nodev,size=2m,uid={uid},gid={gid},mode=700',
+        '--tmpfs', '/tmp:rw,nosuid,nodev,size=2m',
+        '--tmpfs', f'/workspace:rw,nosuid,nodev,size=2m,uid={uid},gid={gid},mode=700',
+        image, 'sleep', '90',
+    ]
+    try:
+        module.docker(*argv)
+        before = json.loads(module.docker('exec', name, 'python3', '-I', '-c', module.DISK_METRICS_SCRIPT))
+        assert before['sample_kind'] == 'terminal'
+        assert before['distinct_filesystems'] == 4
+        alloc = json.loads(module.docker('exec', name, 'python3', '-I', '-c', """
+import json, os
+from pathlib import Path
+before = os.statvfs('/tmp')
+Path('/tmp/known.bin').write_bytes(b'a' * (256 * 1024))
+os.sync()
+after = os.statvfs('/tmp')
+print(json.dumps({
+  'payload_bytes': 256 * 1024,
+  'delta_used': ((after.f_blocks - after.f_bfree) - (before.f_blocks - before.f_bfree)) * after.f_frsize,
+}))
+"""))
+        assert alloc['delta_used'] >= alloc['payload_bytes']
+        enospc = json.loads(module.docker('exec', name, 'python3', '-I', '-c', """
+import errno, json, os
+from pathlib import Path
+def fill(root):
+    path = Path(root) / 'fill.bin'
+    wrote = 0
+    err = None
+    try:
+        with path.open('wb') as fh:
+            while True:
+                fh.write(b'x' * 65536); fh.flush(); os.fsync(fh.fileno()); wrote += 65536
+    except OSError as exc:
+        err = {'enospc': exc.errno == errno.ENOSPC, 'errno': exc.errno}
+    st = os.statvfs(root)
+    return {'wrote': wrote, 'error': err,
+            'used': (st.f_blocks - st.f_bfree) * st.f_frsize,
+            'capacity': st.f_blocks * st.f_frsize}
+print(json.dumps({'tmp': fill('/tmp'), 'shm': fill('/dev/shm')}))
+"""))
+        for key in ('tmp', 'shm'):
+            assert enospc[key]['error']['enospc']
+            assert enospc[key]['used'] <= enospc[key]['capacity']
+            assert enospc[key]['used'] >= int(enospc[key]['capacity'] * 0.9)
+        after = json.loads(module.docker('exec', name, 'python3', '-I', '-c', module.DISK_METRICS_SCRIPT))
+        assert module.disk_evidence_errors(after) == []
+    finally:
+        subprocess.run(['docker', 'rm', '-f', name], capture_output=True, text=True, timeout=30)
+        left = subprocess.run(
+            ['docker', 'ps', '-aq', '--filter', f'name=^/{name}$'],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert left.stdout.strip() == ''

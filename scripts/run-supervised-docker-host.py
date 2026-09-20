@@ -186,6 +186,97 @@ print(json.dumps({'cpu_time_micros': cpu['usage_usec'], 'current_pids_before': p
                   'current_pids': int((root / 'pids.current').read_text())}))
 """
 
+# Fixed agent-writable tmpfs roots under the supervised trial policy. Apparent
+# file lengths (du -sb) are not allocated usage; measure via statvfs instead.
+DISK_METRICS_SCRIPT = """import json, os
+from datetime import datetime, timezone
+from pathlib import Path
+ROOTS = ('/workspace', '/home/harness', '/tmp', '/dev/shm')
+mounts = {}
+for line in Path('/proc/self/mountinfo').read_text().splitlines():
+    parts = line.split()
+    sep = parts.index('-')
+    mounts[parts[4]] = {'device': parts[2], 'fstype': parts[sep + 1]}
+samples = []
+for root in ROOTS:
+    if not Path(root).exists():
+        raise SystemExit('missing mount root: ' + root)
+    if not os.access(root, os.W_OK):
+        raise SystemExit('mount root not writable: ' + root)
+    info = mounts.get(root)
+    if info is None:
+        raise SystemExit('mountinfo missing root: ' + root)
+    st = os.statvfs(root)
+    if st.f_frsize <= 0 or st.f_blocks <= 0 or st.f_bfree < 0 or st.f_bfree > st.f_blocks:
+        raise SystemExit('malformed statvfs for ' + root)
+    used = (st.f_blocks - st.f_bfree) * st.f_frsize
+    capacity = st.f_blocks * st.f_frsize
+    samples.append({'root': root, 'device': info['device'], 'fstype': info['fstype'],
+                    'used_bytes': used, 'capacity_bytes': capacity, 'frsize': st.f_frsize})
+by_device = {}
+for sample in samples:
+    prior = by_device.get(sample['device'])
+    if prior is None:
+        by_device[sample['device']] = sample
+    elif (prior['used_bytes'] != sample['used_bytes']
+          or prior['capacity_bytes'] != sample['capacity_bytes']):
+        raise SystemExit('inconsistent statvfs for device ' + sample['device'])
+print(json.dumps({
+    'sample_kind': 'terminal',
+    'observed_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'scope': 'candidate agent-writable tmpfs roots under trial policy',
+    'mounts': samples,
+    'aggregate_used_bytes': sum(item['used_bytes'] for item in by_device.values()),
+    'aggregate_capacity_bytes': sum(item['capacity_bytes'] for item in by_device.values()),
+    'distinct_filesystems': len(by_device),
+}))
+"""
+
+def disk_evidence_errors(disk: object) -> list[str]:
+    """Return problems that must block successful completion; never zero-fill."""
+    if not isinstance(disk, dict):
+        return ["disk evidence is not an object"]
+    errors = []
+    if disk.get("sample_kind") != "terminal":
+        errors.append("disk sample_kind must be terminal (not peak)")
+    if not isinstance(disk.get("observed_at"), str) or not disk["observed_at"]:
+        errors.append("disk observed_at is missing")
+    if disk.get("scope") != "candidate agent-writable tmpfs roots under trial policy":
+        errors.append("disk scope is missing or unexpected")
+    mounts = disk.get("mounts")
+    expected = ("/workspace", "/home/harness", "/tmp", "/dev/shm")
+    if not isinstance(mounts, list) or [item.get("root") for item in mounts] != list(expected):
+        errors.append("disk mounts must cover the four agent-writable tmpfs roots")
+        return errors
+    by_device: dict = {}
+    for item, root in zip(mounts, expected):
+        if not isinstance(item, dict):
+            errors.append(f"disk mount {root} is malformed")
+            continue
+        for key in ("device", "fstype"):
+            if not isinstance(item.get(key), str) or not item[key]:
+                errors.append(f"disk mount {root} missing {key}")
+        for key in ("used_bytes", "capacity_bytes", "frsize"):
+            value = item.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                errors.append(f"disk mount {root} {key} must be a non-negative int")
+        used, capacity = item.get("used_bytes"), item.get("capacity_bytes")
+        if isinstance(used, int) and isinstance(capacity, int) and used > capacity:
+            errors.append(f"disk mount {root} used_bytes exceeds capacity")
+        device = item.get("device")
+        if isinstance(device, str) and device not in by_device:
+            if isinstance(used, int) and isinstance(capacity, int):
+                by_device[device] = (used, capacity)
+    if not isinstance(disk.get("distinct_filesystems"), int) or disk["distinct_filesystems"] != len(by_device):
+        errors.append("disk distinct_filesystems does not match mount devices")
+    expected_used = sum(pair[0] for pair in by_device.values())
+    expected_capacity = sum(pair[1] for pair in by_device.values())
+    if disk.get("aggregate_used_bytes") != expected_used:
+        errors.append("disk aggregate_used_bytes does not match distinct filesystems")
+    if disk.get("aggregate_capacity_bytes") != expected_capacity:
+        errors.append("disk aggregate_capacity_bytes does not match distinct filesystems")
+    return errors
+
 class Host:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -246,10 +337,13 @@ class Host:
         self.last_renewal = time.monotonic()
 
     def base_args(self) -> list[str]:
+        # Concrete trial caps only: workspace/home/tmp tmpfs plus /dev/shm via
+        # Docker --shm-size. Not operator knobs or a full ResourceLimitReport.
         return [
             "--read-only", "--user", f"{os.getuid()}:{os.getgid()}",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--pids-limit", "128", "--memory", "2g", "--memory-swap", "2g", "--cpus", "1",
+            "--shm-size", "64m",
             "--tmpfs", f"/home/harness:rw,nosuid,nodev,size=128m,uid={os.getuid()},gid={os.getgid()},mode=700",
             "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
         ]
@@ -341,7 +435,8 @@ class Host:
         if not self.state.get("container_started") or "resource_evidence" in self.state:
             return
         evidence = {"status": "incomplete", "candidate_id": self.state.get("candidate_id"),
-                    "scope": "candidate cgroup through quiesced export; excludes verifier and proxy"}
+                    "scope": ("candidate cgroup and agent-writable tmpfs through "
+                              "quiesced export; excludes verifier and proxy")}
         errors = []
         try:
             state = json.loads(docker("inspect", self.name, "--format", "{{json .State}}"))
@@ -364,6 +459,14 @@ class Host:
             if (metrics["memory_events"]["oom"] or metrics["memory_events"]["oom_kill"]
                     or metrics["pids_events"]["max"]):
                 errors.append("candidate hit an OOM or PID limit")
+        except Exception as error:
+            errors.append(str(error))
+        # Disk accounting needs the live candidate mount namespace; measure after
+        # quiescence checks so the sample is terminal, not a forged peak.
+        try:
+            disk = json.loads(docker("exec", self.name, "python3", "-I", "-c", DISK_METRICS_SCRIPT))
+            evidence["disk"] = disk
+            errors.extend(disk_evidence_errors(disk))
         except Exception as error:
             errors.append(str(error))
         try:
