@@ -119,6 +119,9 @@ pub(super) async fn wait_until_cancelled(
     generation: u64,
 ) {
     loop {
+        // Subscribe before the state check so notify_waiters() between unlock and
+        // await cannot be lost (Tokio registers notify_waiters interest on create).
+        let notified = cancel_notify.notified();
         {
             let guard = state.lock().await;
             if guard
@@ -136,7 +139,7 @@ pub(super) async fn wait_until_cancelled(
                 return;
             }
         }
-        cancel_notify.notified().await;
+        notified.await;
     }
 }
 
@@ -174,4 +177,51 @@ pub(super) fn stop_cleanup_deadline_error(budget: Duration) -> harness_core::err
     harness_core::error::HarnessError::AgentExecution(format!(
         "codex app-server stop/cleanup deadline ({budget:?}) elapsed before descendant cleanup confirmed"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{timeout, Duration as TokioDuration};
+
+    #[tokio::test]
+    async fn wait_until_cancelled_observes_notify_after_state_check_window() {
+        let state = Arc::new(Mutex::new(super::super::AdapterState::new()));
+        let cancel_notify = Arc::new(Notify::new());
+        let generation = {
+            let mut guard = state.lock().await;
+            guard
+                .begin_attempt()
+                .expect("first attempt must allocate a generation")
+        };
+
+        let waiter = {
+            let state = state.clone();
+            let cancel_notify = cancel_notify.clone();
+            tokio::spawn(async move {
+                wait_until_cancelled(&state, &cancel_notify, generation).await;
+            })
+        };
+
+        // Yield so the waiter reaches the unlocked notified().await path.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        {
+            let mut guard = state.lock().await;
+            let attempt = guard
+                .active_attempt
+                .as_mut()
+                .expect("attempt remains active while waiter runs");
+            assert_eq!(attempt.generation, generation);
+            attempt.cancel_requested = true;
+        }
+        // notify_waiters after unlock is the race window the subscribe-first fix closes.
+        cancel_notify.notify_waiters();
+
+        timeout(TokioDuration::from_millis(500), waiter)
+            .await
+            .expect("cancel wake must not hang after notify_waiters")
+            .expect("waiter task must join");
+    }
 }
