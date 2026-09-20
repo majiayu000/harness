@@ -443,12 +443,20 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     drop(execution);
     if terminate_execution_after_drop {
         if let Some(adapter) = execution_terminator.as_ref() {
-            if let Err(error) = adapter.terminate_and_drain().await {
+            if let Err(cleanup_error) = adapter.terminate_and_drain().await {
                 tracing::error!(
                     thread_id = %thread_id,
                     turn_id = %turn_id,
-                    "failed to force-stop and drain interrupted agent execution: {error}"
+                    "failed to force-stop and drain interrupted agent execution: {cleanup_error}"
                 );
+                // Surface cleanup failure at the turn/resource-release boundary so
+                // unknown process state is never reported as a successful drain.
+                execution_result = Some(match execution_result.take() {
+                    None | Some(Ok(())) => Err(cleanup_error),
+                    Some(Err(primary)) => Err(HarnessError::AgentExecution(format!(
+                        "{primary}; cleanup failed: {cleanup_error}"
+                    ))),
+                });
             }
         }
     }

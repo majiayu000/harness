@@ -906,5 +906,125 @@ async fn adapter_state_reports_incomplete_child_when_stdout_reader_is_missing() 
     state.stdout_lines = None;
     assert!(!state.child_ready());
 
-    state.reset_child().await;
+    state
+        .reset_child()
+        .await
+        .expect("sleep child cleanup should succeed");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn terminate_propagates_injected_cleanup_failure_and_blocks_reuse() {
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("sleep process should spawn");
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let stdin = child.stdin.take().expect("stdin should be piped");
+    let adapter = CodexAdapter::new(PathBuf::from("unused-codex"));
+    {
+        let mut state = adapter.state.lock().await;
+        state.child = Some(
+            crate::ManagedChild::new(child, "codex app-server test").with_injected_cleanup_error(
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "injected descendant cleanup failure",
+                ),
+            ),
+        );
+        state.stdin = Some(stdin);
+        state.stdout_lines = Some(BufReader::new(stdout).lines());
+        state.thread_id = Some("thread-1".into());
+        state.active_turn_id = Some("turn-1".into());
+        state.child_workspace = Some(PathBuf::from("/tmp/workspace"));
+    }
+
+    let first = adapter
+        .terminate_and_drain()
+        .await
+        .expect_err("injected cleanup failure must surface");
+    let first_message = first.to_string();
+    assert!(
+        first_message.contains("injected descendant cleanup failure"),
+        "terminate must report the cleanup failure: {first_message}"
+    );
+
+    {
+        let mut state = adapter.state.lock().await;
+        assert!(
+            state.child.is_some(),
+            "failed cleanup must retain ManagedChild ownership"
+        );
+        assert!(
+            state.failed_cleanup.is_some(),
+            "failed cleanup outcome must remain visible"
+        );
+        assert!(
+            !state.permits_child_reuse(),
+            "reuse gate must reject after cleanup failure"
+        );
+        assert!(!state.child_ready());
+        assert!(state.stdin.is_none());
+        assert!(state.stdout_lines.is_none());
+        // Simulate losing the child handle while cleanup remains unconfirmed:
+        // terminate must not become success merely because `child` is now None.
+        state.child = None;
+    }
+
+    let second = adapter
+        .terminate_and_drain()
+        .await
+        .expect_err("repeated terminate must not become success while cleanup remains failed");
+    assert!(
+        second.to_string().contains("failed to clean up"),
+        "repeated terminate must keep the failed cleanup outcome: {second}"
+    );
+    assert!(
+        !adapter.state.lock().await.permits_child_reuse(),
+        "reuse gate must stay closed until cleanup is confirmed"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn reset_after_error_preserves_primary_and_cleanup_failures() {
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("sleep process should spawn");
+    let _stdout = child.stdout.take().expect("stdout should be piped");
+    let _stdin = child.stdin.take().expect("stdin should be piped");
+    let mut state = AdapterState::new();
+    state.child = Some(
+        crate::ManagedChild::new(child, "codex app-server test").with_injected_cleanup_error(
+            std::io::Error::other("injected descendant cleanup failure"),
+        ),
+    );
+
+    let combined = reset_after_error(
+        &mut state,
+        harness_core::error::HarnessError::AgentExecution(
+            "codex app-server stdout closed before turn/completed".into(),
+        ),
+    )
+    .await;
+    let message = combined.to_string();
+    assert!(
+        message.contains("stdout closed before turn/completed"),
+        "primary error must be preserved: {message}"
+    );
+    assert!(
+        message.contains("cleanup failed"),
+        "cleanup failure must be attached: {message}"
+    );
+    assert!(
+        message.contains("injected descendant cleanup failure"),
+        "cleanup detail must remain: {message}"
+    );
+    assert!(state.child.is_some());
+    assert!(!state.permits_child_reuse());
 }
