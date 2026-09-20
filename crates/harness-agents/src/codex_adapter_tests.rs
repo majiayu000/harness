@@ -1,6 +1,9 @@
 use super::*;
 use harness_core::{agent::AgentDiagnosticSeverity, types::Item};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
 
 fn test_turn_request(project_root: PathBuf) -> AgentRequest {
     AgentRequest {
@@ -1010,6 +1013,7 @@ async fn reset_after_error_preserves_primary_and_cleanup_failures() {
         harness_core::error::HarnessError::AgentExecution(
             "codex app-server stdout closed before turn/completed".into(),
         ),
+        std::time::Duration::from_secs(45),
     )
     .await;
     let message = combined.to_string();
@@ -1027,4 +1031,424 @@ async fn reset_after_error_preserves_primary_and_cleanup_failures() {
     );
     assert!(state.child.is_some());
     assert!(!state.permits_child_reuse());
+}
+
+#[cfg(unix)]
+fn write_python_app_server(dir: &std::path::Path, body: &str) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join("codex-app-server-stub");
+    std::fs::write(
+        &path,
+        format!("#!/usr/bin/env python3\nimport json, os, sys, time\n{body}\n"),
+    )?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+fn short_deadlines() -> AttemptDeadlines {
+    AttemptDeadlines {
+        absolute_init: Duration::from_millis(250),
+        frame_write: Duration::from_millis(200),
+        stop_cleanup: Duration::from_millis(500),
+    }
+}
+
+fn control_test_deadlines() -> AttemptDeadlines {
+    AttemptDeadlines {
+        absolute_init: Duration::from_secs(5),
+        frame_write: Duration::from_millis(200),
+        stop_cleanup: Duration::from_secs(2),
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn interrupt_before_remote_turn_id_is_honored_after_barrier() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let turn_start_seen = dir.path().join("turn-start-seen");
+    let release_turn_started = dir.path().join("release-turn-started");
+    let stub = write_python_app_server(
+        dir.path(),
+        r#"
+turn_start_seen = os.environ["TURN_START_SEEN"]
+release_turn_started = os.environ["RELEASE_TURN_STARTED"]
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"method": "thread/started", "params": {"thread": {"id": "thread-1"}}}), flush=True)
+    elif method == "turn/start":
+        open(turn_start_seen, "w").close()
+        while not os.path.exists(release_turn_started):
+            time.sleep(0.01)
+        print(json.dumps({"method": "turn/started", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "inProgress", "items": []}}}), flush=True)
+    elif method == "turn/interrupt":
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+        print(json.dumps({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "interrupted", "items": [], "error": None}}}), flush=True)
+"#,
+    )?;
+    let adapter = Arc::new(CodexAdapter::new(stub).with_deadlines(AttemptDeadlines {
+        absolute_init: Duration::from_secs(5),
+        frame_write: Duration::from_secs(2),
+        stop_cleanup: Duration::from_secs(2),
+    }));
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request.env_vars.insert(
+        "TURN_START_SEEN".into(),
+        turn_start_seen.display().to_string(),
+    );
+    request.env_vars.insert(
+        "RELEASE_TURN_STARTED".into(),
+        release_turn_started.display().to_string(),
+    );
+    request.timeout_secs = Some(5);
+    let (tx, mut rx) = mpsc::channel(8);
+    let turn: tokio::task::JoinHandle<harness_core::error::Result<()>> = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.as_ref().start_turn(request, tx).await })
+    };
+
+    let started = Instant::now();
+    while !turn_start_seen.exists() {
+        if started.elapsed() > Duration::from_secs(15) {
+            panic!("timed out waiting for turn/start barrier");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    adapter.interrupt().await?;
+    assert!(
+        adapter
+            .state
+            .lock()
+            .await
+            .active_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.cancel_requested),
+        "interrupt before remote turn id must record attempt-scoped cancel intent"
+    );
+    std::fs::write(&release_turn_started, b"go")?;
+
+    let result = turn.await.expect("join");
+    // Either cancelled locally or completed as interrupted — never a quiet success
+    // after a pre-ID interrupt without delivering cancel intent.
+    match result {
+        Ok(()) => {
+            let mut saw_cancelled = false;
+            while let Ok(event) = rx.try_recv() {
+                if matches!(event, AgentEvent::TurnCancelled { .. }) {
+                    saw_cancelled = true;
+                }
+            }
+            assert!(
+                saw_cancelled,
+                "successful return after pre-ID interrupt must observe TurnCancelled"
+            );
+        }
+        Err(error) => {
+            let message = error.to_string();
+            assert!(
+                message.contains("cancelled") || message.contains("interrupted"),
+                "unexpected failure after pre-ID interrupt: {message}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn interrupt_returns_while_initialize_floods_irrelevant_notifications() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let init_seen = dir.path().join("init-seen");
+    let stub = write_python_app_server(
+        dir.path(),
+        r#"
+init_seen = os.environ["INIT_SEEN"]
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        open(init_seen, "w").close()
+        while True:
+            print(json.dumps({"method": "warning", "params": {"message": "noise"}}), flush=True)
+            time.sleep(0.02)
+"#,
+    )?;
+    let adapter = Arc::new(CodexAdapter::new(stub).with_deadlines(control_test_deadlines()));
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request
+        .env_vars
+        .insert("INIT_SEEN".into(), init_seen.display().to_string());
+    request.timeout_secs = None; // stdout-stall disabled; absolute init still applies
+    let (tx, _rx) = mpsc::channel(8);
+    let turn: tokio::task::JoinHandle<harness_core::error::Result<()>> = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.as_ref().start_turn(request, tx).await })
+    };
+
+    let started = Instant::now();
+    while !init_seen.exists() {
+        if started.elapsed() > Duration::from_secs(15) {
+            panic!("timed out waiting for initialize");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let interrupt_started = Instant::now();
+    adapter.interrupt().await?;
+    assert!(
+        interrupt_started.elapsed() < Duration::from_millis(500),
+        "interrupt must not wait behind protocol I/O lock"
+    );
+
+    let error = turn
+        .await
+        .expect("join")
+        .expect_err("flooded initialize must end via cancel or absolute deadline");
+    let message = error.to_string();
+    assert!(
+        message.contains("cancelled") || message.contains("absolute initialize deadline"),
+        "unexpected initialize failure: {message}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn absolute_initialize_deadline_fires_on_irrelevant_notifications() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stub = write_python_app_server(
+        dir.path(),
+        r#"
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        while True:
+            print(json.dumps({"method": "warning", "params": {"message": "noise"}}), flush=True)
+            time.sleep(0.01)
+"#,
+    )?;
+    let adapter = CodexAdapter::new(stub).with_deadlines(short_deadlines());
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request.timeout_secs = None;
+    let (tx, _rx) = mpsc::channel(4);
+    let error = adapter
+        .start_turn(request, tx)
+        .await
+        .expect_err("absolute initialize deadline must fire");
+    assert!(
+        format!("{error}").contains("absolute initialize deadline"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn idle_interrupt_does_not_poison_next_attempt() {
+    let adapter = CodexAdapter::new(PathBuf::from("codex"));
+    adapter.interrupt().await.unwrap();
+    assert!(adapter.state.lock().await.active_attempt.is_none());
+    let generation = adapter.state.lock().await.begin_attempt().unwrap();
+    assert_eq!(generation, 1);
+    assert!(!adapter.state.lock().await.cancel_requested_for(generation));
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn overlapping_start_turn_is_rejected() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let gate = dir.path().join("hold");
+    let stub = write_python_app_server(
+        dir.path(),
+        r#"
+gate = os.environ["HOLD_GATE"]
+open(gate, "w").close()
+while os.path.exists(gate):
+    time.sleep(0.05)
+for raw in sys.stdin:
+    pass
+"#,
+    )?;
+    let adapter = Arc::new(CodexAdapter::new(stub).with_deadlines(AttemptDeadlines {
+        absolute_init: Duration::from_secs(5),
+        frame_write: Duration::from_secs(2),
+        stop_cleanup: Duration::from_secs(2),
+    }));
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request
+        .env_vars
+        .insert("HOLD_GATE".into(), gate.display().to_string());
+    request.timeout_secs = Some(5);
+    let (tx1, _rx1) = mpsc::channel(4);
+    let first = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.start_turn(request, tx1).await })
+    };
+
+    let started = Instant::now();
+    while !gate.exists() {
+        if started.elapsed() > Duration::from_secs(15) {
+            panic!("first start_turn never reached stub");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Give the first attempt time to publish its generation.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (tx2, _rx2) = mpsc::channel(4);
+    let overlap = adapter
+        .start_turn(test_turn_request(dir.path().to_path_buf()), tx2)
+        .await
+        .expect_err("overlapping start must be rejected");
+    assert!(
+        format!("{overlap}").contains("overlapping start_turn"),
+        "{overlap}"
+    );
+
+    let _ = std::fs::remove_file(&gate);
+    let _ = first.await;
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn frame_write_deadline_poisons_session_when_child_stops_reading() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stub = write_python_app_server(
+        dir.path(),
+        r#"
+# Complete handshake, then stop consuming stdin so the next large frame write blocks.
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"method": "thread/started", "params": {"thread": {"id": "thread-1"}}}), flush=True)
+        break
+time.sleep(60)
+"#,
+    )?;
+    let adapter = CodexAdapter::new(stub).with_deadlines(AttemptDeadlines {
+        absolute_init: Duration::from_secs(5),
+        frame_write: Duration::from_millis(100),
+        stop_cleanup: Duration::from_millis(500),
+    });
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    // Large prompt forces writes beyond the typical pipe buffer once framed.
+    request.prompt = "x".repeat(256 * 1024);
+    request.timeout_secs = None;
+    let (tx, _rx) = mpsc::channel(4);
+    let error = adapter
+        .start_turn(request, tx)
+        .await
+        .expect_err("blocked stdin write must hit frame-write deadline");
+    let message = error.to_string();
+    assert!(
+        message.contains("frame write deadline") || message.contains("poisoned"),
+        "{message}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn dropped_start_turn_retains_cleanup_ownership() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let init_seen = dir.path().join("init-seen");
+    let stub = write_python_app_server(
+        dir.path(),
+        r#"
+init_seen = os.environ["INIT_SEEN"]
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        open(init_seen, "w").close()
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+        time.sleep(60)
+"#,
+    )?;
+    let adapter = Arc::new(CodexAdapter::new(stub).with_deadlines(control_test_deadlines()));
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request
+        .env_vars
+        .insert("INIT_SEEN".into(), init_seen.display().to_string());
+    request.timeout_secs = Some(5);
+    let (tx, _rx) = mpsc::channel(4);
+    let turn: tokio::task::JoinHandle<harness_core::error::Result<()>> = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.as_ref().start_turn(request, tx).await })
+    };
+
+    let started = Instant::now();
+    while !init_seen.exists() {
+        if started.elapsed() > Duration::from_secs(15) {
+            panic!("initialize never observed");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    turn.abort();
+    let _ = turn.await;
+
+    // Dropped attempt schedules cleanup; wait briefly for the spawn task.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let state = adapter.state.lock().await;
+    assert!(
+        state.active_attempt.is_none() || state.child.is_none() || state.failed_cleanup.is_some(),
+        "dropped start_turn must not leave an unowned live attempt without cleanup bookkeeping"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn stale_reader_is_not_restored_after_generation_changes() -> anyhow::Result<()> {
+    let adapter = CodexAdapter::new(PathBuf::from("codex"));
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("stdout");
+    let stdin = child.stdin.take().expect("stdin");
+    let lines = BufReader::new(stdout).lines();
+    {
+        let mut state = adapter.state.lock().await;
+        let generation = state.begin_attempt()?;
+        state.child = Some(crate::ManagedChild::new(child, "stale reader test"));
+        state.stdin = Some(stdin);
+        // Simulate an older generation finishing while holding a detached reader.
+        state.clear_attempt_if_current(generation);
+        let next = state.begin_attempt()?;
+        assert_ne!(generation, next);
+        // Restoring under the wrong generation must be rejected by finish_attempt_success.
+        drop(state);
+        let error = adapter
+            .finish_attempt_success(generation, lines)
+            .await
+            .expect_err("stale generation must not restore stdout reader");
+        assert!(format!("{error}").contains("generation"));
+        assert!(adapter.state.lock().await.stdout_lines.is_none());
+    }
+    let _ = adapter.terminate_and_drain().await;
+    Ok(())
 }
