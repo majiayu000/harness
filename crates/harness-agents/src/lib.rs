@@ -144,6 +144,10 @@ pub(crate) struct ManagedChild {
     cleanup_disarmed: bool,
     egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
     egress_verification: crate::spawn_contract::EgressVerification,
+    /// Test-only hook: after the root process exits, return this error instead
+    /// of completing descendant cleanup so callers can assert failure propagation.
+    #[cfg(test)]
+    injected_cleanup_error: Option<std::io::Error>,
 }
 
 impl ManagedChild {
@@ -156,7 +160,19 @@ impl ManagedChild {
             cleanup_disarmed: false,
             egress_proxy_lease: None,
             egress_verification: crate::spawn_contract::EgressVerification::NotRequired,
+            #[cfg(test)]
+            injected_cleanup_error: None,
         }
+    }
+
+    /// Inject a descendant-cleanup failure after the root child exits.
+    ///
+    /// Ownership remains with the caller: `cleanup_disarmed` stays false so a
+    /// failed cleanup cannot be mistaken for a drained process.
+    #[cfg(test)]
+    pub(crate) fn with_injected_cleanup_error(mut self, error: std::io::Error) -> Self {
+        self.injected_cleanup_error = Some(error);
+        self
     }
 
     pub(crate) fn with_egress_proxy_lease(
@@ -222,6 +238,10 @@ impl ManagedChild {
         &mut self,
     ) -> std::io::Result<std::process::ExitStatus> {
         let status = self.wait().await?;
+        #[cfg(test)]
+        if let Some(error) = self.injected_cleanup_error.take() {
+            return Err(error);
+        }
         self.cleanup_after_child_exit().await?;
         Ok(status)
     }
