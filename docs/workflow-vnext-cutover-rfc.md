@@ -155,6 +155,8 @@ Each shared task predicate binds both `store_key = <configured task-store identi
 `runtime_workflow_id IS NOT NULL`; neither column alone proves ownership.
 The runtime-state predicate is separately fixed to the configured data directory's exact
 `RuntimeStateStore::store_key_for_data_dir` value; it never selects another store key.
+If that helper returns an error (uncreatable path, failed canonicalization, or non-UTF-8
+canonical path), cutover inventory/archive must refuse rather than broaden the predicate.
 
 That inventory is a review input, not an executable authorization. Any intervening source migration
 changes the manifest version and invalidates prior counts, fingerprints, approvals, and dry-run
