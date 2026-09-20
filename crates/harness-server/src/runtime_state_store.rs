@@ -1,5 +1,6 @@
 use crate::runtime_hosts_state::PersistedRuntimeHost;
 use crate::runtime_project_cache_state::PersistedHostProjectCache;
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use harness_core::db::{Migration, PgStoreContext};
 use harness_core::store_backend::{PostgresBackend, StoreLocation};
@@ -151,7 +152,7 @@ impl RuntimeStateStore {
         setup_pool: &PgPool,
         data_dir: &Path,
     ) -> anyhow::Result<Self> {
-        let store_key = Self::store_key_for_data_dir(data_dir);
+        let store_key = Self::store_key_for_data_dir(data_dir)?;
         Self::open_with_context_and_store_key(context, setup_pool, store_key).await
     }
 
@@ -175,12 +176,35 @@ impl RuntimeStateStore {
         &self.schema
     }
 
-    pub fn store_key_for_data_dir(data_dir: &Path) -> String {
-        data_dir
-            .canonicalize()
-            .unwrap_or_else(|_| data_dir.to_path_buf())
-            .to_string_lossy()
-            .into_owned()
+    /// Derive the shared-schema store key for a configured data directory.
+    ///
+    /// Ensures the directory exists, canonicalizes it, and converts the result
+    /// losslessly to UTF-8. Failure is returned explicitly — callers must not
+    /// fall back to a raw or lossy path as an alternate namespace identity.
+    pub fn store_key_for_data_dir(data_dir: &Path) -> anyhow::Result<String> {
+        std::fs::create_dir_all(data_dir).with_context(|| {
+            format!(
+                "failed to create runtime state store data dir '{}'",
+                data_dir.display()
+            )
+        })?;
+        let canonical = data_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize runtime state store data dir '{}'",
+                data_dir.display()
+            )
+        })?;
+        Self::store_key_from_canonical_path(&canonical)
+    }
+
+    pub(crate) fn store_key_from_canonical_path(canonical: &Path) -> anyhow::Result<String> {
+        let Some(key) = canonical.to_str() else {
+            anyhow::bail!(
+                "runtime state store data dir '{}' is not valid UTF-8 after canonicalization; refusing lossy store-key identity",
+                canonical.display()
+            );
+        };
+        Ok(key.to_owned())
     }
 
     pub fn store_key(&self) -> &str {
@@ -225,6 +249,12 @@ impl RuntimeStateStore {
         Ok((Some(snapshot), LoadSnapshotOutcome::Loaded))
     }
 
+    /// Persist a runtime-state snapshot for this store key.
+    ///
+    /// Callers that share a store key across concurrent updates must serialize
+    /// snapshot capture together with this write (see
+    /// `AppState::runtime_state_persist_lock`). Capturing outside that boundary
+    /// can let an older snapshot overwrite a newer one.
     pub async fn persist_snapshot(
         &self,
         hosts: Vec<PersistedRuntimeHost>,
