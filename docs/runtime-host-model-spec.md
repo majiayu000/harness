@@ -131,9 +131,12 @@ Required prompt preparation failures use the fenced preflight-failure path and
 return no executable prompt. The server rechecks lease ownership and cancellation
 after preparation and audit persistence. A rendered prompt does not provision a
 checkout, transfer candidate commits, execute a model or prove completed work;
-completion and eval evidence requirements still apply. The supervised Docker
-client consumes rendered agent claims and pinned Git bundles for a single task;
-it does not yet execute native quality-gate jobs or advertise eval capabilities.
+Completion and eval evidence requirements still apply. The supervised Docker
+client consumes rendered agent claims and pinned Git bundles, and can execute a
+follow-on native quality-gate claim against a retained candidate bound to
+`command.expected_head_sha`. It still advertises only lease-proof capability and
+rejects eval/agent-contract jobs until resource, network, credential and
+evidence requirements are complete.
 
 `POST /api/runtime-hosts/{id}/runtime-jobs/{runtime_job_id}/lease/renew`
 - request: `{ lease_generation, lease_expires_at, lease_proof, renewal_id, lease_secs?: number }`

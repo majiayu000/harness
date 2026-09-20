@@ -944,3 +944,298 @@ def test_verifier_reconstructs_pinned_bundle_offline_before_running_verifier(tmp
     assert not events
     assert (tmp_path / 'verifier.stdout').read_text() == 'verified output'
     assert handoff['verified'] is False
+
+
+def quality_gate_module():
+    path = Path(__file__).resolve().parents[1] / 'scripts/supervised_quality_gate.py'
+    spec = importlib.util.spec_from_file_location('supervised_quality_gate', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def seed_retained_candidate(tmp_path, candidate='b' * 40):
+    candidate_dir = tmp_path / 'candidate'
+    workspace = candidate_dir / 'workspace'
+    workspace.mkdir(parents=True)
+    (workspace / 'ok').write_text('ok\n')
+    bundle = candidate_dir / 'candidate.bundle'
+    bundle.write_bytes(b'candidate-bundle-bytes')
+    digest = __import__('hashlib').sha256(bundle.read_bytes()).hexdigest()
+    handoff = {
+        'base_commit': 'a' * 40,
+        'candidate_commit': candidate,
+        'bundle_sha256': digest,
+        'verified': True,
+    }
+    return handoff, bundle
+
+
+def test_prepare_follow_on_claim_clears_execution_evidence_and_refuses_completion(tmp_path):
+    runner = host(tmp_path, 'new')
+    runner.persist = Mock()
+    runner.state['execution_evidence'] = {
+        'checked_out_commit': 'a' * 40,
+        'usage': {'total_tokens': 9},
+    }
+    runner.state['job'] = {'id': 'old-job'}
+    runner.prepare_follow_on_claim()
+    assert 'execution_evidence' not in runner.state
+    assert 'job' not in runner.state
+    assert runner.state['phase'] == 'claiming'
+    (tmp_path / 'completion.json').write_text('{"completed":true}\n')
+    with pytest.raises(RuntimeError, match='refusing to mutate a completed run'):
+        runner.prepare_follow_on_claim()
+    assert (tmp_path / 'completion.json').read_text() == '{"completed":true}\n'
+
+
+def test_fresh_state_consumes_copied_candidate_without_mutating_prior_completed_run(tmp_path):
+    """Supported handoff: copy candidate/ into a fresh state dir; leave prior run intact."""
+    import hashlib
+    import shutil
+    from types import SimpleNamespace
+
+    prior = tmp_path / 'prior'
+    fresh = tmp_path / 'fresh'
+    prior.mkdir()
+    fresh.mkdir()
+    handoff, bundle = seed_retained_candidate(prior)
+    (prior / 'candidate' / 'revision.json').write_text(json.dumps({
+        'base_commit': handoff['base_commit'],
+        'candidate_commit': handoff['candidate_commit'],
+    }))
+    prior_state = {
+        'host_id': 'prior-host',
+        'phase': 'completed',
+        'git_handoff': handoff,
+        'job': {'id': 'impl-job', 'input': {'activity': 'modify'}},
+        'lease': {'lease_generation': 1, 'lease_expires_at': 'old', 'lease_proof': 'old'},
+        'result': {'status': 'succeeded'},
+        'execution_evidence': {
+            'checked_out_commit': 'f' * 40,
+            'usage': {'total_tokens': 42},
+        },
+    }
+    (prior / 'state.json').write_text(json.dumps(prior_state, indent=2))
+    (prior / 'completion.json').write_text(json.dumps({'completed': True}))
+    (prior / 'completion-response.json').write_text(json.dumps({'completed': True}))
+    prior_snapshot = {
+        path.relative_to(prior).as_posix(): path.read_bytes()
+        for path in prior.rglob('*') if path.is_file()
+    }
+
+    shutil.copytree(prior / 'candidate', fresh / 'candidate')
+    request_path = fresh / 'request.json'
+    submission_path = fresh / 'submission.json'
+    verifier_path = fresh / 'operator-verifier.py'
+    request_path.write_text(json.dumps({'project': str(fresh), 'prompt': 'qg'}))
+    submission_path.write_text(json.dumps({'task_id': 'qg-task', 'workflow_id': 'workflow-id'}))
+    verifier_path.write_text('pass\n')
+
+    runner = host(fresh, 'new')
+    runner.name = 'fresh-host'
+    runner.args = SimpleNamespace(
+        base_commit=handoff['base_commit'],
+        model='model',
+        image='image',
+        request=request_path,
+        submission=submission_path,
+        verifier=verifier_path,
+    )
+    runner.persist = lambda: (fresh / 'state.json').write_text(json.dumps(runner.state, indent=2))
+    expected = handoff['candidate_commit']
+    command = {
+        'activity': 'run_quality_gate',
+        'expected_head_sha': expected,
+        'validation_commands_argv': [['python3', '-I', '/trusted/verify.py', '/candidate']],
+    }
+    claim = {
+        'claimed': True,
+        'lease_generation': 2,
+        'lease_expires_at': 'new-expiry',
+        'lease_proof': 'new-proof',
+        'runtime_job': {
+            'id': 'quality-job',
+            'input': {
+                'activity': 'run_quality_gate',
+                'workflow_id': 'workflow-id',
+                'command': command,
+            },
+        },
+    }
+    runner.api = Mock(side_effect=[{}, claim])
+    runner.launch = Mock(side_effect=AssertionError('must not launch agent'))
+    runner.wait = Mock(side_effect=AssertionError('must not wait on agent'))
+    validation = [{
+        'argv': command['validation_commands_argv'][0],
+        'exit_code': 0,
+        'output_sha256': 'd' * 64,
+        'duration_ms': 3,
+    }]
+    runner.verify_expected_head = Mock(return_value=validation)
+    runner.cleanup = Mock()
+    runner.complete = Mock(side_effect=lambda: runner.state.update(phase='completed') or
+                           setattr(runner, '_completion', {
+                               **{k: runner.state['lease'][k] for k in
+                                  ('lease_generation', 'lease_expires_at', 'lease_proof')},
+                               'result': runner.state['result'],
+                               'execution_evidence': runner.state['execution_evidence'],
+                           }))
+    # Stale evidence must not survive into the fresh claim even if present briefly.
+    runner.state['execution_evidence'] = {'checked_out_commit': '0' * 40, 'usage': {'total_tokens': 99}}
+
+    runner.run()
+
+    for rel, content in prior_snapshot.items():
+        assert (prior / rel).read_bytes() == content
+    assert json.loads((prior / 'state.json').read_text())['phase'] == 'completed'
+    assert json.loads((prior / 'state.json').read_text())['execution_evidence']['usage']['total_tokens'] == 42
+    runner.launch.assert_not_called()
+    assert runner.state['result']['status'] == 'succeeded'
+    assert runner.state['execution_evidence']['checked_out_commit'] == expected
+    assert runner.state['execution_evidence']['usage']['total_tokens'] == 0
+    assert runner._completion['execution_evidence']['checked_out_commit'] == expected
+    assert runner.state['git_handoff']['bundle_sha256'] == hashlib.sha256(bundle.read_bytes()).hexdigest()
+
+
+def test_bind_rejects_local_candidate_that_is_not_expected_head():
+    gate = quality_gate_module()
+    with pytest.raises(RuntimeError, match='not an externally verified PR head'):
+        gate.bind_retained_candidate({'candidate_commit': 'a' * 40}, 'b' * 40)
+
+
+def test_native_quality_gate_claim_binds_expected_head_and_submits_evidence(tmp_path):
+    runner, _ = claimed_runner(tmp_path)
+    handoff, bundle = seed_retained_candidate(tmp_path)
+    runner.state['git_handoff'] = handoff
+    (tmp_path / 'verifier.py').write_text('pass\n')
+    expected = handoff['candidate_commit']
+    command = {
+        'activity': 'run_quality_gate',
+        'expected_head_sha': expected,
+        'validation_commands_argv': [['python3', '-I', '/trusted/verify.py', '/candidate']],
+    }
+    claim = {
+        'claimed': True,
+        **runner.state['lease'],
+        'runtime_job': {
+            'id': 'quality-job',
+            'input': {
+                'activity': 'run_quality_gate',
+                'workflow_id': 'workflow-id',
+                'command': command,
+            },
+        },
+    }
+    runner.api = Mock(side_effect=[{}, claim])
+    runner.launch = Mock(side_effect=AssertionError('must not launch agent'))
+    runner.wait = Mock(side_effect=AssertionError('must not wait on agent'))
+    validation = [{
+        'argv': command['validation_commands_argv'][0],
+        'exit_code': 0,
+        'output_sha256': 'd' * 64,
+        'duration_ms': 3,
+    }]
+    runner.verify_expected_head = Mock(return_value=validation)
+    runner.cleanup = Mock()
+    runner.complete = Mock(side_effect=lambda: runner.state.update(phase='completed') or
+                           setattr(runner, '_completion', {
+                               **runner.state['lease'],
+                               'result': runner.state['result'],
+                               'execution_evidence': runner.state['execution_evidence'],
+                           }))
+    # claimed_runner leaves phase claiming; keep retained candidate and skip freeze.
+    runner.state['phase'] = 'claiming'
+    runner.state['input_snapshot'] = {'base_commit': 'a' * 40, 'bundle_sha256': 'e' * 64}
+    runner.run()
+    runner.launch.assert_not_called()
+    runner.verify_expected_head.assert_called_once_with(
+        expected, [command['validation_commands_argv'][0]]
+    )
+    assert runner.state['result']['status'] == 'succeeded'
+    assert runner.state['result']['signals'][0]['signal_type'] == 'QualityPassed'
+    evidence = runner.state['execution_evidence']
+    assert evidence['checked_out_commit'] == expected
+    assert evidence['validation'] == validation
+    assert evidence['usage']['total_tokens'] == 0
+    assert evidence['isolation_cleanup_status'] == 'cleaned'
+    assert runner._completion['execution_evidence']['checked_out_commit'] == expected
+    handoff_artifact = next(
+        a['artifact'] for a in runner.state['result']['artifacts']
+        if a['artifact_type'] == 'supervised_git_handoff'
+    )
+    assert handoff_artifact['candidate_commit'] == expected
+    assert handoff_artifact['verified'] is True
+
+
+def test_native_quality_gate_rejects_mismatched_expected_head(tmp_path):
+    runner, _ = claimed_runner(tmp_path)
+    handoff, _ = seed_retained_candidate(tmp_path, candidate='b' * 40)
+    runner.state.update(phase='claiming', git_handoff=handoff,
+                        input_snapshot={'base_commit': 'a' * 40, 'bundle_sha256': 'e' * 64})
+    (tmp_path / 'verifier.py').write_text('pass\n')
+    claim = {
+        'claimed': True,
+        **runner.state['lease'],
+        'runtime_job': {
+            'id': 'quality-job',
+            'input': {
+                'activity': 'run_quality_gate',
+                'workflow_id': 'workflow-id',
+                'command': {
+                    'expected_head_sha': 'c' * 40,
+                    'validation_commands_argv': [['python3', '-I', '/verify.py', '/candidate']],
+                },
+            },
+        },
+    }
+    runner.api = Mock(side_effect=[{}, claim])
+    runner.launch = Mock(side_effect=AssertionError('must not launch'))
+    runner.cleanup = Mock()
+    runner.complete = Mock()
+    runner.run()
+    assert runner.state['result']['status'] == 'failed'
+    assert 'not an externally verified PR head' in runner.state['result']['error']
+    runner.launch.assert_not_called()
+    runner.complete.assert_called_once()
+
+
+def test_verify_expected_head_uses_helper_verify_and_server_argv(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = load()
+    runner = host(tmp_path, 'executing')
+    runner.name = 'owned'
+    runner.args = SimpleNamespace(image='pinned-image')
+    runner.renew = Mock()
+    handoff, _ = seed_retained_candidate(tmp_path)
+    runner.state['git_handoff'] = handoff
+    (tmp_path / 'verifier.py').write_text('pass\n')
+    expected = handoff['candidate_commit']
+    commands = [['python3', '-I', '/trusted/verify.py', '/candidate']]
+    out = tmp_path / 'quality-gate-out'
+    calls = []
+
+    def docker(*args):
+        calls.append(args)
+        if args[0] == 'run':
+            out.mkdir(exist_ok=True)
+            (out / 'validation.json').write_text(json.dumps([{
+                'argv': commands[0], 'exit_code': 0,
+                'output_sha256': 'f' * 64, 'duration_ms': 1,
+            }]))
+            return 'cid'
+        if args[0] == 'inspect':
+            return json.dumps({'Running': False, 'ExitCode': 0})
+        return 'ok'
+
+    monkeypatch.setitem(runner.verify_expected_head.__globals__, 'docker', docker)
+    assert runner.verify_expected_head(expected, commands)[0]['exit_code'] == 0
+    command = calls[0]
+    assert command[:7] == ('run', '-d', '--name', 'owned-verify', '--network', 'none', '--read-only')
+    assert f'type=bind,src={tmp_path}/candidate,dst=/handoff,readonly' in command
+    assert any(arg.endswith('dst=/trusted/verify.py,readonly') for arg in command)
+    script = command[command.index('-c') + 1]
+    assert '/git-handoff.py' in script and 'verify' in script
+    payload = json.loads(command[-1])
+    assert payload['candidate'] == expected
+    assert payload['commands'] == commands
