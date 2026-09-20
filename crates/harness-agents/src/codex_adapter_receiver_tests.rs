@@ -35,7 +35,7 @@ async fn closed_event_receiver_kills_and_reaps_app_server_process_group() -> any
             "codex app-server receiver test",
         ));
         state.stdin = Some(stdin);
-        state.stdout_lines = Some(BufReader::new(stdout).lines());
+        state.stdout_lines = Some(adapter.wrap_stdout(stdout));
         state.thread_id = Some("thread-1".into());
         state.child_workspace = Some(PathBuf::from("/tmp/project"));
     }

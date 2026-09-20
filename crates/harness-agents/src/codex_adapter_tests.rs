@@ -1,8 +1,11 @@
+use super::bounded_frame::{BoundedStdoutReader, DEFAULT_MAX_PROTOCOL_FRAME_BYTES};
 use super::*;
+use harness_core::agent::AgentAdapter;
 use harness_core::{agent::AgentDiagnosticSeverity, types::Item};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::BufReader;
 use tokio::time::Instant;
 
 fn test_turn_request(project_root: PathBuf) -> AgentRequest {
@@ -603,7 +606,8 @@ async fn app_server_read_times_out_when_stdout_stalls() -> anyhow::Result<()> {
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("stdout should be piped"))?;
-    let mut lines = BufReader::new(stdout).lines();
+    let mut lines =
+        BoundedStdoutReader::new(BufReader::new(stdout), DEFAULT_MAX_PROTOCOL_FRAME_BYTES);
 
     let error = CodexAdapter::read_next_message_with_timeout(
         &mut lines,
@@ -788,7 +792,7 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         let mut state = adapter.state.lock().await;
         state.child = Some(crate::ManagedChild::new(child, "codex app-server test"));
         state.stdin = Some(stdin);
-        state.stdout_lines = Some(BufReader::new(stdout).lines());
+        state.stdout_lines = Some(adapter.wrap_stdout(stdout));
         state.thread_id = Some("thread-1".into());
         state.child_workspace = Some(PathBuf::from("/tmp/project"));
     }
@@ -854,7 +858,7 @@ async fn start_turn_continues_after_error_notification_until_completed() -> anyh
         let mut state = adapter.state.lock().await;
         state.child = Some(crate::ManagedChild::new(child, "codex app-server test"));
         state.stdin = Some(stdin);
-        state.stdout_lines = Some(BufReader::new(stdout).lines());
+        state.stdout_lines = Some(adapter.wrap_stdout(stdout));
         state.thread_id = Some("thread-1".into());
         state.child_workspace = Some(project_root.path().to_path_buf());
     }
@@ -903,7 +907,10 @@ async fn adapter_state_reports_incomplete_child_when_stdout_reader_is_missing() 
     let mut state = AdapterState::new();
     state.child = Some(crate::ManagedChild::new(child, "codex app-server test"));
     state.stdin = Some(stdin);
-    state.stdout_lines = Some(BufReader::new(stdout).lines());
+    state.stdout_lines = Some(BoundedStdoutReader::new(
+        BufReader::new(stdout),
+        DEFAULT_MAX_PROTOCOL_FRAME_BYTES,
+    ));
 
     assert!(state.child_ready());
     state.stdout_lines = None;
@@ -938,7 +945,7 @@ async fn terminate_propagates_injected_cleanup_failure_and_blocks_reuse() {
             ),
         );
         state.stdin = Some(stdin);
-        state.stdout_lines = Some(BufReader::new(stdout).lines());
+        state.stdout_lines = Some(adapter.wrap_stdout(stdout));
         state.thread_id = Some("thread-1".into());
         state.active_turn_id = Some("turn-1".into());
         state.child_workspace = Some(PathBuf::from("/tmp/workspace"));
@@ -1430,7 +1437,7 @@ async fn stale_reader_is_not_restored_after_generation_changes() -> anyhow::Resu
         .spawn()?;
     let stdout = child.stdout.take().expect("stdout");
     let stdin = child.stdin.take().expect("stdin");
-    let lines = BufReader::new(stdout).lines();
+    let lines = adapter.wrap_stdout(stdout);
     {
         let mut state = adapter.state.lock().await;
         let generation = state.begin_attempt()?;
@@ -1450,5 +1457,143 @@ async fn stale_reader_is_not_restored_after_generation_changes() -> anyhow::Resu
         assert!(adapter.state.lock().await.stdout_lines.is_none());
     }
     let _ = adapter.terminate_and_drain().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn oversized_frame_with_newline_resets_and_reaps_child() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Initialize ok, then emit a frame larger than the injected 64-byte limit.
+    let stub = write_python_app_server(
+        dir.path(),
+        r#"
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+        sys.stdout.write("x" * 80 + "\n")
+        sys.stdout.flush()
+        time.sleep(60)
+"#,
+    )?;
+    let adapter = CodexAdapter::new(stub)
+        .with_deadlines(control_test_deadlines())
+        .with_max_protocol_frame_bytes(64);
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request.timeout_secs = Some(5);
+    let (tx, _rx) = mpsc::channel(4);
+    let error = adapter
+        .start_turn(request, tx)
+        .await
+        .expect_err("oversized framed stdout must fail");
+    let message = format!("{error}");
+    assert!(
+        message.contains("protocol frame exceeds maximum size"),
+        "expected frame-size error, got: {message}"
+    );
+    let state = adapter.state.lock().await;
+    assert!(state.child.is_none(), "child must be reaped after oversize");
+    assert!(state.stdin.is_none());
+    assert!(state.stdout_lines.is_none());
+    assert!(
+        state.protocol_poisoned || state.failed_cleanup.is_some() || state.child.is_none(),
+        "oversize must poison or fully reset the session"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn oversized_frame_without_newline_resets_and_reaps_child() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let stub = write_python_app_server(
+        dir.path(),
+        r#"
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+        # No trailing newline: stream must still reject once capacity is exceeded.
+        sys.stdout.write("y" * 80)
+        sys.stdout.flush()
+        time.sleep(60)
+"#,
+    )?;
+    let adapter = CodexAdapter::new(stub)
+        .with_deadlines(control_test_deadlines())
+        .with_max_protocol_frame_bytes(64);
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request.timeout_secs = Some(5);
+    let (tx, _rx) = mpsc::channel(4);
+    let error = adapter
+        .start_turn(request, tx)
+        .await
+        .expect_err("oversized unframed stdout must fail");
+    let message = format!("{error}");
+    assert!(
+        message.contains("protocol frame exceeds maximum size"),
+        "expected frame-size error, got: {message}"
+    );
+    let state = adapter.state.lock().await;
+    assert!(state.child.is_none(), "child must be reaped after oversize");
+    assert!(state.stdin.is_none());
+    assert!(state.stdout_lines.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn injected_limit_accepts_exact_boundary_frame_during_initialize() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Large enough that normal handshake JSON fits; exact-limit frame is whitespace.
+    let limit = 256usize;
+    let stub = write_python_app_server(
+        dir.path(),
+        &format!(
+            r#"
+limit = {limit}
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        frame = (b" " * limit) + b"\n"
+        assert len(frame) == limit + 1
+        sys.stdout.buffer.write(frame)
+        sys.stdout.buffer.write((json.dumps({{"id": msg["id"], "result": {{}}}}) + "\n").encode())
+        sys.stdout.buffer.flush()
+    elif msg.get("method") == "thread/start":
+        sys.stdout.buffer.write((json.dumps({{"method": "thread/started", "params": {{"thread": {{"id": "thread-1"}}}}}})+ "\n").encode())
+        sys.stdout.buffer.write((json.dumps({{"id": msg["id"], "result": {{"thread": {{"id": "thread-1"}}}}}})+ "\n").encode())
+        sys.stdout.buffer.flush()
+    elif msg.get("method") == "turn/start":
+        sys.stdout.buffer.write((json.dumps({{"method": "turn/started", "params": {{"threadId": "thread-1", "turn": {{"id": "turn-1", "status": "inProgress", "items": []}}}}}})+ "\n").encode())
+        sys.stdout.buffer.write((json.dumps({{"method": "turn/completed", "params": {{"threadId": "thread-1", "turn": {{"id": "turn-1", "status": "completed", "items": [], "error": None}}}}}})+ "\n").encode())
+        sys.stdout.buffer.flush()
+"#
+        ),
+    )?;
+    let adapter = CodexAdapter::new(stub)
+        .with_deadlines(control_test_deadlines())
+        .with_max_protocol_frame_bytes(limit);
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request.timeout_secs = Some(5);
+    let (tx, mut rx) = mpsc::channel(8);
+    adapter.start_turn(request, tx).await?;
+    let mut completed = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AgentEvent::TurnCompleted { .. }) {
+            completed = true;
+        }
+    }
+    assert!(completed, "exact-limit blank frame must not abort the turn");
     Ok(())
 }
