@@ -156,12 +156,15 @@ is no source-directory-only mode or old-state migration.
 ## Native quality-gate consumption
 
 After an implementation activity retains `candidate/candidate.bundle` and
-`supervised_git_handoff`, the same state directory can claim a subsequent
-`run_quality_gate` job. Reset `phase` to `new` (or start a fresh state directory
-that already contains the retained candidate) and point `--submission` at the
-quality-gate workflow. The client skips source freeze when a retained candidate
-is present, rejects `prepared_prompt` on the native claim, and requires
-`command.expected_head_sha` plus `validation_commands_argv`.
+`supervised_git_handoff`, claim a subsequent `run_quality_gate` job from a
+**fresh** `--state-dir`. Copy only the prior run's `candidate/` tree into that
+directory (or start with a state directory that already contains it). Do not
+rewrite the completed run's `phase`, lease, result, or `completion*.json` files:
+same-directory mutation of a completed run is refused. The fresh client rebuilds
+`git_handoff` from `candidate/revision.json` plus the on-disk bundle digest,
+skips source freeze, rejects `prepared_prompt` on the native claim, and requires
+`command.expected_head_sha` plus `validation_commands_argv`. Point `--submission`
+at the quality-gate workflow.
 
 Verification reconstructs the retained bundle with the existing
 `supervised_git_handoff.verify` helper, pinning the candidate commit to
@@ -172,7 +175,10 @@ tree (`/candidate`), with the operator verifier also mounted at
 `/trusted/verify.py` for argv compatibility. Completion includes host
 `execution_evidence` whose `checked_out_commit` is that expected head, with honest
 zero model usage and without advertising `eval_resource_limits` or other eval
-capabilities. Eval, agent-contract, and exact-replay jobs remain rejected.
+capabilities. Prior-job `execution_evidence` is cleared before the new claim so
+stale evidence cannot attach to the current lease. Eval, agent-contract, and
+exact-replay jobs remain rejected. Completed restarts of the original state
+directory still no-op and do not reclaim.
 
 ## Candidate resource evidence
 

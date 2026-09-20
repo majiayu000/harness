@@ -971,6 +971,133 @@ def seed_retained_candidate(tmp_path, candidate='b' * 40):
     return handoff, bundle
 
 
+def test_prepare_follow_on_claim_clears_execution_evidence_and_refuses_completion(tmp_path):
+    runner = host(tmp_path, 'new')
+    runner.persist = Mock()
+    runner.state['execution_evidence'] = {
+        'checked_out_commit': 'a' * 40,
+        'usage': {'total_tokens': 9},
+    }
+    runner.state['job'] = {'id': 'old-job'}
+    runner.prepare_follow_on_claim()
+    assert 'execution_evidence' not in runner.state
+    assert 'job' not in runner.state
+    assert runner.state['phase'] == 'claiming'
+    (tmp_path / 'completion.json').write_text('{"completed":true}\n')
+    with pytest.raises(RuntimeError, match='refusing to mutate a completed run'):
+        runner.prepare_follow_on_claim()
+    assert (tmp_path / 'completion.json').read_text() == '{"completed":true}\n'
+
+
+def test_fresh_state_consumes_copied_candidate_without_mutating_prior_completed_run(tmp_path):
+    """Supported handoff: copy candidate/ into a fresh state dir; leave prior run intact."""
+    import hashlib
+    import shutil
+    from types import SimpleNamespace
+
+    prior = tmp_path / 'prior'
+    fresh = tmp_path / 'fresh'
+    prior.mkdir()
+    fresh.mkdir()
+    handoff, bundle = seed_retained_candidate(prior)
+    (prior / 'candidate' / 'revision.json').write_text(json.dumps({
+        'base_commit': handoff['base_commit'],
+        'candidate_commit': handoff['candidate_commit'],
+    }))
+    prior_state = {
+        'host_id': 'prior-host',
+        'phase': 'completed',
+        'git_handoff': handoff,
+        'job': {'id': 'impl-job', 'input': {'activity': 'modify'}},
+        'lease': {'lease_generation': 1, 'lease_expires_at': 'old', 'lease_proof': 'old'},
+        'result': {'status': 'succeeded'},
+        'execution_evidence': {
+            'checked_out_commit': 'f' * 40,
+            'usage': {'total_tokens': 42},
+        },
+    }
+    (prior / 'state.json').write_text(json.dumps(prior_state, indent=2))
+    (prior / 'completion.json').write_text(json.dumps({'completed': True}))
+    (prior / 'completion-response.json').write_text(json.dumps({'completed': True}))
+    prior_snapshot = {
+        path.relative_to(prior).as_posix(): path.read_bytes()
+        for path in prior.rglob('*') if path.is_file()
+    }
+
+    shutil.copytree(prior / 'candidate', fresh / 'candidate')
+    request_path = fresh / 'request.json'
+    submission_path = fresh / 'submission.json'
+    verifier_path = fresh / 'operator-verifier.py'
+    request_path.write_text(json.dumps({'project': str(fresh), 'prompt': 'qg'}))
+    submission_path.write_text(json.dumps({'task_id': 'qg-task', 'workflow_id': 'workflow-id'}))
+    verifier_path.write_text('pass\n')
+
+    runner = host(fresh, 'new')
+    runner.name = 'fresh-host'
+    runner.args = SimpleNamespace(
+        base_commit=handoff['base_commit'],
+        model='model',
+        image='image',
+        request=request_path,
+        submission=submission_path,
+        verifier=verifier_path,
+    )
+    runner.persist = lambda: (fresh / 'state.json').write_text(json.dumps(runner.state, indent=2))
+    expected = handoff['candidate_commit']
+    command = {
+        'activity': 'run_quality_gate',
+        'expected_head_sha': expected,
+        'validation_commands_argv': [['python3', '-I', '/trusted/verify.py', '/candidate']],
+    }
+    claim = {
+        'claimed': True,
+        'lease_generation': 2,
+        'lease_expires_at': 'new-expiry',
+        'lease_proof': 'new-proof',
+        'runtime_job': {
+            'id': 'quality-job',
+            'input': {
+                'activity': 'run_quality_gate',
+                'workflow_id': 'workflow-id',
+                'command': command,
+            },
+        },
+    }
+    runner.api = Mock(side_effect=[{}, claim])
+    runner.launch = Mock(side_effect=AssertionError('must not launch agent'))
+    runner.wait = Mock(side_effect=AssertionError('must not wait on agent'))
+    validation = [{
+        'argv': command['validation_commands_argv'][0],
+        'exit_code': 0,
+        'output_sha256': 'd' * 64,
+        'duration_ms': 3,
+    }]
+    runner.verify_expected_head = Mock(return_value=validation)
+    runner.cleanup = Mock()
+    runner.complete = Mock(side_effect=lambda: runner.state.update(phase='completed') or
+                           setattr(runner, '_completion', {
+                               **{k: runner.state['lease'][k] for k in
+                                  ('lease_generation', 'lease_expires_at', 'lease_proof')},
+                               'result': runner.state['result'],
+                               'execution_evidence': runner.state['execution_evidence'],
+                           }))
+    # Stale evidence must not survive into the fresh claim even if present briefly.
+    runner.state['execution_evidence'] = {'checked_out_commit': '0' * 40, 'usage': {'total_tokens': 99}}
+
+    runner.run()
+
+    for rel, content in prior_snapshot.items():
+        assert (prior / rel).read_bytes() == content
+    assert json.loads((prior / 'state.json').read_text())['phase'] == 'completed'
+    assert json.loads((prior / 'state.json').read_text())['execution_evidence']['usage']['total_tokens'] == 42
+    runner.launch.assert_not_called()
+    assert runner.state['result']['status'] == 'succeeded'
+    assert runner.state['execution_evidence']['checked_out_commit'] == expected
+    assert runner.state['execution_evidence']['usage']['total_tokens'] == 0
+    assert runner._completion['execution_evidence']['checked_out_commit'] == expected
+    assert runner.state['git_handoff']['bundle_sha256'] == hashlib.sha256(bundle.read_bytes()).hexdigest()
+
+
 def test_bind_rejects_local_candidate_that_is_not_expected_head():
     gate = quality_gate_module()
     with pytest.raises(RuntimeError, match='not an externally verified PR head'):

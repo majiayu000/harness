@@ -444,13 +444,56 @@ class Host:
             return None
         return handoff
 
+    def hydrate_retained_candidate(self) -> dict | None:
+        """Return a retained handoff, reconstructing pins from candidate/ when needed.
+
+        A fresh --state-dir may receive only a copied candidate/ tree from a prior
+        completed run. Do not require rewriting that prior run's phase or completion
+        files: rebuild git_handoff from revision.json plus the on-disk bundle digest.
+        """
+        existing = self.retained_candidate()
+        if existing is not None:
+            return existing
+        revision_path = self.root / "candidate" / "revision.json"
+        bundle = self.root / "candidate" / "candidate.bundle"
+        snapshot = self.root / "candidate" / "workspace"
+        if not revision_path.is_file() or not bundle.is_file() or not snapshot.is_dir():
+            return None
+        revision = json.loads(revision_path.read_text())
+        if not isinstance(revision, dict):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{40}", str(revision.get("candidate_commit", ""))):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{40}", str(revision.get("base_commit", ""))):
+            return None
+        if getattr(self, "args", None) is not None:
+            if revision["base_commit"] != self.args.base_commit:
+                raise RuntimeError("retained candidate base_commit does not match --base-commit")
+        with bundle.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        self.state["git_handoff"] = {
+            "base_commit": revision["base_commit"],
+            "candidate_commit": revision["candidate_commit"],
+            "bundle_sha256": digest,
+            "verified": False,
+        }
+        self.persist()
+        return self.retained_candidate()
+
     def prepare_follow_on_claim(self) -> None:
-        # Keep the verified candidate; clear only the prior job's lease and result.
+        # Keep the verified candidate; clear prior-job lease, result, and evidence.
+        # Never delete a completed run's completion artifacts — use a fresh state dir.
+        for name in ("completion.json", "completion-response.json"):
+            if (self.root / name).exists():
+                raise RuntimeError(
+                    "refusing to mutate a completed run's "
+                    + name
+                    + "; copy candidate/ into a fresh --state-dir instead"
+                )
         for key in ("job", "lease", "result", "agent_result", "prepared_prompt",
-                    "cleanup_errors", "resource_evidence"):
+                    "cleanup_errors", "resource_evidence", "execution_evidence"):
             self.state.pop(key, None)
-        for name in ("completion.json", "completion-response.json", "agent.jsonl", "agent.stderr",
-                     "verifier.stdout", "candidate-resources.json"):
+        for name in ("agent.jsonl", "agent.stderr", "verifier.stdout", "candidate-resources.json"):
             path = self.root / name
             if path.exists():
                 path.unlink()
@@ -613,7 +656,7 @@ class Host:
             self.state["request"] = json.loads(self.args.request.read_text())
             self.state["submission"] = json.loads(self.args.submission.read_text())
             (self.root / "verifier.py").write_bytes(self.args.verifier.read_bytes())
-            if self.retained_candidate():
+            if self.hydrate_retained_candidate():
                 # Reuse a previously exported candidate; do not recopy operator source.
                 self.prepare_follow_on_claim()
             else:
