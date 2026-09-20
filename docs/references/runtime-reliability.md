@@ -45,7 +45,7 @@ different liveness models, and no atomic relationship:
 - **Workspace leases** — `workspace_leases` rows keyed
   `(store_key, project_key, slot_index)` carry `owner_session`, `process_id`,
   and `process_started_at`, with liveness judged by PID inspection via
-  `sysinfo` (`crates/harness-server/src/workspace_lease_store.rs:19-77`).
+  `sysinfo` (`crates/harness-server/src/workspace_lease_store/mod.rs:19-77`).
 
 The worker renews its job lease during execution
 (`execute_with_lease_renewal`, `crates/harness-workflow/src/runtime/worker.rs:162`),
