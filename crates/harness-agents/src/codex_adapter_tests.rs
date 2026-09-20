@@ -1597,3 +1597,280 @@ for raw in sys.stdin:
     assert!(completed, "exact-limit blank frame must not abort the turn");
     Ok(())
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn cancel_during_spawn_prevents_uncancelled_turn() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let spawn_seen = dir.path().join("spawn-seen");
+    let release_spawn = dir.path().join("release-spawn");
+    let turn_started = dir.path().join("turn-started");
+    let stub = write_python_app_server(
+        dir.path(),
+        r#"
+spawn_seen = os.environ["SPAWN_SEEN"]
+release_spawn = os.environ["RELEASE_SPAWN"]
+turn_started = os.environ["TURN_STARTED"]
+open(spawn_seen, "w").close()
+while not os.path.exists(release_spawn):
+    time.sleep(0.01)
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"method": "thread/started", "params": {"thread": {"id": "thread-1"}}}), flush=True)
+        print(json.dumps({"id": msg["id"], "result": {"thread": {"id": "thread-1"}}}), flush=True)
+    elif method == "turn/start":
+        open(turn_started, "w").close()
+        print(json.dumps({"method": "turn/started", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "inProgress", "items": []}}}), flush=True)
+        print(json.dumps({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed", "items": [], "error": None}}}), flush=True)
+"#,
+    )?;
+    let adapter = Arc::new(CodexAdapter::new(stub).with_deadlines(control_test_deadlines()));
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request
+        .env_vars
+        .insert("SPAWN_SEEN".into(), spawn_seen.display().to_string());
+    request
+        .env_vars
+        .insert("RELEASE_SPAWN".into(), release_spawn.display().to_string());
+    request
+        .env_vars
+        .insert("TURN_STARTED".into(), turn_started.display().to_string());
+    request.timeout_secs = Some(5);
+
+    let (tx, _rx) = mpsc::channel(8);
+    let turn: tokio::task::JoinHandle<harness_core::error::Result<()>> = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.as_ref().start_turn(request, tx).await })
+    };
+
+    let started = Instant::now();
+    while !spawn_seen.exists() {
+        if started.elapsed() > Duration::from_secs(15) {
+            let _ = std::fs::write(&release_spawn, b"go");
+            let _ = turn.await;
+            panic!("timed out waiting for spawn barrier");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    adapter.interrupt().await?;
+    assert!(
+        adapter
+            .state
+            .lock()
+            .await
+            .active_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.cancel_requested),
+        "cancel during spawn must record attempt-scoped cancel intent"
+    );
+
+    // Releasing spawn must not allow an uncancelled turn to start for this attempt.
+    std::fs::write(&release_spawn, b"go")?;
+
+    let error = turn
+        .await
+        .expect("join")
+        .expect_err("cancel during spawn must fail the attempt");
+    assert!(
+        format!("{error}").contains("cancelled"),
+        "expected cancelled attempt, got: {error}"
+    );
+    assert!(
+        !turn_started.exists(),
+        "cancelled spawn must not proceed into an uncancelled turn/start"
+    );
+    assert!(
+        adapter.state.lock().await.active_attempt.is_none(),
+        "cancelled spawn must clear the attempt"
+    );
+
+    let next_generation = adapter.state.lock().await.begin_attempt()?;
+    assert!(
+        !adapter
+            .state
+            .lock()
+            .await
+            .cancel_requested_for(next_generation),
+        "spawn cancel must not poison the next generation"
+    );
+    adapter
+        .state
+        .lock()
+        .await
+        .clear_attempt_if_current(next_generation);
+
+    let mut second = test_turn_request(dir.path().to_path_buf());
+    second.env_vars.insert(
+        "SPAWN_SEEN".into(),
+        dir.path().join("spawn-seen-2").display().to_string(),
+    );
+    // Immediate release so the second spawn proceeds through handshake.
+    let release2 = dir.path().join("release-spawn-2");
+    std::fs::write(&release2, b"go")?;
+    second
+        .env_vars
+        .insert("RELEASE_SPAWN".into(), release2.display().to_string());
+    second.env_vars.insert(
+        "TURN_STARTED".into(),
+        dir.path().join("turn-started-2").display().to_string(),
+    );
+    second.timeout_secs = Some(5);
+    let (tx2, mut rx2) = mpsc::channel(8);
+    adapter.as_ref().start_turn(second, tx2).await?;
+    let mut completed = false;
+    while let Ok(event) = rx2.try_recv() {
+        if matches!(event, AgentEvent::TurnCompleted { .. }) {
+            completed = true;
+        }
+    }
+    assert!(
+        completed,
+        "next generation after spawn cancel must complete a turn"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn cancel_completion_race_and_repeated_cancel_leave_next_generation_clean(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let turn_start_seen = dir.path().join("turn-start-seen");
+    let release_completion = dir.path().join("release-completion");
+    let stub = write_python_app_server(
+        dir.path(),
+        r#"
+turn_start_seen = os.environ["TURN_START_SEEN"]
+release_completion = os.environ["RELEASE_COMPLETION"]
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"method": "thread/started", "params": {"thread": {"id": "thread-1"}}}), flush=True)
+        print(json.dumps({"id": msg["id"], "result": {"thread": {"id": "thread-1"}}}), flush=True)
+    elif method == "turn/start":
+        open(turn_start_seen, "w").close()
+        while not os.path.exists(release_completion):
+            time.sleep(0.01)
+        print(json.dumps({"method": "turn/started", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "inProgress", "items": []}}}), flush=True)
+        print(json.dumps({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed", "items": [], "error": None}}}), flush=True)
+    elif method == "turn/interrupt":
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+        print(json.dumps({"method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "interrupted", "items": [], "error": None}}}), flush=True)
+"#,
+    )?;
+    let adapter = Arc::new(CodexAdapter::new(stub).with_deadlines(control_test_deadlines()));
+    let mut request = test_turn_request(dir.path().to_path_buf());
+    request.env_vars.insert(
+        "TURN_START_SEEN".into(),
+        turn_start_seen.display().to_string(),
+    );
+    request.env_vars.insert(
+        "RELEASE_COMPLETION".into(),
+        release_completion.display().to_string(),
+    );
+    request.timeout_secs = Some(5);
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let turn: tokio::task::JoinHandle<harness_core::error::Result<()>> = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.as_ref().start_turn(request, tx).await })
+    };
+
+    let started = Instant::now();
+    while !turn_start_seen.exists() {
+        if started.elapsed() > Duration::from_secs(15) {
+            let _ = std::fs::write(&release_completion, b"go");
+            let _ = turn.await;
+            panic!("timed out waiting for turn/start barrier");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Race cancel against imminent completion; repeated cancel must stay idempotent.
+    adapter.interrupt().await?;
+    adapter.interrupt().await?;
+    adapter.interrupt().await?;
+    std::fs::write(&release_completion, b"go")?;
+
+    let first_outcome = turn.await.expect("join");
+    let mut saw_cancelled = false;
+    let mut saw_completed = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AgentEvent::TurnCancelled { .. } => saw_cancelled = true,
+            AgentEvent::TurnCompleted { .. } => saw_completed = true,
+            _ => {}
+        }
+    }
+    match first_outcome {
+        Ok(()) => {
+            assert!(
+                saw_cancelled ^ saw_completed,
+                "race must yield exactly one terminal turn event (cancelled XOR completed); cancelled={saw_cancelled} completed={saw_completed}"
+            );
+        }
+        Err(error) => {
+            let message = error.to_string();
+            assert!(
+                message.contains("cancelled") || message.contains("interrupted"),
+                "unexpected race failure: {message}"
+            );
+            assert!(
+                !(saw_cancelled && saw_completed),
+                "failed race must not also emit both terminal events"
+            );
+        }
+    }
+
+    assert!(
+        adapter.state.lock().await.active_attempt.is_none(),
+        "first attempt must be cleared after the race"
+    );
+
+    let mut second = test_turn_request(dir.path().to_path_buf());
+    second.env_vars.insert(
+        "TURN_START_SEEN".into(),
+        dir.path().join("turn-start-seen-2").display().to_string(),
+    );
+    second.env_vars.insert(
+        "RELEASE_COMPLETION".into(),
+        dir.path()
+            .join("release-completion-2")
+            .display()
+            .to_string(),
+    );
+    // Immediate completion path: release file already present before turn/start waits.
+    std::fs::write(dir.path().join("release-completion-2"), b"go")?;
+    second.timeout_secs = Some(5);
+    let (tx2, mut rx2) = mpsc::channel(8);
+    adapter.as_ref().start_turn(second, tx2).await?;
+    let mut completed = false;
+    while let Ok(event) = rx2.try_recv() {
+        if matches!(event, AgentEvent::TurnCompleted { .. }) {
+            completed = true;
+        }
+        assert!(
+            !matches!(event, AgentEvent::TurnCancelled { .. }),
+            "next generation must not inherit prior cancel"
+        );
+    }
+    assert!(
+        completed,
+        "next generation after cancel/completion race must complete cleanly"
+    );
+    Ok(())
+}
