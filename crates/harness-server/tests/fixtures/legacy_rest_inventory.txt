@@ -78,7 +78,7 @@ function src/http/task_query_routes/mod.rs::into_response 216232c0d827fd95b43982
 function src/http/task_query_routes/mod.rs::list_runtime_submissions e1b49373195dfa9681c97f2a1210c0449725ec5d61a6764e080cc13e70955ea0
 function src/http/task_routes.rs::create_runtime_submission f56b0cf1edf1f4b72fe0b0655c183face21965ecd0b2eca74bc9ebf5d4801f45
 function src/http/workflow_routes.rs::workflow_lookup_response 0fab0e83554f79a16866d43100429c98b893bc90b030c7efe1366f730d47c3d0
-function src/intake/feishu.rs::feishu_webhook fd7eeb207566d0aff1321558ca206f542b2803cc4d9e046b9148878a31e046db
+function src/intake/feishu.rs::feishu_webhook dd69c0d8757ce3be53fa099b20a37f2afbf690b92717938a125e0bfa4bd8c102
 registry Vec < crate :: http :: runtime_submission_routes :: RuntimeSubmissionArtifact >
 registry Vec < crate :: http :: runtime_submission_routes :: RuntimeSubmissionPrompt >
 registry crate :: handlers :: operator_monitor :: OperatorMonitorResponse

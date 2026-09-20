@@ -335,7 +335,7 @@ pub async fn feishu_webhook(
         ..Default::default()
     };
 
-    let task_id = match crate::http::task_routes::enqueue_task(&state, req).await {
+    let task_id = match state.execution_svc.enqueue(req).await {
         Ok(id) => id,
         Err(e) => {
             tracing::error!("feishu: failed to enqueue task: {e:?}");
@@ -458,6 +458,27 @@ mod tests {
         let mut config = make_feishu_config();
         config.verification_token = Some("secret-123".to_string());
         assert!(has_verification_token(&config));
+    }
+
+    #[test]
+    fn feishu_webhook_enqueues_through_execution_service_not_task_routes() {
+        let source = include_str!("feishu.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("feishu.rs should have a production section before tests");
+        assert!(
+            production.contains("execution_svc.enqueue("),
+            "feishu webhook must enqueue through ExecutionService::enqueue"
+        );
+        assert!(
+            !production.contains("task_routes::enqueue_task"),
+            "feishu webhook must not call HTTP task_routes enqueue helpers"
+        );
+        assert!(
+            !production.contains("enqueue_in_domain"),
+            "feishu webhook must preserve enqueue() queue-domain selection, not enqueue_in_domain"
+        );
     }
 
     #[test]
