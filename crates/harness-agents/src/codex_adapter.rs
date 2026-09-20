@@ -82,6 +82,10 @@ struct AdapterState {
     child_workspace: Option<PathBuf>,
     spawn_policy_fingerprint: Option<crate::spawn_contract::AdapterSpawnPolicyFingerprint>,
     egress_verified_at_dispatch: bool,
+    /// Last failed cleanup outcome. Retained so a later `terminate_and_drain`
+    /// cannot report success merely because `child` is now `None`, and so
+    /// `ensure_child` cannot spawn a replacement until cleanup is confirmed.
+    failed_cleanup: Option<String>,
 }
 impl AdapterState {
     fn new() -> Self {
@@ -95,6 +99,7 @@ impl AdapterState {
             child_workspace: None,
             spawn_policy_fingerprint: None,
             egress_verified_at_dispatch: false,
+            failed_cleanup: None,
         }
     }
     fn next_request_id(&mut self) -> u64 {
@@ -103,15 +108,17 @@ impl AdapterState {
         id
     }
     fn child_ready(&self) -> bool {
-        self.child.is_some() && self.stdin.is_some() && self.stdout_lines.is_some()
+        self.failed_cleanup.is_none()
+            && self.child.is_some()
+            && self.stdin.is_some()
+            && self.stdout_lines.is_some()
     }
-    async fn reset_child(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            child.terminate_now();
-            if let Err(error) = child.wait_and_cleanup_descendants().await {
-                tracing::warn!("failed to clean up codex app-server child: {error}");
-            }
-        }
+    /// Whether this adapter session may start or reuse a child process.
+    #[cfg(test)]
+    fn permits_child_reuse(&self) -> bool {
+        self.failed_cleanup.is_none()
+    }
+    fn clear_protocol_handles(&mut self) {
         self.stdin = None;
         self.stdout_lines = None;
         self.thread_id = None;
@@ -119,6 +126,56 @@ impl AdapterState {
         self.child_workspace = None;
         self.spawn_policy_fingerprint = None;
         self.egress_verified_at_dispatch = false;
+    }
+    /// Terminate the managed child and confirm descendant cleanup.
+    ///
+    /// `Ok(())` means required process/descendant cleanup succeeded. Protocol
+    /// handles are always cleared because they are unusable after terminate.
+    /// On cleanup failure the `ManagedChild` owner is retained and the failure
+    /// outcome is remembered so retries cannot become false successes.
+    async fn reset_child(&mut self) -> harness_core::error::Result<()> {
+        self.clear_protocol_handles();
+
+        let Some(mut child) = self.child.take() else {
+            if let Some(message) = self.failed_cleanup.clone() {
+                return Err(harness_core::error::HarnessError::AgentExecution(message));
+            }
+            return Ok(());
+        };
+
+        child.terminate_now();
+        match child.wait_and_cleanup_descendants().await {
+            Ok(_) => {
+                self.failed_cleanup = None;
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!("failed to clean up codex app-server child: {error}");
+                tracing::warn!("{message}");
+                self.failed_cleanup = Some(message.clone());
+                self.child = Some(child);
+                Err(harness_core::error::HarnessError::AgentExecution(message))
+            }
+        }
+    }
+}
+
+fn attach_cleanup_failure(
+    primary: harness_core::error::HarnessError,
+    cleanup: harness_core::error::HarnessError,
+) -> harness_core::error::HarnessError {
+    harness_core::error::HarnessError::AgentExecution(format!(
+        "{primary}; cleanup failed: {cleanup}"
+    ))
+}
+
+async fn reset_after_error(
+    state: &mut AdapterState,
+    primary: harness_core::error::HarnessError,
+) -> harness_core::error::HarnessError {
+    match state.reset_child().await {
+        Ok(()) => primary,
+        Err(cleanup) => attach_cleanup_failure(primary, cleanup),
     }
 }
 
@@ -319,9 +376,9 @@ impl CodexAdapter {
                 }
             }
         }
-        if state.child.is_some() {
-            tracing::warn!("codex app-server spawn policy changed or state is incomplete; restarting before starting a new turn");
-            state.reset_child().await;
+        if state.child.is_some() || state.failed_cleanup.is_some() {
+            tracing::warn!("codex app-server spawn policy changed, cleanup failed, or state is incomplete; restarting before starting a new turn");
+            state.reset_child().await?;
         }
 
         let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
@@ -388,8 +445,7 @@ impl CodexAdapter {
         {
             Ok(id) => id,
             Err(error) => {
-                state.reset_child().await;
-                return Err(error);
+                return Err(reset_after_error(state, error).await);
             }
         };
 
@@ -507,8 +563,7 @@ impl CodexAdapter {
             }
             Err(error) => {
                 drop(lines);
-                state.reset_child().await;
-                Err(error)
+                Err(reset_after_error(state, error).await)
             }
         }
     }
@@ -572,8 +627,7 @@ impl AgentAdapter for CodexAdapter {
         )
         .await
         {
-            state.reset_child().await;
-            return Err(error);
+            return Err(reset_after_error(&mut state, error).await);
         }
 
         let mut lines = state.stdout_lines.take().ok_or_else(|| {
@@ -632,8 +686,7 @@ impl AgentAdapter for CodexAdapter {
         if let Err(error) = read_result {
             drop(lines);
             let mut state = self.state.lock().await;
-            state.reset_child().await;
-            return Err(error);
+            return Err(reset_after_error(&mut state, error).await);
         }
         if !turn_completed && !receiver_closed {
             stdout_closed = true;
@@ -642,19 +695,25 @@ impl AgentAdapter for CodexAdapter {
         if stdout_closed {
             drop(lines);
             let mut state = self.state.lock().await;
-            state.reset_child().await;
-            return Err(harness_core::error::HarnessError::AgentExecution(
-                "codex app-server stdout closed before turn/completed".into(),
-            ));
+            return Err(reset_after_error(
+                &mut state,
+                harness_core::error::HarnessError::AgentExecution(
+                    "codex app-server stdout closed before turn/completed".into(),
+                ),
+            )
+            .await);
         }
 
         if receiver_closed {
             drop(lines);
             let mut state = self.state.lock().await;
-            state.reset_child().await;
-            return Err(harness_core::error::HarnessError::AgentExecution(
-                "codex event receiver closed before turn/completed".into(),
-            ));
+            return Err(reset_after_error(
+                &mut state,
+                harness_core::error::HarnessError::AgentExecution(
+                    "codex event receiver closed before turn/completed".into(),
+                ),
+            )
+            .await);
         }
         self.state.lock().await.stdout_lines = Some(lines);
         Ok(())
@@ -681,8 +740,7 @@ impl AgentAdapter for CodexAdapter {
     }
 
     async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
-        self.state.lock().await.reset_child().await;
-        Ok(())
+        self.state.lock().await.reset_child().await
     }
 
     async fn steer(&self, text: String) -> harness_core::error::Result<()> {
