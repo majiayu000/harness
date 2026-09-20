@@ -560,6 +560,96 @@ async fn prefired_lease_lost_still_terminates_turn() -> anyhow::Result<()> {
     Ok(())
 }
 
+struct CleanupFailingAdapter {
+    terminate_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentAdapter for CleanupFailingAdapter {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
+    async fn start_turn(
+        &self,
+        _req: AgentRequest,
+        _tx: mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
+        Ok(())
+    }
+
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        self.terminate_calls.fetch_add(1, Ordering::AcqRel);
+        Err(HarnessError::AgentExecution(
+            "failed to clean up codex app-server child: injected descendant cleanup failure"
+                .to_string(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn lease_loss_surfaces_terminate_cleanup_failure_on_turn() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let agent_calls = Arc::new(AtomicUsize::new(0));
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
+    let mut config = HarnessConfig::default();
+    config.server.project_root = root.path().to_path_buf();
+    config.agents.default_agent = "codex".to_string();
+    let mut registry = AgentRegistry::new("codex");
+    registry.register("codex", Arc::new(CountingAgent { calls: agent_calls }));
+    let terminate_calls_for_factory = terminate_calls.clone();
+    registry
+        .register_turn_backend_factory("codex", move || {
+            Arc::new(CleanupFailingAdapter {
+                terminate_calls: terminate_calls_for_factory.clone(),
+            })
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
+    let turn_id = start_test_turn(&server, root.path())?;
+
+    let (lease_lost, receiver) = tokio::sync::watch::channel(false);
+    lease_lost.send_replace(true);
+    run_test_turn(
+        server.clone(),
+        root.path(),
+        turn_id.clone(),
+        TurnLifecycleOptions {
+            lease_lost: Some(receiver),
+            ..TurnLifecycleOptions::default()
+        },
+    )
+    .await?;
+
+    assert_eq!(terminate_calls.load(Ordering::Acquire), 1);
+    let thread_id = server
+        .thread_manager
+        .find_thread_for_turn(&turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should belong to a thread"))?;
+    let turn = server
+        .thread_manager
+        .get_turn(&thread_id, &turn_id)
+        .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert!(
+        turn.items.iter().any(|item| matches!(
+            item,
+            Item::Error { message, .. }
+                if message.contains("lease was lost")
+                    && message.contains("cleanup failed")
+                    && message.contains("injected descendant cleanup failure")
+        )),
+        "turn failure must preserve the primary lease-loss error and the cleanup failure at the release boundary: {:?}",
+        turn.items
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn lease_loss_drops_initializing_turn_before_force_termination() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
