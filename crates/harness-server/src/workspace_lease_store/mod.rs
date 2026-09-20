@@ -11,17 +11,13 @@ use tokio::sync::Semaphore;
 #[cfg(test)]
 const TEST_REPOSITORY_LOCK_CAPACITY: u32 = 4;
 
-#[path = "workspace_cleanup_store.rs"]
-mod workspace_cleanup_store;
-pub(crate) use workspace_cleanup_store::{
+mod cleanup_store;
+pub(crate) use cleanup_store::{
     PersistedWorkspaceCleanupClaim, WorkspaceCleanupTargetRecord,
     WORKSPACE_CLEANUP_TARGETS_TABLE_SQL,
 };
-#[path = "workspace_repository_lock.rs"]
-mod workspace_repository_lock;
-pub(crate) use workspace_repository_lock::{
-    RepositoryLeaseMode, RepositoryLeaseState, RepositoryWriteLease,
-};
+mod repository_lock;
+pub(crate) use repository_lock::{RepositoryLeaseMode, RepositoryLeaseState, RepositoryWriteLease};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceLeaseRecord {
