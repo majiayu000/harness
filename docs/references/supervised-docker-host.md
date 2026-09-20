@@ -34,11 +34,13 @@ when the requested behavior is correct. It must not import acceptance criteria
 from candidate-controlled tests. It runs in an offline container without model
 credentials or access to the server token.
 
-Use local Docker image IDs (`sha256:...`) for both images. Build the existing
-`docker/agent/Dockerfile` and `docker/egress-proxy/Dockerfile` if necessary. The
-agent image needs Codex, Git, Python, and GNU `timeout`; it currently does not
-include the Rust toolchain. Git trees containing symbolic links or submodules are
-rejected. This client is intended for small repositories that fit its tmpfs limits.
+Use local Docker image IDs (`sha256:...`) for the candidate, verifier, and proxy
+images. Build the existing `docker/agent/Dockerfile` and
+`docker/egress-proxy/Dockerfile` if necessary. The agent image needs Codex, Git,
+Python, and GNU `timeout`; it currently does not include the Rust toolchain. The
+offline verifier image is independently pinned and must not be the candidate
+image. Git trees containing symbolic links or submodules are rejected. This
+client is intended for small repositories that fit its tmpfs limits.
 The submitted task must explicitly require committing all changes and supply the
 authorized Git author identity (for example through `git -c user.name=... -c
 user.email=... commit`). The runner does not invent an author or append instructions
@@ -57,9 +59,19 @@ python3 scripts/run-supervised-docker-host.py \
   --auth-file /private/run/codex-auth.json \
   --state-dir /private/run/host-state \
   --image sha256:AGENT_IMAGE_ID \
+  --verifier-image sha256:VERIFIER_IMAGE_ID \
   --proxy-image sha256:PROXY_IMAGE_ID \
   --model gpt-5.5 --timeout 180
 ```
+
+`--image` is the candidate agent image. `--verifier-image` is a separately pinned
+offline verifier image ID (also `sha256:...`). Offline `verify` and
+`verify_expected_head` run only in `--verifier-image`, never in the candidate
+image. The verifier image may ship a native Harness `ENTRYPOINT`; the client
+overrides it with an explicit `python3` entrypoint so reconstruction and
+validation argv cannot be hijacked. A host-owned `config/default.toml.example`
+is mounted read-only at `/config.toml` for native Harness validation commands.
+Do not embed the trusted verifier into the candidate agent image.
 
 Use a private temporary copy of the operator-authorized Codex `auth.json`, not a
 mount of the entire host home directory. The client mounts it read-only and
@@ -167,18 +179,19 @@ skips source freeze, rejects `prepared_prompt` on the native claim, and requires
 at the quality-gate workflow.
 
 Verification reconstructs the retained bundle with the existing
-`supervised_git_handoff.verify` helper, pinning the candidate commit to
-`expected_head_sha`. A local candidate SHA that does not equal the
-server-selected head fails closed; it is not treated as an externally verified
-PR head. Offline validation runs the exact server argv against the reconstructed
-tree (`/candidate`), with the operator verifier also mounted at
-`/trusted/verify.py` for argv compatibility. Completion includes host
-`execution_evidence` whose `checked_out_commit` is that expected head, with honest
-zero model usage and without advertising `eval_resource_limits` or other eval
-capabilities. Prior-job `execution_evidence` is cleared before the new claim so
-stale evidence cannot attach to the current lease. Eval, agent-contract, and
-exact-replay jobs remain rejected. Completed restarts of the original state
-directory still no-op and do not reclaim.
+`supervised_git_handoff.verify` helper inside `--verifier-image`, pinning the
+candidate commit to `expected_head_sha`. A local candidate SHA that does not
+equal the server-selected head fails closed; it is not treated as an externally
+verified PR head. Offline validation runs the exact server argv against the
+reconstructed tree (`/candidate`), with the operator verifier also mounted at
+`/trusted/verify.py` for argv compatibility and `config/default.toml.example` at
+`/config.toml`. Completion includes host `execution_evidence` whose
+`checked_out_commit` is that expected head, with honest zero model usage and
+without advertising `eval_resource_limits` or other eval capabilities. Prior-job
+`execution_evidence` is cleared before the new claim so stale evidence cannot
+attach to the current lease. Eval, agent-contract, and exact-replay jobs remain
+rejected. Completed restarts of the original state directory still no-op and do
+not reclaim.
 
 ## Candidate resource evidence
 
