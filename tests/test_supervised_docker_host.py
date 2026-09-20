@@ -679,7 +679,8 @@ def test_workspace_alias_retargeting_does_not_change_canonical_source(tmp_path, 
     alias.symlink_to(source, target_is_directory=True)
     state = tmp_path / 'private'
     args = SimpleNamespace(workspace=alias, state_dir=state, server_url='http://localhost',
-                           image='image', proxy_image='proxy', model='model', timeout=30, synthetic_dns=False, base_commit=base)
+                           image='image', verifier_image='verifier', proxy_image='proxy',
+                           model='model', timeout=30, synthetic_dns=False, base_commit=base)
     monkeypatch.setenv('HARNESS_API_TOKEN', 'test-only')
     runner = module.Host(args)
     try:
@@ -787,7 +788,7 @@ def claimed_runner(tmp_path):
     from types import SimpleNamespace
     runner = host(tmp_path, 'claiming')
     runner.name = 'test'
-    runner.args = SimpleNamespace(model='model', image='image')
+    runner.args = SimpleNamespace(model='model', image='image', verifier_image='verifier')
     runner.state.update(request={'project': str(tmp_path), 'prompt': 'task'},
                         submission={'task_id': 'task-id', 'workflow_id': 'workflow-id'})
     digest = hashlib.sha256(b'\0'.join(x.encode() for x in [str(tmp_path), '', 'task-id', 'task'])).hexdigest()
@@ -902,7 +903,7 @@ def test_verifier_reconstructs_pinned_bundle_offline_before_running_verifier(tmp
     module = load()
     runner = host(tmp_path, 'executing')
     runner.name = 'owned'
-    runner.args = SimpleNamespace(image='pinned-image')
+    runner.args = SimpleNamespace(image='pinned-image', verifier_image='pinned-verifier')
     runner.renew = Mock()
     handoff = {'base_commit': 'a' * 40, 'candidate_commit': 'b' * 40,
                'bundle_sha256': 'c' * 64, 'verified': False}
@@ -919,6 +920,10 @@ def test_verifier_reconstructs_pinned_bundle_offline_before_running_verifier(tmp
     assert runner.verify() == 0
     command = calls[0]
     assert command[:7] == ('run', '-d', '--name', 'owned-verify', '--network', 'none', '--read-only')
+    assert 'pinned-verifier' in command
+    assert 'pinned-image' not in command
+    assert '--entrypoint' in command and command[command.index('--entrypoint') + 1] == 'python3'
+    assert any('dst=/config.toml,readonly' in arg for arg in command)
     assert f'type=bind,src={tmp_path}/candidate,dst=/handoff,readonly' in command
     assert f'type=bind,src={module.GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly' in command
     assert any(arg.startswith('/candidate:rw,') for arg in command)
@@ -1038,6 +1043,7 @@ def test_fresh_state_consumes_copied_candidate_without_mutating_prior_completed_
         base_commit=handoff['base_commit'],
         model='model',
         image='image',
+        verifier_image='verifier',
         request=request_path,
         submission=submission_path,
         verifier=verifier_path,
@@ -1205,7 +1211,7 @@ def test_verify_expected_head_uses_helper_verify_and_server_argv(tmp_path, monke
     module = load()
     runner = host(tmp_path, 'executing')
     runner.name = 'owned'
-    runner.args = SimpleNamespace(image='pinned-image')
+    runner.args = SimpleNamespace(image='pinned-image', verifier_image='pinned-verifier')
     runner.renew = Mock()
     handoff, _ = seed_retained_candidate(tmp_path)
     runner.state['git_handoff'] = handoff
@@ -1232,10 +1238,39 @@ def test_verify_expected_head_uses_helper_verify_and_server_argv(tmp_path, monke
     assert runner.verify_expected_head(expected, commands)[0]['exit_code'] == 0
     command = calls[0]
     assert command[:7] == ('run', '-d', '--name', 'owned-verify', '--network', 'none', '--read-only')
+    assert 'pinned-verifier' in command
+    assert 'pinned-image' not in command
+    assert '--entrypoint' in command and command[command.index('--entrypoint') + 1] == 'python3'
+    assert any('dst=/config.toml,readonly' in arg for arg in command)
     assert f'type=bind,src={tmp_path}/candidate,dst=/handoff,readonly' in command
-    assert any(arg.endswith('dst=/trusted/verify.py,readonly') for arg in command)
+    assert any('dst=/trusted/verify.py,readonly' in arg for arg in command)
     script = command[command.index('-c') + 1]
     assert '/git-handoff.py' in script and 'verify' in script
     payload = json.loads(command[-1])
     assert payload['candidate'] == expected
     assert payload['commands'] == commands
+
+
+def test_cli_requires_distinct_pinned_verifier_image(monkeypatch, capsys):
+    module = load()
+    image = 'sha256:' + 'a' * 64
+    argv = [
+        'run-supervised-docker-host.py',
+        '--server-url', 'http://127.0.0.1:1',
+        '--request', '/tmp/r.json',
+        '--submission', '/tmp/s.json',
+        '--workspace', '/tmp/ws',
+        '--verifier', '/tmp/v.py',
+        '--auth-file', '/tmp/a.json',
+        '--state-dir', '/tmp/st',
+        '--base-commit', 'a' * 40,
+        '--image', image,
+        '--verifier-image', image,
+        '--proxy-image', 'sha256:' + 'b' * 64,
+    ]
+    monkeypatch.setattr(sys, 'argv', argv)
+    with pytest.raises(SystemExit) as outcome:
+        module.main()
+    assert outcome.value.code == 2
+    err = capsys.readouterr().err.lower()
+    assert 'differ' in err

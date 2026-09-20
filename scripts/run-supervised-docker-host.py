@@ -23,11 +23,11 @@ import urllib.error
 import urllib.request
 import uuid
 
-
 IMAGE_PREFIX = "sha256:"
 LEASE_SECONDS = 300
 OUTPUT_LIMIT = 8 * 1024 * 1024
 GIT_HANDOFF_SCRIPT = Path(__file__).with_name("supervised_git_handoff.py").resolve()
+TRUSTED_CONFIG = Path(__file__).resolve().parents[1] / "config" / "default.toml.example"
 _QUALITY_GATE_SPEC = importlib.util.spec_from_file_location(
     "supervised_quality_gate", Path(__file__).with_name("supervised_quality_gate.py")
 )
@@ -42,7 +42,6 @@ HOST_OWNED_ARTIFACTS = {
     "supervised_git_handoff",
 }
 
-
 def save(path: Path, value: dict) -> None:
     temporary = path.with_suffix(".tmp")
     with temporary.open("w", encoding="utf-8") as stream:
@@ -51,7 +50,6 @@ def save(path: Path, value: dict) -> None:
         os.fsync(stream.fileno())
     temporary.replace(path)
 
-
 def docker(*args: str, timeout: int = 30) -> str:
     result = subprocess.run(
         ["docker", *args], capture_output=True, text=True, timeout=timeout
@@ -59,7 +57,6 @@ def docker(*args: str, timeout: int = 30) -> str:
     if result.returncode:
         raise RuntimeError(f"docker {args[0]} failed: {result.stderr.strip()}")
     return result.stdout.strip()
-
 
 def stream_agent_output(command: list[str], root: Path, timeout: int, renew) -> int:
     """Keep a shared bounded prefix of both attached streams outside the candidate."""
@@ -115,7 +112,6 @@ def stream_agent_output(command: list[str], root: Path, timeout: int, renew) -> 
                 reason = f"{type(primary_error).__name__}: {primary_error}; {reason}"
             raise RuntimeError(reason) from primary_error
 
-
 def read_activity_result(log: Path, activity: str) -> dict:
     # Only host-captured assistant messages carry results; tool output is untrusted.
     messages = []
@@ -138,7 +134,6 @@ def read_activity_result(log: Path, activity: str) -> dict:
     # The completion endpoint owns the full ActivityResult contract validation.
     return result
 
-
 def read_usage(log: Path) -> dict:
     for line in reversed(log.read_text(encoding="utf-8").splitlines()):
         event = json.loads(line)
@@ -152,19 +147,16 @@ def read_usage(log: Path) -> dict:
             }
     raise RuntimeError("agent produced no completed-turn usage evidence")
 
-
 def archive_members(stream: tarfile.TarFile) -> list[tarfile.TarInfo]:
     members = stream.getmembers()
     if any(not (member.isfile() or member.isdir()) for member in members):
         raise RuntimeError("source archive contains a link or special file")
     return members
 
-
 def extract_candidate(archive: Path, destination: Path) -> None:
     destination.mkdir(mode=0o700)
     with tarfile.open(archive) as stream:
         stream.extractall(destination, members=archive_members(stream), filter="data")
-
 
 CANDIDATE_REAPER_SCRIPT = """import os, time
 # PID 1 adopts agent descendants and must reap them before cgroup quiescence.
@@ -177,7 +169,6 @@ while time.monotonic() < deadline:
         pass  # No adopted children are waiting; keep the fixed retention deadline.
     time.sleep(0.01)
 """
-
 
 CGROUP_METRICS_SCRIPT = """import json
 from pathlib import Path
@@ -195,7 +186,6 @@ print(json.dumps({'cpu_time_micros': cpu['usage_usec'], 'current_pids_before': p
                   'current_pids': int((root / 'pids.current').read_text())}))
 """
 
-
 class Host:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -212,7 +202,8 @@ class Host:
         }
         identity = {
             "server_url": args.server_url,
-            "image": args.image, "proxy_image": args.proxy_image, "model": args.model,
+            "image": args.image, "verifier_image": args.verifier_image, "proxy_image": args.proxy_image,
+            "model": args.model,
             "workspace": str(self.workspace), "base_commit": args.base_commit, "timeout": args.timeout,
             "synthetic_dns": args.synthetic_dns,
         }
@@ -500,32 +491,43 @@ class Host:
         self.state["phase"] = "claiming"
         self.persist()
 
-    def verify(self, candidate_commit: str | None = None) -> int:
-        # Reconstruct only verified Git blobs in a fresh offline container.
-        handoff = self.state["git_handoff"]
-        pin = candidate_commit or handoff["candidate_commit"]
-        docker("run", "-d", "--name", self.name + "-verify", "--network", "none",
-               *self.base_args(),
-               "--tmpfs", f"/candidate:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
-               "--mount", f"type=bind,src={self.root / 'candidate'},dst=/handoff,readonly",
-               "--mount", f"type=bind,src={GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly",
-               "--mount", f"type=bind,src={self.root / 'verifier.py'},dst=/verify.py,readonly",
-               self.args.image, "python3", "-I", "-c",
-               "import subprocess,sys\n"
-               "subprocess.run(['python3','-I','/git-handoff.py','verify',"
-               "'/handoff/candidate.bundle',*sys.argv[1:],'/handoff/workspace','/candidate'],check=True)\n"
-               "sys.exit(subprocess.call(['python3','-I','/verify.py','/candidate']))",
-               handoff["base_commit"], pin, handoff["bundle_sha256"])
-        deadline = time.monotonic() + 30
+    def offline_verify_args(self, *extra_mounts: str) -> list[str]:
+        return [
+            "run", "-d", "--name", self.name + "-verify", "--network", "none",
+            *self.base_args(),
+            "--tmpfs", f"/candidate:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
+            "--mount", f"type=bind,src={self.root / 'candidate'},dst=/handoff,readonly",
+            "--mount", f"type=bind,src={GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly",
+            "--mount", f"type=bind,src={self.root / 'verifier.py'},dst=/verify.py,readonly",
+            "--mount", f"type=bind,src={TRUSTED_CONFIG},dst=/config.toml,readonly",
+            *extra_mounts,
+            "--entrypoint", "python3",
+            self.args.verifier_image, "-I", "-c",
+        ]
+
+    def wait_verify_container(self) -> dict:
+        deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             self.renew()
             state = json.loads(docker("inspect", self.name + "-verify", "--format", "{{json .State}}"))
             if not state["Running"]:
                 output = docker("logs", self.name + "-verify")
                 (self.root / "verifier.stdout").write_text(output)
-                return state["ExitCode"]
+                return state
             time.sleep(1)
-        raise RuntimeError("independent verifier exceeded 30s deadline")
+        raise RuntimeError("independent verifier exceeded 120s deadline")
+
+    def verify(self, candidate_commit: str | None = None) -> int:
+        # Reconstruct verified Git blobs; override ENTRYPOINT (may be native Harness).
+        handoff = self.state["git_handoff"]
+        pin = candidate_commit or handoff["candidate_commit"]
+        docker(*self.offline_verify_args(),
+               "import subprocess,sys\n"
+               "subprocess.run(['python3','-I','/git-handoff.py','verify',"
+               "'/handoff/candidate.bundle',*sys.argv[1:],'/handoff/workspace','/candidate'],check=True)\n"
+               "sys.exit(subprocess.call(['python3','-I','/verify.py','/candidate']))",
+               handoff["base_commit"], pin, handoff["bundle_sha256"])
+        return self.wait_verify_container()["ExitCode"]
 
     def verify_expected_head(self, expected_head_sha: str, validation_commands: list) -> list:
         """Bind retained-bundle reconstruction to the server-selected head, then run argv."""
@@ -540,28 +542,14 @@ class Host:
                 path.unlink()
         else:
             out_dir.mkdir(mode=0o700)
-        docker("run", "-d", "--name", self.name + "-verify", "--network", "none",
-               *self.base_args(),
-               "--tmpfs", f"/candidate:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
-               "--mount", f"type=bind,src={self.root / 'candidate'},dst=/handoff,readonly",
-               "--mount", f"type=bind,src={GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly",
-               "--mount", f"type=bind,src={self.root / 'verifier.py'},dst=/verify.py,readonly",
-               "--mount", f"type=bind,src={self.root / 'verifier.py'},dst=/trusted/verify.py,readonly",
-               "--mount", f"type=bind,src={out_dir},dst=/out",
-               self.args.image, "python3", "-I", "-c", quality_gate.OFFLINE_VALIDATION_SCRIPT,
-               payload)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            self.renew()
-            state = json.loads(docker("inspect", self.name + "-verify", "--format", "{{json .State}}"))
-            if not state["Running"]:
-                output = docker("logs", self.name + "-verify")
-                (self.root / "verifier.stdout").write_text(output)
-                return quality_gate.read_validation_evidence(
-                    out_dir / "validation.json", len(validation_commands)
-                )
-            time.sleep(1)
-        raise RuntimeError("independent verifier exceeded 30s deadline")
+        docker(*self.offline_verify_args(
+            f"--mount=type=bind,src={self.root / 'verifier.py'},dst=/trusted/verify.py,readonly",
+            f"--mount=type=bind,src={out_dir},dst=/out",
+        ), quality_gate.OFFLINE_VALIDATION_SCRIPT, payload)
+        self.wait_verify_container()
+        return quality_gate.read_validation_evidence(
+            out_dir / "validation.json", len(validation_commands)
+        )
 
     def result(self, status: str, reason: str, artifacts: list | None = None,
                native: dict | None = None) -> dict:
@@ -617,6 +605,7 @@ class Host:
         self.state["result"] = self.result(native["status"], native["summary"], [
             {"artifact_type": "supervised_docker_verification", "artifact": {
                 "image": self.args.image,
+                "verifier_image": self.args.verifier_image,
                 "verifier_exit_code": 0 if native["status"] == "succeeded" else 1,
                 "verifier_sha256": hashlib.sha256((self.root / "verifier.py").read_bytes()).hexdigest(),
                 "candidate_sha256": hashlib.sha256(
@@ -745,7 +734,9 @@ class Host:
                     self.persist()
                     self.state["result"] = self.result(native["status"], native["summary"], artifacts + [
                         {"artifact_type": "supervised_docker_verification", "artifact": {
-                            "image": self.args.image, "verifier_exit_code": verifier_exit,
+                            "image": self.args.image,
+                            "verifier_image": self.args.verifier_image,
+                            "verifier_exit_code": verifier_exit,
                             "verifier_sha256": hashlib.sha256((self.root / "verifier.py").read_bytes()).hexdigest(),
                             "candidate_sha256": hashlib.sha256((self.root / "candidate.tar").read_bytes()).hexdigest(),
                             "full_eval_capabilities": False,
@@ -768,22 +759,24 @@ class Host:
         self.complete()
         print(json.dumps(self.state["result"], indent=2))
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-url", required=True)
     for field in ["request", "submission", "workspace", "verifier", "auth-file", "state-dir"]:
         parser.add_argument("--" + field, required=True, type=Path)
     parser.add_argument("--base-commit", required=True, help="Full 40-character base commit SHA")
-    parser.add_argument("--image", required=True)
+    parser.add_argument("--image", required=True, help="Pinned candidate agent image ID")
+    parser.add_argument("--verifier-image", required=True, help="Pinned offline verifier image ID")
     parser.add_argument("--proxy-image", required=True)
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--synthetic-dns", action="store_true")
     args = parser.parse_args()
     if not all(value.startswith(IMAGE_PREFIX) and len(value) == 71
-               for value in [args.image, args.proxy_image]):
+               for value in [args.image, args.verifier_image, args.proxy_image]):
         parser.error("images must be local sha256 image IDs")
+    if args.verifier_image == args.image:
+        parser.error("--verifier-image must differ from --image")
     if not 1 <= args.timeout <= 300:
         parser.error("timeout must be between 1 and 300 seconds")
     if not re.fullmatch(r"[0-9a-f]{40}", args.base_commit):
@@ -792,7 +785,6 @@ def main() -> None:
     host.run()
     if host.state.get("result", {}).get("status") != "succeeded":
         raise SystemExit(1)
-
 
 if __name__ == "__main__":
     main()
