@@ -1,6 +1,6 @@
 //! Attempt-scoped cancellation and private deadline defaults for Codex app-server.
 //!
-//! See #2095 §3.2–3.3 (PR B). Frame-size bounds remain PR C.
+//! See #2095 §3.2–3.3 (PR B). Frame-size bounds live in `bounded_frame` (PR C).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

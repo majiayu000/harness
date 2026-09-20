@@ -10,19 +10,23 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::Instant;
-type StdoutLines = Lines<BufReader<ChildStdout>>;
 const MAX_PROTOCOL_LINE_PREVIEW: usize = 240;
 mod attempt;
+mod bounded_frame;
 mod protocol;
 use self::attempt::{
     absolute_init_deadline_error, cancelled_error, frame_write_deadline_error,
     overlapping_start_error, stale_generation_error, stop_cleanup_deadline_error,
     wait_until_cancelled, ActiveAttempt, AttemptDeadlines, TurnAttemptGuard,
 };
+use self::bounded_frame::{
+    map_frame_read_error, BoundedStdoutReader, DEFAULT_MAX_PROTOCOL_FRAME_BYTES,
+};
+type StdoutFrames = BoundedStdoutReader<ChildStdout>;
 /// Parse one Codex app-server JSON-RPC line.
 ///
 /// ```
@@ -82,11 +86,13 @@ pub struct CodexAdapter {
     /// does not require holding the lifecycle mutex across protocol I/O.
     cancel_notify: Arc<Notify>,
     deadlines: AttemptDeadlines,
+    /// Private per-frame stdout bound (#2095 §3.4). Injectable in tests only.
+    max_protocol_frame_bytes: usize,
 }
 struct AdapterState {
     child: Option<crate::ManagedChild>,
     stdin: Option<ChildStdin>,
-    stdout_lines: Option<StdoutLines>,
+    stdout_lines: Option<StdoutFrames>,
     next_id: u64,
     thread_id: Option<String>,
     /// Remains mirrored from `active_attempt.remote_turn_id` for interrupt/steer.
@@ -316,6 +322,7 @@ impl CodexAdapter {
             state: Arc::new(Mutex::new(AdapterState::new())),
             cancel_notify: Arc::new(Notify::new()),
             deadlines: AttemptDeadlines::default(),
+            max_protocol_frame_bytes: DEFAULT_MAX_PROTOCOL_FRAME_BYTES,
         }
     }
 
@@ -324,6 +331,17 @@ impl CodexAdapter {
     fn with_deadlines(mut self, deadlines: AttemptDeadlines) -> Self {
         self.deadlines = deadlines;
         self
+    }
+
+    /// Test-only private frame-size injection (#2095 §3.4).
+    #[cfg(test)]
+    fn with_max_protocol_frame_bytes(mut self, max_protocol_frame_bytes: usize) -> Self {
+        self.max_protocol_frame_bytes = max_protocol_frame_bytes;
+        self
+    }
+
+    fn wrap_stdout(&self, stdout: ChildStdout) -> StdoutFrames {
+        BoundedStdoutReader::new(BufReader::new(stdout), self.max_protocol_frame_bytes)
     }
 
     fn effective_turn_request(&self, mut req: AgentRequest) -> AgentRequest {
@@ -520,13 +538,13 @@ impl CodexAdapter {
     }
 
     async fn read_next_message(
-        lines: &mut StdoutLines,
+        lines: &mut StdoutFrames,
     ) -> harness_core::error::Result<Option<ParsedCodexMessage>> {
-        let Some(line) = lines.next_line().await.map_err(|error| {
-            harness_core::error::HarnessError::AgentExecution(format!(
-                "failed reading codex app-server stdout: {error}"
-            ))
-        })?
+        let max_frame_bytes = lines.max_frame_bytes();
+        let Some(line) = lines
+            .next_frame()
+            .await
+            .map_err(|error| map_frame_read_error(error, max_frame_bytes))?
         else {
             return Ok(None);
         };
@@ -547,7 +565,7 @@ impl CodexAdapter {
     }
 
     async fn read_next_message_with_timeout(
-        lines: &mut StdoutLines,
+        lines: &mut StdoutFrames,
         stall_timeout: Option<Duration>,
         phase: &str,
     ) -> harness_core::error::Result<Option<ParsedCodexMessage>> {
@@ -565,7 +583,7 @@ impl CodexAdapter {
 
     async fn read_next_message_cancellable(
         &self,
-        lines: &mut StdoutLines,
+        lines: &mut StdoutFrames,
         generation: u64,
         stall_timeout: Option<Duration>,
         absolute_deadline: Option<Instant>,
@@ -757,7 +775,7 @@ impl CodexAdapter {
                 return Err(stale_generation_error());
             }
             state.stdin = child.inner_mut().stdin.take();
-            state.stdout_lines = Some(BufReader::new(stdout).lines());
+            state.stdout_lines = Some(self.wrap_stdout(stdout));
             state.child = Some(child);
             state.child_workspace = Some(child_workspace.clone());
         }
@@ -947,7 +965,7 @@ impl CodexAdapter {
     async fn finish_attempt_success(
         &self,
         generation: u64,
-        lines: StdoutLines,
+        lines: StdoutFrames,
     ) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
         if !state.generation_is_current(generation) {
@@ -1405,7 +1423,7 @@ mod spawn_policy_tests {
             let mut state = adapter.state.lock().await;
             let generation = state.begin_attempt()?;
             state.stdin = Some(stdin);
-            state.stdout_lines = Some(BufReader::new(stdout).lines());
+            state.stdout_lines = Some(adapter.wrap_stdout(stdout));
             state.child = Some(crate::ManagedChild::new(child, "codex policy test"));
             state.spawn_policy_fingerprint =
                 Some(crate::spawn_contract::adapter_spawn_policy_fingerprint(
