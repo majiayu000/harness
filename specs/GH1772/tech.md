@@ -22,7 +22,7 @@ All citations verified on `main` (81c78255).
 - Workspace leases: `workspace_leases` keyed `(store_key, project_key,
   slot_index)` with `owner_session`, `process_id`, `process_started_at`, PID
   liveness via `sysinfo`
-  (`crates/harness-server/src/workspace_lease_store.rs:19-77`).
+  (`crates/harness-server/src/workspace_lease_store/mod.rs:19-77`).
 - Rejected completion path: `crates/harness-workflow/src/runtime/worker.rs:172-188`
   — `commit_runtime_activity_completion_with_transcript_if_owned` returning
   `None` produces `tracing::warn!` + `return Ok(None)`; the `ActivityResult`
@@ -163,7 +163,7 @@ B-005).
   `store/transaction_helpers.rs`, `store/instances.rs`,
   `store_migrations.rs` — epoch exposure, dead-letter table, version
   predicate.
-- `crates/harness-server/src/workspace_lease_store.rs`,
+- `crates/harness-server/src/workspace_lease_store/mod.rs`,
   `workspace_pool.rs` — epoch-aware acquisition/renewal/release.
 - `crates/harness-server/src/http/background/auto_recovery.rs` — adoption
   sweep.
