@@ -262,7 +262,9 @@ pub struct AppState {
     pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
     pub postgres_catalog: Arc<crate::postgres_catalog::PostgresCatalogMonitor>,
     pub isolation_availability: harness_core::config::isolation::IsolationAvailability,
-    /// Serializes runtime snapshot writes to avoid out-of-order persistence.
+    /// Serializes runtime snapshot capture and writes for a shared store key.
+    /// Must be held across both `snapshot_state` calls and `persist_snapshot`
+    /// so concurrent updates cannot let an older capture overwrite a newer one.
     pub runtime_state_persist_lock: Mutex<()>,
     /// Set when a runtime-state persist fails; the next successful
     /// `persist_runtime_state` call clears it.  Handlers that find no
@@ -357,6 +359,8 @@ impl AppState {
     }
 
     pub async fn persist_runtime_state(&self) -> anyhow::Result<()> {
+        // Capture and write stay under this lock so concurrent callers sharing a
+        // store key cannot schedule an older snapshot after a newer one.
         let _guard = self.runtime_state_persist_lock.lock().await;
         let Some(store) = self.core.runtime_state_store.as_ref() else {
             if self.runtime_state_persistence_required() {
