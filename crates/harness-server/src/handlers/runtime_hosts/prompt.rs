@@ -22,6 +22,15 @@ pub(super) async fn prepare_claim_prompt(
     let Some(workspace) = workspace else {
         return Ok(None);
     };
+    // The next activity is selected by the server after the host asks for work.
+    // Native validation has no model prompt; deliver its existing command intact.
+    // Explicit contract/replay jobs still require their own raw-claim protocol.
+    if completion::runtime_job_activity(job) == harness_workflow::runtime::QUALITY_GATE_ACTIVITY
+        && job.input.pointer("/command/agent_contract").is_none()
+        && job.input.pointer("/command/exact_replay").is_none()
+    {
+        return Ok(None);
+    }
     crate::workflow_runtime_worker::remote_prompt::prepare(state, job, workspace)
         .await
         .map(Some)
@@ -274,6 +283,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_prompt_claim_delivers_native_quality_gate_without_rendering(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
+            return Ok(());
+        };
+        let app = runtime_hosts_workflow_app(state);
+        register_host(&app, "mixed-host").await?;
+        let expected_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let command = json!({
+            "activity": "run_quality_gate",
+            "expected_head_sha": expected_head,
+            "validation_commands_argv": [["python3", "-I", "/trusted/verify.py"]],
+        });
+        let job = enqueue_runtime_host_test_job(
+            &store,
+            "native-quality-mixed",
+            RuntimeKind::RemoteHost,
+            "remote",
+            json!({"activity":"run_quality_gate", "command":command}),
+        )
+        .await?;
+        let response = post_json(
+            &app,
+            "/api/runtime-hosts/mixed-host/runtime-jobs/claim".into(),
+            json!({"execution_workspace":"/workspace"}),
+        )
+        .await?;
+        assert_eq!(response["claimed"], true);
+        assert_eq!(response["runtime_job_id"], job.id);
+        assert!(response.get("prepared_prompt").is_none());
+        assert_eq!(response["runtime_job"]["input"]["command"], command);
+        assert!(response["lease_proof"].as_str().is_some());
+        let running = store.get_runtime_job(&job.id).await?.expect("job retained");
+        assert_eq!(
+            running.status,
+            harness_workflow::runtime::RuntimeJobStatus::Running
+        );
+        let events = store.runtime_events_for(&job.id).await?;
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "RuntimePromptPrepared"));
+        super::check_claim_fence(&store, &running)
+            .await
+            .expect("native lease remains live");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn remote_prompt_claim_failure_never_falls_back_to_raw() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let Some((state, store)) = make_test_state_with_runtime_store(dir.path()).await? else {
@@ -287,7 +345,16 @@ mod tests {
                 json!({"prompt_ref":"prompt-memory:missing"}),
                 "implement_issue",
             ),
-            ("native-quality", json!({}), "run_quality_gate"),
+            (
+                "native-pinned-contract",
+                json!({"agent_contract":{}}),
+                "run_quality_gate",
+            ),
+            (
+                "native-exact-replay",
+                json!({"exact_replay":{}}),
+                "run_quality_gate",
+            ),
             ("server-child", json!({}), "start_child_workflow"),
             ("server-feedback", json!({}), "inspect_pr_feedback"),
             (
