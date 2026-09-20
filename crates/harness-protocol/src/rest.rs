@@ -98,7 +98,8 @@ pub struct RenewRuntimeJobLeaseRequest {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ClaimRuntimeJobRequest {
     /// Request a rendered agent prompt for this path in the remote host namespace.
-    /// Omit for raw jobs, including native trusted-verifier execution.
+    /// Native quality gates return the raw job even when this field is supplied.
+    /// Omit for explicit raw protocols such as pinned agent contracts and replay.
     #[serde(default)]
     pub execution_workspace: Option<String>,
     #[serde(default)]

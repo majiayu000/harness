@@ -101,9 +101,14 @@ value is an absolute path in the runtime host's namespace, such as `/workspace`;
 it must not contain control characters or leading/trailing whitespace. The server
 does not inspect, create, canonicalize or check out that directory. Invalid paths
 are rejected before leasing. Omitting the field requests the raw job envelope,
-including for hosts executing native verification commands. Rendering is not
-available for quality-gate, pinned agent-contract or exact-replay jobs; requesting
-it for those jobs fails preflight instead of substituting an ordinary model prompt.
+including for hosts executing native verification commands. Native quality-gate
+jobs return that raw envelope without `prepared_prompt` even when the field is
+supplied: a mixed host cannot know the next activity before claiming it. The host
+must execute the returned validation commands independently against the expected
+commit, not send them to a model. Required capabilities, lease fencing and eval
+completion evidence remain enforced. Pinned agent-contract and exact-replay jobs
+still require an explicit raw claim; requesting rendering for those jobs fails
+preflight, including when they name a quality-gate activity.
 Server-owned child-workflow creation, PR-feedback inspection and enabled server-side
 merge execution also reject rendered claims.
 
@@ -126,8 +131,9 @@ Required prompt preparation failures use the fenced preflight-failure path and
 return no executable prompt. The server rechecks lease ownership and cancellation
 after preparation and audit persistence. A rendered prompt does not provision a
 checkout, transfer candidate commits, execute a model or prove completed work;
-completion and eval evidence requirements still apply. The supervised source-only
-Docker client continues to use raw claims and its existing bounded task contract.
+completion and eval evidence requirements still apply. The supervised Docker
+client consumes rendered agent claims and pinned Git bundles for a single task;
+it does not yet execute native quality-gate jobs or advertise eval capabilities.
 
 `POST /api/runtime-hosts/{id}/runtime-jobs/{runtime_job_id}/lease/renew`
 - request: `{ lease_generation, lease_expires_at, lease_proof, renewal_id, lease_secs?: number }`
