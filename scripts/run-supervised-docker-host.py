@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -27,6 +28,19 @@ IMAGE_PREFIX = "sha256:"
 LEASE_SECONDS = 300
 OUTPUT_LIMIT = 8 * 1024 * 1024
 GIT_HANDOFF_SCRIPT = Path(__file__).with_name("supervised_git_handoff.py").resolve()
+_QUALITY_GATE_SPEC = importlib.util.spec_from_file_location(
+    "supervised_quality_gate", Path(__file__).with_name("supervised_quality_gate.py")
+)
+quality_gate = importlib.util.module_from_spec(_QUALITY_GATE_SPEC)
+_QUALITY_GATE_SPEC.loader.exec_module(quality_gate)
+
+HOST_OWNED_ARTIFACTS = {
+    "runtime_host_usage",
+    "supervised_input_snapshot",
+    "supervised_candidate_resources",
+    "supervised_docker_verification",
+    "supervised_git_handoff",
+}
 
 
 def save(path: Path, value: dict) -> None:
@@ -416,9 +430,37 @@ class Host:
         self.state["git_handoff"] = {**revision, "bundle_sha256": digest, "verified": False}
         self.persist()
 
-    def verify(self) -> int:
+    def retained_candidate(self) -> dict | None:
+        handoff = self.state.get("git_handoff")
+        bundle = self.root / "candidate" / "candidate.bundle"
+        snapshot = self.root / "candidate" / "workspace"
+        if not isinstance(handoff, dict) or not bundle.is_file() or not snapshot.is_dir():
+            return None
+        if not re.fullmatch(r"[0-9a-f]{40}", str(handoff.get("candidate_commit", ""))):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{40}", str(handoff.get("base_commit", ""))):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{64}", str(handoff.get("bundle_sha256", ""))):
+            return None
+        return handoff
+
+    def prepare_follow_on_claim(self) -> None:
+        # Keep the verified candidate; clear only the prior job's lease and result.
+        for key in ("job", "lease", "result", "agent_result", "prepared_prompt",
+                    "cleanup_errors", "resource_evidence"):
+            self.state.pop(key, None)
+        for name in ("completion.json", "completion-response.json", "agent.jsonl", "agent.stderr",
+                     "verifier.stdout", "candidate-resources.json"):
+            path = self.root / name
+            if path.exists():
+                path.unlink()
+        self.state["phase"] = "claiming"
+        self.persist()
+
+    def verify(self, candidate_commit: str | None = None) -> int:
         # Reconstruct only verified Git blobs in a fresh offline container.
         handoff = self.state["git_handoff"]
+        pin = candidate_commit or handoff["candidate_commit"]
         docker("run", "-d", "--name", self.name + "-verify", "--network", "none",
                *self.base_args(),
                "--tmpfs", f"/candidate:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
@@ -430,7 +472,7 @@ class Host:
                "subprocess.run(['python3','-I','/git-handoff.py','verify',"
                "'/handoff/candidate.bundle',*sys.argv[1:],'/handoff/workspace','/candidate'],check=True)\n"
                "sys.exit(subprocess.call(['python3','-I','/verify.py','/candidate']))",
-               handoff["base_commit"], handoff["candidate_commit"], handoff["bundle_sha256"])
+               handoff["base_commit"], pin, handoff["bundle_sha256"])
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             self.renew()
@@ -439,6 +481,42 @@ class Host:
                 output = docker("logs", self.name + "-verify")
                 (self.root / "verifier.stdout").write_text(output)
                 return state["ExitCode"]
+            time.sleep(1)
+        raise RuntimeError("independent verifier exceeded 30s deadline")
+
+    def verify_expected_head(self, expected_head_sha: str, validation_commands: list) -> list:
+        """Bind retained-bundle reconstruction to the server-selected head, then run argv."""
+        handoff = self.retained_candidate()
+        if handoff is None:
+            raise RuntimeError("native quality gate requires a retained candidate Git bundle")
+        quality_gate.bind_retained_candidate(handoff, expected_head_sha)
+        payload = quality_gate.validation_spec(handoff, expected_head_sha, validation_commands)
+        out_dir = self.root / "quality-gate-out"
+        if out_dir.exists():
+            for path in out_dir.iterdir():
+                path.unlink()
+        else:
+            out_dir.mkdir(mode=0o700)
+        docker("run", "-d", "--name", self.name + "-verify", "--network", "none",
+               *self.base_args(),
+               "--tmpfs", f"/candidate:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
+               "--mount", f"type=bind,src={self.root / 'candidate'},dst=/handoff,readonly",
+               "--mount", f"type=bind,src={GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly",
+               "--mount", f"type=bind,src={self.root / 'verifier.py'},dst=/verify.py,readonly",
+               "--mount", f"type=bind,src={self.root / 'verifier.py'},dst=/trusted/verify.py,readonly",
+               "--mount", f"type=bind,src={out_dir},dst=/out",
+               self.args.image, "python3", "-I", "-c", quality_gate.OFFLINE_VALIDATION_SCRIPT,
+               payload)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            self.renew()
+            state = json.loads(docker("inspect", self.name + "-verify", "--format", "{{json .State}}"))
+            if not state["Running"]:
+                output = docker("logs", self.name + "-verify")
+                (self.root / "verifier.stdout").write_text(output)
+                return quality_gate.read_validation_evidence(
+                    out_dir / "validation.json", len(validation_commands)
+                )
             time.sleep(1)
         raise RuntimeError("independent verifier exceeded 30s deadline")
 
@@ -465,7 +543,11 @@ class Host:
     def complete(self) -> None:
         payload_path = self.root / "completion.json"
         if not payload_path.exists():
-            save(payload_path, {**self.state["lease"], "result": self.state["result"]})
+            payload = {**self.state["lease"], "result": self.state["result"]}
+            evidence = self.state.get("execution_evidence")
+            if evidence is not None:
+                payload["execution_evidence"] = evidence
+            save(payload_path, payload)
         response = self.api(self.endpoint + f"/runtime-jobs/{self.state['job']['id']}/complete",
                             json.loads(payload_path.read_text()))
         save(self.root / "completion-response.json", response)
@@ -473,6 +555,34 @@ class Host:
             raise RuntimeError("completion was not accepted; evidence retained for reconciliation")
         self.state["phase"] = "completed"
         self.persist()
+
+    def run_native_quality_gate(self) -> None:
+        command = self.state["job"]["input"].get("command")
+        if not isinstance(command, dict):
+            command = {}
+        expected = quality_gate.require_expected_head(command)
+        commands = quality_gate.require_validation_commands(command)
+        self.state["phase"] = "executing"
+        self.persist()
+        validation = self.verify_expected_head(expected, commands)
+        self.state["git_handoff"]["verified"] = all(item["exit_code"] == 0 for item in validation)
+        self.state["execution_evidence"] = quality_gate.execution_evidence(expected, validation)
+        self.persist()
+        native = quality_gate.activity_result(
+            expected, self.state["git_handoff"]["candidate_commit"], validation
+        )
+        self.state["result"] = self.result(native["status"], native["summary"], [
+            {"artifact_type": "supervised_docker_verification", "artifact": {
+                "image": self.args.image,
+                "verifier_exit_code": 0 if native["status"] == "succeeded" else 1,
+                "verifier_sha256": hashlib.sha256((self.root / "verifier.py").read_bytes()).hexdigest(),
+                "candidate_sha256": hashlib.sha256(
+                    (self.root / "candidate" / "candidate.bundle").read_bytes()
+                ).hexdigest(),
+                "expected_head_sha": expected,
+                "full_eval_capabilities": False,
+            }},
+        ], native)
 
     def run(self) -> None:
         phase = self.state["phase"]
@@ -485,7 +595,8 @@ class Host:
         if phase in {"executing", "claimed"}:
             reason = "host interrupted; candidate was not rerun"
             try:
-                self.collect_resources(stop_agents=True)
+                if self.state.get("container_started"):
+                    self.collect_resources(stop_agents=True)
             except Exception as error:
                 reason += "; " + str(error)
             self.state["result"] = self.result("failed", reason)
@@ -502,17 +613,21 @@ class Host:
             self.state["request"] = json.loads(self.args.request.read_text())
             self.state["submission"] = json.loads(self.args.submission.read_text())
             (self.root / "verifier.py").write_bytes(self.args.verifier.read_bytes())
-            self.state["phase"] = "preparing"
-            self.persist()
-            try:
-                self.freeze_input()
-            except (Exception, KeyboardInterrupt) as error:
-                self.state["phase"] = "preparation_failed"
-                self.state["preparation_error"] = str(error) or "host interrupted by keyboard"
+            if self.retained_candidate():
+                # Reuse a previously exported candidate; do not recopy operator source.
+                self.prepare_follow_on_claim()
+            else:
+                self.state["phase"] = "preparing"
                 self.persist()
-                raise
-            self.state["phase"] = "claiming"
-            self.persist()
+                try:
+                    self.freeze_input()
+                except (Exception, KeyboardInterrupt) as error:
+                    self.state["phase"] = "preparation_failed"
+                    self.state["preparation_error"] = str(error) or "host interrupted by keyboard"
+                    self.persist()
+                    raise
+                self.state["phase"] = "claiming"
+                self.persist()
         self.api("/api/runtime-hosts/register", {
             "host_id": self.name, "capabilities": ["runtime_job_lease_proof_v1"]})
         deadline = time.monotonic() + 30
@@ -526,16 +641,21 @@ class Host:
         job = claim["runtime_job"]
         if job["input"]["workflow_id"] != self.state["submission"]["workflow_id"]:
             raise RuntimeError("claimed unrelated job; use a dedicated disposable server")
-        request = self.state["request"]
-        submission = self.state["submission"]
-        digest = hashlib.sha256(b"\0".join(value.encode() for value in [
-            str(Path(request["project"]).resolve()), request.get("subject_key") or request.get("external_id") or "",
-            submission["task_id"], request["prompt"],
-        ])).hexdigest()
-        if job["input"]["command"].get("prompt_ref") != "prompt-memory:" + digest:
-            raise RuntimeError("request prompt does not match the claimed submission")
-        if "eval" in job["input"]["command"] or "agent_contract" in job["input"]["command"]:
+        command = job["input"].get("command")
+        if not isinstance(command, dict):
+            command = {}
+        if "eval" in command or "agent_contract" in command or "exact_replay" in command:
             raise RuntimeError("this supervised client cannot execute eval or pinned-contract jobs")
+        activity = job["input"].get("activity")
+        if activity != quality_gate.QUALITY_GATE_ACTIVITY:
+            request = self.state["request"]
+            submission = self.state["submission"]
+            digest = hashlib.sha256(b"\0".join(value.encode() for value in [
+                str(Path(request["project"]).resolve()), request.get("subject_key") or request.get("external_id") or "",
+                submission["task_id"], request["prompt"],
+            ])).hexdigest()
+            if command.get("prompt_ref") != "prompt-memory:" + digest:
+                raise RuntimeError("request prompt does not match the claimed submission")
         self.state["job"] = job
         self.state["lease"] = {key: claim[key] for key in
                                ["lease_generation", "lease_expires_at", "lease_proof"]}
@@ -543,54 +663,56 @@ class Host:
         self.persist()
         artifacts = []
         try:
-            prepared = claim.get("prepared_prompt")
-            if not isinstance(prepared, dict) or not isinstance(prepared.get("prompt"), str) or not prepared["prompt"].strip():
-                raise RuntimeError("claim did not deliver a rendered activity prompt")
-            if prepared.get("activity_result_schema", {}).get("activity") != job["input"]["activity"]:
-                raise RuntimeError("rendered result schema does not match the claimed activity")
-            if not re.fullmatch(r"[0-9a-f]{64}", prepared.get("prompt_packet_digest", "")):
-                raise RuntimeError("claim did not deliver a valid prompt packet digest")
-            self.state["prepared_prompt"] = prepared
-            self.state["phase"] = "executing"
-            self.persist()
-            self.launch()
-            exit_code = self.wait()
-            if exit_code:
-                raise RuntimeError(f"agent exited with {exit_code}")
-            usage = {"model": self.args.model, **read_usage(self.root / "agent.jsonl")}
-            artifacts.append({"artifact_type": "runtime_host_usage", "artifact": usage})
-            native = read_activity_result(self.root / "agent.jsonl", job["input"]["activity"])
-            self.state["agent_result"] = native
-            self.persist()
-            for artifact in native.get("artifacts", []):
-                if artifact.get("artifact_type") in {
-                    "runtime_host_usage", "supervised_input_snapshot",
-                    "supervised_candidate_resources", "supervised_docker_verification",
-                    "supervised_git_handoff",
-                }:
-                    raise RuntimeError("agent result contains host-owned artifact: " + artifact["artifact_type"])
-            if native["status"] not in {"succeeded", "succeeded_with_blockers"}:
-                self.collect_resources(stop_agents=True)
-                self.state["result"] = self.result(native["status"], native["summary"], artifacts, native)
+            if activity == quality_gate.QUALITY_GATE_ACTIVITY:
+                if claim.get("prepared_prompt") is not None:
+                    raise RuntimeError("native quality gate must not include a prepared_prompt")
+                self.run_native_quality_gate()
             else:
-                self.capture()
-                verifier_exit = self.verify()
-                if verifier_exit:
-                    raise RuntimeError(f"independent verifier rejected candidate: exit {verifier_exit}")
-                self.state["git_handoff"]["verified"] = True
+                prepared = claim.get("prepared_prompt")
+                if not isinstance(prepared, dict) or not isinstance(prepared.get("prompt"), str) or not prepared["prompt"].strip():
+                    raise RuntimeError("claim did not deliver a rendered activity prompt")
+                if prepared.get("activity_result_schema", {}).get("activity") != job["input"]["activity"]:
+                    raise RuntimeError("rendered result schema does not match the claimed activity")
+                if not re.fullmatch(r"[0-9a-f]{64}", prepared.get("prompt_packet_digest", "")):
+                    raise RuntimeError("claim did not deliver a valid prompt packet digest")
+                self.state["prepared_prompt"] = prepared
+                self.state["phase"] = "executing"
                 self.persist()
-                self.state["result"] = self.result(native["status"], native["summary"], artifacts + [
-                    {"artifact_type": "supervised_docker_verification", "artifact": {
-                        "image": self.args.image, "verifier_exit_code": verifier_exit,
-                        "verifier_sha256": hashlib.sha256((self.root / "verifier.py").read_bytes()).hexdigest(),
-                        "candidate_sha256": hashlib.sha256((self.root / "candidate.tar").read_bytes()).hexdigest(),
-                        "full_eval_capabilities": False,
-                    }},
-                ], native)
+                self.launch()
+                exit_code = self.wait()
+                if exit_code:
+                    raise RuntimeError(f"agent exited with {exit_code}")
+                usage = {"model": self.args.model, **read_usage(self.root / "agent.jsonl")}
+                artifacts.append({"artifact_type": "runtime_host_usage", "artifact": usage})
+                native = read_activity_result(self.root / "agent.jsonl", job["input"]["activity"])
+                self.state["agent_result"] = native
+                self.persist()
+                for artifact in native.get("artifacts", []):
+                    if artifact.get("artifact_type") in HOST_OWNED_ARTIFACTS:
+                        raise RuntimeError("agent result contains host-owned artifact: " + artifact["artifact_type"])
+                if native["status"] not in {"succeeded", "succeeded_with_blockers"}:
+                    self.collect_resources(stop_agents=True)
+                    self.state["result"] = self.result(native["status"], native["summary"], artifacts, native)
+                else:
+                    self.capture()
+                    verifier_exit = self.verify()
+                    if verifier_exit:
+                        raise RuntimeError(f"independent verifier rejected candidate: exit {verifier_exit}")
+                    self.state["git_handoff"]["verified"] = True
+                    self.persist()
+                    self.state["result"] = self.result(native["status"], native["summary"], artifacts + [
+                        {"artifact_type": "supervised_docker_verification", "artifact": {
+                            "image": self.args.image, "verifier_exit_code": verifier_exit,
+                            "verifier_sha256": hashlib.sha256((self.root / "verifier.py").read_bytes()).hexdigest(),
+                            "candidate_sha256": hashlib.sha256((self.root / "candidate.tar").read_bytes()).hexdigest(),
+                            "full_eval_capabilities": False,
+                        }},
+                    ], native)
         except (Exception, KeyboardInterrupt) as error:
             reason = "host interrupted by keyboard" if isinstance(error, KeyboardInterrupt) else str(error)
             try:
-                self.collect_resources(stop_agents=True)
+                if self.state.get("container_started"):
+                    self.collect_resources(stop_agents=True)
             except Exception as collection_error:
                 reason += "; " + str(collection_error)
             self.state["result"] = self.result("failed", reason, artifacts)

@@ -17,9 +17,10 @@ subprocess is added to Harness crates.
 Use a one-activity declarative workflow with `runtime_dispatch.runtime_kind:
 remote_host`. Its activity policy must authorize the supplied request prompt;
 the client requests server-rendered instructions for `/workspace` and retains the
-prompt, packet digest and native result schema before model execution. It does not
-implement multi-activity workflows, pinned agent contracts, historical eval jobs,
-or PR lifecycle actions.
+prompt, packet digest and native result schema before model execution. Native
+`run_quality_gate` claims reuse a retained candidate bundle instead of a model
+prompt. It does not implement full multi-activity eval workflows, pinned agent
+contracts, historical eval jobs, or PR lifecycle actions.
 Submit through `POST /api/workflows/runtime/submissions` and retain both the exact
 request JSON and response JSON. The server currently cannot filter host claims
 by project: do not point this client at a shared server with unrelated jobs.
@@ -145,10 +146,33 @@ Git configuration. `supervised_git_handoff` records base/candidate commit IDs,
 candidate bundle SHA-256 and whether independent verification succeeded. Failed
 verification retains the pins with `verified: false` and drops success signals.
 
-This is a single-task Git handoff. A local candidate commit is not an externally
-published PR head. Multi-activity handoff, historical evaluation contracts and a
-formal baseline remain unsupported; eval and pinned-contract jobs are rejected.
-There is no source-directory-only mode or old-state migration.
+This is a single-task Git handoff plus an optional follow-on native quality-gate
+claim that reuses the retained candidate bundle. A local candidate commit is not
+an externally published PR head: quality-gate verification must match
+`command.expected_head_sha`. Historical evaluation contracts and a formal
+baseline remain unsupported; eval and pinned-contract jobs are rejected. There
+is no source-directory-only mode or old-state migration.
+
+## Native quality-gate consumption
+
+After an implementation activity retains `candidate/candidate.bundle` and
+`supervised_git_handoff`, the same state directory can claim a subsequent
+`run_quality_gate` job. Reset `phase` to `new` (or start a fresh state directory
+that already contains the retained candidate) and point `--submission` at the
+quality-gate workflow. The client skips source freeze when a retained candidate
+is present, rejects `prepared_prompt` on the native claim, and requires
+`command.expected_head_sha` plus `validation_commands_argv`.
+
+Verification reconstructs the retained bundle with the existing
+`supervised_git_handoff.verify` helper, pinning the candidate commit to
+`expected_head_sha`. A local candidate SHA that does not equal the
+server-selected head fails closed; it is not treated as an externally verified
+PR head. Offline validation runs the exact server argv against the reconstructed
+tree (`/candidate`), with the operator verifier also mounted at
+`/trusted/verify.py` for argv compatibility. Completion includes host
+`execution_evidence` whose `checked_out_commit` is that expected head, with honest
+zero model usage and without advertising `eval_resource_limits` or other eval
+capabilities. Eval, agent-contract, and exact-replay jobs remain rejected.
 
 ## Candidate resource evidence
 
