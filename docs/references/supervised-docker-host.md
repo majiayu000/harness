@@ -3,8 +3,8 @@
 `scripts/run-supervised-docker-host.py` executes one already-submitted declarative
 prompt task on a **dedicated disposable Harness server**. It is the first bounded
 execution trial for GH-1768, not the complete nightly benchmark executor. It
-advertises only `runtime_job_lease_proof_v1`; it must not advertise eval resource,
-network-policy, or trusted-verifier capabilities or be used to create a baseline.
+advertises `runtime_job_lease_proof_v1`, `eval_resource_limits`, and
+`eval_network_policy`. It does not advertise `trusted_eval_verifier_v1` and must not be used to create a baseline.
 
 ## Scope
 
@@ -163,7 +163,9 @@ This is a single-task Git handoff plus an optional follow-on native quality-gate
 claim that reuses the retained candidate bundle. A local candidate commit is not
 an externally published PR head: quality-gate verification must match
 `command.expected_head_sha`. Historical evaluation contracts and a formal
-baseline remain unsupported; eval and pinned-contract jobs are rejected. There
+baseline remain unsupported. Pinned-contract jobs and eval jobs that require
+`trusted_eval_verifier_v1` are rejected. Other eval jobs enforce the claimed
+cumulative CPU budget, network policy, and credential environment. There
 is no source-directory-only mode or old-state migration.
 
 ## Native quality-gate consumption
@@ -187,11 +189,11 @@ verified PR head. Offline validation runs the exact server argv against the
 reconstructed tree (`/candidate`), with the operator verifier also mounted at
 `/trusted/verify.py` for argv compatibility and `config/default.toml.example` at
 `/config.toml`. Completion includes host `execution_evidence` whose
-`checked_out_commit` is that expected head, with honest zero model usage and
-without advertising `eval_resource_limits` or other eval capabilities. Prior-job
+`checked_out_commit` is that expected head, with honest zero model usage.
+Lease-only quality gates still omit eval resource measurements. Prior-job
 `execution_evidence` is cleared before the new claim so stale evidence cannot
-attach to the current lease. Eval, agent-contract, and exact-replay jobs remain
-rejected. Completed restarts of the original state directory still no-op and do
+attach to the current lease. Eval quality gates, agent-contract jobs, and
+exact-replay jobs remain rejected. Completed restarts of the original state directory still no-op and do
 not reclaim.
 
 ## Candidate resource evidence
@@ -249,12 +251,12 @@ If candidate PID 1 dies, Docker may remove the cgroup files before collection;
 that remains an incomplete failure, not a recovered final resource measurement.
 Cleanup also removes the exact task-owned observer container.
 
-This adds evidence to the supervised trial. It does **not** implement a complete
-`ResourceLimitReport`, invent a `cpu_time_secs` lifetime quota, or map CPU-rate/wall
-timeout into CPU-time usage, and it does not advertise `eval_resource_limits` or
-enable formal eval jobs. Native quality-gate jobs that never start a candidate
-container still omit `supervised_candidate_resources` rather than fabricating a
-mapping.
+Lease-only jobs still have no CPU-time budget: this disk evidence is not a
+`ResourceLimitReport`, and `--cpus` or the wall timeout is not CPU time. An eval
+claim enforces `resource_limits.effective.cpu_time_secs` from cgroup `usage_usec`
+and reports that measurement separately from wall time. Native quality-gate jobs
+that never start a candidate container still omit `supervised_candidate_resources`
+rather than fabricating a mapping.
 
 A credential-free, no-model Docker probe using the pinned local
 `harness-agent:fixture` image and test-sized tmpfs fixtures recorded argv, image

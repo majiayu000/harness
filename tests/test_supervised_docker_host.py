@@ -348,7 +348,7 @@ def test_stuck_client_cleanup_preserves_primary_failure_and_closes_streams(tmp_p
     process = Mock(stdout=streams[0], stderr=streams[1])
     process.poll.return_value = None
     process.wait.side_effect = subprocess.TimeoutExpired(['docker', 'exec'], 5)
-    monkeypatch.setattr(module.subprocess, 'Popen', Mock(return_value=process))
+    monkeypatch.setattr(module.quality_gate.subprocess, 'Popen', Mock(return_value=process))
     try:
         with pytest.raises(RuntimeError) as raised:
             module.stream_agent_output(['docker', 'exec'], tmp_path, 0 if failure == 'deadline' else 5, Mock())
@@ -917,13 +917,47 @@ def claimed_runner(tmp_path):
     return runner, claim
 
 
+def test_cumulative_cpu_budget_is_cgroup_usage_not_a_rate_or_wall_timeout():
+    module = load()
+    limits = module.quality_gate.trusted_resource_limits({
+        "resource_limits": {
+            "requested": {"cpu_time_secs": 2},
+            "effective": {
+                "cpu_time_secs": 1, "memory_bytes": 8, "pids": 16,
+                "disk_bytes": 512 * 1024 * 1024, "output_bytes": 1024, "wall_time_secs": 30,
+            },
+        }
+    })
+    assert module.quality_gate.cpu_time_exceeded(1_000_000, 1) is False
+    assert module.quality_gate.cpu_time_exceeded(1_000_001, 1) is True
+    report = module.quality_gate.build_resource_report(
+        limits, cpu_usec=1_000_001, peak_memory_bytes=1, peak_pids=1,
+        disk_bytes=1, output_bytes=1, wall_time_millis=1,
+    )
+    assert report["termination"]["resource"] == "cpu_time"
+    assert report["usage"]["cpu_time_millis"] == 1000
+    assert report["usage"]["wall_time_millis"] == 1
+    variables = module.quality_gate.bind_eval_contract(
+        {
+            "resource_limits": limits,
+            "network_policy": {"inbound": "deny", "outbound": "allowlist", "network_allowlist": ["chatgpt.com"]},
+            "credential_environment_variables": {"MODEL_TOKEN": "secret"},
+        },
+        {"eval": {}},
+    )
+    assert variables == {"MODEL_TOKEN": "secret"}
+    assert "secret" not in json.dumps({key: value for key, value in limits.items()})
+
+
 def test_rendered_claim_and_native_result_survive_completion_and_restart(tmp_path):
     runner, claim = claimed_runner(tmp_path)
     native = native_result()
     write_result_log(tmp_path / 'agent.jsonl', native)
     runner.run()
     assert runner.api.call_args_list[1].args[1]['execution_workspace'] == '/workspace'
-    assert runner.api.call_args_list[0].args[1]['capabilities'] == ['runtime_job_lease_proof_v1']
+    assert runner.api.call_args_list[0].args[1]['capabilities'] == [
+        'runtime_job_lease_proof_v1', 'eval_resource_limits', 'eval_network_policy',
+    ]
     saved = json.loads((tmp_path / 'state.json').read_text())
     assert saved['prepared_prompt'] == claim['prepared_prompt']
     assert saved['agent_result'] == native
