@@ -131,10 +131,10 @@ pub(super) async fn wait_until_cancelled(
             {
                 return;
             }
-            if !guard
+            if guard
                 .active_attempt
                 .as_ref()
-                .is_some_and(|attempt| attempt.generation == generation)
+                .is_none_or(|attempt| attempt.generation != generation)
             {
                 return;
             }
