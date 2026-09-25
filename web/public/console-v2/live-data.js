@@ -88,6 +88,7 @@
     const action = byAction.get(id);
     const approval = task.pending_approvals?.find(item => item.type === 'approval_request' && item.id && item.approved == null);
     const tokenUsage = H.details?.get(id)?.task?.token_usage;
+    const leaseState = { active_leased: 'active', expired_lease: 'expired', missing_lease: 'missing' }[invocation?.lease_state] || invocation?.lease_state || '—';
     return {
       id, submissionId: task.submission_id || task.id, repo, n: issue || pr || '—', pr,
       ref: issue ? repo + '#' + issue : pr ? repo + '#PR' + pr : repo + ' · ' + String(task.id).slice(0, 8),
@@ -96,7 +97,7 @@
       agent: invocation?.agent_runtime || '—', model: invocation?.model || '—', effort: invocation?.reasoning_effort || '—',
       host: invocation?.lease_owner || '—', turn: task.turn || 0, max: task.max_turns || worktree?.max_turns || '—',
       age: age(task.created_at), obs: invocation?.last_runtime_observation_at ? age(invocation.last_runtime_observation_at) : '—',
-      lease: invocation?.lease_state || '—', tokens: formatInt(tokenUsage?.total_tokens), cost: formatCost(tokenUsage?.cost_usd), file: '', sym: '', crate: repo,
+      lease: leaseState, tokens: formatInt(tokenUsage?.total_tokens), cost: formatCost(tokenUsage?.cost_usd), file: '', sym: '', crate: repo,
       inbox: approval ? actionInbox({ kind: 'approval', requestId: approval.id, blocked_reason: 'approval_request', unblock_hint: approval.action, next_action: 'Approve or deny request' }) : actionInbox(action), waiting: task.scheduler?.authority_state || '', activity: invocation?.activity || '', taskKind: task.task_kind || '—',
       branch: worktree?.branch || '—', worktree: worktree?.path_short || '—',
       terminal: terminalStates.has(current), ago: age(task.updated_at || task.created_at), score: '—',
@@ -146,11 +147,12 @@
   function mapUsage(usage) {
     const summary = usage?.summary;
     if (!summary) return;
+    const { hourly, hourlySource } = H.X.usage;
     const group = (rows) => (rows || []).map(row => [row.name, formatInt(row.total_tokens), formatCost(row.estimated_cost_usd), summary.total_tokens ? Math.round(100 * row.total_tokens / summary.total_tokens) : 0]);
     H.X.usage = {
       tokens: formatInt(summary.total_tokens), cost: formatCost(summary.estimated_cost_usd), turns: summary.request_count,
       cache: summary.total_tokens ? Math.round(100 * (summary.cache_read_input_tokens || 0) / summary.total_tokens) + '%' : '—',
-      hourly: [], quotas: [], byProject: group(usage.tokens_by_project), byAgent: group(usage.tokens_by_agent), byModel: group(usage.tokens_by_model),
+      hourly, hourlySource, quotas: [], byProject: group(usage.tokens_by_project), byAgent: group(usage.tokens_by_agent), byModel: group(usage.tokens_by_model),
     };
   }
 
@@ -212,7 +214,11 @@
       for (const driverless of monitor?.driverless_progress || []) {
         if (!byAction.has(driverless.workflow_id)) byAction.set(driverless.workflow_id, { ...driverless, kind: 'driverless', next_action: driverless.provenance_status });
       }
-      const byInvocation = new Map((usage?.agent_invocations || []).map(invocation => [invocation.workflow_id, invocation]));
+      const byInvocation = new Map();
+      // The API orders active and newer invocations first for each workflow.
+      for (const invocation of usage?.agent_invocations || []) {
+        if (!byInvocation.has(invocation.workflow_id)) byInvocation.set(invocation.workflow_id, invocation);
+      }
       const byWorktree = new Map((worktrees || []).filter(row => row.runtime_workflow_id).map(row => [row.runtime_workflow_id, row]));
       const rows = tasks.map(task => mapTask(task, byAction, byInvocation, byWorktree));
       const seen = new Set(rows.map(row => row.id));
@@ -291,10 +297,10 @@
           if (!data) continue;
           try {
             const item = JSON.parse(data.slice(6));
-            if (item.type === 'MessageDelta') H.transcripts.get(workflow.id).push({ t: item.text, c: 'oklch(0.86 0.005 275)' });
-            if (item.type === 'Error') H.transcripts.get(workflow.id).push({ t: item.message, c: 'var(--fail)' });
+            if (item.type === 'message_delta') H.transcripts.get(workflow.id).push({ t: item.text, c: 'oklch(0.86 0.005 275)' });
+            if (item.type === 'error') H.transcripts.get(workflow.id).push({ t: item.message, c: 'var(--fail)' });
             refreshView();
-            if (item.type === 'Done' || item.type === 'Error') return;
+            if (item.type === 'done' || item.type === 'error') return;
           } catch { /* Ignore malformed stream events. */ }
         }
       }

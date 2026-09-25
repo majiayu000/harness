@@ -659,6 +659,11 @@ class Component extends DCLogic {
   componentWillUnmount() { clearInterval(this.iv); clearInterval(this.iv0); clearTimeout(this.tt); window.removeEventListener('keydown', this.onKey); window.removeEventListener('resize', this.onResize); }
   componentDidUpdate(pp) {
     if (pp.startScreen !== this.props.startScreen && this.props.startScreen) this.setState({ screen: this.props.startScreen });
+    if (this.state.modal && !window.HC.workflows.some(w => w.id === this.state.modal.id && (this.state.modal.action === 'cancel' || w.inbox?.actions?.includes(this.state.modal.action)))) {
+      this.setState({ modal: null, reason: '' });
+      this.flash('Workflow changed', 'The pending action was closed.');
+      return;
+    }
     if (!this.hasAutoSelected && this.state.vw >= 1280 && window.HC.workflows.length) {
       this.hasAutoSelected = true;
       const first = window.HC.workflows.find(w => w.inbox) || window.HC.workflows[0];
@@ -762,7 +767,12 @@ class Component extends DCLogic {
 
   async doConfirm() {
     const md = this.state.modal; if (!md) return;
-    const w = this.all().find(x => x.id === md.id); if (!w) return;
+    const w = this.all().find(x => x.id === md.id);
+    if (!w || (md.action !== 'cancel' && !w.inbox?.actions?.includes(md.action))) {
+      this.setState({ modal: null, reason: '' });
+      this.flash('Workflow changed', 'The pending action was closed.');
+      return;
+    }
     const A = this.actionMeta(md.action, w);
     if (A.required && !this.state.reason.trim()) return;
     const body = { workflow_id: w.id };
@@ -1063,10 +1073,12 @@ class Component extends DCLogic {
     let m = {}, confirmDisabled = false;
     if (s.modal) {
       const w = all.find(x => x.id === s.modal.id);
-      const A = this.actionMeta(s.modal.action, w);
-      const toneOf = (st) => (H.S[st] || [0, 'var(--muted)'])[1];
-      m = { title: A.title, ref: w.ref, wfTitle: w.title, endpoint: A.endpoint, from: A.from, to: A.to, fromTone: toneOf(A.from), toTone: A.danger ? 'var(--fail)' : toneOf(A.to === 'replanning' ? 'planning' : A.to), confirm: A.confirm, reasonLabel: A.required ? 'Reason · required, written to the audit trail' : 'Note · not sent by this endpoint', placeholder: A.ph, btnBg: A.danger ? 'var(--fail)' : 'var(--btn)', btnFg: A.danger ? 'oklch(0.99 0 0)' : 'var(--btnFg)' };
-      confirmDisabled = A.required && !s.reason.trim();
+      if (w && (s.modal.action === 'cancel' || w.inbox?.actions?.includes(s.modal.action))) {
+        const A = this.actionMeta(s.modal.action, w);
+        const toneOf = (st) => (H.S[st] || [0, 'var(--muted)'])[1];
+        m = { title: A.title, ref: w.ref, wfTitle: w.title, endpoint: A.endpoint, from: A.from, to: A.to, fromTone: toneOf(A.from), toTone: A.danger ? 'var(--fail)' : toneOf(A.to === 'replanning' ? 'planning' : A.to), confirm: A.confirm, reasonLabel: A.required ? 'Reason · required, written to the audit trail' : 'Note · not sent by this endpoint', placeholder: A.ph, btnBg: A.danger ? 'var(--fail)' : 'var(--btn)', btnFg: A.danger ? 'oklch(0.99 0 0)' : 'var(--btnFg)' };
+        confirmDisabled = A.required && !s.reason.trim();
+      }
     }
 
     const titles = { 0: 'Nothing needs you', 1: '1 thing needs you' };
@@ -1085,7 +1097,7 @@ class Component extends DCLogic {
       hosts, breakers, failures, drafts, sched, rulesLogs,
       hasSel: !!insp, s: insp || {}, tabs, tabTimeline: s.tab === 'timeline', tabTranscript: s.tab === 'transcript', tabCommands: s.tab === 'commands', tabArtifacts: s.tab === 'artifacts', tabProof: s.tab === 'proof',
       closeSel: set({ sel: null }), selPrev: () => this.move(-1), selNext: () => this.move(1),
-      hasModal: !!s.modal, m, reason: s.reason, onReason: (e) => this.setState({ reason: e.target.value }), closeModal: set({ modal: null }), confirm: () => this.doConfirm(), confirmDisabled, confirmOpacity: confirmDisabled ? 0.4 : 1,
+      hasModal: !!m.title, m, reason: s.reason, onReason: (e) => this.setState({ reason: e.target.value }), closeModal: set({ modal: null }), confirm: () => this.doConfirm(), confirmDisabled, confirmOpacity: confirmDisabled ? 0.4 : 1,
       hasToast: !!s.toast, toast: s.toast || {},
       ...this.extra(H, all, hist),
     };
