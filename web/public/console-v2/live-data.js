@@ -157,7 +157,7 @@
   }
 
   function applyPayloads(payloads) {
-    const [tasks, monitor, overview, usage, dashboard, snapshot, worktrees, intake, registry, skills, drafts, tokenUsage] = payloads;
+    const [tasks, monitor, overview, usage, dashboard, snapshot, worktrees, intake, registry, skills, drafts, tokenUsage, approvals] = payloads;
     if (monitor) {
       H.health = {
         status: monitor.health.status, degraded: monitor.health.degraded_subsystems || [],
@@ -207,6 +207,7 @@
       signal: String(draft.signal?.signal_type || '—'), budget: '—', state: draft.status,
     }));
     if (tasks) {
+      const bySubmission = new Map((approvals?.data || []).map(row => [row.submission_id, row.pending_approvals]));
       const byAction = new Map((monitor?.operator_actions || []).map(action => [action.workflow_id, action]));
       for (const stuck of monitor?.stuck_workflows || []) {
         if (!byAction.has(stuck.workflow_id)) byAction.set(stuck.workflow_id, { ...stuck, kind: stuck.state === 'failed' ? 'failed' : 'blocked', next_action: stuck.unblock_hint || stuck.retry_hint || stuck.state });
@@ -220,7 +221,7 @@
         if (!byInvocation.has(invocation.workflow_id)) byInvocation.set(invocation.workflow_id, invocation);
       }
       const byWorktree = new Map((worktrees || []).filter(row => row.runtime_workflow_id).map(row => [row.runtime_workflow_id, row]));
-      const rows = tasks.map(task => mapTask(task, byAction, byInvocation, byWorktree));
+      const rows = tasks.map(task => mapTask({ ...task, pending_approvals: bySubmission.get(task.id) || [] }, byAction, byInvocation, byWorktree));
       const seen = new Set(rows.map(row => row.id));
       for (const action of byAction.values()) {
         if (seen.has(action.workflow_id)) continue;
@@ -326,6 +327,7 @@
         request('/projects'), secondaryDue ? H.rpc('skill_list', { query: null }) : Promise.resolve(null),
         secondaryDue ? H.rpc('gc_drafts', { project_id: null }) : Promise.resolve(null),
         secondaryDue ? request('/api/token-usage') : Promise.resolve(null),
+        request('/api/workflows/runtime/approvals'),
       ];
       const results = await Promise.allSettled(jobs);
       const failures = results.filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason));

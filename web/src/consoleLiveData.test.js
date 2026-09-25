@@ -13,6 +13,7 @@ it("keeps the current invocation, hourly series, and snake-case stream events", 
   };
   const responses = {
     "/api/workflows/runtime/submissions?limit=200": { data: [task], page: { has_more: false } },
+    "/api/workflows/runtime/approvals": { data: [{ submission_id: "sub-1", pending_approvals: [{ type: "approval_request", id: "request-1", action: "run tests", approved: null }] }] },
     "/api/operator-monitor": { health: { status: "ok", degraded_subsystems: [], uptime_secs: 30 }, failures: [], operator_actions: [], activity: {} },
     "/api/overview": { projects: [], runtimes: [] },
     "/api/usage-monitor": {
@@ -63,6 +64,7 @@ it("keeps the current invocation, hourly series, and snake-case stream events", 
 
   expect(context.HC.workflows[0].agent).toBe("current-agent");
   expect(context.HC.workflows[0].lease).toBe("active");
+  expect(context.HC.workflows[0].inbox.kind).toBe("approval");
   expect(context.HC.X.usage.hourly).toEqual([0.0001]);
 
   await context.HC.refresh();

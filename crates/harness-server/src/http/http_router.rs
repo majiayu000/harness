@@ -95,6 +95,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
                 .post(task_routes::create_runtime_submission),
         )
         .route(
+            "/api/workflows/runtime/approvals",
+            get(crate::http::approval_list_routes::list_pending_approvals),
+        )
+        .route(
             "/api/workflows/runtime/submissions/{id}",
             get(task_query_routes::get_runtime_submission),
         )

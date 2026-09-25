@@ -166,6 +166,19 @@ pub struct ProjectQueueStatsResponse(pub serde_json::Value);
 #[serde(transparent)]
 pub struct IntakeStatusResponse(pub serde_json::Value);
 
+/// An actionable approval request under a runtime submission handle.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingRuntimeApproval {
+    pub submission_id: String,
+    pub pending_approvals: Vec<harness_core::types::Item>,
+}
+
+/// Pending approvals for live runtime submission handles.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingRuntimeApprovalsResponse {
+    pub data: Vec<PendingRuntimeApproval>,
+}
+
 /// Runtime task detail returned by the workflow submission API.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeTaskDetailResponse {
@@ -451,6 +464,9 @@ impl RestDto for OperatorSnapshotResponse {}
 
 impl private::Sealed for RuntimeTaskDetailResponse {}
 impl RestDto for RuntimeTaskDetailResponse {}
+
+impl private::Sealed for PendingRuntimeApprovalsResponse {}
+impl RestDto for PendingRuntimeApprovalsResponse {}
 
 impl private::Sealed for RuntimeTaskDetailErrorResponse {}
 impl RestDto for RuntimeTaskDetailErrorResponse {}

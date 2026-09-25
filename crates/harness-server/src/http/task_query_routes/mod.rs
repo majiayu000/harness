@@ -67,8 +67,6 @@ struct RuntimeSubmissionSummaryResponse {
     inner: TaskSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal: Option<TaskTerminalInfo>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pending_approvals: Vec<harness_core::types::Item>,
 }
 
 impl From<TaskSummary> for RuntimeSubmissionSummaryResponse {
@@ -78,7 +76,6 @@ impl From<TaskSummary> for RuntimeSubmissionSummaryResponse {
         Self {
             inner: summary,
             terminal,
-            pending_approvals: Vec::new(),
         }
     }
 }
@@ -182,16 +179,7 @@ pub(crate) async fn list_runtime_submissions(
     Json(RuntimeSubmissionListResponse {
         data: data
             .into_iter()
-            .map(|summary| {
-                let pending_approvals = state
-                    .core
-                    .server
-                    .thread_manager
-                    .pending_approval_items_for_runtime_handle(summary.id.as_str());
-                let mut response = RuntimeSubmissionSummaryResponse::from(summary);
-                response.pending_approvals = pending_approvals;
-                response
-            })
+            .map(RuntimeSubmissionSummaryResponse::from)
             .collect(),
         page,
         counts,

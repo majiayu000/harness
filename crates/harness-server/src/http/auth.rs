@@ -218,8 +218,7 @@ pub(crate) fn is_auth_exempt_path(path: &str) -> bool {
 ///
 /// Exempts `/health`, `/webhook`, `/webhook/feishu`, `/signals`, `/favicon.ico`,
 /// `/auth/reset-password`, `/` and `/dashboard` (dashboard HTML), `/overview` and `/usage`
-/// (React SPA HTML), `/assets/*` (hashed React bundle assets),
-/// `/console-v2/*` (allowlisted console assets), and `/ws` (WebSocket
+/// (React SPA HTML), `/assets/*` (hashed React bundle assets), and `/ws` (WebSocket
 /// upgrade).
 /// The dashboard HTML no longer embeds the token, so it is safe to serve without
 /// auth. `/ws` is exempt from *this middleware* because the WebSocket upgrade

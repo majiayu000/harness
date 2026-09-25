@@ -1443,19 +1443,27 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
         .collect::<Vec<_>>();
     assert!(listed_ids.contains(&submission_id.as_str()));
     assert!(listed_ids.contains(&declarative_submission_id));
-    let approval_row = listed["data"]
-        .as_array()
-        .expect("runtime submission list should be an array")
-        .iter()
-        .find(|row| row["id"].as_str() == Some(submission_id.as_str()))
-        .expect("approval-gated submission should be listed");
+
+    let approvals_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/approvals")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(approvals_response.status(), StatusCode::OK);
+    let approvals = response_json(approvals_response).await?;
     assert_eq!(
-        approval_row["pending_approvals"],
+        approvals["data"],
         serde_json::json!([{
-            "type": "approval_request",
-            "id": "request-1",
-            "action": "run cargo test",
-            "approved": null
+            "submission_id": submission_id,
+            "pending_approvals": [{
+                "type": "approval_request",
+                "id": "request-1",
+                "action": "run cargo test",
+                "approved": null
+            }]
         }])
     );
 
