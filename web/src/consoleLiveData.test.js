@@ -6,6 +6,7 @@ import { expect, it } from "vitest";
 const asset = (name) => readFileSync(join(process.cwd(), "public/console-v2", name), "utf8");
 
 it("keeps the current invocation, hourly series, and snake-case stream events", async () => {
+  let readerCancelled = false;
   const task = {
     id: "sub-1", workflow: { id: "wf-1", state: "implementing" }, repo: "owner/repo",
     external_id: "42", description: "Fix issue 42", status: "implementing", turn: 2,
@@ -39,7 +40,10 @@ it("keeps the current invocation, hourly series, and snake-case stream events", 
       if (path.endsWith("/stream")) {
         const data = new TextEncoder().encode('data: {"type":"message_delta","text":"hello"}\n\ndata: {"type":"done"}\n\n');
         let sent = false;
-        return { ok: true, body: { getReader: () => ({ read: async () => sent ? { done: true } : ((sent = true), { done: false, value: data }) }) } };
+        return { ok: true, body: { getReader: () => ({
+          read: async () => sent ? { done: true } : ((sent = true), { done: false, value: data }),
+          cancel: async () => { readerCancelled = true; },
+        }) } };
       }
       if (path === "/rpc") return { ok: true, status: 200, json: async () => ({ result: [] }) };
       const payload = responses[path];
@@ -66,6 +70,7 @@ it("keeps the current invocation, hourly series, and snake-case stream events", 
 
   await context.HC.loadTranscript(context.HC.workflows[0]);
   expect(context.HC.transcripts.get("wf-1")).toEqual([{ t: "hello", c: "oklch(0.86 0.005 275)" }]);
+  expect(readerCancelled).toBe(true);
 });
 
 it("closes a pending action when its workflow disappears", () => {

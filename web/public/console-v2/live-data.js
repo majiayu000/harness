@@ -284,25 +284,29 @@
       });
       if (!response.ok || !response.body) throw new Error('Transcript stream unavailable');
       const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const result = await reader.read();
-        if (result.done) break;
-        buffer += decoder.decode(result.value, { stream: true });
-        const events = buffer.split('\n\n');
-        buffer = events.pop() || '';
-        for (const event of events) {
-          const data = event.split('\n').find(line => line.startsWith('data: '));
-          if (!data) continue;
-          try {
-            const item = JSON.parse(data.slice(6));
-            if (item.type === 'message_delta') H.transcripts.get(workflow.id).push({ t: item.text, c: 'oklch(0.86 0.005 275)' });
-            if (item.type === 'error') H.transcripts.get(workflow.id).push({ t: item.message, c: 'var(--fail)' });
-            refreshView();
-            if (item.type === 'done' || item.type === 'error') return;
-          } catch { /* Ignore malformed stream events. */ }
+      try {
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const result = await reader.read();
+          if (result.done) break;
+          buffer += decoder.decode(result.value, { stream: true });
+          const events = buffer.split('\n\n');
+          buffer = events.pop() || '';
+          for (const event of events) {
+            const data = event.split('\n').find(line => line.startsWith('data: '));
+            if (!data) continue;
+            try {
+              const item = JSON.parse(data.slice(6));
+              if (item.type === 'message_delta') H.transcripts.get(workflow.id).push({ t: item.text, c: 'oklch(0.86 0.005 275)' });
+              if (item.type === 'error') H.transcripts.get(workflow.id).push({ t: item.message, c: 'var(--fail)' });
+              refreshView();
+              if (item.type === 'done' || item.type === 'error') return;
+            } catch { /* Ignore malformed stream events. */ }
+          }
         }
+      } finally {
+        await reader.cancel().catch(() => {});
       }
     } catch (error) {
       H.transcripts.get(workflow.id).push({ t: error.message || String(error), c: 'var(--fail)' });
@@ -330,10 +334,11 @@
       H.partialError = failures.length ? failures.join(' · ') : null;
       applyPayloads(results.map(result => result.status === 'fulfilled' ? result.value : null));
       if (secondaryDue) {
-        const memories = await Promise.allSettled(H.projects.map(project => request('/api/projects/' + encodeURIComponent(project.id) + '/memory')));
+        const projects = H.projects;
+        const memories = await Promise.allSettled(projects.map(project => request('/api/projects/' + encodeURIComponent(project.id) + '/memory')));
         memories.forEach((result, index) => {
           if (result.status !== 'fulfilled') return;
-          const id = H.projects[index].id;
+          const id = projects[index].id;
           H.X.memory[id] = (result.value.records || []).map(record => ({
             id: record.id, kind: record.kind, text: typeof record.payload === 'string' ? record.payload : JSON.stringify(record.payload),
             src: record.evidence_ref || '—', age: age(record.created_at),
