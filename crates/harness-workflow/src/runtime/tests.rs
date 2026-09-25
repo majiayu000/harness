@@ -1,3 +1,4 @@
+use super::completion_evidence::{ARTIFACT_SERVER_VALIDATION_DIGEST, ARTIFACT_VERIFIED_PR_BINDING};
 use super::model::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, ActivityStatus,
     RuntimeJob, RuntimeJobStatus, RuntimeKind, RuntimeProfile, ValidationRecord, WorkflowCommand,
@@ -7,22 +8,25 @@ use super::model::{
 use super::store::RuntimeJobEnqueueOutcome;
 use super::validator::{DecisionValidator, ValidationContext, WorkflowDecisionRejectionKind};
 use super::{
-    build_issue_submission_decision, build_plan_issue_decision, build_pr_detected_decision,
-    build_pr_feedback_decision, build_pr_feedback_sweep_decision, build_prompt_submission_decision,
-    build_quality_gate_run_decision, reduce_runtime_job_completed, CandidateFanoutRequest,
-    CommandDispatchOutcome, DeferClaimedCommandOutcome, DispatchBackoffPolicy,
-    DispatchBarrierInput, DispatchBarrierReasonCode, DispatchClaim, InMemoryWorkflowBus,
-    IssueSubmissionDecisionInput, IssueSubmissionWorkflowAction, PlanIssueDecisionInput,
+    build_issue_submission_decision, build_local_review_request_decision,
+    build_plan_issue_decision, build_pr_detected_decision, build_pr_feedback_decision,
+    build_pr_feedback_sweep_decision, build_prompt_submission_decision,
+    build_quality_gate_run_decision, reduce_runtime_job_completed,
+    reduce_runtime_job_completed_with_registry, CandidateFanoutRequest, CommandDispatchOutcome,
+    DataProvenance, DeferClaimedCommandOutcome, DispatchBackoffPolicy, DispatchBarrierInput,
+    DispatchBarrierReasonCode, DispatchClaim, InMemoryWorkflowBus, IssueSubmissionDecisionInput,
+    IssueSubmissionWorkflowAction, LocalReviewDecisionInput, PlanIssueDecisionInput,
     PlanIssueWorkflowAction, PrDetectedDecisionInput, PrFeedbackDecisionInput, PrFeedbackOutcome,
     PrFeedbackSweepDecisionInput, PrFeedbackWorkflowAction, PromptContinuationPolicy,
     PromptContinuationState, PromptSubmissionDecisionInput, QualityGateDecisionInput,
     QualityGateWorkflowAction, RuntimeCommandDispatcher, RuntimeJobExecutor,
-    RuntimeProfileSelector, RuntimeWorker, SubmissionMode, WorkflowCommandStatus,
-    WorkflowDecisionTransition, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
+    RuntimeProfileSelector, RuntimeWorker, SubmissionMode, WorkflowCancellationCleanupOutcome,
+    WorkflowCommandStatus, WorkflowDataWrite, WorkflowDecisionTransition,
+    WorkflowDefinitionRegistry, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
     LOCAL_REVIEW_ACTIVITY, PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY,
     PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY, QUALITY_BLOCKED_SIGNAL,
     QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
-    QUALITY_PASSED_SIGNAL, RUNTIME_JOB_COMPLETED_EVENT, SCOPE_TOO_LARGE_SIGNAL,
+    QUALITY_PASSED_SIGNAL, RUNTIME_JOB_COMPLETED_EVENT,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Timelike, Utc};
@@ -36,11 +40,11 @@ use std::sync::{
 include!("tests/common.rs");
 include!("tests/decision_builders.rs");
 include!("tests/completion_reducer_core.rs");
-include!("tests/completion_reducer_scope.rs");
 include!("tests/prompt_continuation_reducer.rs");
 include!("tests/completion_reducer_quality.rs");
 include!("tests/completion_reducer_quality_gate.rs");
 include!("tests/runtime_failure_classification.rs");
+include!("tests/runtime_job_predicates.rs");
 include!("tests/decision_validator.rs");
 include!("tests/command_bus.rs");
 include!("tests/worker_lifecycle.rs");
@@ -49,24 +53,35 @@ include!("tests/quality_gate_worker.rs");
 include!("tests/worker_limits.rs");
 include!("tests/durable_store.rs");
 include!("tests/prompt_continuation_store.rs");
+include!("tests/terminal_fence.rs");
+include!("tests/submission_terminal_fence.rs");
 include!("tests/command_dispatcher.rs");
+include!("tests/command_dispatcher_budget.rs");
+include!("tests/completion_budget_ceiling.rs");
 include!("tests/command_store.rs");
 include!("tests/deferred_dispatch.rs");
 include!("tests/deferred_dispatch_review.rs");
+include!("tests/declarative_agent_contract.rs");
 include!("tests/declarative_pinning.rs");
 include!("tests/declarative_validation.rs");
 include!("tests/declarative_interpreter.rs");
 include!("tests/declarative_recovery_integration.rs");
 include!("tests/driverless_progress.rs");
 
+mod eval_cancellation_ack;
+mod evidence;
 mod issue_planning;
 mod local_review;
+mod lock_order_stress;
 mod otel_spans;
 mod p1_followups;
 mod pr_repair_evidence;
+mod provenance_immutability;
 mod remote_host_lease;
+mod remote_host_lease_proof;
 mod replay_determinism;
 mod retry;
 mod runtime_store;
 mod runtime_usage;
+mod terminal_cancellation_ack;
 mod transcript_durability;

@@ -54,6 +54,10 @@ pub const STOP_REASON_RUNTIME_TRANSCRIPT_LOST: &str = "runtime_transcript_lost";
 pub const STOP_REASON_MAINTAINER_INPUT_REQUIRED: &str = "maintainer_input_required";
 /// Stop reason code for structurally invalid agent output (terminal).
 pub const STOP_REASON_INVALID_AGENT_OUTPUT: &str = "invalid_agent_output";
+/// Stop reason code for a workflow that reached its USD budget ceiling
+/// (terminal, GH-1770). Distinct from turn-budget exhaustion: only an
+/// operator unblock or a raised budget resumes the workflow.
+pub const STOP_REASON_BUDGET_EXHAUSTED: &str = "budget_exhausted";
 
 /// The initial transient stop-reason code set. Expanding this table is a
 /// spec/config change, never a runtime inference.
@@ -128,6 +132,7 @@ mod tests {
         for code in [
             STOP_REASON_MAINTAINER_INPUT_REQUIRED,
             STOP_REASON_INVALID_AGENT_OUTPUT,
+            STOP_REASON_BUDGET_EXHAUSTED,
             "some_future_code",
         ] {
             assert_eq!(classify_stop(Some(code), None), StopReasonClass::Terminal);

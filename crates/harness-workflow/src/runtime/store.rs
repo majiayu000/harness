@@ -10,25 +10,41 @@ use super::model::{
 use super::status::WorkflowCommandStatus;
 use super::store_migrations::WORKFLOW_RUNTIME_MIGRATIONS;
 use super::transcript::PendingRuntimeTranscript;
+use super::WorkflowDefinitionRegistry;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use harness_core::db::PgStoreContext;
+use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
+use harness_core::db::{PgMigrator, PgStoreContext};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 #[path = "store/activity_completion.rs"]
 mod activity_completion;
+#[path = "store/activity_completion_dead_letter.rs"]
+mod activity_completion_dead_letter;
+pub use activity_completion_dead_letter::RemoteStaleCompletionOutcome;
+#[path = "store/activity_completion_terminal.rs"]
+mod activity_completion_terminal;
 #[path = "store/artifacts.rs"]
 mod artifacts;
+#[path = "store/child_instance_start.rs"]
+mod child_instance_start;
+#[path = "store/command_attempts.rs"]
+mod command_attempts;
 #[path = "store/command_facade.rs"]
 mod command_facade;
 #[path = "store/commands.rs"]
 mod command_store;
 #[path = "store/coverage_recovery.rs"]
 mod coverage_recovery;
+#[path = "store/decision_provenance.rs"]
+mod decision_provenance;
+#[path = "store/decision_transitions.rs"]
+mod decision_transitions;
 #[path = "store/decisions.rs"]
 mod decisions;
 #[path = "store/definitions.rs"]
@@ -37,22 +53,41 @@ mod definitions;
 mod driverless_progress;
 #[path = "store/events.rs"]
 mod events;
+#[path = "store/evidence.rs"]
+mod evidence;
 #[path = "store/instance_helpers.rs"]
 mod instance_helpers;
 #[path = "store/instances.rs"]
 mod instances;
+#[path = "store/instances_retention.rs"]
+mod instances_retention;
+#[path = "store/lock_order.rs"]
+mod lock_order;
+#[path = "store/lock_order_tests.rs"]
+#[cfg(test)]
+mod lock_order_tests;
+#[path = "store/pr_binding_repair.rs"]
+mod pr_binding_repair;
 #[path = "store/prompt_payloads.rs"]
 mod prompt_payloads;
 #[path = "store/recovery.rs"]
 mod recovery;
 #[path = "store/runtime_completion.rs"]
 mod runtime_completion;
+#[path = "store/runtime_completion_budget.rs"]
+mod runtime_completion_budget;
+#[path = "store/runtime_completion_pr_feedback.rs"]
+mod runtime_completion_pr_feedback;
+#[path = "store/runtime_job_lease_revocation.rs"]
+mod runtime_job_lease_revocation;
 #[path = "store/runtime_job_leases.rs"]
 pub mod runtime_job_leases;
 #[path = "store/runtime_job_queries.rs"]
 mod runtime_job_queries;
 #[path = "store/runtime_job_state.rs"]
 mod runtime_job_state;
+#[path = "store/runtime_job_terminal_fence.rs"]
+mod runtime_job_terminal_fence;
 #[path = "store/runtime_jobs.rs"]
 mod runtime_jobs;
 #[path = "store/runtime_usage.rs"]
@@ -65,32 +100,104 @@ mod submission_instances;
 mod terminal_instance_queries;
 #[path = "store/transaction_helpers.rs"]
 mod transaction_helpers;
+#[path = "store/transition_validation.rs"]
+mod transition_validation;
+pub use child_instance_start::{WorkflowChildStart, WorkflowChildStartOutcome};
+pub use command_facade::DispatchPoolSnapshot;
+pub(in crate::runtime) use command_store::terminal_command_status;
 pub use coverage_recovery::{
     WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
     WorkflowCoverageRecoveryTransition,
 };
+pub(in crate::runtime) use decision_provenance::insert_decision_record_once_tx;
+pub use decision_provenance::DecisionProvenanceConflict;
+pub(in crate::runtime) use definitions::terminal_state_for_instance_tx;
 pub use driverless_progress::{DriverlessProgressInstance, DriverlessProgressProvenanceStatus};
+pub use evidence::{
+    WorkflowRunEvidence, WorkflowRunEvidenceExport, WorkflowRunEvidenceInput,
+    WorkflowRunEvidenceQuery, WORKFLOW_RUN_EVIDENCE_DEFAULT_LIMIT,
+    WORKFLOW_RUN_EVIDENCE_EXPORT_SCHEMA, WORKFLOW_RUN_EVIDENCE_MAX_LIMIT,
+    WORKFLOW_RUN_EVIDENCE_PAYLOAD_MAX_BYTES, WORKFLOW_RUN_EVIDENCE_RETENTION_MAX_BATCH,
+    WORKFLOW_RUN_EVIDENCE_SCHEMA,
+};
+pub use pr_binding_repair::WorkflowPrBindingRepairOutcome;
+pub(in crate::runtime) use prompt_payloads::insert_prompt_payload_tx;
+pub use prompt_payloads::PromptPayloadIntegrityError;
 pub use recovery::{
     WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome, WorkflowRuntimeRecoveryRequest,
 };
+pub use runtime_job_state::{RuntimeJobClaimDeferOutcome, WorkflowCancellationCleanupOutcome};
 pub use runtime_usage::{
-    cost_usd_from_micros, cost_usd_to_micros, RuntimeUsageMetrics, RuntimeUsageRecord,
-    RuntimeUsageUpsert, RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage,
+    cost_usd_from_micros, cost_usd_to_micros, RuntimeAgentTelemetry, RuntimeUsageMetrics,
+    RuntimeUsageRecord, RuntimeUsageUpsert, RuntimeUsageUpsertOutcome, RuntimeWorkflowUsage,
 };
 pub use submission_commit::{
     WorkflowSubmissionDecisionCommit, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload,
 };
 pub use submission_instances::WorkflowSubmissionFilter;
+pub(in crate::runtime) use transaction_helpers::fence_terminal_transition_tx;
+#[cfg(test)]
+use transaction_helpers::force_upsert_lifecycle_state_for_test_tx;
 use transaction_helpers::{
-    apply_inline_command_side_effect, insert_decision_record_tx, insert_event_tx_with_id,
-    insert_instance_if_absent_tx, load_or_insert_initial_instance_tx, runtime_job_for_command_tx,
-    select_instance_for_update_tx, upsert_instance_tx,
+    apply_inline_command_side_effect, commit_decision_instance_tx,
+    commit_parent_attachment_instance_tx, commit_rejected_initial_failure_instance_tx,
+    commit_same_state_instance_tx, insert_event_tx_with_id,
+    insert_validated_canonical_initial_instance_tx, insert_validated_observed_instance_tx,
+    load_or_insert_initial_instance_tx, runtime_job_for_command_tx, select_instance_for_update_tx,
 };
 pub(super) use transaction_helpers::{enum_str, insert_event_tx, to_jsonb_string};
+#[derive(Clone)]
 pub struct WorkflowRuntimeStore {
     pub(super) pool: PgPool,
+    pub(super) definition_registry: Arc<WorkflowDefinitionRegistry>,
+    /// Hard workflow budget ceiling policy (GH-1770 spec §4.4), applied when a
+    /// completed activity commits its decision. Defaults to shadow enforcement
+    /// so a store opened without explicit wiring only records decisions.
+    pub(super) budget_policy: RuntimeBudgetPolicy,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeJobCompletionLease<'a> {
+    pub owner: &'a str,
+    pub expires_at: DateTime<Utc>,
+    pub generation: Option<u64>,
+    pub proof: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentContractAttemptReservation {
+    Reserved,
+    AlreadyReserved,
+    BudgetExhausted,
+    StaleLease,
+}
+
+impl<'a> RuntimeJobCompletionLease<'a> {
+    pub fn local(owner: &'a str, expires_at: DateTime<Utc>) -> Self {
+        Self {
+            owner,
+            expires_at,
+            generation: None,
+            proof: None,
+        }
+    }
+
+    pub fn remote(
+        owner: &'a str,
+        expires_at: DateTime<Utc>,
+        generation: u64,
+        proof: Option<uuid::Uuid>,
+    ) -> Self {
+        Self {
+            owner,
+            expires_at,
+            generation: Some(generation),
+            proof,
+        }
+    }
+}
+const WORKFLOW_RUNTIME_SHARED_POOL_MIGRATIONS_TABLE: &str = "workflow_runtime_schema_migrations";
 pub struct WorkflowInstancePage {
     pub instances: Vec<WorkflowInstance>,
     pub total: i64,
@@ -142,6 +249,8 @@ pub struct WorkflowSubmissionHourlyDone {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowRuntimeStateCount {
     pub definition_id: String,
+    pub definition_version: u32,
+    pub definition_hash: Option<String>,
     pub state: String,
     pub count: usize,
 }
@@ -246,9 +355,27 @@ fn workflow_instance_from_row(
     data: String,
     updated_at: DateTime<Utc>,
 ) -> anyhow::Result<WorkflowInstance> {
-    let mut instance: WorkflowInstance = serde_json::from_str(&data)?;
+    let mut instance = workflow_instance_from_persisted_json(&data)?;
     instance.updated_at = updated_at;
     Ok(instance)
+}
+
+pub(crate) fn workflow_instance_from_persisted_json(
+    data: &str,
+) -> anyhow::Result<WorkflowInstance> {
+    let mut instance: WorkflowInstance = serde_json::from_str(data)?;
+    if instance.data_provenance.is_none() {
+        instance.data_provenance = Some(
+            super::data_provenance::WorkflowDataProvenance::migrated_from_persisted_data(
+                &instance.data,
+            )?,
+        );
+    }
+    Ok(instance)
+}
+
+fn validate_instance_for_persistence(instance: &WorkflowInstance) -> anyhow::Result<()> {
+    instance.validate_data_provenance()
 }
 
 impl WorkflowRuntimeStore {
@@ -263,7 +390,11 @@ impl WorkflowRuntimeStore {
         let pool = context
             .open_migrated_pool(WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            definition_registry: WorkflowDefinitionRegistry::with_builtins().into_shared(),
+            budget_policy: RuntimeBudgetPolicy::default(),
+        })
     }
     pub async fn open_with_database_url_and_schema(
         configured_database_url: Option<&str>,
@@ -273,7 +404,11 @@ impl WorkflowRuntimeStore {
         let pool = context
             .open_migrated_pool(WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            definition_registry: WorkflowDefinitionRegistry::with_builtins().into_shared(),
+            budget_policy: RuntimeBudgetPolicy::default(),
+        })
     }
     pub async fn open_with_context(
         context: &PgStoreContext,
@@ -282,9 +417,115 @@ impl WorkflowRuntimeStore {
         let pool = context
             .open_migrated_pool_with_setup_pool(setup_pool, WORKFLOW_RUNTIME_MIGRATIONS)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            definition_registry: WorkflowDefinitionRegistry::with_builtins().into_shared(),
+            budget_policy: RuntimeBudgetPolicy::default(),
+        })
+    }
+    pub async fn open_with_shared_pool(pool: PgPool) -> anyhow::Result<Self> {
+        PgMigrator::new_with_table(
+            &pool,
+            WORKFLOW_RUNTIME_MIGRATIONS,
+            WORKFLOW_RUNTIME_SHARED_POOL_MIGRATIONS_TABLE,
+        )?
+        .run()
+        .await?;
+        Ok(Self {
+            pool,
+            definition_registry: WorkflowDefinitionRegistry::with_builtins().into_shared(),
+            budget_policy: RuntimeBudgetPolicy::default(),
+        })
+    }
+    /// Wire the runtime budget policy that governs the hard workflow ceiling
+    /// applied when an activity completion commits its decision (GH-1770).
+    pub fn with_budget_policy(mut self, budget_policy: RuntimeBudgetPolicy) -> Self {
+        self.budget_policy = budget_policy;
+        self
+    }
+    /// Inject the immutable definition universe used by this runtime store.
+    /// The handle is built and frozen during startup, before the store is
+    /// shared with workers.
+    pub fn with_definition_registry(
+        mut self,
+        definition_registry: Arc<WorkflowDefinitionRegistry>,
+    ) -> Self {
+        self.definition_registry = definition_registry;
+        self
+    }
+    pub fn definition_registry(&self) -> &WorkflowDefinitionRegistry {
+        &self.definition_registry
+    }
+    /// The wired budget policy, so mid-turn enforcement (the GH-1770 §4.3
+    /// turn-stream watchdog) applies the same ceiling as the dispatch gate and
+    /// the completion ceiling instead of re-reading config.
+    pub fn budget_policy(&self) -> &RuntimeBudgetPolicy {
+        &self.budget_policy
     }
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+}
+
+#[cfg(test)]
+#[path = "store/identity_migration_tests.rs"]
+mod identity_migration_tests;
+
+#[cfg(test)]
+mod persistence_provenance_tests {
+    use super::*;
+    use crate::runtime::{DataProvenance, WorkflowSubject};
+
+    fn instance() -> WorkflowInstance {
+        WorkflowInstance::new(
+            "provenance-test",
+            1,
+            "active",
+            WorkflowSubject::new("test", "provenance-test"),
+        )
+    }
+
+    #[test]
+    fn only_persisted_rows_without_a_sidecar_cross_the_legacy_boundary() {
+        let mut value = serde_json::to_value(instance()).expect("serialize instance");
+        value["data"] = json!({"historical_summary": "legacy"});
+        value
+            .as_object_mut()
+            .expect("instance is an object")
+            .remove("data_provenance");
+
+        let loaded = workflow_instance_from_persisted_json(
+            &serde_json::to_string(&value).expect("serialize persisted row"),
+        )
+        .expect("persisted legacy row should migrate");
+
+        assert!(loaded
+            .data_provenance
+            .as_ref()
+            .is_some_and(|sidecar| sidecar.is_legacy("/historical_summary")));
+        validate_instance_for_persistence(&loaded)
+            .expect("migrated legacy row should be persistable");
+
+        let mut unpersisted = instance();
+        unpersisted.data = json!({"historical_summary": "not persisted"});
+        let error = validate_instance_for_persistence(&unpersisted)
+            .expect_err("new unclassified data must fail closed");
+        assert!(error
+            .to_string()
+            .contains("unclassified workflow.data field"));
+    }
+
+    #[test]
+    fn central_persistence_rejects_raw_overwrite_of_a_classified_value() {
+        let mut instance = instance()
+            .with_classified_data(json!({"server_fact": "verified"}), DataProvenance::Server);
+        instance.data["server_fact"] = json!("tampered");
+
+        let error = validate_instance_for_persistence(&instance)
+            .expect_err("raw mutation must not survive the persistence boundary");
+
+        assert!(error
+            .to_string()
+            .contains("changed outside the classified write API"));
     }
 }

@@ -1,7 +1,7 @@
 use super::status;
 use anyhow::{bail, Context as _, Result};
 use harness_core::config::HarnessConfig;
-use harness_server::reconciliation::ReconciliationReport;
+use harness_protocol::rest::ReconciliationReport;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -94,23 +94,17 @@ fn render_report(report: &ReconciliationReport, dry_run: bool) -> String {
     }
 
     for transition in &report.transitions {
-        let applied = if transition.applied {
-            "applied"
-        } else {
-            "dry-run"
-        };
         output.push_str(&format!(
             "  {} → {} ({}) [{}]\n",
-            transition.from, transition.to, transition.reason, applied
+            transition.from,
+            transition.to,
+            transition.reason,
+            transition_label(transition.applied, dry_run)
         ));
     }
 
     for transition in &report.workflow_transitions {
-        let applied = if transition.applied {
-            "applied"
-        } else {
-            "dry-run"
-        };
+        let applied = transition_label(transition.applied, dry_run);
         let repo = transition.repo.as_deref().unwrap_or("<unknown>");
         let target = transition
             .pr_number
@@ -160,10 +154,20 @@ fn render_report(report: &ReconciliationReport, dry_run: bool) -> String {
     output
 }
 
+fn transition_label(applied: bool, dry_run: bool) -> &'static str {
+    if dry_run {
+        "dry-run"
+    } else if applied {
+        "applied"
+    } else {
+        "failed"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_server::reconciliation::{
+    use harness_protocol::rest::{
         ReconciliationTransition, WorkflowReconciliationAlert, WorkflowReconciliationTransition,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -242,10 +246,22 @@ mod tests {
         assert!(applied.contains("1 transition(s) applied"));
         assert!(applied.contains("pending → completed (merged) [applied]"));
         assert!(applied.contains("workflow workflow-1 owner/repo#42"));
+        assert!(applied.contains("review → done (merged) [failed]"));
         assert!(applied.contains("workflow alert workflow-2"));
+        assert!(!applied.contains("[dry-run]"));
 
         let dry_run = render_report(&report, true);
         assert!(dry_run.contains("1 task transition(s), 1 workflow transition(s)"));
+        assert!(dry_run.contains("[dry-run]"));
+        assert!(!dry_run.contains("[failed]"));
+    }
+
+    #[test]
+    fn transition_label_uses_dry_run_and_applied() {
+        assert_eq!(transition_label(true, true), "dry-run");
+        assert_eq!(transition_label(false, true), "dry-run");
+        assert_eq!(transition_label(true, false), "applied");
+        assert_eq!(transition_label(false, false), "failed");
     }
 
     fn sample_report() -> ReconciliationReport {

@@ -43,7 +43,26 @@ fn base_args_uses_request_reasoning_effort_sandbox_and_approval_policy() {
         .windows(2)
         .any(|window| window == ["-c", "approval_policy=\"on-request\""]));
     assert!(!args.iter().any(|arg| arg == "-a"));
+    assert_eq!(args.get(args.len() - 2).map(String::as_str), Some("--"));
     assert_eq!(args.last().map(String::as_str), Some("ping"));
+}
+
+#[test]
+fn base_args_terminate_prompt_so_dash_prompts_are_not_flags() {
+    let agent = CodexAgent::new(PathBuf::from("codex"), SandboxMode::DangerFullAccess);
+    let request = AgentRequest {
+        prompt: "-looks-like-flag".to_string(),
+        project_root: PathBuf::from("/tmp/project"),
+        ..Default::default()
+    };
+
+    let args: Vec<String> = agent
+        .base_args(&request)
+        .iter()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect();
+    let terminator = args.iter().position(|arg| arg == "--").expect("--");
+    assert_eq!(args[terminator + 1], "-looks-like-flag");
 }
 
 #[test]
@@ -146,4 +165,5 @@ fn deny_all_allowed_tools_keeps_configured_sandbox_mode() {
     assert!(args
         .windows(2)
         .any(|window| window == ["-s", "danger-full-access"]));
+    assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
 }

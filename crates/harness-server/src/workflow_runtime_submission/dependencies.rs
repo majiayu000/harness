@@ -28,6 +28,9 @@ pub(crate) struct DependencyReleaseSummary {
     pub failed: usize,
     pub waiting: usize,
     pub skipped: usize,
+    /// Issues failed because their dependency chain forms a cycle that can
+    /// never self-resolve (GH-1885).
+    pub deadlocked: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,20 +65,17 @@ async fn resolve_issue_dependency_status_by_exact_id(
         .map(Some)
 }
 
-async fn resolve_issue_dependency_status_for_instance(
+/// Resolve a dependency task id to its workflow instance: exact task-id
+/// match first, then the canonical `github-issue:<repo>:issue:<n>` mapping.
+async fn resolve_issue_dependency_instance(
     store: &WorkflowRuntimeStore,
     waiting_instance: &WorkflowInstance,
     task_id: &TaskId,
-) -> anyhow::Result<RuntimeDependencyStatus> {
-    if let Some(status) = resolve_issue_dependency_status_by_exact_id(Some(store), task_id).await? {
-        return Ok(status);
+) -> anyhow::Result<Option<WorkflowInstance>> {
+    if let Some(instance) = store.get_instance_by_task_id(task_id.as_str()).await? {
+        return Ok(Some(instance));
     }
-    let Some(instance) =
-        canonical_github_issue_dependency_instance(store, waiting_instance, task_id).await?
-    else {
-        return Ok(RuntimeDependencyStatus::Waiting);
-    };
-    runtime_dependency_status_from_instance(store, &instance).await
+    canonical_github_issue_dependency_instance(store, waiting_instance, task_id).await
 }
 
 async fn runtime_dependency_status_from_instance(
@@ -147,12 +147,17 @@ async fn canonical_github_issue_dependency_instance(
         .data
         .get("repo")
         .and_then(serde_json::Value::as_str);
-    if dependency_repo != repo.unwrap_or("<none>") {
+    if !repo.is_some_and(|repo| dependency_repo.eq_ignore_ascii_case(repo)) {
         return Ok(None);
     }
-    let workflow_id =
-        harness_workflow::issue_lifecycle::workflow_id(project_id, repo, issue_number);
-    store.get_instance(&workflow_id).await
+    store
+        .get_instance_by_issue(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            project_id,
+            Some(dependency_repo),
+            issue_number,
+        )
+        .await
 }
 
 fn parse_github_issue_dependency(task_id: &str) -> Option<(&str, u64)> {
@@ -176,6 +181,12 @@ pub(crate) async fn release_ready_issue_dependencies(
         )
         .await?;
     let mut summary = DependencyReleaseSummary::default();
+    // Waiting instances and the edges between them, for cycle detection
+    // (GH-1885): edge A -> B when A waits on B and B is itself awaiting
+    // dependencies. A cycle in this subgraph can never self-resolve.
+    let mut waiting_instances: Vec<WorkflowInstance> = Vec::new();
+    let mut waiting_edges: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for instance in instances {
         let depends_on = match task_ids_from_data(&instance.data, "depends_on") {
             Ok(depends_on) => depends_on,
@@ -192,7 +203,12 @@ pub(crate) async fn release_ready_issue_dependencies(
         let mut all_done = true;
         let mut terminal_failure: Option<(TaskId, &'static str)> = None;
         for dep_id in &depends_on {
-            match resolve_issue_dependency_status_for_instance(store, &instance, dep_id).await? {
+            let dep_instance = resolve_issue_dependency_instance(store, &instance, dep_id).await?;
+            let status = match dep_instance.as_ref() {
+                Some(dep) => runtime_dependency_status_from_instance(store, dep).await?,
+                None => RuntimeDependencyStatus::Waiting,
+            };
+            match status {
                 RuntimeDependencyStatus::Done => {}
                 RuntimeDependencyStatus::Failed => {
                     terminal_failure = Some((dep_id.clone(), "failed"));
@@ -202,7 +218,17 @@ pub(crate) async fn release_ready_issue_dependencies(
                     terminal_failure = Some((dep_id.clone(), "cancelled"));
                     break;
                 }
-                RuntimeDependencyStatus::Waiting => all_done = false,
+                RuntimeDependencyStatus::Waiting => {
+                    all_done = false;
+                    if let Some(dep) = dep_instance {
+                        if dep.state == "awaiting_dependencies" {
+                            waiting_edges
+                                .entry(instance.id.clone())
+                                .or_default()
+                                .push(dep.id.clone());
+                        }
+                    }
+                }
             }
         }
         if let Some((dep_id, label)) = terminal_failure {
@@ -213,10 +239,130 @@ pub(crate) async fn release_ready_issue_dependencies(
             summary.released += 1;
         } else {
             store.touch_instance(&instance.id).await?;
+            waiting_instances.push(instance);
+        }
+    }
+    let deadlocked = find_dependency_cycle_members(&waiting_edges);
+    for instance in waiting_instances {
+        if deadlocked.contains(&instance.id) {
+            let cycle: Vec<&str> = deadlocked.iter().map(String::as_str).collect();
+            fail_issue_for_dependency_cycle(store, instance, &cycle).await?;
+            summary.deadlocked += 1;
+        } else {
             summary.waiting += 1;
         }
     }
     Ok(summary)
+}
+
+/// Workflow ids that sit on a dependency cycle among mutually-waiting
+/// instances. Downstream waiters that merely point *into* a cycle are left
+/// alone: once cycle members fail, the existing terminal-dependency path
+/// fails them on the next tick with precise evidence.
+fn find_dependency_cycle_members(
+    edges: &std::collections::BTreeMap<String, Vec<String>>,
+) -> std::collections::BTreeSet<String> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+    let mut color: std::collections::BTreeMap<&str, Color> = edges
+        .iter()
+        .flat_map(|(node, targets)| {
+            std::iter::once(node.as_str()).chain(targets.iter().map(String::as_str))
+        })
+        .map(|node| (node, Color::White))
+        .collect();
+    let mut members = std::collections::BTreeSet::new();
+
+    fn visit<'a>(
+        node: &'a str,
+        edges: &'a std::collections::BTreeMap<String, Vec<String>>,
+        color: &mut std::collections::BTreeMap<&'a str, Color>,
+        stack: &mut Vec<&'a str>,
+        members: &mut std::collections::BTreeSet<String>,
+    ) {
+        color.insert(node, Color::Gray);
+        stack.push(node);
+        for target in edges.get(node).map(Vec::as_slice).unwrap_or_default() {
+            match color.get(target.as_str()).copied().unwrap_or(Color::White) {
+                Color::White => visit(target, edges, color, stack, members),
+                Color::Gray => {
+                    // Back edge: everything on the stack from `target` up is
+                    // on a cycle.
+                    if let Some(start) = stack.iter().position(|frame| *frame == target) {
+                        for frame in &stack[start..] {
+                            members.insert((*frame).to_string());
+                        }
+                    }
+                }
+                Color::Black => {}
+            }
+        }
+        stack.pop();
+        color.insert(node, Color::Black);
+    }
+
+    let nodes: Vec<&str> = color.keys().copied().collect();
+    for node in nodes {
+        if color.get(node).copied() == Some(Color::White) {
+            let mut stack = Vec::new();
+            visit(node, edges, &mut color, &mut stack, &mut members);
+        }
+    }
+    members
+}
+
+/// Fail an issue whose dependency chain forms a cycle (GH-1885). Cycles are
+/// configuration errors that can never self-resolve; failing loudly with
+/// evidence beats idling forever, and `failed -> scheduled` recovery edges
+/// plus force-execute remain available to the operator.
+async fn fail_issue_for_dependency_cycle(
+    store: &WorkflowRuntimeStore,
+    instance: WorkflowInstance,
+    cycle_members: &[&str],
+) -> anyhow::Result<()> {
+    let event_payload = json!({
+        "dependency_cycle_members": cycle_members,
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
+    let decision = WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "dependency_cycle",
+        "failed",
+        format!(
+            "issue dependency chain deadlocked: {} mutually-waiting workflows form a cycle ({})",
+            cycle_members.len(),
+            cycle_members.join(" -> ")
+        ),
+    )
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::MarkFailed,
+        format!("issue-submit:{}:dependency-cycle", instance.id),
+        json!({
+            "dependency_cycle_members": cycle_members,
+        }),
+    ))
+    .high_confidence();
+    let data = set_data_string(
+        instance.data.clone(),
+        "dependency_failure_status",
+        "dependency_cycle",
+    );
+    commit_runtime_decision(
+        store,
+        instance,
+        decision,
+        "IssueDependencyCycleDetected",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn release_ready_prompt_dependencies(
@@ -327,25 +473,27 @@ async fn release_issue_after_dependencies(
             candidate_fanout: fields.candidate_fanout,
         },
     );
-    let event = store
-        .append_event(
-            &instance.id,
-            "IssueDependenciesSatisfied",
-            "workflow_runtime_submission",
-            json!({
-                "task_id": fields.task_id,
-                "repo": fields.repo,
-                "issue_number": fields.issue_number,
-                "depends_on": depends_on_strings(depends_on),
-                "tracker_source": fields.tracker_source,
-                "tracker_external_id": fields.tracker_external_id,
-                "author_trust_class": fields.author_trust_class,
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": fields.task_id,
+        "repo": fields.repo,
+        "issue_number": fields.issue_number,
+        "depends_on": depends_on_strings(depends_on),
+        "tracker_source": fields.tracker_source,
+        "tracker_external_id": fields.tracker_external_id,
+        "author_trust_class": fields.author_trust_class,
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let data = set_data_bool(instance.data.clone(), "dependencies_blocked", false);
-    commit_runtime_decision(store, instance, output.decision, event.id, Some(data)).await?;
+    commit_runtime_decision(
+        store,
+        instance,
+        output.decision,
+        "IssueDependenciesSatisfied",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
     Ok(())
 }
 
@@ -355,18 +503,11 @@ async fn fail_issue_for_dependency(
     dependency_id: &TaskId,
     dependency_status: &str,
 ) -> anyhow::Result<()> {
-    let event = store
-        .append_event(
-            &instance.id,
-            "IssueDependencyFailed",
-            "workflow_runtime_submission",
-            json!({
-                "dependency_task_id": dependency_id.as_str(),
-                "dependency_status": dependency_status,
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "dependency_task_id": dependency_id.as_str(),
+        "dependency_status": dependency_status,
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -396,7 +537,16 @@ async fn fail_issue_for_dependency(
         "dependency_failure_status",
         dependency_status,
     );
-    commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
+    commit_runtime_decision(
+        store,
+        instance,
+        decision,
+        "IssueDependencyFailed",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
     Ok(())
 }
 
@@ -424,20 +574,22 @@ async fn release_prompt_after_dependencies(
             continuation: fields.continuation.as_ref(),
         },
     )?;
-    let event = store
-        .append_event(
-            &instance.id,
-            "PromptDependenciesSatisfied",
-            "workflow_runtime_submission",
-            json!({
-                "task_id": fields.task_id,
-                "depends_on": depends_on_strings(depends_on),
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": fields.task_id,
+        "depends_on": depends_on_strings(depends_on),
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let data = set_data_bool(instance.data.clone(), "dependencies_blocked", false);
-    commit_runtime_decision(store, instance, output.decision, event.id, Some(data)).await?;
+    commit_runtime_decision(
+        store,
+        instance,
+        output.decision,
+        "PromptDependenciesSatisfied",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
     Ok(PromptDependencyReleaseOutcome::Released)
 }
 
@@ -448,18 +600,11 @@ async fn fail_prompt_for_dependency(
     dependency_status: &str,
 ) -> anyhow::Result<()> {
     let prompt_ref = optional_string_field(&instance.data, "prompt_ref");
-    let event = store
-        .append_event(
-            &instance.id,
-            "PromptDependencyFailed",
-            "workflow_runtime_submission",
-            json!({
-                "dependency_task_id": dependency_id.as_str(),
-                "dependency_status": dependency_status,
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "dependency_task_id": dependency_id.as_str(),
+        "dependency_status": dependency_status,
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -489,7 +634,16 @@ async fn fail_prompt_for_dependency(
         "dependency_failure_status",
         dependency_status,
     );
-    commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
+    commit_runtime_decision(
+        store,
+        instance,
+        decision,
+        "PromptDependencyFailed",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
     remove_prompt_submission_prompt_durable(store, prompt_ref.as_deref()).await?;
     Ok(())
 }
@@ -499,18 +653,11 @@ async fn fail_prompt_for_missing_prompt(
     instance: WorkflowInstance,
     fields: &super::PromptSubmissionFields,
 ) -> anyhow::Result<()> {
-    let event = store
-        .append_event(
-            &instance.id,
-            "PromptSubmissionPromptMissing",
-            "workflow_runtime_submission",
-            json!({
-                "task_id": fields.task_id.as_str(),
-                "prompt_ref": fields.prompt_ref.as_str(),
-                "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
-            }),
-        )
-        .await?;
+    let event_payload = json!({
+        "task_id": fields.task_id.as_str(),
+        "prompt_ref": fields.prompt_ref.as_str(),
+        "execution_path": super::EXECUTION_PATH_WORKFLOW_RUNTIME,
+    });
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -532,6 +679,80 @@ async fn fail_prompt_for_missing_prompt(
         "failure_reason",
         "prompt unavailable",
     );
-    commit_runtime_decision(store, instance, decision, event.id, Some(data)).await?;
+    commit_runtime_decision(
+        store,
+        instance,
+        decision,
+        "PromptSubmissionPromptMissing",
+        "workflow_runtime_submission",
+        event_payload,
+        Some(data),
+    )
+    .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cycle_tests {
+    use super::find_dependency_cycle_members;
+    use std::collections::BTreeMap;
+
+    fn edges(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(node, targets)| {
+                (
+                    node.to_string(),
+                    targets.iter().map(|target| target.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_node_cycle_is_detected() {
+        let members = find_dependency_cycle_members(&edges(&[("a", &["b"]), ("b", &["a"])]));
+        assert_eq!(
+            members.into_iter().collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn chain_without_cycle_is_empty() {
+        let members =
+            find_dependency_cycle_members(&edges(&[("a", &["b"]), ("b", &["c"]), ("c", &[])]));
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn waiter_pointing_into_cycle_is_not_a_member() {
+        // d waits on the a<->b cycle but is not on it; it fails via the
+        // terminal-dependency path once the cycle members fail.
+        let members =
+            find_dependency_cycle_members(&edges(&[("a", &["b"]), ("b", &["a"]), ("d", &["a"])]));
+        assert!(members.contains("a"));
+        assert!(members.contains("b"));
+        assert!(!members.contains("d"));
+    }
+
+    #[test]
+    fn self_dependency_is_a_cycle() {
+        let members = find_dependency_cycle_members(&edges(&[("a", &["a"])]));
+        assert!(members.contains("a"));
+    }
+
+    #[test]
+    fn disjoint_cycles_are_all_detected() {
+        let members = find_dependency_cycle_members(&edges(&[
+            ("a", &["b"]),
+            ("b", &["a"]),
+            ("x", &["y"]),
+            ("y", &["z"]),
+            ("z", &["x"]),
+            ("lone", &[]),
+        ]));
+        assert_eq!(members.len(), 5);
+        assert!(!members.contains("lone"));
+    }
 }

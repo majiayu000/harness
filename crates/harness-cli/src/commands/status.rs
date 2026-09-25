@@ -81,12 +81,6 @@ pub(crate) fn resolve_api_token(config: &HarnessConfig) -> Option<String> {
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_owned)
-        .or_else(|| {
-            std::env::var("HARNESS_API_TOKEN")
-                .ok()
-                .map(|token| token.trim().to_string())
-                .filter(|token| !token.is_empty())
-        })
 }
 
 pub(crate) fn server_base_url(

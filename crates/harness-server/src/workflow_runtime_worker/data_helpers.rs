@@ -1,7 +1,8 @@
 use anyhow::Context;
 use harness_core::types::TaskId;
 use harness_workflow::runtime::{
-    RuntimeJob, WorkflowInstance, WorkflowRuntimeStore, PROMPT_TASK_IMPLEMENT_ACTIVITY,
+    DataProvenance, RuntimeJob, WorkflowDataWrite, WorkflowInstance, WorkflowRuntimeStore,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -61,6 +62,65 @@ pub(super) fn string_vec(value: &Value, field: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+pub(super) fn optional_string_vec_strict(
+    value: &Value,
+    field: &str,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(raw_values) = value.get(field) else {
+        return Ok(None);
+    };
+    let values = raw_values
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("`{field}` must be an array of strings"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("`{field}[{index}]` must be a string"))?;
+            if value.trim().is_empty() {
+                anyhow::bail!("`{field}[{index}]` must not be empty");
+            }
+            Ok(value.to_string())
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
+}
+
+pub(super) fn optional_string_matrix_strict(
+    value: &Value,
+    field: &str,
+) -> anyhow::Result<Option<Vec<Vec<String>>>> {
+    let Some(raw_commands) = value.get(field) else {
+        return Ok(None);
+    };
+    let commands = raw_commands
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("`{field}` must be an array of argv arrays"))?;
+    let parsed = commands
+        .iter()
+        .enumerate()
+        .map(|(command_index, command)| {
+            let arguments = command.as_array().ok_or_else(|| {
+                anyhow::anyhow!("`{field}[{command_index}]` must be an argv array")
+            })?;
+            arguments
+                .iter()
+                .enumerate()
+                .map(|(argument_index, argument)| {
+                    argument.as_str().map(str::to_string).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`{field}[{command_index}][{argument_index}]` must be a string"
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Some(parsed))
 }
 
 pub(super) fn dependency_task_ids_from_command(
@@ -196,27 +256,40 @@ pub(super) fn parse_pr_subject_key(subject_key: &str) -> Option<u64> {
 }
 
 pub(super) fn merge_child_issue_data(
-    mut data: Value,
+    child: &mut WorkflowInstance,
     project_id: &str,
     repo: Option<&str>,
     issue_number: u64,
     runtime_job_id: &str,
     command_id: &str,
-) -> Value {
-    if !data.is_object() {
-        data = json!({});
-    }
-    if let Some(object) = data.as_object_mut() {
-        object.insert("project_id".to_string(), json!(project_id));
-        object.insert("repo".to_string(), json!(repo));
-        object.insert("issue_number".to_string(), json!(issue_number));
-        object.insert(
-            "started_by_runtime_job_id".to_string(),
+) -> anyhow::Result<()> {
+    let mut writes = vec![
+        WorkflowDataWrite::set("project_id", json!(project_id), DataProvenance::Server),
+        WorkflowDataWrite::set("repo", json!(repo), DataProvenance::Server),
+        WorkflowDataWrite::set("issue_number", json!(issue_number), DataProvenance::Server),
+        WorkflowDataWrite::set(
+            "started_by_runtime_job_id",
             json!(runtime_job_id),
-        );
-        object.insert("started_by_command_id".to_string(), json!(command_id));
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
+            "started_by_command_id",
+            json!(command_id),
+            DataProvenance::Server,
+        ),
+    ];
+    let merged = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        Path::new(project_id),
+        child.data.clone(),
+    );
+    if let Some(policy) = merged.get("runtime_retry_policy") {
+        writes.push(WorkflowDataWrite::set(
+            "runtime_retry_policy",
+            policy.clone(),
+            DataProvenance::Server,
+        ));
     }
-    crate::workflow_runtime_policy::merge_runtime_retry_policy(Path::new(project_id), data)
+    child.apply_data_writes(writes)
 }
 
 pub(super) struct PrFeedbackChildData<'a> {
@@ -225,47 +298,87 @@ pub(super) struct PrFeedbackChildData<'a> {
     pub issue_number: Option<u64>,
     pub pr_number: u64,
     pub pr_url: Option<&'a str>,
+    pub expected_base_ref: Option<&'a str>,
     pub parent_workflow_id: &'a str,
     pub runtime_job_id: &'a str,
     pub command_id: &'a str,
+    pub remote_fact_hash: Option<&'a str>,
+    pub remote_fact_activity_at: Option<&'a str>,
+    pub eval: Option<&'a Value>,
 }
 
 pub(super) fn merge_pr_feedback_child_data(
-    mut data: Value,
+    child: &mut WorkflowInstance,
     input: PrFeedbackChildData<'_>,
-) -> Value {
-    if !data.is_object() {
-        data = json!({});
-    }
-    if let Some(object) = data.as_object_mut() {
-        object.insert("project_id".to_string(), json!(input.project_id));
-        object.insert("repo".to_string(), json!(input.repo));
-        object.insert("issue_number".to_string(), json!(input.issue_number));
-        object.insert("pr_number".to_string(), json!(input.pr_number));
-        object.insert("pr_url".to_string(), json!(input.pr_url));
-        object.insert(
-            "parent_workflow_id".to_string(),
+) -> anyhow::Result<()> {
+    let mut writes = vec![
+        WorkflowDataWrite::set(
+            "project_id",
+            json!(input.project_id),
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set("repo", json!(input.repo), DataProvenance::Server),
+        WorkflowDataWrite::set(
+            "issue_number",
+            json!(input.issue_number),
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set("pr_number", json!(input.pr_number), DataProvenance::Server),
+        WorkflowDataWrite::set("pr_url", json!(input.pr_url), DataProvenance::Agent),
+        // Base ref and remote activity time are observed on the remote, so
+        // they stay externally classified. The fact hash is the digest
+        // Harness itself computes over those observations, so it is server
+        // data about external data, not external data.
+        WorkflowDataWrite::set(
+            "expected_base_ref",
+            json!(input.expected_base_ref),
+            DataProvenance::External,
+        ),
+        WorkflowDataWrite::set(
+            "remote_fact_hash",
+            json!(input.remote_fact_hash),
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
+            "remote_fact_activity_at",
+            json!(input.remote_fact_activity_at),
+            DataProvenance::External,
+        ),
+        WorkflowDataWrite::set(
+            "parent_workflow_id",
             json!(input.parent_workflow_id),
-        );
-        object.insert(
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
             "started_by_runtime_job_id".to_string(),
             json!(input.runtime_job_id),
-        );
-        object.insert("started_by_command_id".to_string(), json!(input.command_id));
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
+            "started_by_command_id",
+            json!(input.command_id),
+            DataProvenance::Server,
+        ),
+    ];
+    if let Some(eval) = input.eval {
+        writes.push(WorkflowDataWrite::set(
+            "eval",
+            eval.clone(),
+            DataProvenance::Server,
+        ));
     }
-    crate::workflow_runtime_policy::merge_runtime_retry_policy(Path::new(input.project_id), data)
-}
-
-pub(super) fn merge_json_object(target: &mut Value, update: Value) {
-    let Some(target_object) = target.as_object_mut() else {
-        return;
-    };
-    let Some(update_object) = update.as_object() else {
-        return;
-    };
-    for (key, value) in update_object {
-        target_object.insert(key.clone(), value.clone());
+    let merged = crate::workflow_runtime_policy::merge_runtime_retry_policy(
+        Path::new(input.project_id),
+        child.data.clone(),
+    );
+    if let Some(policy) = merged.get("runtime_retry_policy") {
+        writes.push(WorkflowDataWrite::set(
+            "runtime_retry_policy",
+            policy.clone(),
+            DataProvenance::Server,
+        ));
     }
+    child.apply_data_writes(writes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,13 +401,11 @@ pub(super) async fn prompt_task_request_for_job(
     job: &RuntimeJob,
     store: Option<&WorkflowRuntimeStore>,
 ) -> anyhow::Result<PromptTaskRequest> {
-    if activity_name(job) != PROMPT_TASK_IMPLEMENT_ACTIVITY {
+    let prompt_ref = job.input.pointer("/command/prompt_ref");
+    if activity_name(job) != PROMPT_TASK_IMPLEMENT_ACTIVITY && prompt_ref.is_none() {
         return Ok(PromptTaskRequest::NotPromptActivity);
     }
-    let Some(prompt_ref) = job
-        .input
-        .get("command")
-        .and_then(|command| command.get("prompt_ref"))
+    let Some(prompt_ref) = prompt_ref
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
     else {
@@ -392,42 +503,102 @@ mod tests {
         assert_eq!(activity_name(&job), "start_child_workflow");
     }
 
+    #[test]
+    fn pr_feedback_child_data_preserves_remote_fact_metadata() {
+        let mut child = WorkflowInstance::new(
+            "pr_feedback",
+            1,
+            "inspecting",
+            harness_workflow::runtime::WorkflowSubject::new("pr", "pr:77"),
+        );
+        merge_pr_feedback_child_data(
+            &mut child,
+            PrFeedbackChildData {
+                project_id: "/project",
+                repo: Some("owner/repo"),
+                issue_number: Some(123),
+                pr_number: 77,
+                pr_url: Some("https://github.com/owner/repo/pull/77"),
+                expected_base_ref: Some("release"),
+                parent_workflow_id: "parent",
+                runtime_job_id: "runtime-job",
+                command_id: "command",
+                remote_fact_hash: Some("sha256:fact"),
+                remote_fact_activity_at: Some("2026-06-10T00:00:00Z"),
+                eval: None,
+            },
+        )
+        .expect("classified child data write");
+        assert_eq!(child.data["remote_fact_hash"], "sha256:fact");
+        assert_eq!(
+            child.data["remote_fact_activity_at"],
+            "2026-06-10T00:00:00Z"
+        );
+        assert_eq!(child.data["expected_base_ref"], "release");
+
+        // The remote-observed fields must not be laundered into server data by
+        // passing through a server-side merge helper.
+        let provenance = child
+            .data_provenance
+            .as_ref()
+            .expect("merged child data carries a provenance sidecar");
+        assert_eq!(
+            provenance.provenance_for("/expected_base_ref"),
+            Some(DataProvenance::External)
+        );
+        assert_eq!(
+            provenance.provenance_for("/remote_fact_activity_at"),
+            Some(DataProvenance::External)
+        );
+        assert_eq!(
+            provenance.provenance_for("/remote_fact_hash"),
+            Some(DataProvenance::Server)
+        );
+        assert_eq!(
+            provenance.provenance_for("/repo"),
+            Some(DataProvenance::Server)
+        );
+        child
+            .validate_data_provenance()
+            .expect("merged child data is persistable");
+    }
+
     #[tokio::test]
     async fn prompt_task_request_blocks_when_cached_payload_is_unavailable() -> anyhow::Result<()> {
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({
-                "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
-                "command": {
-                    "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
-                    "prompt_ref": "prompt-submission:cache-miss-test"
+        for activity in [PROMPT_TASK_IMPLEMENT_ACTIVITY, "inspect_repository"] {
+            let job = RuntimeJob::pending(
+                "command-1",
+                RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                json!({
+                    "activity": activity,
+                    "command": {
+                        "activity": activity,
+                        "prompt_ref": "prompt-submission:cache-miss-test"
+                    }
+                }),
+            );
+
+            let request = prompt_task_request_for_job(&job, None).await?;
+            assert_eq!(
+                request,
+                PromptTaskRequest::PayloadUnavailable {
+                    prompt_ref: "prompt-submission:cache-miss-test".to_string()
                 }
-            }),
-        );
+            );
 
-        let request = prompt_task_request_for_job(&job, None).await?;
-        assert_eq!(
-            request,
-            PromptTaskRequest::PayloadUnavailable {
-                prompt_ref: "prompt-submission:cache-miss-test".to_string()
-            }
-        );
-
-        let result = prompt_payload_unavailable_result(&job, "prompt-submission:cache-miss-test");
-        assert_eq!(result.status, ActivityStatus::Blocked);
-        assert_eq!(result.activity, PROMPT_TASK_IMPLEMENT_ACTIVITY);
-        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("only held in the current Harness process"));
-        assert_eq!(
-            result.artifacts[0].artifact_type,
-            "prompt_payload_unavailable"
-        );
+            let result =
+                prompt_payload_unavailable_result(&job, "prompt-submission:cache-miss-test");
+            assert_eq!(result.status, ActivityStatus::Blocked);
+            assert_eq!(result.activity, activity);
+            assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+            let error = result.error.expect("missing prompt must report an error");
+            assert!(error.contains("only held in the current Harness process"));
+            assert_eq!(
+                result.artifacts[0].artifact_type,
+                "prompt_payload_unavailable"
+            );
+        }
         Ok(())
     }
 
@@ -452,6 +623,7 @@ mod tests {
             &store,
             crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
                 project_root: &project_root,
+                repo: None,
                 task_id: &task_id,
                 prompt: "restart safe prompt",
                 depends_on: &[],
@@ -470,33 +642,35 @@ mod tests {
         let prompt_ref = workflow.data["prompt_ref"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("prompt ref should be persisted"))?;
-        crate::workflow_runtime_submission::clear_prompt_submission_prompt_cache_for_test(
-            prompt_ref,
-        );
-        let job = RuntimeJob::pending(
-            "command-1",
-            RuntimeKind::CodexJsonrpc,
-            "codex-default",
-            json!({
-                "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
-                "command": {
-                    "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
-                    "prompt_ref": prompt_ref
-                }
-            }),
-        );
+        for activity in [PROMPT_TASK_IMPLEMENT_ACTIVITY, "inspect_repository"] {
+            crate::workflow_runtime_submission::clear_prompt_submission_prompt_cache_for_test(
+                prompt_ref,
+            );
+            let job = RuntimeJob::pending(
+                "command-1",
+                RuntimeKind::CodexJsonrpc,
+                "codex-default",
+                json!({
+                    "activity": activity,
+                    "command": {
+                        "activity": activity,
+                        "prompt_ref": prompt_ref
+                    }
+                }),
+            );
 
-        let request = prompt_task_request_for_job(&job, Some(&store)).await?;
+            let request = prompt_task_request_for_job(&job, Some(&store)).await?;
 
-        assert_eq!(
-            request,
-            PromptTaskRequest::Ready("restart safe prompt".to_string())
-        );
-        assert_eq!(
-            crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref)
-                .as_deref(),
-            Some("restart safe prompt")
-        );
+            assert_eq!(
+                request,
+                PromptTaskRequest::Ready("restart safe prompt".to_string())
+            );
+            assert_eq!(
+                crate::workflow_runtime_submission::lookup_prompt_submission_prompt(prompt_ref)
+                    .as_deref(),
+                Some("restart safe prompt")
+            );
+        }
         Ok(())
     }
 
@@ -621,7 +795,6 @@ mod tests {
         );
 
         let task_id = issue_task_id_from_command(&command, &job, Some("owner/repo"), 42);
-
         assert_eq!(task_id.as_str(), "prompt-task:owner/repo:issue:42");
         assert_eq!(
             issue_task_prefix_from_task_id(&task_id, 42).as_deref(),

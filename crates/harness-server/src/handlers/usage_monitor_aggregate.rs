@@ -9,6 +9,7 @@ pub(super) struct UsageAggregate {
     pub(super) output_tokens: u64,
     pub(super) cache_read_input_tokens: u64,
     pub(super) cache_creation_input_tokens: u64,
+    total_tokens: u64,
     pub(super) request_count: u64,
     pub(super) estimated_cost_usd: f64,
     pub(super) missing_price: bool,
@@ -24,6 +25,7 @@ impl UsageAggregate {
         self.cache_creation_input_tokens = self
             .cache_creation_input_tokens
             .saturating_add(metrics.cache_creation_input_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(metrics.total_tokens());
         self.request_count = self.request_count.saturating_add(1);
         match estimated_cost_usd {
             Some(cost) => self.estimated_cost_usd += cost,
@@ -40,16 +42,14 @@ impl UsageAggregate {
         self.cache_creation_input_tokens = self
             .cache_creation_input_tokens
             .saturating_add(other.cache_creation_input_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         self.request_count = self.request_count.saturating_add(other.request_count);
         self.estimated_cost_usd += other.estimated_cost_usd;
         self.missing_price |= other.missing_price;
     }
 
     pub(super) fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.output_tokens)
-            .saturating_add(self.cache_read_input_tokens)
-            .saturating_add(self.cache_creation_input_tokens)
+        self.total_tokens
     }
 
     pub(super) fn estimated_cost_json(&self, prices_configured: bool) -> Option<f64> {

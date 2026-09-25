@@ -474,8 +474,6 @@ pub struct TaskWorkflowSummary {
     pub force_execute: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_concern: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub review_fallback: Option<harness_workflow::issue_lifecycle::ReviewFallbackSnapshot>,
 }
 
 impl TaskWorkflowSummary {
@@ -493,7 +491,6 @@ impl TaskWorkflowSummary {
             pr_number: u64_data(&workflow.data, "pr_number"),
             force_execute: bool_data(&workflow.data, "force_execute"),
             plan_concern: string_data(&workflow.data, "plan_concern"),
-            review_fallback: None,
         }
     }
 }
@@ -512,7 +509,6 @@ impl From<harness_workflow::issue_lifecycle::IssueWorkflowInstance> for TaskWork
             pr_number: workflow.pr_number,
             force_execute: Some(workflow.force_execute),
             plan_concern: workflow.plan_concern,
-            review_fallback: workflow.review_fallback,
         }
     }
 }

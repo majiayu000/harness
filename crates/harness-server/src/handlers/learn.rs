@@ -47,11 +47,12 @@ pub async fn learn_rules(
     };
 
     let prompt = build_learn_rules_prompt(&draft_contents);
-    let req = AgentRequest {
+    let mut req = AgentRequest {
         prompt,
         project_root,
         ..Default::default()
     };
+    req.apply_configured_policy(&state.core.server.config);
 
     let resp = match agent.execute(req).await {
         Ok(r) => r,
@@ -125,11 +126,12 @@ pub async fn learn_skills(
     };
 
     let prompt = build_learn_skills_prompt(&draft_contents);
-    let req = AgentRequest {
+    let mut req = AgentRequest {
         prompt,
         project_root,
         ..Default::default()
     };
+    req.apply_configured_policy(&state.core.server.config);
 
     let resp = match agent.execute(req).await {
         Ok(r) => r,
@@ -146,7 +148,10 @@ pub async fn learn_skills(
                 tracing::warn!("skipping skill with invalid name: {e}");
                 continue;
             }
-            let skill = skills.create(name, content).clone();
+            let skill = match skills.create(name, content) {
+                Ok(skill) => skill.clone(),
+                Err(error) => return RpcResponse::error(id, INTERNAL_ERROR, error.to_string()),
+            };
             created.push(skill);
         }
     }

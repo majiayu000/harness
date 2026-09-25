@@ -1,6 +1,6 @@
 #[test]
 fn runtime_completion_reducer_maps_pr_feedback_sweep_signal_to_address_command() {
-    let instance = issue_instance("awaiting_feedback").with_data(json!({
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-1",
@@ -47,7 +47,7 @@ fn runtime_completion_reducer_maps_pr_feedback_sweep_signal_to_address_command()
 
 #[test]
 fn runtime_completion_reducer_maps_pr_feedback_child_signal_to_parent_decision() {
-    let instance = issue_instance("awaiting_feedback").with_data(json!({
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-1",
@@ -199,7 +199,7 @@ fn runtime_completion_reducer_uses_pr_feedback_child_signal_when_structured_deci
 
 #[test]
 fn runtime_completion_reducer_prefers_blocking_pr_feedback_over_ready_signal() {
-    let instance = issue_instance("awaiting_feedback").with_data(json!({
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-1",
@@ -341,7 +341,7 @@ fn runtime_completion_reducer_blocks_unknown_success_without_structured_decision
 
 #[test]
 fn runtime_completion_reducer_ignores_stale_pr_feedback_sweep_after_parent_advances() {
-    let instance = issue_instance("ready_to_merge").with_data(json!({
+    let instance = issue_instance("ready_to_merge").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
@@ -365,7 +365,7 @@ fn runtime_completion_reducer_ignores_stale_pr_feedback_sweep_after_parent_advan
 
 #[test]
 fn runtime_completion_reducer_ignores_stale_pr_feedback_child_after_parent_advances() {
-    let instance = issue_instance("ready_to_merge").with_data(json!({
+    let instance = issue_instance("ready_to_merge").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
@@ -400,7 +400,7 @@ fn runtime_completion_reducer_ignores_stale_pr_feedback_child_after_parent_advan
 
 #[test]
 fn runtime_completion_reducer_ignores_stale_local_review_after_pass_advances_parent() {
-    let instance = issue_instance("awaiting_feedback").with_data(json!({
+    let instance = issue_instance("awaiting_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
@@ -424,7 +424,7 @@ fn runtime_completion_reducer_ignores_stale_local_review_after_pass_advances_par
 
 #[test]
 fn runtime_completion_reducer_ignores_stale_local_review_after_changes_advance_parent() {
-    let instance = issue_instance("addressing_feedback").with_data(json!({
+    let instance = issue_instance("addressing_feedback").with_server_data(json!({
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));

@@ -147,6 +147,9 @@ pub(super) async fn insert_runtime_transcript_tx(
     Ok(())
 }
 
+/// Keep the transcript retention set aligned with the commands that can still
+/// use it. A superseded attempt is history: it will never be dispatched again,
+/// so it does not hold a transcript alive (GH-1865).
 pub(super) async fn reconcile_runtime_transcript_dependencies_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
@@ -158,6 +161,7 @@ pub(super) async fn reconcile_runtime_transcript_dependencies_tx(
                SELECT 1
                FROM workflow_commands AS command
                WHERE command.workflow_id = $1
+                 AND command.status <> 'superseded'
                  AND jsonb_typeof(
                      command.data #> '{command,exact_replay,transcript_artifact_ref}'
                  ) = 'string'
@@ -170,6 +174,7 @@ pub(super) async fn reconcile_runtime_transcript_dependencies_tx(
                FROM runtime_jobs AS job
                JOIN workflow_commands AS command ON command.id = job.command_id
                WHERE command.workflow_id = $1
+                 AND command.status <> 'superseded'
                  AND jsonb_typeof(
                      job.data #> '{input,command,exact_replay,transcript_artifact_ref}'
                  ) = 'string'
@@ -190,6 +195,7 @@ pub(super) async fn reconcile_runtime_transcript_dependencies_tx(
              ) AS artifact_ref
              FROM workflow_commands AS command
              WHERE command.workflow_id = $1
+                 AND command.status <> 'superseded'
                AND jsonb_typeof(
                    command.data #> '{command,exact_replay,transcript_artifact_ref}'
                ) = 'string'
@@ -200,6 +206,7 @@ pub(super) async fn reconcile_runtime_transcript_dependencies_tx(
              FROM runtime_jobs AS job
              JOIN workflow_commands AS command ON command.id = job.command_id
              WHERE command.workflow_id = $1
+                 AND command.status <> 'superseded'
                AND jsonb_typeof(
                    job.data #> '{input,command,exact_replay,transcript_artifact_ref}'
                ) = 'string'

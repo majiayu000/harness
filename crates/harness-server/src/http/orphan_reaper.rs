@@ -29,6 +29,7 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
         return;
     }
 
+    let handle = state.background_loops.register_loop("orphan_schema_reaper");
     let weak_state = Arc::downgrade(state);
     tokio::spawn(async move {
         loop {
@@ -37,20 +38,28 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
                 None => break,
             };
 
-            let workflow_cfg = match harness_core::config::workflow::load_workflow_config(
-                &state.core.project_root,
-            ) {
-                Ok(config) => config,
-                Err(_) => {
-                    drop(state);
-                    tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RETRY_SECS)).await;
-                    continue;
-                }
-            };
+            let workflow_cfg =
+                match crate::http::background::load_workflow_config_for_loop(&state, &handle).await
+                {
+                    Ok(config) => config,
+                    Err(error) => {
+                        // Loud, not silent: a malformed WORKFLOW.md must not
+                        // disable reaping without an operator-visible signal
+                        // (GH-1880).
+                        tracing::error!(
+                            loop_name = handle.name(),
+                            "orphan schema reaper workflow config load failed: {error}"
+                        );
+                        drop(state);
+                        tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RETRY_SECS)).await;
+                        continue;
+                    }
+                };
 
             let interval = std::time::Duration::from_secs(
                 workflow_cfg.storage.orphan_reaper_interval_secs.max(1),
             );
+            handle.set_interval(interval.as_secs());
 
             // Disabled is a pause, not a stop: config is reloaded each iteration,
             // so re-enabling takes effect on the next tick without a restart.
@@ -58,6 +67,7 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
                 tracing::debug!(
                     "orphan schema reaper disabled by config; re-checking next interval"
                 );
+                handle.tick_ok();
             } else if let Some(store) = state.core.workflow_runtime_store.as_ref() {
                 let workspace_roots =
                     workspace_roots_for_reaper(state.concurrency.workspace_mgr.as_deref());
@@ -71,6 +81,7 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
                 .await
                 {
                     Ok(report) => {
+                        handle.tick_ok();
                         if !report.legacy_scan_errors.is_empty() {
                             tracing::warn!(
                                 registered_scanned = report.registered_scanned,
@@ -102,6 +113,7 @@ pub(super) fn spawn_orphan_schema_reaper(state: &Arc<AppState>) {
                         }
                     }
                     Err(error) => {
+                        handle.tick_failed(&error.to_string());
                         tracing::warn!("orphan schema reaper tick failed: {error}");
                     }
                 }

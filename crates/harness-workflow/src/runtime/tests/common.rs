@@ -1,3 +1,36 @@
+/// GH-1766: the server-authored validation digest a quality-gate result must
+/// carry for `checking -> passed`, with every command exiting zero.
+fn server_validation_digest_ok(commands: &[&str]) -> ActivityArtifact {
+    ActivityArtifact::new(
+        crate::runtime::completion_evidence::ARTIFACT_SERVER_VALIDATION_DIGEST,
+        json!({
+            "commands": commands
+                .iter()
+                .map(|command| json!({
+                    "command": command,
+                    "exit_code": 0,
+                    "output_sha256": "0".repeat(64),
+                }))
+                .collect::<Vec<_>>(),
+            "cwd": "/workspace",
+        }),
+    )
+}
+
+/// GH-1766: the server-authored PR-binding verification a `BindPr`-minting
+/// result must carry.
+fn verified_pr_binding(pr_number: u64) -> ActivityArtifact {
+    ActivityArtifact::new(
+        crate::runtime::completion_evidence::ARTIFACT_VERIFIED_PR_BINDING,
+        json!({
+            "pr_number": pr_number,
+            "repo": "owner/repo",
+            "head_oid": "abc123",
+            "snapshot_source": "server_github_graphql",
+        }),
+    )
+}
+
 fn issue_instance(state: &str) -> WorkflowInstance {
     WorkflowInstance::new(
         "github_issue_pr",
@@ -5,6 +38,38 @@ fn issue_instance(state: &str) -> WorkflowInstance {
         state,
         WorkflowSubject::new("issue", "123"),
     )
+}
+
+async fn force_upsert_lifecycle_state_for_test(
+    store: &WorkflowRuntimeStore,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<()> {
+    let data = crate::jsonb::to_jsonb_string(instance)?;
+    sqlx::query(
+        "INSERT INTO workflow_instances
+            (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+         ON CONFLICT (id) DO UPDATE SET
+            definition_id = EXCLUDED.definition_id,
+            state = EXCLUDED.state,
+            subject_type = EXCLUDED.subject_type,
+            subject_key = EXCLUDED.subject_key,
+            parent_workflow_id = EXCLUDED.parent_workflow_id,
+            data = EXCLUDED.data,
+            version = EXCLUDED.version,
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(&instance.id)
+    .bind(&instance.definition_id)
+    .bind(&instance.state)
+    .bind(&instance.subject.subject_type)
+    .bind(&instance.subject.subject_key)
+    .bind(&instance.parent_workflow_id)
+    .bind(&data)
+    .bind(instance.version as i64)
+    .execute(store.pool())
+    .await?;
+    Ok(())
 }
 
 fn quality_gate_instance(state: &str) -> WorkflowInstance {
@@ -37,7 +102,7 @@ fn project_issue_instance(
         WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(format!("{project_id}::issue:{issue_number}"))
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id,
         "issue_number": issue_number,
     }))
@@ -70,7 +135,7 @@ async fn enqueue_test_runtime_job_with_not_before(
     not_before: Option<DateTime<Utc>>,
 ) -> anyhow::Result<RuntimeJob> {
     let workflow = issue_instance("implementing").with_id(format!("test-workflow-{command_key}"));
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     enqueue_workflow_runtime_job(
         store,
         &workflow.id,

@@ -1,7 +1,6 @@
 use super::*;
+use crate::workspace::test_support::{async_env_lock, ScopedEnvVar};
 use std::collections::HashMap;
-use std::sync::OnceLock;
-use tokio::sync::Mutex;
 
 #[path = "reconciliation_blocked_done_tests.rs"]
 mod blocked_done_tests;
@@ -9,37 +8,6 @@ mod blocked_done_tests;
 mod local_review_gate_tests;
 #[path = "reconciliation_ready_to_merge_tests.rs"]
 mod ready_to_merge_tests;
-
-fn async_env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-struct ScopedEnvVar {
-    key: String,
-    original: Option<String>,
-}
-
-impl ScopedEnvVar {
-    fn set(key: &str, value: &str) -> Self {
-        let original = std::env::var(key).ok();
-        unsafe { std::env::set_var(key, value) };
-        Self {
-            key: key.to_string(),
-            original,
-        }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        if let Some(value) = &self.original {
-            unsafe { std::env::set_var(&self.key, value) };
-        } else {
-            unsafe { std::env::remove_var(&self.key) };
-        }
-    }
-}
 
 async fn github_state_server(routes: Vec<(&'static str, &'static str)>) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -168,17 +136,11 @@ async fn record_issue_ready_to_merge(
         )
         .await?;
     issue_store
-        .record_ready_to_merge_with_fallback(
+        .record_ready_to_merge(
             project_id,
             Some("owner/repo"),
             pr_number,
             Some("ready to merge before reconciliation"),
-            harness_workflow::issue_lifecycle::ReviewFallbackSnapshot {
-                tier: harness_workflow::issue_lifecycle::ReviewFallbackTier::C,
-                trigger: harness_workflow::issue_lifecycle::ReviewFallbackTrigger::Silence,
-                active_bot: Some("codex".to_string()),
-                activated_at: chrono::Utc::now(),
-            },
         )
         .await?;
     Ok(())
@@ -199,7 +161,7 @@ fn ready_to_merge_instance(
         harness_workflow::runtime::WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id,
         "repo": "owner/repo",
         "issue_number": issue_number,
@@ -246,7 +208,11 @@ async fn persist_ready_to_merge_runtime(
         pr_number,
         chrono::Utc::now() - chrono::Duration::seconds(age_secs),
     );
-    stores.runtime_store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &stores.runtime_store,
+        &instance,
+    )
+    .await?;
     Ok((project_id, workflow_id))
 }
 
@@ -302,7 +268,7 @@ fn runtime_candidate_from_instance_requires_non_terminal_bound_pr() {
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
     .with_id("workflow-1")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "/tmp/project",
         "repo": "owner/repo",
         "issue_number": 42,
@@ -322,7 +288,7 @@ fn runtime_candidate_from_instance_requires_non_terminal_bound_pr() {
         "done",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
-    .with_data(json!({ "pr_number": 77 }));
+    .with_server_data(json!({ "pr_number": 77 }));
     assert!(runtime_candidate_from_instance(&terminal, chrono::Utc::now()).is_none());
 
     let missing_pr = WorkflowInstance::new(
@@ -352,6 +318,144 @@ fn ready_to_merge_open_alert_uses_row_age() {
         ready_to_merge_alert_ttl_secs: 60,
     };
     assert!(ready_to_merge_open_alert(&candidate, GitHubState::Open, settings, now).is_none());
+}
+
+#[tokio::test]
+async fn atomic_stale_reconciliation_does_not_record_issue_side_effects() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let _db_guard = crate::test_helpers::acquire_db_state_guard().await;
+    let Some(stores) = open_runtime_stores().await? else {
+        return Ok(());
+    };
+    let project_root = stores.dir.path().join("stale-reconciliation");
+    std::fs::create_dir(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    stores
+        .issue_store
+        .record_issue_scheduled(
+            &project_id,
+            Some("owner/repo"),
+            42,
+            "stale-reconciliation-task",
+            &[],
+            false,
+        )
+        .await?;
+    stores
+        .issue_store
+        .record_implement_started(
+            &project_id,
+            Some("owner/repo"),
+            42,
+            "stale-reconciliation-task",
+        )
+        .await?;
+    let workflow_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 42);
+    let instance = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
+    )
+    .with_id(&workflow_id)
+    .with_server_data(json!({
+        "project_id": project_id.as_str(),
+        "repo": "owner/repo",
+        "issue_number": 42,
+        "task_id": "stale-reconciliation-task",
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &stores.runtime_store,
+        &instance,
+    )
+    .await?;
+    let stale_instance = instance.clone();
+    stores
+        .runtime_store
+        .ensure_otel_trace_context(&workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("concurrent workflow update must persist"))?;
+    let candidate = RuntimeWorkflowCandidate {
+        workflow_id: workflow_id.clone(),
+        state: "implementing".to_string(),
+        row_updated_at: chrono::Utc::now(),
+        repo: Some("owner/repo".to_string()),
+        project_root: Some(project_root),
+        issue_number: Some(42),
+        pr_number: None,
+        pr_url: None,
+    };
+
+    let applied = reconciliation_apply::apply_loaded_runtime_workflow_transition(
+        &stores.runtime_store,
+        Some(&stores.issue_store),
+        &candidate,
+        stale_instance,
+        "done",
+        "remote issue is closed",
+    )
+    .await?;
+
+    assert!(!applied, "a stale atomic transition must not be applied");
+    let stored = stores
+        .runtime_store
+        .get_instance(&workflow_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("runtime workflow must remain"))?;
+    assert_eq!(stored.state, "implementing");
+    assert_eq!(stored.version, instance.version + 1);
+    assert!(stored.data.get("otel_trace_context").is_some());
+    assert!(stores
+        .runtime_store
+        .events_for(&workflow_id)
+        .await?
+        .is_empty());
+    assert!(stores
+        .runtime_store
+        .decisions_for(&workflow_id)
+        .await?
+        .is_empty());
+    assert!(stores
+        .runtime_store
+        .commands_for(&workflow_id)
+        .await?
+        .is_empty());
+    let rejected_record = harness_workflow::runtime::WorkflowDecisionRecord::rejected(
+        WorkflowDecision::new(
+            &workflow_id,
+            "implementing",
+            "reconcile_issue_completed",
+            "done",
+            "remote issue is closed",
+        ),
+        None,
+        "lease expired before commit",
+    );
+    let rejected_applied = reconciliation_apply::complete_runtime_workflow_transition(
+        Some(rejected_record),
+        Some(&stores.issue_store),
+        &candidate,
+        "done",
+        "remote issue is closed",
+    )
+    .await;
+    assert!(
+        !rejected_applied,
+        "an atomic rejection must not run reconciliation side effects"
+    );
+    let issue_workflow = stores
+        .issue_store
+        .get_by_issue(&project_id, Some("owner/repo"), 42)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("issue workflow must remain"))?;
+    assert_eq!(
+        issue_workflow.state,
+        harness_workflow::issue_lifecycle::IssueLifecycleState::Implementing
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -397,7 +501,7 @@ async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> 
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_ref(),
         "repo": "owner/repo",
         "issue_number": 42,
@@ -405,7 +509,11 @@ async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> 
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
-    stores.runtime_store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &stores.runtime_store,
+        &instance,
+    )
+    .await?;
 
     let report = run_once_with_runtime_config(
         Some(&stores.runtime_store),
@@ -414,7 +522,7 @@ async fn run_once_reconciles_runtime_merged_pr_workflow() -> anyhow::Result<()> 
         false,
         None,
     )
-    .await;
+    .await?;
 
     assert_eq!(report.workflow_transitions.len(), 1);
     assert_eq!(report.workflow_transitions[0].from, "pr_open");
@@ -482,7 +590,7 @@ async fn run_once_reconciles_runtime_closed_pr_workflow() -> anyhow::Result<()> 
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:43"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_ref(),
         "repo": "owner/repo",
         "issue_number": 43,
@@ -490,7 +598,11 @@ async fn run_once_reconciles_runtime_closed_pr_workflow() -> anyhow::Result<()> 
         "pr_number": 88,
         "pr_url": "https://github.com/owner/repo/pull/88",
     }));
-    stores.runtime_store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &stores.runtime_store,
+        &instance,
+    )
+    .await?;
 
     let report = run_once_with_runtime_config(
         Some(&stores.runtime_store),
@@ -499,7 +611,7 @@ async fn run_once_reconciles_runtime_closed_pr_workflow() -> anyhow::Result<()> 
         false,
         None,
     )
-    .await;
+    .await?;
 
     assert_eq!(report.workflow_transitions.len(), 1);
     assert_eq!(report.workflow_transitions[0].to, "cancelled");
@@ -549,7 +661,7 @@ async fn ready_to_merge_reconciliation_waits_for_configured_age() -> anyhow::Res
         false,
         None,
     )
-    .await;
+    .await?;
     assert!(report.workflow_transitions.is_empty());
     assert!(report.workflow_alerts.is_empty());
     let updated = stores
@@ -587,7 +699,7 @@ async fn ready_to_merge_reconciliation_marks_merged_pr_done() -> anyhow::Result<
         false,
         None,
     )
-    .await;
+    .await?;
     assert_eq!(report.workflow_transitions.len(), 1);
     assert_eq!(report.workflow_transitions[0].from, "ready_to_merge");
     assert_eq!(report.workflow_transitions[0].to, "done");
@@ -627,7 +739,7 @@ async fn ready_to_merge_reconciliation_alerts_for_open_pr_after_ttl() -> anyhow:
         false,
         None,
     )
-    .await;
+    .await?;
     assert!(report.workflow_transitions.is_empty());
     assert_eq!(report.workflow_alerts.len(), 1);
     assert_eq!(report.workflow_alerts[0].pr_number, Some(101));

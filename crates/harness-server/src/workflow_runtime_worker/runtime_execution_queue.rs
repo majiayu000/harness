@@ -1,4 +1,5 @@
 use crate::http::AppState;
+use futures::FutureExt;
 use harness_workflow::runtime::WorkflowInstance;
 use serde_json::Value;
 
@@ -38,38 +39,38 @@ fn runtime_execution_queue_request(
     }))
 }
 
-pub(super) async fn acquire_runtime_execution_queue_permit(
-    state: &AppState,
-    workflow: Option<&WorkflowInstance>,
-) -> anyhow::Result<Option<crate::task_queue::TaskPermit>> {
-    acquire_runtime_execution_queue_permit_from_queue(
-        state.concurrency.review_task_queue.as_ref(),
-        workflow,
-    )
-    .await
+pub(super) enum QueueAdmission {
+    Ready(Option<crate::task_queue::TaskPermit>),
+    Busy,
 }
 
-async fn acquire_runtime_execution_queue_permit_from_queue(
-    review_task_queue: &crate::task_queue::TaskQueue,
+pub(super) fn try_runtime_execution_queue_permit(
+    state: &AppState,
     workflow: Option<&WorkflowInstance>,
-) -> anyhow::Result<Option<crate::task_queue::TaskPermit>> {
-    let Some(workflow) = workflow else {
-        return Ok(None);
+) -> anyhow::Result<QueueAdmission> {
+    try_queue_permit(state.concurrency.review_task_queue.as_ref(), workflow)
+}
+
+fn try_queue_permit(
+    queue: &crate::task_queue::TaskQueue,
+    workflow: Option<&WorkflowInstance>,
+) -> anyhow::Result<QueueAdmission> {
+    let request = workflow
+        .map(runtime_execution_queue_request)
+        .transpose()?
+        .flatten();
+    let Some(request) = request else {
+        return Ok(QueueAdmission::Ready(None));
     };
-    let Some(request) = runtime_execution_queue_request(workflow)? else {
-        return Ok(None);
-    };
-    tracing::debug!(
-        workflow_id = %workflow.id,
-        project_id = request.project_id,
-        priority = request.priority,
-        queue_domain = "review",
-        "workflow runtime waiting for execution queue permit"
-    );
-    review_task_queue
+    // acquire is cancellation-safe: an unavailable permit must not retain a
+    // worker, a project permit or a waiter after this single poll.
+    match queue
         .acquire(&request.project_id, request.priority)
-        .await
-        .map(Some)
+        .now_or_never()
+    {
+        Some(result) => result.map(|permit| QueueAdmission::Ready(Some(permit))),
+        None => Ok(QueueAdmission::Busy),
+    }
 }
 
 #[cfg(test)]
@@ -86,7 +87,7 @@ mod tests {
             WorkflowSubject::new("prompt", "review:test"),
         )
         .with_id("runtime-review-policy")
-        .with_data(json!({
+        .with_server_data(json!({
             "project_id": "/tmp/project",
             "execution_policy": {
                 "task_kind": "review",
@@ -121,22 +122,22 @@ mod tests {
         config.max_queue_size = 4;
         let queue = crate::task_queue::TaskQueue::new(&config);
         let workflow = prompt_workflow("review");
-        let first = acquire_runtime_execution_queue_permit_from_queue(&queue, Some(&workflow))
-            .await?
-            .expect("review workflow should acquire a permit");
-        let mut second = Box::pin(acquire_runtime_execution_queue_permit_from_queue(
-            &queue,
-            Some(&workflow),
+        let QueueAdmission::Ready(Some(first)) = try_queue_permit(&queue, Some(&workflow))? else {
+            panic!("first review should acquire a permit");
+        };
+        assert!(matches!(
+            try_queue_permit(&queue, Some(&workflow))?,
+            QueueAdmission::Busy
         ));
-
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            try_queue_permit(&queue, Some(&prompt_workflow("primary")))?,
+            QueueAdmission::Ready(None)
+        ));
         drop(first);
-        let second = tokio::time::timeout(std::time::Duration::from_secs(1), second).await??;
-        assert!(second.is_some());
+        assert!(matches!(
+            try_queue_permit(&queue, Some(&workflow))?,
+            QueueAdmission::Ready(Some(_))
+        ));
         Ok(())
     }
 }

@@ -1,64 +1,24 @@
 use super::helpers::{
-    emit_runtime_notification, mark_turn_failed, process_stream_item, RuntimeUsageContext,
+    emit_runtime_notification, mark_turn_cancelled, mark_turn_failed, process_stream_item,
+    RuntimeUsageContext, StreamCompletionState,
 };
-use harness_core::agent::{AgentEvent, AgentRequest, StreamItem, TurnRequest};
-use harness_core::config::agents::SandboxMode;
+use super::runtime_usage::enforced_budget_cost_error;
+use harness_core::agent::{AgentRequest, StreamItem};
+use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::stall_timeout::normalize_stall_timeout_secs;
 use harness_core::error::HarnessError;
+use harness_core::run_id::RunIdentity;
 use harness_core::types::{ExecutionPhase, TurnId};
 use harness_protocol::notifications::{Notification, RpcNotification};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
-fn bridge_agent_event(
-    event: AgentEvent,
-    output_buf: &mut String,
-    emitted_agent_completion: &mut bool,
-) -> Option<StreamItem> {
-    match event {
-        AgentEvent::ItemStartedPayload { item } => Some(StreamItem::ItemStarted { item }),
-        AgentEvent::MessageDelta { text } => {
-            output_buf.push_str(&text);
-            Some(StreamItem::MessageDelta { text })
-        }
-        AgentEvent::ToolOutputDelta { item_id, text } => {
-            Some(StreamItem::ToolOutputDelta { item_id, text })
-        }
-        AgentEvent::ApprovalRequest { id, command } => {
-            Some(StreamItem::ApprovalRequest { id, command })
-        }
-        AgentEvent::ItemCompletedPayload { item } => {
-            if let harness_core::types::Item::AgentReasoning { content } = &item {
-                output_buf.clear();
-                output_buf.push_str(content);
-                *emitted_agent_completion = true;
-            }
-            Some(StreamItem::ItemCompleted { item })
-        }
-        AgentEvent::TokenUsage { usage } => Some(StreamItem::TokenUsage { usage }),
-        AgentEvent::Warning { message } => Some(StreamItem::Warning { message }),
-        AgentEvent::Error { message } => Some(StreamItem::Error { message }),
-        AgentEvent::TurnCompleted { output } => {
-            if *emitted_agent_completion {
-                output_buf.clear();
-                return None;
-            }
-            let content = if output.is_empty() {
-                std::mem::take(output_buf)
-            } else {
-                output
-            };
-            Some(StreamItem::ItemCompleted {
-                item: harness_core::types::Item::AgentReasoning { content },
-            })
-        }
-        _ => None,
-    }
-}
-
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct TurnLifecycleOptions {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -68,8 +28,20 @@ pub(crate) struct TurnLifecycleOptions {
     pub timeout_secs: Option<u64>,
     pub stall_timeout_secs: Option<u64>,
     pub force_code_agent: bool,
+    /// Reuse the backend selected and checked by the workflow worker.
+    pub selected_backend: Option<Arc<dyn harness_core::agent::AgentBackend>>,
+    pub permission_mode: AgentPermissionMode,
+    pub allowed_tools: Option<Vec<String>>,
     pub env_vars: HashMap<String, String>,
     pub runtime_usage: Option<RuntimeUsageContext>,
+    /// Set when the agent confirms that its first-party egress proxy was
+    /// established before dispatch. The marker is consumed here and is not
+    /// persisted as a transcript item.
+    pub egress_verified_at_dispatch: Option<Arc<AtomicBool>>,
+    /// Stateful lease-lost signal (watch channel): when the owning runtime
+    /// job lease is lost mid-turn, the turn interrupts the agent so the
+    /// child process terminates and the workspace cleanup can run (GH-1877).
+    pub lease_lost: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 pub(crate) async fn run_turn_lifecycle_with_options(
@@ -80,29 +52,36 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     turn_id: TurnId,
     prompt: String,
     agent_name: String,
-    options: TurnLifecycleOptions,
+    mut options: TurnLifecycleOptions,
 ) {
-    let Some(project_root) = server
-        .thread_manager
-        .get_thread(&thread_id)
-        .map(|thread| thread.project_root)
-    else {
+    let Some(project_root) = server.thread_manager.thread_project_root(&thread_id) else {
         tracing::warn!(
             "run_turn_lifecycle skipped because thread {} no longer exists",
             thread_id
         );
         return;
     };
+    match RunIdentity::mint_nested_env_vars(&mut options.env_vars) {
+        Ok(identity) => {
+            if let Some(context) = options.runtime_usage.as_mut() {
+                context.agent_run_id = Some(identity.run_id);
+            }
+        }
+        Err(err) => {
+            tracing::warn!("failed to prepare agent run identity for runtime turn: {err}");
+        }
+    }
 
-    let Some(agent) = server.agent_registry.get(&agent_name) else {
+    let Some(agent) = options
+        .selected_backend
+        .clone()
+        .or_else(|| server.agent_registry.get(&agent_name))
+    else {
         let msg = format!("agent `{agent_name}` not found in registry");
         if let Err(e) = server.thread_manager.add_item(
             &thread_id,
             &turn_id,
-            harness_core::types::Item::Error {
-                code: -1,
-                message: msg.clone(),
-            },
+            harness_core::types::Item::error(msg.clone()),
         ) {
             tracing::warn!("failed to add agent-not-found error item: {e}");
         }
@@ -138,20 +117,63 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let execution_adapter = if options.force_code_agent {
         None
     } else {
-        server.agent_registry.turn_execution_adapter(&agent_name)
+        options
+            .selected_backend
+            .clone()
+            .or_else(|| server.agent_registry.turn_execution_adapter(&agent_name))
     };
+    if let Some(error) = options.runtime_usage.as_ref().and_then(|context| {
+        enforced_budget_cost_error(
+            execution_adapter.as_deref().unwrap_or(agent.as_ref()),
+            &context.budget_policy,
+        )
+    }) {
+        if let Err(record_error) = server.thread_manager.add_item(
+            &thread_id,
+            &turn_id,
+            harness_core::types::Item::error(error.clone()),
+        ) {
+            tracing::error!("failed to record budget admission failure: {record_error}");
+        }
+        mark_turn_failed(
+            &server,
+            &notify_tx,
+            &notification_tx,
+            &thread_id,
+            &turn_id,
+            error,
+        )
+        .await;
+        return;
+    }
+    if let Some(context) = options.runtime_usage.as_ref() {
+        if let Err(error) = context.persist_agent_run_start(&turn_id).await {
+            tracing::error!(
+                runtime_job_id = %context.runtime_job_id,
+                command_id = %context.command_id,
+                workflow_id = %context.workflow_id,
+                "failed to persist workflow runtime agent run start: {error}"
+            );
+        }
+    }
+
     let adapter_opt = if options.force_code_agent {
         None
     } else {
-        execution_adapter
-            .clone()
-            .or_else(|| server.agent_registry.get_adapter(&agent_name))
+        server
+            .agent_registry
+            .get_adapter(&agent_name)
+            .or_else(|| execution_adapter.clone())
+    };
+    let control_is_execution_adapter = match (&adapter_opt, &execution_adapter) {
+        (Some(control), Some(execution)) => Arc::ptr_eq(control, execution),
+        _ => false,
     };
 
     // Register as live adapter (RAII guard for cleanup on turn exit).
-    // Adapters may be control-only (Claude: interrupt/steer/approval side
-    // channel only) or turn-executing (Codex: App Server JSON-RPC owns the
-    // full turn). The strategy is selected at agent registration time.
+    // Adapters may be control-only (interrupt/steer/approval side channel
+    // only) or turn-executing (Codex: App Server JSON-RPC owns the full
+    // turn). The strategy is selected at agent registration time.
     let _adapter_guard = adapter_opt.as_ref().map(|adapter_arc| {
         server
             .thread_manager
@@ -193,55 +215,43 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     );
     let (stream_tx, mut stream_rx) = mpsc::channel(128);
 
-    // Use the adapter for turn execution only when its registered strategy says
-    // it owns the full lifecycle. This is the strategy pattern boundary between
-    // Codex's App Server adapter and Claude's control-only adapter; avoid
-    // branching on agent names here.
+    // Use a turn backend only when the registry supplies one for the agent.
+    // Otherwise the default backend remains the streaming executor.
+    let execution_terminator = execution_adapter.clone();
+    let executes_via_adapter = execution_adapter.is_some();
     let mut execution: std::pin::Pin<
         Box<dyn std::future::Future<Output = harness_core::error::Result<()>> + Send>,
     > = if let Some(adapter_arc) = execution_adapter {
-        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(128);
-        // Move stream_tx into the bridge task so dropping it closes stream_rx.
-        let bridge_tx = stream_tx;
-        tokio::spawn(async move {
-            let mut output_buf = String::new();
-            let mut emitted_agent_completion = false;
-            while let Some(event) = event_rx.recv().await {
-                let maybe_item =
-                    bridge_agent_event(event, &mut output_buf, &mut emitted_agent_completion);
-                if let Some(item) = maybe_item {
-                    if bridge_tx.send(item).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            // event_rx closed → adapter done; dropping bridge_tx closes stream_rx.
-        });
-        let turn_req = TurnRequest {
+        let turn_req = AgentRequest {
             prompt,
             prompt_layers: None,
             project_root,
+            permission_mode: options.permission_mode,
             model: options.model.clone(),
             reasoning_effort: options.reasoning_effort.clone(),
             execution_phase: options.execution_phase,
             sandbox_mode: options.sandbox_mode,
             approval_policy: options.approval_policy.clone(),
-            allowed_tools: None,
+            allowed_tools: options.allowed_tools.clone(),
+            max_budget_usd: None,
             context: vec![],
             timeout_secs,
             env_vars: options.env_vars.clone(),
             capability_token: None,
         };
-        Box::pin(async move { adapter_arc.start_turn(turn_req, event_tx).await })
+        Box::pin(async move { adapter_arc.start_turn(turn_req, stream_tx).await })
     } else {
         let req = AgentRequest {
             prompt,
             project_root,
+            permission_mode: options.permission_mode,
             model: options.model.clone(),
             reasoning_effort: options.reasoning_effort.clone(),
             execution_phase: options.execution_phase,
             sandbox_mode: options.sandbox_mode,
             approval_policy: options.approval_policy.clone(),
+            allowed_tools: options.allowed_tools.clone(),
+            timeout_secs,
             env_vars: options.env_vars.clone(),
             ..Default::default()
         };
@@ -250,6 +260,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     let mut stream_closed = false;
     let mut execution_result: Option<harness_core::error::Result<()>> = None;
     let mut stream_error: Option<String> = None;
+    let mut completion_state = StreamCompletionState::default();
+    let mut stream_cancelled: Option<String> = None;
+    let mut terminate_execution_after_drop = false;
     let mut last_activity = Instant::now();
     let execution_deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
     let execution_timeout = async {
@@ -268,12 +281,38 @@ pub(crate) async fn run_turn_lifecycle_with_options(
             }
             incoming = stream_rx.recv(), if !stream_closed => {
                 match incoming {
-                    Some(item) => {
+                    Some(StreamItem::EgressVerifiedAtDispatch) => {
                         last_activity = Instant::now();
+                        if let Some(verified) = options.egress_verified_at_dispatch.as_ref() {
+                            verified.store(true, Ordering::Release);
+                        }
+                    }
+                    Some(item) => {
+                        if matches!(item, StreamItem::TurnStarted) {
+                            if let Some(context) = options.runtime_usage.as_ref() {
+                                if let Err(error) = context.store.record_runtime_event(
+                                    &context.runtime_job_id, "RuntimeAgentStarted",
+                                    serde_json::json!({ "thread_id": thread_id, "turn_id": turn_id }),
+                                ).await {
+                                    terminate_execution_after_drop = executes_via_adapter;
+                                    execution_result = Some(Err(HarnessError::AgentExecution(format!("failed to persist agent start: {error}"))));
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        if stream_item_resets_stall_timer(&item) {
+                            last_activity = Instant::now();
+                        }
                         if let StreamItem::Error { message } = &item {
                             stream_error.get_or_insert_with(|| message.clone());
                         }
-                        process_stream_item(
+                        if let StreamItem::TurnCancelled { message } = &item {
+                            stream_cancelled.get_or_insert_with(|| message.clone());
+                        }
+                        let Some(item) = completion_state.normalize(item) else {
+                            continue;
+                        };
+                        let budget_stop = process_stream_item(
                             &server,
                             &notify_tx,
                             &notification_tx,
@@ -282,6 +321,33 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                             &turn_id,
                             item,
                         ).await;
+                        // GH-1770 §4.3: an activity that already blew the
+                        // workflow ceiling is precisely the case dispatch-time
+                        // gating cannot catch, so the in-flight turn stops.
+                        if let Some(stop) = budget_stop {
+                            tracing::warn!(
+                                thread_id = %thread_id,
+                                turn_id = %turn_id,
+                                workflow_id = %stop.workflow_id,
+                                spent_usd = stop.spent_usd,
+                                budget_usd = stop.budget_usd,
+                                "workflow budget ceiling reached mid-turn; interrupting agent"
+                            );
+                            if let Some(adapter) = adapter_opt.as_ref() {
+                                if let Err(error) = adapter.interrupt().await {
+                                    tracing::warn!(
+                                        thread_id = %thread_id,
+                                        turn_id = %turn_id,
+                                        "failed to interrupt agent after the budget ceiling: {error}"
+                                    );
+                                }
+                            }
+                            execution_result = Some(Err(HarnessError::AgentExecution(format!(
+                                "Workflow {} spent {:.2} USD, reaching its {:.2} USD budget; turn interrupted.",
+                                stop.workflow_id, stop.spent_usd, stop.budget_usd
+                            ))));
+                            break 'outer;
+                        }
                     }
                     None => {
                         stream_closed = true;
@@ -303,6 +369,56 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     "Agent stream stalled: no output for {}s",
                     stall_timeout.as_secs()
                 ))));
+                terminate_execution_after_drop = executes_via_adapter;
+                break 'outer;
+            }
+            _ = async {
+                    match options.lease_lost.as_ref() {
+                        Some(receiver) => {
+                            let mut receiver = receiver.clone();
+                            loop {
+                                if *receiver.borrow() {
+                                    return;
+                                }
+                                if receiver.changed().await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        None => std::future::pending().await,
+                    }
+                }, if execution_result.is_none() && !stream_closed => {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    turn_id = %turn_id,
+                    "runtime job lease lost mid-turn; interrupting agent"
+                );
+                // A process-backed execution adapter may hold its state lock
+                // inside start_turn while it initializes the child. Calling
+                // interrupt on that same adapter before cancelling the future
+                // would wait on the lock forever. A distinct control backend
+                // remains safe to notify before the execution is cancelled.
+                if !control_is_execution_adapter {
+                    if let Some(adapter) = adapter_opt.as_ref() {
+                        if let Err(error) = adapter.interrupt().await {
+                            tracing::warn!(
+                                thread_id = %thread_id,
+                                turn_id = %turn_id,
+                                "failed to interrupt agent after lease loss: {error}"
+                            );
+                        }
+                    }
+                }
+                if executes_via_adapter {
+                    terminate_execution_after_drop = true;
+                }
+                if !executes_via_adapter {
+                    // The streaming future is dropped immediately after this loop;
+                    // ManagedChild drains its process group synchronously on that drop.
+                }
+                execution_result = Some(Err(HarnessError::AgentExecution(
+                    "Runtime job lease was lost before the agent completed; turn interrupted.".to_string(),
+                )));
                 break 'outer;
             }
             _ = &mut execution_timeout, if execution_result.is_none() => {
@@ -321,12 +437,48 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         }
     }
 
+    // Do not update terminal turn state while an abandoned execution can still
+    // mutate its workspace. Completed futures are harmless to drop here; cancelled
+    // streaming executions synchronously drain their managed process group.
+    drop(execution);
+    if terminate_execution_after_drop {
+        if let Some(adapter) = execution_terminator.as_ref() {
+            if let Err(cleanup_error) = adapter.terminate_and_drain().await {
+                tracing::error!(
+                    thread_id = %thread_id,
+                    turn_id = %turn_id,
+                    "failed to force-stop and drain interrupted agent execution: {cleanup_error}"
+                );
+                // Surface cleanup failure at the turn/resource-release boundary so
+                // unknown process state is never reported as a successful drain.
+                execution_result = Some(match execution_result.take() {
+                    None | Some(Ok(())) => Err(cleanup_error),
+                    Some(Err(primary)) => Err(HarnessError::AgentExecution(format!(
+                        "{primary}; cleanup failed: {cleanup_error}"
+                    ))),
+                });
+            }
+        }
+    }
+
     match execution_result.unwrap_or_else(|| {
         Err(harness_core::error::HarnessError::AgentExecution(
             "turn execution ended without agent result".to_string(),
         ))
     }) {
         Ok(()) => {
+            if let Some(message) = stream_cancelled {
+                mark_turn_cancelled(
+                    &server,
+                    &notify_tx,
+                    &notification_tx,
+                    &thread_id,
+                    &turn_id,
+                    message,
+                )
+                .await;
+                return;
+            }
             if let Some(error_msg) = stream_error {
                 mark_turn_failed(
                     &server,
@@ -362,10 +514,9 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                     if let Err(e) = server.thread_manager.add_item(
                         &thread_id,
                         &turn_id,
-                        harness_core::types::Item::Error {
-                            code: -1,
-                            message: format!("Failed to complete turn: {error_msg}"),
-                        },
+                        harness_core::types::Item::error(format!(
+                            "Failed to complete turn: {error_msg}"
+                        )),
                     ) {
                         tracing::warn!("failed to add error item to turn: {e}");
                     }
@@ -383,14 +534,16 @@ pub(crate) async fn run_turn_lifecycle_with_options(
         }
         Err(err) => {
             let error_msg = err.to_string();
-            if let Err(e) = server.thread_manager.add_item(
-                &thread_id,
-                &turn_id,
-                harness_core::types::Item::Error {
-                    code: -1,
-                    message: error_msg.clone(),
-                },
-            ) {
+            let error_item = match err.turn_failure() {
+                Some(failure) => {
+                    harness_core::types::Item::typed_error(error_msg.clone(), failure.kind)
+                }
+                None => harness_core::types::Item::error(error_msg.clone()),
+            };
+            if let Err(e) = server
+                .thread_manager
+                .add_item(&thread_id, &turn_id, error_item)
+            {
                 tracing::warn!("failed to add error item to turn: {e}");
             }
             mark_turn_failed(
@@ -406,333 +559,241 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     }
 }
 
+fn stream_item_resets_stall_timer(item: &StreamItem) -> bool {
+    !matches!(
+        item,
+        StreamItem::Warning { .. } | StreamItem::Diagnostic { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{bridge_agent_event, run_turn_lifecycle_with_options, TurnLifecycleOptions};
+    //! Admission checks on the ordinary turn engine's actual execution backend.
+
+    use super::super::runtime_usage::RuntimeUsageContext;
+    use super::{run_turn_lifecycle_with_options, TurnLifecycleOptions};
     use crate::{server::HarnessServer, thread_manager::ThreadManager};
-    use harness_agents::registry::{AdapterExecutionStrategy, AgentRegistry};
-    use harness_core::agent::{
-        AgentAdapter, AgentEvent, AgentRequest, AgentResponse, CodeAgent, StreamItem, TurnRequest,
-    };
+    use harness_agents::registry::AgentRegistry;
+    use harness_core::agent::{AgentBackend, AgentRequest, StreamItem};
+    use harness_core::config::workflow::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
     use harness_core::config::HarnessConfig;
-    use harness_core::error::HarnessError;
-    use harness_core::types::{AgentId, Capability, Item, TokenUsage, TurnId, TurnStatus};
+    use harness_core::types::{AgentId, Item, TurnStatus};
+    use harness_workflow::runtime::{RuntimeKind, WorkflowRuntimeStore};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
     use tokio::sync::mpsc;
 
-    struct CountingAgent {
+    struct BudgetBackend {
+        reports_cost: bool,
         calls: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
-    impl CodeAgent for CountingAgent {
+    impl AgentBackend for BudgetBackend {
         fn name(&self) -> &str {
-            "codex"
+            "budget-test"
         }
 
-        fn capabilities(&self) -> Vec<Capability> {
-            vec![Capability::Read]
-        }
-
-        async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
-            Ok(AgentResponse {
-                output: "ok".to_string(),
-                stderr: String::new(),
-                items: Vec::new(),
-                token_usage: TokenUsage::default(),
-                model: "codex".to_string(),
-                exit_code: Some(0),
-            })
+        fn reports_usage_cost(&self) -> bool {
+            self.reports_cost
         }
 
         async fn execute_stream(
             &self,
-            _req: AgentRequest,
+            _request: AgentRequest,
             tx: mpsc::Sender<StreamItem>,
         ) -> harness_core::error::Result<()> {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            tx.send(StreamItem::ItemCompleted {
-                item: Item::AgentReasoning {
-                    content: "agent stream done".to_string(),
-                },
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tx.send(StreamItem::Done).await.map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(error.to_string())
             })
-            .await
-            .map_err(|error| HarnessError::AgentExecution(format!("stream closed: {error}")))?;
-            tx.send(StreamItem::Done)
-                .await
-                .map_err(|error| HarnessError::AgentExecution(format!("stream closed: {error}")))?;
-            Ok(())
-        }
-    }
-
-    struct CountingAdapter {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait]
-    impl AgentAdapter for CountingAdapter {
-        fn name(&self) -> &str {
-            "codex"
         }
 
         async fn start_turn(
             &self,
-            _req: TurnRequest,
-            tx: mpsc::Sender<AgentEvent>,
+            request: AgentRequest,
+            tx: mpsc::Sender<StreamItem>,
         ) -> harness_core::error::Result<()> {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            tx.send(AgentEvent::TurnCompleted {
-                output: "adapter done".to_string(),
-            })
-            .await
-            .map_err(|error| HarnessError::AgentExecution(format!("adapter closed: {error}")))?;
-            Ok(())
-        }
-
-        async fn interrupt(&self) -> harness_core::error::Result<()> {
-            Ok(())
+            self.execute_stream(request, tx).await
         }
     }
 
-    fn server_with_codex_counts(
-        root: &std::path::Path,
-        agent_calls: Arc<AtomicUsize>,
-        adapter_calls: Arc<AtomicUsize>,
-    ) -> anyhow::Result<Arc<HarnessServer>> {
-        let mut config = HarnessConfig::default();
-        config.server.project_root = root.to_path_buf();
-        config.agents.default_agent = "codex".to_string();
-
-        let mut registry = AgentRegistry::new("codex");
-        registry.register("codex", Arc::new(CountingAgent { calls: agent_calls }));
-        let adapter_calls_for_factory = adapter_calls.clone();
-        registry
-            .register_adapter_factory_with_strategy(
-                "codex",
-                move || {
-                    Arc::new(CountingAdapter {
-                        calls: adapter_calls_for_factory.clone(),
-                    })
-                },
-                AdapterExecutionStrategy::ExecuteTurns,
-            )
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-
-        Ok(Arc::new(HarnessServer::new(
-            config,
-            ThreadManager::new(),
-            registry,
-        )))
-    }
-
-    fn start_test_turn(server: &HarnessServer, root: &std::path::Path) -> anyhow::Result<TurnId> {
-        let thread_id = server.thread_manager.start_thread(root.to_path_buf());
-        server
-            .thread_manager
-            .start_turn(&thread_id, "prompt".to_string(), AgentId::from_str("codex"))
-            .map_err(|error| anyhow::anyhow!("{error}"))
-    }
-
-    async fn run_test_turn(
-        server: Arc<HarnessServer>,
-        root: &std::path::Path,
-        turn_id: TurnId,
-        options: TurnLifecycleOptions,
+    async fn ordinary_budget_case(
+        policy: RuntimeBudgetPolicy,
+        force_code_agent: bool,
+        oneshot_reports_cost: bool,
+        adapter_reports_cost: bool,
+        should_launch: bool,
     ) -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let database_url = crate::test_helpers::test_database_url()?;
+        let store = Arc::new(
+            WorkflowRuntimeStore::open_with_database_url(
+                &root.path().join("runtime.db"),
+                Some(&database_url),
+            )
+            .await?,
+        );
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let adapter_calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = AgentRegistry::new("budget-test");
+        registry.register(
+            "budget-test",
+            Arc::new(BudgetBackend {
+                reports_cost: oneshot_reports_cost,
+                calls: agent_calls.clone(),
+            }),
+        );
+        let factory_calls = adapter_calls.clone();
+        registry
+            .register_turn_backend_factory("budget-test", move || {
+                Arc::new(BudgetBackend {
+                    reports_cost: adapter_reports_cost,
+                    calls: factory_calls.clone(),
+                })
+            })
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut config = HarnessConfig::default();
+        config.server.project_root = root.path().to_path_buf();
+        let server = Arc::new(HarnessServer::new(config, ThreadManager::new(), registry));
         let thread_id = server
             .thread_manager
-            .find_thread_for_turn(&turn_id)
-            .ok_or_else(|| anyhow::anyhow!("turn should belong to a thread"))?;
+            .start_thread(root.path().to_path_buf());
+        let turn_id = server.thread_manager.start_turn(
+            &thread_id,
+            "bounded test".to_string(),
+            AgentId::from_str("budget-test"),
+        )?;
+        let suffix = uuid::Uuid::new_v4();
+        let context = RuntimeUsageContext {
+            store,
+            runtime_job_id: format!("ordinary-budget-job-{suffix}"),
+            command_id: format!("ordinary-budget-command-{suffix}"),
+            workflow_id: format!("ordinary-budget-workflow-{suffix}"),
+            agent_run_id: None,
+            runtime_kind: if force_code_agent {
+                RuntimeKind::CodexExec
+            } else {
+                RuntimeKind::CodexJsonrpc
+            },
+            runtime_profile: "budget-test".to_string(),
+            agent: "budget-test".to_string(),
+            model: "scripted".to_string(),
+            project: root.path().display().to_string(),
+            task_id: None,
+            candidate_group_id: None,
+            candidate_id: None,
+            candidate_index: None,
+            candidate_count: None,
+            budget_policy: policy,
+        };
         let (notification_tx, _) = tokio::sync::broadcast::channel(16);
         run_turn_lifecycle_with_options(
-            server,
+            server.clone(),
             None,
             notification_tx,
-            thread_id,
-            turn_id,
-            "prompt".to_string(),
-            "codex".to_string(),
-            options,
+            thread_id.clone(),
+            turn_id.clone(),
+            "bounded test".to_string(),
+            "budget-test".to_string(),
+            TurnLifecycleOptions {
+                force_code_agent,
+                runtime_usage: Some(context),
+                ..Default::default()
+            },
         )
         .await;
-        anyhow::ensure!(root.exists(), "test root should still exist");
+        assert_eq!(
+            agent_calls.load(Ordering::SeqCst),
+            usize::from(should_launch && force_code_agent)
+        );
+        assert_eq!(
+            adapter_calls.load(Ordering::SeqCst),
+            usize::from(should_launch && !force_code_agent)
+        );
+        let turn = server
+            .thread_manager
+            .get_turn(&thread_id, &turn_id)
+            .unwrap();
+        assert_eq!(
+            turn.status,
+            if should_launch {
+                TurnStatus::Completed
+            } else {
+                TurnStatus::Failed
+            }
+        );
+        if !should_launch {
+            assert!(turn.items.iter().any(|item| matches!(
+                item,
+                Item::Error { message, .. } if message.contains("does not report USD cost")
+            )));
+        }
         Ok(())
     }
 
     #[tokio::test]
-    async fn lifecycle_uses_registered_turn_adapter_by_default() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let agent_calls = Arc::new(AtomicUsize::new(0));
-        let adapter_calls = Arc::new(AtomicUsize::new(0));
-        let server =
-            server_with_codex_counts(root.path(), agent_calls.clone(), adapter_calls.clone())?;
-        let turn_id = start_test_turn(&server, root.path())?;
-
-        run_test_turn(
-            server.clone(),
-            root.path(),
-            turn_id.clone(),
-            TurnLifecycleOptions::default(),
-        )
-        .await?;
-
-        assert_eq!(agent_calls.load(Ordering::Acquire), 0);
-        assert_eq!(adapter_calls.load(Ordering::Acquire), 1);
-        let thread_id = server
-            .thread_manager
-            .find_thread_for_turn(&turn_id)
-            .ok_or_else(|| anyhow::anyhow!("turn should belong to a thread"))?;
-        let turn = server
-            .thread_manager
-            .get_turn(&thread_id, &turn_id)
-            .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
-        assert_eq!(turn.status, TurnStatus::Completed);
+    async fn ordinary_budget_enforce_rejects_cost_blind_execution_backend() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        for force_code_agent in [true, false] {
+            ordinary_budget_case(
+                RuntimeBudgetPolicy {
+                    enforcement: RuntimeBudgetEnforcement::Enforce,
+                    ..Default::default()
+                },
+                force_code_agent,
+                !force_code_agent,
+                force_code_agent,
+                false,
+            )
+            .await?;
+        }
         Ok(())
     }
 
     #[tokio::test]
-    async fn lifecycle_force_code_agent_bypasses_turn_adapter() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let agent_calls = Arc::new(AtomicUsize::new(0));
-        let adapter_calls = Arc::new(AtomicUsize::new(0));
-        let server =
-            server_with_codex_counts(root.path(), agent_calls.clone(), adapter_calls.clone())?;
-        let turn_id = start_test_turn(&server, root.path())?;
-
-        run_test_turn(
-            server.clone(),
-            root.path(),
-            turn_id.clone(),
-            TurnLifecycleOptions {
-                force_code_agent: true,
-                ..TurnLifecycleOptions::default()
-            },
-        )
-        .await?;
-
-        assert_eq!(agent_calls.load(Ordering::Acquire), 1);
-        assert_eq!(adapter_calls.load(Ordering::Acquire), 0);
-        let thread_id = server
-            .thread_manager
-            .find_thread_for_turn(&turn_id)
-            .ok_or_else(|| anyhow::anyhow!("turn should belong to a thread"))?;
-        let turn = server
-            .thread_manager
-            .get_turn(&thread_id, &turn_id)
-            .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
-        assert_eq!(turn.status, TurnStatus::Completed);
+    async fn ordinary_budget_enforce_uses_selected_surface_cost_capability() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        for force_code_agent in [true, false] {
+            ordinary_budget_case(
+                RuntimeBudgetPolicy {
+                    enforcement: RuntimeBudgetEnforcement::Enforce,
+                    ..Default::default()
+                },
+                force_code_agent,
+                force_code_agent,
+                !force_code_agent,
+                true,
+            )
+            .await?;
+        }
         Ok(())
     }
 
-    #[test]
-    fn bridge_preserves_warning_and_token_usage_events() {
-        let mut output_buf = String::new();
-        let mut warning_completion = false;
-        let mut usage_completion = false;
-
-        let warning = bridge_agent_event(
-            AgentEvent::Warning {
-                message: "careful".into(),
+    #[tokio::test]
+    async fn ordinary_budget_shadow_and_unlimited_allow_cost_blind_execution() -> anyhow::Result<()>
+    {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        for policy in [
+            RuntimeBudgetPolicy::default(),
+            RuntimeBudgetPolicy {
+                enforcement: RuntimeBudgetEnforcement::Enforce,
+                unlimited: true,
+                ..Default::default()
             },
-            &mut output_buf,
-            &mut warning_completion,
-        );
-        let usage = bridge_agent_event(
-            AgentEvent::TokenUsage {
-                usage: TokenUsage {
-                    input_tokens: 1,
-                    output_tokens: 2,
-                    total_tokens: 3,
-                    cost_usd: 0.0,
-                },
-            },
-            &mut output_buf,
-            &mut usage_completion,
-        );
-
-        assert_eq!(
-            warning,
-            Some(StreamItem::Warning {
-                message: "careful".into()
-            })
-        );
-        assert_eq!(
-            usage,
-            Some(StreamItem::TokenUsage {
-                usage: TokenUsage {
-                    input_tokens: 1,
-                    output_tokens: 2,
-                    total_tokens: 3,
-                    cost_usd: 0.0,
-                }
-            })
-        );
-    }
-
-    #[test]
-    fn bridge_uses_buffered_output_when_turn_completed_payload_is_empty() {
-        let mut output_buf = String::new();
-        let mut emitted_agent_completion = false;
-        let _ = bridge_agent_event(
-            AgentEvent::MessageDelta {
-                text: "hello".into(),
-            },
-            &mut output_buf,
-            &mut emitted_agent_completion,
-        );
-        let completed = bridge_agent_event(
-            AgentEvent::TurnCompleted {
-                output: String::new(),
-            },
-            &mut output_buf,
-            &mut emitted_agent_completion,
-        );
-
-        assert_eq!(
-            completed,
-            Some(StreamItem::ItemCompleted {
-                item: Item::AgentReasoning {
-                    content: "hello".into()
-                }
-            })
-        );
-        assert!(output_buf.is_empty());
-    }
-
-    #[test]
-    fn bridge_suppresses_duplicate_turn_completed_after_agent_message_completion() {
-        let mut output_buf = String::new();
-        let mut emitted_agent_completion = false;
-        let item_completed = bridge_agent_event(
-            AgentEvent::ItemCompletedPayload {
-                item: Item::AgentReasoning {
-                    content: "done".into(),
-                },
-            },
-            &mut output_buf,
-            &mut emitted_agent_completion,
-        );
-        let turn_completed = bridge_agent_event(
-            AgentEvent::TurnCompleted {
-                output: "done".into(),
-            },
-            &mut output_buf,
-            &mut emitted_agent_completion,
-        );
-
-        assert_eq!(
-            item_completed,
-            Some(StreamItem::ItemCompleted {
-                item: Item::AgentReasoning {
-                    content: "done".into()
-                }
-            })
-        );
-        assert!(emitted_agent_completion);
-        assert_eq!(turn_completed, None);
-        assert!(output_buf.is_empty());
+        ] {
+            for force_code_agent in [true, false] {
+                ordinary_budget_case(policy.clone(), force_code_agent, false, false, true).await?;
+            }
+        }
+        Ok(())
     }
 }

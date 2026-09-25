@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use harness_core::config::isolation::IsolationTrustClass;
-use reqwest::header::{HeaderMap, ACCEPT, LINK, RETRY_AFTER, USER_AGENT};
+use reqwest::header::{HeaderMap, LINK, RETRY_AFTER};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -17,6 +17,8 @@ const DEFAULT_RATE_LIMIT_RETRY_SECS: i64 = 60;
 
 #[async_trait]
 pub(crate) trait DispatchedTaskChecker: Send + Sync {
+    // Kept for the persisted-dispatch reconciliation compatibility path below.
+    #[allow(dead_code)]
     async fn exists(&self, task_id: &TaskId) -> anyhow::Result<bool>;
 }
 
@@ -108,6 +110,7 @@ impl GitHubRateLimitThrottle {
 }
 
 impl GitHubIssuesPoller {
+    #[cfg(test)]
     pub fn new(
         repo_config: &harness_core::config::intake::GitHubRepoConfig,
         data_dir: Option<&Path>,
@@ -115,6 +118,7 @@ impl GitHubIssuesPoller {
         Self::new_with_token(repo_config, data_dir, None)
     }
 
+    #[cfg(test)]
     pub fn new_with_token(
         repo_config: &harness_core::config::intake::GitHubRepoConfig,
         data_dir: Option<&Path>,
@@ -218,10 +222,14 @@ impl GitHubIssuesPoller {
         }
     }
 
+    // Retained for explicit persisted-dispatch reconciliation; production intake
+    // currently wires the checker but does not invoke reconciliation automatically.
+    #[allow(dead_code)]
     fn is_synthetic_skip_marker(task_id: &TaskId) -> bool {
         task_id.0.starts_with("skip-")
     }
 
+    #[allow(dead_code)]
     async fn prune_missing_task_entries(&self) -> anyhow::Result<usize> {
         let Some(task_checker) = &self.task_checker else {
             return Ok(0);
@@ -262,6 +270,7 @@ impl GitHubIssuesPoller {
         Ok(stale_issue_ids.len())
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_dispatched_with_store(&self) -> anyhow::Result<usize> {
         self.prune_missing_task_entries().await
     }
@@ -404,6 +413,16 @@ struct GhIssue {
     created_at: Option<DateTime<Utc>>,
 }
 
+impl GhIssue {
+    fn external_id(&self) -> String {
+        if self.pull_request.is_some() {
+            format!("pr:{}", self.number)
+        } else {
+            self.number.to_string()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GhLabel {
     name: String,
@@ -426,20 +445,16 @@ fn parse_gh_output(
     project_root: Option<&std::path::Path>,
 ) -> anyhow::Result<ParsedGhOutput> {
     let issues: Vec<GhIssue> = serde_json::from_slice(json)?;
-    let issues: Vec<GhIssue> = issues
-        .into_iter()
-        .filter(|issue| issue.pull_request.is_none())
-        .collect();
-    let open_issue_ids: HashSet<String> = issues.iter().map(|i| i.number.to_string()).collect();
+    let open_issue_ids: HashSet<String> = issues.iter().map(GhIssue::external_id).collect();
     let new_issues = issues
         .into_iter()
         .filter(|issue| {
-            let issue_id = issue.number.to_string();
+            let issue_id = issue.external_id();
             !dispatched_contains_issue(dispatched, &issue_id)
         })
         .map(|issue| IncomingIssue {
             source: "github".to_string(),
-            external_id: issue.number.to_string(),
+            external_id: issue.external_id(),
             identifier: format!("#{}", issue.number),
             title: issue.title,
             description: issue.body,
@@ -474,7 +489,7 @@ fn github_issues_url(api_base_url: &str, repo: &str, label: &str) -> anyhow::Res
     Ok(url.to_string())
 }
 
-fn classify_author_association(author_association: Option<&str>) -> IsolationTrustClass {
+pub(crate) fn classify_author_association(author_association: Option<&str>) -> IsolationTrustClass {
     match author_association
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -507,13 +522,7 @@ async fn fetch_github_issue_page(
     repo: &str,
     github_token: Option<&str>,
 ) -> anyhow::Result<GitHubIssuePageFetch> {
-    let mut request = client
-        .get(url)
-        .header(ACCEPT, "application/vnd.github+json")
-        .header(USER_AGENT, "harness-server");
-    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
-        request = request.bearer_auth(token);
-    }
+    let request = crate::github_client::apply_github_headers(client.get(url), github_token);
     let response = request.send().await?;
     let status = response.status();
     if !status.is_success() {
@@ -638,7 +647,8 @@ impl IntakeSource for GitHubIssuesPoller {
     }
 
     async fn poll(&self) -> anyhow::Result<Vec<IncomingIssue>> {
-        self.poll_from_api_base_url("https://api.github.com").await
+        self.poll_from_api_base_url(&crate::github_client::github_api_base_url())
+            .await
     }
 
     async fn mark_dispatched(&self, external_id: &str, task_id: &TaskId) -> anyhow::Result<()> {
@@ -694,5 +704,40 @@ mod tests;
 mod rate_limit_tests;
 
 #[cfg(test)]
-#[path = "github_issues_trust_tests.rs"]
-mod trust_tests;
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn intake_trust_classifies_github_author_association() -> anyhow::Result<()> {
+        let parsed = parse_gh_output(
+            br##"[
+            {"number":1,"title":"Owner","body":null,"url":"u1","labels":[],"author_association":"OWNER","createdAt":null},
+            {"number":2,"title":"Member","body":null,"url":"u2","labels":[],"author_association":"MEMBER","createdAt":null},
+            {"number":3,"title":"Collaborator","body":null,"url":"u3","labels":[],"author_association":"COLLABORATOR","createdAt":null},
+            {"number":4,"title":"First timer","body":null,"url":"u4","labels":[],"author_association":"FIRST_TIME_CONTRIBUTOR","createdAt":null},
+            {"number":5,"title":"Missing association","body":null,"url":"u5","labels":[],"createdAt":null}
+        ]"##,
+            "owner/repo",
+            &DashMap::new(),
+            None,
+        )?;
+
+        let classes: Vec<_> = parsed
+            .new_issues
+            .into_iter()
+            .map(|issue| issue.author_trust_class)
+            .collect();
+
+        assert_eq!(
+            classes,
+            vec![
+                IsolationTrustClass::Trusted,
+                IsolationTrustClass::Trusted,
+                IsolationTrustClass::Trusted,
+                IsolationTrustClass::NonCollaborator,
+                IsolationTrustClass::NonCollaborator,
+            ]
+        );
+        Ok(())
+    }
+}

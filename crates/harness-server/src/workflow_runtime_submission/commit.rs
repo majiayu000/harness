@@ -1,7 +1,8 @@
 use super::{
-    depends_on_strings, insert_author_trust_class, merge_last_decision, optional_string_field,
-    string_field, IssueSubmissionRuntimeContext, PromptSubmissionRuntimeContext,
-    WorkflowSubmissionRuntimeRecord, EXECUTION_PATH_WORKFLOW_RUNTIME,
+    classify_submission_data, depends_on_strings, insert_author_trust_class, merge_last_decision,
+    optional_string_field, string_field, IssueSubmissionRuntimeContext,
+    PromptSubmissionRuntimeContext, WorkflowSubmissionRuntimeRecord,
+    EXECUTION_PATH_WORKFLOW_RUNTIME, GITHUB_ISSUE_PR_DEFINITION_ID, PROMPT_TASK_DEFINITION_ID,
 };
 use super::{
     prompt_memory::{cache_prompt_submission_prompt, remove_prompt_submission_prompt},
@@ -17,15 +18,41 @@ use harness_workflow::runtime::{
 };
 use serde_json::json;
 
-pub(super) async fn apply_decision(
+pub(super) fn decision_validator_for_instance(
+    store: &WorkflowRuntimeStore,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<DecisionValidator> {
+    match instance.definition_id.as_str() {
+        GITHUB_ISSUE_PR_DEFINITION_ID => Ok(DecisionValidator::github_issue_pr()),
+        PROMPT_TASK_DEFINITION_ID => Ok(DecisionValidator::prompt_task()),
+        other => store
+            .definition_registry()
+            .decision_validator_for_instance(instance)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "workflow definition `{other}` has an invalid definition pin: {error:?}"
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!("workflow definition `{other}` cannot be committed by submission")
+            }),
+    }
+}
+
+pub(super) async fn apply_decision<F, Fut>(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
     new_instance: bool,
     mut decision: WorkflowDecision,
     ctx: &IssueSubmissionRuntimeContext<'_>,
     accepted_data: serde_json::Value,
-) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
-    let validation_context = if instance.is_terminal() {
+    admission: F,
+) -> anyhow::Result<WorkflowSubmissionRuntimeRecord>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let validation_context = if instance.is_terminal_with_registry(store.definition_registry()) {
         ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
     } else {
         ValidationContext::new("workflow-policy", chrono::Utc::now())
@@ -57,8 +84,16 @@ pub(super) async fn apply_decision(
             DecisionValidator::github_issue_pr().validate(&instance, &decision, &validation_context)
         {
             let reason = error.to_string();
-            let rejected_instance = new_instance
-                .then(|| rejected_submission_instance(instance.clone(), accepted_data, &reason));
+            let rejected_instance = if new_instance {
+                Some(rejected_submission_instance(
+                    instance.clone(),
+                    accepted_data,
+                    &reason,
+                )?)
+            } else {
+                None
+            };
+            admission().await?;
             let outcome = store
                 .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
                     workflow_id: &instance.id,
@@ -98,7 +133,8 @@ pub(super) async fn apply_decision(
         committed_decision,
         accepted_data,
         preserves_applied_instance(&instance, existing_record.as_ref()),
-    );
+    )?;
+    admission().await?;
     let outcome = store
         .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
             workflow_id: &instance.id,
@@ -119,6 +155,15 @@ pub(super) async fn apply_decision(
         })
         .await?
         .ok_or_else(|| submission_commit_conflict(&instance.id))?;
+    if !outcome.record.accepted {
+        return Ok(WorkflowSubmissionRuntimeRecord {
+            workflow_id: instance.id,
+            accepted: false,
+            decision_id: outcome.record.id,
+            command_ids: Vec::new(),
+            rejection_reason: outcome.record.rejection_reason,
+        });
+    }
     Ok(WorkflowSubmissionRuntimeRecord {
         workflow_id: instance.id,
         accepted: true,
@@ -137,7 +182,7 @@ pub(super) async fn apply_prompt_decision(
     execution_policy: &super::runtime_models::PromptExecutionPolicy,
     accepted_data: serde_json::Value,
 ) -> anyhow::Result<WorkflowSubmissionRuntimeRecord> {
-    let validation_context = if instance.is_terminal() {
+    let validation_context = if instance.is_terminal_with_registry(store.definition_registry()) {
         ValidationContext::new("workflow-policy", chrono::Utc::now()).allow_terminal_reopen()
     } else {
         ValidationContext::new("workflow-policy", chrono::Utc::now())
@@ -169,8 +214,15 @@ pub(super) async fn apply_prompt_decision(
             DecisionValidator::prompt_task().validate(&instance, &decision, &validation_context)
         {
             let reason = error.to_string();
-            let rejected_instance = new_instance
-                .then(|| rejected_submission_instance(instance.clone(), accepted_data, &reason));
+            let rejected_instance = if new_instance {
+                Some(rejected_submission_instance(
+                    instance.clone(),
+                    accepted_data,
+                    &reason,
+                )?)
+            } else {
+                None
+            };
             let outcome = store
                 .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
                     workflow_id: &instance.id,
@@ -211,7 +263,7 @@ pub(super) async fn apply_prompt_decision(
         committed_decision,
         accepted_data,
         preserves_applied_instance(&instance, existing_record.as_ref()),
-    );
+    )?;
     let final_prompt_ref = optional_string_field(&final_instance.data, "prompt_ref");
     let prompt_payload_commits = final_prompt_ref.as_deref() == Some(prompt_ref.as_str());
     let previous_prompt_ref = optional_string_field(&instance.data, "prompt_ref");
@@ -243,6 +295,15 @@ pub(super) async fn apply_prompt_decision(
         })
         .await?
         .ok_or_else(|| submission_commit_conflict(&instance.id))?;
+    if !outcome.record.accepted {
+        return Ok(WorkflowSubmissionRuntimeRecord {
+            workflow_id: instance.id,
+            accepted: false,
+            decision_id: outcome.record.id,
+            command_ids: Vec::new(),
+            rejection_reason: outcome.record.rejection_reason,
+        });
+    }
     if prompt_payload_commits {
         cache_prompt_submission_prompt(&prompt_ref, ctx.prompt);
         remove_prompt_submission_prompt(previous_prompt_ref_to_remove);
@@ -335,21 +396,22 @@ fn accepted_submission_instance(
     decision: &WorkflowDecision,
     accepted_data: serde_json::Value,
     preserve_current: bool,
-) -> WorkflowInstance {
+) -> anyhow::Result<WorkflowInstance> {
     if preserve_current {
-        return instance;
+        return Ok(instance);
     }
     instance.state = decision.next_state.clone();
     instance.version = instance.version.saturating_add(1);
-    instance.data = merge_last_decision(accepted_data, &decision.decision);
-    instance
+    let data = merge_last_decision(accepted_data, &decision.decision);
+    classify_submission_data(&mut instance, data)?;
+    Ok(instance)
 }
 
 fn rejected_submission_instance(
     mut instance: WorkflowInstance,
     mut rejected_data: serde_json::Value,
     reason: &str,
-) -> WorkflowInstance {
+) -> anyhow::Result<WorkflowInstance> {
     instance.state = "failed".to_string();
     instance.version = instance.version.saturating_add(1);
     if let Some(data) = rejected_data.as_object_mut() {
@@ -359,8 +421,9 @@ fn rejected_submission_instance(
             json!(chrono::Utc::now().to_rfc3339()),
         );
     }
-    instance.data = merge_last_decision(rejected_data, "submission_rejected");
-    instance
+    let data = merge_last_decision(rejected_data, "submission_rejected");
+    classify_submission_data(&mut instance, data)?;
+    Ok(instance)
 }
 
 fn preserves_applied_instance(

@@ -9,410 +9,398 @@ GH-1732
 See `specs/GH1732/product.md`.
 
 <!-- specrail-planned-changes
-{"issue":1732,"complete":true,"paths":["crates/harness-core/src/config/workflow.rs","crates/harness-server/src/http/tests/runtime_worker_tests.rs","crates/harness-server/src/workflow_runtime_worker/executor.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance_tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet_activity_policy_tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet_tests.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014"]}
+{"issue":1732,"complete":true,"paths":["crates/harness-server/src/http/background/runtime_profiles.rs","crates/harness-server/src/http/tests/runtime_worker_tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance_tests.rs","crates/harness-server/src/workflow_runtime_worker/prompt_packet/fixtures/model_facing_prompt_v1.txt","crates/harness-server/src/workflow_runtime_worker/prompt_packet_tests.rs","crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs"],"spec_refs":["B-001","B-002","B-003","B-004","B-005","B-006","B-007","B-008","B-009","B-010","B-011","B-012","B-013","B-014","B-015","B-016"]}
 -->
 
 ## Current System
 
-- `crates/harness-server/src/workflow_runtime_worker/prompt_packet.rs:26-97`
-  builds one JSON prompt packet from runtime job, workflow instance, project
-  roots, runtime profile, effective workflow document, selected repo memory,
-  activity policy, and continuation context.
-- `prompt_packet.rs:49-87` serializes runtime profile, workflow file content,
-  command input, runtime contract, result schema, and structured-output
-  requirements without source-level provenance.
-- `prompt_packet.rs:88-90` includes selected repo-memory representations only
-  when retrieval returned records.
-- `prompt_packet.rs:756-769` hashes the complete packet and emits the existing
-  compact `runtime_prompt_packet` activity artifact.
-- `crates/harness-server/src/workflow_runtime_worker/executor.rs:124-159`
-  retrieves repo memory, builds the packet, hashes it, records prompt
-  preparation, and only then constructs and executes the agent prompt.
-- `executor.rs:298-317` persists `RuntimePromptPrepared` with the packet digest
-  and complete packet in one runtime event.
-- `executor.rs:99-147` resolves sandbox, model, reasoning effort, and approval
-  separately from the `RuntimeProfile` serialized into the packet. It also
-  resolves durable prompt-task text before packet construction but appends
-  that text only after the packet has already been hashed and recorded.
-- `crates/harness-agents/src/claude.rs:75-83` resolves an omitted request model
-  from execution phase and `ReasoningBudget`, but `executor.rs` currently
-  derives execution phase only after recording the packet.
-- `crates/harness-server/src/http/tests/runtime_worker_tests.rs:103-107`
-  asserts the durable prompt packet's current v1 schema and must move with the
-  intentional packet-schema bump.
-- `crates/harness-server/src/workflow_runtime_worker/repo_memory_prompt.rs:16-68`
-  returns either selected records or explicit retrieval-degradation evidence;
-  it does not fabricate records on failure.
-- `crates/harness-workflow/src/runtime/memory_retrieval.rs:26-30` gives selected
-  memory its durable record and estimated token count.
-- `crates/harness-workflow/src/runtime/model.rs:469-484` defines declared
-  runtime-profile fields, some of which may be absent and resolved from server
-  or workflow defaults at launch.
-- `crates/harness-core/src/config/workflow.rs:15-23` defines effective workflow
-  config, prompt template, and one display-oriented `source_path`. The loader
-  can combine central and repository files into a string, so this field cannot
-  truthfully preserve each source by itself.
-- `prompt_packet.rs` is currently 794 lines, so new provenance logic cannot be
-  added inline without violating the repository's 800-line ceiling.
+PR #1813 introduced durable v2 prompt packets and context provenance, then
+merged with review findings and related coverage gaps unresolved:
+
+- `crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance.rs:187-204`
+  interpolates the exact profile name into a runtime locator. ASC-001 runtime
+  locators accept a constrained logical-segment grammar, while
+  `RuntimeProfile` accepts arbitrary names. Existing names such as
+  `planning profile`, Unicode, an empty string, and UUID-shaped text can
+  therefore abort packet construction. Some multi-segment names such as
+  `team/codex` already validate and must keep their existing identity.
+- `context_provenance_tests.rs:155-157` fixes the existing valid
+  `codex-default` component ID as
+  `runtime:agent_runtime:runtime_profile/codex-default`. Hashing every profile
+  name would migrate that identity without a provenance-schema version change.
+- `context_provenance.rs:156-164` removes three audit sections from the
+  model-facing clone but leaves its schema as v2. The durable packet is
+  correctly v2, but the rendered packet bytes no longer match the v1
+  model-facing contract required by B-014.
+- `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs:40-58`
+  has only `Explicit` and `UnobservedAgentDefault` approval states, and
+  `runtime_profile.rs:108-111` chooses the latter whenever the profile omits a
+  policy. That claim is correct only for Codex; Claude Code and Anthropic API
+  do not support this profile field.
+- `crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance_tests.rs:715-744`
+  currently treats an arbitrary profile name as required-provenance failure.
+  The file is already 798 lines, so additive fixtures would cross the
+  repository's 800-line hard ceiling.
+- `context_provenance_tests.rs:771-798` verifies that audit fields are absent
+  from the rendered prompt, but does not assert the model-facing schema,
+  historical removal of `workflow_file.prompt_template`, or exact
+  v1-compatible prompt bytes. Deriving an expected packet from the new v2
+  packet would share the implementation's field drift and is not an
+  independent oracle.
+- `context_provenance_tests.rs:716-768` proves only that the packet builder
+  returns an error for a corrupted source digest. It does not prove that the
+  executor records no `RuntimePromptPrepared` event and starts no agent.
+- `crates/harness-server/src/http/background/runtime_profiles.rs:202-209` and
+  `:394-407` silently convert explicitly configured approval policy to `None`
+  for unsupported runtime kinds. That contradicts B-016 and hides invalid
+  operator configuration before `runtime_profile.rs` can reject it.
+
+The durable v2 packet, packet digest, activity artifact, selected-source
+provenance, redaction, ordering, and runtime-setting launch parity are the
+implemented B-001 through B-013 baseline. The remediation preserves that
+baseline and corrects its compatibility, identity, failure-boundary, and
+capability-validation gaps.
 
 ## Proposed Design
 
-### Focused Provenance Module
+### Implemented Provenance Baseline
 
-Add `prompt_packet/context_provenance.rs` and declare it as a private submodule
-from `prompt_packet.rs`. The module owns:
+Keep the existing focused private
+`prompt_packet/context_provenance.rs` module and the canonical ASC-001 types from
+`harness_core::stack`. The module owns the v1 provenance envelope, ordered
+validated components, safe locators, source digests, prompt-task binding, and
+closed coverage declarations. It remains an internal prompt-packet boundary,
+not a new protocol DTO.
 
-- `CONTEXT_PROVENANCE_SCHEMA`;
-- construction of `ContextProvenance`;
-- normalized digest helpers for runtime profile, workflow document, and memory;
-- prompt-task reference/text binding without raw-text duplication;
-- safe source-locator normalization;
-- coverage declarations for context not observed by Harness.
+Keep `ResolvedRuntimeSettings` as the single value shared by provenance and
+agent launch. It records profile name, runtime kind, execution phase, model,
+reasoning effort, sandbox, approval resolution, max turns, timeout, and stall
+timeout after profile/workflow/server fallback. Claude phase-derived defaults,
+explicit overrides, and lifecycle launch values continue to use this same
+resolved value.
 
-Use ASC-001 types from `harness_core::stack`; do not copy component, source,
-trust, freshness, capability, or selection enums into the server crate.
-Provenance has a private serializable envelope containing the schema,
-ordered validated `AgentStackComponent` entries, and a closed list of coverage
-limitations.
+Keep the implemented source model:
 
-This is an internal domain boundary, not a `harness-protocol` response
-contract. `harness_core::stack` is intentionally the canonical cross-crate
-Agent Stack model established by ASC-001, so protocol-local duplicate newtypes
-would weaken that contract. `build_runtime_prompt_packet` continues to return
-its existing private `serde_json::Value`; this issue adds no response DTO or
-external consumer contract.
+- runtime settings are the first `agent_runtime` entry;
+- retained central and repository workflow sources remain ordered and retain
+  exact-content digests without exposing unsafe absolute paths;
+- the effective workflow document, or explicit defaults when no source exists,
+  uses canonical config plus prompt-template hashing;
+- selected repo-memory records preserve retrieval order, safe metadata, and the
+  digest of their redacted packet representation without duplicating payloads;
+- prompt-task text is bound by durable reference plus exact-text SHA-256 without
+  copying raw task text into provenance;
+- independently loaded agent CLI, MCP, user-global, and provider context remains
+  explicitly `not_observed_by_harness`.
 
-### Shared Resolved Runtime Settings
+The durable v2 packet continues to nest provenance and resolved settings before
+the existing packet digest is computed. `RuntimePromptPrepared` atomically
+persists the complete packet and digest, and the activity artifact carries the
+same schema and digest. Any provenance validation or serialization failure
+propagates before hashing, event persistence, prompt rendering, or agent
+launch. Deterministic rebuild and order-sensitivity fixtures remain the
+acceptance evidence for repeat/replay behavior.
 
-Add private `ResolvedRuntimeSettings` in `runtime_profile.rs`. One resolver
-accepts the already timeout-adjusted `RuntimeProfile`, `RuntimeKind`, derived
-`ExecutionPhase`, and complete server agent and concurrency configuration and
-returns the final profile name, kind, execution phase, model, reasoning effort,
-sandbox, approval policy, max-turns, timeout, and effective stall timeout.
-`executor.rs` derives activity and execution phase before packet construction,
-creates this value once, passes it to packet/provenance construction, and uses
-the same launch fields for `TurnLifecycleOptions` and agent request
-construction. The resolver normalizes
-`server.config.concurrency.stall_timeout_secs` into the resolved value, and the
-executor passes that resolved stall timeout explicitly through
-`TurnLifecycleOptions.stall_timeout_secs`, so the lifecycle no longer re-reads
-server configuration after `RuntimePromptPrepared` is recorded.
-`max_turns` is copied from the effective profile already enforced by the
-workflow runtime; it is evidence, not a second enforcement point. Existing
-validation helpers become implementation details of this single resolver.
+### Deterministic Profile Locator
 
-Model resolution is exact: explicit profile model wins; otherwise Codex uses
-`agents.codex.default_model`, Claude uses
-`agents.claude.reasoning_budget.model_for_phase(execution_phase)` when both
-values exist and falls back to `agents.claude.default_model`, and Anthropic API
-uses `agents.anthropic_api.default_model`. Reasoning effort is the explicit
-profile value when supported; otherwise Codex uses its configured default,
-Claude uses `execution_phase.effort_level()` when a phase exists, and Anthropic
-API records no unsupported effort value. Passing the resolved model and effort
-explicitly to `TurnLifecycleOptions` makes the existing agent implementations
-take those values before any internal default or phase fallback, so provenance
-and launch cannot diverge.
+In `context_provenance.rs`, first construct the historical locator:
 
-Approval policy is truthful, not guessed. When the profile supplies
-`approval_policy`, the resolver records it and the executor passes it
-explicitly to launch. When a Codex profile omits it, `CodexAgent::base_args`
-emits no override and the Codex CLI resolves the effective policy from its own
-independently loaded configuration, so no server-side final value exists;
-the resolved settings then record the approval policy as explicitly unset
-(`None` serialized as a distinct `unobserved` marker, never a fabricated
-default), and the `agent_cli_context_not_observed` coverage marker documents
-that the effective policy lives outside Harness observation.
+```text
+runtime_profile/<exact profile name>
+```
 
-The packet retains the declared/effective `runtime_profile` section for
-compatibility and adds `resolved_runtime_settings`. Provenance hashes canonical
-JSON of only the resolved value. No launch field is recomputed after the
-packet is recorded.
+If `AgentStackSource::new` accepts it, use that source unchanged. This preserves
+existing component IDs such as
+`runtime:agent_runtime:runtime_profile/codex-default` and valid multi-segment
+names such as `runtime_profile/team/codex`.
 
-The resolver rejects `timeout_secs = 0` with a typed error before packet
-construction. Positive values pass unchanged to both provenance and
-`TurnLifecycleOptions`; the lifecycle's defensive minimum no longer changes a
-value accepted from this path.
+Only when the historical locator fails ASC-001 validation, derive:
 
-### Workflow Source Preservation
+```text
+runtime_profile_name_sha256/<lowercase SHA-256 of exact UTF-8 profile-name bytes>
+```
 
-Extend `WorkflowDocument` with an observation-only, serde-skipped ordered
-source list. Each source records whether it is the central base or repository
-override, its original path for in-process classification, and SHA-256 of the
-exact file bytes read. `load_workflow_document_with_base` retains central then
-repository order while preserving the existing merged config, prompt template,
-and compatibility `source_path`.
+Use the existing `Sha256Digest::from_bytes` helper. The separate
+`runtime_profile_name_sha256` namespace makes the fallback disjoint from every
+historical `runtime_profile/...` locator, including a valid profile literally
+named `name_sha256_<digest>`. The complete digest avoids normalization
+collisions and keeps the fallback deterministic.
 
-The provenance builder emits:
+The locator is an audit identity, not a replacement for the setting value.
+`ResolvedRuntimeSettings.profile_name` continues to serialize the exact
+configured string without trimming, case folding, Unicode normalization,
+escaping, or replacement. The resolved-settings digest therefore remains
+sensitive to the exact name. The fallback locator does not copy the invalid raw
+name; already-valid historical locators remain readable and stable.
 
-- one runtime-scoped central-source entry whose locator contains a digest of
-  the canonical path rather than the absolute path;
-- one repository-scoped `WORKFLOW.md` entry when the repository file exists;
-- one runtime-scoped effective-document entry whose digest covers normalized
-  merged config and prompt template; or
-- one runtime-scoped defaults entry when no configured source exists.
+The named fixture freezes existing component IDs and known SHA-256 outputs. It
+includes an empty name, leading/trailing whitespace pairs, case-distinct invalid
+names, invalid slash shapes, UUID-shaped text, and NFC/NFD Unicode pairs.
+Expected digests are literal vectors produced from the exact bytes, not values
+computed by the helper under test.
 
-Configured-versus-default classification comes from the source list, never
-from whether the display path can be normalized relative to the project.
+### Durable v2 and Model-Facing v1
 
-`prompt_packet.rs` calls the module once after creating the base packet fields
-and before activity policy or final hashing:
+Keep `RUNTIME_PROMPT_PACKET_SCHEMA` and every persisted prompt packet/activity
+artifact on `harness.runtime.prompt_packet.v2`. In
+`strip_model_facing_audit_sections`, after removing
+`context_provenance`, `resolved_runtime_settings`, and
+`prompt_task_request`, set the cloned packet's `schema` to the existing
+`HISTORICAL_PROMPT_PACKET_SCHEMA_V1` constant.
 
-1. define one `RUNTIME_PROMPT_PACKET_SCHEMA` constant with value
-   `harness.runtime.prompt_packet.v2`, and use it for both the newly produced
-   packet and `workflow_prompt_artifact`;
-2. build provenance from `runtime_profile`, `workflow_document`, selected
-   `repo_memory`, resolved runtime settings, and the already constructed packet
-   sections;
-3. serialize it through `serde_json::to_value` with contextual error handling;
-4. assign `packet["context_provenance"]`;
-5. continue existing activity-policy and continuation processing.
+`build_runtime_job_prompt` continues to remove
+`workflow_file.prompt_template` before `pretty_json` and append a non-empty
+template once after the packet section. Only the model-facing clone changes.
+The durable packet keeps the template, provenance, resolved settings, v2 schema,
+digest, event, and activity artifact.
 
-Any validation or serialization error propagates from
-`build_runtime_prompt_packet`. The caller therefore does not hash, record, or
-execute an incomplete packet.
+Add
+`prompt_packet/fixtures/model_facing_prompt_v1.txt`, generated from pre-v2
+commit `f55eea8bb6f3355fecea2696d71e45501f973c16` with documented fixed job and
+command IDs, fixed roots/profile/input, no memory, and a non-empty prompt
+template. The fixture contains the complete historical prompt bytes. The named
+regression test builds the current durable v2 packet from the same deterministic
+inputs and compares the complete rendered prompt directly with `include_str!`.
+It must not clone the v2 packet to derive the expected value and must not call
+the stripping helper to construct its oracle. The test separately asserts that
+the durable packet remains v2 and retains all audit fields and the template,
+while the rendered packet JSON is v1, excludes the template and audit fields,
+and appends the template exactly once.
 
-### Source Entries
+### Runtime-Aware Approval Resolution
 
-Resolved runtime settings:
+Extend private `ResolvedApprovalPolicy` in `runtime_profile.rs` with
+`NotApplicable`, serialized by the existing tagged snake_case representation
+as:
 
-- kind `agent_runtime`;
-- runtime-scoped locator `runtime-profile/<profile name>`;
-- ID from the ASC-001 helper:
-  `runtime:agent_runtime:runtime-profile/<profile name>`;
-- digest of canonical serde JSON for `ResolvedRuntimeSettings`;
-- reason `workflow_runtime_profile_selected`;
-- observation/trust `runtime_observed`;
-- selection `loaded`;
-- order 0.
+```json
+{"resolution":"not_applicable"}
+```
 
-Workflow sources and effective document:
+Resolution is a closed runtime-kind decision:
 
-- all four entry forms have kind `workflow` and derive their IDs through the
-  ASC-001 helper;
-- a central source uses runtime locator
-  `workflow-source/central/<canonical-path-sha256>` and therefore ID
-  `runtime:workflow:workflow-source/central/<canonical-path-sha256>`;
-- a repository source uses repository locator `WORKFLOW.md` and ID
-  `repository:workflow:WORKFLOW.md`;
-- the normalized effective document uses runtime locator
-  `workflow-document/effective` and ID
-  `runtime:workflow:workflow-document/effective`;
-- defaults use runtime locator `workflow-document/defaults` and ID
-  `runtime:workflow:workflow-document/defaults`;
-- central and repository source entries use the ordered source facts retained
-  by `WorkflowDocument`;
-- source digests cover exact bytes read, while the effective-document digest
-  covers canonical JSON containing merged `config` and `prompt_template`;
-- the defaults entry digest covers the same canonical JSON shape as the
-  effective document — normalized default `WorkflowConfig` plus the empty
-  prompt template — so conforming producers emit identical defaults digests
-  and any change to behavior-affecting defaults changes this digest;
-- central absolute paths are represented only by a runtime-scoped path digest;
-- the repository source uses the normalized `WORKFLOW.md` locator;
-- reasons distinguish `workflow_base_selected`,
-  `workflow_repository_selected`, `workflow_document_effective`, and
-  `workflow_defaults_selected`;
-- observation/trust are `runtime_observed`, selection is `loaded`, and orders
-  follow the runtime entry then central source, repository source, effective
-  document, and memory records.
+| Runtime kind | Explicit profile policy | Omitted profile policy |
+| --- | --- | --- |
+| `CodexExec`, `CodexJsonrpc` | `Explicit { value }` after existing validation | `UnobservedAgentDefault` |
+| `ClaudeCode`, `AnthropicApi` | Typed rejection | `NotApplicable` |
+| `RemoteHost` | Typed rejection before local settings resolution | Existing local-resolution rejection; no resolved settings |
 
-Repo memory:
+`explicit_value()` returns `None` for both non-explicit variants. The two
+variants remain distinct in serialized provenance: unobserved means an
+effective value may be selected outside Harness, while not applicable means no
+approval-policy setting participates in launch.
 
-- kind `memory`;
-- runtime locator `repo-memory/<durable record ID>` and canonical ID
-  `runtime:memory:repo-memory/<durable record ID>`;
-- digest of the exact redacted JSON representation returned by
-  `repo_memory_prompt_value`, scoped to that record;
-- safe metadata fields for durable ID, optional evidence reference, and
-  estimated token count stored in the provenance entry's typed metadata
-  extension defined by this module, not in the ASC-001 component;
-- reason `repo_memory_selected`;
-- observation `runtime_observed`, trust `self_declared`;
-- selection `loaded`;
-- order immediately after the final workflow entry, preserving memory selection
-  order.
+### Dispatch Policy Validation
 
-The module never copies raw memory payload into provenance. The payload remains
-only in the existing packet memory section. On retrieval failure, the input
-record list is empty and no memory entry is emitted; the existing degradation
-artifact remains the failure evidence.
+In `http/background/runtime_profiles.rs`, make both top-level dispatch-policy
+resolution and nested profile-override resolution return an error when the
+operator explicitly supplies `approval_policy` for `ClaudeCode`,
+`AnthropicApi`, or `RemoteHost`. Do not use `runtime_kind_supports_approval_policy`
+to silently turn an explicit value into `None`.
 
-### Dynamic Payload and Coverage
+An omitted policy remains capability-aware. Codex profiles may inherit a Codex
+policy; non-Codex profiles carry no policy into `RuntimeProfile` and resolve to
+`NotApplicable` where local settings are supported. When an override changes
+from Codex to a non-Codex kind without declaring a policy, do not inherit the
+Codex-only base value and do not report an error. The distinction is explicit:
+unsupported operator input is rejected, while an inapplicable inherited field
+is not propagated.
 
-Do not create reusable context components for workflow instance, command input,
-prompt-task request, activity result schema, or continuation payload. They are
-per-invocation packet sections and remain covered by the enclosing packet
-digest.
+Table-driven tests cover explicit policy at the top-level and nested override
+paths for all three non-Codex kinds, plus a kind-switch fixture proving that an
+omitted non-Codex policy does not inherit a Codex value.
 
-Pass `prompt_task_request.prompt_text()` into `build_runtime_prompt_packet`.
-When present, add a redacted `prompt_task_request` packet section containing
-the existing non-empty `prompt_ref` and lowercase SHA-256 of the exact UTF-8
-task text. Do not place raw task text in the packet or provenance. The existing
-`build_runtime_job_prompt` appends that same text after packet rendering, so
-prompt semantics remain unchanged while the recorded packet digest becomes
-sensitive to the text actually executed.
+### Executor Failure Boundary
 
-Audit metadata never reaches the model. `build_runtime_job_prompt` already
-renders a clone of the packet with `workflow_file.prompt_template` removed;
-extend that same model-facing clone to also strip the audit-only
-`context_provenance`, `resolved_runtime_settings`, and `prompt_task_request`
-sections before rendering. The durable packet persisted in
-`RuntimePromptPrepared` keeps all of these fields; only the model-facing
-rendering excludes them, so the agent-visible prompt bytes for unchanged
-inputs are identical to today's v1 rendering and B-014 holds.
+Keep the corrupted workflow-source digest builder test as direct evidence that a
+real provenance construction error is returned. Add a separate, job-scoped
+`#[cfg(test)]` failure marker in `apply_context_provenance` so a worker test can
+inject the same error boundary without global state or parallel-test races. The
+marker has no production build behavior and returns a named provenance error
+before packet mutation or serialization.
 
-Add closed coverage markers for:
+In `http/tests/runtime_worker_tests.rs`, enqueue a job carrying that test-only
+marker and run the real workflow-runtime worker with a registered recording
+agent and isolated PostgreSQL database. Assert that the job fails with the
+injected provenance error, no event has type `RuntimePromptPrepared`, and the
+agent received zero prompts/turn invocations. This exercises the actual
+executor ordering without modifying `executor.rs`.
 
-- `agent_cli_context_not_observed`;
-- `mcp_host_context_not_observed`;
-- `user_global_context_not_observed`;
-- `model_provider_context_not_observed`.
+### Test Restructuring and File Ceiling
 
-These markers prevent consumers from treating absence as a proof. They contain
-no guessed file paths or values.
+In `context_provenance_tests.rs`, remove the obsolete invalid-profile-name
+failure case, retain the corrupted workflow digest case, and replace the old
+audit-field-only prompt fixture with
+`profile_locator_preserves_valid_identity_and_hashes_invalid_exact_bytes`.
 
-### Deterministic Hashing
+Put the larger frozen-prompt compatibility test in the existing
+`prompt_packet_tests.rs`, backed by the read-only fixture file, rather than
+embedding the golden bytes in the near-ceiling provenance test module. Put the
+closed runtime-kind resolution and explicit rejection matrices in
+`runtime_profile.rs`; put dispatch-policy rejection/inheritance fixtures beside
+their helpers in `runtime_profiles.rs`; put the executor-boundary assertion in
+the existing runtime worker integration test file.
 
-Reuse `serde_json::to_vec` plus SHA-256 for individual normalized sources.
-Source structs use deterministic field order and no unordered maps. Repo-memory
-entry order is the existing retrieval order. The complete packet digest
-continues to cover provenance, activity policy, continuation context, and all
-dynamic payloads.
+After rustfmt, `context_provenance_tests.rs` must remain below 800 lines.
+Keep `prompt_packet_tests.rs` below 800 lines as well. Delete or restructure
+obsolete fixture code; do not suppress dead code, duplicate the golden bytes, or
+weaken assertions.
 
-Do not reuse the current `prompt_packet_digest` fail-soft empty-vector fallback
-for source digests. Provenance serialization is required evidence and returns
-an error on failure. A later implementation may harden the existing packet
-helper separately; this issue does not silently change its public behavior.
+## Authorized Implementation Surface
 
-### Test Layout
+| Path | Change |
+| --- | --- |
+| `crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance.rs` | Preserve valid historical locators, add the disjoint exact-byte hash fallback, restore v1 only on the model-facing clone, and provide the job-scoped test-only failure marker. |
+| `crates/harness-server/src/workflow_runtime_worker/prompt_packet/context_provenance_tests.rs` | Replace obsolete fixtures with the B-012 builder and B-015 identity/hash tests while staying below 800 lines. |
+| `crates/harness-server/src/workflow_runtime_worker/prompt_packet_tests.rs` | Compare the current model-facing prompt with the independent frozen pre-v2 fixture and assert durable/model separation. |
+| `crates/harness-server/src/workflow_runtime_worker/prompt_packet/fixtures/model_facing_prompt_v1.txt` | Store the complete fixed-input prompt bytes produced by pre-v2 commit `f55eea8b`. |
+| `crates/harness-server/src/workflow_runtime_worker/runtime_profile.rs` | Add `NotApplicable`, resolve omitted policies by runtime kind, and close omitted/explicit runtime-kind matrices. |
+| `crates/harness-server/src/http/background/runtime_profiles.rs` | Reject explicitly configured non-Codex approval policy without inheriting Codex policy across a kind switch; add focused tests. |
+| `crates/harness-server/src/http/tests/runtime_worker_tests.rs` | Prove an injected provenance failure records no prompt event and starts no agent. |
 
-Keep new tests in
-`prompt_packet/context_provenance_tests.rs` and include them from the provenance
-module. Existing `prompt_packet_tests.rs` assertions remain unchanged except
-where full packet fixtures must acknowledge the additive field.
-
-Tests construct real `RuntimeProfile`, `WorkflowDocument`, and
-`RetrievedRepoMemoryRecord` values, then assert complete provenance entries,
-absence of duplicated payloads, coverage markers, stable ordering, source
-digest sensitivity, and packet digest sensitivity.
-
-Keep `prompt_packet.rs` at or below the repository's 800-line hard ceiling by
-placing construction, hashing, and prompt-task binding helpers in the focused
-submodule; the parent module contains only the minimal call sites and wiring.
+No Cargo, database, protocol, workflow configuration, `executor.rs`,
+`prompt_packet.rs`, or high-context file change is authorized.
 
 ## Data Flow
 
-Resolved runtime settings + ordered workflow source facts/effective document +
-selected repo-memory records → validated ordered provenance → prompt-task
-reference/text digest binding → nested packet fields → existing activity
-policy/continuation enrichment → existing packet SHA-256 →
-`RuntimePromptPrepared { prompt_packet_digest, prompt_packet }` → agent prompt
-using the same resolved settings and prompt-task text.
+Exact profile name → preserve valid historical locator or use disjoint
+exact-byte hash fallback + unchanged `resolved_runtime_settings.profile_name` →
+durable v2 packet and digest → model-facing clone strips audit fields and
+prompt template, resets schema to v1, then appends the template once → frozen
+pre-v2 agent prompt contract.
 
-Failure before packet completion returns an error and prevents the runtime
-event and agent execution.
+Runtime kind + explicitly declared/omitted approval policy → dispatch
+validation → direct runtime-setting validation → one of `Explicit`,
+`UnobservedAgentDefault`, `NotApplicable`, or a typed rejection → the same
+serialized resolved settings feed provenance and launch.
+
+Injected test-only provenance failure → packet construction error → failed
+runtime job with no `RuntimePromptPrepared` event → zero agent invocations.
 
 ## Product-to-Test Mapping
 
 | Behavior invariant | Implementation area | Verification |
 | --- | --- | --- |
-| B-001 | shared v2 packet/artifact schema plus provenance insertion | `cargo test -p harness-server context_provenance_tests::v2_packet_and_artifact_share_schema_and_v1_remains_historical --lib`; `cargo test -p harness-server runtime_job_worker_tick_runs_registered_agent_and_completes_job --lib` |
-| B-002 | constructor inputs and no inventory fallback | `cargo test -p harness-server context_provenance_tests::provenance_contains_only_runtime_selected_sources --lib` |
-| B-003 | ASC-001 component construction and ordered entry wrapper | `cargo test -p harness-server context_provenance_tests::all_provenance_entries_validate_against_stack_component_contract --lib` |
-| B-004 | phase-first single resolved-settings construction/use | `cargo test -p harness-server context_provenance_tests::claude_phase_defaults_and_explicit_overrides_match_agent_launch_provenance --lib`; `cargo test -p harness-server context_provenance_tests::provenance_and_agent_launch_share_resolved_runtime_settings_and_reject_zero_timeout --lib` |
-| B-005 | retained source list and workflow builders | `cargo test -p harness-server context_provenance_tests::central_repository_merged_and_default_workflows_have_truthful_provenance --lib` |
-| B-006 | repo-memory source builder | `cargo test -p harness-server context_provenance_tests::selected_memory_order_and_safe_metadata_are_preserved --lib` |
-| B-007 | empty memory input and existing degradation boundary | `cargo test -p harness-server context_provenance_tests::missing_memory_records_are_not_fabricated --lib`; `cargo test -p harness-server repo_memory_prompt --lib` |
-| B-008 | dynamic-payload and prompt-task binding | `cargo test -p harness-server context_provenance_tests::prompt_task_text_is_digest_bound_without_becoming_context --lib` |
-| B-009 | closed coverage markers | `cargo test -p harness-server context_provenance_tests::manifest_declares_unobserved_external_context --lib` |
-| B-010 | redacted entry serialization | `cargo test -p harness-server context_provenance_tests::provenance_does_not_duplicate_memory_payload_or_secret_values --lib` |
-| B-011 | ordering and digest fixtures | `cargo test -p harness-server context_provenance_tests::provenance_and_packet_digests_are_repeatable_and_order_sensitive --lib` |
-| B-012 | fallible builder boundary | `cargo test -p harness-server context_provenance_tests::invalid_required_provenance_aborts_packet_construction --lib` |
-| B-013 | RuntimePromptPrepared and activity-artifact persistence path | `cargo test -p harness-server runtime_job_worker_tick_runs_registered_agent_and_completes_job --lib` |
-| B-014 | existing behavior and workspace suites | `cargo test --workspace`; `git diff --name-only origin/main...HEAD` |
+| B-001 | Existing v2 durable packet and provenance validation | `cargo test -p harness-server context_provenance_tests::v2_packet_and_artifact_share_schema_and_v1_remains_historical --lib`; isolated-DB `cargo test -p harness-server runtime_job_worker_tick_runs_registered_agent_and_completes_job --lib` |
+| B-002 | Existing selected-source constructor boundary | `cargo test -p harness-server context_provenance_tests::provenance_contains_only_runtime_selected_sources --lib` |
+| B-003 | ASC-001 validation plus stable valid-profile identity | `cargo test -p harness-server context_provenance_tests::all_provenance_entries_validate_against_stack_component_contract --lib`; `cargo test -p harness-server context_provenance_tests::profile_locator_preserves_valid_identity_and_hashes_invalid_exact_bytes --lib` |
+| B-004 | Shared settings, Claude phase/default parity, and capability-aware approval resolution | `cargo test -p harness-server context_provenance_tests::claude_phase_defaults_and_explicit_overrides_match_agent_launch_provenance --lib`; `cargo test -p harness-server context_provenance_tests::provenance_and_agent_launch_share_resolved_runtime_settings_and_reject_zero_timeout --lib`; `cargo test -p harness-server runtime_profile::tests::approval_policy_resolution_matches_runtime_capability_matrix --lib` |
+| B-005 | Existing retained workflow-source builders | `cargo test -p harness-server context_provenance_tests::central_repository_merged_and_default_workflows_have_truthful_provenance --lib` |
+| B-006 | Existing repo-memory source builder | `cargo test -p harness-server context_provenance_tests::selected_memory_order_and_safe_metadata_are_preserved --lib` |
+| B-007 | Missing-memory and retrieval-degradation boundary | `cargo test -p harness-server context_provenance_tests::missing_memory_records_are_not_fabricated --lib`; `cargo test -p harness-server repo_memory_prompt::tests::memory_flag_degraded_enabled_store_unavailable_records_degradation --lib` |
+| B-008 | Existing prompt-task digest binding | `cargo test -p harness-server context_provenance_tests::prompt_task_text_is_digest_bound_without_becoming_context --lib` |
+| B-009 | Existing closed coverage markers | `cargo test -p harness-server context_provenance_tests::manifest_declares_unobserved_external_context --lib` |
+| B-010 | Existing redacted serialization | `cargo test -p harness-server context_provenance_tests::provenance_does_not_duplicate_memory_payload_or_secret_values --lib` |
+| B-011 | Deterministic rebuild/replay, order sensitivity, and exact-byte locator vectors | `cargo test -p harness-server context_provenance_tests::provenance_and_packet_digests_are_repeatable_and_order_sensitive --lib`; `cargo test -p harness-server context_provenance_tests::profile_locator_preserves_valid_identity_and_hashes_invalid_exact_bytes --lib` |
+| B-012 | Real builder failure plus executor fail-closed ordering | `cargo test -p harness-server context_provenance_tests::invalid_required_provenance_aborts_packet_construction --lib`; isolated-DB `cargo test -p harness-server provenance_failure_prevents_prompt_event_and_agent_start --lib` |
+| B-013 | Runtime worker event/artifact linkage | isolated-DB `cargo test -p harness-server runtime_job_worker_tick_runs_registered_agent_and_completes_job --lib` |
+| B-014 | Independent frozen v1 complete-prompt compatibility | `cargo test -p harness-server prompt_packet::tests::model_facing_prompt_matches_frozen_v1_fixture_while_durable_packet_remains_v2 --lib` |
+| B-015 | Stable valid identity plus disjoint exact-byte fallback | `cargo test -p harness-server context_provenance_tests::profile_locator_preserves_valid_identity_and_hashes_invalid_exact_bytes --lib` |
+| B-016 | Closed runtime-kind resolution and dispatch rejection matrices | `cargo test -p harness-server runtime_profile::tests::approval_policy_resolution_matches_runtime_capability_matrix --lib`; `cargo test -p harness-server runtime_profile::tests::runtime_profile_approval_policy_rejects_non_codex_runtimes --lib`; `cargo test -p harness-server runtime_profiles::tests::runtime_dispatch_rejects_explicit_non_codex_approval_policy --lib`; `cargo test -p harness-server runtime_profiles::tests::runtime_dispatch_kind_switch_does_not_inherit_codex_approval_policy --lib` |
 
 ## Alternatives Considered
 
-- Treat the packet digest as sufficient provenance: rejected because it cannot
-  explain source identity, selection, ordering, or observation gaps.
-- Build provenance from repository inventory: rejected because discovered files
-  are not proof of runtime selection.
-- Persist a second runtime event: rejected because packet and provenance could
-  commit separately and the existing event already stores the complete packet.
-- Duplicate raw memory content in provenance: rejected for privacy, bundle
-  size, and inconsistent redaction risk.
-- Add logic inline to `prompt_packet.rs`: rejected because the file is already
-  at the repository hard ceiling.
-- Claim context loaded independently by agent CLIs: rejected because Harness
-  has no observation proving those loads.
+- Percent-encode or slugify profile names: rejected because ambiguous
+  normalization and reserved segments can still create collisions or invalid
+  locators.
+- Hash every profile name under the historical namespace: rejected because it
+  migrates valid component IDs and can collide with a valid raw profile name
+  shaped like the fallback.
+- Reject or rename existing profiles: rejected because provenance must not
+  narrow the already accepted runtime-profile contract.
+- Downgrade the durable packet to v1: rejected because v2 is the required
+  evidence contract; only the model-facing compatibility clone is v1.
+- Derive the v1 expected packet by deleting fields from the new v2 packet:
+  rejected because actual and oracle would share unrelated field drift.
+- Reuse `UnobservedAgentDefault` for every omitted policy: rejected because it
+  falsely claims an external default exists for unsupported runtimes.
+- Silently drop explicit non-Codex approval policy in dispatch configuration:
+  rejected because invalid operator input must not become success-shaped.
+- Add a global failure flag for the executor test: rejected because parallel
+  tests could observe another test's injected state; the job-scoped marker is
+  deterministic and isolated.
 
 ## Risks
 
-- Security: provenance could duplicate secrets or memory. Builders include
-  only safe metadata and digests; negative tests inspect serialized output.
-- Logic: omitting a selected source creates incomplete audit evidence. The
-  constructor takes the same runtime inputs as packet construction.
-- Compatibility: historical packets lack provenance. Readers must treat them
-  as lower-evidence v1 records, not invalid stored runtime events. Newly
-  produced packets use v2 so missing required provenance is distinguishable.
-- Integrity: fallback-resolved settings or durable prompt text could escape the
-  packet digest. One resolved value feeds both launch and provenance, and the
-  packet binds prompt text before `RuntimePromptPrepared`.
-- Provenance: one display-oriented workflow source string can collapse or
-  misclassify central/repository inputs. The loader retains ordered typed source
-  facts and exact content digests separately.
-- Performance: hashing selected profile/workflow/memory representations is
-  linear in packet input already being serialized and bounded by memory budget.
-- Maintenance: adding a new behavior-affecting packet source must update both
-  packet construction and the provenance builder in one reviewed change.
+- Identity: unconditional hashing would split a stable component identity.
+  Valid historical locators are preserved; only previously invalid names enter
+  the disjoint namespace.
+- Privacy: hashing is not encryption. This change does not claim secrecy; it
+  avoids copying an invalid arbitrary name into the fallback locator while the
+  exact name remains in resolved settings.
+- Compatibility: changing only the model-facing clone must not mutate or
+  re-hash the durable packet. The frozen complete-prompt fixture and durable
+  assertions cover both sides without a shared oracle.
+- Semantics: `NotApplicable` and `UnobservedAgentDefault` could be conflated by
+  callers that only use `explicit_value()`. Serialized enum assertions preserve
+  their distinct audit meaning.
+- Configuration: changing silent discard to a typed error can reject previously
+  accepted invalid configurations. This is intentional fail-closed behavior and
+  the error must name the runtime kind and unsupported field.
+- Test integrity: the failure seam exists only under `cfg(test)` and is scoped
+  to one job input; production builds expose no trigger and parallel tests share
+  no mutable flag.
+- Maintenance: the provenance test file is at the ceiling. Replacement and a
+  separate read-only golden fixture, not additive inline snapshots, are
+  completion requirements.
 
 ## Test Plan
 
-- [ ] Add profile, workflow-file, workflow-default, one-memory, multi-memory,
-      and no-memory provenance fixtures.
-- [ ] Add resolved server-default/profile-override parity fixtures.
-- [ ] Add Claude phase-derived model/effort and explicit-override fixtures that
-      assert the same values in provenance and the captured agent request.
-- [ ] Add central-only, repository-only, merged, and defaults workflow-source
-      fixtures.
-- [ ] Add same-reference/different-prompt-text packet digest fixtures.
-- [ ] Add packet v1 historical compatibility, v2 required provenance, repo
-      memory `self_declared` trust, and zero-timeout rejection fixtures.
-- [ ] Add a Codex omitted-approval-policy fixture asserting the resolved
-      settings record an explicit unobserved marker, not a fabricated default.
-- [ ] Add a resolved stall-timeout fixture asserting the same normalized value
-      appears in provenance and `TurnLifecycleOptions`.
-- [ ] Add a defaults-entry digest fixture asserting two independent builds emit
-      identical digests over the normalized default `WorkflowConfig`.
-- [ ] Add a model-facing prompt assertion proving `context_provenance`,
-      `resolved_runtime_settings`, and `prompt_task_request` are absent from
-      the rendered agent prompt while present in the durable packet.
-- [ ] Update the runtime-worker integration assertion to v2 and assert the
-      activity artifact carries the same schema constant and packet digest.
-- [ ] Add redaction and external-context coverage assertions.
-- [ ] Add stable ordering and source/packet digest sensitivity assertions.
-- [ ] Prove invalid required provenance returns before event recording and
-      agent execution using the existing executor boundary test.
-- [ ] Run `cargo check --workspace --all-targets`.
+- [ ] Add
+      `profile_locator_preserves_valid_identity_and_hashes_invalid_exact_bytes`;
+      freeze existing IDs for `codex-default` and `team/codex`, then assert
+      literal SHA-256 vectors for empty, whitespace-, case-, slash-, UUID-, and
+      NFC/NFD-distinct invalid names plus exact preserved profile values.
+- [ ] Generate `model_facing_prompt_v1.txt` from pre-v2 commit `f55eea8b` using
+      fixed IDs/inputs and a non-empty prompt template; document the inputs in
+      the test and compare current complete prompt bytes directly to the
+      fixture.
+- [ ] Add
+      `model_facing_prompt_matches_frozen_v1_fixture_while_durable_packet_remains_v2`;
+      assert durable v2 and audit/template retention, rendered v1 and field
+      stripping, exact complete prompt bytes, and one appended template section.
+- [ ] Add
+      `approval_policy_resolution_matches_runtime_capability_matrix` for both
+      Codex kinds, Claude Code, Anthropic API, and Remote Host; expand explicit
+      direct-resolution rejection over every non-Codex kind.
+- [ ] Add top-level and nested dispatch-policy matrices that reject explicit
+      policy for Claude Code, Anthropic API, and Remote Host; add a Codex to
+      non-Codex kind-switch case that does not inherit Codex policy.
+- [ ] Retain B-012 coverage for corrupted required provenance after removing
+      invalid profile names as a negative case.
+- [ ] Add the job-scoped `cfg(test)` failure marker and isolated-DB
+      `provenance_failure_prevents_prompt_event_and_agent_start` worker test.
+- [ ] Re-run the existing Claude phase/default and shared launch-settings
+      parity tests without weakening assertions.
+- [ ] Re-run the missing-memory and visible degradation-artifact tests.
+- [ ] Run `cargo fmt --all` and `cargo fmt --all -- --check`.
+- [ ] Run `cargo check -p harness-server --all-targets`.
 - [ ] Run `cargo test -p harness-server context_provenance --lib`.
 - [ ] Run `cargo test -p harness-server prompt_packet --lib`.
+- [ ] Run `cargo test -p harness-server runtime_profile --lib`.
+- [ ] Run `cargo test -p harness-server runtime_profiles --lib`.
 - [ ] Run `cargo test -p harness-server repo_memory_prompt --lib`.
+- [ ] Run `cargo test -p harness-server --lib`.
 - [ ] With an isolated disposable PostgreSQL database, run
-      `HARNESS_DATABASE_URL=<isolated-db-url> cargo test --workspace`; without
-      one, run the repository pre-push DB-less suite and record the deferred DB
-      suites for CI.
-- [ ] Run `cargo fmt --all` and `cargo fmt --all -- --check`.
-- [ ] Before push, run
-      `cargo clippy --workspace --all-targets -- -D warnings`.
+      `HARNESS_DATABASE_URL=<isolated-test-url> scripts/test-server-db.sh` and
+      `HARNESS_DATABASE_URL=<isolated-test-url> cargo test --workspace -- --test-threads=1`.
+      Without one, run the repository DB-less pre-push suite, record the
+      PostgreSQL suites as deferred, and require current-head CI or an isolated
+      database run before merge readiness.
+- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings` before push.
+- [ ] Verify both `context_provenance_tests.rs` and `prompt_packet_tests.rs` are
+      below 800 lines.
+- [ ] Verify the implementation diff contains exactly the seven authorized
+      implementation paths.
 - [ ] Run
       `python3 checks/check_workflow.py --repo . --spec-dir specs/GH1732`.
-- [ ] Confirm the implementation diff contains only the nine paths in the
-      planned-changes manifest.
 
 ## Rollback Plan
 
-Revert the implementation commit. Already recorded v2 packets remain valid JSON
-and retain their existing packet digest. Reversion resumes v1 packet emission
-and requires no database rollback. Evidence consumers continue requiring
-provenance for v2 while treating v1 as lower-evidence history rather than
-fabricating source claims.
+Revert the remediation implementation commit and the frozen fixture together.
+No migration or external dependency rollback is required. The rollback would
+restore invalid-name failures, identity/prompt incompatibility, silent
+non-Codex policy discard, and the unproven executor boundary, so it is
+acceptable only as an emergency response followed by blocking affected runtime
+submissions. Existing durable v2 packets remain valid JSON and retain their
+recorded digests.

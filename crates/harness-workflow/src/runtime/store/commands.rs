@@ -1,17 +1,94 @@
 use super::{
-    enum_str, runtime_job_for_command_tx, to_jsonb_string, ClaimedCommandTerminalOutcome,
-    RuntimeJobEnqueueOutcome, WorkflowRuntimeStore,
+    command_attempts::{insert_command_attempt_tx, AttemptReplacement},
+    definitions::terminal_state_for_instance_tx,
+    enum_str, runtime_job_for_command_tx, to_jsonb_string, workflow_instance_from_persisted_json,
+    ClaimedCommandTerminalOutcome, RuntimeJobEnqueueOutcome, WorkflowRuntimeStore,
 };
 use crate::runtime::{
     DispatchClaim, RuntimeJob, RuntimeKind, WorkflowCommand, WorkflowCommandStatus,
-    WorkflowInstance,
+    WorkflowDefinitionRegistry, WorkflowTerminalState,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
-use uuid::Uuid;
 
 impl WorkflowRuntimeStore {
+    pub async fn fail_claimed_command_with_completion_if_owned(
+        &self,
+        command_id: &str,
+        dispatch_claim: DispatchClaim<'_>,
+        result: &crate::runtime::ActivityResult,
+    ) -> anyhow::Result<bool> {
+        let generation = i64::try_from(dispatch_claim.generation)
+            .map_err(|_| anyhow::anyhow!("dispatch claim generation exceeds PostgreSQL BIGINT"))?;
+        let workflow_id: Option<(String,)> =
+            sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
+                .bind(command_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((workflow_id,)) = workflow_id else {
+            anyhow::bail!("workflow command not found: {command_id}");
+        };
+        let mut tx = self.pool.begin().await?;
+        let instance = super::select_instance_for_update_tx(&mut tx, &workflow_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("workflow instance not found: {workflow_id}"))?;
+        let command_row: Option<(String, Option<String>, i64, String)> = sqlx::query_as(
+            "SELECT status, dispatch_owner, dispatch_claim_generation, data::text
+             FROM workflow_commands WHERE id = $1 FOR UPDATE",
+        )
+        .bind(command_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((status, owner, current_generation, command_data)) = command_row else {
+            anyhow::bail!("workflow command not found: {command_id}");
+        };
+        if status != WorkflowCommandStatus::Dispatching.as_str()
+            || owner.as_deref() != Some(dispatch_claim.owner)
+            || current_generation != generation
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let command: WorkflowCommand = serde_json::from_str(&command_data)?;
+        sqlx::query(
+            "UPDATE workflow_commands
+             SET status = $2, dispatch_owner = NULL,
+                 dispatch_lease_expires_at = NULL, dispatch_not_before = NULL,
+                 dispatch_barrier = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1",
+        )
+        .bind(command_id)
+        .bind(WorkflowCommandStatus::Failed.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let event = super::insert_event_tx(
+            &mut tx,
+            &workflow_id,
+            "RuntimeJobCompleted",
+            dispatch_claim.owner,
+            json!({
+                "command_id": command_id,
+                "command": command,
+                "runtime_job_id": format!("dispatch-validation:{command_id}:{generation}"),
+                "runtime_job_status": "failed",
+                "activity_result": result,
+            }),
+        )
+        .await?;
+        super::runtime_completion::apply_runtime_completion_decision_tx(
+            &mut tx,
+            &self.definition_registry,
+            &instance.id,
+            dispatch_claim.owner,
+            &event,
+            &self.budget_policy,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn skip_claimed_command_if_owned(
         &self,
         command_id: &str,
@@ -60,7 +137,7 @@ impl WorkflowRuntimeStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         let workflow = workflow_data
-            .map(|(data,)| serde_json::from_str::<WorkflowInstance>(&data))
+            .map(|(data,)| workflow_instance_from_persisted_json(&data))
             .transpose()?;
         let command_claim: Option<(String, Option<String>, i64)> = sqlx::query_as(
             "SELECT status, dispatch_owner, dispatch_claim_generation
@@ -79,15 +156,17 @@ impl WorkflowRuntimeStore {
             tx.rollback().await?;
             return Ok(ClaimedCommandTerminalOutcome::StaleClaim);
         }
-        let Some(workflow) = workflow.filter(WorkflowInstance::is_terminal) else {
+        let Some(workflow) = workflow else {
             tx.rollback().await?;
             return Ok(ClaimedCommandTerminalOutcome::NotTerminal);
         };
-        let terminal_status = if workflow.state == "cancelled" {
-            WorkflowCommandStatus::Cancelled
-        } else {
-            WorkflowCommandStatus::Skipped
+        let Some(terminal_state) =
+            terminal_state_for_instance_tx(&mut tx, &self.definition_registry, &workflow).await?
+        else {
+            tx.rollback().await?;
+            return Ok(ClaimedCommandTerminalOutcome::NotTerminal);
         };
+        let terminal_status = terminal_command_status(terminal_state);
         let result = sqlx::query(
             "UPDATE workflow_commands
              SET status = $2, dispatch_owner = NULL,
@@ -116,19 +195,6 @@ impl WorkflowRuntimeStore {
     }
 }
 
-pub(super) async fn insert(
-    pool: &PgPool,
-    workflow_id: &str,
-    decision_id: Option<&str>,
-    command: &WorkflowCommand,
-    status: WorkflowCommandStatus,
-) -> anyhow::Result<String> {
-    let mut tx = pool.begin().await?;
-    let id = insert_tx(&mut tx, workflow_id, decision_id, command, status).await?;
-    tx.commit().await?;
-    Ok(id)
-}
-
 pub(super) async fn insert_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workflow_id: &str,
@@ -136,19 +202,15 @@ pub(super) async fn insert_tx(
     command: &WorkflowCommand,
     status: WorkflowCommandStatus,
 ) -> anyhow::Result<String> {
-    let data = to_jsonb_string(command)?;
-    let command_type = enum_str(&command.command_type)?;
-    let (id,): (String,) = sqlx::query_as(insert_sql())
-        .bind(Uuid::new_v4().to_string())
-        .bind(workflow_id)
-        .bind(decision_id)
-        .bind(&command_type)
-        .bind(&command.dedupe_key)
-        .bind(status.as_str())
-        .bind(&data)
-        .bind(WorkflowCommandStatus::Pending.as_str())
-        .fetch_one(&mut **tx)
-        .await?;
+    let id = insert_command_attempt_tx(
+        tx,
+        workflow_id,
+        decision_id,
+        command,
+        status,
+        AttemptReplacement::PendingIntent,
+    )
+    .await?;
     super::artifacts::reconcile_runtime_transcript_dependencies_tx(tx, workflow_id).await?;
     Ok(id)
 }
@@ -160,75 +222,21 @@ pub(super) async fn insert_or_reactivate_cancelled_tx(
     command: &WorkflowCommand,
     status: WorkflowCommandStatus,
 ) -> anyhow::Result<String> {
-    let data = to_jsonb_string(command)?;
-    let command_type = enum_str(&command.command_type)?;
-    let (id,): (String,) = sqlx::query_as(
-        "INSERT INTO workflow_commands
-            (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-         ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
-            decision_id = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.decision_id ELSE workflow_commands.decision_id END,
-            command_type = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.command_type ELSE workflow_commands.command_type END,
-            data = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.data ELSE workflow_commands.data END,
-            status = CASE WHEN workflow_commands.status = $8 THEN EXCLUDED.status ELSE workflow_commands.status END,
-            dispatch_owner = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_owner END,
-            dispatch_lease_expires_at = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_lease_expires_at END,
-            dispatch_not_before = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_not_before END,
-            dispatch_barrier = CASE WHEN workflow_commands.status = $8 THEN NULL ELSE workflow_commands.dispatch_barrier END,
-            updated_at = CASE WHEN workflow_commands.status = $8 THEN CURRENT_TIMESTAMP ELSE workflow_commands.updated_at END
-         RETURNING id",
+    insert_command_attempt_tx(
+        tx,
+        workflow_id,
+        decision_id,
+        command,
+        status,
+        AttemptReplacement::ReactivateCancelled,
     )
-    .bind(Uuid::new_v4().to_string())
-    .bind(workflow_id)
-    .bind(decision_id)
-    .bind(command_type)
-    .bind(&command.dedupe_key)
-    .bind(status.as_str())
-    .bind(data)
-    .bind(WorkflowCommandStatus::Cancelled.as_str())
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok(id)
-}
-
-fn insert_sql() -> &'static str {
-    "INSERT INTO workflow_commands
-        (id, workflow_id, decision_id, command_type, dedupe_key, status, data)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-     ON CONFLICT (workflow_id, dedupe_key) DO UPDATE SET
-        decision_id = CASE
-            WHEN workflow_commands.status = $8 THEN EXCLUDED.decision_id
-            ELSE workflow_commands.decision_id
-        END,
-        command_type = CASE
-            WHEN workflow_commands.status = $8 THEN EXCLUDED.command_type
-            ELSE workflow_commands.command_type
-        END,
-        data = CASE
-            WHEN workflow_commands.status = $8 THEN EXCLUDED.data
-            ELSE workflow_commands.data
-        END,
-        status = CASE
-            WHEN workflow_commands.status = $8 THEN EXCLUDED.status
-            ELSE workflow_commands.status
-        END,
-        updated_at = CASE
-            WHEN workflow_commands.status = $8
-                 AND (
-                     workflow_commands.status <> EXCLUDED.status
-                     OR workflow_commands.decision_id IS DISTINCT FROM EXCLUDED.decision_id
-                     OR workflow_commands.command_type <> EXCLUDED.command_type
-                     OR workflow_commands.data <> EXCLUDED.data
-                 )
-            THEN CURRENT_TIMESTAMP
-            ELSE workflow_commands.updated_at
-        END
-     RETURNING id"
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn enqueue_runtime_job_for_command(
     pool: &PgPool,
+    definition_registry: &WorkflowDefinitionRegistry,
     command_id: &str,
     dispatch_claim: Option<DispatchClaim<'_>>,
     runtime_kind: RuntimeKind,
@@ -249,17 +257,15 @@ pub(super) async fn enqueue_runtime_job_for_command(
         anyhow::bail!("workflow command not found: {command_id}");
     };
     let mut tx = pool.begin().await?;
-    let workflow = if dispatch_claim.is_some() {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
-                .bind(&workflow_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        row.map(|(data,)| serde_json::from_str::<WorkflowInstance>(&data))
-            .transpose()?
-    } else {
-        None
-    };
+    let workflow_row: Option<(String,)> =
+        sqlx::query_as("SELECT data::text FROM workflow_instances WHERE id = $1 FOR UPDATE")
+            .bind(&workflow_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let workflow = workflow_row
+        .map(|(data,)| workflow_instance_from_persisted_json(&data))
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("workflow instance not found: {workflow_id}"))?;
     let command_row: Option<(String, Option<String>, i64)> = sqlx::query_as(
         "SELECT status, dispatch_owner, dispatch_claim_generation
          FROM workflow_commands WHERE id = $1 FOR UPDATE",
@@ -292,12 +298,10 @@ pub(super) async fn enqueue_runtime_job_for_command(
             tx.rollback().await?;
             return Ok(RuntimeJobEnqueueOutcome::StaleClaim);
         }
-        if let Some(workflow) = workflow.as_ref().filter(|workflow| workflow.is_terminal()) {
-            let terminal_status = if workflow.state == "cancelled" {
-                WorkflowCommandStatus::Cancelled
-            } else {
-                WorkflowCommandStatus::Skipped
-            };
+        if let Some(terminal_state) =
+            terminal_state_for_instance_tx(&mut tx, definition_registry, &workflow).await?
+        {
+            let terminal_status = terminal_command_status(terminal_state);
             sqlx::query(
                 "UPDATE workflow_commands SET status = $2, dispatch_owner = NULL,
                     dispatch_lease_expires_at = NULL, dispatch_not_before = NULL,
@@ -327,6 +331,25 @@ pub(super) async fn enqueue_runtime_job_for_command(
             tx.rollback().await?;
             return Ok(RuntimeJobEnqueueOutcome::StaleClaim);
         }
+    } else if let Some(terminal_state) =
+        terminal_state_for_instance_tx(&mut tx, definition_registry, &workflow).await?
+    {
+        let terminal_status = terminal_command_status(terminal_state);
+        sqlx::query(
+            "UPDATE workflow_commands SET status = $2, dispatch_owner = NULL,
+                dispatch_lease_expires_at = NULL, dispatch_not_before = NULL,
+                dispatch_barrier = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1
+               AND status IN ('pending', 'dispatching', 'dispatched', 'deferred')",
+        )
+        .bind(command_id)
+        .bind(terminal_status.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(RuntimeJobEnqueueOutcome::WorkflowTerminal {
+            status: terminal_status,
+        });
     } else if command_status != WorkflowCommandStatus::Pending {
         tx.rollback().await?;
         return Ok(match existing {
@@ -405,6 +428,17 @@ pub(super) async fn enqueue_runtime_job_for_command(
     }
     tx.commit().await?;
     Ok(RuntimeJobEnqueueOutcome::Enqueued(job))
+}
+
+pub(in crate::runtime) fn terminal_command_status(
+    terminal_state: WorkflowTerminalState,
+) -> WorkflowCommandStatus {
+    match terminal_state {
+        WorkflowTerminalState::Cancelled => WorkflowCommandStatus::Cancelled,
+        WorkflowTerminalState::Succeeded | WorkflowTerminalState::Failed => {
+            WorkflowCommandStatus::Skipped
+        }
+    }
 }
 
 fn exact_dispatch_claim(job: &RuntimeJob, owner: &str, generation: u64) -> bool {

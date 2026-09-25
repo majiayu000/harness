@@ -51,7 +51,7 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
     }));
@@ -63,13 +63,13 @@ async fn workflow_runtime_tree_endpoint_returns_nested_runtime_details() -> anyh
     )
     .with_id("issue-123")
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 123,
     }));
-    store.upsert_instance(&parent).await?;
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     let event = store
         .append_event(
             &child.id,
@@ -251,12 +251,12 @@ async fn workflow_runtime_tree_endpoint_defaults_to_compact_polling_shape() -> a
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1165"),
     )
     .with_id("issue-1165")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 1165,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     store
         .append_event(
             &workflow.id,
@@ -485,18 +485,24 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
                     .expect("extra data should be an object")
                     .clone(),
             );
+        let initial_state = if matches!(id, "issue-blocked" | "issue-terminal") {
+            "implementing"
+        } else {
+            state
+        };
         let workflow = harness_workflow::runtime::WorkflowInstance::new(
             "github_issue_pr",
             1,
-            state,
+            initial_state,
             harness_workflow::runtime::WorkflowSubject::new(
                 "issue",
                 format!("issue:{issue_number}"),
             ),
         )
         .with_id(id)
-        .with_data(data);
-        store.upsert_instance(&workflow).await?;
+        .with_server_data(data);
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
     }
     let blocked_runtime_job_id = set_recovery_source_job(
         store,
@@ -505,6 +511,7 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
             "implement_issue",
             "issue-blocked-source",
         ),
+        "blocked",
     )
     .await?;
     let failed_runtime_job_id = set_recovery_source_job(
@@ -514,6 +521,7 @@ async fn workflow_runtime_tree_endpoint_exposes_shared_projection_status() -> an
             "implement_issue",
             "issue-terminal-source",
         ),
+        "failed",
     )
     .await?;
 
@@ -627,6 +635,7 @@ async fn set_recovery_source_job(
     store: &harness_workflow::runtime::WorkflowRuntimeStore,
     workflow_id: &str,
     command: harness_workflow::runtime::WorkflowCommand,
+    final_state: &str,
 ) -> anyhow::Result<String> {
     let command_id = store.enqueue_command(workflow_id, None, &command).await?;
     let job = store
@@ -642,8 +651,15 @@ async fn set_recovery_source_job(
         .get_instance(workflow_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("missing workflow {workflow_id}"))?;
-    workflow.data["last_stop"]["runtime_job_id"] = serde_json::json!(runtime_job_id.clone());
-    store.upsert_instance(&workflow).await?;
+    let mut last_stop = workflow.data["last_stop"].clone();
+    last_stop["runtime_job_id"] = serde_json::json!(runtime_job_id.clone());
+    workflow.set_data_field(
+        "last_stop",
+        last_stop,
+        harness_workflow::runtime::DataProvenance::Server,
+    )?;
+    workflow.state = final_state.to_string();
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     Ok(runtime_job_id)
 }
 
@@ -667,12 +683,12 @@ async fn workflow_runtime_tree_endpoint_returns_summary_only_shape() -> anyhow::
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1166"),
     )
     .with_id("issue-1166")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 1166,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
         "implement_issue",
         "issue-1166-implement",
@@ -746,12 +762,13 @@ async fn workflow_runtime_tree_summary_only_counts_all_project_workflows_with_ti
             ),
         )
         .with_id(id)
-        .with_data(serde_json::json!({
+        .with_server_data(serde_json::json!({
             "project_id": project_id,
             "repo": "owner/repo",
             "issue_number": issue_number,
         }));
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
     }
 
     let response = workflow_runtime_app(state)
@@ -815,12 +832,13 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
             ),
         )
         .with_id(id)
-        .with_data(serde_json::json!({
+        .with_server_data(serde_json::json!({
             "project_id": project_id,
             "repo": "owner/repo",
             "issue_number": issue_number,
         }));
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
         let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
             "replan_issue",
             format!("replan-{issue_number}"),
@@ -842,12 +860,13 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
         harness_workflow::runtime::WorkflowSubject::new("quality_gate", "issue:101"),
     )
     .with_id("quality-gate-101")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 101,
     }));
-    store.upsert_instance(&quality_gate).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &quality_gate)
+        .await?;
     let non_terminal_passed_issue = harness_workflow::runtime::WorkflowInstance::new(
         harness_workflow::runtime::GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
@@ -855,12 +874,16 @@ async fn workflow_runtime_tree_endpoint_summarizes_all_project_workflows_when_pa
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:103"),
     )
     .with_id("issue-103")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 103,
     }));
-    store.upsert_instance(&non_terminal_passed_issue).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        store,
+        &non_terminal_passed_issue,
+    )
+    .await?;
 
     let response = workflow_runtime_app(state)
         .oneshot(
@@ -918,12 +941,12 @@ async fn workflow_runtime_tree_endpoint_splits_running_lease_states() -> anyhow:
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1170"),
     )
     .with_id("issue-1170")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 1170,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     for activity in ["implement_issue", "inspect_pr_feedback"] {
         let command =
@@ -952,7 +975,7 @@ async fn workflow_runtime_tree_endpoint_splits_running_lease_states() -> anyhow:
     store
         .record_runtime_event(
             &active.id,
-            "RuntimeTurnStarted",
+            "RuntimeAgentStarted",
             serde_json::json!({ "owner": "active-worker" }),
         )
         .await?;
@@ -1026,12 +1049,12 @@ async fn workflow_runtime_tree_endpoint_limits_runtime_jobs_per_command() -> any
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:456"),
     )
     .with_id("issue-456")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
         "issue_number": 456,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-456");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;

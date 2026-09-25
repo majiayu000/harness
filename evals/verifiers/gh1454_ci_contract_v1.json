@@ -1,0 +1,39 @@
+{
+  "verifier_id": "gh1454_ci_contract_v1",
+  "max_input_bytes": 2097152,
+  "files": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "forbidden_trimmed_lines": [
+        "check:"
+      ],
+      "exact_counts": {
+        "bun run build": 1
+      },
+      "required_fragments": [
+        "workspace: ${{ steps.filter.outputs.workspace }}",
+        "other_crates: ${{ steps.filter.outputs.other_crates }}",
+        "web-build:",
+        "actions/upload-artifact@v4",
+        "actions/download-artifact@v4",
+        "HARNESS_SKIP_WEB_BUILD: \"1\"",
+        "name: Compute test scope",
+        "steps.scope.outputs.packages",
+        "needs.web-build.result"
+      ]
+    },
+    {
+      "path": ".githooks/pre-commit",
+      "forbidden_trimmed_lines": [],
+      "exact_counts": {},
+      "required_fragments": [
+        "derive_scope()",
+        "git diff --cached --name-only",
+        "Cargo.toml|Cargo.lock)",
+        "crates/*/*)",
+        "cargo clippy $scope --all-targets -- -D warnings",
+        "cargo test $scope --lib"
+      ]
+    }
+  ]
+}

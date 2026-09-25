@@ -1,0 +1,10 @@
+# Repository contract and CI trust boundary.
+# The main-branch ruleset requires a fresh owner review for these paths.
+/.github/ @majiayu000
+/.githooks/ @majiayu000
+/.bun-version @majiayu000
+/AGENTS.md @majiayu000
+/CLAUDE.md @majiayu000
+/checks/ @majiayu000
+/scripts/ @majiayu000
+/tests/ @majiayu000

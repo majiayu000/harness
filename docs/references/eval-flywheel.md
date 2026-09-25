@@ -115,8 +115,8 @@ snapshots, and remote-fact capture.
    to validate the manifest"* (`commands/eval.rs:82`). Evidence collection —
    the actual running of agents against cases — is external and manual.
 3. **No CI wiring.** `.github/workflows/` contains no job invoking
-   `harness eval`; the only grep hit for "eval" across workflows is unrelated
-   (`workflow-check.yml`). There is no nightly run, no PR-triggered run.
+   `harness eval` and no eval-related workflow. There is no nightly run, no
+   PR-triggered run.
 4. **No committed baselines.** `evals/` contains only `benchmarks/`. No
    `evals/baselines/` directory, no historical report to feed
    `diff_eval_run_reports`. The diffing code has never had two real inputs.

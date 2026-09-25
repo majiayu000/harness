@@ -49,7 +49,7 @@ async fn issue_resubmission_after_completed_command_creates_fresh_attempt() -> a
         .await?;
     let mut instance = store.get_instance(&workflow_id).await?.unwrap();
     instance.state = "failed".to_string();
-    store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &instance).await?;
 
     let second = record_issue_submission(
         &store,
@@ -110,6 +110,7 @@ async fn prompt_resubmission_after_completed_command_creates_fresh_attempt() -> 
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: "first prompt body",
             depends_on: &[],
@@ -128,12 +129,13 @@ async fn prompt_resubmission_after_completed_command_creates_fresh_attempt() -> 
         .await?;
     let mut instance = store.get_instance(&workflow_id).await?.unwrap();
     instance.state = "failed".to_string();
-    store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &instance).await?;
 
     let second = record_prompt_submission(
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: "second prompt body",
             depends_on: &[],

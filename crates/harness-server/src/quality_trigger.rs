@@ -2,7 +2,7 @@ use crate::handlers::cross_review::run_cross_review_with_context;
 use crate::observation_compression::{completion_observation_session, RawObservationSink};
 use chrono::{Duration as ChronoDuration, Utc};
 use harness_core::agent::CodeAgent;
-use harness_core::config::misc::AutoAdoptPolicy;
+use harness_core::config::{misc::AutoAdoptPolicy, HarnessConfig};
 use harness_core::types::TaskId;
 use harness_core::types::{Capability, EventFilters, Grade, Project};
 use harness_gc::gc_agent::GcAgent;
@@ -47,6 +47,7 @@ pub struct QualityTrigger {
     auto_adopt: AutoAdoptPolicy,
     auto_adopt_path_prefix: String,
     gc_run_timeout_secs: u64,
+    agent_config: HarnessConfig,
 }
 
 impl QualityTrigger {
@@ -62,6 +63,7 @@ impl QualityTrigger {
         auto_adopt: AutoAdoptPolicy,
         auto_adopt_path_prefix: String,
         gc_run_timeout_secs: u64,
+        agent_config: HarnessConfig,
     ) -> Self {
         Self {
             events,
@@ -75,6 +77,7 @@ impl QualityTrigger {
             auto_adopt,
             auto_adopt_path_prefix,
             gc_run_timeout_secs,
+            agent_config,
         }
     }
 
@@ -101,6 +104,7 @@ impl QualityTrigger {
 
     /// Grade recent events, run optional cross-review, log the result, and
     /// auto-trigger GC if warranted.
+    #[cfg(test)]
     pub async fn check_and_maybe_trigger(&self, task_ctx: Option<&TaskReviewContext>) {
         self.check_and_maybe_trigger_inner(task_ctx, None).await;
     }
@@ -162,7 +166,15 @@ impl QualityTrigger {
             .next_back()
             .unwrap_or(0);
 
-        let mut report = QualityGrader::grade(&window_events, violation_count);
+        let Some(mut report) = QualityGrader::grade(&window_events, violation_count) else {
+            // No independent gradeable events and no violations in the window:
+            // there is nothing to grade. Leaving GC cadence untouched is the
+            // honest response; derived grade events cannot become new evidence.
+            tracing::debug!(
+                "quality_trigger: observation window held no evidence; leaving GC cadence unchanged"
+            );
+            return;
+        };
 
         // Cross-review gate: skip if no challenger, no task context, or grade=A.
         if let (Some(challenger), Some(ctx)) = (&self.challenger_agent, task_ctx) {
@@ -246,13 +258,22 @@ impl QualityTrigger {
                                     2,
                                     Some(vec![]),
                                     compression,
+                                    &self.agent_config,
                                 ),
                             )
                             .await
                             {
                                 Ok(Ok(result)) => {
-                                    report.semantic_verdict = Some(result.final_verdict.clone());
-                                    if result.final_verdict == "NOT_CONVERGED" {
+                                    report.semantic_verdict =
+                                        Some(result.final_verdict.as_str().to_string());
+                                    // Fail closed (GH-1767): both an unconverged
+                                    // review and an unparseable challenger reply
+                                    // downgrade the grade.
+                                    if matches!(
+                                        result.final_verdict,
+                                        crate::handlers::cross_review::CrossReviewVerdict::NotConverged
+                                            | crate::handlers::cross_review::CrossReviewVerdict::ProtocolFailure
+                                    ) {
                                         let original = report.grade;
                                         report.grade = Self::downgrade(report.grade);
                                         tracing::info!(

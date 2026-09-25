@@ -183,13 +183,14 @@ async fn make_read_only_route_test_state_with_project_root(
     let execution_svc: Arc<dyn ExecutionService> = Arc::new(ReadOnlyRouteExecutionService);
 
     Ok(Arc::new(AppState {
+        background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         core: CoreServices {
             server: server.clone(),
             project_root: project_root.to_path_buf(),
             home_dir: std::env::var("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| project_root.to_path_buf()),
-            tasks,
+            tasks: Some(tasks),
             plan_db: None,
             plan_cache: Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
@@ -247,7 +248,6 @@ async fn make_read_only_route_test_state_with_project_root(
             token_dispatch_counters: IntakeServices::new_token_dispatch_counters(),
             intake_bindings: crate::intake::binding::IntakeBindingRegistry::new(),
         },
-        interceptors: vec![],
         startup_statuses: vec![],
         degraded_subsystems: vec![],
         project_svc,

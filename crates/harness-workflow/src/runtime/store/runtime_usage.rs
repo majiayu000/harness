@@ -1,7 +1,13 @@
 use super::super::model::RuntimeKind;
 use super::WorkflowRuntimeStore;
 use chrono::{DateTime, Utc};
+use harness_core::run_id::RunId;
+use harness_core::types::Event;
+use harness_observe::event_store::EventStore;
 use harness_observe::usage::UsageMetrics;
+use serde::Serialize;
+use std::collections::HashSet;
+use std::str::FromStr;
 
 pub type RuntimeUsageMetrics = UsageMetrics;
 const COST_USD_MICROS_PER_DOLLAR: f64 = 1_000_000.0;
@@ -27,6 +33,7 @@ pub struct RuntimeUsageUpsert {
     pub command_id: String,
     pub workflow_id: String,
     pub turn_id: Option<String>,
+    pub agent_run_id: Option<RunId>,
     pub runtime_kind: RuntimeKind,
     pub runtime_profile: String,
     pub agent: String,
@@ -39,6 +46,7 @@ pub struct RuntimeUsageUpsert {
     pub candidate_count: Option<u32>,
     pub metrics: RuntimeUsageMetrics,
     pub cost_usd_micros: u64,
+    pub cost_usd_observed: bool,
     pub reported_at: DateTime<Utc>,
 }
 
@@ -58,7 +66,7 @@ pub enum RuntimeUsageUpsertOutcome {
     Persisted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeUsageRecord {
     pub id: String,
     pub runtime_job_id: String,
@@ -66,6 +74,7 @@ pub struct RuntimeUsageRecord {
     pub command_id: String,
     pub workflow_id: String,
     pub turn_id: Option<String>,
+    pub agent_run_id: Option<RunId>,
     pub runtime_kind: String,
     pub runtime_profile: String,
     pub agent: String,
@@ -78,14 +87,27 @@ pub struct RuntimeUsageRecord {
     pub candidate_count: Option<u32>,
     pub metrics: RuntimeUsageMetrics,
     pub cost_usd_micros: u64,
+    pub cost_usd_observed: bool,
     pub reported_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeWorkflowUsage {
     pub metrics: RuntimeUsageMetrics,
     pub cost_usd_micros: u64,
+    pub cost_usd_observed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeAgentTelemetry {
+    pub workflow_id: String,
+    pub workflow_state: String,
+    pub terminal: bool,
+    pub agent: String,
+    pub usage: Option<RuntimeWorkflowUsage>,
+    pub usage_records: Vec<RuntimeUsageRecord>,
+    pub policy_events: Vec<Event>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -96,6 +118,7 @@ struct RuntimeUsageDbRow {
     command_id: String,
     workflow_id: String,
     turn_id: Option<String>,
+    agent_run_id: Option<String>,
     runtime_kind: String,
     runtime_profile: String,
     agent: String,
@@ -112,6 +135,7 @@ struct RuntimeUsageDbRow {
     cache_creation_input_tokens: i64,
     reported_total_tokens: Option<i64>,
     cost_usd_micros: i64,
+    cost_usd_observed: bool,
     reported_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -124,22 +148,35 @@ impl WorkflowRuntimeStore {
         if usage_metrics_are_zero(&usage.metrics) && usage.cost_usd_micros == 0 {
             return Ok(RuntimeUsageUpsertOutcome::SkippedZeroUsage);
         }
+        self.upsert_runtime_usage_row(usage).await?;
+        Ok(RuntimeUsageUpsertOutcome::Persisted)
+    }
+
+    /// Persist the workflow turn to agent-run mapping at turn start, even when
+    /// the agent never reports nonzero token usage.
+    pub async fn upsert_runtime_agent_run(&self, usage: &RuntimeUsageUpsert) -> anyhow::Result<()> {
+        self.upsert_runtime_usage_row(usage).await
+    }
+
+    async fn upsert_runtime_usage_row(&self, usage: &RuntimeUsageUpsert) -> anyhow::Result<()> {
         let usage_key = usage.usage_key();
         let id = format!("runtime_usage:{}:{usage_key}", usage.runtime_job_id);
         sqlx::query(
             "INSERT INTO runtime_usage_events
-                (id, runtime_job_id, usage_key, command_id, workflow_id, turn_id,
+                (id, runtime_job_id, usage_key, command_id, workflow_id, turn_id, agent_run_id,
                  runtime_kind, runtime_profile, agent, model, project, task_id,
                  candidate_group_id, candidate_id, candidate_index, candidate_count,
                  input_tokens, output_tokens, cache_read_input_tokens,
-                 cache_creation_input_tokens, reported_total_tokens, cost_usd_micros, reported_at)
+                 cache_creation_input_tokens, reported_total_tokens, cost_usd_micros,
+                 cost_usd_observed, reported_at)
              VALUES
                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                 $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
              ON CONFLICT (runtime_job_id, usage_key) DO UPDATE SET
                 command_id = EXCLUDED.command_id,
                 workflow_id = EXCLUDED.workflow_id,
                 turn_id = EXCLUDED.turn_id,
+                agent_run_id = EXCLUDED.agent_run_id,
                 runtime_kind = EXCLUDED.runtime_kind,
                 runtime_profile = EXCLUDED.runtime_profile,
                 agent = EXCLUDED.agent,
@@ -156,6 +193,7 @@ impl WorkflowRuntimeStore {
                 cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
                 reported_total_tokens = EXCLUDED.reported_total_tokens,
                 cost_usd_micros = EXCLUDED.cost_usd_micros,
+                cost_usd_observed = EXCLUDED.cost_usd_observed,
                 reported_at = EXCLUDED.reported_at,
                 updated_at = CURRENT_TIMESTAMP",
         )
@@ -165,6 +203,7 @@ impl WorkflowRuntimeStore {
         .bind(&usage.command_id)
         .bind(&usage.workflow_id)
         .bind(&usage.turn_id)
+        .bind(usage.agent_run_id.as_ref().map(RunId::as_str))
         .bind(usage.runtime_kind.as_str())
         .bind(&usage.runtime_profile)
         .bind(&usage.agent)
@@ -193,10 +232,11 @@ impl WorkflowRuntimeStore {
                 .transpose()?,
         )
         .bind(u64_to_i64(usage.cost_usd_micros, "cost_usd_micros")?)
+        .bind(usage.cost_usd_observed)
         .bind(usage.reported_at)
         .execute(&self.pool)
         .await?;
-        Ok(RuntimeUsageUpsertOutcome::Persisted)
+        Ok(())
     }
 
     pub async fn runtime_usage_between(
@@ -206,11 +246,12 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<Vec<RuntimeUsageRecord>> {
         let rows: Vec<RuntimeUsageDbRow> = sqlx::query_as(
             "SELECT
-                id, runtime_job_id, usage_key, command_id, workflow_id, turn_id,
+                id, runtime_job_id, usage_key, command_id, workflow_id, turn_id, agent_run_id,
                 runtime_kind, runtime_profile, agent, model, project, task_id,
                 candidate_group_id, candidate_id, candidate_index, candidate_count,
                 input_tokens, output_tokens, cache_read_input_tokens,
                 cache_creation_input_tokens, reported_total_tokens, cost_usd_micros,
+                cost_usd_observed,
                 reported_at, updated_at
              FROM runtime_usage_events
              WHERE reported_at >= $1 AND reported_at <= $2
@@ -229,19 +270,20 @@ impl WorkflowRuntimeStore {
         &self,
         workflow_id: &str,
     ) -> anyhow::Result<Option<RuntimeWorkflowUsage>> {
-        let row: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        let row: (i64, i64, i64, i64, i64, i64, i64, bool) = sqlx::query_as(
             "SELECT
                 COUNT(*)::BIGINT,
                 COALESCE(SUM(input_tokens), 0)::BIGINT,
                 COALESCE(SUM(output_tokens), 0)::BIGINT,
                 COALESCE(SUM(cache_read_input_tokens), 0)::BIGINT,
                 COALESCE(SUM(cache_creation_input_tokens), 0)::BIGINT,
-                COALESCE(SUM(GREATEST(
-                    COALESCE(reported_total_tokens, 0),
+                COALESCE(SUM(COALESCE(
+                    reported_total_tokens,
                     input_tokens + output_tokens
                         + cache_read_input_tokens + cache_creation_input_tokens
                 )), 0)::BIGINT,
-                COALESCE(SUM(cost_usd_micros), 0)::BIGINT
+                COALESCE(SUM(cost_usd_micros), 0)::BIGINT,
+                COALESCE(BOOL_AND(cost_usd_observed), FALSE)
              FROM runtime_usage_events
              WHERE workflow_id = $1",
         )
@@ -260,7 +302,88 @@ impl WorkflowRuntimeStore {
                 reported_total_tokens: Some(i64_to_u64(row.5, "reported_total_tokens")?),
             },
             cost_usd_micros: i64_to_u64(row.6, "cost_usd_micros")?,
+            cost_usd_observed: row.7,
         }))
+    }
+
+    /// Total adapter-reported spend (micro-dollars) for one runtime profile
+    /// since `since` — the daily-profile-cap input for the GH-1770 gate.
+    pub async fn runtime_usage_cost_for_profile_since(
+        &self,
+        runtime_profile: &str,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<u64> {
+        let (cost_usd_micros,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(cost_usd_micros), 0)::BIGINT
+             FROM runtime_usage_events
+             WHERE runtime_profile = $1 AND reported_at >= $2",
+        )
+        .bind(runtime_profile)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        i64_to_u64(cost_usd_micros, "cost_usd_micros")
+    }
+
+    /// Single durable query path for "what did agent X do in workflow/run Y?"
+    ///
+    /// (see [`runtime_usage_cost_for_workflow_tx`] for the transaction-scoped
+    /// spend read used by the completion-time budget ceiling)
+    ///
+    /// This returns the workflow outcome from `workflow_instances` plus the
+    /// per-turn usage rows for one persisted runtime agent plus policy-hook
+    /// events linked by the persisted runtime usage `agent_run_id`.
+    pub async fn runtime_agent_telemetry_for_workflow(
+        &self,
+        workflow_id: &str,
+        agent: &str,
+        event_store: &EventStore,
+    ) -> anyhow::Result<Option<RuntimeAgentTelemetry>> {
+        let Some(workflow) = self.get_instance(workflow_id).await? else {
+            return Ok(None);
+        };
+        let usage_records = self
+            .runtime_usage_records_for_workflow_agent(workflow_id, agent)
+            .await?;
+        let policy_events = policy_events_for_usage_records(event_store, &usage_records).await?;
+        let usage = aggregate_usage_records(&usage_records)?;
+        let terminal = workflow.is_terminal_with_registry(&self.definition_registry);
+        Ok(Some(RuntimeAgentTelemetry {
+            workflow_id: workflow.id,
+            workflow_state: workflow.state.clone(),
+            terminal,
+            agent: agent.to_string(),
+            usage,
+            usage_records,
+            policy_events,
+        }))
+    }
+
+    pub async fn runtime_usage_records_for_workflow_agent(
+        &self,
+        workflow_id: &str,
+        agent: &str,
+    ) -> anyhow::Result<Vec<RuntimeUsageRecord>> {
+        let rows: Vec<RuntimeUsageDbRow> = sqlx::query_as(
+            "SELECT
+                id, runtime_job_id, usage_key, command_id, workflow_id, turn_id, agent_run_id,
+                runtime_kind, runtime_profile, agent, model, project, task_id,
+                candidate_group_id, candidate_id, candidate_index, candidate_count,
+                input_tokens, output_tokens, cache_read_input_tokens,
+                cache_creation_input_tokens, reported_total_tokens, cost_usd_micros,
+                cost_usd_observed,
+                reported_at, updated_at
+             FROM runtime_usage_events
+             WHERE workflow_id = $1 AND agent = $2
+             ORDER BY reported_at ASC, id ASC",
+        )
+        .bind(workflow_id)
+        .bind(agent)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(runtime_usage_record_from_row)
+            .collect()
     }
 
     /// Return one durable runtime turn count per workflow for dashboard
@@ -284,6 +407,47 @@ impl WorkflowRuntimeStore {
     }
 }
 
+/// Adapter-reported spend (micro-dollars) for one workflow, read inside the
+/// activity-completion transaction so the hard budget ceiling (GH-1770 spec
+/// §4.4) sees the spend of the activity it is committing.
+pub(super) async fn runtime_usage_cost_for_workflow_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workflow_id: &str,
+) -> anyhow::Result<u64> {
+    let (cost_usd_micros,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(cost_usd_micros), 0)::BIGINT
+         FROM runtime_usage_events
+         WHERE workflow_id = $1",
+    )
+    .bind(workflow_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    i64_to_u64(cost_usd_micros, "cost_usd_micros")
+}
+
+async fn policy_events_for_usage_records(
+    event_store: &EventStore,
+    usage_records: &[RuntimeUsageRecord],
+) -> anyhow::Result<Vec<Event>> {
+    let mut seen_run_ids = HashSet::new();
+    let mut policy_events = Vec::new();
+    for run_id in usage_records
+        .iter()
+        .filter_map(|record| record.agent_run_id.as_ref())
+    {
+        if !seen_run_ids.insert(run_id.as_str().to_string()) {
+            continue;
+        }
+        policy_events.extend(event_store.policy_events_for_agent_run(run_id).await?);
+    }
+    policy_events.sort_by(|left, right| {
+        left.ts
+            .cmp(&right.ts)
+            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+    });
+    Ok(policy_events)
+}
+
 fn runtime_usage_record_from_row(row: RuntimeUsageDbRow) -> anyhow::Result<RuntimeUsageRecord> {
     Ok(RuntimeUsageRecord {
         id: row.id,
@@ -292,6 +456,11 @@ fn runtime_usage_record_from_row(row: RuntimeUsageDbRow) -> anyhow::Result<Runti
         command_id: row.command_id,
         workflow_id: row.workflow_id,
         turn_id: row.turn_id,
+        agent_run_id: row
+            .agent_run_id
+            .as_deref()
+            .map(RunId::from_str)
+            .transpose()?,
         runtime_kind: row.runtime_kind,
         runtime_profile: row.runtime_profile,
         agent: row.agent,
@@ -325,13 +494,66 @@ fn runtime_usage_record_from_row(row: RuntimeUsageDbRow) -> anyhow::Result<Runti
                 .transpose()?,
         },
         cost_usd_micros: i64_to_u64(row.cost_usd_micros, "cost_usd_micros")?,
+        cost_usd_observed: row.cost_usd_observed,
         reported_at: row.reported_at,
         updated_at: row.updated_at,
     })
 }
 
 fn usage_metrics_are_zero(metrics: &RuntimeUsageMetrics) -> bool {
-    metrics.input_tokens == 0 && metrics.output_tokens == 0 && metrics.total_tokens() == 0
+    metrics.is_zero_token_usage()
+}
+
+fn aggregate_usage_records(
+    records: &[RuntimeUsageRecord],
+) -> anyhow::Result<Option<RuntimeWorkflowUsage>> {
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let mut metrics = RuntimeUsageMetrics::default();
+    let mut reported_total_tokens = 0_u64;
+    let mut cost_usd_micros = 0_u64;
+    let mut cost_usd_observed = true;
+    for record in records {
+        metrics.input_tokens = checked_add(
+            metrics.input_tokens,
+            record.metrics.input_tokens,
+            "input_tokens",
+        )?;
+        metrics.output_tokens = checked_add(
+            metrics.output_tokens,
+            record.metrics.output_tokens,
+            "output_tokens",
+        )?;
+        metrics.cache_read_input_tokens = checked_add(
+            metrics.cache_read_input_tokens,
+            record.metrics.cache_read_input_tokens,
+            "cache_read_input_tokens",
+        )?;
+        metrics.cache_creation_input_tokens = checked_add(
+            metrics.cache_creation_input_tokens,
+            record.metrics.cache_creation_input_tokens,
+            "cache_creation_input_tokens",
+        )?;
+        reported_total_tokens = checked_add(
+            reported_total_tokens,
+            record.metrics.total_tokens(),
+            "reported_total_tokens",
+        )?;
+        cost_usd_micros = checked_add(cost_usd_micros, record.cost_usd_micros, "cost_usd_micros")?;
+        cost_usd_observed &= record.cost_usd_observed;
+    }
+    metrics.reported_total_tokens = Some(reported_total_tokens);
+    Ok(Some(RuntimeWorkflowUsage {
+        metrics,
+        cost_usd_micros,
+        cost_usd_observed,
+    }))
+}
+
+fn checked_add(left: u64, right: u64, field: &str) -> anyhow::Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(|| anyhow::anyhow!("{field} aggregate exceeds u64::MAX"))
 }
 
 fn u64_to_i64(value: u64, field: &str) -> anyhow::Result<i64> {
@@ -344,4 +566,22 @@ fn i64_to_u64(value: i64, field: &str) -> anyhow::Result<u64> {
 
 fn i64_to_u32(value: i64, field: &str) -> anyhow::Result<u32> {
     u32::try_from(value).map_err(|_| anyhow::anyhow!("{field} is outside u32 range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_metrics_are_zero_counts_cache_tokens() {
+        let metrics = UsageMetrics {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 5,
+            cache_creation_input_tokens: 0,
+            reported_total_tokens: Some(0),
+        };
+
+        assert!(!usage_metrics_are_zero(&metrics));
+    }
 }

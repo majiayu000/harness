@@ -31,15 +31,16 @@ pub(crate) async fn run_skill_governance_tick(
         .await
         .map_err(|e| anyhow::anyhow!("failed to query skill_used events: {e}"))?;
 
-    let task_statuses: HashMap<String, TaskStatus> = state
-        .core
-        .tasks
-        .list_all_statuses_with_terminal()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to list tasks for governance scoring: {e}"))?
-        .into_iter()
-        .map(|(id, status)| (id.as_str().to_string(), status))
-        .collect();
+    let task_statuses: HashMap<String, TaskStatus> = match state.core.tasks.as_ref() {
+        Some(tasks) => tasks
+            .list_all_statuses_with_terminal()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to list tasks for governance scoring: {e}"))?
+            .into_iter()
+            .map(|(id, status)| (id.as_str().to_string(), status))
+            .collect(),
+        None => HashMap::new(),
+    };
 
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
     let mut outcomes: HashMap<SkillId, SkillGovernanceInput> = HashMap::new();

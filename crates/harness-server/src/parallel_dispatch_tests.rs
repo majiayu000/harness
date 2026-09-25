@@ -1,4 +1,5 @@
 use super::*;
+use crate::workspace::ActiveWorkspaceState;
 use async_trait::async_trait;
 use harness_core::{
     agent::StreamItem,
@@ -9,7 +10,10 @@ use std::{
     collections::VecDeque,
     path::Path,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 const GIT_LOCAL_ENV_VARS: &[&str] = &[
@@ -32,19 +36,23 @@ const GIT_LOCAL_ENV_VARS: &[&str] = &[
 
 struct SequencedAgent {
     outputs: Mutex<VecDeque<String>>,
-    prompts: Mutex<Vec<String>>,
+    requests: Mutex<Vec<AgentRequest>>,
 }
 
 impl SequencedAgent {
     fn new(outputs: impl IntoIterator<Item = &'static str>) -> Self {
         Self {
             outputs: Mutex::new(outputs.into_iter().map(str::to_string).collect()),
-            prompts: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
         }
     }
 
     fn prompt_count(&self) -> usize {
-        self.prompts.lock().unwrap().len()
+        self.requests.lock().unwrap().len()
+    }
+
+    fn requests(&self) -> Vec<AgentRequest> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -59,7 +67,7 @@ impl CodeAgent for SequencedAgent {
     }
 
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
-        self.prompts.lock().unwrap().push(req.prompt);
+        self.requests.lock().unwrap().push(req);
         let output = self
             .outputs
             .lock()
@@ -75,6 +83,85 @@ impl CodeAgent for SequencedAgent {
         _tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
         Ok(())
+    }
+}
+
+struct BlockingAgent {
+    started: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl CodeAgent for BlockingAgent {
+    fn name(&self) -> &str {
+        "blocking-test-agent"
+    }
+
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[derive(Default)]
+struct CancellationOrder {
+    started: AtomicUsize,
+    started_notify: tokio::sync::Notify,
+    drop_started: AtomicUsize,
+    drop_started_notify: tokio::sync::Notify,
+    drained: AtomicUsize,
+}
+
+impl CancellationOrder {
+    async fn wait_for_started(&self, expected: usize) {
+        wait_for_count(&self.started, &self.started_notify, expected).await;
+    }
+
+    async fn wait_for_drop_started(&self, expected: usize) {
+        wait_for_count(&self.drop_started, &self.drop_started_notify, expected).await;
+    }
+}
+
+async fn wait_for_count(count: &AtomicUsize, notify: &tokio::sync::Notify, expected: usize) {
+    loop {
+        let notified = notify.notified();
+        if count.load(Ordering::Acquire) >= expected {
+            return;
+        }
+        notified.await;
+    }
+}
+
+struct DrainOrderedAgent {
+    order: Arc<CancellationOrder>,
+}
+
+struct DrainOnCancel {
+    order: Arc<CancellationOrder>,
+}
+
+impl Drop for DrainOnCancel {
+    fn drop(&mut self) {
+        self.order.drop_started.fetch_add(1, Ordering::Release);
+        self.order.drop_started_notify.notify_waiters();
+
+        tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(250)));
+        self.order.drained.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[async_trait]
+impl CodeAgent for DrainOrderedAgent {
+    fn name(&self) -> &str {
+        "drain-ordered-test-agent"
+    }
+
+    async fn execute(&self, _req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
+        let _drain = DrainOnCancel {
+            order: Arc::clone(&self.order),
+        };
+        self.order.started.fetch_add(1, Ordering::Release);
+        self.order.started_notify.notify_waiters();
+        std::future::pending().await
     }
 }
 
@@ -136,6 +223,10 @@ async fn sequential_whitespace_output_aborts_remaining_steps() -> anyhow::Result
         ..Default::default()
     })?);
     let agent = Arc::new(SequencedAgent::new([" \n\t", "should not run"]));
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.agents.capability_profile = harness_core::config::agents::CapabilityProfile::Full;
+    config.isolation.default_tier = harness_core::config::isolation::IsolationTier::Container;
+    config.isolation.network_allowlist = vec!["api.openai.com".to_string()];
     let subtasks = vec![
         SubtaskSpec {
             prompt: "step 1".to_string(),
@@ -157,11 +248,29 @@ async fn sequential_whitespace_output_aborts_remaining_steps() -> anyhow::Result
         &base_branch,
         Vec::new(),
         Duration::from_secs(5),
+        &config,
     )
     .await;
 
     assert!(result.is_sequential);
     assert_eq!(agent.prompt_count(), 1, "second step must not execute");
+    let requests = agent.requests();
+    assert_eq!(
+        requests[0].permission_mode,
+        harness_core::config::agents::AgentPermissionMode::Full
+    );
+    assert_eq!(
+        requests[0]
+            .env_vars
+            .get(harness_core::agent::AGENT_ISOLATION_TIER_ENV),
+        Some(&"container".to_string())
+    );
+    assert_eq!(
+        requests[0]
+            .env_vars
+            .get(harness_core::agent::AGENT_NETWORK_ALLOWLIST_ENV),
+        Some(&"api.openai.com".to_string())
+    );
     assert_eq!(result.results.len(), 1);
     assert_eq!(result.results[0].index, 0);
     assert!(result.results[0].response.is_none());
@@ -185,7 +294,10 @@ async fn concurrent_subtasks_release_pool_slots_before_creating_all_workspaces(
             auto_cleanup: true,
             ..Default::default()
         },
-        crate::workspace_pool::WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        crate::workspace_pool::WorkspacePoolConfig::new_for_local_pool_tests(
+            1,
+            std::collections::HashMap::new(),
+        ),
         None,
     )?);
     let agent = Arc::new(SequencedAgent::new(["first", "second", "third"]));
@@ -208,6 +320,7 @@ async fn concurrent_subtasks_release_pool_slots_before_creating_all_workspaces(
             &base_branch,
             Vec::new(),
             Duration::from_secs(5),
+            &harness_core::config::HarnessConfig::default(),
         ),
     )
     .await
@@ -225,6 +338,177 @@ async fn concurrent_subtasks_release_pool_slots_before_creating_all_workspaces(
     );
     assert_eq!(workspace_mgr.live_count(), 0);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_parallel_dispatch_requires_cleanup_before_workspace_reuse() -> anyhow::Result<()>
+{
+    let source = tempfile::tempdir()?;
+    let base_branch = init_git_repo(source.path());
+    let workspaces = tempfile::tempdir()?;
+    let workspace_mgr = Arc::new(WorkspaceManager::new(WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        auto_cleanup: true,
+        ..Default::default()
+    })?);
+    let agent = Arc::new(BlockingAgent {
+        started: tokio::sync::Notify::new(),
+    });
+    let task_id = TaskId::from_str("cancelled-sequential-dispatch");
+    let seq_id = sequential_subtask_id(&task_id);
+    let run_manager = workspace_mgr.clone();
+    let run_agent = agent.clone();
+    let run_source = source.path().to_path_buf();
+    let run_branch = base_branch.clone();
+    let run_task_id = task_id.clone();
+    let run = tokio::spawn(async move {
+        run_parallel_subtasks(
+            &run_task_id,
+            run_agent,
+            vec![
+                SubtaskSpec {
+                    prompt: "step one".to_string(),
+                    depends_on_indices: Vec::new(),
+                },
+                SubtaskSpec {
+                    prompt: "step two".to_string(),
+                    depends_on_indices: vec![0],
+                },
+            ],
+            run_manager,
+            &run_source,
+            "origin",
+            &run_branch,
+            Vec::new(),
+            Duration::from_secs(30),
+            &HarnessConfig::default(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), agent.started.notified()).await?;
+    let workspace_path = workspace_mgr
+        .get_workspace(&seq_id)
+        .expect("active sequential workspace");
+    let first_acquisition = workspace_mgr
+        .active_workspace_acquisition_id(&seq_id, &workspace_path)
+        .expect("first acquisition");
+
+    run.abort();
+    match run.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => anyhow::bail!("dispatch should be cancelled"),
+    }
+    let replacement_task = TaskId::from_str("different-task-after-cancelled-dispatch");
+    let replacement = tokio::time::timeout(
+        Duration::from_secs(5),
+        workspace_mgr.create_workspace(
+            &replacement_task,
+            source.path(),
+            "origin",
+            &base_branch,
+            1,
+            None,
+            None,
+        ),
+    )
+    .await??;
+
+    assert_ne!(replacement.acquisition_id, first_acquisition);
+    workspace_mgr
+        .remove_workspace_acquisition(&replacement_task, &replacement.acquisition_id)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_concurrent_dispatch_drains_agents_before_execution_guards_drop(
+) -> anyhow::Result<()> {
+    let source = tempfile::tempdir()?;
+    let base_branch = init_git_repo(source.path());
+    let workspaces = tempfile::tempdir()?;
+    let workspace_mgr = Arc::new(WorkspaceManager::new(WorkspaceConfig {
+        root: workspaces.path().to_path_buf(),
+        auto_cleanup: true,
+        ..Default::default()
+    })?);
+    let order = Arc::new(CancellationOrder::default());
+    let agent = Arc::new(DrainOrderedAgent {
+        order: Arc::clone(&order),
+    });
+    let task_id = TaskId::from_str("cancelled-concurrent-dispatch");
+    let subtask_ids = [
+        parallel_subtask_id(&task_id, 0),
+        parallel_subtask_id(&task_id, 1),
+    ];
+    let run_manager = Arc::clone(&workspace_mgr);
+    let run_source = source.path().to_path_buf();
+    let run_branch = base_branch.clone();
+    let run_task_id = task_id.clone();
+    let run = tokio::spawn(async move {
+        run_parallel_subtasks(
+            &run_task_id,
+            agent,
+            vec![
+                SubtaskSpec {
+                    prompt: "parallel step one".to_string(),
+                    depends_on_indices: Vec::new(),
+                },
+                SubtaskSpec {
+                    prompt: "parallel step two".to_string(),
+                    depends_on_indices: Vec::new(),
+                },
+            ],
+            run_manager,
+            &run_source,
+            "origin",
+            &run_branch,
+            Vec::new(),
+            Duration::from_secs(30),
+            &HarnessConfig::default(),
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), order.wait_for_started(2)).await?;
+    for subtask_id in &subtask_ids {
+        let active = workspace_mgr
+            .active
+            .get(subtask_id)
+            .expect("subtask workspace should be active");
+        assert!(matches!(active.state, ActiveWorkspaceState::Running(_)));
+    }
+
+    run.abort();
+    match tokio::time::timeout(Duration::from_secs(5), run).await? {
+        Err(join_error) => assert!(join_error.is_cancelled()),
+        Ok(_) => anyhow::bail!("dispatch should be cancelled"),
+    }
+    tokio::time::timeout(Duration::from_secs(5), order.wait_for_drop_started(1)).await?;
+    for subtask_id in &subtask_ids {
+        let active = workspace_mgr
+            .active
+            .get(subtask_id)
+            .expect("workspace must remain owned while its agent drains");
+        assert!(
+            matches!(active.state, ActiveWorkspaceState::Running(_)),
+            "execution guard dropped before agent cancellation drained"
+        );
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), order.wait_for_drop_started(2)).await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while order.drained.load(Ordering::Acquire) < 2 {
+            tokio::task::yield_now().await;
+        }
+        while subtask_ids
+            .iter()
+            .any(|subtask_id| workspace_mgr.get_workspace(subtask_id).is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
     Ok(())
 }
 

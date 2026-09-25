@@ -7,6 +7,20 @@ pub(super) enum RuntimeDecisionCommitOutcome {
     Stale,
 }
 
+pub(super) fn outcome_from_atomic_record(
+    record: Option<WorkflowDecisionRecord>,
+) -> RuntimeDecisionCommitOutcome {
+    match record {
+        Some(record) if record.accepted => RuntimeDecisionCommitOutcome::Accepted,
+        Some(record) => RuntimeDecisionCommitOutcome::Rejected {
+            reason: record
+                .rejection_reason
+                .unwrap_or_else(|| "transition rejected by atomic validation".to_string()),
+        },
+        None => RuntimeDecisionCommitOutcome::Stale,
+    }
+}
+
 impl RuntimeDecisionCommitOutcome {
     #[cfg(test)]
     fn into_result(self) -> anyhow::Result<()> {
@@ -76,10 +90,16 @@ pub(super) async fn persist_pr_detected(
     .into_result()
 }
 
-pub(super) async fn persist_pr_feedback_sweep_request(
+pub(super) async fn persist_pr_feedback_sweep_request<F, Fut>(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
-) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
+    latest_pr_fact: Option<&ObservedPrFact>,
+    admission: F,
+) -> anyhow::Result<PrFeedbackSweepRequestOutcome>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     let workflow_id = instance.id.clone();
     let task_id = runtime_task_id_from_instance(&instance);
     let pr_number = required_u64_field(&instance.data, "pr_number")?;
@@ -89,8 +109,13 @@ pub(super) async fn persist_pr_feedback_sweep_request(
         .get("issue_number")
         .and_then(|value| value.as_u64());
     let repo = optional_string_field(&instance.data, "repo");
+    let expected_base_ref =
+        crate::http::auto_merge::expected_base_ref_from_workflow_data(&instance.data);
     let accepted_data = instance.data.clone();
     let sweep_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let remote_fact_activity_at = latest_pr_fact
+        .and_then(|fact| fact.activity_at)
+        .map(|activity_at| activity_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     let output = build_pr_feedback_sweep_decision(
         &instance,
         PrFeedbackSweepDecisionInput {
@@ -99,6 +124,9 @@ pub(super) async fn persist_pr_feedback_sweep_request(
             pr_url: pr_url.as_deref(),
             issue_number,
             repo: repo.as_deref(),
+            expected_base_ref: expected_base_ref.as_deref(),
+            remote_fact_hash: latest_pr_fact.map(|fact| fact.fact_hash.as_str()),
+            remote_fact_activity_at: remote_fact_activity_at.as_deref(),
             summary: "Runtime workflow requested a PR feedback sweep.",
         },
     );
@@ -108,6 +136,7 @@ pub(super) async fn persist_pr_feedback_sweep_request(
         "pr_number": pr_number,
         "pr_url": pr_url.as_deref(),
     });
+    admission().await?;
     match commit_runtime_decision(
         store,
         instance,
@@ -150,7 +179,6 @@ pub(super) async fn persist_pr_hygiene_repair_request(
 ) -> anyhow::Result<PrFeedbackSweepRequestOutcome> {
     let workflow_id = instance.id.clone();
     let task_id = runtime_task_id_from_instance(&instance);
-    let project_id = ctx.project_root.to_string_lossy().into_owned();
     let pr_url = optional_string_field(&instance.data, "pr_url").or_else(|| {
         ctx.pr_url
             .map(str::trim)
@@ -189,18 +217,17 @@ pub(super) async fn persist_pr_hygiene_repair_request(
             "Comment asking whether the PR should be closed when dirty_age_secs is at least dirty_age_to_comment_secs and no recent activity explains the stale state."
         ],
     });
-    let mut accepted_data = pr_runtime_data(
-        ctx.project_root,
-        project_id,
-        repo.as_deref(),
-        issue_number,
-        ctx.task_id,
-        ctx.pr_number,
-        pr_url.as_deref(),
-        Some(&summary),
-    );
+    let next_round = next_feedback_repair_round(&instance.data);
+    let mut accepted_data = instance.data.clone();
     if let Some(object) = accepted_data.as_object_mut() {
         object.insert("hygiene_context".to_string(), hygiene_context.clone());
+        object.insert("feedback_summary".to_string(), json!(summary));
+        object.insert("feedback_repair_round".to_string(), json!(next_round));
+        object.insert(
+            "feedback_repair_lane".to_string(),
+            json!(FeedbackRepairLane::RemoteFeedback.as_str()),
+        );
+        object.remove("feedback_repair_blocker_count");
     }
     let repair_nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let output = build_pr_hygiene_repair_decision(
@@ -278,7 +305,8 @@ pub(super) async fn persist_pr_feedback(
     )
     .await?;
     if instance.state == "pr_open" {
-        store.upsert_instance(&instance).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &instance)
+            .await?;
         request_local_review(store, &instance.id).await?;
         return Ok(());
     }
@@ -451,8 +479,8 @@ pub(super) async fn persist_pr_merged(
         "done",
         ctx.summary,
     )
-    .with_command(WorkflowCommand::new(
-        WorkflowCommandType::MarkDone,
+    .with_command(harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::MarkDone,
         format!("pr-merged:{}:{}", ctx.task_id.as_str(), ctx.pr_number),
         json!({
             "task_id": ctx.task_id.as_str(),
@@ -463,6 +491,14 @@ pub(super) async fn persist_pr_merged(
     .with_evidence(WorkflowEvidence::new(
         "pr_merged",
         ctx.pr_url.unwrap_or("merged externally"),
+    ))
+    // A server-observed merge is the terminal proof the `-> done` contract
+    // requires (GH-1766); the agent never asserts this.
+    .with_evidence(WorkflowEvidence::runtime_observed(
+        harness_workflow::runtime::completion_evidence::EVIDENCE_GITHUB_TERMINAL,
+        ctx.pr_url.unwrap_or("merged externally"),
+        "workflow_runtime_pr_feedback",
+        None,
     ))
     .high_confidence();
     commit_runtime_decision(
@@ -510,8 +546,13 @@ pub(super) async fn approve_runtime_merge(
         .get("pr_number")
         .and_then(|value| value.as_u64());
     let pr_url = optional_string_field(&instance.data, "pr_url");
-    let expected_head_sha = optional_string_field(&instance.data, "pr_head_sha")
-        .or_else(|| optional_string_field(&instance.data, "head_sha"));
+    let expected_head_sha = trusted_merge_head_sha(&instance);
+    let Some(expected_head_sha) = expected_head_sha else {
+        return Ok(RuntimeMergeApprovalOutcome::Rejected {
+            workflow_id: instance.id,
+            reason: "ready-to-merge workflow is missing a server-observed PR head SHA".to_string(),
+        });
+    };
     let merge_method = optional_string_field(&instance.data, "merge_method")
         .unwrap_or_else(|| "squash".to_string());
     let delete_branch = optional_bool_field(&instance.data, "merge_delete_branch").unwrap_or(true);
@@ -612,6 +653,26 @@ pub(super) async fn approve_runtime_merge(
     }
 }
 
+fn trusted_merge_head_sha(instance: &WorkflowInstance) -> Option<String> {
+    ["pr_head_sha", "head_sha", "merge_review_head_sha"]
+        .into_iter()
+        .find_map(|field| {
+            let provenance = instance
+                .data_provenance
+                .as_ref()?
+                .provenance_for(&format!("/{field}"));
+            if !matches!(
+                provenance,
+                Some(DataProvenance::Server | DataProvenance::External)
+            ) {
+                return None;
+            }
+            optional_string_field(&instance.data, field)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
 pub(super) async fn commit_runtime_decision(
     store: &WorkflowRuntimeStore,
     instance: WorkflowInstance,
@@ -624,11 +685,14 @@ pub(super) async fn commit_runtime_decision(
 ) -> anyhow::Result<RuntimeDecisionCommitOutcome> {
     let expected_state = instance.state.clone();
     let validator = DecisionValidator::github_issue_pr();
-    let validation = validator.validate(
-        &instance,
-        &decision,
-        &ValidationContext::new("workflow-policy", chrono::Utc::now()),
-    );
+    let resubmission = instance.state == "cancelled" && event_type == "PrResubmitted";
+    let context = ValidationContext::new("workflow-policy", chrono::Utc::now());
+    let context = if resubmission {
+        context.allow_terminal_reopen()
+    } else {
+        context
+    };
+    let validation = validator.validate(&instance, &decision, &context);
     if let Err(error) = validation {
         let reason = error.to_string();
         let record = store
@@ -651,22 +715,49 @@ pub(super) async fn commit_runtime_decision(
     let mut final_instance = instance.clone();
     final_instance.state = decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = merge_last_decision(accepted_data, &decision.decision);
+    let data = merge_last_decision(accepted_data, &decision.decision);
+    replace_pr_runtime_data(&mut final_instance, data)?;
+    if resubmission {
+        let committed = store
+            .commit_submission_decision_transition(
+                harness_workflow::runtime::WorkflowSubmissionDecisionTransition {
+                    workflow_id: &instance.id,
+                    expected_state: &expected_state,
+                    expected_version: instance.version,
+                    create_if_missing: None,
+                    event_id: None,
+                    new_event_id: None,
+                    event_type,
+                    source,
+                    payload: event_payload,
+                    decision: &decision,
+                    existing_record: None,
+                    rejection_reason: None,
+                    final_instance: Some(&final_instance),
+                    command_status: WorkflowCommandStatus::Pending,
+                    prompt_payload: None,
+                },
+            )
+            .await?;
+        return Ok(outcome_from_atomic_record(
+            committed.map(|commit| commit.record),
+        ));
+    }
     let create_if_missing = new_instance.then_some(&instance);
     let record = store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: &expected_state,
-            create_if_missing,
-            event_type,
-            source,
-            payload: event_payload,
-            decision: &decision,
-            final_instance: &final_instance,
-            command_status: WorkflowCommandStatus::Pending,
-        })
+        .apply_decision_transition(
+            WorkflowDecisionTransition {
+                expected_state: &expected_state,
+                create_if_missing,
+                event_type,
+                source,
+                payload: event_payload,
+                decision: &decision,
+                final_instance: &final_instance,
+                command_status: WorkflowCommandStatus::Pending,
+            },
+            "workflow-policy",
+        )
         .await?;
-    Ok(match record {
-        Some(_) => RuntimeDecisionCommitOutcome::Accepted,
-        None => RuntimeDecisionCommitOutcome::Stale,
-    })
+    Ok(outcome_from_atomic_record(record))
 }

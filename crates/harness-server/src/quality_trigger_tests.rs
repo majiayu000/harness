@@ -56,6 +56,7 @@ async fn make_trigger_with_challenger(
         harness_core::config::misc::AutoAdoptPolicy::Off,
         ".harness/generated/".to_string(),
         120,
+        harness_core::config::HarnessConfig::default(),
     )
 }
 
@@ -291,6 +292,38 @@ async fn check_logs_quality_grade_event() {
         .as_deref()
         .unwrap_or("")
         .starts_with("grade="));
+}
+
+#[tokio::test]
+async fn prior_quality_grade_cannot_refresh_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    // A stale grade from the old empty-window behavior must not become fresh
+    // evidence. With zero cooldown and Grade::A enabled, treating it as input
+    // would both append another grade and arm the GC trigger.
+    let trigger = make_trigger(dir.path(), vec![Grade::A], 0).await;
+    trigger.events.log_quality_grade(Grade::A, 100.0).await;
+    let before = trigger.last_triggered.load(Ordering::Relaxed);
+
+    trigger.check_and_maybe_trigger(None).await;
+
+    let grade_events = trigger
+        .events
+        .query(&EventFilters {
+            hook: Some("quality_grade".to_string()),
+            ..EventFilters::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        grade_events.len(),
+        1,
+        "derived grade output must not produce another grade"
+    );
+    assert_eq!(
+        trigger.last_triggered.load(Ordering::Relaxed),
+        before,
+        "derived grade output must not trigger GC"
+    );
 }
 
 // --- challenger cross-review tests ---

@@ -352,6 +352,9 @@ export function UsageMonitor() {
             </span>
           </div>
 
+          <p className="px-4 py-3 text-sm text-ink-3 border-b border-line">
+            Recorded usage only. Cursor CLI token usage and cost are unavailable in Harness; zero totals do not mean zero consumption.
+          </p>
           <div className="grid grid-cols-6 border-b border-line">
             <KpiCard label="Tokens" value={fmtTokens(data?.summary.total_tokens)} delta={`${fmtInt(data?.summary.request_count)} requests`} />
             <KpiCard

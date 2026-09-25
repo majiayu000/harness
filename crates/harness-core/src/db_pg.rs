@@ -156,14 +156,14 @@ fn configured_pg_pool_config() -> anyhow::Result<PgPoolConfig> {
 }
 
 fn configured_database_url_from_env(name: &str) -> Option<String> {
-    std::env::var(name)
+    crate::config::process_env::var(name)
         .ok()
         .map(|url| url.trim().to_string())
         .filter(|url| !url.is_empty())
 }
 
 fn configured_u32_from_env(name: &str) -> anyhow::Result<Option<u32>> {
-    match std::env::var(name) {
+    match crate::config::process_env::var(name) {
         Ok(value) if !value.trim().is_empty() => value
             .trim()
             .parse()
@@ -174,7 +174,7 @@ fn configured_u32_from_env(name: &str) -> anyhow::Result<Option<u32>> {
 }
 
 fn configured_u64_from_env(name: &str) -> anyhow::Result<Option<u64>> {
-    match std::env::var(name) {
+    match crate::config::process_env::var(name) {
         Ok(value) if !value.trim().is_empty() => value
             .trim()
             .parse()
@@ -199,7 +199,7 @@ fn database_url_config_paths() -> anyhow::Result<Vec<PathBuf>> {
     // Unit tests may temporarily change the process CWD while other tests open
     // stores concurrently. The test binary path is stable, so this preserves the
     // repository config fallback without reading the generic DATABASE_URL.
-    if std::env::var_os("XDG_CONFIG_HOME").is_none() {
+    if crate::config::process_env::var_os("XDG_CONFIG_HOME").is_none() {
         if let Ok(current_exe) = std::env::current_exe() {
             if let Some(parent) = current_exe.parent() {
                 if let Some(path) = repository_default_config_from_dir(parent) {
@@ -359,7 +359,7 @@ impl PgStoreContext {
             anyhow::bail!("database URL must not be empty");
         }
         let schema = schema.into();
-        validate_schema_name(&schema)?;
+        validate_identifier(&schema)?;
         Ok(Self {
             database_url,
             schema,
@@ -415,6 +415,29 @@ impl PgStoreContext {
                     self.schema
                 )
             })
+    }
+
+    /// Open a schema-scoped pool with a caller-owned connection budget.
+    ///
+    /// Long-lived session consumers such as advisory locks must be sized from
+    /// their own admission limit instead of inheriting the ordinary query-pool
+    /// budget.
+    pub async fn open_runtime_pool_with_max_connections(
+        &self,
+        max_connections: u32,
+    ) -> anyhow::Result<PgPool> {
+        pg_open_pool_schematized_with_max_connections(
+            &self.database_url,
+            &self.schema,
+            max_connections,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to open Postgres runtime pool for schema '{}': {error}",
+                self.schema
+            )
+        })
     }
 
     pub async fn open_pool_with_setup_pool(&self, setup_pool: &PgPool) -> anyhow::Result<PgPool> {
@@ -481,39 +504,43 @@ pub async fn pg_open_pool(database_url: &str) -> anyhow::Result<PgPool> {
     Ok(pool)
 }
 
-/// Validates that a schema name contains only ASCII letters, digits, and
+/// Validates that a PostgreSQL identifier contains only ASCII letters, digits, and
 /// underscores, starts with a letter or underscore, and fits within
 /// PostgreSQL's 63-byte identifier limit (NAMEDATALEN-1). Rejects the name
 /// before it is ever interpolated into SQL, providing defence in depth against
-/// injection if the schema-name construction ever changes.
-pub(crate) fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
-    let mut chars = schema.chars();
+/// injection if schema or table-name construction ever changes.
+pub(crate) fn validate_identifier(identifier: &str) -> anyhow::Result<()> {
+    let mut chars = identifier.chars();
     let first = match chars.next() {
         Some(c) => c,
-        None => anyhow::bail!("schema name must not be empty"),
+        None => anyhow::bail!("Postgres identifier must not be empty"),
     };
     if !first.is_ascii_alphabetic() && first != '_' {
         anyhow::bail!(
-            "schema name must start with a letter or underscore, got: {:?}",
-            schema
+            "Postgres identifier must start with a letter or underscore, got: {:?}",
+            identifier
         );
     }
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
         anyhow::bail!(
-            "schema name may only contain ASCII letters, digits, and underscores, got: {:?}",
-            schema
+            "Postgres identifier may only contain ASCII letters, digits, and underscores, got: {:?}",
+            identifier
         );
     }
     // PostgreSQL silently truncates identifiers to 63 bytes (NAMEDATALEN-1).
     // Two names differing only after byte 63 would alias to the same schema.
-    if schema.len() > 63 {
+    if identifier.len() > 63 {
         anyhow::bail!(
-            "schema name exceeds PostgreSQL's 63-byte identifier limit ({} bytes): {:?}",
-            schema.len(),
-            schema
+            "Postgres identifier exceeds PostgreSQL's 63-byte identifier limit ({} bytes): {:?}",
+            identifier.len(),
+            identifier
         );
     }
     Ok(())
+}
+
+pub(crate) fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
+    validate_identifier(schema)
 }
 
 /// Creates the Postgres schema `schema` if it does not already exist.
@@ -522,7 +549,7 @@ pub(crate) fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
 /// mandatory entry-point for schema creation so the name is always checked
 /// regardless of which store calls it.
 pub async fn pg_create_schema_if_not_exists(pool: &PgPool, schema: &str) -> anyhow::Result<()> {
-    validate_schema_name(schema)?;
+    validate_identifier(schema)?;
     match sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema))
         .execute(pool)
         .await
@@ -570,9 +597,30 @@ fn pg_create_schema_if_not_exists_race(error: &sqlx::Error) -> bool {
 /// does not start with a letter or underscore — rejecting invalid names before
 /// they are interpolated into SQL.
 pub async fn pg_open_pool_schematized(database_url: &str, schema: &str) -> anyhow::Result<PgPool> {
-    validate_schema_name(schema)?;
-    let opts = PgConnectOptions::from_str(database_url)?;
     let settings = pg_pool_settings(database_url)?;
+    pg_open_pool_schematized_with_settings(database_url, schema, settings).await
+}
+
+async fn pg_open_pool_schematized_with_max_connections(
+    database_url: &str,
+    schema: &str,
+    max_connections: u32,
+) -> anyhow::Result<PgPool> {
+    if max_connections == 0 {
+        anyhow::bail!("Postgres pool max_connections must be greater than 0");
+    }
+    let mut settings = pg_pool_settings(database_url)?;
+    settings.max_connections = max_connections;
+    pg_open_pool_schematized_with_settings(database_url, schema, settings).await
+}
+
+async fn pg_open_pool_schematized_with_settings(
+    database_url: &str,
+    schema: &str,
+    settings: PgPoolSettings,
+) -> anyhow::Result<PgPool> {
+    validate_identifier(schema)?;
+    let opts = PgConnectOptions::from_str(database_url)?;
     let schema_for_hook = schema.to_string();
     let pool = PgPoolOptions::new()
         .max_connections(settings.max_connections)
@@ -610,11 +658,32 @@ fn pg_duplicate_column_error(statement: &str, error: &sqlx::Error) -> bool {
 pub struct PgMigrator<'a> {
     pool: &'a PgPool,
     migrations: &'a [Migration],
+    migration_table: &'a str,
 }
 
 impl<'a> PgMigrator<'a> {
     pub fn new(pool: &'a PgPool, migrations: &'a [Migration]) -> Self {
-        Self { pool, migrations }
+        Self {
+            pool,
+            migrations,
+            migration_table: "schema_migrations",
+        }
+    }
+
+    /// Use a store-specific migration ledger when multiple logical stores share
+    /// one PostgreSQL schema and their migration version numbers would
+    /// otherwise collide in the default `schema_migrations` table.
+    pub fn new_with_table(
+        pool: &'a PgPool,
+        migrations: &'a [Migration],
+        migration_table: &'a str,
+    ) -> anyhow::Result<Self> {
+        validate_identifier(migration_table)?;
+        Ok(Self {
+            pool,
+            migrations,
+            migration_table,
+        })
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -653,20 +722,25 @@ impl<'a> PgMigrator<'a> {
     }
 
     async fn run_locked(&self, conn: &mut PgConnection) -> anyhow::Result<()> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
+        let create_migrations_table = format!(
+            "CREATE TABLE IF NOT EXISTS \"{}\" (
                 version     BIGINT PRIMARY KEY,
                 description TEXT NOT NULL,
                 applied_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
-        )
-        .execute(&mut *conn)
-        .await?;
+            self.migration_table
+        );
+        sqlx::query(&create_migrations_table)
+            .execute(&mut *conn)
+            .await?;
 
-        let rows: Vec<(i64,)> =
-            sqlx::query_as("SELECT version FROM schema_migrations ORDER BY version ASC")
-                .fetch_all(&mut *conn)
-                .await?;
+        let select_versions = format!(
+            "SELECT version FROM \"{}\" ORDER BY version ASC",
+            self.migration_table
+        );
+        let rows: Vec<(i64,)> = sqlx::query_as(&select_versions)
+            .fetch_all(&mut *conn)
+            .await?;
         let applied: HashSet<u32> = rows.into_iter().map(|(v,)| v as u32).collect();
 
         let mut pending: Vec<&Migration> = self
@@ -706,7 +780,11 @@ impl<'a> PgMigrator<'a> {
                 }
             }
         }
-        sqlx::query("INSERT INTO schema_migrations (version, description) VALUES ($1, $2)")
+        let insert_migration = format!(
+            "INSERT INTO \"{}\" (version, description) VALUES ($1, $2)",
+            self.migration_table
+        );
+        sqlx::query(&insert_migration)
             .bind(migration.version as i64)
             .bind(migration.description)
             .execute(&mut *tx)

@@ -7,13 +7,15 @@
 //! store. Metrics that harness does not yet track (runtime CPU/RAM) are
 //! returned as `null` so the UI degrades gracefully.
 
+use crate::http::rest_contract::ContractJson as Json;
 use crate::http::AppState;
 use crate::runtime_projection::{RuntimeActiveBucket, RuntimeWorkflowProjection};
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use chrono::{DateTime, Duration, Timelike, Utc};
 use harness_core::types::{Decision, Event, EventFilters};
 use harness_observe::quality::QualityGrader;
 use harness_observe::usage::UsageMetrics;
+use harness_protocol::rest::OverviewResponse;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +32,7 @@ const THROUGHPUT_BUCKETS: usize = 24;
 const FEED_LIMIT: usize = 40;
 
 /// GET /api/overview — JSON payload driving the system overview page.
-pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<OverviewResponse>) {
     let now = Utc::now();
     // Snap the query window to the start of the oldest bucket on the hour
     // axis so that SQL rows and JS buckets agree. Without this, tasks
@@ -43,7 +45,18 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
 
     // ---- global task queue counts (reuse existing services) ----
     let tq = &state.concurrency.task_queue;
-    let active_counts = active_task_overview_counts(&state).await;
+    let active_counts = match active_task_overview_counts(&state).await {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::error!("overview: active workflow counts unavailable: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OverviewResponse(
+                    json!({"error": "active workflow counts unavailable"}),
+                )),
+            );
+        }
+    };
     let running = active_counts.running;
     let queued = active_counts.queued;
     let max_concurrent = tq.global_limit();
@@ -55,7 +68,9 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
                 tracing::error!("overview: workflow runtime metrics query failed: {error}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "workflow runtime metrics unavailable"})),
+                    Json(OverviewResponse(
+                        json!({"error": "workflow runtime metrics unavailable"}),
+                    )),
                 );
             }
         };
@@ -235,17 +250,25 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
 
     let feed = build_feed(&events, now);
     // Exhausted outbound alert deliveries in the window (GH1582 B-008).
-    let alert_delivery_failures = state
+    let alert_delivery_failures = match state
         .observability
         .events
         .query_external_signals(Some(now - chrono::Duration::hours(OVERVIEW_WINDOW_HOURS)))
-        .map(|signals| {
-            signals
-                .iter()
-                .filter(|s| s.source == "alerting" && s.payload["outcome"] == "exhausted")
-                .count()
-        })
-        .unwrap_or(0);
+    {
+        Ok(signals) => signals
+            .iter()
+            .filter(|s| s.source == "alerting" && s.payload["outcome"] == "exhausted")
+            .count(),
+        Err(e) => {
+            tracing::error!("overview: failed to query exhausted alert deliveries: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OverviewResponse(
+                    json!({"error": "exhausted alert deliveries unavailable"}),
+                )),
+            );
+        }
+    };
     let alerts = build_alerts(&events, &runtime_hosts, alert_delivery_failures);
 
     let evolution: Value = events
@@ -330,7 +353,7 @@ pub async fn overview(State(state): State<Arc<AppState>>) -> (StatusCode, Json<V
         },
     });
 
-    (StatusCode::OK, Json(body))
+    (StatusCode::OK, Json(OverviewResponse(body)))
 }
 
 /// Start of the oldest bucket on the hour axis. Shared by the SQL `since`
@@ -478,55 +501,38 @@ impl ActiveTaskOverviewCounts {
     }
 }
 
-pub(crate) async fn active_task_overview_counts(state: &AppState) -> ActiveTaskOverviewCounts {
+pub(crate) async fn active_task_overview_counts(
+    state: &AppState,
+) -> anyhow::Result<ActiveTaskOverviewCounts> {
     let mut counts = ActiveTaskOverviewCounts::default();
-    let runtime_counts_available = state.core.workflow_runtime_store.is_some();
-
-    if let Some(store) = state.core.workflow_runtime_store.as_ref() {
-        match crate::handlers::definition_ids::active_count_definition_ids() {
-            Ok(definition_ids) => {
-                for definition_id in &definition_ids {
-                    match store
-                        .list_nonterminal_instances_by_definition(definition_id, None, None)
-                        .await
-                    {
-                        Ok(workflows) => {
-                            for workflow in workflows {
-                                add_active_runtime_workflow(&mut counts, &workflow);
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                definition_id = definition_id.as_str(),
-                                "overview: failed to list runtime workflows for active counts: {error}"
-                            );
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::error!("overview: {error}; runtime workflow active counts unavailable");
-            }
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("workflow runtime store unavailable"))?;
+    for definition_id in
+        crate::handlers::definition_ids::active_count_definition_ids(store.definition_registry())?
+    {
+        let workflows = store
+            .list_nonterminal_instances_by_definition(&definition_id, None, None)
+            .await?;
+        for workflow in workflows {
+            add_active_runtime_workflow_with_registry(
+                store.definition_registry(),
+                &mut counts,
+                &workflow,
+            );
         }
     }
-
-    if !runtime_counts_available {
-        for _ in 0..state.concurrency.task_queue.running_count() {
-            counts.add(None, ActiveTaskBucket::Running);
-        }
-        for _ in 0..state.concurrency.task_queue.queued_count() {
-            counts.add(None, ActiveTaskBucket::Queued);
-        }
-    }
-
-    counts
+    Ok(counts)
 }
 
-fn add_active_runtime_workflow(
+fn add_active_runtime_workflow_with_registry(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     counts: &mut ActiveTaskOverviewCounts,
     workflow: &harness_workflow::runtime::WorkflowInstance,
 ) -> bool {
-    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(registry, workflow);
     let Some(bucket) = projection.active_bucket() else {
         return false;
     };
@@ -536,6 +542,18 @@ fn add_active_runtime_workflow(
     };
     counts.add(projection.project_id.as_deref(), bucket);
     true
+}
+
+#[cfg(test)]
+fn add_active_runtime_workflow(
+    counts: &mut ActiveTaskOverviewCounts,
+    workflow: &harness_workflow::runtime::WorkflowInstance,
+) -> bool {
+    add_active_runtime_workflow_with_registry(
+        &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
+        counts,
+        workflow,
+    )
 }
 
 /// Top of the current hour (i.e. `HH:00:00Z`). Falls back to `now` on the
@@ -579,7 +597,9 @@ fn compute_grade(events: &[Event]) -> (Option<f64>, Option<Value>) {
                 .count()
         })
         .unwrap_or(0);
-    let report = QualityGrader::grade(events, violation_count);
+    let Some(report) = QualityGrader::grade(events, violation_count) else {
+        return (None, None);
+    };
     let letter = serde_json::to_value(report.grade).ok();
     (Some(report.score), letter)
 }

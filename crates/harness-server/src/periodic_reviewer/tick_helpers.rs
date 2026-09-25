@@ -82,12 +82,16 @@ pub(super) fn terminal_result_disposition(result: &ActivityResult) -> TerminalRe
     match result.status {
         ActivityStatus::Succeeded => TerminalResultDisposition::ReadRuntimeTurn,
         ActivityStatus::Cancelled => TerminalResultDisposition::Ignore,
-        ActivityStatus::Failed | ActivityStatus::Blocked
+        ActivityStatus::Failed
+        | ActivityStatus::Blocked
+        | ActivityStatus::SucceededWithBlockers
             if result.summary.trim() == "REVIEW_SKIPPED" =>
         {
             TerminalResultDisposition::Return("REVIEW_SKIPPED".to_string())
         }
-        ActivityStatus::Failed | ActivityStatus::Blocked => TerminalResultDisposition::Failed(
+        ActivityStatus::Failed
+        | ActivityStatus::Blocked
+        | ActivityStatus::SucceededWithBlockers => TerminalResultDisposition::Failed(
             result
                 .error
                 .clone()
@@ -162,7 +166,7 @@ pub(super) async fn poll_task_output(
             .await
         {
             Ok(Some(event)) => event,
-            Ok(None) if workflow.is_terminal() => {
+            Ok(None) if workflow.is_terminal_with_registry(store.definition_registry()) => {
                 tracing::error!(
                     task_id = %task_id,
                     workflow_id = %workflow.id,

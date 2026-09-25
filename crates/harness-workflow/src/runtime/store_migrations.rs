@@ -1,5 +1,8 @@
 use harness_core::db::Migration;
 
+mod github_identity;
+mod remote_lease_proof;
+
 pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -592,5 +595,198 @@ pub(super) static WORKFLOW_RUNTIME_MIGRATIONS: &[Migration] = &[
         );
         CREATE INDEX IF NOT EXISTS idx_workflow_artifact_dependencies_workflow
           ON workflow_artifact_dependencies (workflow_id)",
+    },
+    Migration {
+        version: 24,
+        description: "supersede workflow command attempts instead of rewriting them",
+        sql: "ALTER TABLE workflow_commands
+                ADD COLUMN IF NOT EXISTS attempt_generation INTEGER NOT NULL DEFAULT 1;
+              ALTER TABLE workflow_commands
+                ADD COLUMN IF NOT EXISTS superseded_by_command_id TEXT;
+              ALTER TABLE workflow_commands
+                DROP CONSTRAINT IF EXISTS workflow_commands_status_check;
+              ALTER TABLE workflow_commands
+                ADD CONSTRAINT workflow_commands_status_check
+                CHECK (status IN (
+                  'pending', 'dispatching', 'deferred', 'dispatched', 'handled_inline',
+                  'completed', 'failed', 'blocked', 'cancelled', 'skipped', 'superseded'
+                ));
+              -- Dedupe identity now covers only live attempts: a superseded row
+              -- keeps its dedupe_key as the record of the attempt it was, while
+              -- the replacement attempt takes over that key.
+              ALTER TABLE workflow_commands
+                DROP CONSTRAINT IF EXISTS workflow_commands_workflow_id_dedupe_key_key;
+              CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_commands_live_dedupe
+                ON workflow_commands (workflow_id, dedupe_key)
+                WHERE status <> 'superseded'",
+    },
+    Migration {
+        version: 25,
+        description: "persist runtime usage agent run ids",
+        sql: "ALTER TABLE runtime_usage_events
+              ADD COLUMN IF NOT EXISTS agent_run_id TEXT;
+              CREATE INDEX IF NOT EXISTS idx_runtime_usage_events_agent_run
+              ON runtime_usage_events (agent_run_id)",
+    },
+    Migration {
+        version: 26,
+        description: "dead-letter completed activity results rejected by lease ownership",
+        sql: "CREATE TABLE IF NOT EXISTS runtime_job_completions_dlq (
+                id TEXT PRIMARY KEY,
+                runtime_job_id TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                lease_expires_at TIMESTAMPTZ NOT NULL,
+                result JSONB NOT NULL,
+                transcript JSONB,
+                recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                applied BOOLEAN NOT NULL DEFAULT FALSE
+              );
+              CREATE INDEX IF NOT EXISTS idx_runtime_job_completions_dlq_job
+              ON runtime_job_completions_dlq (runtime_job_id);
+              CREATE INDEX IF NOT EXISTS idx_runtime_job_completions_dlq_unapplied
+              ON runtime_job_completions_dlq (applied, recorded_at)",
+    },
+    Migration {
+        version: 27,
+        description: "retain workflow run evidence metadata and bounded payloads",
+        sql: "CREATE TABLE IF NOT EXISTS workflow_run_evidence (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                command_id TEXT,
+                runtime_job_id TEXT,
+                project_id TEXT NOT NULL,
+                commit_sha TEXT,
+                stack TEXT NOT NULL,
+                suite TEXT NOT NULL,
+                baseline TEXT,
+                decision TEXT NOT NULL,
+                evidence_schema TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                trust TEXT NOT NULL,
+                location JSONB NOT NULL,
+                retention_class TEXT NOT NULL,
+                payload JSONB,
+                payload_expires_at TIMESTAMPTZ,
+                payload_expired_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT workflow_run_evidence_required_text_not_blank
+                    CHECK (
+                        btrim(id) <> ''
+                        AND btrim(workflow_id) <> ''
+                        AND btrim(project_id) <> ''
+                        AND btrim(stack) <> ''
+                        AND btrim(suite) <> ''
+                        AND btrim(decision) <> ''
+                        AND btrim(evidence_schema) <> ''
+                        AND btrim(digest) <> ''
+                        AND btrim(trust) <> ''
+                        AND btrim(retention_class) <> ''
+                    )
+              );
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_project_time
+                ON workflow_run_evidence (project_id, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_commit_time
+                ON workflow_run_evidence (commit_sha, created_at DESC)
+                WHERE commit_sha IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_suite_time
+                ON workflow_run_evidence (suite, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_decision_time
+                ON workflow_run_evidence (decision, created_at DESC);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_created_time
+                ON workflow_run_evidence (created_at DESC, id DESC);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_payload_expiry
+                ON workflow_run_evidence (payload_expires_at)
+                WHERE payload IS NOT NULL AND payload_expires_at IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_workflow_id
+                ON workflow_run_evidence (workflow_id);
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_command_id
+                ON workflow_run_evidence (command_id)
+                WHERE command_id IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_run_evidence_runtime_job_id
+                ON workflow_run_evidence (runtime_job_id)
+                WHERE runtime_job_id IS NOT NULL",
+    },
+    Migration {
+        version: 28,
+        description: "prove remote lease provenance for stale completion recovery",
+        sql: remote_lease_proof::SQL,
+    },
+    Migration {
+        version: 29,
+        description: "index case-insensitive runtime GitHub subject lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_workflow_instances_project_repo_issue_ci
+              ON workflow_instances (
+                  definition_id,
+                  (data->'data'->>'project_id'),
+                  (LOWER(data->'data'->>'repo')),
+                  (data->'data'->>'issue_number'),
+                  updated_at DESC
+              )
+              WHERE data->'data'->>'issue_number' IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_workflow_instances_project_repo_pr_ci
+              ON workflow_instances (
+                  definition_id,
+                  (data->'data'->>'project_id'),
+                  (LOWER(data->'data'->>'repo')),
+                  (data->'data'->>'pr_number'),
+                  updated_at DESC
+              )
+              WHERE data->'data'->>'pr_number' IS NOT NULL",
+    },
+    Migration {
+        version: 30,
+        description: "index case-insensitive GitHub remote fact lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_remote_fact_snapshots_provider_repo_subject_ci
+              ON remote_fact_snapshots (
+                  provider,
+                  (LOWER(repo)),
+                  subject_type,
+                  subject_number,
+                  fetched_at DESC,
+                  updated_at DESC
+              )",
+    },
+    Migration {
+        version: 31,
+        description: "canonicalize GitHub remote fact repository identity",
+        sql: "WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY provider, LOWER(repo), subject_type, subject_number
+                           ORDER BY
+                               CASE LOWER(state)
+                                   WHEN 'merged' THEN 4
+                                   WHEN 'closed' THEN 3
+                                   WHEN 'done' THEN 3
+                                   WHEN 'cancelled' THEN 2
+                                   ELSE 1
+                               END DESC,
+                               fetched_at DESC,
+                               fact_hash DESC,
+                               updated_at DESC,
+                               id DESC
+                       ) AS row_number
+                FROM remote_fact_snapshots
+                WHERE provider = 'github'
+              )
+              DELETE FROM remote_fact_snapshots AS snapshot
+              USING ranked
+              WHERE snapshot.id = ranked.id
+                AND ranked.row_number > 1;
+              UPDATE remote_fact_snapshots
+              SET repo = LOWER(repo), updated_at = CURRENT_TIMESTAMP
+              WHERE provider = 'github' AND repo <> LOWER(repo)",
+    },
+    Migration {
+        version: 32,
+        description: "enforce unique runtime GitHub issue identities",
+        sql: github_identity::SQL,
+    },
+    Migration {
+        version: 33,
+        description: "record whether runtime USD cost was provider observed",
+        sql: "ALTER TABLE runtime_usage_events
+              ADD COLUMN IF NOT EXISTS cost_usd_observed BOOLEAN NOT NULL DEFAULT FALSE",
     },
 ];

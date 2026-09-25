@@ -1,10 +1,14 @@
-use super::manifest::EvalBenchmarkCase;
+use super::{
+    data::eval_cleanup_data,
+    manifest::{EvalBenchmarkCase, EvalIsolationProfile},
+    transition_outcome::accepted_transition_record,
+    trusted_verifier::{is_trusted_eval_verifier_argv, TRUSTED_EVAL_VERIFIER_V1_CAPABILITY},
+};
 use crate::runtime::{
-    build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeCommandDispatcher,
-    RuntimeJobStatus, RuntimeProfile, SubmissionMode, ValidationContext, WorkflowCommand,
-    WorkflowCommandStatus, WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition,
-    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID,
+    build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeProfile, SubmissionMode,
+    ValidationContext, WorkflowCommand, WorkflowCommandStatus, WorkflowCommandType,
+    WorkflowDecision, WorkflowDecisionTransition, WorkflowDefinition, WorkflowEvidence,
+    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -28,12 +32,6 @@ pub struct EvalCaseEnqueueOutcome {
     pub command_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct EvalCaseDispatchOutcome {
-    pub enqueue: EvalCaseEnqueueOutcome,
-    pub dispatched_jobs: usize,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct EvalCaseWorkflowInput<'a> {
     pub eval_run_id: &'a str,
@@ -41,6 +39,8 @@ pub struct EvalCaseWorkflowInput<'a> {
     pub project_id: &'a str,
     pub task_id: &'a str,
     pub additional_prompt: Option<&'a str>,
+    pub timeout_secs: u64,
+    pub resource_limits: &'a harness_sandbox::CappedResourceLimits,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +123,9 @@ pub async fn enqueue_eval_case_workflow(
     store: &WorkflowRuntimeStore,
     input: EvalCaseWorkflowInput<'_>,
 ) -> anyhow::Result<EvalCaseEnqueueOutcome> {
+    validate_eval_case_replayable(input.case)?;
+    let verification_argv = input.case.verification_command_argv()?;
+
     store
         .upsert_definition(
             &WorkflowDefinition::new(GITHUB_ISSUE_PR_DEFINITION_ID, 1, "GitHub issue PR workflow")
@@ -130,7 +133,7 @@ pub async fn enqueue_eval_case_workflow(
         )
         .await?;
 
-    let initial_instance = eval_case_initial_instance(input);
+    let initial_instance = eval_case_initial_instance(input, &verification_argv);
     let additional_prompt = eval_case_additional_prompt(input.additional_prompt);
     let output = build_issue_submission_decision(
         &initial_instance,
@@ -148,7 +151,7 @@ pub async fn enqueue_eval_case_workflow(
             candidate_fanout: None,
         },
     );
-    let decision = with_eval_command_metadata(output.decision, input);
+    let decision = with_eval_command_metadata(output.decision, input, &verification_argv);
     let validator = crate::runtime::DecisionValidator::github_issue_pr();
     validator.validate(
         &initial_instance,
@@ -159,31 +162,40 @@ pub async fn enqueue_eval_case_workflow(
     let mut submitted_instance = initial_instance.clone();
     submitted_instance.state = decision.next_state.clone();
     submitted_instance.version = submitted_instance.version.saturating_add(1);
-    submitted_instance.data = eval_case_submitted_data(input, &decision.decision);
-    let record = store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: &initial_instance.state,
-            create_if_missing: Some(&initial_instance),
-            event_type: "EvalCaseSubmitted",
-            source: "eval-run",
-            payload: json!({
-                "eval_run_id": input.eval_run_id,
-                "case_id": input.case.case_id,
-                "issue": input.case.issue,
-                "repo": input.case.repo,
-            }),
-            decision: &decision,
-            final_instance: &submitted_instance,
-            command_status: WorkflowCommandStatus::Pending,
-        })
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "eval case workflow {} was not in the expected `{}` state",
-                initial_instance.id,
-                initial_instance.state
+    submitted_instance.replace_classified_data(
+        eval_case_submitted_data(input, &decision.decision, &verification_argv),
+        crate::runtime::DataProvenance::Server,
+    );
+    let record = accepted_transition_record(
+        store
+            .apply_decision_transition(
+                WorkflowDecisionTransition {
+                    expected_state: &initial_instance.state,
+                    create_if_missing: Some(&initial_instance),
+                    event_type: "EvalCaseSubmitted",
+                    source: "eval-run",
+                    payload: json!({
+                        "eval_run_id": input.eval_run_id,
+                        "case_id": input.case.case_id,
+                        "issue": input.case.issue,
+                        "repo": input.case.repo,
+                    }),
+                    decision: &decision,
+                    final_instance: &submitted_instance,
+                    command_status: WorkflowCommandStatus::Pending,
+                },
+                "eval-run",
             )
-        })?;
+            .await?,
+        &initial_instance.id,
+        "eval case enqueue",
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "eval case workflow {} changed or disappeared before commit",
+            initial_instance.id
+        )
+    })?;
     let command_ids = store
         .commands_for(&submitted_instance.id)
         .await?
@@ -204,29 +216,25 @@ pub async fn enqueue_eval_case_workflow(
     })
 }
 
-pub async fn dispatch_eval_case_workflow(
-    store: &WorkflowRuntimeStore,
-    runtime_profile: RuntimeProfile,
-    input: EvalCaseWorkflowInput<'_>,
-) -> anyhow::Result<EvalCaseDispatchOutcome> {
-    let enqueue = enqueue_eval_case_workflow(store, input).await?;
-    let outcomes = RuntimeCommandDispatcher::new(store, runtime_profile)
-        .dispatch_pending()
-        .await?;
-    let dispatched_jobs = outcomes
-        .into_iter()
-        .filter(|outcome| {
-            matches!(
-                outcome,
-                crate::runtime::CommandDispatchOutcome::Enqueued { .. }
-                    | crate::runtime::CommandDispatchOutcome::AlreadyDispatched { .. }
-            )
-        })
-        .count();
-    Ok(EvalCaseDispatchOutcome {
-        enqueue,
-        dispatched_jobs,
-    })
+fn validate_eval_case_replayable(case: &EvalBenchmarkCase) -> anyhow::Result<()> {
+    if let Some(blocker) = case.replay_blocker() {
+        anyhow::bail!("eval case {} is not replayable: {blocker}", case.case_id);
+    }
+    case.verification_command_argv()?;
+    Ok(())
+}
+
+pub fn eval_isolated_runtime_profile(
+    case: &EvalBenchmarkCase,
+    timeout_secs: u64,
+) -> RuntimeProfile {
+    let mut profile = RuntimeProfile::new(
+        case.isolation.runtime_profile.clone(),
+        case.isolation.runtime_kind,
+    );
+    profile.sandbox = Some(case.isolation.sandbox.clone());
+    profile.timeout_secs = Some(timeout_secs);
+    profile
 }
 
 pub async fn cleanup_cancelled_eval_run(
@@ -263,7 +271,7 @@ pub async fn cleanup_cancelled_eval_run(
             }
         };
         for command in commands {
-            if !active_command_status(command.status) {
+            if !command.status.is_active() {
                 continue;
             }
             match store
@@ -287,15 +295,28 @@ pub async fn cleanup_cancelled_eval_run(
         let mut final_instance = instance.clone();
         if !instance.is_terminal() {
             match cancel_eval_workflow_instance(store, &instance, eval_run_id, case, reason).await {
-                Ok(Some(cancelled_instance)) => {
-                    summary.workflows_cancelled += 1;
-                    final_instance = cancelled_instance;
-                }
+                Ok(Some(_)) => summary.workflows_cancelled += 1,
                 Ok(None) => {}
                 Err(error) => {
                     summary.record_failure(&case.case_id, &workflow_id, "cancel_workflow", error);
                 }
             }
+            final_instance = match store.get_instance(&workflow_id).await {
+                Ok(Some(latest_instance)) => latest_instance,
+                Ok(None) => {
+                    summary.record_failure(
+                        &case.case_id,
+                        &workflow_id,
+                        "reload_workflow",
+                        "workflow disappeared after cleanup transition",
+                    );
+                    instance.clone()
+                }
+                Err(error) => {
+                    summary.record_failure(&case.case_id, &workflow_id, "reload_workflow", error);
+                    continue;
+                }
+            };
         };
 
         if let Err(error) =
@@ -325,8 +346,13 @@ async fn cancel_eval_workflow_instance(
     let mut final_instance = instance.clone();
     final_instance.state = "cancelled".to_string();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data =
-        eval_cleanup_data(final_instance.data, eval_run_id, &case.case_id, reason);
+    let cleanup_data = eval_cleanup_data(
+        final_instance.data.clone(),
+        eval_run_id,
+        &case.case_id,
+        reason,
+    );
+    final_instance.replace_classified_data(cleanup_data, crate::runtime::DataProvenance::Server);
 
     let decision = WorkflowDecision::new(
         &instance.id,
@@ -356,22 +382,29 @@ async fn cancel_eval_workflow_instance(
         &ValidationContext::new("eval-cleanup", Utc::now()),
     )?;
 
-    let record = store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: &observed_state,
-            create_if_missing: None,
-            event_type: "EvalRunCancelled",
-            source: "eval-cleanup",
-            payload: json!({
-                "eval_run_id": eval_run_id,
-                "case_id": case.case_id,
-                "reason": reason,
-            }),
-            decision: &decision,
-            final_instance: &final_instance,
-            command_status: WorkflowCommandStatus::Pending,
-        })
-        .await?;
+    let record = accepted_transition_record(
+        store
+            .apply_decision_transition(
+                WorkflowDecisionTransition {
+                    expected_state: &observed_state,
+                    create_if_missing: None,
+                    event_type: "EvalRunCancelled",
+                    source: "eval-cleanup",
+                    payload: json!({
+                        "eval_run_id": eval_run_id,
+                        "case_id": case.case_id,
+                        "reason": reason,
+                    }),
+                    decision: &decision,
+                    final_instance: &final_instance,
+                    command_status: WorkflowCommandStatus::Pending,
+                },
+                "eval-cleanup",
+            )
+            .await?,
+        &instance.id,
+        "eval cleanup",
+    )?;
     Ok(record.map(|_| final_instance))
 }
 
@@ -403,12 +436,14 @@ async fn collect_remaining_eval_resources(
         summary.orphan_pull_requests += 1;
     }
 
-    for command in store.commands_for(workflow_id).await? {
-        if active_command_status(command.status) {
+    let commands = store.commands_for(workflow_id).await?;
+    let mut jobs_by_command = super::cleanup::runtime_jobs_by_command_id(store, &commands).await?;
+    for command in commands {
+        if command.status.is_active() {
             summary.active_commands += 1;
         }
-        for job in store.runtime_jobs_for_command(&command.id).await? {
-            if active_runtime_job_status(job.status) {
+        for job in jobs_by_command.remove(&command.id).unwrap_or_default() {
+            if job.status.is_active() {
                 summary.active_runtime_jobs += 1;
             }
         }
@@ -417,51 +452,10 @@ async fn collect_remaining_eval_resources(
     Ok(())
 }
 
-fn eval_cleanup_data(mut data: Value, eval_run_id: &str, case_id: &str, reason: &str) -> Value {
-    if !data.is_object() {
-        data = json!({});
-    }
-    let Some(object) = data.as_object_mut() else {
-        return data;
-    };
-    let eval = object
-        .entry("eval".to_string())
-        .or_insert_with(|| json!({}));
-    if !eval.is_object() {
-        *eval = json!({});
-    }
-    if let Some(eval_object) = eval.as_object_mut() {
-        eval_object.insert(
-            "cleanup".to_string(),
-            json!({
-                "status": "cancelled",
-                "eval_run_id": eval_run_id,
-                "case_id": case_id,
-                "reason": reason,
-            }),
-        );
-    }
-    data
-}
-
-fn active_command_status(status: WorkflowCommandStatus) -> bool {
-    matches!(
-        status,
-        WorkflowCommandStatus::Pending
-            | WorkflowCommandStatus::Dispatching
-            | WorkflowCommandStatus::Deferred
-            | WorkflowCommandStatus::Dispatched
-    )
-}
-
-fn active_runtime_job_status(status: RuntimeJobStatus) -> bool {
-    matches!(
-        status,
-        RuntimeJobStatus::Pending | RuntimeJobStatus::Running
-    )
-}
-
-fn eval_case_initial_instance(input: EvalCaseWorkflowInput<'_>) -> WorkflowInstance {
+pub(super) fn eval_case_initial_instance(
+    input: EvalCaseWorkflowInput<'_>,
+    verification_argv: &[Vec<String>],
+) -> WorkflowInstance {
     WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
@@ -472,14 +466,22 @@ fn eval_case_initial_instance(input: EvalCaseWorkflowInput<'_>) -> WorkflowInsta
         input.eval_run_id,
         &input.case.case_id,
     ))
-    .with_data(eval_case_submitted_data(input, "created"))
+    .with_classified_data(
+        eval_case_submitted_data(input, "created", verification_argv),
+        crate::runtime::DataProvenance::Server,
+    )
 }
 
-fn eval_case_submitted_data(input: EvalCaseWorkflowInput<'_>, last_decision: &str) -> Value {
+fn eval_case_submitted_data(
+    input: EvalCaseWorkflowInput<'_>,
+    last_decision: &str,
+    verification_argv: &[Vec<String>],
+) -> Value {
     json!({
         "project_id": input.project_id,
         "repo": input.case.repo,
         "issue_number": input.case.issue,
+        "author_trust_class": "non_collaborator",
         "submission_id": input.task_id,
         "task_id": input.task_id,
         "task_ids": [input.task_id],
@@ -491,9 +493,13 @@ fn eval_case_submitted_data(input: EvalCaseWorkflowInput<'_>, last_decision: &st
             "case_id": input.case.case_id,
             "base_commit": input.case.base_commit,
             "verify_commands": input.case.verify_commands,
-            "timeout_secs": input.case.timeout_secs,
+            "verify_commands_argv": verification_argv,
+            "timeout_secs": input.timeout_secs,
+            "resource_limits": input.resource_limits,
+            "required_runtime_host_capabilities": eval_required_runtime_host_capabilities(verification_argv),
             "branch_prefix": EVAL_BRANCH_PREFIX,
             "pull_request_mode": EVAL_PR_DRAFT_MODE,
+            "isolation": eval_isolation_metadata(&input.case.isolation),
         },
         "last_decision": last_decision,
         "execution_path": "workflow_runtime",
@@ -503,6 +509,7 @@ fn eval_case_submitted_data(input: EvalCaseWorkflowInput<'_>, last_decision: &st
 fn with_eval_command_metadata(
     mut decision: crate::runtime::WorkflowDecision,
     input: EvalCaseWorkflowInput<'_>,
+    verification_argv: &[Vec<String>],
 ) -> crate::runtime::WorkflowDecision {
     for command in &mut decision.commands {
         let Some(object) = command.command.as_object_mut() else {
@@ -515,9 +522,13 @@ fn with_eval_command_metadata(
                 "case_id": input.case.case_id,
                 "base_commit": input.case.base_commit,
                 "verify_commands": input.case.verify_commands,
-                "timeout_secs": input.case.timeout_secs,
+                "verify_commands_argv": verification_argv,
+                "timeout_secs": input.timeout_secs,
+                "resource_limits": input.resource_limits,
+                "required_runtime_host_capabilities": eval_required_runtime_host_capabilities(verification_argv),
                 "branch_prefix": EVAL_BRANCH_PREFIX,
                 "pull_request_mode": EVAL_PR_DRAFT_MODE,
+                "isolation": eval_isolation_metadata(&input.case.isolation),
             }),
         );
         object.insert("branch_prefix".to_string(), json!(EVAL_BRANCH_PREFIX));
@@ -527,8 +538,40 @@ fn with_eval_command_metadata(
             "validation_commands".to_string(),
             json!(input.case.verify_commands),
         );
+        object.insert(
+            "validation_commands_argv".to_string(),
+            json!(verification_argv),
+        );
     }
     decision
+}
+
+fn eval_isolation_metadata(isolation: &EvalIsolationProfile) -> Value {
+    json!({
+        "tier": isolation.tier,
+        "runtime_kind": isolation.runtime_kind,
+        "runtime_profile": isolation.runtime_profile,
+        "sandbox": isolation.sandbox,
+        "backend": isolation.backend,
+        "image": isolation.image,
+        "network_allowlist": isolation.network_allowlist,
+        "lifecycle": isolation.lifecycle,
+        "cleanup_required": isolation.cleanup_required,
+    })
+}
+
+fn eval_required_runtime_host_capabilities(verification_argv: &[Vec<String>]) -> Vec<&'static str> {
+    let mut capabilities = vec![
+        harness_sandbox::EVAL_RESOURCE_LIMITS_CAPABILITY,
+        harness_sandbox::EVAL_NETWORK_POLICY_CAPABILITY,
+    ];
+    if verification_argv
+        .iter()
+        .any(|argv| is_trusted_eval_verifier_argv(argv))
+    {
+        capabilities.push(TRUSTED_EVAL_VERIFIER_V1_CAPABILITY);
+    }
+    capabilities
 }
 
 fn eval_case_workflow_id(eval_run_id: &str, case_id: &str) -> String {
@@ -537,8 +580,12 @@ fn eval_case_workflow_id(eval_run_id: &str, case_id: &str) -> String {
 
 const EVAL_CASE_DEFAULT_ADDITIONAL_PROMPT: &str = "\
 This is a Harness eval run. Execute through the normal workflow runtime path, \
-open only a draft pull request, use the harness-eval/ branch prefix, and do not \
-merge or close the eval-produced PR.";
+open only a draft pull request, use the harness-eval/ branch prefix, use the \
+recorded eval isolation profile, keep untrusted case execution out of the \
+caller/server environment, retain backend/image/lifecycle/cleanup evidence, \
+and do not merge or close the eval-produced PR. Before making changes, check out \
+the exact requested base commit. The runtime host independently reports the \
+observed checkout commit to the server.";
 
 fn eval_case_additional_prompt(additional_prompt: Option<&str>) -> String {
     match additional_prompt
@@ -551,218 +598,5 @@ fn eval_case_additional_prompt(additional_prompt: Option<&str>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::runtime::{RuntimeKind, RuntimeProfile, WorkflowRuntimeStore};
-
-    #[test]
-    fn eval_run_plan_marks_issue_submission_for_draft_prs() {
-        let case = EvalBenchmarkCase {
-            case_id: "owner/repo#42".to_string(),
-            repo: "owner/repo".to_string(),
-            issue: 42,
-            base_commit: "abcdef1".to_string(),
-            verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
-            timeout_secs: 120,
-        };
-        let input = EvalCaseWorkflowInput {
-            eval_run_id: "run-1",
-            case: &case,
-            project_id: "/repo",
-            task_id: "eval-task-1",
-            additional_prompt: None,
-        };
-
-        let initial = eval_case_initial_instance(input);
-        assert_eq!(initial.id, "eval:run-1:owner/repo#42");
-        assert_eq!(initial.definition_id, GITHUB_ISSUE_PR_DEFINITION_ID);
-        assert_eq!(initial.data["eval"]["eval_run_id"], "run-1");
-        assert_eq!(initial.data["eval"]["branch_prefix"], EVAL_BRANCH_PREFIX);
-        assert_eq!(
-            initial.data["eval"]["pull_request_mode"],
-            EVAL_PR_DRAFT_MODE
-        );
-
-        let output = build_issue_submission_decision(
-            &initial,
-            IssueSubmissionDecisionInput {
-                task_id: "eval-task-1",
-                repo: Some("owner/repo"),
-                issue_number: 42,
-                labels: &[],
-                force_execute: true,
-                additional_prompt: Some(EVAL_CASE_DEFAULT_ADDITIONAL_PROMPT),
-                depends_on: &[],
-                dependencies_blocked: false,
-                remote_fact_hash: None,
-                submission_mode: SubmissionMode::Immediate,
-                candidate_fanout: None,
-            },
-        );
-        let decision = with_eval_command_metadata(output.decision, input);
-        let command = &decision.commands[0].command;
-        assert_eq!(command["activity"], "implement_issue");
-        assert_eq!(command["eval"]["eval_run_id"], "run-1");
-        assert_eq!(command["branch_prefix"], EVAL_BRANCH_PREFIX);
-        assert_eq!(command["pull_request_mode"], EVAL_PR_DRAFT_MODE);
-        assert_eq!(
-            command["validation_commands"][0],
-            "cargo test -p harness-workflow eval_run"
-        );
-    }
-
-    #[test]
-    fn eval_run_prompt_preserves_required_draft_pr_constraints() {
-        let prompt = eval_case_additional_prompt(Some("Use the small implementation slice."));
-        assert!(prompt.contains("open only a draft pull request"));
-        assert!(prompt.contains("harness-eval/ branch prefix"));
-        assert!(prompt.contains("Use the small implementation slice."));
-    }
-
-    #[test]
-    fn eval_cleanup_summary_requires_zero_remaining_resources() {
-        let mut summary = EvalRunCleanupSummary::new("run-1");
-        assert!(summary.is_clean());
-
-        summary.active_runtime_jobs = 1;
-        assert!(!summary.is_clean());
-
-        summary.active_runtime_jobs = 0;
-        summary.orphan_pull_requests = 1;
-        assert!(!summary.is_clean());
-    }
-
-    #[tokio::test]
-    async fn eval_cleanup_cancels_mid_run_workflow_without_runtime_orphans() -> anyhow::Result<()> {
-        if std::env::var_os("HARNESS_DATABASE_URL").is_none() {
-            return Ok(());
-        }
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime_store")).await?;
-        let case = EvalBenchmarkCase {
-            case_id: "owner/repo#42".to_string(),
-            repo: "owner/repo".to_string(),
-            issue: 42,
-            base_commit: "abcdef1".to_string(),
-            verify_commands: vec!["cargo test -p harness-workflow eval_cleanup".to_string()],
-            timeout_secs: 120,
-        };
-        let outcome = enqueue_eval_case_workflow(
-            &store,
-            EvalCaseWorkflowInput {
-                eval_run_id: "run-cleanup",
-                case: &case,
-                project_id: dir.path().to_string_lossy().as_ref(),
-                task_id: "eval-task-1",
-                additional_prompt: None,
-            },
-        )
-        .await?;
-        assert_eq!(outcome.command_ids.len(), 1);
-        let _job = store
-            .enqueue_runtime_job_for_pending_command(
-                &outcome.command_ids[0],
-                RuntimeKind::CodexExec,
-                "codex",
-                json!({
-                    "activity": "implement_issue",
-                    "eval": {
-                        "eval_run_id": "run-cleanup",
-                        "case_id": case.case_id.clone(),
-                    }
-                }),
-                None,
-            )
-            .await?;
-
-        let summary = cleanup_cancelled_eval_run(
-            &store,
-            EvalRunCleanupInput {
-                eval_run_id: "run-cleanup",
-                cases: std::slice::from_ref(&case),
-                reason: "operator cancelled eval run",
-            },
-        )
-        .await?;
-
-        assert_eq!(summary.workflows_seen, 1);
-        assert_eq!(summary.workflows_cancelled, 1);
-        assert_eq!(summary.commands_cancelled, 1);
-        assert_eq!(summary.runtime_jobs_cancelled, 1);
-        assert!(summary.is_clean());
-
-        let workflow = match store.get_instance(&outcome.plan.workflow_id).await? {
-            Some(workflow) => workflow,
-            None => panic!("eval workflow should remain as terminal history"),
-        };
-        assert_eq!(workflow.state, "cancelled");
-        assert_eq!(
-            workflow.data["eval"]["cleanup"]["reason"],
-            "operator cancelled eval run"
-        );
-
-        let commands = store.commands_for(&outcome.plan.workflow_id).await?;
-        assert!(commands.iter().all(|command| {
-            matches!(
-                command.status,
-                WorkflowCommandStatus::Cancelled | WorkflowCommandStatus::HandledInline
-            )
-        }));
-        let jobs = store
-            .runtime_jobs_for_command(&outcome.command_ids[0])
-            .await?;
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].status, RuntimeJobStatus::Cancelled);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn eval_run_dispatches_standard_runtime_job() -> anyhow::Result<()> {
-        if std::env::var_os("HARNESS_DATABASE_URL").is_none() {
-            return Ok(());
-        }
-        let dir = tempfile::tempdir()?;
-        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime_store")).await?;
-        let case = EvalBenchmarkCase {
-            case_id: "owner/repo#42".to_string(),
-            repo: "owner/repo".to_string(),
-            issue: 42,
-            base_commit: "abcdef1".to_string(),
-            verify_commands: vec!["cargo test -p harness-workflow eval_run".to_string()],
-            timeout_secs: 120,
-        };
-
-        let outcome = dispatch_eval_case_workflow(
-            &store,
-            RuntimeProfile::new("codex", RuntimeKind::CodexExec),
-            EvalCaseWorkflowInput {
-                eval_run_id: "run-1",
-                case: &case,
-                project_id: dir.path().to_string_lossy().as_ref(),
-                task_id: "eval-task-1",
-                additional_prompt: None,
-            },
-        )
-        .await?;
-
-        assert_eq!(outcome.dispatched_jobs, 1);
-        assert_eq!(outcome.enqueue.command_ids.len(), 1);
-        let jobs = store
-            .runtime_jobs_for_command(&outcome.enqueue.command_ids[0])
-            .await?;
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].input["activity"], "implement_issue");
-        assert_eq!(jobs[0].input["command"]["eval"]["eval_run_id"], "run-1");
-        assert_eq!(
-            jobs[0].input["command"]["branch_prefix"],
-            EVAL_BRANCH_PREFIX
-        );
-        assert_eq!(
-            jobs[0].input["command"]["pull_request_mode"],
-            EVAL_PR_DRAFT_MODE
-        );
-
-        Ok(())
-    }
-}
+#[path = "run_tests.rs"]
+mod tests;

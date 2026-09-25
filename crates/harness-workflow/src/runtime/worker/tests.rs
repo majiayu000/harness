@@ -60,7 +60,9 @@ async fn enqueue_test_runtime_job(
         WorkflowSubject::new("issue", format!("issue:{key}")),
     )
     .with_id(format!("runtime-worker-test-{key}"));
-    store.upsert_instance(&workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
     let activity = input
         .get("activity")
         .and_then(serde_json::Value::as_str)
@@ -70,6 +72,46 @@ async fn enqueue_test_runtime_job(
     store
         .enqueue_runtime_job(&command_id, runtime_kind, runtime_profile, input)
         .await
+}
+
+#[test]
+fn child_completion_payload_carries_parent_recovery_identity() {
+    let child = WorkflowInstance::new(
+        super::super::PR_FEEDBACK_DEFINITION_ID,
+        1,
+        "feedback_found",
+        WorkflowSubject::new("pr", "pr:77"),
+    )
+    .with_id("pr-feedback-child")
+    .with_server_data(json!({
+        "started_by_runtime_job_id": "parent-start-child-job",
+    }));
+    let event = super::super::model::WorkflowEvent::new(
+        &child.id,
+        1,
+        "RuntimeJobCompleted",
+        "runtime-worker",
+    )
+    .with_payload(json!({
+        "runtime_job_id": "child-inspection-job",
+        "activity_result": {
+            "activity": super::super::PR_FEEDBACK_INSPECT_ACTIVITY,
+            "status": "succeeded",
+            "summary": "Feedback remains.",
+            "artifacts": [],
+            "signals": [],
+            "validation": [],
+            "error": null,
+            "error_kind": null
+        }
+    }));
+
+    let payload = merge_child_completion_payload(&event, &child);
+
+    assert_eq!(payload["child_workflow_id"], child.id);
+    assert_eq!(payload["recovery_activity"], "start_child_workflow");
+    assert_eq!(payload["recovery_runtime_job_id"], "parent-start-child-job");
+    assert_eq!(payload["runtime_job_id"], "child-inspection-job");
 }
 
 #[tokio::test]
@@ -236,6 +278,13 @@ fn mark_failed_inline_command_persists_failure_reason_into_data() {
         Some("Agent turn timed out after 900s"),
         "MarkFailed must surface its reason as the queryable failure_reason"
     );
+    assert_eq!(
+        instance
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/failure_reason")),
+        Some(super::super::DataProvenance::Agent)
+    );
     assert_eq!(instance.data["error_kind"], "timeout");
     assert_eq!(instance.data["retry_hint"], "Retry after route repair.");
     assert_eq!(instance.data["last_stop"]["runtime_job_id"], "job-1");
@@ -260,6 +309,13 @@ fn mark_blocked_inline_command_persists_stop_metadata_into_data() {
         instance.data["unblock_hint"],
         "Post approval, then call unblock."
     );
+    assert_eq!(
+        instance
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/blocked_reason")),
+        Some(super::super::DataProvenance::Agent)
+    );
     assert_eq!(instance.data["last_stop"]["runtime_job_id"], "job-2");
 }
 
@@ -270,4 +326,86 @@ fn prompt_task_instance() -> WorkflowInstance {
         "implementing",
         WorkflowSubject::new("p", "1"),
     )
+}
+
+struct LeaseLostExecutor {
+    cancel_calls: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl RuntimeJobExecutor for LeaseLostExecutor {
+    async fn execute(&self, _job: RuntimeJob) -> ActivityResult {
+        self.release.notified().await;
+        ActivityResult::cancelled("check", "cancelled after lease lost")
+    }
+
+    async fn cancel_execution(&self, _job: &RuntimeJob) {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+#[tokio::test]
+async fn lease_lost_cancels_execution_and_waits_for_cleanup() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = enqueue_test_runtime_job(
+        &store,
+        "lease-lost-cancel",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
+
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let executor = LeaseLostExecutor {
+        cancel_calls: Arc::clone(&cancel_calls),
+        release: Arc::clone(&release),
+    };
+    // Short lease so the renewal loop hits the tampered lease quickly; the
+    // tamper task steals ownership while execute is still blocked.
+    let worker =
+        RuntimeWorker::new(&store, "lease-lost-worker").with_lease_ttl(Duration::seconds(4));
+    let pool = store.pool().clone();
+    let tamper_job_id = job.id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        sqlx::query(
+            r#"UPDATE runtime_jobs
+               SET data = jsonb_set(data, '{lease,owner}', '"other-worker"')
+               WHERE id = $1"#,
+        )
+        .bind(&tamper_job_id)
+        .execute(&pool)
+        .await
+        .expect("lease tamper should apply");
+    });
+
+    let completed = worker.run_once(&executor).await?;
+
+    assert_eq!(
+        cancel_calls.load(Ordering::SeqCst),
+        1,
+        "executor cancel must be invoked"
+    );
+    assert!(completed.is_none(), "lease-lost completion must not commit");
+
+    let (dlq_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&job.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        dlq_count, 1,
+        "lease-lost result must land in the dead-letter"
+    );
+    Ok(())
 }

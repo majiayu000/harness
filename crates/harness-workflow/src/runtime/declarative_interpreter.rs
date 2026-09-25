@@ -27,6 +27,7 @@ pub fn build_declarative_submission_decision(
     }
     let commands = commands_for_target(
         definition,
+        instance,
         initial,
         format!("{}:{}:submit", instance.id, initial),
     )?;
@@ -44,6 +45,7 @@ pub fn build_declarative_submission_decision(
 
 fn commands_for_target(
     definition: &DeclarativeWorkflowDefinition,
+    instance: &WorkflowInstance,
     target: &str,
     dedupe_key: String,
 ) -> anyhow::Result<Vec<WorkflowCommand>> {
@@ -62,11 +64,16 @@ fn commands_for_target(
     }
     if let Some(state) = definition.policy().states.get(target) {
         if let Some(activity) = state.activity.as_deref() {
-            return Ok(vec![WorkflowCommand::enqueue_activity(
-                activity, dedupe_key,
-            )]);
+            return Ok(vec![
+                super::declarative_agent_contract::declarative_enqueue_activity_command(
+                    definition, instance, activity, dedupe_key,
+                )?,
+            ]);
         }
         return match state.progress {
+            Some(DeclaredProgressMode::CommandDriven) => anyhow::bail!(
+                "declarative target state '{target}' is command-driven but declares no activity"
+            ),
             Some(DeclaredProgressMode::ExternalWait) => Ok(vec![WorkflowCommand::wait(
                 format!("declarative workflow is waiting in state '{target}'"),
                 dedupe_key,
@@ -75,6 +82,10 @@ fn commands_for_target(
                 WorkflowCommandType::RequestOperatorAttention,
                 dedupe_key,
                 json!({ "state": target }),
+            )]),
+            Some(DeclaredProgressMode::ParentHandoff) => Ok(vec![WorkflowCommand::wait(
+                format!("declarative workflow is waiting for parent handoff in state '{target}'"),
+                dedupe_key,
             )]),
             None => anyhow::bail!("declarative target state '{target}' has no progress driver"),
         };
@@ -155,9 +166,13 @@ mod tests {
             definition.policy().initial.clone(),
             WorkflowSubject::new("test", "submission"),
         )
-        .with_data(json!({ "definition_hash": definition.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": definition.definition_hash(), "prompt_ref": "submission-task" }));
 
         let decision = build_declarative_submission_decision(&definition, &instance)?;
+        assert_eq!(
+            decision.commands[0].command["prompt_ref"],
+            "submission-task"
+        );
         assert_eq!(decision.decision, DECLARATIVE_SUBMISSION_DECISION);
         assert_eq!(decision.observed_state, "working");
         assert_eq!(decision.next_state, "working");
@@ -181,7 +196,7 @@ mod tests {
             definition.policy().initial.clone(),
             WorkflowSubject::new("test", "submission-mismatch"),
         )
-        .with_data(json!({ "definition_hash": definition.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
 
         assert!(build_declarative_submission_decision(&definition, &instance).is_err());
     }

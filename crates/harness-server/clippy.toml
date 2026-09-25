@@ -1,0 +1,5 @@
+disallowed-types = [
+  { path = "axum::Json", reason = "REST DTOs must use the protocol contract or the closed legacy adapter", replacement = "crate::http::rest_contract::ContractJson", allow-invalid = true },
+  { path = "axum::extract::Query", reason = "REST DTOs must use the protocol contract or the closed legacy adapter", replacement = "crate::http::rest_contract::ContractQuery", allow-invalid = true },
+  { path = "axum::extract::Path", reason = "named REST path DTOs must be protocol-owned", replacement = "crate::http::rest_contract::ContractPath", allow-invalid = true },
+]

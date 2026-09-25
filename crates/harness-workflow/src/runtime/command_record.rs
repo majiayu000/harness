@@ -18,6 +18,8 @@ pub(super) type WorkflowCommandRecordRow = (
     String,
     DateTime<Utc>,
     DateTime<Utc>,
+    i32,
+    Option<String>,
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -42,6 +44,14 @@ pub struct WorkflowCommandRecord {
     pub command: WorkflowCommand,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Which attempt at this dedupe key the row records. A new attempt never
+    /// rewrites an earlier one; it supersedes it and takes the next generation
+    /// (GH-1865).
+    #[serde(default)]
+    pub attempt_generation: u32,
+    /// Set on a superseded row: the attempt that replaced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by_command_id: Option<String>,
 }
 
 pub(super) fn from_row(
@@ -59,11 +69,15 @@ pub(super) fn from_row(
         data,
         created_at,
         updated_at,
+        attempt_generation,
+        superseded_by_command_id,
     ): WorkflowCommandRecordRow,
 ) -> anyhow::Result<WorkflowCommandRecord> {
     use anyhow::Context;
 
     let status = WorkflowCommandStatus::try_from(status.as_str())?;
+    let attempt_generation = u32::try_from(attempt_generation)
+        .context("workflow command attempt generation is negative")?;
     let dispatch_attempt_count = u64::try_from(dispatch_attempt_count)
         .context("workflow command dispatch attempt count is negative")?;
     let dispatch_claim_generation = u64::try_from(dispatch_claim_generation)
@@ -113,5 +127,7 @@ pub(super) fn from_row(
         command: serde_json::from_str(&data)?,
         created_at,
         updated_at,
+        attempt_generation,
+        superseded_by_command_id,
     })
 }

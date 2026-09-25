@@ -61,11 +61,65 @@ impl DefaultTaskService {
     pub fn new(store: Arc<TaskStore>) -> Arc<Self> {
         Arc::new(Self { store })
     }
+}
 
-    /// Expose the underlying store for callers that need direct access
-    /// (e.g. `spawn_task` and mutation helpers).
-    pub fn store(&self) -> Arc<TaskStore> {
-        self.store.clone()
+/// Stub used when the optional task store failed to open at startup.
+pub struct UnavailableTaskService;
+
+impl UnavailableTaskService {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+#[async_trait]
+impl TaskService for UnavailableTaskService {
+    fn get(&self, _id: &TaskId) -> Option<TaskState> {
+        None
+    }
+
+    fn list(&self) -> Vec<TaskState> {
+        Vec::new()
+    }
+
+    fn list_children(&self, _parent_id: &TaskId) -> Vec<TaskState> {
+        Vec::new()
+    }
+
+    async fn latest_done_pr_url(&self) -> Option<String> {
+        None
+    }
+
+    fn count(&self) -> usize {
+        0
+    }
+
+    fn subscribe_stream(&self, _id: &TaskId) -> Option<broadcast::Receiver<StreamItem>> {
+        None
+    }
+
+    async fn count_for_dashboard(&self) -> DashboardCounts {
+        DashboardCounts {
+            global_done: 0,
+            global_failed: 0,
+            global_stalled: 0,
+            by_project: HashMap::new(),
+        }
+    }
+
+    async fn latest_done_pr_urls_all_projects(&self) -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    async fn count_done_since(&self, _since: chrono::DateTime<chrono::Utc>) -> u64 {
+        0
+    }
+
+    async fn done_per_project_hour_since(
+        &self,
+        _since: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(String, String, u64)> {
+        Vec::new()
     }
 }
 

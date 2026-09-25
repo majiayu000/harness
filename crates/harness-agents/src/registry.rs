@@ -1,39 +1,19 @@
 use harness_core::{
-    agent::AgentAdapter, agent::CodeAgent, agent::TaskClassification, agent::TaskComplexity,
-    error::HarnessError,
+    agent::AgentBackend, agent::TaskClassification, agent::TaskComplexity, error::HarnessError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Describes how an optional interactive adapter participates in turn execution.
+/// Bundles the default backend with optional runtime-turn/control backends.
 ///
-/// `ControlOnly` adapters are registered only for side-channel operations such as
-/// interrupt, steer, or approval response. `ExecuteTurns` adapters are the
-/// canonical turn executor for the agent. This keeps agent-specific behavior at
-/// registration time instead of branching on agent names at runtime.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum AdapterExecutionStrategy {
-    #[default]
-    ControlOnly,
-    ExecuteTurns,
-}
-
-impl AdapterExecutionStrategy {
-    pub fn executes_turns(self) -> bool {
-        matches!(self, Self::ExecuteTurns)
-    }
-}
-
-/// Bundles an agent executor with an optional interactive adapter.
-///
-/// A descriptor is created with `adapter: None` on plain `register()` calls.
-/// Call `register_adapter()` or `register_adapter_with_strategy()` to attach an
-/// adapter after the agent is registered.
+/// The default backend handles one-shot `execute` and fallback streaming.
+/// A control backend is registered as the live side channel for interrupt,
+/// steer, and approval. A turn backend factory owns full runtime turns when the
+/// backend uses a stateful protocol process that must be fresh per turn.
 pub struct AgentDescriptor {
-    pub agent: Arc<dyn CodeAgent>,
-    pub adapter: Option<Arc<dyn AgentAdapter>>,
-    pub adapter_factory: Option<Arc<dyn Fn() -> Arc<dyn AgentAdapter> + Send + Sync>>,
-    pub adapter_strategy: AdapterExecutionStrategy,
+    pub backend: Arc<dyn AgentBackend>,
+    pub control_backend: Option<Arc<dyn AgentBackend>>,
+    pub turn_backend_factory: Option<Arc<dyn Fn() -> Arc<dyn AgentBackend> + Send + Sync>>,
 }
 
 pub struct AgentRegistry {
@@ -61,119 +41,89 @@ impl AgentRegistry {
             .collect();
     }
 
-    pub fn register(&mut self, name: impl Into<String>, agent: Arc<dyn CodeAgent>) {
+    pub fn register(&mut self, name: impl Into<String>, backend: Arc<dyn AgentBackend>) {
         let name = name.into();
-        // Preserve any previously attached adapter so that hot-reload cannot
-        // accidentally clear the adapter by re-registering the agent under the
-        // same name (the old split-registry design had this property naturally).
+        // Preserve turn/control backends so hot-reload cannot accidentally clear
+        // side channels by re-registering the default backend under the same name.
         let existing = self.entries.get(&name);
-        let existing_adapter = existing.and_then(|d| d.adapter.clone());
-        let existing_adapter_factory = existing.and_then(|d| d.adapter_factory.clone());
-        let existing_strategy = existing.map(|d| d.adapter_strategy).unwrap_or_default();
+        let existing_control_backend = existing.and_then(|d| d.control_backend.clone());
+        let existing_turn_backend_factory = existing.and_then(|d| d.turn_backend_factory.clone());
         if !self.entries.contains_key(&name) {
             self.registration_order.push(name.clone());
         }
         self.entries.insert(
             name,
             AgentDescriptor {
-                agent,
-                adapter: existing_adapter,
-                adapter_factory: existing_adapter_factory,
-                adapter_strategy: existing_strategy,
+                backend,
+                control_backend: existing_control_backend,
+                turn_backend_factory: existing_turn_backend_factory,
             },
         );
     }
 
-    /// Attach a control-only adapter to an already-registered agent.
+    /// Attach a control backend to an already-registered agent.
     ///
     /// Returns `Err(HarnessError::AgentNotFound)` if the agent name is unknown,
     /// so misconfiguration fails loudly instead of silently (U-23).
     pub fn register_adapter(
         &mut self,
         name: &str,
-        adapter: Arc<dyn AgentAdapter>,
-    ) -> harness_core::error::Result<()> {
-        self.register_adapter_with_strategy(name, adapter, AdapterExecutionStrategy::ControlOnly)
-    }
-
-    /// Attach an adapter with an explicit execution strategy.
-    ///
-    /// Use `ExecuteTurns` only when the adapter owns the full turn lifecycle for
-    /// the agent. Use `ControlOnly` when the adapter exists for side-channel
-    /// control while the legacy `CodeAgent` remains the turn executor.
-    pub fn register_adapter_with_strategy(
-        &mut self,
-        name: &str,
-        adapter: Arc<dyn AgentAdapter>,
-        strategy: AdapterExecutionStrategy,
+        adapter: Arc<dyn AgentBackend>,
     ) -> harness_core::error::Result<()> {
         match self.entries.get_mut(name) {
             Some(descriptor) => {
-                descriptor.adapter = Some(adapter);
-                descriptor.adapter_factory = None;
-                descriptor.adapter_strategy = strategy;
+                descriptor.control_backend = Some(adapter);
                 Ok(())
             }
             None => Err(HarnessError::AgentNotFound(format!(
-                "cannot register adapter: agent '{}' not found",
+                "cannot register control backend: agent '{}' not found",
                 name
             ))),
         }
     }
 
-    /// Attach an adapter factory to an already-registered agent.
+    /// Attach a turn backend factory to an already-registered agent.
     ///
-    /// Use this for stateful turn-executing adapters that must not share a
+    /// Use this for stateful turn-executing backends that must not share a
     /// single process or protocol stream across concurrent turns.
-    pub fn register_adapter_factory_with_strategy<F>(
+    pub fn register_turn_backend_factory<F>(
         &mut self,
         name: &str,
         factory: F,
-        strategy: AdapterExecutionStrategy,
     ) -> harness_core::error::Result<()>
     where
-        F: Fn() -> Arc<dyn AgentAdapter> + Send + Sync + 'static,
+        F: Fn() -> Arc<dyn AgentBackend> + Send + Sync + 'static,
     {
         match self.entries.get_mut(name) {
             Some(descriptor) => {
-                descriptor.adapter = None;
-                descriptor.adapter_factory = Some(Arc::new(factory));
-                descriptor.adapter_strategy = strategy;
+                descriptor.turn_backend_factory = Some(Arc::new(factory));
                 Ok(())
             }
             None => Err(HarnessError::AgentNotFound(format!(
-                "cannot register adapter factory: agent '{}' not found",
+                "cannot register turn backend factory: agent '{}' not found",
                 name
             ))),
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<Arc<dyn CodeAgent>> {
-        self.entries.get(name).map(|d| d.agent.clone())
+    pub fn get(&self, name: &str) -> Option<Arc<dyn AgentBackend>> {
+        self.entries.get(name).map(|d| d.backend.clone())
     }
 
-    /// Return the adapter registered for the given agent name, if any.
-    pub fn get_adapter(&self, name: &str) -> Option<Arc<dyn AgentAdapter>> {
-        self.entries.get(name).and_then(|d| d.adapter.clone())
+    /// Return the control backend registered for the given agent name, if any.
+    pub fn get_adapter(&self, name: &str) -> Option<Arc<dyn AgentBackend>> {
+        self.entries
+            .get(name)
+            .and_then(|d| d.control_backend.clone())
     }
 
-    /// Return the adapter execution strategy for the given agent name.
-    pub fn adapter_strategy(&self, name: &str) -> Option<AdapterExecutionStrategy> {
-        self.entries.get(name).map(|d| d.adapter_strategy)
-    }
-
-    /// Return the adapter only when its strategy says it should execute turns.
-    pub fn turn_execution_adapter(&self, name: &str) -> Option<Arc<dyn AgentAdapter>> {
+    /// Return the backend that owns full runtime-turn execution.
+    pub fn turn_execution_adapter(&self, name: &str) -> Option<Arc<dyn AgentBackend>> {
         let descriptor = self.entries.get(name)?;
-        if descriptor.adapter_strategy.executes_turns() {
-            descriptor
-                .adapter_factory
-                .as_ref()
-                .map(|factory| factory())
-                .or_else(|| descriptor.adapter.clone())
-        } else {
-            None
-        }
+        descriptor
+            .turn_backend_factory
+            .as_ref()
+            .map(|factory| factory())
     }
 
     pub fn resolved_default_agent_name(&self) -> Option<&str> {
@@ -190,7 +140,7 @@ impl AgentRegistry {
             .map(String::as_str)
     }
 
-    pub fn default_agent(&self) -> Option<Arc<dyn CodeAgent>> {
+    pub fn default_agent(&self) -> Option<Arc<dyn AgentBackend>> {
         self.resolved_default_agent_name()
             .and_then(|name| self.get(name))
     }
@@ -198,7 +148,7 @@ impl AgentRegistry {
     pub fn dispatch(
         &self,
         task: &TaskClassification,
-    ) -> harness_core::error::Result<Arc<dyn CodeAgent>> {
+    ) -> harness_core::error::Result<Arc<dyn AgentBackend>> {
         let preferred = match task.complexity {
             TaskComplexity::Critical | TaskComplexity::Complex => self
                 .complexity_preferred_agents
@@ -221,9 +171,9 @@ impl AgentRegistry {
 mod tests {
     use super::*;
     use harness_core::{
-        agent::AgentEvent, agent::AgentRequest, agent::AgentResponse, agent::CodeAgent,
-        agent::StreamItem, agent::TaskClassification, agent::TaskComplexity, agent::TurnRequest,
-        types::Capability, types::TokenUsage,
+        agent::AgentBackend, agent::AgentEvent, agent::AgentRequest, agent::AgentResponse,
+        agent::StreamItem, agent::TaskClassification, agent::TaskComplexity, types::Capability,
+        types::TokenUsage,
     };
 
     struct StubAgent {
@@ -231,7 +181,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl CodeAgent for StubAgent {
+    impl AgentBackend for StubAgent {
         fn name(&self) -> &str {
             self.agent_name
         }
@@ -409,14 +359,14 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl AgentAdapter for StubAdapter {
+    impl AgentBackend for StubAdapter {
         fn name(&self) -> &str {
             self.adapter_name
         }
 
         async fn start_turn(
             &self,
-            _req: TurnRequest,
+            _req: AgentRequest,
             _tx: tokio::sync::mpsc::Sender<AgentEvent>,
         ) -> harness_core::error::Result<()> {
             Ok(())
@@ -466,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn register_adapter_defaults_to_control_only_strategy() {
+    fn register_adapter_attaches_control_backend_only() {
         let mut registry = AgentRegistry::new("mock");
         registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
         registry
@@ -478,32 +428,25 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            registry.adapter_strategy("mock"),
-            Some(AdapterExecutionStrategy::ControlOnly)
-        );
+        assert!(registry.get_adapter("mock").is_some());
         assert!(registry.turn_execution_adapter("mock").is_none());
     }
 
     #[test]
-    fn register_adapter_with_execute_strategy_enables_turn_execution() {
+    fn register_turn_backend_factory_enables_turn_execution() {
         let mut registry = AgentRegistry::new("mock");
         registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
         registry
-            .register_adapter_with_strategy(
-                "mock",
+            .register_turn_backend_factory("mock", || {
                 Arc::new(StubAdapter {
-                    adapter_name: "mock",
-                }),
-                AdapterExecutionStrategy::ExecuteTurns,
-            )
+                    adapter_name: "mock-turn",
+                })
+            })
             .unwrap();
 
-        assert_eq!(
-            registry.adapter_strategy("mock"),
-            Some(AdapterExecutionStrategy::ExecuteTurns)
-        );
-        assert!(registry.turn_execution_adapter("mock").is_some());
+        let turn_backend = registry.turn_execution_adapter("mock");
+        assert!(turn_backend.is_some());
+        assert_eq!(turn_backend.unwrap().name(), "mock-turn");
     }
 
     #[test]
@@ -513,16 +456,12 @@ mod tests {
         let create_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count_for_factory = create_count.clone();
         registry
-            .register_adapter_factory_with_strategy(
-                "mock",
-                move || {
-                    count_for_factory.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Arc::new(StubAdapter {
-                        adapter_name: "mock",
-                    })
-                },
-                AdapterExecutionStrategy::ExecuteTurns,
-            )
+            .register_turn_backend_factory("mock", move || {
+                count_for_factory.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Arc::new(StubAdapter {
+                    adapter_name: "mock",
+                })
+            })
             .unwrap();
 
         assert!(registry.get_adapter("mock").is_none());
@@ -553,7 +492,7 @@ mod tests {
             )
             .unwrap();
 
-        // dispatch() must still return the CodeAgent, not the adapter
+        // dispatch() must still return the default backend, not the control backend.
         let agent = registry
             .dispatch(&classification(TaskComplexity::Simple))
             .unwrap();
@@ -561,20 +500,26 @@ mod tests {
     }
 
     #[test]
-    fn re_register_preserves_existing_adapter_and_strategy() {
+    fn re_register_preserves_existing_control_and_turn_backends() {
         let mut registry = AgentRegistry::new("mock");
         registry.register("mock", Arc::new(StubAgent { agent_name: "mock" }));
         registry
-            .register_adapter_with_strategy(
+            .register_adapter(
                 "mock",
                 Arc::new(StubAdapter {
-                    adapter_name: "mock",
+                    adapter_name: "mock-control",
                 }),
-                AdapterExecutionStrategy::ExecuteTurns,
             )
             .unwrap();
+        registry
+            .register_turn_backend_factory("mock", || {
+                Arc::new(StubAdapter {
+                    adapter_name: "mock-turn",
+                })
+            })
+            .unwrap();
 
-        // Re-registering with a new agent must not clear the adapter.
+        // Re-registering with a new default backend must not clear runtime/control backends.
         registry.register(
             "mock",
             Arc::new(StubAgent {
@@ -585,15 +530,16 @@ mod tests {
         let adapter = registry.get_adapter("mock");
         assert!(
             adapter.is_some(),
-            "adapter must survive re-registration of the same agent name"
+            "control backend must survive re-registration of the same agent name"
         );
-        assert_eq!(adapter.unwrap().name(), "mock");
-        assert_eq!(
-            registry.adapter_strategy("mock"),
-            Some(AdapterExecutionStrategy::ExecuteTurns),
-            "adapter strategy must survive re-registration"
+        assert_eq!(adapter.unwrap().name(), "mock-control");
+        let turn_backend = registry.turn_execution_adapter("mock");
+        assert!(
+            turn_backend.is_some(),
+            "turn backend factory must survive re-registration"
         );
-        // The agent itself must be updated.
+        assert_eq!(turn_backend.unwrap().name(), "mock-turn");
+        // The default backend itself must be updated.
         assert_eq!(registry.get("mock").unwrap().name(), "mock-v2");
     }
 

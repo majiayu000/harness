@@ -47,22 +47,32 @@ async fn runtime_worker_claims_one_job_once_and_records_events() -> anyhow::Resu
 
 #[tokio::test]
 async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> anyhow::Result<()> {
-    if resolve_database_url(None).is_err() {
-        return Ok(());
+    let configured = match harness_core::config::process_env::var("HARNESS_DATABASE_URL") {
+        Ok(configured) => configured,
+        Err(std::env::VarError::NotPresent) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if configured.trim().is_empty() {
+        anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
     }
+    let database_url = harness_core::db::resolve_test_database_url(Some(&configured))?;
 
     let dir = tempfile::tempdir()?;
-    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let store = WorkflowRuntimeStore::open_with_database_url(
+        &dir.path().join("workflow_runtime.db"),
+        Some(&database_url),
+    )
+    .await?;
     let matching = WorkflowInstance::new(
         "github_issue_pr",
         1,
         "pr_open",
         WorkflowSubject::new("issue", "issue:77"),
     )
-    .with_id("project-a::owner/repo::issue:77")
-    .with_data(json!({
+    .with_id("project-a::Owner/Repo::issue:77")
+    .with_server_data(json!({
         "project_id": "project-a",
-        "repo": "owner/repo",
+        "repo": "Owner/Repo",
         "issue_number": 77,
         "pr_number": 880,
     }));
@@ -73,7 +83,7 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
         WorkflowSubject::new("issue", "issue:78"),
     )
     .with_id("project-a::owner/other::issue:78")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-a",
         "repo": "owner/other",
         "issue_number": 78,
@@ -86,21 +96,26 @@ async fn runtime_store_get_instance_by_pr_filters_by_project_repo_and_pr() -> an
         WorkflowSubject::new("issue", "issue:79"),
     )
     .with_id("project-b::owner/repo::issue:79")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-b",
         "repo": "owner/repo",
         "issue_number": 79,
         "pr_number": 880,
     }));
-    store.upsert_instance(&matching).await?;
-    store.upsert_instance(&wrong_repo).await?;
-    store.upsert_instance(&wrong_project).await?;
+    store.force_upsert_lifecycle_state_for_test(&matching).await?;
+    store.force_upsert_lifecycle_state_for_test(&wrong_repo).await?;
+    store.force_upsert_lifecycle_state_for_test(&wrong_project).await?;
 
     let found = store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 880)
         .await?
-        .expect("matching runtime issue workflow should be found");
+        .expect("mixed-case legacy workflow should match a canonical repository lookup");
     assert_eq!(found.id, matching.id);
+    let found_by_issue = store
+        .get_instance_by_issue("github_issue_pr", "project-a", Some("owner/repo"), 77)
+        .await?
+        .expect("mixed-case legacy issue should match a canonical repository lookup");
+    assert_eq!(found_by_issue.id, matching.id);
     assert!(store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 881)
         .await?
@@ -401,7 +416,7 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = issue_instance("replanning");
-    store.upsert_instance(&workflow).await?;
+    store.force_upsert_lifecycle_state_for_test(&workflow).await?;
     let command = WorkflowCommand::enqueue_activity("replan_issue", "replan-1");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let job = store
@@ -453,5 +468,45 @@ async fn runtime_worker_records_completion_event_and_command_status() -> anyhow:
     assert!(decisions
         .iter()
         .any(|record| record.decision.decision == "resume_implementation_after_replan"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_defers_busy_execution_without_reserving_a_turn() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() { return Ok(()); }
+    struct BusyExecutor;
+    #[async_trait::async_trait]
+    impl RuntimeJobExecutor for BusyExecutor {
+        async fn prepare_execution(&self, _: &RuntimeJob) -> anyhow::Result<Option<chrono::DateTime<Utc>>> {
+            Ok(Some(Utc::now() + Duration::minutes(1)))
+        }
+        async fn execute(&self, _: RuntimeJob) -> ActivityResult { panic!("busy execution must not start"); }
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = enqueue_test_runtime_job(&store, "busy-command", RuntimeKind::Cursor, "cursor", json!({"activity":"check"})).await?;
+    let worker = RuntimeWorker::new(&store, "busy-worker");
+    assert!(worker.run_once(&BusyExecutor).await?.is_none());
+    let pending = store.get_runtime_job(&job.id).await?.expect("pending job");
+    assert_eq!(pending.status, RuntimeJobStatus::Pending);
+    assert!(pending.lease.is_none());
+    let events = store.runtime_events_for(&job.id).await?;
+    assert!(!events.iter().any(|event| event.event_type == "RuntimeTurnStarted"));
+    assert!(events.iter().any(|event| event.event_type == "RuntimeJobClaimDeferred"));
+    let next = enqueue_test_runtime_job(&store, "available-command", RuntimeKind::Cursor, "cursor", json!({"activity":"check"})).await?;
+    let result = worker.run_once(&StaticRuntimeExecutor { result: ActivityResult::succeeded("check", "done") }).await?.expect("another job should proceed");
+    assert_eq!(result.id, next.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_worker_prioritizes_issue_work_over_periodic_scans() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() { return Ok(()); }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    enqueue_test_runtime_job(&store, "scan-command", RuntimeKind::Cursor, "cursor", json!({"activity":"implement_prompt", "command":{"source":"periodic_review"}})).await?;
+    let issue = enqueue_test_runtime_job(&store, "issue-command", RuntimeKind::Cursor, "cursor", json!({"activity":"plan_issue"})).await?;
+    let completed = RuntimeWorker::new(&store, "worker").run_once(&StaticRuntimeExecutor { result: ActivityResult::succeeded("plan_issue", "planned") }).await?.expect("issue should execute");
+    assert_eq!(completed.id, issue.id);
     Ok(())
 }

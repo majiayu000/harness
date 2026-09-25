@@ -2,6 +2,10 @@ use super::repo_memory::{
     record_from_row, RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, RepoMemoryRecordRow,
 };
 use super::store::WorkflowRuntimeStore;
+use harness_core::retrieval::{
+    score_retrieval_candidate, KnowledgeRetriever, LexicalKnowledgeRetriever, RetrievalCandidate,
+    RetrievalField, RetrievalQuery, RetrievalSurface,
+};
 use serde_json::Value;
 
 pub const DEFAULT_REPO_MEMORY_RETRIEVAL_LIMIT: usize = 5;
@@ -36,6 +40,17 @@ impl WorkflowRuntimeStore {
         activity_class: &str,
         options: RepoMemoryRetrievalOptions,
     ) -> anyhow::Result<Vec<RetrievedRepoMemoryRecord>> {
+        self.retrieve_repo_memory_records_for_task(repo, activity_class, None, options)
+            .await
+    }
+
+    pub async fn retrieve_repo_memory_records_for_task(
+        &self,
+        repo: &str,
+        activity_class: &str,
+        task_text: Option<&str>,
+        options: RepoMemoryRetrievalOptions,
+    ) -> anyhow::Result<Vec<RetrievedRepoMemoryRecord>> {
         if repo.trim().is_empty() || options.limit == 0 || options.token_budget == 0 {
             return Ok(Vec::new());
         }
@@ -63,6 +78,7 @@ impl WorkflowRuntimeStore {
         Ok(select_repo_memory_records(
             candidates,
             activity_class,
+            task_text,
             options,
         ))
     }
@@ -71,27 +87,85 @@ impl WorkflowRuntimeStore {
 fn select_repo_memory_records(
     mut candidates: Vec<RepoMemoryRecord>,
     activity_class: &str,
+    task_text: Option<&str>,
     options: RepoMemoryRetrievalOptions,
 ) -> Vec<RetrievedRepoMemoryRecord> {
     if options.limit == 0 || options.token_budget == 0 {
         return Vec::new();
     }
-    rank_repo_memory_candidates(&mut candidates, activity_class);
+    rank_repo_memory_candidates(&mut candidates, activity_class, task_text);
     let mut selected = select_with_budget(candidates.iter(), options.limit, options.token_budget);
     ensure_failure_lesson_mix(&mut selected, &candidates, options);
     selected
 }
 
-fn rank_repo_memory_candidates(candidates: &mut [RepoMemoryRecord], activity_class: &str) {
+fn rank_repo_memory_candidates(
+    candidates: &mut Vec<RepoMemoryRecord>,
+    activity_class: &str,
+    task_text: Option<&str>,
+) {
     let activity_class = activity_class.trim();
-    candidates.sort_by(|left, right| {
-        let left_activity_mismatch = left.activity_class != activity_class;
-        let right_activity_mismatch = right.activity_class != activity_class;
-        left_activity_mismatch
-            .cmp(&right_activity_mismatch)
-            .then_with(|| right.created_at.cmp(&left.created_at))
-            .then_with(|| left.id.cmp(&right.id))
+    let query_text = repo_memory_relevance_query(activity_class, task_text);
+    let retrieval_query =
+        RetrievalQuery::new(RetrievalSurface::RepoMemory, &query_text, candidates.len())
+            .with_activity_class(activity_class);
+    let retriever = LexicalKnowledgeRetriever;
+    let mut ranked = std::mem::take(candidates)
+        .into_iter()
+        .map(|record| RankedRepoMemoryCandidate {
+            activity_mismatch: record.activity_class != activity_class,
+            relevance: repo_memory_relevance(&retriever, &record, &retrieval_query),
+            record,
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        left.activity_mismatch
+            .cmp(&right.activity_mismatch)
+            .then_with(|| right.relevance.total_cmp(&left.relevance))
+            .then_with(|| right.record.use_count.cmp(&left.record.use_count))
+            .then_with(|| right.record.created_at.cmp(&left.record.created_at))
+            .then_with(|| left.record.id.cmp(&right.record.id))
     });
+    *candidates = ranked.into_iter().map(|ranked| ranked.record).collect();
+}
+
+#[derive(Debug, Clone)]
+struct RankedRepoMemoryCandidate {
+    record: RepoMemoryRecord,
+    activity_mismatch: bool,
+    relevance: f64,
+}
+
+fn repo_memory_relevance_query(activity_class: &str, task_text: Option<&str>) -> String {
+    match task_text.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(task_text) => format!("{activity_class}\n{task_text}"),
+        None => activity_class.to_string(),
+    }
+}
+
+fn repo_memory_relevance(
+    retriever: &dyn KnowledgeRetriever,
+    record: &RepoMemoryRecord,
+    query: &RetrievalQuery<'_>,
+) -> f64 {
+    let payload = compact_payload(&record.payload_json);
+    let evidence = record.evidence_ref.as_deref().unwrap_or_default();
+    let id = record.id.to_string();
+    score_retrieval_candidate(
+        retriever,
+        query,
+        RetrievalCandidate::new(
+            &id,
+            vec![
+                RetrievalField::new(&record.activity_class, 1.5),
+                RetrievalField::new(record.kind.db_value(), 0.7),
+                RetrievalField::new(record.outcome.db_value(), 0.3),
+                RetrievalField::new(&payload, 1.0),
+                RetrievalField::new(evidence, 0.2),
+            ],
+        ),
+    )
+    .unwrap_or(0.0)
 }
 
 fn select_with_budget<'a>(
@@ -269,6 +343,7 @@ mod tests {
         let selected = select_repo_memory_records(
             vec![same_old.clone(), other_new.clone(), same_new.clone()],
             "implement_issue",
+            None,
             RepoMemoryRetrievalOptions {
                 limit: 5,
                 token_budget: 10_000,
@@ -277,6 +352,39 @@ mod tests {
 
         let ids: Vec<Uuid> = selected.iter().map(|entry| entry.record.id).collect();
         assert_eq!(ids, vec![same_new.id, same_old.id, other_new.id]);
+    }
+
+    #[test]
+    fn memory_retrieval_ranks_task_relevant_payload_before_newer_record() {
+        let relevant_old = memory_record(
+            1,
+            "implement_issue",
+            RepoMemoryOutcome::Done,
+            RepoMemoryKind::EnvironmentNote,
+            90,
+            json!({"lesson": "Rust toolchain cache failures require cargo clean before retry"}),
+        );
+        let unrelated_new = memory_record(
+            2,
+            "implement_issue",
+            RepoMemoryOutcome::Done,
+            RepoMemoryKind::EnvironmentNote,
+            1,
+            json!({"lesson": "Frontend color spacing changed in the dashboard"}),
+        );
+
+        let selected = select_repo_memory_records(
+            vec![unrelated_new.clone(), relevant_old.clone()],
+            "implement_issue",
+            Some("fix a rust toolchain cache failure"),
+            RepoMemoryRetrievalOptions {
+                limit: 2,
+                token_budget: 10_000,
+            },
+        );
+
+        let ids: Vec<Uuid> = selected.iter().map(|entry| entry.record.id).collect();
+        assert_eq!(ids, vec![relevant_old.id, unrelated_new.id]);
     }
 
     #[test]
@@ -306,6 +414,7 @@ mod tests {
         let selected = select_repo_memory_records(
             records,
             "implement_issue",
+            None,
             RepoMemoryRetrievalOptions {
                 limit: 5,
                 token_budget: 10_000,
@@ -350,6 +459,7 @@ mod tests {
         let selected = select_repo_memory_records(
             vec![first.clone(), oversized.clone(), third.clone()],
             "implement_issue",
+            None,
             RepoMemoryRetrievalOptions {
                 limit: 5,
                 token_budget,
@@ -376,6 +486,7 @@ mod tests {
         let selected = select_repo_memory_records(
             vec![record],
             "implement_issue",
+            None,
             RepoMemoryRetrievalOptions {
                 limit: 5,
                 token_budget: 1,

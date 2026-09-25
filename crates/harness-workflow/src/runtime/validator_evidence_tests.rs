@@ -4,6 +4,7 @@ use crate::runtime::model::{
     ActivityArtifact, WorkflowCommand, WorkflowCommandType, WorkflowEvidence,
 };
 use crate::runtime::validator::{DecisionValidator, TransitionAllowlist, TransitionRule};
+use harness_core::claim_trust::{ClaimProvenance, ClaimTrustLevel};
 use serde_json::json;
 
 fn rule(operator_recovery_only: bool) -> TransitionRule {
@@ -99,6 +100,83 @@ fn only_nonempty_nondecision_artifact_types_become_evidence() {
 }
 
 #[test]
+fn claim_trust_vocabulary_is_closed_and_ordered() {
+    let actual = ClaimTrustLevel::ALL
+        .iter()
+        .map(|trust| {
+            serde_json::to_value(trust)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            "self_declared",
+            "repository_observed",
+            "runtime_observed",
+            "runner_observed",
+            "reexecuted",
+            "cryptographically_attested",
+            "human_approved"
+        ]
+    );
+    assert!(serde_json::from_str::<ClaimTrustLevel>("\"unsigned_attestation\"").is_err());
+    assert!(ClaimTrustLevel::Reexecuted.satisfies(ClaimTrustLevel::RuntimeObserved));
+    assert!(!ClaimTrustLevel::SelfDeclared.satisfies(ClaimTrustLevel::RuntimeObserved));
+}
+
+#[test]
+fn stronger_claim_trust_requires_matching_proof_metadata() {
+    let context = ValidationContext::new("workflow_runtime_operator_action", chrono::Utc::now());
+    let no_proof = decision("advance")
+        .with_evidence(WorkflowEvidence::new("ReviewReport", "ok").with_provenance(
+            ClaimProvenance::with_trust(ClaimTrustLevel::CryptographicallyAttested, None),
+        ))
+        .with_evidence(WorkflowEvidence::new("tests", "ok"));
+    let rejection = validate_declarative_transition_metadata(&rule(false), &no_proof, &context)
+        .expect_err("attested trust without proof must fail");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InvalidDecisionContract
+    );
+    assert!(rejection
+        .message
+        .contains("cryptographically_attested requires proof metadata"));
+
+    let unsigned_attestation = decision("advance")
+        .with_evidence(WorkflowEvidence::new("ReviewReport", "ok").with_provenance(
+            ClaimProvenance::cryptographically_attested("sha256:payload", "  ", None),
+        ))
+        .with_evidence(WorkflowEvidence::new("tests", "ok"));
+    let rejection =
+        validate_declarative_transition_metadata(&rule(false), &unsigned_attestation, &context)
+            .expect_err("empty signature must not count as attested proof");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InvalidDecisionContract
+    );
+    assert!(rejection.message.contains("signature must not be empty"));
+
+    let inferred_human = decision("advance")
+        .with_evidence(
+            WorkflowEvidence::new("ReviewReport", "ok")
+                .with_provenance(ClaimProvenance::human_approved("approver", " ")),
+        )
+        .with_evidence(WorkflowEvidence::new("tests", "ok"));
+    let rejection =
+        validate_declarative_transition_metadata(&rule(false), &inferred_human, &context)
+            .expect_err("human approval requires an explicit approval reference");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InvalidDecisionContract
+    );
+    assert!(rejection.message.contains("approval_ref must not be empty"));
+}
+
+#[test]
 fn transition_allowlist_keeps_rule_metadata() {
     let mut metadata_rule = rule(true);
     metadata_rule.required_command = Some(WorkflowCommandType::EnqueueActivity);
@@ -113,6 +191,166 @@ fn transition_allowlist_keeps_rule_metadata() {
         Some(WorkflowCommandType::EnqueueActivity)
     );
     assert_eq!(compiled.required_evidence.len(), 2);
+}
+
+/// GH-1766 Evidence Contract table test: every contracted transition of the
+/// built-in definitions requires exactly the named evidence class, and every
+/// other explicit rule keeps an empty requirement set.
+#[test]
+fn builtin_evidence_contract_matches_spec_table() {
+    use crate::runtime::completion_evidence::{
+        EVIDENCE_GITHUB_TERMINAL, EVIDENCE_PROMPT_COMPLETION, EVIDENCE_SERVER_PR_SNAPSHOT,
+        EVIDENCE_SERVER_VALIDATION_DIGEST, EVIDENCE_VERIFIED_PR_BINDING,
+    };
+
+    /// definition id, its allowlist, and the contracted
+    /// `(from, to, required evidence kinds)` rows from `product.md`.
+    type EvidenceContract = (&'static str, TransitionAllowlist, Vec<ContractRow>);
+    type ContractRow = (&'static str, &'static str, Vec<&'static str>);
+
+    let contract: &[EvidenceContract] = &[
+        (
+            "github_issue_pr",
+            TransitionAllowlist::github_issue_pr_defaults(),
+            vec![
+                (
+                    "implementing",
+                    "pr_open",
+                    vec![EVIDENCE_VERIFIED_PR_BINDING],
+                ),
+                ("implementing", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                ("pr_open", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                ("awaiting_feedback", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                (
+                    "addressing_feedback",
+                    "done",
+                    vec![EVIDENCE_GITHUB_TERMINAL],
+                ),
+                ("blocked", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                ("local_review_gate", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                (
+                    "quality_gate_pending",
+                    "done",
+                    vec![EVIDENCE_GITHUB_TERMINAL],
+                ),
+                ("ready_to_merge", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+                ("merging", "done", vec![EVIDENCE_GITHUB_TERMINAL]),
+            ],
+        ),
+        (
+            "quality_gate",
+            TransitionAllowlist::quality_gate_defaults(),
+            vec![(
+                "checking",
+                "passed",
+                vec![EVIDENCE_SERVER_VALIDATION_DIGEST],
+            )],
+        ),
+        (
+            "pr_feedback",
+            TransitionAllowlist::pr_feedback_defaults(),
+            vec![(
+                "inspecting",
+                "ready_to_merge",
+                vec![EVIDENCE_SERVER_PR_SNAPSHOT],
+            )],
+        ),
+        (
+            "prompt_task",
+            TransitionAllowlist::prompt_task_defaults(),
+            vec![("implementing", "done", vec![EVIDENCE_PROMPT_COMPLETION])],
+        ),
+    ];
+
+    for (definition, allowlist, required) in contract {
+        for (from, to, evidence) in required {
+            let rule = allowlist
+                .rule_for(from, to)
+                .unwrap_or_else(|| panic!("{definition}: missing rule {from} -> {to}"));
+            for kind in evidence {
+                assert!(
+                    rule.required_evidence.contains(*kind),
+                    "{definition}: {from} -> {to} must require `{kind}`"
+                );
+                let expected_trust = match *kind {
+                    EVIDENCE_SERVER_VALIDATION_DIGEST => ClaimTrustLevel::Reexecuted,
+                    EVIDENCE_VERIFIED_PR_BINDING
+                    | EVIDENCE_GITHUB_TERMINAL
+                    | EVIDENCE_SERVER_PR_SNAPSHOT => ClaimTrustLevel::RuntimeObserved,
+                    EVIDENCE_PROMPT_COMPLETION => ClaimTrustLevel::SelfDeclared,
+                    _ => ClaimTrustLevel::SelfDeclared,
+                };
+                assert_eq!(
+                    rule.required_evidence_trust.get(*kind).copied(),
+                    Some(expected_trust),
+                    "{definition}: {from} -> {to} `{kind}` trust requirement diverges from the contract table",
+                );
+            }
+        }
+        for rule in allowlist.rules() {
+            let Some(from) = rule.from_state.as_deref() else {
+                assert!(
+                    rule.required_evidence.is_empty(),
+                    "{definition}: from_any rules must not carry evidence requirements"
+                );
+                continue;
+            };
+            let contracted = required.iter().any(|(contract_from, contract_to, _)| {
+                *contract_from == from && *contract_to == rule.to_state
+            });
+            assert_eq!(
+                !rule.required_evidence.is_empty(),
+                contracted,
+                "{definition}: {from} -> {} evidence requirement diverges from the contract table",
+                rule.to_state
+            );
+        }
+    }
+}
+
+/// GH-1766: a contracted transition rejects a decision missing its evidence
+/// class with the typed reason, and accepts the same decision carrying it.
+#[test]
+fn contracted_transition_rejects_without_evidence_and_accepts_with_it() {
+    use crate::runtime::completion_evidence::EVIDENCE_SERVER_VALIDATION_DIGEST;
+
+    let allowlist = TransitionAllowlist::quality_gate_defaults();
+    let Some(rule) = allowlist.rule_for("checking", "passed") else {
+        panic!("quality_gate defaults must declare checking -> passed");
+    };
+    let context = ValidationContext::new("runtime-worker", chrono::Utc::now());
+    let bare = WorkflowDecision::new("wf-1", "checking", "quality_passed", "passed", "test");
+    let rejection = validate_declarative_transition_metadata(rule, &bare, &context)
+        .expect_err("missing digest evidence must reject");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::MissingRequiredEvidence
+    );
+    assert!(rejection
+        .message
+        .contains(EVIDENCE_SERVER_VALIDATION_DIGEST));
+
+    let weak = bare.clone().with_evidence(WorkflowEvidence::new(
+        EVIDENCE_SERVER_VALIDATION_DIGEST,
+        "agent claimed the validation digest passed",
+    ));
+    let rejection = validate_declarative_transition_metadata(rule, &weak, &context)
+        .expect_err("self-declared evidence must not satisfy reexecuted evidence policy");
+    assert_eq!(
+        rejection.kind,
+        WorkflowDecisionRejectionKind::InsufficientEvidenceTrust
+    );
+    assert!(rejection.message.contains("requires reexecuted"));
+
+    let evidenced = bare.with_evidence(WorkflowEvidence::reexecuted(
+        EVIDENCE_SERVER_VALIDATION_DIGEST,
+        "server executed 2 validation command(s), all exit 0",
+        "server_validation_digest:2_commands",
+        None,
+    ));
+    if let Err(rejection) = validate_declarative_transition_metadata(rule, &evidenced, &context) {
+        panic!("digest evidence should satisfy the contract: {rejection}");
+    }
 }
 
 #[test]

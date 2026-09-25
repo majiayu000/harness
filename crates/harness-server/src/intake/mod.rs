@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::AppState;
+use crate::services::execution::QueueDomain;
 use crate::workflow_runtime_submission::{
     runtime_models::{TaskFailureKind, TaskId, TaskStatus},
     CreateTaskRequest, MAX_TASK_PRIORITY,
@@ -173,7 +174,7 @@ impl IntakeOrchestrator {
                 }
             };
             for issue in issues {
-                let repo_key = issue.repo.clone().unwrap_or_else(|| "default".to_string());
+                let repo_key = intake_repo_key(source.name(), issue.repo.as_deref());
                 by_repo
                     .entry(repo_key)
                     .or_default()
@@ -324,6 +325,15 @@ impl IntakeOrchestrator {
     }
 }
 
+fn intake_repo_key(source_name: &str, repo: Option<&str>) -> String {
+    let repo = repo.unwrap_or("default");
+    if source_name == "github" {
+        repo.to_ascii_lowercase()
+    } else {
+        repo.to_string()
+    }
+}
+
 async fn record_intake_idle(
     state: &Arc<AppState>,
     project_id: &str,
@@ -355,7 +365,11 @@ async fn enqueue_fallback_intake_issue(
 ) {
     let external_id = issue.external_id.clone();
     let req = fallback_intake_task_request(&issue, source.name(), default_project_root);
-    match crate::http::task_routes::enqueue_task_background(Arc::clone(state), req).await {
+    match state
+        .execution_svc
+        .enqueue_in_domain(req, QueueDomain::Primary)
+        .await
+    {
         Ok(task_id) => {
             if let Err(error) = source.mark_dispatched(&external_id, &task_id).await {
                 tracing::warn!(
@@ -388,6 +402,9 @@ fn fallback_intake_task_request(
         .filter(|priority| *priority <= MAX_TASK_PRIORITY)
         .unwrap_or_default();
     CreateTaskRequest {
+        pr: (source_name == "github")
+            .then(|| issue.external_id.strip_prefix("pr:")?.parse::<u64>().ok())
+            .flatten(),
         prompt: Some(build_prompt_from_issue(issue)),
         project: Some(issue.project_root.clone().unwrap_or(default_project_root)),
         source: Some(source_name.to_string()),
@@ -497,6 +514,17 @@ mod tests {
     }
 
     #[test]
+    fn github_poll_pull_request_uses_native_pr_intake() {
+        let issue = incoming_issue("github", "pr:42");
+        let req = fallback_intake_task_request(&issue, "github", "/tmp/project".into());
+        assert_eq!(req.pr, Some(42));
+        assert_eq!(req.issue, None);
+        assert_eq!(github_direct_issue_number("github", &issue), None);
+        let other = fallback_intake_task_request(&issue, "feishu", "/tmp/project".into());
+        assert_eq!(other.pr, None);
+    }
+
+    #[test]
     fn github_direct_issue_number_only_accepts_numeric_github_issues() {
         assert_eq!(
             github_direct_issue_number("github", &incoming_issue("github", "42")),
@@ -530,5 +558,17 @@ mod tests {
         assert_eq!(req.labels, vec!["inbox"]);
         assert_eq!(req.priority, 2);
         assert_eq!(req.issue, None);
+    }
+
+    #[test]
+    fn github_intake_repo_key_is_canonical_for_the_entire_poll_tick() {
+        assert_eq!(
+            intake_repo_key("github", Some("Owner/Repo")),
+            intake_repo_key("github", Some("owner/repo"))
+        );
+        assert_eq!(
+            intake_repo_key("feishu", Some("Team/Channel")),
+            "Team/Channel"
+        );
     }
 }

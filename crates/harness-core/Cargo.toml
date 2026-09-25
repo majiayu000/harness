@@ -6,12 +6,18 @@ license.workspace = true
 repository.workspace = true
 description = "Core domain model, configuration, prompts, and agent traits for Harness"
 
+[features]
+default = []
+db-postgres = ["dep:sqlx"]
+
 [lints]
 workspace = true
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+jsonschema = { workspace = true }
+json5 = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 chrono = { workspace = true }
@@ -21,14 +27,9 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 anyhow = { workspace = true }
-sqlx = { workspace = true }
+sqlx = { workspace = true, optional = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
-cap-std = { workspace = true }
-same-file = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

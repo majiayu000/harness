@@ -1,4 +1,4 @@
-use harness_core::types::{Item, ThreadId, TurnId, TurnStatus};
+use harness_core::types::{Item, ThreadId, TurnFailureKind, TurnId, TurnStatus};
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, ActivitySignal, RuntimeJob,
 };
@@ -10,20 +10,12 @@ use super::activity_status_contract::{
     enforce_activity_status_contract, status_contract_blockers_from_result,
 };
 use super::data_helpers::activity_name;
+#[path = "activity_result_parser.rs"]
+mod activity_result_parser;
 use super::prompt_packet::workflow_prompt_artifact;
+use activity_result_parser::parse_activity_result_json;
 
-const CODEX_SKILL_BUDGET_WARNING: &str =
-    "Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter.";
-const CODEX_SKILL_BUDGET_WARNING_ADVICE: &str =
-    " Disable unused skills or plugins to leave more room for the rest.";
-const CODEX_SKILL_BUDGET_AGENT_ERROR: &str =
-    "agent execution failed: Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter.";
-const CODEX_SKILL_BUDGET_STRUCTURED_AGENT_ERROR: &str =
-    "agent execution failed: codex structured error: Skill descriptions were shortened to fit the 2% skills context budget. Codex can still see every skill, but some descriptions are shorter.";
-const CODEX_SKILL_BUDGET_STRUCTURED_AGENT_ERROR_PREFIX: &str =
-    "agent execution failed: codex structured error: exit ";
-
-pub(super) fn activity_result_from_turn(
+pub(super) fn activity_result_from_turn_with_workflow(
     job: &RuntimeJob,
     status: &TurnStatus,
     items: &[Item],
@@ -32,6 +24,7 @@ pub(super) fn activity_result_from_turn(
     agent_name: &str,
     project_root: &Path,
     prompt_packet_digest: &str,
+    workflow_definition: Option<&str>,
 ) -> ActivityResult {
     let activity = activity_name(job);
     let summary = last_agent_summary(items).unwrap_or_else(|| match status {
@@ -40,7 +33,8 @@ pub(super) fn activity_result_from_turn(
         TurnStatus::Failed => "Agent turn failed.".to_string(),
         TurnStatus::Running => "Agent turn is still running after lifecycle returned.".to_string(),
     });
-    let envelope = activity_result_envelope_from_turn(status, items, &activity, summary);
+    let envelope =
+        activity_result_envelope_from_turn(status, items, &activity, summary, workflow_definition);
     match envelope.outcome {
         ActivityResultEnvelopeOutcome::MissingStructuredOutput => {
             tracing::warn!(
@@ -82,18 +76,6 @@ pub(super) fn activity_result_from_turn(
                 );
             }
         }
-        ActivityResultEnvelopeOutcome::AcceptedWithTurnWarning => {
-            if let Some(error) = envelope.extraction_error.as_deref() {
-                tracing::warn!(
-                    runtime_job_id = %job.id,
-                    activity = %activity,
-                    agent = %agent_name,
-                    turn_status = ?status,
-                    items = items.len(),
-                    "accepted structured activity result despite non-fatal turn warning: {error}"
-                );
-            }
-        }
         ActivityResultEnvelopeOutcome::StatusContractDowngraded => {
             let blocker_signals = status_contract_blockers_from_result(&envelope.final_result);
             tracing::error!(
@@ -109,7 +91,9 @@ pub(super) fn activity_result_from_turn(
         ActivityResultEnvelopeOutcome::Accepted | ActivityResultEnvelopeOutcome::TurnCancelled => {}
     }
     let envelope_artifact = envelope.to_artifact();
-    let result = envelope.into_final_result();
+    let result = harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(
+        envelope.into_final_result(),
+    );
     result
         .with_artifact(envelope_artifact)
         .with_artifact(workflow_prompt_artifact(prompt_packet_digest))
@@ -131,10 +115,35 @@ pub(super) fn activity_result_from_turn(
         ))
 }
 
+#[cfg(test)]
+fn activity_result_from_turn(
+    job: &RuntimeJob,
+    status: &TurnStatus,
+    items: &[Item],
+    thread_id: &ThreadId,
+    turn_id: &TurnId,
+    agent_name: &str,
+    project_root: &Path,
+    prompt_packet_digest: &str,
+) -> ActivityResult {
+    activity_result_from_turn_with_workflow(
+        job,
+        status,
+        items,
+        thread_id,
+        turn_id,
+        agent_name,
+        project_root,
+        prompt_packet_digest,
+        None,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ActivityResultExtractionStrategy {
     FencedActivityResult,
+    RawActivityResult,
     NotAttempted,
 }
 
@@ -142,7 +151,6 @@ enum ActivityResultExtractionStrategy {
 #[serde(rename_all = "snake_case")]
 enum ActivityResultEnvelopeOutcome {
     Accepted,
-    AcceptedWithTurnWarning,
     MissingStructuredOutput,
     InvalidStructuredOutput,
     ZeroOutputSpawnFailure,
@@ -166,8 +174,9 @@ impl ActivityResultEnvelope {
         raw_status: TurnStatus,
         extraction_strategy: ActivityResultExtractionStrategy,
         result: ActivityResult,
+        workflow_definition: Option<&str>,
     ) -> Self {
-        let (downgraded, result) = enforce_activity_status_contract(result);
+        let (downgraded, result) = enforce_activity_status_contract(workflow_definition, result);
         let outcome = if downgraded {
             ActivityResultEnvelopeOutcome::StatusContractDowngraded
         } else {
@@ -179,27 +188,6 @@ impl ActivityResultEnvelope {
             raw_status,
             extracted_activity: Some(result.activity.clone()),
             extraction_error: None,
-            final_result: result,
-        }
-    }
-
-    fn accepted_with_turn_warning(
-        raw_status: TurnStatus,
-        result: ActivityResult,
-        warning: String,
-    ) -> Self {
-        let (downgraded, result) = enforce_activity_status_contract(result);
-        let outcome = if downgraded {
-            ActivityResultEnvelopeOutcome::StatusContractDowngraded
-        } else {
-            ActivityResultEnvelopeOutcome::AcceptedWithTurnWarning
-        };
-        Self {
-            extraction_strategy: ActivityResultExtractionStrategy::FencedActivityResult,
-            outcome,
-            raw_status,
-            extracted_activity: Some(result.activity.clone()),
-            extraction_error: Some(warning),
             final_result: result,
         }
     }
@@ -265,12 +253,13 @@ impl ActivityResultEnvelope {
 
     fn invalid_structured_output(
         raw_status: TurnStatus,
+        extraction_strategy: ActivityResultExtractionStrategy,
         activity: String,
         error: String,
         extracted_activity: Option<String>,
     ) -> Self {
         Self {
-            extraction_strategy: ActivityResultExtractionStrategy::FencedActivityResult,
+            extraction_strategy,
             outcome: ActivityResultEnvelopeOutcome::InvalidStructuredOutput,
             raw_status,
             extracted_activity,
@@ -295,9 +284,17 @@ impl ActivityResultEnvelope {
         }
     }
 
-    fn failed(raw_status: TurnStatus, activity: String, summary: String, error: String) -> Self {
+    fn failed(
+        raw_status: TurnStatus,
+        activity: String,
+        summary: String,
+        error: String,
+        failure_kind: Option<TurnFailureKind>,
+    ) -> Self {
         let mut result = ActivityResult::failed(activity, summary, error.clone());
-        if turn_error_is_timeout(&error) {
+        if let Some(kind) = failure_kind {
+            result = result.with_error_kind(activity_error_kind_from_turn_failure(kind));
+        } else if turn_error_is_timeout(&error) {
             result = result.with_error_kind(ActivityErrorKind::Timeout);
         } else if turn_error_is_non_retryable_agent_limit(&error) {
             result = result.with_error_kind(ActivityErrorKind::Configuration);
@@ -338,18 +335,72 @@ impl ActivityResultEnvelope {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StructuredOutputCorrection {
+    pub outcome: String,
+    pub error: String,
+    pub extracted_activity: Option<String>,
+}
+
+pub(super) fn activity_result_envelope_outcome(result: &ActivityResult) -> Option<&str> {
+    activity_result_envelope(result)?
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+}
+
+pub(super) fn structured_output_correction(
+    result: &ActivityResult,
+) -> Option<StructuredOutputCorrection> {
+    let envelope = activity_result_envelope(result)?;
+    let outcome = envelope.get("outcome")?.as_str()?;
+    if !matches!(
+        outcome,
+        "invalid_structured_output" | "missing_structured_output"
+    ) {
+        return None;
+    }
+    let error = envelope
+        .get("extraction_error")
+        .and_then(serde_json::Value::as_str)
+        .or(result.error.as_deref())
+        .unwrap_or("structured activity result was invalid")
+        .to_string();
+    let extracted_activity = envelope
+        .get("extracted_activity")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Some(StructuredOutputCorrection {
+        outcome: outcome.to_string(),
+        error,
+        extracted_activity,
+    })
+}
+
+fn activity_result_envelope(result: &ActivityResult) -> Option<&serde_json::Value> {
+    result
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == "activity_result_envelope")
+        .map(|artifact| &artifact.artifact)
+}
+
 fn activity_result_envelope_from_turn(
     status: &TurnStatus,
     items: &[Item],
     activity: &str,
     summary: String,
+    workflow_definition: Option<&str>,
 ) -> ActivityResultEnvelope {
     match status {
         TurnStatus::Completed => match structured_activity_result(items, activity) {
-            StructuredActivityResult::Parsed(result) => ActivityResultEnvelope::accepted(
-                *status,
-                ActivityResultExtractionStrategy::FencedActivityResult,
+            StructuredActivityResult::Parsed {
                 result,
+                extraction_strategy,
+            } => ActivityResultEnvelope::accepted(
+                *status,
+                extraction_strategy,
+                result,
+                workflow_definition,
             ),
             StructuredActivityResult::Missing => {
                 let activity_summary = agent_activity_summary(items);
@@ -370,8 +421,10 @@ fn activity_result_envelope_from_turn(
             StructuredActivityResult::Invalid {
                 error,
                 extracted_activity,
+                extraction_strategy,
             } => ActivityResultEnvelope::invalid_structured_output(
                 *status,
+                extraction_strategy,
                 activity.to_string(),
                 error,
                 extracted_activity,
@@ -381,33 +434,24 @@ fn activity_result_envelope_from_turn(
             ActivityResultEnvelope::cancelled(*status, activity.to_string(), summary)
         }
         TurnStatus::Failed => {
-            let error = failed_turn_error(items);
-            if let Some(warning) = failed_turn_warning_allows_structured_result(items) {
-                match structured_activity_result(items, activity) {
-                    StructuredActivityResult::Parsed(result) => {
-                        return ActivityResultEnvelope::accepted_with_turn_warning(
-                            *status, result, warning,
-                        );
-                    }
-                    StructuredActivityResult::Invalid {
-                        error: parse_error,
-                        extracted_activity,
-                    } => {
-                        return ActivityResultEnvelope::invalid_structured_output(
-                            *status,
-                            activity.to_string(),
-                            parse_error,
-                            extracted_activity,
-                        );
-                    }
-                    StructuredActivityResult::Missing => {}
-                }
-            }
-            ActivityResultEnvelope::failed(*status, activity.to_string(), summary, error)
+            let error = last_error(items).unwrap_or_else(|| "agent turn failed".to_string());
+            ActivityResultEnvelope::failed(
+                *status,
+                activity.to_string(),
+                summary,
+                error,
+                last_error_failure_kind(items),
+            )
         }
         TurnStatus::Running => {
             let error = last_error(items).unwrap_or_else(|| "agent turn failed".to_string());
-            ActivityResultEnvelope::failed(*status, activity.to_string(), summary, error)
+            ActivityResultEnvelope::failed(
+                *status,
+                activity.to_string(),
+                summary,
+                error,
+                last_error_failure_kind(items),
+            )
         }
     }
 }
@@ -437,7 +481,7 @@ fn agent_activity_summary(items: &[Item]) -> AgentActivitySummary {
             )
             .count(),
         tool_invocations: items.iter().filter(|item| item_is_tool_activity(item)).count(),
-        structured_result_artifacts: usize::from(latest_activity_result_block(items).is_some()),
+        structured_result_artifacts: usize::from(structured_activity_result_candidate(items)),
         total_items: items.len(),
     }
 }
@@ -463,107 +507,55 @@ fn turn_error_is_non_retryable_agent_limit(error: &str) -> bool {
         || harness_core::error::is_billing_failure_message(error)
 }
 
-fn failed_turn_error(items: &[Item]) -> String {
-    items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Error { message, .. } if !failed_turn_error_allows_structured_result(message) => {
-                Some(truncate_summary(message.trim()))
-            }
-            _ => None,
-        })
-        .next_back()
-        .or_else(|| last_error(items))
-        .unwrap_or_else(|| "agent turn failed".to_string())
-}
-
-fn failed_turn_warning_allows_structured_result(items: &[Item]) -> Option<String> {
-    let mut warning = None;
-    for item in items {
-        if let Item::Error { message, .. } = item {
-            if !failed_turn_error_allows_structured_result(message) {
-                return None;
-            }
-            warning = Some(message.clone());
-        }
-    }
-    warning
-}
-
-fn failed_turn_error_allows_structured_result(error: &str) -> bool {
-    let error = error.trim();
-    let error = error
-        .strip_suffix(CODEX_SKILL_BUDGET_WARNING_ADVICE)
-        .unwrap_or(error);
-    error == CODEX_SKILL_BUDGET_WARNING
-        || error == CODEX_SKILL_BUDGET_AGENT_ERROR
-        || error == CODEX_SKILL_BUDGET_STRUCTURED_AGENT_ERROR
-        || codex_structured_skill_budget_error_allows_structured_result(error)
-}
-
-fn codex_structured_skill_budget_error_allows_structured_result(error: &str) -> bool {
-    let Some(rest) = error.strip_prefix(CODEX_SKILL_BUDGET_STRUCTURED_AGENT_ERROR_PREFIX) else {
-        return false;
-    };
-    let Some(status_prefix) = rest.strip_suffix(CODEX_SKILL_BUDGET_WARNING) else {
-        return false;
-    };
-    let Some(status_text) = status_prefix.strip_suffix(": ") else {
-        return false;
-    };
-    !status_text.trim().is_empty() && !status_text.contains(['\n', '\r'])
-}
-
 enum StructuredActivityResult {
     Missing,
-    Parsed(ActivityResult),
+    Parsed {
+        result: ActivityResult,
+        extraction_strategy: ActivityResultExtractionStrategy,
+    },
     Invalid {
         error: String,
         extracted_activity: Option<String>,
+        extraction_strategy: ActivityResultExtractionStrategy,
     },
 }
 
 fn structured_activity_result(items: &[Item], expected_activity: &str) -> StructuredActivityResult {
     if let Some(block) = latest_activity_result_block(items) {
-        return parse_activity_result_block(block, expected_activity);
+        return parse_activity_result_block(
+            block,
+            expected_activity,
+            ActivityResultExtractionStrategy::FencedActivityResult,
+        );
+    }
+
+    if let Some(raw_json) = latest_raw_activity_result_json(items) {
+        return parse_activity_result_block(
+            raw_json,
+            expected_activity,
+            ActivityResultExtractionStrategy::RawActivityResult,
+        );
     }
 
     StructuredActivityResult::Missing
 }
 
-fn parse_activity_result_block(block: &str, expected_activity: &str) -> StructuredActivityResult {
+fn parse_activity_result_block(
+    block: &str,
+    expected_activity: &str,
+    extraction_strategy: ActivityResultExtractionStrategy,
+) -> StructuredActivityResult {
     match parse_activity_result_json(block, expected_activity) {
-        Ok(result) => StructuredActivityResult::Parsed(result),
+        Ok(result) => StructuredActivityResult::Parsed {
+            result,
+            extraction_strategy,
+        },
         Err(error) => StructuredActivityResult::Invalid {
             error: error.error,
             extracted_activity: error.extracted_activity,
+            extraction_strategy,
         },
     }
-}
-
-fn parse_activity_result_json(
-    block: &str,
-    expected_activity: &str,
-) -> Result<ActivityResult, StructuredActivityResultError> {
-    match serde_json::from_str::<ActivityResult>(block) {
-        Ok(result) if result.activity == expected_activity => Ok(result),
-        Ok(result) => Err(StructuredActivityResultError {
-            error: format!(
-                "activity result block reported activity `{}`, expected `{expected_activity}`",
-                result.activity
-            ),
-            extracted_activity: Some(result.activity),
-        }),
-        Err(error) => Err(StructuredActivityResultError {
-            error: format!("activity result block is invalid JSON: {error}"),
-            extracted_activity: None,
-        }),
-    }
-}
-
-struct StructuredActivityResultError {
-    error: String,
-    extracted_activity: Option<String>,
 }
 
 fn latest_activity_result_block(items: &[Item]) -> Option<&str> {
@@ -573,6 +565,21 @@ fn latest_activity_result_block(items: &[Item]) -> Option<&str> {
         }
         _ => None,
     })
+}
+
+fn latest_raw_activity_result_json(items: &[Item]) -> Option<&str> {
+    items.iter().rev().find_map(|item| match item {
+        Item::AgentReasoning { content } => {
+            let content = content.trim();
+            (content.starts_with('{') && content.ends_with('}')).then_some(content)
+        }
+        _ => None,
+    })
+}
+
+fn structured_activity_result_candidate(items: &[Item]) -> bool {
+    latest_activity_result_block(items).is_some()
+        || latest_raw_activity_result_json(items).is_some()
 }
 
 fn extract_fenced_block<'a>(text: &'a str, lang: &str) -> Option<&'a str> {
@@ -623,12 +630,33 @@ pub(super) fn last_agent_summary(items: &[Item]) -> Option<String> {
 }
 
 pub(super) fn last_error(items: &[Item]) -> Option<String> {
+    last_error_item(items).map(|(message, _)| message)
+}
+
+fn last_error_failure_kind(items: &[Item]) -> Option<TurnFailureKind> {
+    last_error_item(items).and_then(|(_, kind)| kind)
+}
+
+fn last_error_item(items: &[Item]) -> Option<(String, Option<TurnFailureKind>)> {
     items.iter().rev().find_map(|item| match item {
-        Item::Error { message, .. } if !message.trim().is_empty() => {
-            Some(truncate_summary(message.trim()))
-        }
+        Item::Error {
+            message,
+            failure_kind,
+            ..
+        } if !message.trim().is_empty() => Some((truncate_summary(message.trim()), *failure_kind)),
         _ => None,
     })
+}
+
+fn activity_error_kind_from_turn_failure(kind: TurnFailureKind) -> ActivityErrorKind {
+    match kind {
+        TurnFailureKind::Timeout => ActivityErrorKind::Timeout,
+        TurnFailureKind::Quota | TurnFailureKind::Billing => ActivityErrorKind::Configuration,
+        TurnFailureKind::Upstream => ActivityErrorKind::ExternalDependency,
+        TurnFailureKind::LocalProcess => ActivityErrorKind::SpawnFailure,
+        TurnFailureKind::Protocol => ActivityErrorKind::Retryable,
+        TurnFailureKind::Unknown => ActivityErrorKind::Unknown,
+    }
 }
 
 fn truncate_summary(value: &str) -> String {

@@ -11,7 +11,9 @@ async fn durable_store_persists_workflow_runtime_bus_contract() -> anyhow::Resul
     store.upsert_definition(&definition).await?;
 
     let instance = issue_instance("implementing");
-    store.upsert_instance(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let loaded = store
         .get_instance(&instance.id)
         .await?
@@ -146,33 +148,47 @@ async fn durable_store_apply_decision_transition_can_create_initial_instance() -
         77,
         "https://github.com/owner/repo/pull/77",
         "pr-detected:task-1:77",
+    ))
+    // `implementing -> pr_open` requires server-verified PR evidence
+    // (GH-1766); a decision reaching the store without it is rejected.
+    .with_evidence(WorkflowEvidence::runtime_observed(
+        ARTIFACT_VERIFIED_PR_BINDING,
+        json!({ "pr_number": 77, "repo": "owner/repo", "state": "OPEN" }).to_string(),
+        "workflow-runtime-test",
+        None,
     ));
     let mut final_instance = initial.clone();
     final_instance.state = "pr_open".to_string();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = json!({
-        "project_id": "/project-a",
-        "issue_number": 123,
-        "pr_number": 77,
-        "pr_url": "https://github.com/owner/repo/pull/77",
-        "last_decision": "bind_pr",
-    });
+    final_instance.replace_classified_data(
+        json!({
+            "project_id": "/project-a",
+            "issue_number": 123,
+            "pr_number": 77,
+            "pr_url": "https://github.com/owner/repo/pull/77",
+            "last_decision": "bind_pr",
+        }),
+        DataProvenance::Server,
+    );
 
     let record = store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: "implementing",
-            create_if_missing: Some(&initial),
-            event_type: "PrDetected",
-            source: "workflow-runtime-test",
-            payload: json!({
-                "issue_number": 123,
-                "pr_number": 77,
-                "pr_url": "https://github.com/owner/repo/pull/77",
-            }),
-            decision: &decision,
-            final_instance: &final_instance,
-            command_status: WorkflowCommandStatus::Pending,
-        })
+        .apply_decision_transition(
+            WorkflowDecisionTransition {
+                expected_state: "implementing",
+                create_if_missing: Some(&initial),
+                event_type: "PrDetected",
+                source: "workflow-runtime-test",
+                payload: json!({
+                    "issue_number": 123,
+                    "pr_number": 77,
+                    "pr_url": "https://github.com/owner/repo/pull/77",
+                }),
+                decision: &decision,
+                final_instance: &final_instance,
+                command_status: WorkflowCommandStatus::Pending,
+            },
+            "workflow-runtime-test",
+        )
         .await?
         .expect("missing initial instance should be created inside the transition");
 
@@ -205,13 +221,18 @@ async fn durable_store_apply_decision_transition_does_not_rewind_existing_instan
     let initial = project_issue_instance("/project-a", 124, "implementing");
     let mut existing = initial.clone();
     existing.state = "awaiting_feedback".to_string();
-    existing.data = json!({
-        "project_id": "/project-a",
-        "issue_number": 124,
-        "pr_number": 78,
-        "last_decision": "record_feedback",
-    });
-    store.upsert_instance(&existing).await?;
+    existing.replace_classified_data(
+        json!({
+            "project_id": "/project-a",
+            "issue_number": 124,
+            "pr_number": 78,
+            "last_decision": "record_feedback",
+        }),
+        DataProvenance::Server,
+    );
+    store
+        .force_upsert_lifecycle_state_for_test(&existing)
+        .await?;
     let decision = WorkflowDecision::new(
         &initial.id,
         "implementing",
@@ -227,29 +248,35 @@ async fn durable_store_apply_decision_transition_does_not_rewind_existing_instan
     let mut final_instance = initial.clone();
     final_instance.state = "pr_open".to_string();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = json!({
-        "project_id": "/project-a",
-        "issue_number": 124,
-        "pr_number": 79,
-        "pr_url": "https://github.com/owner/repo/pull/79",
-        "last_decision": "bind_pr",
-    });
+    final_instance.replace_classified_data(
+        json!({
+            "project_id": "/project-a",
+            "issue_number": 124,
+            "pr_number": 79,
+            "pr_url": "https://github.com/owner/repo/pull/79",
+            "last_decision": "bind_pr",
+        }),
+        DataProvenance::Server,
+    );
 
     let record = store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: "implementing",
-            create_if_missing: Some(&initial),
-            event_type: "PrDetected",
-            source: "workflow-runtime-test",
-            payload: json!({
-                "issue_number": 124,
-                "pr_number": 79,
-                "pr_url": "https://github.com/owner/repo/pull/79",
-            }),
-            decision: &decision,
-            final_instance: &final_instance,
-            command_status: WorkflowCommandStatus::Pending,
-        })
+        .apply_decision_transition(
+            WorkflowDecisionTransition {
+                expected_state: "implementing",
+                create_if_missing: Some(&initial),
+                event_type: "PrDetected",
+                source: "workflow-runtime-test",
+                payload: json!({
+                    "issue_number": 124,
+                    "pr_number": 79,
+                    "pr_url": "https://github.com/owner/repo/pull/79",
+                }),
+                decision: &decision,
+                final_instance: &final_instance,
+                command_status: WorkflowCommandStatus::Pending,
+            },
+            "workflow-runtime-test",
+        )
         .await?;
 
     assert!(record.is_none());
@@ -273,16 +300,18 @@ async fn durable_store_lists_workflow_runtime_tree_inputs() -> anyhow::Result<()
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
 
-    let parent = quality_gate_instance("checking").with_data(json!({
+    let parent = quality_gate_instance("checking").with_server_data(json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
     }));
     let child =
         project_issue_instance("/project-a", 123, "replanning").with_parent(parent.id.clone());
     let other_project = project_issue_instance("/project-b", 456, "implementing");
-    store.upsert_instance(&parent).await?;
-    store.upsert_instance(&child).await?;
-    store.upsert_instance(&other_project).await?;
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&child).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&other_project)
+        .await?;
     let event = store
         .append_event(
             &child.id,
@@ -360,16 +389,22 @@ async fn durable_store_lists_nonterminal_instances_by_definition() -> anyhow::Re
     let active = project_issue_instance("/project-a", 123, "implementing");
     let queued = project_issue_instance("/project-a", 124, "ready_to_merge");
     let terminal = project_issue_instance("/project-a", 125, "done");
-    let other_definition = prompt_task_instance("implementing").with_data(json!({
+    let other_definition = prompt_task_instance("implementing").with_server_data(json!({
         "project_id": "/project-a",
         "repo": "owner/repo",
     }));
     let other_project = project_issue_instance("/project-b", 126, "implementing");
-    store.upsert_instance(&active).await?;
-    store.upsert_instance(&queued).await?;
-    store.upsert_instance(&terminal).await?;
-    store.upsert_instance(&other_definition).await?;
-    store.upsert_instance(&other_project).await?;
+    store.force_upsert_lifecycle_state_for_test(&active).await?;
+    store.force_upsert_lifecycle_state_for_test(&queued).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&terminal)
+        .await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&other_definition)
+        .await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&other_project)
+        .await?;
 
     let listed = store
         .list_nonterminal_instances_by_definition(
@@ -399,8 +434,10 @@ async fn driverless_completion_is_rejected_atomically() -> anyhow::Result<()> {
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = issue_instance("replanning")
         .with_id("issue-driverless-completion")
-        .with_data(json!({ "marker": "must-remain" }));
-    store.upsert_instance(&instance).await?;
+        .with_server_data(json!({ "marker": "must-remain" }));
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
 
     let stale_command = WorkflowCommand::enqueue_activity(
         "implement_issue",
@@ -448,10 +485,9 @@ async fn driverless_completion_is_rejected_atomically() -> anyhow::Result<()> {
         &driverless,
     );
     let (first_record, replayed_record) = tokio::join!(first_completion, replayed_completion);
-    let record = first_record?
-        .expect("completion should persist a rejected decision");
-    let replayed_record = replayed_record?
-        .expect("replayed completion should persist a rejected decision");
+    let record = first_record?.expect("completion should persist a rejected decision");
+    let replayed_record =
+        replayed_record?.expect("replayed completion should persist a rejected decision");
 
     for rejected in [&record, &replayed_record] {
         assert!(!rejected.accepted);
@@ -472,9 +508,7 @@ async fn driverless_completion_is_rejected_atomically() -> anyhow::Result<()> {
     let decisions = store.decisions_for(&instance.id).await?;
     assert_eq!(decisions.len(), 2);
     assert!(decisions.iter().all(|decision| !decision.accepted));
-    assert!(decisions
-        .iter()
-        .any(|decision| decision.id == record.id));
+    assert!(decisions.iter().any(|decision| decision.id == record.id));
     assert!(decisions
         .iter()
         .any(|decision| decision.id == replayed_record.id));
@@ -508,8 +542,10 @@ async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> an
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = issue_instance("replanning")
         .with_id("issue-driverless-production-completion")
-        .with_data(json!({ "marker": "must-remain" }));
-    store.upsert_instance(&instance).await?;
+        .with_server_data(json!({ "marker": "must-remain" }));
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
 
     let state_entry = WorkflowDecision::new(
         &instance.id,
@@ -562,10 +598,7 @@ async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> an
         "driverless-production-wait",
     ));
     let result = ActivityResult::succeeded("replan_issue", "Replan completed.").with_artifact(
-        ActivityArtifact::new(
-            "workflow_decision",
-            serde_json::to_value(&driverless)?,
-        ),
+        ActivityArtifact::new("workflow_decision", serde_json::to_value(&driverless)?),
     );
 
     let first = store.commit_runtime_activity_completion_if_owned(
@@ -622,8 +655,7 @@ async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> an
         command.status == WorkflowCommandStatus::HandledInline
             && matches!(
                 command.command.command_type,
-                WorkflowCommandType::MarkBlocked
-                    | WorkflowCommandType::RequestOperatorAttention
+                WorkflowCommandType::MarkBlocked | WorkflowCommandType::RequestOperatorAttention
             )
     }));
     let jobs = store.runtime_jobs_for_command(&command_id).await?;
@@ -632,7 +664,13 @@ async fn runtime_activity_completion_fences_concurrent_driverless_replay() -> an
     assert_eq!(store.events_for(&instance.id).await?.len(), 1);
     let decisions = store.decisions_for(&instance.id).await?;
     assert_eq!(decisions.len(), 3);
-    assert_eq!(decisions.iter().filter(|decision| decision.accepted).count(), 2);
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|decision| decision.accepted)
+            .count(),
+        2
+    );
     let rejected = decisions
         .iter()
         .find(|decision| !decision.accepted)
@@ -663,7 +701,24 @@ async fn authoritative_domain_completion_wins_over_driverless_artifact() -> anyh
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = issue_instance("implementing").with_id("issue-closed-domain-winner");
-    store.upsert_instance(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+    let unfinished = WorkflowCommand::enqueue_activity(
+        "inspect_pr_feedback",
+        "issue-closed-domain-unfinished",
+    );
+    let unfinished_command_id = store
+        .enqueue_command(&instance.id, None, &unfinished)
+        .await?;
+    let unfinished_job = store
+        .enqueue_runtime_job(
+            &unfinished_command_id,
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({ "activity": "inspect_pr_feedback" }),
+        )
+        .await?;
     let driverless = WorkflowDecision::new(
         &instance.id,
         "implementing",
@@ -687,6 +742,7 @@ async fn authoritative_domain_completion_wins_over_driverless_artifact() -> anyh
             "issue_url": "https://github.com/owner/repo/issues/123"
         }),
     ))
+    .with_artifact(crate::runtime::completion_evidence::verified_issue_state_for_test(123))
     .with_artifact(ActivityArtifact::new(
         "workflow_decision",
         serde_json::to_value(&driverless)?,
@@ -719,8 +775,92 @@ async fn authoritative_domain_completion_wins_over_driverless_artifact() -> anyh
     assert_eq!(decisions.len(), 1);
     assert!(decisions[0].accepted);
     let commands = store.commands_for(&instance.id).await?;
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].command.command_type, WorkflowCommandType::MarkDone);
-    assert_eq!(commands[0].decision_id.as_deref(), Some(record.id.as_str()));
+    assert_eq!(commands.len(), 2);
+    let terminal_marker = commands
+        .iter()
+        .find(|command| command.command.command_type == WorkflowCommandType::MarkDone)
+        .expect("terminal transition should persist its marker");
+    assert_eq!(
+        terminal_marker.decision_id.as_deref(),
+        Some(record.id.as_str())
+    );
+    let cancelled = store
+        .get_command(&unfinished_command_id)
+        .await?
+        .expect("unfinished command should remain auditable");
+    assert_eq!(cancelled.status, WorkflowCommandStatus::Cancelled);
+    assert_eq!(
+        store
+            .get_runtime_job(&unfinished_job.id)
+            .await?
+            .expect("unfinished job should remain auditable")
+            .status,
+        RuntimeJobStatus::Cancelled
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unverified_closed_issue_uses_blocked_fallback() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let instance = issue_instance("implementing")
+        .with_id("unverified-closed-issue")
+        .with_server_data(json!({
+            "repo": "owner/repo",
+            "issue_number": 123,
+        }));
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
+    let result = ActivityResult::succeeded("implement_issue", "Issue is closed.").with_signal(
+        ActivitySignal::new(
+            "IssueClosed",
+            json!({
+                "issue_number": 123,
+                "state": "closed",
+                "issue_url": "https://github.com/owner/repo/issues/123",
+            }),
+        ),
+    );
+
+    let record = store
+        .commit_parent_runtime_completion(
+            &instance.id,
+            "runtime-1",
+            json!({
+                "command_id": "unverified-closed-command",
+                "runtime_job_id": "unverified-closed-job",
+                "activity_result": result,
+            }),
+        )
+        .await?
+        .expect("insufficient terminal trust should produce a blocked fallback");
+
+    assert!(record.accepted);
+    assert_eq!(record.decision.decision, "block_invalid_agent_output");
+    assert_eq!(record.decision.next_state, "blocked");
+    let decisions = store.decisions_for(&instance.id).await?;
+    assert_eq!(decisions.len(), 2);
+    assert!(decisions.iter().any(|candidate| {
+        !candidate.accepted
+            && candidate.decision.decision == "finish_closed_issue"
+            && candidate
+                .rejection_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("insufficient evidence trust"))
+    }));
+    assert_eq!(
+        store
+            .get_instance(&instance.id)
+            .await?
+            .expect("workflow should remain visible")
+            .state,
+        "blocked"
+    );
     Ok(())
 }

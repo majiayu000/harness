@@ -1,14 +1,54 @@
-use harness_workflow::runtime::{ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus};
+use harness_workflow::runtime::reducer::prompt_validation_report_has_nonzero_exit;
+use harness_workflow::runtime::{
+    ActivityArtifact, ActivityResult, ActivitySignal, ActivityStatus, LocalReviewOutcome,
+    GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_BLOCKED_SIGNAL,
+    LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL, PROMPT_TASK_DEFINITION_ID,
+    PROMPT_TASK_IMPLEMENT_ACTIVITY,
+};
 use serde_json::{json, Value};
 
+/// Reconciles claimed success with explicit blocker evidence (GH-1897).
+/// Recognized blockers produce SucceededWithBlockers and an audit artifact.
+/// Remediable readiness conditions are handled by their activity-specific path.
+const BLOCKING_SIGNAL_TYPES: &[&str] = &[
+    "ChangesRequested",
+    "ChecksFailed",
+    "LocalReviewPassed",
+    "LocalReviewChangesRequested",
+    "LocalReviewBlocked",
+    "QualityBlocked",
+    "QualityFailed",
+];
+
+/// Structured artifact fields whose non-empty/non-zero value reports a blocker.
+const BLOCKING_COUNT_FIELDS: &[&str] = &[
+    "open_review_threads",
+    "unresolved_review_threads",
+    "pending_checks",
+    "failing_checks",
+    "failed_checks",
+    "requested_changes",
+    "blocking_reviews",
+    "mergeability_blockers",
+    "blockers",
+];
+
+/// `merge_state_status` values that report a blocker.
+const BLOCKING_MERGE_STATES: &[&str] = &["blocked", "dirty", "unknown", "unstable", "behind"];
+
+/// The reconciled outcome name recorded in the contract artifact.
+const RECONCILED_OUTCOME: &str = "succeeded_with_blockers";
+const PR_FEEDBACK_REPAIR_ACTIVITY: &str = "address_pr_feedback";
+
 pub(super) fn enforce_activity_status_contract(
+    workflow_definition: Option<&str>,
     mut result: ActivityResult,
 ) -> (bool, ActivityResult) {
     if result.status != ActivityStatus::Succeeded {
         return (false, result);
     }
 
-    let blockers = activity_status_contract_blockers(&result);
+    let blockers = activity_status_contract_blockers(workflow_definition, &result);
     if blockers.is_empty() {
         return (false, result);
     }
@@ -19,7 +59,7 @@ pub(super) fn enforce_activity_status_contract(
         blockers.join("; ")
     );
 
-    result.status = ActivityStatus::Blocked;
+    result.status = ActivityStatus::SucceededWithBlockers;
     result.summary = format!("Activity blocked by status contract. {reason}");
     result.error = Some(reason);
     result.artifacts.push(ActivityArtifact::new(
@@ -27,7 +67,8 @@ pub(super) fn enforce_activity_status_contract(
         json!({
             "schema": "harness.runtime.activity_status_contract.v1",
             "claimed_status": "succeeded",
-            "effective_status": "blocked",
+            "effective_status": RECONCILED_OUTCOME,
+            "reconciled_outcome": RECONCILED_OUTCOME,
             "claimed_summary": claimed_summary,
             "blocker_signals": blockers,
         }),
@@ -36,7 +77,8 @@ pub(super) fn enforce_activity_status_contract(
         "ActivityStatusContractDowngraded",
         json!({
             "claimed_status": "succeeded",
-            "effective_status": "blocked",
+            "effective_status": RECONCILED_OUTCOME,
+            "reconciled_outcome": RECONCILED_OUTCOME,
         }),
     ));
 
@@ -60,28 +102,64 @@ pub(super) fn status_contract_blockers_from_result(result: &ActivityResult) -> V
         .unwrap_or_default()
 }
 
-fn activity_status_contract_blockers(result: &ActivityResult) -> Vec<String> {
+fn activity_status_contract_blockers(
+    workflow_definition: Option<&str>,
+    result: &ActivityResult,
+) -> Vec<String> {
     let mut blockers = Vec::new();
+    let local_review_outcome = declared_local_review_outcome(workflow_definition, result);
+    let local_review_outcome_accepts_blockers = matches!(
+        local_review_outcome,
+        Some(LocalReviewOutcome::ChangesRequested | LocalReviewOutcome::Blocked)
+    );
+    let pr_feedback_repair = workflow_definition == Some(GITHUB_ISSUE_PR_DEFINITION_ID)
+        && result.activity == PR_FEEDBACK_REPAIR_ACTIVITY;
 
     for signal in &result.signals {
-        match signal.signal_type.as_str() {
-            "ChangesRequested"
-            | "ChecksFailed"
-            | "LocalReviewChangesRequested"
-            | "LocalReviewBlocked"
-            | "QualityBlocked"
-            | "QualityFailed" => {
-                push_unique(&mut blockers, format!("signal:{}", signal.signal_type));
-            }
-            _ => {}
+        if local_review_outcome.is_some()
+            && is_local_review_outcome_signal(signal.signal_type.as_str())
+        {
+            continue;
+        }
+        if BLOCKING_SIGNAL_TYPES.contains(&signal.signal_type.as_str()) {
+            push_unique(&mut blockers, format!("signal:{}", signal.signal_type));
         }
     }
 
-    for artifact in &result.artifacts {
-        collect_structured_blockers(&artifact.artifact, &mut blockers);
+    if !local_review_outcome_accepts_blockers {
+        for artifact in &result.artifacts {
+            collect_structured_blockers(
+                &artifact.artifact,
+                &mut blockers,
+                (pr_feedback_repair && artifact.artifact_type == "pr_repair_snapshot")
+                    || local_review_outcome == Some(LocalReviewOutcome::Passed),
+            );
+        }
     }
 
-    collect_textual_blockers(&result.summary, &mut blockers);
+    // PR prose describes what happened; structured contracts determine the
+    // outcome. Merge completion also requires an independent GitHub read.
+    if pr_feedback_repair
+        || local_review_outcome.is_some()
+        || (workflow_definition == Some(GITHUB_ISSUE_PR_DEFINITION_ID)
+            && result.activity == "merge_pr")
+    {
+        return blockers;
+    }
+
+    let mut summary_blockers = Vec::new();
+    if !local_review_outcome_accepts_blockers {
+        collect_textual_blockers(&result.summary, &mut summary_blockers);
+    }
+    if workflow_definition == Some(PROMPT_TASK_DEFINITION_ID)
+        && result.activity == PROMPT_TASK_IMPLEMENT_ACTIVITY
+        && prompt_validation_report_has_nonzero_exit(result)
+    {
+        summary_blockers.retain(|blocker| blocker != "text:failing_checks");
+    }
+    for blocker in summary_blockers {
+        push_unique(&mut blockers, blocker);
+    }
     if let Some(error) = result.error.as_deref() {
         collect_textual_blockers(error, &mut blockers);
     }
@@ -89,47 +167,80 @@ fn activity_status_contract_blockers(result: &ActivityResult) -> Vec<String> {
     blockers
 }
 
-fn collect_structured_blockers(value: &Value, blockers: &mut Vec<String>) {
+fn declared_local_review_outcome(
+    workflow_definition: Option<&str>,
+    result: &ActivityResult,
+) -> Option<LocalReviewOutcome> {
+    if workflow_definition != Some(GITHUB_ISSUE_PR_DEFINITION_ID)
+        || result.activity != LOCAL_REVIEW_ACTIVITY
+    {
+        return None;
+    }
+
+    let mut declared_count = 0;
+    let mut declared_outcome = None;
+    for signal in &result.signals {
+        let outcome = match signal.signal_type.as_str() {
+            LOCAL_REVIEW_PASSED_SIGNAL => LocalReviewOutcome::Passed,
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL => LocalReviewOutcome::ChangesRequested,
+            LOCAL_REVIEW_BLOCKED_SIGNAL => LocalReviewOutcome::Blocked,
+            _ => continue,
+        };
+        declared_count += 1;
+        declared_outcome = Some(outcome);
+    }
+
+    if declared_count != 1 {
+        return None;
+    }
+
+    declared_outcome
+}
+
+fn is_local_review_outcome_signal(signal_type: &str) -> bool {
+    matches!(
+        signal_type,
+        LOCAL_REVIEW_PASSED_SIGNAL
+            | LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL
+            | LOCAL_REVIEW_BLOCKED_SIGNAL
+    )
+}
+
+fn collect_structured_blockers(
+    value: &Value,
+    blockers: &mut Vec<String>,
+    remote_readiness_deferred: bool,
+) {
     match value {
         Value::Object(object) => {
             for (key, value) in object {
                 let normalized_key = key.to_ascii_lowercase();
-                match normalized_key.as_str() {
-                    "open_review_threads"
-                    | "unresolved_review_threads"
-                    | "pending_checks"
-                    | "failing_checks"
-                    | "failed_checks"
-                    | "requested_changes"
-                    | "blocking_reviews"
-                    | "mergeability_blockers"
-                    | "blockers"
-                        if json_value_reports_blocker(value) =>
+                if BLOCKING_COUNT_FIELDS.contains(&normalized_key.as_str()) {
+                    if !(remote_readiness_deferred && normalized_key == "pending_checks")
+                        && json_value_reports_blocker(value)
                     {
                         push_unique(blockers, format!("field:{normalized_key}"));
                     }
-                    "review_decision" if json_string_equals(value, "changes_requested") => {
+                } else if normalized_key == "review_decision" {
+                    if json_string_equals(value, "changes_requested") {
                         push_unique(blockers, "field:review_decision_changes_requested");
                     }
-                    "merge_state_status"
-                        if json_string_is_one_of(
-                            value,
-                            &["blocked", "dirty", "unknown", "unstable", "behind"],
-                        ) =>
+                } else if normalized_key == "merge_state_status" {
+                    if json_string_is_one_of(value, BLOCKING_MERGE_STATES)
+                        && !(remote_readiness_deferred
+                            && json_string_is_one_of(value, &["blocked", "unknown", "unstable"]))
                     {
                         push_unique(blockers, "field:merge_state_status_blocked");
                     }
-                    "mergeable" if value.as_bool() == Some(false) => {
-                        push_unique(blockers, "field:mergeable_false");
-                    }
-                    _ => {}
+                } else if normalized_key == "mergeable" && value.as_bool() == Some(false) {
+                    push_unique(blockers, "field:mergeable_false");
                 }
-                collect_structured_blockers(value, blockers);
+                collect_structured_blockers(value, blockers, remote_readiness_deferred);
             }
         }
         Value::Array(values) => {
             for value in values {
-                collect_structured_blockers(value, blockers);
+                collect_structured_blockers(value, blockers, remote_readiness_deferred);
             }
         }
         _ => {}
@@ -217,14 +328,473 @@ fn collect_textual_blockers(text: &str, blockers: &mut Vec<String>) {
 }
 
 fn contains_affirmative_blocker(normalized_text: &str, needle: &str) -> bool {
-    normalized_text.contains(needle)
-        && !normalized_text.contains(&format!("no {needle}"))
-        && !normalized_text.contains(&format!("without {needle}"))
+    normalized_text
+        .match_indices(needle)
+        .any(|(index, _)| !blocker_clause_is_resolved_or_negated(&normalized_text[..index]))
+}
+
+fn blocker_clause_is_resolved_or_negated(prefix: &str) -> bool {
+    let clause = prefix
+        .rsplit_once(['.', ';', ',', '!', '?', '\n'])
+        .map_or(prefix, |(_, rest)| rest);
+    let words: Vec<&str> = clause.split_whitespace().collect();
+    if words.ends_with(&["no", "new"]) {
+        return true;
+    }
+    words
+        .iter()
+        .rev()
+        .find(|word| !matches!(**word, "the" | "all" | "any" | "those" | "these"))
+        .is_some_and(|word| {
+            matches!(
+                *word,
+                "no" | "without" | "addressed" | "resolved" | "fixed" | "cleared" | "closed"
+            )
+        })
 }
 
 fn push_unique(blockers: &mut Vec<String>, blocker: impl Into<String>) {
     let blocker = blocker.into();
     if !blockers.contains(&blocker) {
         blockers.push(blocker);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prompt_result_with_report(exit_code: Value) -> ActivityResult {
+        ActivityResult::succeeded(
+            PROMPT_TASK_IMPLEMENT_ACTIVITY,
+            "Validation reported failed checks.",
+        )
+        .with_artifact(ActivityArtifact::new(
+            "validation_report",
+            json!([{
+                "command": "cargo test",
+                "exit_code": exit_code,
+            }]),
+        ))
+    }
+
+    #[test]
+    fn every_blocking_signal_type_downgrades_claimed_success() {
+        for signal_type in BLOCKING_SIGNAL_TYPES {
+            let claimed = ActivityResult::succeeded("run_local_review", "All good.")
+                .with_signal(ActivitySignal::new(*signal_type, json!({})));
+
+            let (changed, result) = enforce_activity_status_contract(None, claimed);
+
+            assert!(changed, "signal {signal_type} must downgrade");
+            assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+            assert_eq!(
+                status_contract_blockers_from_result(&result),
+                vec![format!("signal:{signal_type}")]
+            );
+        }
+    }
+
+    #[test]
+    fn declared_local_review_outcome_signals_are_preserved_for_github_issue_pr() {
+        for signal_type in [
+            LOCAL_REVIEW_PASSED_SIGNAL,
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            LOCAL_REVIEW_BLOCKED_SIGNAL,
+        ] {
+            let claimed = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Review completed.")
+                .with_signal(ActivitySignal::new(signal_type, json!({})));
+
+            let (changed, result) =
+                enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+            assert!(
+                !changed,
+                "signal {signal_type} should stay reducer-routable"
+            );
+            assert_eq!(result.status, ActivityStatus::Succeeded);
+            assert!(status_contract_blockers_from_result(&result).is_empty());
+        }
+    }
+
+    #[test]
+    fn declared_local_review_blocker_outcomes_preserve_matching_blocker_evidence() {
+        for signal_type in [
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            LOCAL_REVIEW_BLOCKED_SIGNAL,
+        ] {
+            let claimed = ActivityResult::succeeded(
+                LOCAL_REVIEW_ACTIVITY,
+                "Local review found two unresolved review threads and requested changes.",
+            )
+            .with_signal(ActivitySignal::new(
+                signal_type,
+                json!({ "pr_number": 1914 }),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                "local_review_findings",
+                json!({
+                    "unresolved_review_threads": [
+                        {"path": "AGENTS.md", "line": 61},
+                        {"path": "CLAUDE.md", "line": 14}
+                    ],
+                    "blockers": [
+                        "two unresolved review threads"
+                    ]
+                }),
+            ));
+
+            let (changed, result) =
+                enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+            assert!(
+                !changed,
+                "declared {signal_type} should reach the github_issue_pr reducer"
+            );
+            assert_eq!(result.status, ActivityStatus::Succeeded);
+            assert!(status_contract_blockers_from_result(&result).is_empty());
+        }
+    }
+
+    #[test]
+    fn local_review_passed_with_blocker_evidence_still_downgrades() {
+        let claimed = ActivityResult::succeeded(
+            LOCAL_REVIEW_ACTIVITY,
+            "Local review passed, but two unresolved review threads remain.",
+        )
+        .with_signal(ActivitySignal::new(
+            LOCAL_REVIEW_PASSED_SIGNAL,
+            json!({ "pr_number": 1914 }),
+        ))
+        .with_artifact(ActivityArtifact::new(
+            "local_review_findings",
+            json!({
+                "unresolved_review_threads": [
+                    {"path": "AGENTS.md", "line": 61},
+                    {"path": "CLAUDE.md", "line": 14}
+                ]
+            }),
+        ));
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+        let blockers = status_contract_blockers_from_result(&result);
+        assert!(blockers.contains(&"field:unresolved_review_threads".to_string()));
+        assert!(!blockers.contains(&"text:unresolved_review_threads".to_string()));
+    }
+
+    #[test]
+    fn conflicting_declared_local_review_outcomes_still_downgrade() {
+        let claimed = ActivityResult::succeeded(
+            LOCAL_REVIEW_ACTIVITY,
+            "Local review requested changes and could not complete.",
+        )
+        .with_signal(ActivitySignal::new(
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            json!({ "pr_number": 1914 }),
+        ))
+        .with_signal(ActivitySignal::new(
+            LOCAL_REVIEW_BLOCKED_SIGNAL,
+            json!({ "pr_number": 1914 }),
+        ))
+        .with_artifact(ActivityArtifact::new(
+            "local_review_findings",
+            json!({
+                "unresolved_review_threads": [
+                    {"path": "AGENTS.md", "line": 61}
+                ]
+            }),
+        ));
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+        let blockers = status_contract_blockers_from_result(&result);
+        assert!(blockers.contains(&format!("signal:{LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL}")));
+        assert!(blockers.contains(&format!("signal:{LOCAL_REVIEW_BLOCKED_SIGNAL}")));
+        assert!(blockers.contains(&"field:unresolved_review_threads".to_string()));
+    }
+
+    #[test]
+    fn duplicate_declared_local_review_outcomes_downgrade() {
+        for signal_type in [
+            LOCAL_REVIEW_PASSED_SIGNAL,
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            LOCAL_REVIEW_BLOCKED_SIGNAL,
+        ] {
+            let claimed = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Review completed.")
+                .with_signal(ActivitySignal::new(signal_type, json!({})))
+                .with_signal(ActivitySignal::new(signal_type, json!({})));
+
+            let (changed, result) =
+                enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+            assert!(
+                changed,
+                "duplicate {signal_type} declarations must fail closed"
+            );
+            assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+            assert_eq!(
+                status_contract_blockers_from_result(&result),
+                vec![format!("signal:{signal_type}")]
+            );
+        }
+    }
+
+    #[test]
+    fn local_review_blocker_evidence_still_downgrades_without_declared_outcome() {
+        let claimed = ActivityResult::succeeded(
+            LOCAL_REVIEW_ACTIVITY,
+            "Local review found two unresolved review threads.",
+        )
+        .with_artifact(ActivityArtifact::new(
+            "local_review_findings",
+            json!({
+                "unresolved_review_threads": [
+                    {"path": "AGENTS.md", "line": 61},
+                    {"path": "CLAUDE.md", "line": 14}
+                ]
+            }),
+        ));
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+        let blockers = status_contract_blockers_from_result(&result);
+        assert!(blockers.contains(&"field:unresolved_review_threads".to_string()));
+        assert!(blockers.contains(&"text:unresolved_review_threads".to_string()));
+    }
+
+    #[test]
+    fn local_review_blocker_like_signals_still_downgrade_outside_declared_context() {
+        for (workflow_definition, activity) in [
+            (Some(GITHUB_ISSUE_PR_DEFINITION_ID), "inspect_pr_feedback"),
+            (Some("custom_workflow"), LOCAL_REVIEW_ACTIVITY),
+            (None, LOCAL_REVIEW_ACTIVITY),
+        ] {
+            for signal_type in [
+                LOCAL_REVIEW_PASSED_SIGNAL,
+                LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+                LOCAL_REVIEW_BLOCKED_SIGNAL,
+            ] {
+                let claimed = ActivityResult::succeeded(activity, "Review completed.")
+                    .with_signal(ActivitySignal::new(signal_type, json!({})));
+
+                let (changed, result) =
+                    enforce_activity_status_contract(workflow_definition, claimed);
+
+                assert!(
+                    changed,
+                    "signal {signal_type} must downgrade for workflow={workflow_definition:?} activity={activity}"
+                );
+                assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+                assert_eq!(
+                    status_contract_blockers_from_result(&result),
+                    vec![format!("signal:{signal_type}")]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_blocking_count_field_downgrades_claimed_success() {
+        for field in BLOCKING_COUNT_FIELDS {
+            let claimed = ActivityResult::succeeded("run_local_review", "All good.").with_artifact(
+                ActivityArtifact::new("review_summary", json!({ *field: 2 })),
+            );
+
+            let (changed, result) = enforce_activity_status_contract(None, claimed);
+
+            assert!(changed, "field {field} must downgrade");
+            assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+            assert_eq!(
+                status_contract_blockers_from_result(&result),
+                vec![format!("field:{field}")]
+            );
+        }
+    }
+
+    #[test]
+    fn every_blocking_merge_state_downgrades_claimed_success() {
+        for merge_state in BLOCKING_MERGE_STATES {
+            let claimed = ActivityResult::succeeded("inspect_pr", "PR inspected.").with_artifact(
+                ActivityArtifact::new("pr_state", json!({ "merge_state_status": *merge_state })),
+            );
+
+            let (changed, result) = enforce_activity_status_contract(None, claimed);
+
+            assert!(changed, "merge state {merge_state} must downgrade");
+            assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+            assert_eq!(
+                status_contract_blockers_from_result(&result),
+                vec!["field:merge_state_status_blocked"]
+            );
+        }
+
+        let clean = ActivityResult::succeeded("inspect_pr", "PR inspected.").with_artifact(
+            ActivityArtifact::new("pr_state", json!({ "merge_state_status": "clean" })),
+        );
+        let (changed, result) = enforce_activity_status_contract(None, clean);
+        assert!(!changed);
+        assert_eq!(result.status, ActivityStatus::Succeeded);
+    }
+
+    #[test]
+    fn review_decision_and_mergeable_false_downgrade_claimed_success() {
+        let changes_requested = ActivityResult::succeeded("inspect_pr", "PR inspected.")
+            .with_artifact(ActivityArtifact::new(
+                "pr_state",
+                json!({ "review_decision": "CHANGES_REQUESTED" }),
+            ));
+        let (changed, result) = enforce_activity_status_contract(None, changes_requested);
+        assert!(changed);
+        assert_eq!(
+            status_contract_blockers_from_result(&result),
+            vec!["field:review_decision_changes_requested"]
+        );
+
+        let unmergeable = ActivityResult::succeeded("inspect_pr", "PR inspected.").with_artifact(
+            ActivityArtifact::new("pr_state", json!({ "mergeable": false })),
+        );
+        let (changed, result) = enforce_activity_status_contract(None, unmergeable);
+        assert!(changed);
+        assert_eq!(
+            status_contract_blockers_from_result(&result),
+            vec!["field:mergeable_false"]
+        );
+    }
+
+    #[test]
+    fn reconciliation_records_explicit_outcome_evidence() {
+        let claimed = ActivityResult::succeeded("run_local_review", "Review done.").with_signal(
+            ActivitySignal::new("LocalReviewChangesRequested", json!({})),
+        );
+        let (changed, result) = enforce_activity_status_contract(None, claimed);
+
+        assert!(changed);
+        let artifact = result
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_type == "activity_status_contract")
+            .expect("contract artifact");
+        assert_eq!(
+            artifact.artifact.get("reconciled_outcome"),
+            Some(&json!(RECONCILED_OUTCOME))
+        );
+        assert_eq!(
+            artifact.artifact.get("claimed_summary"),
+            Some(&json!("Review done."))
+        );
+        let downgrade_signal = result
+            .signals
+            .iter()
+            .find(|signal| signal.signal_type == "ActivityStatusContractDowngraded")
+            .expect("downgrade signal");
+        assert_eq!(
+            downgrade_signal.signal.get("reconciled_outcome"),
+            Some(&json!(RECONCILED_OUTCOME))
+        );
+    }
+
+    #[test]
+    fn negated_textual_blockers_do_not_downgrade() {
+        let claimed = ActivityResult::succeeded(
+            "run_local_review",
+            "Merged cleanly with no failing checks and no unresolved review threads.",
+        );
+        let (changed, result) = enforce_activity_status_contract(None, claimed);
+
+        assert!(!changed);
+        assert_eq!(result.status, ActivityStatus::Succeeded);
+    }
+
+    #[test]
+    fn non_succeeded_results_are_left_untouched() {
+        let blocked = ActivityResult {
+            status: ActivityStatus::Blocked,
+            ..ActivityResult::succeeded("run_local_review", "Blocked upstream.")
+        }
+        .with_signal(ActivitySignal::new(
+            "LocalReviewChangesRequested",
+            json!({}),
+        ));
+        let (changed, result) = enforce_activity_status_contract(None, blocked);
+
+        assert!(!changed);
+        assert_eq!(result.status, ActivityStatus::Blocked);
+        assert!(status_contract_blockers_from_result(&result).is_empty());
+    }
+
+    #[test]
+    fn prompt_failed_checks_without_nonzero_report_remain_blocking() {
+        let (changed, result) = enforce_activity_status_contract(
+            Some(PROMPT_TASK_DEFINITION_ID),
+            prompt_result_with_report(json!(0)),
+        );
+
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+        assert_eq!(
+            status_contract_blockers_from_result(&result),
+            vec!["text:failing_checks"]
+        );
+    }
+
+    #[test]
+    fn prompt_nonzero_report_does_not_hide_explicit_checks_failed_signal() {
+        let claimed = prompt_result_with_report(json!(101)).with_signal(ActivitySignal::new(
+            "ChecksFailed",
+            json!({ "check": "cargo test" }),
+        ));
+
+        let (changed, result) =
+            enforce_activity_status_contract(Some(PROMPT_TASK_DEFINITION_ID), claimed);
+
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+        assert_eq!(
+            status_contract_blockers_from_result(&result),
+            vec!["signal:ChecksFailed"]
+        );
+    }
+
+    #[test]
+    fn missing_or_custom_workflow_keeps_prompt_named_failed_checks_blocking() {
+        for workflow_definition in [None, Some("custom_prompt_workflow")] {
+            let (changed, result) = enforce_activity_status_contract(
+                workflow_definition,
+                prompt_result_with_report(json!(101)),
+            );
+
+            assert!(changed);
+            assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+            assert_eq!(
+                status_contract_blockers_from_result(&result),
+                vec!["text:failing_checks"]
+            );
+        }
+    }
+
+    #[test]
+    fn remote_readiness_wait_does_not_hide_actionable_failures() {
+        let mut blockers = Vec::new();
+        collect_structured_blockers(
+            &json!({"pending_checks":2,"merge_state_status":"BLOCKED"}),
+            &mut blockers,
+            true,
+        );
+        assert!(blockers.is_empty());
+        collect_structured_blockers(
+            &json!({"failed_checks":1,"merge_state_status":"DIRTY","unresolved_review_threads":1}),
+            &mut blockers,
+            true,
+        );
+        assert!(blockers.contains(&"field:failed_checks".to_string()));
+        assert!(blockers.contains(&"field:merge_state_status_blocked".to_string()));
+        assert!(blockers.contains(&"field:unresolved_review_threads".to_string()));
     }
 }

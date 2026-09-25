@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
+use super::api_error::ApiError;
 use super::rate_limit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,11 +60,12 @@ pub struct CoreServices {
     /// Home directory captured at startup to avoid TOCTOU when validating
     /// project roots against `$HOME` in concurrent requests.
     pub home_dir: std::path::PathBuf,
-    pub tasks: Arc<task_runner::TaskStore>,
+    pub tasks: Option<Arc<task_runner::TaskStore>>,
     pub plan_db: Option<crate::plan_db::PlanDb>,
     /// In-memory plan cache hydrated from `plan_db` on startup.
     /// Write-through: every mutation must also persist via `plan_db`.
-    pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    /// Values are shared handles so read paths never deep-clone plan contents.
+    pub plan_cache: Arc<DashMap<String, std::sync::Arc<harness_exec::plan::ExecPlan>>>,
     pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     pub project_workflow_store:
         Option<Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>>,
@@ -249,6 +251,8 @@ pub struct GitHubTokenDispatchCounterSnapshot {
 
 pub struct AppState {
     pub core: CoreServices,
+    /// Health registry for background orchestration loops (GH-1880).
+    pub(crate) background_loops: Arc<crate::http::background::BackgroundLoopHealth>,
     pub engines: EngineServices,
     pub observability: ObservabilityServices,
     pub concurrency: ConcurrencyServices,
@@ -258,7 +262,9 @@ pub struct AppState {
     pub runtime_project_cache: Arc<crate::runtime_project_cache::RuntimeProjectCacheManager>,
     pub postgres_catalog: Arc<crate::postgres_catalog::PostgresCatalogMonitor>,
     pub isolation_availability: harness_core::config::isolation::IsolationAvailability,
-    /// Serializes runtime snapshot writes to avoid out-of-order persistence.
+    /// Serializes runtime snapshot capture and writes for a shared store key.
+    /// Must be held across both `snapshot_state` calls and `persist_snapshot`
+    /// so concurrent updates cannot let an older capture overwrite a newer one.
     pub runtime_state_persist_lock: Mutex<()>,
     /// Set when a runtime-state persist fails; the next successful
     /// `persist_runtime_state` call clears it.  Handlers that find no
@@ -269,17 +275,20 @@ pub struct AppState {
         Arc<crate::runtime_circuit_breaker::RuntimeCircuitBreakerRegistry>,
     pub notifications: NotificationServices,
     pub intake: IntakeServices,
-    pub interceptors: Vec<Arc<dyn harness_core::interceptor::TurnInterceptor>>,
     /// Structured startup outcomes for stores and optional subsystems.
     pub startup_statuses: Vec<StoreStartupResult>,
     /// Subsystem names that degraded to `None` at startup (optional stores only).
     /// Set once during `build_app_state`; read-only thereafter.
     pub degraded_subsystems: Vec<&'static str>,
 
-    // ── Service layer ────────────────────────────────────────────────────────
-    // Trait-based abstractions for independent testability. Each service owns
-    // its dependencies; the fields above are preserved for handlers that have
-    // not yet been migrated to the service interfaces.
+    // ── Service layer (frozen — GH-1976) ─────────────────────────────────────
+    // Existing ProjectService / TaskService / ExecutionService fields stay for
+    // the minority of call sites that already use them. This surface is frozen:
+    // do not add new *_svc traits/methods, and do not migrate handlers that
+    // reach state.core.* merely to improve the ratio. New handlers should use
+    // the dominant state.core.* pattern until a concrete execution, isolation,
+    // or testing need requires a service boundary (see crates/harness-server/
+    // src/services/mod.rs).
     /// Project registry operations and default-root lookup.
     pub project_svc: Arc<dyn crate::services::project::ProjectService>,
     /// Task lifecycle queries and stream subscriptions.
@@ -289,6 +298,33 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn issue_workflow_store(
+        &self,
+    ) -> Result<&Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>, ApiError> {
+        self.core
+            .issue_workflow_store
+            .as_ref()
+            .ok_or_else(|| ApiError::store_unavailable("issue workflow store"))
+    }
+
+    pub(crate) fn project_workflow_store(
+        &self,
+    ) -> Result<&Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>, ApiError> {
+        self.core
+            .project_workflow_store
+            .as_ref()
+            .ok_or_else(|| ApiError::store_unavailable("project workflow store"))
+    }
+
+    pub(crate) fn workflow_runtime_store(
+        &self,
+    ) -> Result<&Arc<harness_workflow::runtime::WorkflowRuntimeStore>, ApiError> {
+        self.core
+            .workflow_runtime_store
+            .as_ref()
+            .ok_or_else(|| ApiError::store_unavailable("workflow runtime store"))
+    }
+
     fn runtime_state_persistence_required(&self) -> bool {
         self.startup_statuses
             .iter()
@@ -323,6 +359,8 @@ impl AppState {
     }
 
     pub async fn persist_runtime_state(&self) -> anyhow::Result<()> {
+        // Capture and write stay under this lock so concurrent callers sharing a
+        // store key cannot schedule an older snapshot after a newer one.
         let _guard = self.runtime_state_persist_lock.lock().await;
         let Some(store) = self.core.runtime_state_store.as_ref() else {
             if self.runtime_state_persistence_required() {

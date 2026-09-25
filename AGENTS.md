@@ -9,6 +9,48 @@ Use the user's language for conversation. Keep repository artifacts in English, 
 - Issue titles and descriptions
 - CLI help text and error messages
 
+## Design simplicity (anti-over-engineering)
+
+Over-engineering is the most frequent correction in this workspace. These are
+hard defaults and they apply INSIDE the requested scope, not just to adjacent
+changes:
+
+- No backward compatibility, migration shims, legacy fallbacks, or old-data
+  backfill unless the user explicitly asks for them. Assume breaking changes
+  are acceptable by default.
+- Words like 完美 / 长远 / 通用 / 一定不能影响 / "perfect" / "long-term"
+  describe quality goals, not authorization to platformize. Implement only
+  what the current stated requirement needs; mention future extensions as
+  one-line notes in the final message, never as extra code, schemas, tiers,
+  modes, or config surfaces.
+- Do not mechanize judgment: no hardcoded validators, closed error-code sets,
+  alias tables, or rule engines to enforce what instructions and review
+  already cover.
+- Validate once at the trusted boundary. Do not duplicate the same check
+  across layers (double probes, dual bookkeeping that must be reconciled).
+- Design-size checkpoint: before writing code, if the plan adds a new
+  abstraction layer, a new config surface, more than ~5 new files, or any
+  speculative option, present the minimal version and the additions as
+  separate items and default to the minimal version.
+- VibeGuard's error-handling strictness (U-17/U-29) applies to real error
+  paths inside the requested change; it never justifies adding new
+  validators, checks, or compatibility layers.
+- When the user says something is over-designed: cut it, do not defend it.
+
+## Problem framing and tool choice
+
+- Before the first tool call, identify the exact target, failure direction,
+  and requested access path.
+- The user's latest correction overrides earlier assumptions immediately.
+- When the user specifies SSH, CLI, API, or another access path, use that path.
+  Do not substitute UI automation unless the requested path is unavailable.
+- Diagnose the named system first. Do not inspect or modify adjacent tools merely
+  because they could plausibly cause the symptom.
+- For troubleshooting, establish evidence before mutation. Make one minimal
+  change, verify the original symptom, then stop when it passes.
+- If the target or direction is genuinely ambiguous, ask one short clarification
+  question before operating external systems.
+
 ## Build
 
 | Changed surface | During implementation |
@@ -20,9 +62,12 @@ Use the user's language for conversation. Keep repository artifacts in English, 
 Validation workflow:
 
 1. During implementation, run the smallest command from the table that covers the changed surface. Do not run the CI-equivalent workspace check after every edit.
-2. Before committing, run `cargo fmt --all` and `cargo fmt --all -- --check`. For behavior-changing code, run the relevant package tests; run full workspace tests when the change affects shared behavior, persistence, workflow runtime, or agent adapters.
+2. Before committing, run `cargo fmt --all` and `cargo fmt --all -- --check`. For behavior-changing code, run only the relevant package or filtered tests. Do not run `cargo test --workspace` locally; CI owns the full workspace test matrix, including changes to shared behavior, persistence, workflow runtime, and agent adapters.
 3. Before pushing a PR, run `cargo clippy --workspace --all-targets -- -D warnings` to catch CI-equivalent warnings and lints.
 
+- NEVER run `cargo test --workspace` on a developer machine unless the user explicitly requests it for that run.
+- NEVER run broad or unfiltered PostgreSQL test suites against a persistent or shared database. Local PostgreSQL validation must use the narrowest affected package/test filter and an isolated disposable database; leave full database suites to CI.
+- Keep `HARNESS_DATABASE_URL` and `DATABASE_URL` unset when pushing unless the user explicitly requests local database pre-push suites. The DB-less pre-push path and CI are the default.
 - When adding a new enum variant, grep ALL match sites for that enum and update them — CI uses exhaustive match checks
 - Dead code in `#[cfg(test)]` modules still triggers `-D warnings` in CI; delete unused test helpers instead of suppressing with `#[allow(dead_code)]`
 - Pre-commit hook (`.githooks/pre-commit`) runs fmt + staged-scope clippy as a fast commit gate. After cloning, activate with: `git config core.hooksPath .githooks`
@@ -31,7 +76,7 @@ Validation workflow:
 
 ## Architecture
 
-Harness is an agent orchestration layer. It constructs prompts and manages lifecycle — agents (Codex CLI) decide how to execute.
+Harness is an agent orchestration layer. It constructs prompts and manages lifecycle; the selected coding agent decides how to execute.
 
 - ZERO `Command::new("gh")` or `Command::new("git")` calls inside harness crates — all GitHub/git interaction must be in agent prompts only
 - When testing Harness product behavior for "fix issue X" or "handle PR Y", delegate to harness server (`POST /api/workflows/runtime/submissions`). For direct repository maintenance in this checkout, implement and verify the requested code change directly unless the user explicitly asks to exercise the Harness server flow.
@@ -43,12 +88,12 @@ These names overlap in everyday speech but mean different things in code. Use th
 | Term | Meaning | Location |
 |---|---|---|
 | **workflow runtime** | Orchestration layer that decides what should happen next; event-sourced state machine with a command outbox. | `crates/harness-workflow/src/runtime/` |
-| **agent runtime** (a.k.a. `CodeAgent` / `AgentAdapter`) | Agent abstraction; receives an `AgentRequest` and returns a stream or response. | `crates/harness-core/src/agent.rs`, `crates/harness-agents/src/` |
-| **`RuntimeKind`** | Label the workflow layer attaches to an agent type (`CodexExec` / `CodexJsonrpc` / `ClaudeCode` / `AnthropicApi` / `RemoteHost`). | `crates/harness-workflow/src/runtime/model.rs` |
+| **agent runtime** (a.k.a. `AgentBackend`) | Agent abstraction; receives an `AgentRequest` and returns a stream or response. `CodeAgent` and `AgentAdapter` are type aliases of `AgentBackend`, not separate traits. | `crates/harness-core/src/agent.rs`, `crates/harness-agents/src/` |
+| **`RuntimeKind`** | Label the workflow layer attaches to an agent implementation. Treat the enum definition as the source of truth; do not duplicate its variants in documentation. | `crates/harness-workflow/src/runtime/model.rs` |
 | **task** | Legacy execution unit; submissions are being migrated to flow through the workflow runtime instead. | `crates/harness-server/src/task_runner/` |
 | **runtime host** | Process instance that executes runtime jobs; can register remotely via `/api/runtime-hosts`. | `crates/harness-server/src/runtime_hosts.rs` |
 
-There is no type literally named `AgentRuntime` in the codebase. The phrase is used informally to mean "the agent runtime layer" (i.e. `CodeAgent` and `AgentAdapter` impls). Prefer the precise names above when writing code.
+There is no type literally named `AgentRuntime` in the codebase. The phrase is used informally to mean the agent runtime layer (implementations of `AgentBackend`). Prefer `AgentBackend` in new code. `CodeAgent` means the oneshot execute surface (CLI wrappers and HTTP backends such as `AnthropicApiAgent`); `AgentAdapter` means a per-turn protocol backend. Both names alias the same trait.
 
 ## Worktree Usage
 
@@ -58,19 +103,25 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 
 ## PR Workflow
 
-- After creating a PR, wait for Gemini code review bot before merging
-- If Gemini leaves review comments, address valid feedback before merge
-- If no comments or only false positives, proceed with merge
+- Before merging, every PR must receive a fresh-context review from an agent process that did not author the changes. Review output must be machine-parseable: direct reviews must put `APPROVED` on the last non-empty line when no blockers remain or prefix each blocking finding with `ISSUE:`; packaged review workflows may instead use their declared verdict field, such as `Assessment: APPROVE` or `Consensus: APPROVE`. Missing or unparseable output is not approval.
+- External review bots are optional advisors. Address valid feedback when it arrives, but bot silence, quota exhaustion, or service failure does not block a merge.
+- Address valid reviewer findings before merge. Record the reason for rejecting false positives in the handoff or on the PR when useful.
+- Merging requires a passing `CI Result` check and squash merge.
+- Do not change `Cargo.toml` versions in feature or fix PRs; version bumps happen during releases.
+- Resolve review threads once their feedback has been verified as addressed.
 
-## Codex Integration
+## Agent Integration (dual surface)
 
-| Surface | Implementation | Invocation |
-|---|---|---|
-| `CodeAgent` | `crates/harness-agents/src/codex.rs` | `codex exec`; the prompt is the final positional argument |
-| `AgentAdapter` | `crates/harness-agents/src/codex_adapter.rs` | `codex app-server` over stdio JSON-RPC |
+`crates/harness-agents/src/builder.rs` wires both surfaces into `AgentRegistry`. Do not treat either Codex path as dead code.
 
-- Keep changes scoped to the affected integration surface; they do not share the same CLI argument contract.
-- After modifying either surface, run `cargo test --package harness-agents`.
+| Surface | Trait name (alias) | Codex | Claude | OpenCode |
+|---|---|---|---|---|
+| Oneshot execute | `CodeAgent` | `codex.rs` via `codex exec`; prompt is the final positional argument | `claude.rs` via `claude -p <PROMPT> ...` | `opencode.rs` |
+| Per-turn protocol | `AgentAdapter` | `codex_adapter.rs` via `codex app-server` JSON-RPC, registered with `register_turn_backend_factory("codex", ...)` | none — `ClaudeAdapter` / `claude_adapter.rs` was removed (GH-1786); stream-json parsers live in `claude_stream_json.rs` | `opencode_adapter.rs` via `register_turn_backend_factory("opencode", ...)` |
+
+- The two surfaces do not share a CLI argument contract. Keep changes scoped to the affected implementation. `anthropic-api` is a oneshot HTTP `CodeAgent`, not a CLI wrapper.
+- After modifying a spawn path, run `cargo test --package harness-agents`.
+- Do not register a process-backed adapter as a singleton on `AgentRegistry` for concurrent turns. Attach a `register_turn_backend_factory` so each turn gets a fresh adapter.
 
 ## Server Operation
 
@@ -85,10 +136,10 @@ There is no type literally named `AgentRuntime` in the codebase. The phrase is u
 - Prefer standard library over new dependencies
 - Run `cargo audit` before adding security-sensitive crates
 
-## VibeGuard Overrides (Harness-specific, from GC Learn 2026-03-19)
+## VibeGuard Overrides
 
 - RS-03 exempt: `fn main()` scope, `Mutex::lock().unwrap()`, `RwLock::{read,write}().unwrap()`
 - RS-13: only flag functions returning `()` or `Result<()>` — typed returns are transformers, not action functions
-- U-16 exempt: `**/prompts.rs` → 1200-line limit, `**/dispatch.rs` → 1000-line limit
+- U-16 exempt: `crates/harness-core/src/prompts/parsing.rs` → 1100-line limit; `crates/harness-cli/src/commands.rs` → 1700-line limit. Remove an exemption after the file is split below the default limit.
 - L1 exempt: new files matching `src/**/{mod,lib,main}.rs` (standard Rust module files)
 - gh/git guard: AGENTS.md rule is semantic (agent prompts only); bash guard should not double-block `cargo test` subprocesses

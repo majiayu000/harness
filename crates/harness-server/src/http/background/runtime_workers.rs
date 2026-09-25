@@ -24,7 +24,7 @@ fn log_runtime_worker_tick_result(
         anyhow::Result<crate::workflow_runtime_worker::RuntimeJobWorkerTick>,
         tokio::task::JoinError,
     >,
-) {
+) -> Option<String> {
     match result {
         Ok(Ok(tick)) if tick.touched_anything() => {
             tracing::info!(
@@ -33,13 +33,16 @@ fn log_runtime_worker_tick_result(
                 cancelled = tick.cancelled,
                 "workflow runtime job worker tick complete"
             );
+            None
         }
-        Ok(Ok(_)) => {}
+        Ok(Ok(_)) => None,
         Ok(Err(e)) => {
             tracing::warn!("workflow runtime job worker tick failed: {e}");
+            Some(e.to_string())
         }
         Err(e) => {
             tracing::warn!("workflow runtime job worker task panicked: {e}");
+            Some(format!("workflow runtime job worker task failed: {e}"))
         }
     }
 }
@@ -47,10 +50,16 @@ fn log_runtime_worker_tick_result(
 type RuntimeWorkerJoinSet =
     tokio::task::JoinSet<anyhow::Result<crate::workflow_runtime_worker::RuntimeJobWorkerTick>>;
 
-pub(super) fn drain_finished_runtime_worker_ticks(workers: &mut RuntimeWorkerJoinSet) {
+pub(super) fn drain_finished_runtime_worker_ticks(
+    workers: &mut RuntimeWorkerJoinSet,
+) -> Option<String> {
+    let mut first_error = None;
     while let Some(result) = workers.try_join_next() {
-        log_runtime_worker_tick_result(result);
+        if let Some(error) = log_runtime_worker_tick_result(result) {
+            first_error.get_or_insert(error);
+        }
     }
+    first_error
 }
 
 pub(super) fn runtime_worker_open_slots(
@@ -161,6 +170,7 @@ pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
 
     let weak_state = Arc::downgrade(state);
     let mut shutdown_rx = state.notifications.ws_shutdown_tx.subscribe();
+    let handle = state.background_loops.register_loop("runtime_job_workers");
     tokio::spawn(async move {
         let mut workers = tokio::task::JoinSet::new();
         let active_worker_state_clones = Arc::new(AtomicUsize::new(0));
@@ -170,12 +180,10 @@ pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                 Some(state) => state,
                 None => break,
             };
-            let workflow_cfg = match load_runtime_workflow_config(
-                &state.core.project_root,
-                "workflow runtime job workers",
-            ) {
+            let workflow_cfg = match load_workflow_config_for_loop(&state, &handle).await {
                 Ok(config) => config,
-                Err(_) => {
+                Err(error) => {
+                    handle.tick_failed(&format!("workflow config load failed: {error}"));
                     drop(state);
                     if runtime_worker_sleep_or_shutdown(
                         std::time::Duration::from_secs(RUNTIME_WORKFLOW_CONFIG_RETRY_SECS),
@@ -192,7 +200,7 @@ pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
             let policy = runtime_worker_loop_policy(workflow_cfg.runtime_worker);
             let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
             let lease_ttl = runtime_worker_lease_ttl(&policy);
-            drain_finished_runtime_worker_ticks(&mut workers);
+            let worker_tick_error = drain_finished_runtime_worker_ticks(&mut workers);
             let worker_state_clones = active_worker_state_clones.load(Ordering::Acquire);
             if !runtime_worker_has_external_state_owner(
                 Arc::strong_count(&state),
@@ -215,9 +223,27 @@ pub(in crate::http) fn spawn_runtime_job_workers(state: &Arc<AppState>) {
                 &mut next_worker_id,
             );
             drop(state);
+            if let Some(error) = worker_tick_error {
+                handle.tick_failed(&error);
+            } else {
+                handle.tick_ok();
+            }
+            handle.set_interval(interval.as_secs());
             if runtime_worker_sleep_or_shutdown(interval, &mut shutdown_rx, &mut workers).await {
                 break;
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_worker_tick_is_returned_to_the_supervisor_health_signal() {
+        let error = log_runtime_worker_tick_result(Ok(Err(anyhow::anyhow!("worker failed"))));
+
+        assert_eq!(error.as_deref(), Some("worker failed"));
+    }
 }

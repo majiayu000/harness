@@ -1,15 +1,28 @@
 use super::model::{WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowInstance};
+use super::state_registry::{WorkflowDefinitionRegistry, WorkflowStateDefinition};
+use super::validator_binding::DecisionValidatorBinding;
 use super::validator_progress;
-use chrono::{DateTime, Utc};
-use std::collections::BTreeSet;
+#[cfg(test)]
+use chrono::Utc;
+use harness_core::claim_trust::ClaimTrustLevel;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+#[path = "validator_command_rules.rs"]
+mod command_rules;
+#[path = "validator_evidence.rs"]
+mod evidence_contract;
 #[path = "validator_github_issue_pr.rs"]
 mod github_issue_pr_validation;
+#[path = "validator_hidden_transitions.rs"]
+mod hidden_transitions;
 #[path = "validator_prompt_task.rs"]
 mod prompt_task_validation;
 #[path = "validator_context.rs"]
 mod validation_context;
+
+use command_rules::{is_replan_command, required_command_for_transition};
+pub use validation_context::ValidationContext;
 
 #[cfg(test)]
 #[path = "validator_tests.rs"]
@@ -22,6 +35,7 @@ pub struct TransitionRule {
     pub allowed_commands: BTreeSet<WorkflowCommandType>,
     pub required_command: Option<WorkflowCommandType>,
     pub required_evidence: BTreeSet<String>,
+    pub required_evidence_trust: BTreeMap<String, ClaimTrustLevel>,
     pub operator_recovery_only: bool,
 }
 
@@ -37,6 +51,7 @@ impl TransitionRule {
             allowed_commands: allowed_commands.into_iter().collect(),
             required_command: None,
             required_evidence: BTreeSet::new(),
+            required_evidence_trust: BTreeMap::new(),
             operator_recovery_only: false,
         }
     }
@@ -51,6 +66,7 @@ impl TransitionRule {
             allowed_commands: allowed_commands.into_iter().collect(),
             required_command: None,
             required_evidence: BTreeSet::new(),
+            required_evidence_trust: BTreeMap::new(),
             operator_recovery_only: false,
         }
     }
@@ -158,6 +174,7 @@ impl TransitionAllowlist {
                 [EnqueueActivity, StartChildWorkflow, Wait],
             )
             .allow("failed", "merging", [EnqueueActivity])
+            .allow("blocked", "planning", [EnqueueActivity, Wait])
             .allow("blocked", "implementing", [EnqueueActivity, Wait])
             .allow("blocked", "replanning", [EnqueueActivity, Wait])
             .allow("blocked", "local_review_gate", [EnqueueActivity, Wait])
@@ -172,8 +189,10 @@ impl TransitionAllowlist {
                 [EnqueueActivity, StartChildWorkflow, Wait],
             )
             .allow("blocked", "merging", [EnqueueActivity])
+            .allow("blocked", "done", [MarkDone])
             .allow("cancelled", "scheduled", [EnqueueActivity, Wait])
             .allow("cancelled", "planning", [EnqueueActivity, Wait])
+            .allow("cancelled", "local_review_gate", [EnqueueActivity])
             .allow("cancelled", "implementing", [EnqueueActivity, Wait])
             .allow("scheduled", "planning", [EnqueueActivity, Wait])
             .allow(
@@ -218,16 +237,29 @@ impl TransitionAllowlist {
             .allow("pr_open", "local_review_gate", [EnqueueActivity, Wait])
             .allow("pr_open", "awaiting_feedback", [Wait])
             .allow(
+                "awaiting_feedback",
+                "local_review_gate",
+                [EnqueueActivity, Wait],
+            )
+            .allow(
                 "local_review_gate",
                 "local_review_gate",
                 [EnqueueActivity, Wait],
             )
-            .allow("local_review_gate", "awaiting_feedback", [Wait])
+            .allow(
+                "local_review_gate",
+                "quality_gate_pending",
+                [StartChildWorkflow],
+            )
+            .allow("local_review_gate", "ready_to_merge", std::iter::empty())
+            .allow("ready_to_merge", "local_review_gate", [EnqueueActivity])
+            .allow("merging", "local_review_gate", [EnqueueActivity])
             .allow(
                 "local_review_gate",
                 "addressing_feedback",
                 [EnqueueActivity, MarkBlocked, Wait],
             )
+            .allow("local_review_gate", "done", [MarkDone])
             .allow("pr_open", "done", [MarkDone])
             .allow(
                 "awaiting_feedback",
@@ -270,6 +302,7 @@ impl TransitionAllowlist {
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
+            .with_github_issue_pr_evidence_contract()
     }
 
     pub fn quality_gate_defaults() -> Self {
@@ -288,6 +321,7 @@ impl TransitionAllowlist {
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
+            .with_quality_gate_evidence_contract()
     }
 
     pub fn pr_feedback_defaults() -> Self {
@@ -307,11 +341,12 @@ impl TransitionAllowlist {
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
+            .with_pr_feedback_evidence_contract()
     }
 
     pub fn prompt_task_defaults() -> Self {
         use WorkflowCommandType::{
-            EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
+            BindPr, EnqueueActivity, MarkBlocked, MarkCancelled, MarkDone, MarkFailed,
             RequestOperatorAttention, Wait,
         };
 
@@ -331,23 +366,22 @@ impl TransitionAllowlist {
             .allow("implementing", "implementing", [EnqueueActivity])
             .allow("blocked", "awaiting_dependencies", [Wait])
             .allow("blocked", "implementing", [EnqueueActivity, Wait])
-            .allow("implementing", "done", [MarkDone])
+            .allow("implementing", "done", [BindPr, MarkDone])
+            // A prompt task may mint Done only with structured self-declared
+            // evidence; the reducer resolves validation-report-or-no-change and
+            // mints this kind (GH-1817).
+            .require_evidence_with_trust(
+                "implementing",
+                "done",
+                [(
+                    super::model::EVIDENCE_PROMPT_COMPLETION,
+                    ClaimTrustLevel::SelfDeclared,
+                )],
+            )
             .allow_from_any("blocked", [MarkBlocked, RequestOperatorAttention, Wait])
             .allow_from_any("failed", [MarkFailed])
             .allow_from_any("cancelled", [MarkCancelled])
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct ValidationContext {
-    pub actor: String,
-    pub now: DateTime<Utc>,
-    pub resource_budget_available: bool,
-    pub replan_available: bool,
-    pub wait_available: bool,
-    pub allow_terminal_reopen: bool,
-    pub allow_missing_pinned_cancel: bool,
-    pub active_dedupe_keys: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +405,7 @@ pub enum WorkflowDecisionRejectionKind {
     ProgressDriverMissing,
     MissingTerminalEvidence,
     MissingRequiredEvidence,
+    InsufficientEvidenceTrust,
     OperatorRecoveryDenied,
 }
 
@@ -400,7 +435,9 @@ impl std::error::Error for WorkflowDecisionRejection {}
 #[derive(Debug, Clone)]
 pub struct DecisionValidator {
     allowlist: TransitionAllowlist,
+    states: Vec<WorkflowStateDefinition>,
     kind: DecisionValidatorKind,
+    binding: DecisionValidatorBinding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,48 +448,80 @@ enum DecisionValidatorKind {
 }
 
 impl DecisionValidator {
+    /// A validator over a bare allowlist, bound to no definition. The store
+    /// refuses such a validator; callers that persist transitions must build a
+    /// bound one instead.
     pub fn new(allowlist: TransitionAllowlist) -> Self {
         Self {
             allowlist,
+            states: Vec::new(),
             kind: DecisionValidatorKind::Generic,
+            binding: DecisionValidatorBinding::unbound(),
         }
     }
 
+    /// A validator bound to the exact declarative definition a pin resolved to.
+    pub fn for_declarative_definition(
+        definition_id: &str,
+        definition_version: u32,
+        definition_hash: &str,
+        allowlist: TransitionAllowlist,
+        states: Vec<WorkflowStateDefinition>,
+    ) -> Self {
+        let mut validator = Self::for_definition(definition_id, allowlist, states);
+        validator.binding = DecisionValidatorBinding::for_declarative(
+            definition_id,
+            definition_version,
+            definition_hash,
+        );
+        validator
+    }
+
+    /// The definition identity this validator was resolved from.
+    pub fn binding(&self) -> &DecisionValidatorBinding {
+        &self.binding
+    }
+
     pub fn github_issue_pr() -> Self {
-        super::state_registry::decision_validator_for_definition(
-            super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID,
-        )
-        .expect("built-in github_issue_pr workflow definition must be registered")
+        WorkflowDefinitionRegistry::with_builtins()
+            .decision_validator_for_definition(super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID)
+            .expect("built-in github_issue_pr workflow definition must be registered")
     }
 
     pub fn quality_gate() -> Self {
-        super::state_registry::decision_validator_for_definition(
-            super::quality_gate::QUALITY_GATE_DEFINITION_ID,
-        )
-        .expect("built-in quality_gate workflow definition must be registered")
+        WorkflowDefinitionRegistry::with_builtins()
+            .decision_validator_for_definition(super::quality_gate::QUALITY_GATE_DEFINITION_ID)
+            .expect("built-in quality_gate workflow definition must be registered")
     }
 
     pub fn pr_feedback() -> Self {
-        super::state_registry::decision_validator_for_definition(
-            super::pr_feedback::PR_FEEDBACK_DEFINITION_ID,
-        )
-        .expect("built-in pr_feedback workflow definition must be registered")
+        WorkflowDefinitionRegistry::with_builtins()
+            .decision_validator_for_definition(super::pr_feedback::PR_FEEDBACK_DEFINITION_ID)
+            .expect("built-in pr_feedback workflow definition must be registered")
     }
 
     pub fn prompt_task() -> Self {
-        super::state_registry::decision_validator_for_definition(
-            super::prompt_task::PROMPT_TASK_DEFINITION_ID,
-        )
-        .expect("built-in prompt_task workflow definition must be registered")
+        WorkflowDefinitionRegistry::with_builtins()
+            .decision_validator_for_definition(super::prompt_task::PROMPT_TASK_DEFINITION_ID)
+            .expect("built-in prompt_task workflow definition must be registered")
     }
 
-    pub(crate) fn for_definition(definition_id: &str, allowlist: TransitionAllowlist) -> Self {
+    pub(crate) fn for_definition(
+        definition_id: &str,
+        allowlist: TransitionAllowlist,
+        states: Vec<WorkflowStateDefinition>,
+    ) -> Self {
         let kind = match definition_id {
             super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID => DecisionValidatorKind::GithubIssuePr,
             super::prompt_task::PROMPT_TASK_DEFINITION_ID => DecisionValidatorKind::PromptTask,
             _ => DecisionValidatorKind::Generic,
         };
-        Self { allowlist, kind }
+        Self {
+            allowlist,
+            states,
+            kind,
+            binding: DecisionValidatorBinding::for_definition(definition_id),
+        }
     }
 
     pub fn validate(
@@ -481,7 +550,9 @@ impl DecisionValidator {
             ));
         }
 
-        if instance.is_terminal()
+        if self
+            .state_definition(&instance.state)
+            .is_some_and(|state| state.terminal_state.is_some())
             && decision.next_state != instance.state
             && !context.allow_terminal_reopen
         {
@@ -527,7 +598,12 @@ impl DecisionValidator {
             ));
         };
 
-        validator_progress::validate_declarative_transition_metadata(rule, decision, context)?;
+        // Rule metadata and required evidence are checked in that order with
+        // command structure in between (GH-1766). A decision that is both
+        // malformed and unproven must report the structural error: it is the
+        // actionable one, and reporting `MissingRequiredEvidence` first masks
+        // it. Both still block.
+        validator_progress::validate_declarative_transition_rule_metadata(rule, decision, context)?;
 
         if self.kind == DecisionValidatorKind::PromptTask
             && decision.observed_state == "implementing"
@@ -536,7 +612,9 @@ impl DecisionValidator {
             prompt_task_validation::validate_decision(decision)?;
         }
         self.validate_commands(rule, decision, context)?;
+        validator_progress::validate_required_evidence(rule, decision)?;
         validator_progress::validate_target_progress_contract_with_override(
+            self.state_definition(&decision.next_state),
             instance,
             decision,
             context.allow_missing_pinned_cancel,
@@ -549,6 +627,12 @@ impl DecisionValidator {
         from_state: &'a str,
     ) -> impl Iterator<Item = &'a TransitionRule> + 'a {
         self.allowlist.rules_from(from_state)
+    }
+
+    pub(super) fn state_definition(&self, state: &str) -> Option<&WorkflowStateDefinition> {
+        self.states
+            .iter()
+            .find(|definition| definition.key.state.as_ref() == state)
     }
 
     fn validate_commands(
@@ -646,29 +730,6 @@ impl DecisionValidator {
         Ok(())
     }
 
-    fn validate_hidden_workflow_transition(
-        &self,
-        instance: &WorkflowInstance,
-        decision: &WorkflowDecision,
-        context: &ValidationContext,
-    ) -> Result<bool, WorkflowDecisionRejection> {
-        if self.kind != DecisionValidatorKind::GithubIssuePr
-            || !github_issue_pr_validation::is_reconciliation_only_done_transition(decision)
-        {
-            return Ok(false);
-        }
-
-        let rule = TransitionRule::new(
-            decision.observed_state.as_str(),
-            "done",
-            [WorkflowCommandType::MarkDone],
-        );
-        self.validate_commands(&rule, decision, context)?;
-        validator_progress::validate_target_progress_contract(instance, decision)?;
-        github_issue_pr_validation::validate_reconciliation_only_done(decision, context)?;
-        Ok(true)
-    }
-
     fn validate_command_payload(
         &self,
         command: &WorkflowCommand,
@@ -701,62 +762,5 @@ impl DecisionValidator {
         }
 
         Ok(())
-    }
-
-    fn validate_dedupe(
-        &self,
-        command: &WorkflowCommand,
-        seen_dedupe_keys: &mut BTreeSet<String>,
-        context: &ValidationContext,
-    ) -> Result<(), WorkflowDecisionRejection> {
-        if command.dedupe_key.trim().is_empty() {
-            return Err(WorkflowDecisionRejection::new(
-                WorkflowDecisionRejectionKind::MissingDedupeKey,
-                "workflow commands must include a non-empty dedupe key",
-            ));
-        }
-
-        if !seen_dedupe_keys.insert(command.dedupe_key.clone()) {
-            return Err(WorkflowDecisionRejection::new(
-                WorkflowDecisionRejectionKind::DuplicateCommandDedupeKey,
-                format!(
-                    "decision contains duplicate command dedupe key '{}'",
-                    command.dedupe_key
-                ),
-            ));
-        }
-
-        if context.active_dedupe_keys.contains(&command.dedupe_key) {
-            return Err(WorkflowDecisionRejection::new(
-                WorkflowDecisionRejectionKind::ActiveDuplicateCommand,
-                format!(
-                    "an active command already owns dedupe key '{}'",
-                    command.dedupe_key
-                ),
-            ));
-        }
-
-        Ok(())
-    }
-}
-
-fn is_replan_command(command: &WorkflowCommand) -> bool {
-    command.activity_name() == Some("replan_issue")
-}
-
-fn required_command_for_transition(
-    from_state: &str,
-    to_state: &str,
-) -> Option<WorkflowCommandType> {
-    match (from_state, to_state) {
-        (from_state, "pr_open") if from_state != "pr_open" => Some(WorkflowCommandType::BindPr),
-        ("idle", "scanning") => Some(WorkflowCommandType::EnqueueActivity),
-        ("scanning", "planning_batch") => Some(WorkflowCommandType::EnqueueActivity),
-        ("planning_batch", "dispatching") => Some(WorkflowCommandType::StartChildWorkflow),
-        (_, "done") => Some(WorkflowCommandType::MarkDone),
-        (_, "blocked") => Some(WorkflowCommandType::MarkBlocked),
-        (_, "failed") => Some(WorkflowCommandType::MarkFailed),
-        (_, "cancelled") => Some(WorkflowCommandType::MarkCancelled),
-        _ => None,
     }
 }

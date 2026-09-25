@@ -177,3 +177,30 @@ async fn operation_lock_unknown_host_churn_does_not_accumulate_entries() {
     }
     assert_eq!(manager.operation_lock_count(), 0);
 }
+
+#[tokio::test]
+async fn runtime_job_lock_blocks_only_the_same_job() {
+    let manager = RuntimeHostManager::with_heartbeat_timeout(60);
+    let first_job = manager.lock_runtime_job_operation("job-a").await;
+
+    // Heartbeat and deregistration use the host lock, while an unrelated
+    // renewal uses a different job lock; neither may wait behind verification.
+    let host_operation = manager.lock_operation("host-a").await;
+    let other_job = manager.lock_runtime_job_operation("job-b").await;
+    let mut same_job = Box::pin(manager.lock_runtime_job_operation("job-a"));
+    poll_fn(|context| match same_job.as_mut().poll(context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("same-job operation acquired the held completion lock"),
+    })
+    .await;
+
+    assert_eq!(manager.operation_lock_count(), 1);
+    assert_eq!(manager.runtime_job_operation_lock_count(), 2);
+    drop(host_operation);
+    drop(other_job);
+    drop(first_job);
+    let resumed_same_job = same_job.await;
+    drop(resumed_same_job);
+    assert_eq!(manager.operation_lock_count(), 0);
+    assert_eq!(manager.runtime_job_operation_lock_count(), 0);
+}

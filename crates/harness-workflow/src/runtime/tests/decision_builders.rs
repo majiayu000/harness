@@ -526,6 +526,9 @@ fn pr_feedback_sweep_decision_starts_child_workflow() {
             pr_url: Some("https://github.com/owner/repo/pull/77"),
             issue_number: Some(123),
             repo: Some("owner/repo"),
+            expected_base_ref: Some("release"),
+            remote_fact_hash: Some("sha256:pr-fact"),
+            remote_fact_activity_at: Some("2026-06-10T00:00:00Z"),
             summary: "Runtime workflow requested a PR feedback sweep.",
         },
     );
@@ -546,7 +549,19 @@ fn pr_feedback_sweep_decision_starts_child_workflow() {
         output.decision.commands[0].command["child_activity"],
         PR_FEEDBACK_INSPECT_ACTIVITY
     );
+    assert_eq!(
+        output.decision.commands[0].command["expected_base_ref"],
+        "release"
+    );
     assert_eq!(output.decision.commands[0].command["pr_number"], 77);
+    assert_eq!(
+        output.decision.commands[0].command["remote_fact_hash"],
+        "sha256:pr-fact"
+    );
+    assert_eq!(
+        output.decision.commands[0].command["remote_fact_activity_at"],
+        "2026-06-10T00:00:00Z"
+    );
     DecisionValidator::github_issue_pr()
         .validate(
             &instance,
@@ -554,6 +569,33 @@ fn pr_feedback_sweep_decision_starts_child_workflow() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("PR feedback sweep decision should validate");
+}
+
+#[test]
+fn local_review_request_can_restart_from_waiting_for_remote_feedback() {
+    let instance = issue_instance("awaiting_feedback");
+    let output = build_local_review_request_decision(
+        &instance,
+        LocalReviewDecisionInput {
+            dedupe_key: "local-review:123:77",
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            issue_number: Some(123),
+            repo: Some("owner/repo"),
+            summary: "Runtime workflow requested local review before remote feedback.",
+        },
+    );
+
+    assert_eq!(output.action, PrFeedbackWorkflowAction::RequestLocalReview);
+    assert_eq!(output.decision.decision, "run_local_review");
+    assert_eq!(output.decision.next_state, "local_review_gate");
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &output.decision,
+            &ValidationContext::new("workflow-policy", Utc::now()),
+        )
+        .expect("waiting PR feedback workflows may re-enter local review");
 }
 
 #[test]

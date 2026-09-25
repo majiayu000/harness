@@ -1,4 +1,112 @@
 use super::*;
+use crate::runtime::AgentContractAttemptReservation;
+
+#[tokio::test]
+async fn agent_contract_attempt_reservation_rejects_a_reclaimed_lease() -> anyhow::Result<()> {
+    if harness_core::db::resolve_test_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow = issue_instance("implementing").with_id("contract-stale-lease");
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "contract-stale-lease-command",
+        json!({
+            "activity": "implement_issue",
+            "agent_contract": {
+                "input_schema": "harness.semantic_activity_input.v1",
+                "output_schema": "harness.semantic_verdict.v1",
+                "allowed_outcomes": ["small", "large"],
+                "tools": "none",
+                "mutation": "forbidden",
+                "workspace": "ephemeral_empty",
+                "fresh_context": true,
+                "max_primary_attempts": 1,
+                "max_corrections": 1
+            }
+        }),
+    );
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    let job = store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexExec,
+            "codex-contract",
+            json!({"activity": "implement_issue", "command": command.command}),
+        )
+        .await?;
+    let first_expiry = Utc::now() + chrono::Duration::minutes(5);
+    let first = store
+        .claim_next_runtime_job_excluding_runtime_kind(
+            RuntimeKind::RemoteHost,
+            "first-worker",
+            first_expiry,
+        )
+        .await?
+        .expect("job should be claimed");
+    assert_eq!(
+        store
+            .reserve_agent_contract_attempt(&first, Some(2), 1, 0)
+            .await?,
+        AgentContractAttemptReservation::Reserved
+    );
+    store
+        .extend_runtime_job_lease_if_owned(
+            &job.id,
+            "first-worker",
+            first_expiry,
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await?
+        .expect("lease should expire");
+    let second = store
+        .claim_next_runtime_job_excluding_runtime_kind(
+            RuntimeKind::RemoteHost,
+            "second-worker",
+            Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await?
+        .expect("job should be reclaimed");
+    assert!(second.lease_generation > first.lease_generation);
+    assert_eq!(
+        store
+            .reserve_agent_contract_attempt(&first, Some(2), 1, 1)
+            .await?,
+        AgentContractAttemptReservation::StaleLease
+    );
+    Ok(())
+}
+
+#[rustfmt::skip]
+#[tokio::test]
+async fn runtime_turn_reservation_is_atomic_and_replay_safe() -> anyhow::Result<()> {
+    if harness_core::db::resolve_test_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow_id = "turn-reservation";
+    store.force_upsert_lifecycle_state_for_test(&issue_instance("implementing").with_id(workflow_id)).await?;
+    let mut jobs = Vec::new();
+    for key in ["a", "b"] {
+        jobs.push(enqueue_workflow_runtime_job(&store, workflow_id, key, RuntimeKind::CodexJsonrpc, "codex-default", json!({"activity": "implement_issue"}), None).await?);
+    }
+    store.record_runtime_event(&jobs[0].id, "RuntimeTurnStarted", json!({"owner": "initial"})).await?;
+    let first = store.reserve_runtime_turn_started_for_workflow(workflow_id, &jobs[0].id, 2, json!({"reservation_key": "retry-0"})).await?;
+    let replay = store.reserve_runtime_turn_started_for_workflow(workflow_id, &jobs[0].id, 2, json!({"reservation_key": "retry-0"})).await?;
+    assert_eq!(first.as_ref().map(|event| &event.id), replay.as_ref().map(|event| &event.id));
+    let left = store.reserve_runtime_turn_started_for_workflow(workflow_id, &jobs[0].id, 3, json!({"reservation_key": "retry-race-1"}));
+    let right = store.reserve_runtime_turn_started_for_workflow(workflow_id, &jobs[1].id, 3, json!({"reservation_key": "retry-race-2"}));
+    let (left, right) = tokio::join!(left, right);
+    let granted = [left?, right?].into_iter().filter(Option::is_some).count();
+    assert_eq!(granted, 1);
+    assert_eq!(store.runtime_turns_started_for_workflow(workflow_id, None).await?, 3);
+    Ok(())
+}
 
 #[tokio::test]
 async fn runtime_jobs_accept_typed_status_values() -> anyhow::Result<()> {
@@ -57,7 +165,9 @@ async fn runtime_graph_rejects_orphan_references() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = issue_instance("implementing").with_id("fk-workflow");
-    store.upsert_instance(&workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
     let command = WorkflowCommand::enqueue_activity("fk_activity", "fk-command");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     let runtime_job = store
@@ -204,6 +314,28 @@ async fn runtime_graph_rejects_orphan_references() -> anyhow::Result<()> {
     .expect_err("workflow artifact without a runtime job should be rejected");
     assert_constraint_error(error, "workflow_artifacts_runtime_job_id_fkey");
 
+    let inserted = sqlx::query(
+        "INSERT INTO workflow_run_evidence
+            (id, workflow_id, runtime_job_id, project_id, stack, suite, decision,
+             evidence_schema, digest, trust, location, retention_class)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)",
+    )
+    .bind("retained-evidence-links")
+    .bind("missing-workflow")
+    .bind("missing-runtime-job")
+    .bind("/project")
+    .bind("codex-default")
+    .bind("acceptance")
+    .bind("accepted")
+    .bind("harness.test.evidence.v1")
+    .bind("sha256:abc")
+    .bind("agent")
+    .bind("{}")
+    .bind("short")
+    .execute(store.pool())
+    .await?;
+    assert_eq!(inserted.rows_affected(), 1);
+
     store
         .record_runtime_event(
             &runtime_job.id,
@@ -225,12 +357,14 @@ async fn insert_instance_if_absent_does_not_overwrite_existing_workflow() -> any
     let workflow_id = "insert-if-absent-existing-workflow";
     let existing = issue_instance("implementing")
         .with_id(workflow_id)
-        .with_data(json!({"marker": "real"}));
-    store.upsert_instance(&existing).await?;
+        .with_server_data(json!({"marker": "real"}));
+    store
+        .force_upsert_lifecycle_state_for_test(&existing)
+        .await?;
 
-    let fallback = issue_instance("failed")
+    let fallback = issue_instance("discovered")
         .with_id(workflow_id)
-        .with_data(json!({"marker": "fallback"}));
+        .with_server_data(json!({"marker": "fallback"}));
     let inserted = store.insert_instance_if_absent(&fallback).await?;
 
     assert!(!inserted);
@@ -240,7 +374,7 @@ async fn insert_instance_if_absent_does_not_overwrite_existing_workflow() -> any
     assert_eq!(persisted.state, "implementing");
     assert_eq!(persisted.data["marker"], "real");
 
-    let new_workflow = issue_instance("failed").with_id("insert-if-absent-new-workflow");
+    let new_workflow = issue_instance("discovered").with_id("insert-if-absent-new-workflow");
     assert!(store.insert_instance_if_absent(&new_workflow).await?);
     Ok(())
 }
@@ -452,14 +586,22 @@ async fn nonterminal_listing_uses_definition_specific_terminal_states() -> anyho
     let issue_done = project_issue_instance("/project-a", 224, "done");
     let quality_checking = quality_gate_instance("checking")
         .with_id("/project-a::quality:checking")
-        .with_data(json!({ "project_id": "/project-a" }));
+        .with_server_data(json!({ "project_id": "/project-a" }));
     let quality_passed = quality_gate_instance("passed")
         .with_id("/project-a::quality:passed")
-        .with_data(json!({ "project_id": "/project-a" }));
-    store.upsert_instance(&issue_passed).await?;
-    store.upsert_instance(&issue_done).await?;
-    store.upsert_instance(&quality_checking).await?;
-    store.upsert_instance(&quality_passed).await?;
+        .with_server_data(json!({ "project_id": "/project-a" }));
+    store
+        .force_upsert_lifecycle_state_for_test(&issue_passed)
+        .await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&issue_done)
+        .await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&quality_checking)
+        .await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&quality_passed)
+        .await?;
 
     let issue_ids: std::collections::HashSet<_> = store
         .list_nonterminal_instances_by_definition(
@@ -502,7 +644,9 @@ async fn aged_wait_listing_filters_by_age_and_terminal_state() -> anyhow::Result
     let fresh_blocked = project_issue_instance("/project-a", 303, "blocked");
     let old_done = project_issue_instance("/project-a", 304, "done");
     for instance in [&old_blocked, &old_feedback, &fresh_blocked, &old_done] {
-        store.upsert_instance(instance).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(instance)
+            .await?;
     }
     sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = ANY($1::text[])")
         .bind(vec![
@@ -533,6 +677,42 @@ async fn aged_wait_listing_filters_by_age_and_terminal_state() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn list_instances_by_parent_uses_store_updated_at() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let parent = project_issue_instance("/project-a", 305, "awaiting_feedback");
+    let mut child = quality_gate_instance("checking")
+        .with_id("parent-row-timestamp-child")
+        .with_parent(&parent.id);
+    child.updated_at = Utc::now() - Duration::days(7);
+    store.force_upsert_lifecycle_state_for_test(&parent).await?;
+    store.force_upsert_lifecycle_state_for_test(&child).await?;
+
+    let row_updated_at =
+        DateTime::parse_from_rfc3339("2026-07-30T15:50:07.844135Z")?.with_timezone(&Utc);
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = $1")
+        .bind(&child.id)
+        .bind(row_updated_at)
+        .execute(store.pool())
+        .await?;
+
+    let loaded = store
+        .list_instances_by_parent(&parent.id, None)
+        .await?
+        .into_iter()
+        .find(|instance| instance.id == child.id)
+        .expect("child should be listed by parent");
+
+    assert_eq!(loaded.updated_at, row_updated_at);
+    assert_ne!(loaded.updated_at, child.updated_at);
+    Ok(())
+}
+
+#[tokio::test]
 async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
@@ -540,7 +720,7 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let terminal_parent = project_issue_instance("/project-a", 401, "done");
+    let mut terminal_parent = project_issue_instance("/project-a", 401, "implementing");
     let terminal_child = quality_gate_instance("passed")
         .with_id("terminal-family-child")
         .with_parent(&terminal_parent.id);
@@ -548,13 +728,10 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
     let active_child = quality_gate_instance("checking")
         .with_id("active-family-child")
         .with_parent(&active_parent.id);
-    for instance in [
-        &terminal_parent,
-        &terminal_child,
-        &active_parent,
-        &active_child,
-    ] {
-        store.upsert_instance(instance).await?;
+    for instance in [&terminal_parent, &active_parent, &active_child] {
+        store
+            .force_upsert_lifecycle_state_for_test(instance)
+            .await?;
     }
     store
         .append_event(&terminal_parent.id, "TerminalEvent", "test", json!({}))
@@ -576,6 +753,13 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
         .await?;
     store
         .record_runtime_event(&runtime_job.id, "RuntimePromptPrepared", json!({}))
+        .await?;
+    terminal_parent.state = "done".to_string();
+    store
+        .force_upsert_lifecycle_state_for_test(&terminal_parent)
+        .await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&terminal_child)
         .await?;
     sqlx::query(
         "INSERT INTO workflow_artifacts (id, workflow_id, runtime_job_id, artifact_type, data)
@@ -617,6 +801,55 @@ async fn retention_prunes_only_terminal_workflow_families() -> anyhow::Result<()
     Ok(())
 }
 
+#[tokio::test]
+async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let terminal_a = project_issue_instance("/project-a", 501, "done");
+    let terminal_b = project_issue_instance("/project-a", 502, "done");
+    let active = project_issue_instance("/project-a", 503, "done");
+    let active_child = quality_gate_instance("checking")
+        .with_id("active-family-child-503")
+        .with_parent(&active.id);
+    for instance in [&terminal_a, &terminal_b, &active, &active_child] {
+        store
+            .force_upsert_lifecycle_state_for_test(instance)
+            .await?;
+    }
+    sqlx::query("UPDATE workflow_instances SET updated_at = $2 WHERE id = ANY($1::text[])")
+        .bind(vec![
+            terminal_a.id.clone(),
+            terminal_b.id.clone(),
+            active.id.clone(),
+            active_child.id.clone(),
+        ])
+        .bind(Utc::now() - Duration::days(45))
+        .execute(store.pool())
+        .await?;
+
+    let cutoff = Utc::now() - Duration::days(30);
+    assert_eq!(
+        store.count_terminal_history_candidates(cutoff, 100).await?,
+        2
+    );
+    assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
+
+    let summary = store.prune_terminal_runtime_history(cutoff, 1).await?;
+    assert_eq!(summary.workflow_instances_deleted, 1);
+    assert_eq!(
+        store.count_terminal_history_candidates(cutoff, 100).await?,
+        1
+    );
+    assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
+    assert!(store.get_instance(&terminal_a.id).await?.is_none());
+    assert!(store.get_instance(&active.id).await?.is_some());
+    Ok(())
+}
+
 include!("runtime_store_support.rs");
 
 #[tokio::test]
@@ -628,7 +861,9 @@ async fn dedupe_uses_runtime_job_timestamps_not_uuid_order() -> anyhow::Result<(
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = project_issue_instance("/project-a", 123, "replanning");
-    store.upsert_instance(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let command = WorkflowCommand::enqueue_activity("replan_issue", "issue-123-replan-latest");
     let command_id = store.enqueue_command(&instance.id, None, &command).await?;
     let older = store
@@ -684,5 +919,180 @@ async fn dedupe_uses_runtime_job_timestamps_not_uuid_order() -> anyhow::Result<(
         RuntimeJobEnqueueOutcome::AlreadyExists(job) => assert_eq!(job.id, newer.id),
         other => panic!("unexpected latest-job dedupe outcome: {other:?}"),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_expired_completion_is_recorded_to_dead_letter() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let job = enqueue_test_runtime_job(
+        &store,
+        "command-dlq",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "check" }),
+    )
+    .await?;
+
+    let first_claim = store
+        .claim_next_runtime_job("worker-a", Utc::now() + Duration::minutes(5))
+        .await?
+        .expect("runtime job should be claimable");
+    let first_lease_expires_at = first_claim
+        .lease
+        .as_ref()
+        .expect("lease should exist")
+        .expires_at;
+
+    let result = ActivityResult::succeeded("check", "Completed work from a stale lease.");
+    store
+        .record_lease_expired_completion(
+            &first_claim.id,
+            "worker-a",
+            first_claim.lease_generation,
+            first_lease_expires_at,
+            &result,
+            None,
+        )
+        .await?;
+
+    let (dlq_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&first_claim.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        dlq_count, 1,
+        "lease-expired completion must be durable in the DLQ"
+    );
+
+    let (result_payload, applied): (serde_json::Value, bool) = sqlx::query_as(
+        "SELECT result, applied FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&first_claim.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        result_payload["summary"],
+        "Completed work from a stale lease."
+    );
+    assert!(!applied, "DLQ record must start unapplied");
+
+    let (event_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_events
+         WHERE runtime_job_id = $1 AND event_type = 'LeaseExpiredCompletionRecorded'",
+    )
+    .bind(&first_claim.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        event_count, 1,
+        "DLQ recording must be surfaced as a runtime event"
+    );
+
+    let job_now = store.get_runtime_job(&job.id).await?.expect("job exists");
+    assert_eq!(
+        job_now.status,
+        RuntimeJobStatus::Running,
+        "job must remain reclaimable"
+    );
+
+    // A later re-expiry of the same job must not duplicate the DLQ record.
+    store
+        .record_lease_expired_completion(
+            &first_claim.id,
+            "worker-a",
+            first_claim.lease_generation,
+            first_lease_expires_at,
+            &result,
+            None,
+        )
+        .await?;
+    let (dlq_count_after,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&first_claim.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(dlq_count_after, 1, "DLQ must keep one record per job");
+    Ok(())
+}
+
+#[tokio::test]
+async fn lease_expired_completion_persists_transcript_payload() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let workflow =
+        crate::runtime::tests::issue_instance("implementing").with_id("dlq-transcript-workflow");
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
+    let command = WorkflowCommand::enqueue_activity("implement_issue", "command-dlq-transcript");
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+    store
+        .enqueue_runtime_job(
+            &command_id,
+            RuntimeKind::CodexExec,
+            "codex-default",
+            json!({
+                "workflow_id": workflow.id,
+                "activity": "implement_issue",
+                "command": {"activity": "implement_issue"},
+            }),
+        )
+        .await?;
+    let lease_expires_at = Utc::now() + Duration::minutes(5);
+    let claimed = store
+        .claim_next_runtime_job("worker-a", lease_expires_at)
+        .await?
+        .expect("runtime job should be claimable");
+
+    let result = ActivityResult::succeeded("implement_issue", "opened pull request").with_artifact(
+        ActivityArtifact::new(
+            crate::runtime::transcript::RUNTIME_TRANSCRIPT_SOURCE_ARTIFACT,
+            json!({
+                "content": "{\"messages\":[]}",
+                "content_format": "harness.turn.v1+json",
+                "turn_id": "dlq-turn-1",
+            }),
+        ),
+    );
+    let (result, pending) =
+        crate::runtime::transcript::prepare_runtime_transcript(&claimed, result)?;
+
+    store
+        .record_lease_expired_completion(
+            &claimed.id,
+            "worker-a",
+            claimed.lease_generation,
+            lease_expires_at,
+            &result,
+            pending.as_ref(),
+        )
+        .await?;
+
+    let (transcript_json,): (Option<serde_json::Value>,) = sqlx::query_as(
+        "SELECT transcript FROM runtime_job_completions_dlq WHERE runtime_job_id = $1",
+    )
+    .bind(&claimed.id)
+    .fetch_one(store.pool())
+    .await?;
+    let transcript = transcript_json.expect("transcript must be persisted in the DLQ");
+    assert_eq!(transcript["schema"], "harness.runtime.transcript.v1");
+    assert_eq!(
+        transcript["reference"]["producer_runtime_job_id"],
+        claimed.id
+    );
+    assert_eq!(transcript["workflow_id"], "dlq-transcript-workflow");
     Ok(())
 }

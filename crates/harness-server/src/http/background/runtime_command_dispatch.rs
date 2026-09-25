@@ -41,12 +41,19 @@ pub(in crate::http) async fn run_runtime_command_dispatch_tick(
     let prompt_release =
         crate::workflow_runtime_submission::release_ready_prompt_dependencies(store, batch_limit)
             .await?;
-    if release.released > 0 || release.failed > 0 || release.skipped > 0 {
+    if release.deadlocked > 0 {
+        tracing::warn!(
+            deadlocked = release.deadlocked,
+            "issue dependency cycles detected and failed with evidence"
+        );
+    }
+    if release.released > 0 || release.failed > 0 || release.skipped > 0 || release.deadlocked > 0 {
         tracing::info!(
             released = release.released,
             failed = release.failed,
             waiting = release.waiting,
             skipped = release.skipped,
+            deadlocked = release.deadlocked,
             "workflow runtime dependency release tick complete"
         );
     }
@@ -91,6 +98,43 @@ async fn dispatch_runtime_command_with_project_policy(
     fallback_profile_selector: RuntimeProfileSelector,
     dispatch_owner: &str,
 ) -> anyhow::Result<CommandDispatchOutcome> {
+    let has_agent_contract =
+        match crate::workflow_runtime_worker::validate_pinned_agent_contract_command(
+            store, &command,
+        )
+        .await
+        {
+            Ok(has_agent_contract) => has_agent_contract,
+            Err(error) => {
+                let reason = format!("invalid pinned agent_contract: {error}");
+                let result = harness_workflow::runtime::ActivityResult::failed(
+                    command.command.runtime_activity_key(),
+                    "Pinned agent contract failed dispatch validation.",
+                    &reason,
+                )
+                .with_error_kind(harness_workflow::runtime::ActivityErrorKind::Fatal);
+                let failed = store
+                    .fail_claimed_command_with_completion_if_owned(
+                        &command.id,
+                        harness_workflow::runtime::DispatchClaim {
+                            owner: dispatch_owner,
+                            generation: command.dispatch_claim_generation,
+                        },
+                        &result,
+                    )
+                    .await?;
+                return Ok(CommandDispatchOutcome::Skipped {
+                    command_id: command.id,
+                    reason: if failed {
+                        reason
+                    } else {
+                        "dispatch claim became stale before invalid agent_contract failure"
+                            .to_string()
+                    },
+                });
+            }
+        };
+
     if !command.command.requires_runtime_job() {
         return RuntimeCommandDispatcher::with_profile_selector(store, fallback_profile_selector)
             .with_dispatcher_id(dispatch_owner)
@@ -157,19 +201,21 @@ async fn dispatch_runtime_command_with_project_policy(
     let repo = command_repo_hint(store, &command).await?;
     let activity = command.command.runtime_activity_key().to_string();
     let dispatch_gate_fact_hash = command_dispatch_gate_fact_hash(&command);
-    let outcome = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
+    let workflow_cfg =
+        load_runtime_workflow_config(&project_root, "workflow runtime command dispatcher")?;
+    let mut dispatcher = RuntimeCommandDispatcher::with_profile_selector(store, profile_selector)
         .with_isolation_config(isolation_config)
         .with_isolation_availability(state.isolation_availability.clone())
         .with_dispatcher_id(dispatch_owner)
-        .with_defer_backoff(dispatch_backoff(
-            &load_runtime_workflow_config(
-                &project_root,
-                "workflow runtime command dispatcher backoff",
-            )?
-            .runtime_dispatch,
-        )?)
-        .dispatch_command(command)
-        .await?;
+        .with_defer_backoff(dispatch_backoff(&workflow_cfg.runtime_dispatch)?)
+        .with_budget_policy(workflow_cfg.runtime_budget_policy);
+    let effective_profile = dispatcher.effective_profile_for_command(&command).await?;
+    if let Some(profile) =
+        enforceable_agent_contract_profile(state, has_agent_contract, &effective_profile)
+    {
+        dispatcher = dispatcher.with_enforceable_agent_contract_profile(profile);
+    }
+    let outcome = dispatcher.dispatch_command(command).await?;
     record_runtime_agent_dispatch_counter(
         state,
         repo.as_deref(),
@@ -178,6 +224,30 @@ async fn dispatch_runtime_command_with_project_policy(
         dispatch_gate_fact_hash.as_deref(),
     );
     Ok(outcome)
+}
+
+fn enforceable_agent_contract_profile(
+    state: &AppState,
+    has_agent_contract: bool,
+    profile: &harness_workflow::runtime::RuntimeProfile,
+) -> Option<harness_workflow::runtime::RuntimeProfile> {
+    if !has_agent_contract {
+        return None;
+    }
+    if profile.timeout_secs.is_none_or(|timeout| timeout == 0) {
+        return None;
+    }
+    let backend = crate::workflow_runtime_worker::agent_backend_for_runtime_kind(
+        &state.core.server.agent_registry,
+        profile.kind,
+    )
+    .ok()?;
+    if crate::workflow_runtime_worker::ensure_backend_can_enforce_contract(backend.as_ref())
+        .is_err()
+    {
+        return None;
+    }
+    Some(profile.clone())
 }
 
 async fn runtime_isolation_config_for_command(
@@ -484,6 +554,44 @@ fn expand_home_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Pool starvation probe (GH-1895): after N consecutive empty dispatcher
+/// ticks, decide between "no work exists" (idle, log only) and "work exists
+/// but is gated" (starvation: warn and raise `runtime_pool_starved` through
+/// the GH-1582 alerting channel).
+async fn probe_pool_starvation(state: &Arc<AppState>, empty_ticks: u32) {
+    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
+        return;
+    };
+    let snapshot = match store.dispatch_pool_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!("pool starvation probe could not read the dispatch pool: {error}");
+            return;
+        }
+    };
+    if !snapshot.has_gated_work() {
+        tracing::debug!(
+            empty_ticks,
+            "runtime pool has no dispatchable and no gated work (idle)"
+        );
+        return;
+    }
+    tracing::warn!(
+        empty_ticks,
+        deferred_commands = snapshot.deferred_commands,
+        gated_workflows = snapshot.gated_workflows,
+        pending_commands = snapshot.pending_commands,
+        "runtime pool starved: work exists but nothing has dispatched"
+    );
+    state
+        .observability
+        .alerts
+        .raise(crate::alerting::producers::runtime_pool_starved(
+            empty_ticks,
+            &snapshot,
+        ));
+}
+
 pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
     if state.core.workflow_runtime_store.is_none() {
         tracing::debug!("workflow runtime command dispatcher disabled: store unavailable");
@@ -491,18 +599,22 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
     }
 
     let weak_state = Arc::downgrade(state);
+    let mut starvation = crate::alerting::producers::PoolStarvationTracker::new(
+        state.core.server.config.alerting.pool_starvation_ticks,
+    );
+    let handle = state
+        .background_loops
+        .register_loop("runtime_command_dispatch");
     tokio::spawn(async move {
         loop {
             let state = match weak_state.upgrade() {
                 Some(state) => state,
                 None => break,
             };
-            let workflow_cfg = match load_runtime_workflow_config(
-                &state.core.project_root,
-                "workflow runtime command dispatcher",
-            ) {
+            let workflow_cfg = match load_workflow_config_for_loop(&state, &handle).await {
                 Ok(config) => config,
-                Err(_) => {
+                Err(error) => {
+                    handle.tick_failed(&format!("workflow config load failed: {error}"));
                     tokio::time::sleep(std::time::Duration::from_secs(
                         RUNTIME_WORKFLOW_CONFIG_RETRY_SECS,
                     ))
@@ -512,6 +624,7 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
             };
             let policy = workflow_cfg.runtime_dispatch;
             let interval = std::time::Duration::from_secs(policy.interval_secs.max(1));
+            handle.set_interval(interval.as_secs());
             let inherited_profile = match runtime_default_profile_for_project(
                 &state,
                 &state.core.project_root,
@@ -524,6 +637,9 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
                     tracing::warn!(
                             "workflow runtime command dispatcher could not resolve default runtime profile: {error}"
                         );
+                    handle.tick_failed(&format!(
+                        "default runtime profile resolution failed: {error}"
+                    ));
                     tokio::time::sleep(interval).await;
                     continue;
                 }
@@ -538,6 +654,7 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
                     tracing::warn!(
                         "workflow runtime command dispatcher could not build runtime profile selector: {error}"
                     );
+                    handle.tick_failed(&format!("runtime profile selector build failed: {error}"));
                     tokio::time::sleep(interval).await;
                     continue;
                 }
@@ -549,17 +666,24 @@ pub(in crate::http) fn spawn_runtime_command_dispatcher(state: &Arc<AppState>) {
             )
             .await
             {
-                Ok(tick) if tick.touched_anything() => {
-                    tracing::info!(
-                        enqueued = tick.enqueued,
-                        already_dispatched = tick.already_dispatched,
-                        skipped = tick.skipped,
-                        "workflow runtime command dispatcher tick complete"
-                    );
+                Ok(tick) => {
+                    if tick.touched_anything() {
+                        tracing::info!(
+                            enqueued = tick.enqueued,
+                            already_dispatched = tick.already_dispatched,
+                            skipped = tick.skipped,
+                            "workflow runtime command dispatcher tick complete"
+                        );
+                    }
+                    let dispatched_any = tick.enqueued > 0 || tick.already_dispatched > 0;
+                    if let Some(empty_ticks) = starvation.observe_tick(dispatched_any) {
+                        probe_pool_starvation(&state, empty_ticks).await;
+                    }
+                    handle.tick_ok();
                 }
-                Ok(_) => {}
                 Err(e) => {
                     tracing::warn!("workflow runtime command dispatcher tick failed: {e}");
+                    handle.tick_failed(&e.to_string());
                 }
             }
             tokio::time::sleep(interval).await;

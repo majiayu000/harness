@@ -1,6 +1,6 @@
 pub(crate) fn resolve_github_token(config_token: Option<&str>) -> Option<String> {
-    let github_token = std::env::var("GITHUB_TOKEN").ok();
-    let gh_token = std::env::var("GH_TOKEN").ok();
+    let github_token = harness_core::config::process_env::var("GITHUB_TOKEN").ok();
+    let gh_token = harness_core::config::process_env::var("GH_TOKEN").ok();
     resolve_github_token_from_sources(config_token, github_token.as_deref(), gh_token.as_deref())
 }
 

@@ -3,7 +3,6 @@ import { renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
 import { useAllTasks, useTasks, useWorktrees, useTaskDetail, useTaskStream } from "./queries";
-import { TOKEN_KEY } from "./api";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -132,40 +131,6 @@ describe("useWorktrees", () => {
   });
 });
 
-// ── stream URL construction ───────────────────────────────────────────────────
-// Mirrors the logic in openStream() in Worktrees.tsx to prevent regressions.
-
-function buildStreamUrl(taskId: string): string {
-  const tok = (globalThis.sessionStorage?.getItem?.(TOKEN_KEY) ?? "").trim();
-  const base = `/api/workflows/runtime/submissions/${encodeURIComponent(taskId)}/stream`;
-  return tok ? `${base}?token=${encodeURIComponent(tok)}` : base;
-}
-
-describe("stream URL construction", () => {
-  it("uses the workflow runtime submission stream path", () => {
-    expect(buildStreamUrl("abc-123")).toBe(
-      "/api/workflows/runtime/submissions/abc-123/stream",
-    );
-  });
-
-  it("appends token query param when session token is set", () => {
-    sessionStorage.setItem(TOKEN_KEY, "mytoken");
-    expect(buildStreamUrl("abc-123")).toBe(
-      "/api/workflows/runtime/submissions/abc-123/stream?token=mytoken",
-    );
-  });
-
-  it("omits token param when no session token", () => {
-    expect(buildStreamUrl("abc-123")).not.toContain("token=");
-  });
-
-  it("encodes submission handles that contain path separators", () => {
-    expect(buildStreamUrl("github-pr-feedback::/repo::pr:42")).toBe(
-      "/api/workflows/runtime/submissions/github-pr-feedback%3A%3A%2Frepo%3A%3Apr%3A42/stream",
-    );
-  });
-});
-
 // ── useTasks ─────────────────────────────────────────────────────────────────
 
 describe("useTasks", () => {
@@ -275,14 +240,14 @@ describe("useTaskDetail", () => {
 // ── useTaskStream ─────────────────────────────────────────────────────────────
 
 describe("useTaskStream", () => {
-  it("calls onChunk for each MessageDelta event", async () => {
+  it("calls onChunk for each message_delta event", async () => {
     const chunks: string[] = [];
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       start(controller) {
-        controller.enqueue(encoder.encode('data: {"type":"MessageDelta","text":"hello "}\n\n'));
-        controller.enqueue(encoder.encode('data: {"type":"MessageDelta","text":"world"}\n\n'));
-        controller.enqueue(encoder.encode('data: {"type":"Done"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"message_delta","text":"hello "}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"message_delta","text":"world"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"done"}\n\n'));
         controller.close();
       },
     });
@@ -296,6 +261,35 @@ describe("useTaskStream", () => {
 
     await waitFor(() => expect(chunks.length).toBe(2));
     expect(chunks).toEqual(["hello ", "world"]);
+  });
+
+  it("calls onError for error events and ignores PascalCase type names", async () => {
+    const chunks: string[] = [];
+    const errors: string[] = [];
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"MessageDelta","text":"ignored"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"error","message":"stream failed"}\n\n'));
+        controller.close();
+      },
+    });
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(stream, { status: 200 }),
+    ) as unknown as typeof fetch;
+
+    renderHook(
+      () =>
+        useTaskStream(
+          "t1",
+          (text) => chunks.push(text),
+          (message) => errors.push(message),
+        ),
+      { wrapper: makeWrapper() },
+    );
+
+    await waitFor(() => expect(errors).toEqual(["stream failed"]));
+    expect(chunks).toEqual([]);
   });
 
   it("aborts the fetch when the hook cleans up", async () => {

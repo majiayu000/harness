@@ -1,8 +1,70 @@
 use super::*;
 
 #[test]
+fn runtime_completion_reducer_retries_failed_prompt_task_with_valid_contract() {
+    let instance = prompt_task_instance("implementing").with_server_data(json!({
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 2
+        }
+    }));
+    let command = WorkflowCommand::new(
+        WorkflowCommandType::EnqueueActivity,
+        "prompt-implement-1",
+        json!({
+            "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY,
+            "prompt_ref": "prompt-memory:review"
+        }),
+    );
+    let result = ActivityResult::failed(
+        PROMPT_TASK_IMPLEMENT_ACTIVITY,
+        "Agent turn failed.",
+        "first-party egress proxy did not become healthy before dispatch",
+    );
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-1",
+        "command": command,
+        "runtime_job_id": "job-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("failed prompt activity should produce a retry decision");
+
+    assert_eq!(decision.decision, "retry_failed_prompt_task");
+    assert_eq!(decision.next_state, "implementing");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(decision.commands[0].command["retry_attempt"], 1);
+    assert_eq!(
+        decision.commands[0].command["max_failed_activity_retries"],
+        2
+    );
+    assert_eq!(
+        decision.commands[0].command["previous_command_id"],
+        "command-1"
+    );
+    assert_eq!(
+        decision.commands[0].command["previous_runtime_job_id"],
+        "job-1"
+    );
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("prompt runtime retry decision should validate");
+}
+
+#[test]
 fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }
@@ -59,7 +121,7 @@ fn runtime_completion_reducer_retries_failed_activity_when_policy_allows() {
 
 #[test]
 fn runtime_completion_reducer_retries_local_review_failure_when_policy_allows() {
-    let instance = issue_instance("local_review_gate").with_data(json!({
+    let instance = issue_instance("local_review_gate").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }
@@ -110,8 +172,255 @@ fn runtime_completion_reducer_retries_local_review_failure_when_policy_allows() 
 }
 
 #[test]
+fn runtime_completion_reducer_reinspects_failed_feedback_repair_instead_of_replaying_it() {
+    let instance = issue_instance("addressing_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 6
+        }
+    }));
+    let command = WorkflowCommand::enqueue_activity("address_pr_feedback", "repair-1");
+    let result = ActivityResult::failed(
+        "address_pr_feedback",
+        "Feedback repair timed out after pushing a commit.",
+        "runtime activity produced no output for 600 seconds",
+    )
+    .with_error_kind(ActivityErrorKind::Timeout);
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-repair-1",
+        "command": command,
+        "runtime_job_id": "job-repair-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("failed feedback repair should request an independent review");
+
+    assert_eq!(decision.decision, "reinspect_after_feedback_repair_failure");
+    assert_eq!(decision.next_state, "local_review_gate");
+    assert_eq!(decision.commands.len(), 1);
+    assert_eq!(
+        decision.commands[0].activity_name(),
+        Some(LOCAL_REVIEW_ACTIVITY)
+    );
+    assert!(decision.commands[0].command.get("retry_attempt").is_none());
+    DecisionValidator::github_issue_pr()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("feedback repair reconciliation decision should validate");
+}
+
+#[test]
+fn runtime_completion_reducer_retries_zero_activity_feedback_spawn_failure() {
+    let instance = issue_instance("addressing_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 1
+        }
+    }));
+    let command = WorkflowCommand::enqueue_activity("address_pr_feedback", "repair-spawn-1");
+    let result = ActivityResult::failed(
+        "address_pr_feedback",
+        "Agent turn completed without observable activity.",
+        "agent completed with no observable activity",
+    )
+    .with_error_kind(ActivityErrorKind::SpawnFailure)
+    .with_artifact(ActivityArtifact::new(
+        "activity_result_envelope",
+        json!({
+            "schema": "harness.runtime.activity_result_envelope.v1",
+            "outcome": "zero_output_spawn_failure",
+            "raw_status": "completed",
+            "final_result": {
+                "activity": "address_pr_feedback",
+                "status": "failed",
+                "error_kind": "spawn_failure"
+            }
+        }),
+    ));
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-repair-spawn-1",
+        "command": command,
+        "runtime_job_id": "job-repair-spawn-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("zero-activity spawn failure should retain the safe retry path");
+
+    assert_eq!(decision.decision, "retry_failed_runtime_activity");
+    assert_eq!(decision.next_state, "addressing_feedback");
+    assert_eq!(decision.commands[0].command["retry_attempt"], 1);
+}
+
+#[test]
+fn runtime_completion_reducer_reconciles_unverified_feedback_spawn_failure() {
+    let instance = issue_instance("addressing_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 1
+        }
+    }));
+    let command = WorkflowCommand::enqueue_activity("address_pr_feedback", "repair-spawn-1");
+    let result = ActivityResult::failed(
+        "address_pr_feedback",
+        "Agent claimed it never started.",
+        "agent completed with no observable activity",
+    )
+    .with_error_kind(ActivityErrorKind::SpawnFailure);
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-repair-spawn-1",
+        "command": command,
+        "runtime_job_id": "job-repair-spawn-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("unverified spawn failure should reconcile possible side effects");
+
+    assert_eq!(decision.decision, "reinspect_after_feedback_repair_failure");
+    assert_eq!(decision.next_state, "local_review_gate");
+}
+
+#[test]
+fn runtime_completion_reducer_reconciles_fatal_feedback_failure() {
+    let instance = issue_instance("addressing_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 3
+        }
+    }));
+    let command = WorkflowCommand::enqueue_activity("address_pr_feedback", "repair-fatal-1");
+    let result = ActivityResult::failed(
+        "address_pr_feedback",
+        "Feedback repair cannot continue.",
+        "repository instructions forbid this operation",
+    )
+    .with_error_kind(ActivityErrorKind::Fatal);
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-repair-fatal-1",
+        "command": command,
+        "runtime_job_id": "job-repair-fatal-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("fatal feedback failure should reconcile uncertain side effects");
+
+    assert_eq!(decision.decision, "reinspect_after_feedback_repair_failure");
+    assert_eq!(decision.next_state, "local_review_gate");
+}
+
+#[test]
+fn runtime_completion_reducer_reconciles_configuration_feedback_failure() {
+    let instance = issue_instance("addressing_feedback").with_server_data(json!({
+        "pr_number": 77,
+        "runtime_retry_policy": {
+            "max_failed_activity_retries": 3
+        }
+    }));
+    let command = WorkflowCommand::enqueue_activity("address_pr_feedback", "repair-config-1");
+    let result = ActivityResult::failed(
+        "address_pr_feedback",
+        "Structured repair output was invalid.",
+        "missing harness activity result",
+    )
+    .with_error_kind(ActivityErrorKind::Configuration);
+    let event = WorkflowEvent::new(
+        &instance.id,
+        1,
+        super::super::reducer::RUNTIME_JOB_COMPLETED_EVENT,
+        "runtime-1",
+    )
+    .with_payload(json!({
+        "command_id": "command-repair-config-1",
+        "command": command,
+        "runtime_job_id": "job-repair-config-1",
+        "activity_result": result,
+    }));
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("configuration feedback failure should reconcile uncertain side effects");
+
+    assert_eq!(decision.decision, "reinspect_after_feedback_repair_failure");
+    assert_eq!(decision.next_state, "local_review_gate");
+}
+
+#[test]
+fn runtime_completion_reducer_reconciles_blocked_feedback_repair() {
+    let instance = issue_instance("addressing_feedback");
+    let result = ActivityResult {
+        activity: "address_pr_feedback".to_string(),
+        status: ActivityStatus::Blocked,
+        summary: "Repair stopped after inspecting the repository.".to_string(),
+        artifacts: Vec::new(),
+        signals: Vec::new(),
+        validation: Vec::new(),
+        error: Some("maintainer input is required".to_string()),
+        error_kind: Some(ActivityErrorKind::Configuration),
+    };
+    let event = runtime_completion_event(&instance, "address_pr_feedback", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("blocked feedback repair should reconcile uncertain side effects");
+
+    assert_eq!(decision.decision, "reinspect_after_feedback_repair_failure");
+    assert_eq!(decision.next_state, "local_review_gate");
+}
+
+#[test]
+fn runtime_completion_reducer_reconciles_cancelled_feedback_repair() {
+    let instance = issue_instance("addressing_feedback");
+    let result = ActivityResult::cancelled(
+        "address_pr_feedback",
+        "Repair was cancelled after the agent started.",
+    );
+    let event = runtime_completion_event(&instance, "address_pr_feedback", result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("cancelled feedback repair should reconcile uncertain side effects");
+
+    assert_eq!(decision.decision, "reinspect_after_feedback_repair_failure");
+    assert_eq!(decision.next_state, "local_review_gate");
+}
+
+#[test]
 fn runtime_completion_reducer_retries_timeout_activity_failure_when_policy_allows() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }
@@ -156,7 +465,7 @@ fn runtime_completion_reducer_retries_timeout_activity_failure_when_policy_allow
 
 #[test]
 fn runtime_completion_reducer_retries_spawn_failure_when_policy_allows() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }
@@ -240,46 +549,35 @@ fn runtime_failure_blocked_decision_carries_structured_stop_metadata() {
 }
 
 #[test]
-fn runtime_failure_scope_guard_block_carries_structured_stop_metadata() {
+fn runtime_succeeded_with_blockers_routes_like_blocked() {
     let instance = issue_instance("implementing");
     let result = ActivityResult {
         activity: "implement_issue".to_string(),
-        status: ActivityStatus::Blocked,
-        summary: "Scope guard rejected the implementation.".to_string(),
+        status: ActivityStatus::SucceededWithBlockers,
+        summary: "Implementation finished but review threads remain unresolved.".to_string(),
         artifacts: Vec::new(),
         signals: Vec::new(),
         validation: Vec::new(),
-        error: None,
+        error: Some("Unresolved review threads block completion.".to_string()),
         error_kind: None,
-    }
-    .with_signal(ActivitySignal::new(
-        SCOPE_TOO_LARGE_SIGNAL,
-        json!({
-            "base_ref": "origin/main",
-            "files_changed": 42,
-            "lines_added": 1600,
-            "max_files_changed": 30,
-            "max_lines_added": 1500,
-            "decomposition_skeleton": [{"title": "Split reducer behavior"}]
-        }),
-    ));
+    };
     let event = runtime_completion_event(&instance, "implement_issue", result);
 
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")
-        .expect("scope guard should block the workflow");
+        .expect("succeeded-with-blockers activity should block the workflow");
 
-    assert_eq!(decision.decision, "block_scope_too_large");
-    let command = &decision.commands[0];
-    assert_eq!(command.command["blocked_reason"], decision.reason);
-    assert_eq!(command.command["last_stop"]["state"], "blocked");
-    assert_eq!(command.command["last_stop"]["activity"], "implement_issue");
-    assert_eq!(command.command["last_stop"]["runtime_job_id"], "job-1");
+    assert_eq!(decision.decision, "block_after_runtime_activity");
+    assert_eq!(decision.next_state, "blocked");
+    assert_eq!(
+        decision.commands[0].command["blocked_reason"],
+        "Unresolved review threads block completion."
+    );
 }
 
 #[test]
 fn runtime_failure_does_not_retry_fatal_activity_failure() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 3
         }
@@ -338,7 +636,7 @@ fn runtime_failure_does_not_retry_fatal_activity_failure() {
 
 #[test]
 fn runtime_completion_reducer_fails_after_retry_policy_exhausted() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1
         }
@@ -390,7 +688,7 @@ fn runtime_completion_reducer_fails_after_retry_policy_exhausted() {
 
 #[test]
 fn runtime_completion_reducer_uses_activity_retry_override() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 1,
             "activity_retries": {
@@ -447,7 +745,7 @@ fn runtime_completion_reducer_uses_activity_retry_override() {
 
 #[test]
 fn runtime_completion_reducer_adds_retry_cooldown_metadata() {
-    let instance = issue_instance("implementing").with_data(json!({
+    let instance = issue_instance("implementing").with_server_data(json!({
         "runtime_retry_policy": {
             "max_failed_activity_retries": 3,
             "retry_delay_secs": 30,

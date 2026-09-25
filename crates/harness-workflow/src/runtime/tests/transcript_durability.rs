@@ -8,7 +8,9 @@ async fn claimed_transcript_job(
     store: &WorkflowRuntimeStore,
     workflow: &WorkflowInstance,
 ) -> anyhow::Result<(RuntimeJob, DateTime<Utc>)> {
-    store.upsert_instance(workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(workflow)
+        .await?;
     let command = WorkflowCommand::enqueue_activity("implement_issue", "transcript-command");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     store
@@ -96,6 +98,14 @@ async fn transcript_completion_is_atomic_restart_safe_and_pinned_while_active() 
         store.read_runtime_transcript(&artifact_ref).await?,
         RuntimeTranscriptRead::Verified(_)
     ));
+    let result_events = store
+        .runtime_events_for(&job.id)
+        .await?
+        .into_iter()
+        .filter(|event| event.event_type == "ActivityResultReady")
+        .collect::<Vec<_>>();
+    assert_eq!(result_events.len(), 1);
+    assert_eq!(result_events[0].event, serde_json::to_value(&result)?);
 
     drop(store);
     let reopened = WorkflowRuntimeStore::open(&path).await?;
@@ -361,7 +371,9 @@ async fn transcript_persistence_failure_rolls_back_runtime_completion() -> anyho
 
     let worker_workflow =
         issue_instance("implementing").with_id("transcript-worker-rollback-workflow");
-    store.upsert_instance(&worker_workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&worker_workflow)
+        .await?;
     let worker_command =
         WorkflowCommand::enqueue_activity("implement_issue", "transcript-worker-rollback-command");
     let worker_command_id = store
@@ -419,10 +431,12 @@ async fn transcript_retention_waits_for_every_dependent_workflow_to_finish() -> 
         .await?
         .expect("producer workflow");
     terminal_producer.state = "done".to_string();
-    store.upsert_instance(&terminal_producer).await?;
+    force_upsert_lifecycle_state_for_test(&store, &terminal_producer).await?;
 
     let dependent = issue_instance("implementing").with_id("transcript-pin-dependent");
-    store.upsert_instance(&dependent).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&dependent)
+        .await?;
     let dependent_command = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
         "dependent-replay",
@@ -469,7 +483,7 @@ async fn transcript_retention_waits_for_every_dependent_workflow_to_finish() -> 
 
     let mut terminal_dependent = dependent;
     terminal_dependent.state = "done".to_string();
-    store.upsert_instance(&terminal_dependent).await?;
+    force_upsert_lifecycle_state_for_test(&store, &terminal_dependent).await?;
     let summary = store
         .prune_terminal_runtime_history(Utc::now() - Duration::days(30), 100)
         .await?;
@@ -505,15 +519,17 @@ async fn missing_transcript_dependency_keeps_producer_reconstructable() -> anyho
         .expect("producer completion should commit");
     let mut terminal_producer = producer.clone();
     terminal_producer.state = "done".to_string();
-    store.upsert_instance(&terminal_producer).await?;
+    force_upsert_lifecycle_state_for_test(&store, &terminal_producer).await?;
 
     let dependent = issue_instance("failed")
         .with_id("missing-pin-dependent")
-        .with_data(json!({
+        .with_server_data(json!({
             "stop_reason_code": "runtime_transcript_lost",
             "last_stop": {"stop_reason_code": "runtime_transcript_lost"},
         }));
-    store.upsert_instance(&dependent).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&dependent)
+        .await?;
     let replay = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
         "missing-dependent-replay",
@@ -522,7 +538,9 @@ async fn missing_transcript_dependency_keeps_producer_reconstructable() -> anyho
             "exact_replay": {"transcript_artifact_ref": artifact_ref},
         }),
     );
-    store.enqueue_command(&dependent.id, None, &replay).await?;
+    store
+        .enqueue_command_for_test_unchecked(&dependent.id, None, &replay)
+        .await?;
     sqlx::query("DELETE FROM workflow_artifacts WHERE id = $1")
         .bind(&artifact_ref)
         .execute(store.pool())
@@ -576,15 +594,17 @@ async fn lost_transcript_consumer_and_producer_remain_pinned_until_recovery() ->
         .expect("producer completion should commit");
     let mut terminal_producer = producer.clone();
     terminal_producer.state = "done".to_string();
-    store.upsert_instance(&terminal_producer).await?;
+    force_upsert_lifecycle_state_for_test(&store, &terminal_producer).await?;
 
     let consumer = issue_instance("failed")
         .with_id("lost-family-consumer")
-        .with_data(json!({
+        .with_server_data(json!({
             "stop_reason_code": "runtime_transcript_lost",
             "last_stop": {"stop_reason_code": "runtime_transcript_lost"},
         }));
-    store.upsert_instance(&consumer).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&consumer)
+        .await?;
     let replay = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
         "lost-family-replay",
@@ -593,7 +613,9 @@ async fn lost_transcript_consumer_and_producer_remain_pinned_until_recovery() ->
             "exact_replay": {"transcript_artifact_ref": artifact_ref},
         }),
     );
-    store.enqueue_command(&consumer.id, None, &replay).await?;
+    store
+        .enqueue_command_for_test_unchecked(&consumer.id, None, &replay)
+        .await?;
     sqlx::query("DELETE FROM workflow_artifacts WHERE id = $1")
         .bind(&artifact_ref)
         .execute(store.pool())
@@ -627,7 +649,9 @@ async fn transcript_dependencies_follow_the_persisted_dedupe_command() -> anyhow
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let workflow = issue_instance("implementing").with_id("transcript-dependency-reconcile");
-    store.upsert_instance(&workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
     let replay = |artifact_ref: &str| {
         WorkflowCommand::new(
             WorkflowCommandType::EnqueueActivity,
@@ -639,10 +663,12 @@ async fn transcript_dependencies_follow_the_persisted_dedupe_command() -> anyhow
         )
     };
 
-    let command_id = store
+    store
         .enqueue_command(&workflow.id, None, &replay("runtime-transcript:old"))
         .await?;
-    store
+    // The second enqueue supersedes the first attempt, so retention follows the
+    // live attempt and drops the superseded one (GH-1865).
+    let command_id = store
         .enqueue_command(&workflow.id, None, &replay("runtime-transcript:current"))
         .await?;
     let mut dependencies: Vec<(String,)> = sqlx::query_as(

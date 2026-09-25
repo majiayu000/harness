@@ -3,13 +3,31 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod agent_contract;
+mod agent_contract_schemas;
+mod budget;
 mod candidates;
 mod defaults;
 mod intake_binding;
+mod reserved_keys;
+mod runtime_completion;
+mod shared;
 mod storage;
+pub use agent_contract::{
+    AgentContractMutationPolicy, AgentContractToolPolicy, AgentContractWorkspacePolicy,
+    WorkflowAgentContract, AGENT_CONTRACT_MAX_CORRECTIONS_CEILING,
+    AGENT_CONTRACT_MAX_PRIMARY_ATTEMPTS_CEILING, SUPPORTED_AGENT_CONTRACT_INPUT_SCHEMAS,
+    SUPPORTED_AGENT_CONTRACT_OUTPUT_SCHEMAS,
+};
+pub use agent_contract_schemas::{
+    agent_contract_input_schema_document, agent_contract_output_schema_document,
+    validate_agent_contract_input, validate_agent_contract_output,
+};
+pub use budget::{RuntimeBudgetEnforcement, RuntimeBudgetPolicy};
 pub use candidates::WorkflowCandidatesPolicy;
 use defaults::*;
 pub use intake_binding::{IntakeFilterPolicy, WorkflowDefinitionIntakePolicy};
+pub use runtime_completion::RuntimeCompletionPolicy;
 pub use storage::WorkflowStoragePolicy;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -34,6 +52,8 @@ pub enum WorkflowSourceRole {
     CentralBase,
     /// The repository `{project_root}/WORKFLOW.md` override.
     RepositoryOverride,
+    /// Reusable workflow selected by the project's workflow.file setting.
+    SelectedWorkflow,
 }
 
 /// Observation-only fact about one configured workflow source file that was
@@ -48,7 +68,10 @@ pub struct WorkflowSourceObservation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowIdentityPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(default = "default_workflow_version")]
@@ -111,13 +134,21 @@ pub struct WorkflowActivityPolicy {
     pub prompt: Option<String>,
     #[serde(default)]
     pub validation: Vec<String>,
+    /// Generic agent execution contract (semantic classification and other
+    /// bounded no-tool judgments). Validated when a declarative definition
+    /// references the activity; the resolved contract participates in the
+    /// pinned definition identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_contract: Option<WorkflowAgentContract>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeclaredProgressMode {
+    CommandDriven,
     ExternalWait,
     OperatorGate,
+    ParentHandoff,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -184,22 +215,6 @@ pub struct IssueWorkflowPolicy {
     pub force_execute_label: String,
     #[serde(default = "default_true")]
     pub auto_replan_on_plan_issue: bool,
-    /// When true, the review loop pauses at `ready_to_merge` and requires a
-    /// human to call `POST /api/workflows/runtime/merge` with the workflow ID
-    /// before the workflow advances to `done`. Defaults to `false` to
-    /// preserve the automatic merge flow.
-    #[serde(default)]
-    pub require_human_gate_before_merge: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrScopeGuardPolicy {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_pr_scope_guard_max_files_changed")]
-    pub max_files_changed: u32,
-    #[serde(default = "default_pr_scope_guard_max_lines_added")]
-    pub max_lines_added: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +297,7 @@ pub struct RuntimeDispatchProfileOverride {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerPolicy {
     #[serde(default)]
     pub enabled: bool,
@@ -347,15 +363,17 @@ pub struct WorkflowConfig {
     #[serde(default)]
     pub issue_workflow: IssueWorkflowPolicy,
     #[serde(default)]
-    pub pr_scope_guard: PrScopeGuardPolicy,
-    #[serde(default)]
     pub pr_feedback: PrFeedbackPolicy,
     #[serde(default)]
     pub runtime_dispatch: RuntimeDispatchPolicy,
     #[serde(default)]
     pub runtime_worker: RuntimeWorkerPolicy,
     #[serde(default)]
+    pub runtime_completion: RuntimeCompletionPolicy,
+    #[serde(default)]
     pub runtime_retry_policy: RuntimeRetryPolicy,
+    #[serde(default)]
+    pub runtime_budget_policy: RuntimeBudgetPolicy,
     #[serde(default)]
     pub memory: WorkflowMemoryPolicy,
     #[serde(default)]
@@ -371,17 +389,6 @@ impl Default for IssueWorkflowPolicy {
         Self {
             force_execute_label: default_force_execute_label(),
             auto_replan_on_plan_issue: default_true(),
-            require_human_gate_before_merge: false,
-        }
-    }
-}
-
-impl Default for PrScopeGuardPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_files_changed: default_pr_scope_guard_max_files_changed(),
-            max_lines_added: default_pr_scope_guard_max_lines_added(),
         }
     }
 }
@@ -479,6 +486,7 @@ impl Default for RuntimeWorkerPolicy {
 impl Default for WorkflowIdentityPolicy {
     fn default() -> Self {
         Self {
+            file: None,
             id: None,
             version: default_workflow_version(),
         }
@@ -575,6 +583,10 @@ fn read_workflow_file(path: &Path) -> anyhow::Result<Option<LoadedWorkflowFile>>
             )
         })?,
     };
+    reserved_keys::reject_misplaced_completion_evidence_fields(
+        &value,
+        &path.display().to_string(),
+    )?;
     Ok(Some(LoadedWorkflowFile {
         front_matter: value,
         body: body.trim().to_string(),
@@ -628,12 +640,16 @@ pub fn load_workflow_document(project_root: &Path) -> anyhow::Result<WorkflowDoc
 
 /// Core resolution with an explicit base path (kept separate from the global
 /// registration so it can be unit-tested without touching process state).
-fn load_workflow_document_with_base(
+pub(super) fn load_workflow_document_with_base(
     project_root: &Path,
     base_path: Option<&Path>,
 ) -> anyhow::Result<WorkflowDocument> {
     let repo_path = project_root.join("WORKFLOW.md");
     let repo = read_workflow_file(&repo_path)?;
+    let project_policy = repo
+        .as_ref()
+        .map(|file| file.front_matter.clone())
+        .unwrap_or_default();
 
     // The base only applies when it is a distinct file from the repo's own
     // WORKFLOW.md (otherwise a repo that *is* the config dir would merge with
@@ -661,7 +677,7 @@ fn load_workflow_document_with_base(
         });
     }
 
-    let (merged_value, prompt_template, source_path) = match (base, repo) {
+    let (mut merged_value, mut prompt_template, source_path) = match (base, repo) {
         (None, None) => return Ok(WorkflowDocument::default()),
         (Some((base_path, base_file)), None) => (
             base_file.front_matter,
@@ -685,6 +701,13 @@ fn load_workflow_document_with_base(
         }
     };
 
+    shared::resolve(
+        project_root,
+        &project_policy,
+        &mut merged_value,
+        &mut prompt_template,
+        &mut sources,
+    )?;
     let mut config: WorkflowConfig = match merged_value {
         serde_yaml::Value::Null => WorkflowConfig::default(),
         value => serde_yaml::from_value(value).map_err(|e| {
@@ -695,6 +718,7 @@ fn load_workflow_document_with_base(
         definition.validate_identifiers()?;
     }
     config.runtime_dispatch.apply_default_activity_profiles();
+    config.runtime_budget_policy.validate()?;
     let defer_floor = config.runtime_dispatch.defer_backoff_secs;
     let defer_ceiling = config.runtime_dispatch.defer_backoff_max_secs;
     let chrono_seconds = |seconds: u64| {
@@ -765,6 +789,10 @@ fn split_front_matter_and_body(contents: &str) -> (Option<&str>, &str) {
 #[cfg(test)]
 #[path = "workflow_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "workflow_agent_contract_tests.rs"]
+mod agent_contract_tests;
 
 #[cfg(test)]
 #[path = "workflow_intake_binding_tests.rs"]

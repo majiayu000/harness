@@ -84,7 +84,9 @@ mod declarative_validation {
                 WorkflowCommandType::RequestOperatorAttention,
             ])
         );
-        assert!(workflow_definition("docs_review").is_none());
+        assert!(WorkflowDefinitionRegistry::with_builtins()
+            .definition("docs_review")
+            .is_none());
     }
 
     #[test]

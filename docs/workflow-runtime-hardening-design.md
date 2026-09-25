@@ -1,5 +1,11 @@
 # Workflow Runtime Hardening Design
 
+> Architecture relationship (2026-08-28): all fail-closed output, reducer, lease, retry, recovery,
+> and observability invariants in this document remain current conformance requirements.
+> `docs/workflow-first-autonomous-change-rfc.md` proposes extending them but is not yet approved. Any
+> removal of legacy-success fallbacks belongs to the separately approved implementation/cutover
+> change, not to this relationship notice.
+
 ## Goal
 
 The workflow runtime must remain correct when agent output is incomplete, stale, malformed, or semantically wrong. Agents are allowed to propose facts and decisions; the workflow runtime owns persisted state transitions, command creation, leases, retry policy, and operator escalation.

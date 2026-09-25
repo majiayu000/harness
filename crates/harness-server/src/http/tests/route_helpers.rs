@@ -83,7 +83,7 @@ async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1111"),
     )
     .with_id("runtime-proof-workflow")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "task_id": task_id,
         "task_ids": [task_id],
         "project_id": "/project-a",
@@ -92,7 +92,7 @@ async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result
         "pr_number": 77,
         "pr_url": pr_url,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let event = store
         .append_event(
             &workflow.id,
@@ -118,6 +118,8 @@ async fn get_task_proof_returns_runtime_backed_terminal_task() -> anyhow::Result
         state
             .core
             .tasks
+            .as_ref()
+            .expect("tasks")
             .get_with_db_fallback(&task_runner::TaskId::from_str(task_id))
             .await?
             .is_none(),
@@ -173,11 +175,11 @@ async fn get_task_proof_rejects_nonterminal_runtime_task() -> anyhow::Result<()>
         harness_workflow::runtime::WorkflowSubject::new("prompt", "prompt:active"),
     )
     .with_id("runtime-proof-active-workflow")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "task_id": task_id,
         "project_id": "/project-a",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     let response = runtime_submission_app(state)
         .oneshot(
@@ -229,6 +231,14 @@ pub(super) fn runtime_submission_app(state: Arc<AppState>) -> Router {
             "/api/workflows/runtime/submissions",
             get(task_query_routes::list_runtime_submissions)
                 .post(task_routes::create_runtime_submission),
+        )
+        .route(
+            "/api/workflows/runtime/evidence",
+            get(runtime_submission_routes::get_evidence),
+        )
+        .route(
+            "/api/workflows/runtime/evidence/export",
+            get(runtime_submission_routes::get_evidence_export),
         )
         .route(
             "/api/workflows/runtime/submissions/{id}",
@@ -346,6 +356,8 @@ pub(super) async fn assert_runtime_issue_submission(
         state
             .core
             .tasks
+            .as_ref()
+            .expect("tasks")
             .get_with_db_fallback(&task_id)
             .await?
             .is_none(),
@@ -415,7 +427,7 @@ pub(super) async fn seed_bound_runtime_pr_workflow(
         harness_workflow::runtime::WorkflowSubject::new("issue", format!("issue:{issue_number}")),
     )
     .with_id(workflow_id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id,
         "repo": repo,
         "issue_number": issue_number,
@@ -425,7 +437,7 @@ pub(super) async fn seed_bound_runtime_pr_workflow(
         "pr_url": format!("https://github.com/{repo}/pull/{pr_number}"),
         "execution_path": "workflow_runtime"
     }));
-    store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &instance).await?;
     Ok((workflow_id, task_id))
 }
 
@@ -456,6 +468,8 @@ pub(super) async fn assert_runtime_local_review_requested(
         state
             .core
             .tasks
+            .as_ref()
+            .expect("tasks")
             .get_with_db_fallback(&task_runner::TaskId::from_str(task_id))
             .await?
             .is_none(),
@@ -473,6 +487,8 @@ pub(super) async fn assert_runtime_prompt_submission(
         state
             .core
             .tasks
+            .as_ref()
+            .expect("tasks")
             .get_with_db_fallback(&task_runner::TaskId::from_str(task_id))
             .await?
             .is_none(),

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::circuit_breaker::CircuitBreaker;
+use crate::hook_circuit_breaker::CircuitBreaker;
 
 /// Post-tool-use hook enforcer.
 ///
@@ -117,10 +117,15 @@ impl TurnInterceptor for HookEnforcer {
             return PostToolUseResult::clean();
         }
 
-        let engine = self.rules.read().await;
-        if engine.guards().is_empty() {
-            return PostToolUseResult::clean();
-        }
+        // Snapshot under the read lock; the scan spawns one bash script per
+        // guard and must not pin the lock while it runs.
+        let snapshot = {
+            let engine = self.rules.read().await;
+            if engine.guards().is_empty() {
+                return PostToolUseResult::clean();
+            }
+            engine.snapshot()
+        };
 
         // Circuit breaker: auto-pass when the consecutive-block limit has been
         // reached (stop_hook_active equivalent — prevents infinite loops).
@@ -133,7 +138,10 @@ impl TurnInterceptor for HookEnforcer {
             return PostToolUseResult::clean();
         }
 
-        let violations = match engine.scan_files(project_root, &event.affected_files).await {
+        let violations = match snapshot
+            .scan_files(project_root, &event.affected_files)
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -157,6 +165,7 @@ impl TurnInterceptor for HookEnforcer {
             SessionId::new()
         };
         let mut ev = Event::new(sid, "hook_enforcement", "post_tool_use", decision);
+        ev.run_id = event.run_id.clone();
         ev.detail = Some(format!(
             "tool={} files={} violations={}",
             event.tool_name,
@@ -189,9 +198,11 @@ impl TurnInterceptor for HookEnforcer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::run_id::RunId;
     use harness_core::{types::EventFilters, types::GuardId, types::Language};
     use harness_rules::engine::{Guard, RuleEngine};
     use std::ffi::OsString;
+    use std::str::FromStr;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
@@ -289,6 +300,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: None,
+            run_id: None,
         };
         let result = enforcer.post_tool_use(&event, &project).await;
         assert!(
@@ -321,6 +333,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: None,
+            run_id: None,
         };
         let result = enforcer.post_tool_use(&event, &project).await;
         assert!(
@@ -346,6 +359,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![],
             session_id: None,
+            run_id: None,
         };
         let result = enforcer.post_tool_use(&event, dir.path()).await;
         assert!(result.violation_feedback.is_none());
@@ -364,10 +378,12 @@ mod tests {
         std::fs::create_dir_all(&project)?;
 
         let enforcer = HookEnforcer::new(rules, event_store.clone(), true);
+        let run_id = RunId::from_str("ar-01j1qb3c9r7v5m2k8x4tznq6wd")?;
         let event = ToolUseEvent {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: None,
+            run_id: Some(run_id.clone()),
         };
         enforcer.post_tool_use(&event, &project).await;
 
@@ -381,6 +397,7 @@ mod tests {
             "hook_enforcement event must appear in EventStore"
         );
         assert_eq!(logged[0].tool, "post_tool_use");
+        assert_eq!(logged[0].run_id, Some(run_id));
 
         Ok(())
     }
@@ -401,6 +418,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: None,
+            run_id: None,
         };
         let result = enforcer.post_tool_use(&event, dir.path()).await;
         assert!(
@@ -442,6 +460,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: Some(sid.clone()),
+            run_id: None,
         };
 
         // First two blocks: violations returned, circuit still closed.
@@ -483,6 +502,7 @@ mod tests {
             tool_name: "write_file".to_string(),
             affected_files: vec![PathBuf::from("src/main.rs")],
             session_id: None,
+            run_id: None,
         };
 
         let result = enforcer.post_tool_use(&event, &project).await;

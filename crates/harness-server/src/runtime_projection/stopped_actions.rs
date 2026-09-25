@@ -1,8 +1,8 @@
 use super::{RuntimeRecoveryTargetProjection, RuntimeStoppedActionEligibility};
 use harness_workflow::runtime::{
-    workflow_declarative_definition, ActivityErrorKind, WorkflowCommand, WorkflowCommandType,
-    WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
-    PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
+    ActivityErrorKind, WorkflowCommand, WorkflowCommandType, WorkflowDefinitionRegistry,
+    WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID, ISSUE_PLAN_ACTIVITY,
+    LOCAL_REVIEW_ACTIVITY, PR_FEEDBACK_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ pub(crate) async fn stopped_action_eligibility_for_workflows(
     let mut plans = Vec::new();
     let mut runtime_job_ids = Vec::new();
     for workflow in workflows {
-        let Some(plan) = stopped_action_plan(workflow) else {
+        let Some(plan) = stopped_action_plan(store.definition_registry(), workflow) else {
             continue;
         };
         if let Some(runtime_job_id) = plan.runtime_job_id.as_ref() {
@@ -61,13 +61,14 @@ pub(crate) async fn stopped_action_eligibility_for_workflows(
 }
 
 pub(super) fn pinned_recovery_targets(
+    registry: &WorkflowDefinitionRegistry,
     workflow: &WorkflowInstance,
 ) -> Vec<RuntimeRecoveryTargetProjection> {
     if workflow.state != "blocked" {
         return Vec::new();
     }
     let Some(definition) =
-        workflow_declarative_definition(&workflow.definition_id, workflow.definition_version)
+        registry.declarative_definition(&workflow.definition_id, workflow.definition_version)
     else {
         return Vec::new();
     };
@@ -122,9 +123,12 @@ struct RecoveryDispatchTarget {
     activity: &'static str,
 }
 
-fn stopped_action_plan(workflow: &WorkflowInstance) -> Option<StoppedActionPlan> {
+fn stopped_action_plan(
+    registry: &WorkflowDefinitionRegistry,
+    workflow: &WorkflowInstance,
+) -> Option<StoppedActionPlan> {
     if workflow.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID {
-        if workflow.state != "blocked" || pinned_recovery_targets(workflow).is_empty() {
+        if workflow.state != "blocked" || pinned_recovery_targets(registry, workflow).is_empty() {
             return None;
         }
         return Some(StoppedActionPlan {
@@ -230,6 +234,9 @@ fn optional_error_kind(value: Option<&Value>) -> Option<Option<ActivityErrorKind
 
 fn recovery_dispatch_target(activity: &str) -> Option<RecoveryDispatchTarget> {
     match activity {
+        ISSUE_PLAN_ACTIVITY => Some(RecoveryDispatchTarget {
+            activity: ISSUE_PLAN_ACTIVITY,
+        }),
         "implement_issue" => Some(RecoveryDispatchTarget {
             activity: "implement_issue",
         }),
@@ -322,6 +329,16 @@ mod tests {
     }
 
     #[test]
+    fn operator_monitor_recognizes_stopped_issue_planning() {
+        assert_eq!(
+            recovery_dispatch_target(ISSUE_PLAN_ACTIVITY),
+            Some(RecoveryDispatchTarget {
+                activity: ISSUE_PLAN_ACTIVITY,
+            })
+        );
+    }
+
+    #[test]
     fn declarative_projection_exposes_only_exact_pinned_recovery_metadata() {
         let policy = WorkflowDefinitionPolicy {
             id: "projection_recovery".to_string(),
@@ -371,7 +388,7 @@ mod tests {
             "blocked",
             WorkflowSubject::new("test", "one"),
         )
-        .with_data(json!({ "definition_hash": definition.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
         assert_eq!(
             recovery_targets_for_definition(&pinned, &definition),
             [RuntimeRecoveryTargetProjection {
@@ -421,15 +438,16 @@ mod tests {
             let mut workflow = WorkflowInstance::new(
                 GITHUB_ISSUE_PR_DEFINITION_ID,
                 1,
-                state,
+                "implementing",
                 WorkflowSubject::new("issue", format!("issue:{id}")),
             )
             .with_id(id.to_string())
-            .with_data(json!({
+            .with_server_data(json!({
                 "error_kind": "timeout",
                 "last_stop": { "state": state, "activity": "implement_issue" },
             }));
-            store.upsert_instance(&workflow).await?;
+            crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
+                .await?;
             let command = WorkflowCommand::new(
                 WorkflowCommandType::EnqueueActivity,
                 format!("{id}-source"),
@@ -444,8 +462,16 @@ mod tests {
                     command.command,
                 )
                 .await?;
-            workflow.data["last_stop"]["runtime_job_id"] = json!(job.id);
-            store.upsert_instance(&workflow).await?;
+            let mut last_stop = workflow.data["last_stop"].clone();
+            last_stop["runtime_job_id"] = json!(job.id);
+            workflow.set_data_field(
+                "last_stop",
+                last_stop,
+                harness_workflow::runtime::DataProvenance::Server,
+            )?;
+            workflow.state = state.to_string();
+            crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
+                .await?;
             workflows.push(workflow);
         }
 

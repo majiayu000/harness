@@ -1,12 +1,17 @@
 use super::{to_jsonb_string, WorkflowRuntimeStore};
-use crate::runtime::declarative_pinning::hydrate_persisted_declarative_definition;
-use crate::runtime::declarative_pinning::DECLARATIVE_DEFINITION_METADATA_KIND;
-use crate::runtime::model::WorkflowDefinition;
-use crate::runtime::DeclarativeWorkflowDefinition;
+use crate::runtime::declarative_pinning::{
+    hydrate_persisted_declarative_definition, is_persisted_declarative_definition,
+    DECLARATIVE_DEFINITION_METADATA_KIND,
+};
+use crate::runtime::model::{WorkflowDefinition, WorkflowInstance};
+use crate::runtime::{
+    DeclarativeWorkflowDefinition, WorkflowDefinitionRegistry, WorkflowTerminalState,
+};
+use sqlx::{Postgres, Transaction};
 
 impl WorkflowRuntimeStore {
     pub async fn upsert_definition(&self, definition: &WorkflowDefinition) -> anyhow::Result<()> {
-        if is_declarative_definition(definition) {
+        if is_persisted_declarative_definition(definition) {
             return self.persist_definition_version(definition).await;
         }
         let data = to_jsonb_string(definition)?;
@@ -52,6 +57,22 @@ impl WorkflowRuntimeStore {
         row.map(|(data,)| serde_json::from_str(&data))
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub async fn terminal_state_for_instance(
+        &self,
+        instance: &WorkflowInstance,
+    ) -> anyhow::Result<Option<WorkflowTerminalState>> {
+        if let Some(terminal_state) = self
+            .definition_registry
+            .terminal_state_for_instance(instance)
+        {
+            return Ok(Some(terminal_state));
+        }
+        let definition = self
+            .get_definition(&instance.definition_id, instance.definition_version)
+            .await?;
+        persisted_terminal_state(instance, definition.as_ref())
     }
 
     pub async fn persist_definition_version(
@@ -120,16 +141,69 @@ impl WorkflowRuntimeStore {
         self.list_definitions()
             .await?
             .into_iter()
-            .filter(is_declarative_definition)
+            .filter(is_persisted_declarative_definition)
             .map(|definition| hydrate_persisted_declarative_definition(&definition))
             .collect()
     }
 }
 
-fn is_declarative_definition(definition: &WorkflowDefinition) -> bool {
-    definition
-        .metadata
-        .get("kind")
+pub(in crate::runtime) async fn terminal_state_for_instance_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    registry: &WorkflowDefinitionRegistry,
+    instance: &WorkflowInstance,
+) -> anyhow::Result<Option<WorkflowTerminalState>> {
+    if let Some(terminal_state) = registry.terminal_state_for_instance(instance) {
+        return Ok(Some(terminal_state));
+    }
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT data::text FROM workflow_definitions
+         WHERE id = $1 AND version = $2",
+    )
+    .bind(&instance.definition_id)
+    .bind(i64::from(instance.definition_version))
+    .fetch_optional(&mut **tx)
+    .await?;
+    let definition = row
+        .map(|(data,)| serde_json::from_str::<WorkflowDefinition>(&data))
+        .transpose()?;
+    persisted_terminal_state(instance, definition.as_ref())
+}
+
+fn persisted_terminal_state(
+    instance: &WorkflowInstance,
+    definition: Option<&WorkflowDefinition>,
+) -> anyhow::Result<Option<WorkflowTerminalState>> {
+    let Some(definition) =
+        definition.filter(|definition| is_persisted_declarative_definition(definition))
+    else {
+        return Ok(None);
+    };
+    let expected_hash = instance
+        .data
+        .get("definition_hash")
         .and_then(serde_json::Value::as_str)
-        == Some(DECLARATIVE_DEFINITION_METADATA_KIND)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "declarative workflow '{}' is missing its pinned definition hash",
+                instance.id
+            )
+        })?;
+    if definition.id != instance.definition_id
+        || definition.version != instance.definition_version
+        || definition.definition_hash != expected_hash
+    {
+        anyhow::bail!(
+            "persisted declarative workflow definition '{}@{}' does not match workflow '{}' pin",
+            definition.id,
+            definition.version,
+            instance.id
+        );
+    }
+    let definition = hydrate_persisted_declarative_definition(definition)?;
+    Ok(definition
+        .registered()
+        .states
+        .iter()
+        .find(|state| state.key.state.as_ref() == instance.state)
+        .and_then(|state| state.terminal_state))
 }

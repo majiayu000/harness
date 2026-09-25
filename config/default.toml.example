@@ -50,6 +50,13 @@ max_turns = 20
 # wall-clock turn timeout.
 # stall_timeout_secs = 600
 
+[workflow]
+# Temporary one-release emergency kill switch for server-verified completion
+# evidence. Defaults to true; keep enabled unless a controlled rollback is
+# required. Disabling it accepts agent-claimed terminal results without
+# server-verified evidence for every project in this Harness deployment.
+completion_evidence_enforced = true
+
 [workflow.circuit_breaker]
 # Pause dispatch for a runtime profile after repeated same-class failures.
 enabled = true
@@ -65,6 +72,14 @@ default_agent = "codex"
 # Optional: preferred routing order for complex/critical tasks.
 complexity_preferred_agents = ["codex"]
 sandbox_mode = "danger-full-access"
+# Claude enforces Standard by default. Use "full" only as an explicit unrestricted opt-up.
+capability_profile = "standard"
+
+[isolation]
+# Scoped agents require explicit provider and task-service hosts. Container
+# isolation keeps this allowlist usable on Linux as well as macOS.
+default_tier = "container"
+network_allowlist = ["github.com", "api.github.com", "api.openai.com", "api.anthropic.com"]
 
 [agents.claude]
 cli_path = "claude"
@@ -85,6 +100,11 @@ default_model = "sonnet"
 cli_path = "codex"
 default_model = "gpt-5.5"
 reasoning_effort = "xhigh"
+
+# Optional Cursor Agent backend; see docs/cursor-agent.md for workflow setup.
+[agents.cursor]
+cli_path = "cursor-agent"
+default_model = "auto"
 
 [agents.anthropic_api]
 base_url = "https://api.anthropic.com"
@@ -145,8 +165,8 @@ log_retention_max_files = 30
 log_retention_days = 90
 
 [context]
-# Shadow mode records composition manifests without changing injected context.
-mode = "shadow"
+# Context composition is preview-only; it is used by context/preview and does
+# not change production agent requests.
 budget_tokens = 24000
 reserved_headroom = 0.20
 provider_timeout_ms = 2000

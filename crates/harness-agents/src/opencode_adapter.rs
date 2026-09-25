@@ -1,0 +1,722 @@
+use crate::streaming::capture_agent_stderr_diagnostics;
+use async_trait::async_trait;
+use harness_core::agent::{AgentAdapter, AgentEvent, AgentRequest, ApprovalDecision};
+use harness_core::config::agents::{OpenCodeAgentConfig, SandboxMode};
+use harness_sandbox::SandboxSpec;
+use serde_json::{json, Value};
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::ChildStdout;
+use tokio::sync::{mpsc, Mutex};
+
+type StdoutLines = Lines<BufReader<ChildStdout>>;
+mod protocol;
+#[cfg(test)]
+use self::protocol::request_id_string;
+use self::protocol::{
+    acp_error_message, protocol_line_preview, request_id_from_string, response_id_matches,
+};
+pub use self::protocol::{parse_acp_message, ParsedAcpMessage};
+
+fn stall_timeout_for(req: &AgentRequest) -> Option<Duration> {
+    req.timeout_secs
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+}
+
+async fn prepare_acp_spawn(
+    cli_path: &std::path::Path,
+    req: &AgentRequest,
+) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
+    let args = [OsString::from("acp")];
+    let sandbox_mode = req.sandbox_mode.unwrap_or(SandboxMode::DangerFullAccess);
+    let sandbox_spec = if let Some(token) = req.capability_token.as_ref() {
+        SandboxSpec::new(sandbox_mode, &req.project_root)
+            .with_allowed_write_paths(token.allowed_write_paths.clone())
+    } else {
+        SandboxSpec::new(sandbox_mode, &req.project_root)
+    };
+    crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+        program: cli_path,
+        args: &args,
+        project_root: &req.project_root,
+        sandbox_spec: &sandbox_spec,
+        env_vars: &req.env_vars,
+        secret_env_keys: &[],
+        container_bind_mounts: &[],
+        permission_mode: req.permission_mode,
+        forward_stdin: true,
+    })
+    .await
+}
+
+pub struct OpenCodeAcpAdapter {
+    cli_path: PathBuf,
+    default_model: String,
+    sandbox_mode: SandboxMode,
+    state: Arc<Mutex<AdapterState>>,
+}
+
+struct AdapterState {
+    child: Option<crate::ManagedChild>,
+    stdin: Option<tokio::process::ChildStdin>,
+    stdout_lines: Option<StdoutLines>,
+    next_id: u64,
+    session_id: Option<String>,
+    spawn_policy_fingerprint: Option<crate::spawn_contract::AdapterSpawnPolicyFingerprint>,
+    egress_verified_at_dispatch: bool,
+}
+
+impl AdapterState {
+    fn new() -> Self {
+        Self {
+            child: None,
+            stdin: None,
+            stdout_lines: None,
+            next_id: 1,
+            session_id: None,
+            spawn_policy_fingerprint: None,
+            egress_verified_at_dispatch: false,
+        }
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn child_ready(&self) -> bool {
+        self.child.is_some() && self.stdin.is_some() && self.stdout_lines.is_some()
+    }
+
+    async fn reset_child(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            child.terminate_now();
+            if let Err(error) = child.wait_and_cleanup_descendants().await {
+                tracing::warn!("failed to clean up opencode acp child: {error}");
+            }
+        }
+        self.stdin = None;
+        self.stdout_lines = None;
+        self.session_id = None;
+        self.spawn_policy_fingerprint = None;
+        self.egress_verified_at_dispatch = false;
+    }
+}
+
+impl OpenCodeAcpAdapter {
+    pub fn new(cli_path: PathBuf) -> Self {
+        let config = OpenCodeAgentConfig {
+            cli_path,
+            ..OpenCodeAgentConfig::default()
+        };
+        Self::from_config(config, SandboxMode::DangerFullAccess)
+    }
+
+    pub fn from_config(config: OpenCodeAgentConfig, sandbox_mode: SandboxMode) -> Self {
+        Self {
+            cli_path: config.cli_path,
+            default_model: config.default_model,
+            sandbox_mode,
+            state: Arc::new(Mutex::new(AdapterState::new())),
+        }
+    }
+
+    fn effective_turn_request(&self, mut req: AgentRequest) -> AgentRequest {
+        if req.model.is_none() && !self.default_model.is_empty() {
+            req.model = Some(self.default_model.clone());
+        }
+        if req.sandbox_mode.is_none() {
+            req.sandbox_mode = Some(self.sandbox_mode);
+        }
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
+        run_identity.write_env_vars(&mut req.env_vars);
+        req
+    }
+
+    async fn send_json_line(
+        state: &mut AdapterState,
+        payload: &Value,
+    ) -> harness_core::error::Result<()> {
+        let stdin = state.stdin.as_mut().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution("opencode stdin not available".into())
+        })?;
+        let mut line = serde_json::to_string(payload).map_err(|error| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to serialize opencode payload: {error}"
+            ))
+        })?;
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).await.map_err(|error| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to write to opencode: {error}"
+            ))
+        })?;
+        stdin.flush().await.map_err(|error| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to flush opencode stdin: {error}"
+            ))
+        })
+    }
+
+    async fn send_request(
+        state: &mut AdapterState,
+        method: &str,
+        params: Value,
+    ) -> harness_core::error::Result<u64> {
+        let id = state.next_request_id();
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        Self::send_json_line(state, &payload).await?;
+        Ok(id)
+    }
+
+    async fn send_notification(
+        state: &mut AdapterState,
+        method: &str,
+        params: Value,
+    ) -> harness_core::error::Result<()> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        Self::send_json_line(state, &payload).await
+    }
+
+    async fn read_next_message(
+        lines: &mut StdoutLines,
+    ) -> harness_core::error::Result<Option<ParsedAcpMessage>> {
+        let Some(line) = lines.next_line().await.map_err(|error| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed reading opencode acp stdout: {error}"
+            ))
+        })?
+        else {
+            return Ok(None);
+        };
+        if line.trim().is_empty() {
+            return Ok(Some(ParsedAcpMessage::Ignore));
+        }
+        if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+            return Ok(Some(ParsedAcpMessage::Event(
+                AgentEvent::EgressVerifiedAtDispatch,
+            )));
+        }
+        parse_acp_message(&line).map(Some).ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "opencode acp emitted invalid JSON-RPC stdout: {}",
+                protocol_line_preview(&line)
+            ))
+        })
+    }
+
+    async fn read_next_message_with_timeout(
+        lines: &mut StdoutLines,
+        stall_timeout: Option<Duration>,
+        phase: &str,
+    ) -> harness_core::error::Result<Option<ParsedAcpMessage>> {
+        let read = Self::read_next_message(lines);
+        let Some(stall_timeout) = stall_timeout else {
+            return read.await;
+        };
+        match tokio::time::timeout(stall_timeout, read).await {
+            Ok(result) => result,
+            Err(_) => Err(harness_core::error::HarnessError::AgentExecution(format!(
+                "opencode acp {phase} stalled for {stall_timeout:?} without stdout"
+            ))),
+        }
+    }
+
+    async fn ensure_child(
+        &self,
+        req: &AgentRequest,
+        state: &mut AdapterState,
+    ) -> harness_core::error::Result<()> {
+        let requested_fingerprint =
+            crate::spawn_contract::adapter_spawn_policy_fingerprint(req, self.sandbox_mode);
+        if state.child_ready()
+            && state.spawn_policy_fingerprint.as_ref() == Some(&requested_fingerprint)
+        {
+            if let Some(child) = state.child.as_ref() {
+                match child.validate_egress_proxy().await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => tracing::warn!(
+                        "opencode acp egress proxy is unavailable; restarting before starting a new turn: {error}"
+                    ),
+                }
+            }
+        }
+        if state.child.is_some() {
+            tracing::warn!("opencode acp spawn policy changed or state is incomplete; restarting before starting a new turn");
+            state.reset_child().await;
+        }
+
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
+        let prepared_spawn = prepare_acp_spawn(&self.cli_path, req).await?;
+        let child_workspace = prepared_spawn.child_workspace.clone();
+        let spawn_project_root = req.project_root.clone();
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
+                prepared_spawn,
+                run_identity,
+                native_kind: "opencode",
+                process_label: "opencode acp",
+                stdio: crate::spawn_supervisor::AgentStdio::piped_output(
+                    std::process::Stdio::piped(),
+                ),
+                extra_env_removals: Vec::new(),
+                map_spawn_error: Box::new(move |error, _spawn| {
+                    let message = crate::classify_missing_workspace_spawn_failure(
+                        error,
+                        &spawn_project_root,
+                        format!("failed to spawn opencode acp: {error}"),
+                    );
+                    harness_core::error::HarnessError::AgentExecution(message)
+                }),
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
+        let mut child = supervised.child;
+        let await_container_egress_canary = child.awaits_container_egress_canary();
+        let mut egress_verified_at_dispatch = child.egress_verified_before_spawn();
+
+        if let Some(stderr) = child.inner_mut().stderr.take() {
+            tokio::spawn(async move {
+                capture_agent_stderr_diagnostics(stderr, "opencode", None).await;
+            });
+        }
+
+        let stdout = child.inner_mut().stdout.take().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(
+                "opencode acp stdout unavailable".into(),
+            )
+        })?;
+        state.stdin = child.inner_mut().stdin.take();
+        state.stdout_lines = Some(BufReader::new(stdout).lines());
+        state.child = Some(child);
+        let stall_timeout = stall_timeout_for(req);
+
+        let init_id = match Self::send_request(
+            state,
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientInfo": {
+                    "name": "harness",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            }),
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                state.reset_child().await;
+                return Err(error);
+            }
+        };
+
+        let mut lines = state.stdout_lines.take().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(
+                "opencode stdout reader not available".into(),
+            )
+        })?;
+        let protocol_result = async {
+            loop {
+                match Self::read_next_message_with_timeout(&mut lines, stall_timeout, "initialize")
+                    .await?
+                {
+                    Some(ParsedAcpMessage::Response { id, .. })
+                        if response_id_matches(&id, init_id) =>
+                    {
+                        break;
+                    }
+                    Some(ParsedAcpMessage::RpcError { id, error })
+                        if response_id_matches(&id, init_id) =>
+                    {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            acp_error_message(&error, "opencode acp initialize failed"),
+                        ));
+                    }
+                    Some(ParsedAcpMessage::Event(AgentEvent::Warning { message })) => {
+                        tracing::warn!(agent = "opencode", "{message}");
+                    }
+                    Some(ParsedAcpMessage::Event(AgentEvent::Error { message })) => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(message));
+                    }
+                    Some(ParsedAcpMessage::Event(AgentEvent::EgressVerifiedAtDispatch))
+                        if await_container_egress_canary =>
+                    {
+                        egress_verified_at_dispatch = true;
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            "opencode acp exited during initialize".into(),
+                        ));
+                    }
+                }
+            }
+
+            Self::send_notification(state, "notifications/initialized", Value::Null).await?;
+
+            let session_request = Self::send_request(
+                state,
+                "session/new",
+                session_new_params(req, &child_workspace),
+            )
+            .await?;
+
+            loop {
+                match Self::read_next_message_with_timeout(&mut lines, stall_timeout, "session/new")
+                    .await?
+                {
+                    Some(ParsedAcpMessage::Response { id, result })
+                        if response_id_matches(&id, session_request) =>
+                    {
+                        if let Some(session_id) = result.get("sessionId").and_then(Value::as_str) {
+                            state.session_id = Some(session_id.to_string());
+                            break;
+                        }
+                    }
+                    Some(ParsedAcpMessage::RpcError { id, error })
+                        if response_id_matches(&id, session_request) =>
+                    {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            acp_error_message(&error, "opencode acp session/new failed"),
+                        ));
+                    }
+                    Some(ParsedAcpMessage::Event(AgentEvent::Warning { message })) => {
+                        tracing::warn!(agent = "opencode", "{message}");
+                    }
+                    Some(ParsedAcpMessage::Event(AgentEvent::Error { message })) => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(message));
+                    }
+                    Some(ParsedAcpMessage::Event(AgentEvent::EgressVerifiedAtDispatch))
+                        if await_container_egress_canary =>
+                    {
+                        egress_verified_at_dispatch = true;
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            "opencode acp exited before session/new completed".into(),
+                        ));
+                    }
+                }
+            }
+            if await_container_egress_canary && !egress_verified_at_dispatch {
+                return Err(harness_core::error::HarnessError::AgentExecution(
+                    "opencode acp started before the container egress canary reported success"
+                        .into(),
+                ));
+            }
+            Ok(())
+        }
+        .await;
+
+        match protocol_result {
+            Ok(()) => {
+                state.stdout_lines = Some(lines);
+                state.spawn_policy_fingerprint = Some(requested_fingerprint);
+                state.egress_verified_at_dispatch = egress_verified_at_dispatch;
+                Ok(())
+            }
+            Err(error) => {
+                drop(lines);
+                state.reset_child().await;
+                Err(error)
+            }
+        }
+    }
+}
+
+fn session_new_params(req: &AgentRequest, child_workspace: &std::path::Path) -> Value {
+    json!({
+        "cwd": child_workspace,
+        "mcpServers": [],
+        "configOptions": session_config_options(req),
+    })
+}
+
+fn session_config_options(req: &AgentRequest) -> Vec<Value> {
+    let mut options = Vec::new();
+    if let Some(model) = req.model.as_deref().filter(|value| !value.is_empty()) {
+        options.push(json!({ "id": "model", "value": model }));
+    }
+    options
+}
+
+#[async_trait]
+impl AgentAdapter for OpenCodeAcpAdapter {
+    fn name(&self) -> &str {
+        "opencode"
+    }
+
+    fn reports_usage_cost(&self) -> bool {
+        true
+    }
+
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: mpsc::Sender<AgentEvent>,
+    ) -> harness_core::error::Result<()> {
+        let req = self.effective_turn_request(req);
+        crate::spawn_supervisor::validate_capability_token(req.capability_token.as_ref())?;
+        let mut state = self.state.lock().await;
+        self.ensure_child(&req, &mut state).await?;
+        if state.egress_verified_at_dispatch {
+            tx.send(AgentEvent::EgressVerifiedAtDispatch)
+                .await
+                .map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "opencode acp event receiver closed after egress verification: {error}"
+                    ))
+                })?;
+        }
+
+        let session_id = state.session_id.clone().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(
+                "opencode session/new did not yield a session id".into(),
+            )
+        })?;
+
+        if let Err(error) = Self::send_request(
+            &mut state,
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [
+                    {
+                        "type": "text",
+                        "text": req.prompt,
+                    }
+                ],
+            }),
+        )
+        .await
+        {
+            state.reset_child().await;
+            return Err(error);
+        }
+
+        let mut lines = state.stdout_lines.take().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(
+                "opencode stdout reader not available".into(),
+            )
+        })?;
+        drop(state);
+
+        let mut turn_completed = false;
+        let mut receiver_closed = false;
+        let mut stdout_closed = false;
+        let stall_timeout = stall_timeout_for(&req);
+        let read_result = async {
+            while let Some(message) =
+                Self::read_next_message_with_timeout(&mut lines, stall_timeout, "turn").await?
+            {
+                match message {
+                    ParsedAcpMessage::Response { result, .. } => {
+                        // A JSON-RPC error response (e.g. -32602 invalid
+                        // params) must fail the turn, not be treated as a
+                        // successful completion.
+                        if result.get("error").is_some() || result.get("code").is_some() {
+                            let message = acp_error_message(&result, "opencode acp request failed");
+                            if tx.send(AgentEvent::Error { message }).await.is_err() {
+                                receiver_closed = true;
+                            }
+                            turn_completed = true;
+                            break;
+                        }
+                        let stop_reason = result.get("stopReason").and_then(Value::as_str);
+                        if stop_reason == Some("cancelled")
+                            && tx
+                                .send(AgentEvent::Error {
+                                    message: "opencode turn cancelled by agent".into(),
+                                })
+                                .await
+                                .is_err()
+                        {
+                            receiver_closed = true;
+                        }
+                        turn_completed = true;
+                        break;
+                    }
+                    ParsedAcpMessage::RpcError { error, .. } => {
+                        let message = acp_error_message(&error, "opencode acp request failed");
+                        if tx.send(AgentEvent::Error { message }).await.is_err() {
+                            receiver_closed = true;
+                        }
+                        turn_completed = true;
+                        break;
+                    }
+                    ParsedAcpMessage::Ignore => {}
+                    ParsedAcpMessage::Event(event) => {
+                        let is_terminal = matches!(
+                            event,
+                            AgentEvent::TurnCompleted { .. } | AgentEvent::Error { .. }
+                        );
+                        if tx.send(event).await.is_err() {
+                            receiver_closed = true;
+                            break;
+                        }
+                        if is_terminal {
+                            turn_completed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = read_result {
+            drop(lines);
+            let mut state = self.state.lock().await;
+            state.reset_child().await;
+            return Err(error);
+        }
+        if !turn_completed && !receiver_closed {
+            stdout_closed = true;
+        }
+
+        if stdout_closed {
+            drop(lines);
+            let mut state = self.state.lock().await;
+            state.reset_child().await;
+            return Err(harness_core::error::HarnessError::AgentExecution(
+                "opencode acp stdout closed before turn/completed".into(),
+            ));
+        }
+
+        if receiver_closed {
+            drop(lines);
+            let mut state = self.state.lock().await;
+            state.reset_child().await;
+            return Err(harness_core::error::HarnessError::AgentExecution(
+                "opencode event receiver closed before turn/completed".into(),
+            ));
+        }
+        self.state.lock().await.stdout_lines = Some(lines);
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> harness_core::error::Result<()> {
+        let mut state = self.state.lock().await;
+        let Some(session_id) = state.session_id.clone() else {
+            return Ok(());
+        };
+        Self::send_notification(
+            &mut state,
+            "session/cancel",
+            json!({ "sessionId": session_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        self.state.lock().await.reset_child().await;
+        Ok(())
+    }
+
+    async fn respond_approval(
+        &self,
+        id: String,
+        decision: ApprovalDecision,
+    ) -> harness_core::error::Result<()> {
+        let mut state = self.state.lock().await;
+        let request_id = request_id_from_string(&id);
+        let result = match decision {
+            ApprovalDecision::Accept => json!({ "outcome": "approved" }),
+            ApprovalDecision::Reject { reason } => {
+                json!({ "outcome": "rejected", "reason": reason })
+            }
+        };
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result,
+        });
+        Self::send_json_line(&mut state, &payload).await
+    }
+}
+
+#[cfg(test)]
+#[path = "opencode_adapter_tests.rs"]
+mod tests;
+
+#[cfg(all(test, unix))]
+mod spawn_policy_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn ready_child_restarts_when_spawn_policy_changes() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        let adapter = OpenCodeAcpAdapter::new(project.path().join("missing-opencode"));
+        let request = AgentRequest {
+            prompt: "ping".to_string(),
+            prompt_layers: None,
+            project_root: project.path().to_path_buf(),
+            permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
+            model: None,
+            reasoning_effort: None,
+            execution_phase: None,
+            sandbox_mode: Some(SandboxMode::DangerFullAccess),
+            approval_policy: None,
+            allowed_tools: None,
+            max_budget_usd: None,
+            context: Vec::new(),
+            timeout_secs: None,
+            env_vars: HashMap::new(),
+            capability_token: None,
+        };
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("60")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        crate::set_process_group(&mut command);
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing stdout"))?;
+        let mut state = AdapterState::new();
+        state.stdin = Some(stdin);
+        state.stdout_lines = Some(BufReader::new(stdout).lines());
+        state.child = Some(crate::ManagedChild::new(child, "opencode policy test"));
+        state.spawn_policy_fingerprint = Some(
+            crate::spawn_contract::adapter_spawn_policy_fingerprint(&request, adapter.sandbox_mode),
+        );
+
+        adapter.ensure_child(&request, &mut state).await?;
+        let mut scoped = request;
+        scoped.permission_mode = harness_core::config::agents::AgentPermissionMode::Scoped;
+        adapter
+            .ensure_child(&scoped, &mut state)
+            .await
+            .expect_err("changed policy must attempt a fresh spawn");
+
+        assert!(state.child.is_none());
+        assert!(state.spawn_policy_fingerprint.is_none());
+        Ok(())
+    }
+}

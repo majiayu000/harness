@@ -25,6 +25,38 @@ static PROJECT_WORKFLOW_MIGRATIONS: &[Migration] = &[
         sql: "CREATE INDEX IF NOT EXISTS idx_project_workflows_project
               ON project_workflows ((data::jsonb->>'project_id'))",
     },
+    Migration {
+        version: 3,
+        description: "index case-insensitive GitHub project workflow lookups",
+        sql: "CREATE INDEX IF NOT EXISTS idx_project_workflows_repo_ci
+              ON project_workflows (
+                  (data::jsonb->>'project_id'),
+                  (LOWER(data::jsonb->>'repo')),
+                  updated_at DESC
+              )",
+    },
+    Migration {
+        version: 4,
+        description: "enforce unique project workflow repository identities",
+        sql: "DO $$
+              BEGIN
+                IF EXISTS (
+                  SELECT 1 FROM project_workflows
+                  WHERE data::jsonb->>'repo' IS NOT NULL
+                  GROUP BY data::jsonb->>'project_id', LOWER(data::jsonb->>'repo')
+                  HAVING COUNT(*) > 1
+                ) THEN
+                  RAISE EXCEPTION 'project_workflows contains case-colliding repository identities; resolve duplicates before migration';
+                END IF;
+              END $$;
+              DROP INDEX IF EXISTS idx_project_workflows_repo_ci;
+              CREATE UNIQUE INDEX idx_project_workflows_repo_ci
+              ON project_workflows (
+                  (data::jsonb->>'project_id'),
+                  (LOWER(data::jsonb->>'repo'))
+              )
+              WHERE data::jsonb->>'repo' IS NOT NULL",
+    },
 ];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,6 +140,7 @@ pub struct ProjectWorkflowInstance {
 impl ProjectWorkflowInstance {
     pub fn new(project_id: impl Into<String>, repo: Option<String>) -> Self {
         let project_id = project_id.into();
+        let repo = repo.map(|repo| repo.to_ascii_lowercase());
         let now = Utc::now();
         Self {
             id: workflow_id(&project_id, repo.as_deref()),
@@ -243,6 +276,16 @@ impl ProjectWorkflowStore {
         &self,
         workflow: &ProjectWorkflowInstance,
     ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        lock_project_identity(&mut tx, &workflow.project_id, workflow.repo.as_deref()).await?;
+        if self
+            .load_for_update_by_project(&mut tx, &workflow.project_id, workflow.repo.as_deref())
+            .await?
+            .is_some()
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
         let data = serde_json::to_string(workflow)?;
         let result = sqlx::query(
             "INSERT INTO project_workflows (id, data) VALUES ($1, $2)
@@ -250,8 +293,9 @@ impl ProjectWorkflowStore {
         )
         .bind(&workflow.id)
         .bind(&data)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -264,8 +308,8 @@ impl ProjectWorkflowStore {
             sqlx::query_as(
                 "SELECT data FROM project_workflows
                  WHERE data::jsonb->>'project_id' = $1
-                   AND data::jsonb->>'repo' = $2
-                 ORDER BY updated_at DESC
+                   AND LOWER(data::jsonb->>'repo') = LOWER($2)
+                 ORDER BY (data::jsonb->>'repo' = $2) DESC, updated_at DESC
                  LIMIT 1",
             )
             .bind(project_id)
@@ -451,10 +495,21 @@ impl ProjectWorkflowStore {
     where
         F: FnOnce(&mut ProjectWorkflowInstance),
     {
-        let workflow_id = workflow_id(project_id, repo);
+        let mut tx = self.pool.begin().await?;
+        lock_project_identity(&mut tx, project_id, repo).await?;
+        if let Some((row_id, mut workflow)) = self
+            .load_for_update_by_project(&mut tx, project_id, repo)
+            .await?
+        {
+            f(&mut workflow);
+            self.upsert_in_tx(&mut tx, &workflow).await?;
+            debug_assert_eq!(workflow.id, row_id);
+            tx.commit().await?;
+            return Ok(workflow);
+        }
         let placeholder =
             ProjectWorkflowInstance::new(project_id.to_string(), repo.map(str::to_string));
-        let mut tx = self.pool.begin().await?;
+        let workflow_id = placeholder.id.clone();
         self.insert_placeholder(&mut tx, &workflow_id, &placeholder)
             .await?;
         let mut workflow = self
@@ -505,6 +560,42 @@ impl ProjectWorkflowStore {
             .map_err(Into::into)
     }
 
+    async fn load_for_update_by_project(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        project_id: &str,
+        repo: Option<&str>,
+    ) -> anyhow::Result<Option<(String, ProjectWorkflowInstance)>> {
+        let row: Option<(String, String)> = if let Some(repo) = repo {
+            sqlx::query_as(
+                "SELECT id, data FROM project_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND LOWER(data::jsonb->>'repo') = LOWER($2)
+                 ORDER BY (data::jsonb->>'repo' = $2) DESC, updated_at DESC
+                 LIMIT 1
+                 FOR UPDATE",
+            )
+            .bind(project_id)
+            .bind(repo)
+            .fetch_optional(&mut **tx)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, data FROM project_workflows
+                 WHERE data::jsonb->>'project_id' = $1
+                   AND data::jsonb->>'repo' IS NULL
+                 ORDER BY updated_at DESC
+                 LIMIT 1
+                 FOR UPDATE",
+            )
+            .bind(project_id)
+            .fetch_optional(&mut **tx)
+            .await?
+        };
+        row.map(|(id, data)| Ok((id, serde_json::from_str(&data)?)))
+            .transpose()
+    }
+
     async fn upsert_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -524,79 +615,25 @@ impl ProjectWorkflowStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use harness_core::db::resolve_database_url;
-
-    async fn open_test_store() -> anyhow::Result<Option<ProjectWorkflowStore>> {
-        if resolve_database_url(None).is_err() {
-            return Ok(None);
-        }
-        let dir = tempfile::tempdir()?;
-        match ProjectWorkflowStore::open(&dir.path().join("project_workflows.db")).await {
-            Ok(store) => Ok(Some(store)),
-            Err(e) => {
-                tracing::warn!("project workflow store test skipped: {e}");
-                Ok(None)
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn project_workflow_store_tracks_repo_state_transitions() -> anyhow::Result<()> {
-        let Some(store) = open_test_store().await? else {
-            return Ok(());
-        };
-        let project_id = "/tmp/project-c";
-        store
-            .record_poll_started(project_id, Some("owner/repo"))
-            .await?;
-        store
-            .record_planning_started(project_id, Some("owner/repo"))
-            .await?;
-        store
-            .record_planner_enqueued(project_id, Some("owner/repo"), "planner-1")
-            .await?;
-        store
-            .record_monitoring_started(project_id, Some("owner/repo"))
-            .await?;
-
-        let workflow = store
-            .get_by_project(project_id, Some("owner/repo"))
-            .await?
-            .expect("project workflow");
-        assert_eq!(workflow.state, ProjectWorkflowState::Monitoring);
-        assert_eq!(
-            workflow.active_planner_task_id.as_deref(),
-            Some("planner-1")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn project_workflow_store_scopes_rows_by_repo() -> anyhow::Result<()> {
-        let Some(store) = open_test_store().await? else {
-            return Ok(());
-        };
-        let project_id = "/tmp/shared-project";
-        store
-            .record_poll_started(project_id, Some("owner/repo-a"))
-            .await?;
-        store
-            .record_poll_started(project_id, Some("owner/repo-b"))
-            .await?;
-
-        let a = store
-            .get_by_project(project_id, Some("owner/repo-a"))
-            .await?
-            .expect("repo-a workflow");
-        let b = store
-            .get_by_project(project_id, Some("owner/repo-b"))
-            .await?
-            .expect("repo-b workflow");
-
-        assert_ne!(a.id, b.id);
-        Ok(())
-    }
+async fn lock_project_identity(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    project_id: &str,
+    repo: Option<&str>,
+) -> anyhow::Result<()> {
+    let canonical_repo = repo.map(str::to_ascii_lowercase);
+    let lock_key =
+        serde_json::to_string(&("project_workflow_identity", project_id, canonical_repo))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
+
+#[cfg(test)]
+#[path = "project_lifecycle_migration_tests.rs"]
+mod migration_tests;
+
+#[cfg(test)]
+#[path = "project_lifecycle_tests.rs"]
+mod tests;

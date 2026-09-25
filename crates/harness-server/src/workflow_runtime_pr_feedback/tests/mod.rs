@@ -1,0 +1,996 @@
+use super::*;
+use harness_core::db::resolve_database_url;
+
+#[tokio::test]
+async fn pr_detected_persists_pr_open_state() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("task-1");
+
+    record_pr_detected(
+        Some(&store),
+        PrDetectedRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: "https://github.com/owner/repo/pull/77",
+        },
+    )
+    .await;
+
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("workflow instance should be persisted");
+    assert_eq!(instance.state, "pr_open");
+    assert_eq!(
+        store.events_for(&workflow_id).await?[0].event_type,
+        "PrDetected"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transient_pr_lifecycle_persist_failure_is_retried_and_converges() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("transient-pr-lifecycle-persist-failure");
+    let _guard = set_pr_lifecycle_persist_test_failures(task_id.as_str(), 2);
+
+    record_pr_detected(
+        Some(&store),
+        PrDetectedRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: "https://github.com/owner/repo/pull/77",
+        },
+    )
+    .await;
+
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    let instance = store.get_instance(&workflow_id).await?;
+    let Some(instance) = instance else {
+        anyhow::bail!("workflow instance should be persisted after retry");
+    };
+    assert_eq!(instance.state, "pr_open");
+    let events = store.events_for(&workflow_id).await?;
+    assert!(events.iter().any(|event| event.event_type == "PrDetected"));
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "PrLifecyclePersistenceFailed"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_pr_lifecycle_persist_failure_records_operator_event() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("persistent-pr-lifecycle-persist-failure");
+    let _guard =
+        set_pr_lifecycle_persist_test_failures(task_id.as_str(), PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS);
+
+    record_pr_detected(
+        Some(&store),
+        PrDetectedRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: "https://github.com/owner/repo/pull/77",
+        },
+    )
+    .await;
+
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    let instance = store.get_instance(&workflow_id).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "persistent failure should create a terminal workflow for operator-visible events"
+        )
+    })?;
+    assert_eq!(instance.state, "failed");
+    assert!(instance.is_terminal());
+    let events = store.events_for(&workflow_id).await?;
+    let failure_event = events
+        .iter()
+        .find(|event| event.event_type == "PrLifecyclePersistenceFailed");
+    let Some(failure_event) = failure_event else {
+        anyhow::bail!("persistent failure should create an operator-visible workflow event");
+    };
+    assert_eq!(failure_event.event["operation"], "record_pr_detected");
+    assert_eq!(
+        failure_event.event["attempts"],
+        serde_json::json!(PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS)
+    );
+    assert_eq!(failure_event.event["issue_number"], 123);
+    assert_eq!(failure_event.event["pr_number"], 77);
+    assert_eq!(failure_event.event["task_id"], task_id.as_str());
+    assert!(failure_event.event["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("injected PR lifecycle persist failure")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_pr_lifecycle_persist_failure_preserves_existing_workflow() -> anyhow::Result<()>
+{
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("existing-pr-lifecycle-persist-failure");
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    let existing = issue_instance(
+        workflow_id.clone(),
+        project_root.to_string_lossy().into_owned(),
+        Some("owner/repo".to_string()),
+        123,
+        "awaiting_feedback",
+    )
+    .with_server_data(json!({
+        "project_id": project_root.to_string_lossy(),
+        "repo": "owner/repo",
+        "issue_number": 123,
+        "marker": "real",
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &existing).await?;
+    let _guard =
+        set_pr_lifecycle_persist_test_failures(task_id.as_str(), PR_LIFECYCLE_PERSIST_MAX_ATTEMPTS);
+
+    record_pr_detected(
+        Some(&store),
+        PrDetectedRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: "https://github.com/owner/repo/pull/77",
+        },
+    )
+    .await;
+
+    let Some(instance) = store.get_instance(&workflow_id).await? else {
+        anyhow::bail!("existing workflow should still be present after failure recording");
+    };
+    assert_eq!(instance.state, "awaiting_feedback");
+    assert_eq!(instance.data["marker"], "real");
+    assert!(instance.data.get("failure_kind").is_none());
+
+    let events = store.events_for(&workflow_id).await?;
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "PrLifecyclePersistenceFailed"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejected_new_runtime_decision_persists_initial_instance() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    upsert_github_issue_pr_definition(&store).await?;
+    let instance = issue_instance(
+        workflow_id.clone(),
+        project_root.to_string_lossy().into_owned(),
+        Some("owner/repo".to_string()),
+        123,
+        "pr_open",
+    );
+    let decision = WorkflowDecision::new(
+        &workflow_id,
+        "awaiting_feedback",
+        "record_feedback",
+        "addressing_feedback",
+        "intentionally stale observed state",
+    );
+
+    let outcome = commit_runtime_decision(
+        &store,
+        instance.clone(),
+        true,
+        decision,
+        "FeedbackFound",
+        "workflow_runtime_pr_feedback_test",
+        json!({ "issue_number": 123, "pr_number": 77 }),
+        instance.data.clone(),
+    )
+    .await?;
+
+    assert!(matches!(
+        outcome,
+        RuntimeDecisionCommitOutcome::Rejected { .. }
+    ));
+    let loaded = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("rejected initial transition should still persist the workflow instance");
+    assert_eq!(loaded.state, "pr_open");
+    assert_eq!(store.events_for(&workflow_id).await?.len(), 1);
+    let decisions = store.decisions_for(&workflow_id).await?;
+    assert_eq!(decisions.len(), 1);
+    assert!(!decisions[0].accepted);
+    Ok(())
+}
+
+#[test]
+fn atomic_validation_rejection_is_not_reported_as_accepted() {
+    let workflow_id = "atomic-validation-rejection";
+    let decision = WorkflowDecision::new(
+        workflow_id,
+        "addressing_feedback",
+        "address_feedback",
+        "local_review_gate",
+        "feedback addressed",
+    )
+    .with_command(WorkflowCommand::enqueue_activity(
+        "run_local_review",
+        "atomic-validation-rejection-command",
+    ));
+
+    assert_eq!(
+        outcome_from_atomic_record(Some(WorkflowDecisionRecord::accepted(
+            decision.clone(),
+            Some("atomic-validation-event".to_string()),
+        ))),
+        RuntimeDecisionCommitOutcome::Accepted
+    );
+    assert_eq!(
+        outcome_from_atomic_record(None),
+        RuntimeDecisionCommitOutcome::Stale
+    );
+
+    let outcome = outcome_from_atomic_record(Some(WorkflowDecisionRecord::rejected(
+        decision,
+        Some("atomic-validation-event".to_string()),
+        "atomic validator rejected the transition",
+    )));
+
+    let RuntimeDecisionCommitOutcome::Rejected { reason } = outcome else {
+        panic!("atomic validator rejection must not be reported as success");
+    };
+    assert_eq!(reason, "atomic validator rejected the transition");
+}
+
+#[tokio::test]
+async fn pr_feedback_does_not_reopen_a_passed_local_review() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("task-1");
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    record_pr_detected(
+        Some(&store),
+        PrDetectedRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: 123,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: "https://github.com/owner/repo/pull/77",
+        },
+    )
+    .await;
+
+    request_local_review(&store, &workflow_id).await?;
+    persist_local_review_passed(
+        &store,
+        &LocalReviewPassedRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: Some(123),
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            summary: "Local agent review approved the PR.",
+        },
+    )
+    .await?;
+
+    let commands_after_local_review = store.commands_for(&workflow_id).await?;
+    assert_eq!(
+        commands_after_local_review
+            .iter()
+            .filter(|command| command.command.activity_name()
+                == Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY))
+            .count(),
+        1,
+        "passing review must not enqueue a second review"
+    );
+    assert_eq!(
+        store
+            .get_instance(&workflow_id)
+            .await?
+            .expect("approved workflow")
+            .state,
+        "ready_to_merge"
+    );
+
+    record_pr_feedback(
+        Some(&store),
+        PrFeedbackRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: Some(123),
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            outcome: PrFeedbackOutcome::ReadyToMerge,
+            summary: "Reviewer approved and validation passed.",
+        },
+    )
+    .await;
+
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("workflow instance should be persisted");
+    assert_eq!(instance.state, "ready_to_merge");
+    let events = store.events_for(&workflow_id).await?;
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "PrReadyToMerge"));
+    assert_eq!(
+        store.commands_for(&workflow_id).await?.len(),
+        commands_after_local_review.len()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pr_feedback_without_issue_requests_local_review_first() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("pr-feedback-task");
+
+    record_pr_feedback(
+        Some(&store),
+        PrFeedbackRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: None,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            outcome: PrFeedbackOutcome::BlockingFeedback,
+            summary: "Review found actionable feedback.",
+        },
+    )
+    .await;
+
+    let workflow_id = pr_workflow_id(&project_root.to_string_lossy(), Some("owner/repo"), 77);
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("PR-scoped workflow should be persisted");
+    assert_eq!(instance.subject.subject_type, "pr");
+    assert_eq!(instance.subject.subject_key, "pr:77");
+    assert_eq!(instance.state, "local_review_gate");
+    assert_eq!(instance.data["pr_number"], 77);
+    assert!(instance.data.get("issue_number").is_none());
+    let events = store.events_for(&workflow_id).await?;
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "LocalReviewRequested"));
+    let commands = store.commands_for(&workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].command.activity_name(),
+        Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pr_hygiene_repair_requests_address_pr_feedback_with_context() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project-hygiene");
+    std::fs::create_dir(&project_root)?;
+    let task_id =
+        synthesized_pr_feedback_task_id(&project_root.to_string_lossy(), Some("owner/repo"), 81);
+
+    let outcome = request_pr_hygiene_repair(
+        &store,
+        PrHygieneRepairRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            task_id: &task_id,
+            pr_number: 81,
+            pr_url: Some("https://github.com/owner/repo/pull/81"),
+            title: Some("Dirty PR"),
+            merge_state_status: Some("DIRTY"),
+            head_oid: Some("abc123"),
+            updated_at: Some("2026-06-10T00:00:00Z"),
+            observed_at: "2026-06-12T00:00:00Z",
+            dirty_age_secs: 172800,
+            dirty_age_to_repair_secs: 172800,
+            dirty_age_to_comment_secs: 604800,
+            rebase_needed_label: "rebase-needed",
+        },
+    )
+    .await?;
+
+    let workflow_id = match outcome {
+        PrFeedbackSweepRequestOutcome::Requested { workflow_id, .. } => workflow_id,
+        other => anyhow::bail!("expected hygiene repair request, got {other:?}"),
+    };
+    let Some(instance) = store.get_instance(&workflow_id).await? else {
+        anyhow::bail!("workflow should exist");
+    };
+    assert_eq!(instance.state, "addressing_feedback");
+    assert_eq!(instance.data["feedback_repair_round"], 1);
+    assert!(instance.data.get("feedback_repair_blocker_count").is_none());
+    assert_eq!(instance.data["feedback_repair_lane"], "remote_feedback");
+    let commands = store.commands_for(&workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].command.activity_name(),
+        Some("address_pr_feedback")
+    );
+    assert_eq!(commands[0].command.command["source"], "pr_hygiene");
+    assert_eq!(
+        commands[0].command.command["hygiene"]["dirty_age_secs"],
+        172800
+    );
+    assert_eq!(
+        commands[0].command.command["hygiene"]["rebase_needed_label"],
+        "rebase-needed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pr_feedback_without_issue_uses_bound_workflow_for_local_review() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("pr-feedback-task");
+    let issue_workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    upsert_github_issue_pr_definition(&store).await?;
+    let issue_workflow = issue_instance(
+        issue_workflow_id.clone(),
+        project_root.to_string_lossy().into_owned(),
+        Some("owner/repo".to_string()),
+        123,
+        "pr_open",
+    )
+    .with_server_data(json!({
+        "project_id": project_root.to_string_lossy(),
+        "repo": "owner/repo",
+        "issue_number": 123,
+        "task_id": "issue-task",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &issue_workflow)
+        .await?;
+
+    record_pr_feedback(
+        Some(&store),
+        PrFeedbackRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: None,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            outcome: PrFeedbackOutcome::ReadyToMerge,
+            summary: "Reviewer approved and validation passed.",
+        },
+    )
+    .await;
+
+    let instance = store
+        .get_instance(&issue_workflow_id)
+        .await?
+        .expect("issue workflow should still exist");
+    assert_eq!(instance.state, "local_review_gate");
+    assert_eq!(instance.data["issue_number"], 123);
+    assert_eq!(instance.data["pr_number"], 77);
+    let pr_scoped_id = pr_workflow_id(&project_root.to_string_lossy(), Some("owner/repo"), 77);
+    assert!(store.get_instance(&pr_scoped_id).await?.is_none());
+    let commands = store.commands_for(&issue_workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        commands[0].command.activity_name(),
+        Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_mixed_case_pr_requests_share_one_canonical_workflow() -> anyhow::Result<()> {
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("mixed-case-concurrent-pr");
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let first_barrier = barrier.clone();
+    let second_barrier = barrier;
+
+    let (first, second) = tokio::join!(
+        request_pr_feedback_sweep_for_pr_with_admission(
+            &store,
+            PrFeedbackSweepRuntimeContext {
+                project_root: &project_root,
+                repo: Some("Owner/Repo"),
+                task_id: &task_id,
+                pr_number: 78,
+                pr_url: Some("https://github.com/Owner/Repo/pull/78"),
+            },
+            None,
+            move || {
+                let barrier = first_barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    Ok(())
+                }
+            },
+        ),
+        request_pr_feedback_sweep_for_pr_with_admission(
+            &store,
+            PrFeedbackSweepRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                task_id: &task_id,
+                pr_number: 78,
+                pr_url: Some("https://github.com/owner/repo/pull/78"),
+            },
+            None,
+            move || {
+                let barrier = second_barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    Ok(())
+                }
+            },
+        )
+    );
+    let outcomes = [first?, second?];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, PrFeedbackSweepRequestOutcome::Requested { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, PrFeedbackSweepRequestOutcome::NotCandidate { .. }))
+            .count(),
+        1
+    );
+
+    let project_id = project_root.to_string_lossy();
+    let canonical_id = pr_workflow_id(&project_id, Some("owner/repo"), 78);
+    let mixed_case_id = format!("{project_id}::repo:Owner/Repo::pr:78:feedback");
+    for outcome in &outcomes {
+        let workflow_id = match outcome {
+            PrFeedbackSweepRequestOutcome::Requested { workflow_id, .. }
+            | PrFeedbackSweepRequestOutcome::NotCandidate { workflow_id, .. }
+            | PrFeedbackSweepRequestOutcome::ActiveCommandExists { workflow_id, .. }
+            | PrFeedbackSweepRequestOutcome::Rejected { workflow_id, .. } => workflow_id,
+        };
+        assert_eq!(workflow_id, &canonical_id);
+    }
+    let instance = store
+        .get_instance(&canonical_id)
+        .await?
+        .expect("canonical PR workflow should be persisted");
+    assert_eq!(instance.data["repo"], "owner/repo");
+    assert!(store.get_instance(&mixed_case_id).await?.is_none());
+    assert_eq!(store.commands_for(&canonical_id).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pr_merged_without_issue_creates_pr_scoped_done_workflow() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("pr-feedback-task");
+
+    record_pr_merged(
+        Some(&store),
+        PrMergedRuntimeContext {
+            project_root: &project_root,
+            repo: Some("owner/repo"),
+            issue_number: None,
+            task_id: &task_id,
+            pr_number: 77,
+            pr_url: Some("https://github.com/owner/repo/pull/77"),
+            summary: "PR merged externally.",
+        },
+    )
+    .await;
+
+    let workflow_id = pr_workflow_id(&project_root.to_string_lossy(), Some("owner/repo"), 77);
+    let instance = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("PR-scoped workflow should be persisted");
+    assert_eq!(instance.state, "done");
+    assert_eq!(instance.data["pr_number"], 77);
+    assert!(instance.data.get("issue_number").is_none());
+    let events = store.events_for(&workflow_id).await?;
+    assert!(events.iter().any(|event| event.event_type == "PrMerged"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_local_review_records_runtime_command() -> anyhow::Result<()> {
+    let Ok(database_url) = resolve_database_url(None) else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        match WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await {
+            Ok(store) => store,
+            Err(_) => return Ok(()),
+        };
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let workflow_id = harness_workflow::issue_lifecycle::workflow_id(
+        &project_root.to_string_lossy(),
+        Some("owner/repo"),
+        123,
+    );
+    upsert_github_issue_pr_definition(&store).await?;
+    let instance = issue_instance(
+        workflow_id.clone(),
+        project_root.to_string_lossy().into_owned(),
+        Some("owner/repo".to_string()),
+        123,
+        "pr_open",
+    )
+    .with_server_data(json!({
+        "project_id": project_root.to_string_lossy(),
+        "repo": "owner/repo",
+        "issue_number": 123,
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "task_id": "task-1",
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &instance).await?;
+
+    let outcome = request_local_review(&store, &workflow_id).await?;
+    assert_eq!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested {
+            workflow_id: workflow_id.clone(),
+            task_id: "task-1".to_string(),
+        }
+    );
+    let updated = store
+        .get_instance(&workflow_id)
+        .await?
+        .expect("workflow should still exist");
+    assert_eq!(updated.state, "local_review_gate");
+    assert_eq!(updated.data["last_decision"], "run_local_review");
+    let commands = store.commands_for(&workflow_id).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].status, "pending");
+    assert_eq!(
+        commands[0].command.command_type,
+        harness_workflow::runtime::WorkflowCommandType::EnqueueActivity
+    );
+    assert_eq!(
+        commands[0].command.activity_name(),
+        Some(harness_workflow::runtime::LOCAL_REVIEW_ACTIVITY)
+    );
+    assert_eq!(commands[0].command.command["pr_number"], 77);
+
+    let claimed = store
+        .claim_pending_commands(
+            "dispatching-pr-feedback-test",
+            chrono::Utc::now() + chrono::Duration::seconds(30),
+            1,
+        )
+        .await?;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].status, "dispatching");
+
+    let second = request_local_review(&store, &workflow_id).await?;
+    assert_eq!(
+        second,
+        PrFeedbackSweepRequestOutcome::NotCandidate {
+            workflow_id: workflow_id.clone(),
+            state: "local_review_gate".to_string(),
+        }
+    );
+    assert_eq!(store.commands_for(&workflow_id).await?.len(), 1);
+    Ok(())
+}
+
+mod restart_suppression;
+mod suppression;
+
+#[tokio::test]
+async fn merge_readiness_review_preserves_new_head_through_persistence() -> anyhow::Result<()> {
+    use harness_workflow::runtime::{
+        reduce_runtime_job_completed, ActivityResult, ActivitySignal, WorkflowEvent,
+        LOCAL_REVIEW_ACTIVITY, LOCAL_REVIEW_PASSED_SIGNAL,
+    };
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
+    let ready = pr_scoped_instance(
+        format!("head-review-{}", uuid::Uuid::new_v4()),
+        dir.path().to_string_lossy().into_owned(),
+        Some("owner/repo".into()),
+        &TaskId::from_str("head-review"),
+        77,
+        None,
+        "ready_to_merge",
+    )
+    .with_server_data(json!({"pr_number":77, "merge_review_head_sha":"old-head"}));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &ready).await?;
+    let outcome = request_merge_readiness_review(&store, ready.clone(), "new-head").await?;
+    assert!(matches!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested { .. }
+    ));
+    let reviewing = store
+        .get_instance(&ready.id)
+        .await?
+        .expect("persisted review");
+    assert_eq!(reviewing.state, "local_review_gate");
+    assert_eq!(reviewing.data["merge_review_head_sha"], "new-head");
+    let result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Reviewed new head").with_signal(
+        ActivitySignal::new(
+            LOCAL_REVIEW_PASSED_SIGNAL,
+            json!({"reviewed_head_sha":"new-head", "working_tree_clean":true}),
+        ),
+    );
+    let event =
+        WorkflowEvent::new(&ready.id, 1, "RuntimeJobCompleted", "runtime-1").with_payload(json!({
+            "command_id":"command-1",
+            "command": WorkflowCommand::enqueue_activity(LOCAL_REVIEW_ACTIVITY, "review-1"),
+            "runtime_job_id":"job-1", "activity_result":result
+        }));
+    let decision = reduce_runtime_job_completed(&reviewing, &event)?.expect("review decision");
+    assert_eq!(decision.next_state, "ready_to_merge");
+    let accepted_data = reviewing.data.clone();
+    let outcome = commit_runtime_decision(
+        &store,
+        reviewing,
+        false,
+        decision,
+        "RuntimeJobCompleted",
+        "runtime-1",
+        event.event,
+        accepted_data,
+    )
+    .await?;
+    assert!(matches!(outcome, RuntimeDecisionCommitOutcome::Accepted));
+    let approved = store
+        .get_instance(&ready.id)
+        .await?
+        .expect("approved review");
+    assert_eq!(approved.state, "ready_to_merge");
+    assert_eq!(approved.data["merge_review_head_sha"], "new-head");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pr_requirements_reopen_ready_review_atomically() -> anyhow::Result<()> {
+    let Some(database_url) = crate::test_helpers::configured_test_database_url()? else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let store =
+        WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
+    let task_id = TaskId::from_str("requirements-review");
+    let ctx = || PrFeedbackSweepRuntimeContext {
+        project_root: dir.path(),
+        repo: Some("owner/requirements"),
+        task_id: &task_id,
+        pr_number: 17,
+        pr_url: None,
+    };
+    let id = pr_workflow_id(
+        &dir.path().to_string_lossy(),
+        Some("owner/requirements"),
+        17,
+    );
+    let outcome = request_pr_feedback_sweep_for_pr_with_admission(
+        &store,
+        ctx(),
+        Some("Retain the requested upgrade."),
+        || async { Ok(()) },
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested { .. }
+    ));
+    let first = store
+        .get_instance(&id)
+        .await?
+        .expect("persisted submission");
+    assert_eq!(
+        first.data["additional_prompt"],
+        "Retain the requested upgrade."
+    );
+    assert_eq!(
+        pr_runtime_field_provenance("additional_prompt"),
+        DataProvenance::External
+    );
+
+    // Exercise persistence admission with a ready state, without inventing an Agent verdict.
+    let ready_id = format!("{id}-ready");
+    let ready = pr_scoped_instance(
+        ready_id.clone(),
+        dir.path().to_string_lossy().into_owned(),
+        Some("owner/requirements".into()),
+        &task_id,
+        17,
+        None,
+        "ready_to_merge",
+    )
+    .with_server_data(json!({"pr_number":17,"task_id":task_id.as_str(),
+            "additional_prompt":"Original requirement", "merge_review_head_sha":"old-head"}));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &ready).await?;
+    let rejected = request_local_review_with_admission(
+        &store,
+        &ready_id,
+        Some("Updated requirement"),
+        || async { anyhow::bail!("remote admission denied") },
+    )
+    .await;
+    assert!(rejected.is_err());
+    let unchanged = store
+        .get_instance(&ready_id)
+        .await?
+        .expect("ready instance");
+    assert_eq!(unchanged.state, "ready_to_merge");
+    assert_eq!(unchanged.data["additional_prompt"], "Original requirement");
+    assert!(store.commands_for(&ready_id).await?.is_empty());
+    let outcome = request_local_review_with_admission(
+        &store,
+        &ready_id,
+        Some("Updated requirement"),
+        || async { Ok(()) },
+    )
+    .await?;
+    assert!(matches!(
+        outcome,
+        PrFeedbackSweepRequestOutcome::Requested { .. }
+    ));
+    let updated = store
+        .get_instance(&ready_id)
+        .await?
+        .expect("reopened review");
+    assert_eq!(updated.state, "local_review_gate");
+    assert_eq!(updated.data["additional_prompt"], "Updated requirement");
+    assert!(updated.data.get("merge_review_head_sha").is_none());
+    assert_eq!(store.commands_for(&ready_id).await?.len(), 1);
+    Ok(())
+}

@@ -5,8 +5,7 @@ use harness_workflow::runtime::{
     PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY, PR_FEEDBACK_DEFINITION_ID,
     PR_FEEDBACK_INSPECT_ACTIVITY, PR_FEEDBACK_SNAPSHOT_ARTIFACT, PR_REPAIR_SNAPSHOT_ARTIFACT,
     QUALITY_BLOCKED_SIGNAL, QUALITY_FAILED_SIGNAL, QUALITY_GATE_ACTIVITY,
-    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, SCOPE_TOO_LARGE_SIGNAL,
-    SERVER_PR_SNAPSHOT_ARTIFACT,
+    QUALITY_GATE_DEFINITION_ID, QUALITY_PASSED_SIGNAL, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -87,7 +86,7 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
                     harness_workflow::runtime::LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
                     harness_workflow::runtime::LOCAL_REVIEW_BLOCKED_SIGNAL,
                 ])
-                .requires("at_least_one_local_review_outcome_signal")
+                .requires("exactly_one_local_review_outcome_signal")
         }
         (GITHUB_ISSUE_PR_DEFINITION_ID, "sweep_pr_feedback")
         | (GITHUB_ISSUE_PR_DEFINITION_ID, PR_FEEDBACK_INSPECT_ACTIVITY) => {
@@ -98,7 +97,6 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
                 .with_accepted_signals(vec![
                     ISSUE_CLOSED_SIGNAL,
                     ISSUE_ALREADY_RESOLVED_SIGNAL,
-                    SCOPE_TOO_LARGE_SIGNAL,
                 ])
                 .with_accepted_artifacts(vec![
                     "pull_request",
@@ -106,7 +104,7 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
                     ISSUE_STATE_ARTIFACT,
                     "workflow_decision",
                 ])
-                .requires("pull_request_artifact_or_closed_issue_or_scope_too_large_signal; deferred submission mode requires candidate_branch instead of pull_request")
+                .requires("pull_request_artifact_or_closed_issue_signal; deferred submission mode requires candidate_branch instead of pull_request")
         }
         (GITHUB_ISSUE_PR_DEFINITION_ID, CANDIDATE_PROMOTION_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)
@@ -139,8 +137,12 @@ pub(super) fn activity_contract(workflow_definition: &str, activity: &str) -> Ac
         .requires("pr_repair_snapshot_with_action_and_passing_validation_or_closed_issue_evidence"),
         (PROMPT_TASK_DEFINITION_ID, PROMPT_TASK_IMPLEMENT_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)
-                .with_accepted_artifacts(vec!["validation_report"])
-                .requires("validation_evidence")
+                .with_accepted_artifacts(vec![
+                    "validation_report",
+                    "no_change_rationale",
+                    "pull_request",
+                ])
+                .requires("validation_report artifact ([{command, exit_code}]) or no_change_rationale string artifact; completion is rejected without one of them")
         }
         (QUALITY_GATE_DEFINITION_ID, QUALITY_GATE_ACTIVITY) => {
             ActivityContract::new(workflow_definition, activity)

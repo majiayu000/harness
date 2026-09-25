@@ -9,32 +9,7 @@ impl WorkflowRuntimeStore {
         payload: Value,
     ) -> anyhow::Result<WorkflowEvent> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!("workflow_events:{workflow_id}"))
-            .execute(&mut *tx)
-            .await?;
-        let (next_sequence,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workflow_events WHERE workflow_id = $1",
-        )
-        .bind(workflow_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let event = WorkflowEvent::new(workflow_id, next_sequence as u64, event_type, source)
-            .with_payload(payload);
-        let data = to_jsonb_string(&event)?;
-        sqlx::query(
-            "INSERT INTO workflow_events
-                (id, workflow_id, sequence, event_type, source, data)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
-        )
-        .bind(&event.id)
-        .bind(&event.workflow_id)
-        .bind(event.sequence as i64)
-        .bind(&event.event_type)
-        .bind(&event.source)
-        .bind(&data)
-        .execute(&mut *tx)
-        .await?;
+        let event = insert_event_tx(&mut tx, workflow_id, event_type, source, payload).await?;
         tx.commit().await?;
         Ok(event)
     }

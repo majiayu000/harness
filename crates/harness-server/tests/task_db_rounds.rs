@@ -3,8 +3,9 @@
 
 use harness_core::error::TaskDbDecodeError;
 use harness_core::types::TaskId as CoreTaskId;
-use harness_server::task_db::TaskDb;
-use harness_server::task_runner::{TaskKind, TaskPhase, TaskSchedulerState, TaskState, TaskStatus};
+use harness_server::server::test_support::{
+    TaskDb, TaskKind, TaskPhase, TaskSchedulerState, TaskState, TaskStatus,
+};
 
 fn make_task(id: &str) -> TaskState {
     TaskState {

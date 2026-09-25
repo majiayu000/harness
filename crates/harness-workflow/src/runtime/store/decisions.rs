@@ -1,25 +1,16 @@
 use super::*;
 
 impl WorkflowRuntimeStore {
+    /// Record a decision on its own, outside a larger transition.
+    ///
+    /// Shares the append-only write with every in-transaction writer: a repeat
+    /// of the same row is an idempotent replay, and a repeat that differs is a
+    /// [`DecisionProvenanceConflict`](super::DecisionProvenanceConflict)
+    /// rather than an overwrite (GH-1865).
     pub async fn record_decision(&self, record: &WorkflowDecisionRecord) -> anyhow::Result<()> {
-        let data = to_jsonb_string(record)?;
-        sqlx::query(
-            "INSERT INTO workflow_decisions
-                (id, workflow_id, event_id, accepted, data, rejection_reason)
-             VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-             ON CONFLICT (id) DO UPDATE SET
-                accepted = EXCLUDED.accepted,
-                data = EXCLUDED.data,
-                rejection_reason = EXCLUDED.rejection_reason",
-        )
-        .bind(&record.id)
-        .bind(&record.workflow_id)
-        .bind(&record.event_id)
-        .bind(record.accepted)
-        .bind(&data)
-        .bind(&record.rejection_reason)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        insert_decision_record_once_tx(&mut tx, record).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -63,6 +54,40 @@ impl WorkflowRuntimeStore {
                 .push(serde_json::from_str(&data)?);
         }
         Ok(by_workflow)
+    }
+
+    pub async fn latest_unresolved_rejection_for_workflow(
+        &self,
+        workflow_id: &str,
+    ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT rejected.data::text
+             FROM workflow_decisions AS rejected
+             JOIN workflow_events AS rejected_event
+               ON rejected_event.id = rejected.event_id
+              AND rejected_event.workflow_id = rejected.workflow_id
+             WHERE rejected.workflow_id = $1
+               AND rejected.accepted = false
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM workflow_decisions AS progress
+                   JOIN workflow_events AS progress_event
+                     ON progress_event.id = progress.event_id
+                    AND progress_event.workflow_id = progress.workflow_id
+                   WHERE progress.workflow_id = rejected.workflow_id
+                     AND progress.accepted = true
+                     AND progress_event.sequence >= rejected_event.sequence
+                     AND progress.data->'decision'->>'observed_state'
+                         <> progress.data->'decision'->>'next_state'
+               )
+             ORDER BY rejected_event.sequence DESC
+             LIMIT 1",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(data,)| serde_json::from_str(&data).map_err(Into::into))
+            .transpose()
     }
 
     pub async fn detail_counts_for_workflows(

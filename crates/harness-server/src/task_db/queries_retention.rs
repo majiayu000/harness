@@ -5,6 +5,43 @@ use super::TaskDb;
 use crate::task_runner::TaskStatus;
 
 impl TaskDb {
+    /// Count terminal tasks eligible for retention pruning without deleting.
+    /// Bounded by the same batch limit as `prune_terminal_tasks_before` so
+    /// dry-run reports match what the next real pass would delete.
+    pub async fn count_terminal_tasks_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: u32,
+    ) -> anyhow::Result<u64> {
+        super::record_task_db_usage();
+        if batch_size == 0 {
+            return Ok(0);
+        }
+
+        let terminal_statuses = TaskStatus::terminal_statuses();
+        let placeholders = Self::numbered_placeholders(3, terminal_statuses.len());
+        let batch_param = terminal_statuses.len() + 3;
+        let select_sql = format!(
+            "SELECT COUNT(*) FROM tasks \
+             WHERE store_key = $1 AND updated_at < $2 AND status IN ({placeholders}) \
+             AND id IN (SELECT id FROM tasks \
+                WHERE store_key = $1 AND updated_at < $2 AND status IN ({placeholders}) \
+                ORDER BY updated_at ASC, id ASC LIMIT ${batch_param})"
+        );
+        let mut query = sqlx::query_scalar::<_, i64>(&select_sql)
+            .bind(&self.store_key)
+            .bind(cutoff);
+        for status in terminal_statuses {
+            query = query.bind(*status);
+        }
+        query = query.bind(i64::from(batch_size));
+        for status in TaskStatus::terminal_statuses() {
+            query = query.bind(*status);
+        }
+        let count = query.fetch_one(&self.pool).await?;
+        Ok(count.max(0) as u64)
+    }
+
     pub async fn prune_terminal_tasks_before(
         &self,
         cutoff: DateTime<Utc>,

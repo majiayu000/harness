@@ -92,10 +92,12 @@ fn deduplicate_keeps_unique_skills() {
 #[test]
 fn create_adds_skill_to_store() {
     let mut store = SkillStore::new();
-    store.create(
-        "my-skill".to_string(),
-        "# My Skill\nDoes stuff.".to_string(),
-    );
+    store
+        .create(
+            "my-skill".to_string(),
+            "# My Skill\nDoes stuff.".to_string(),
+        )
+        .unwrap();
     assert_eq!(store.list().len(), 1);
     assert_eq!(store.list()[0].name, "my-skill");
 }
@@ -103,7 +105,9 @@ fn create_adds_skill_to_store() {
 #[test]
 fn delete_removes_skill() {
     let mut store = SkillStore::new();
-    store.create("removable".to_string(), "content".to_string());
+    store
+        .create("removable".to_string(), "content".to_string())
+        .unwrap();
     let id = store.list()[0].id.clone();
     assert!(store.delete(&id));
     assert!(store.list().is_empty());
@@ -114,10 +118,12 @@ fn create_persists_file_to_disk() {
     let dir = tempfile::tempdir().expect("tempdir");
     let persist_path = dir.path().to_path_buf();
     let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
-    store.create(
-        "my-skill".to_string(),
-        "# My Skill\nDoes stuff.".to_string(),
-    );
+    store
+        .create(
+            "my-skill".to_string(),
+            "# My Skill\nDoes stuff.".to_string(),
+        )
+        .unwrap();
     let file = persist_path.join("my-skill.md");
     assert!(file.exists(), "skill file should be written to disk");
     let contents = std::fs::read_to_string(&file).expect("read file");
@@ -125,11 +131,52 @@ fn create_persists_file_to_disk() {
 }
 
 #[test]
+fn create_rejects_invalid_names_without_changing_memory_or_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let persist_path = dir.path().join("skills");
+    let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
+    for name in [
+        ".",
+        "..",
+        "../escape",
+        "/absolute",
+        "foo/bar",
+        "foo\\bar",
+        "",
+        "bad\nname",
+    ] {
+        let error = store
+            .create(name.to_string(), "secret".to_string())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(store.list().is_empty());
+        assert!(store.skill_dirs.is_empty());
+        assert!(!persist_path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn create_reports_persistence_failure_without_adding_skill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("blocked.md")).unwrap();
+    let mut store = SkillStore::new().with_persist_dir(dir.path().to_path_buf());
+    assert!(store
+        .create("blocked".to_string(), "content".to_string())
+        .is_err());
+    assert!(store.list().is_empty());
+    assert!(store.skill_dirs.is_empty());
+    assert!(dir.path().join("blocked.md").is_dir());
+}
+
+#[test]
 fn delete_removes_file_from_disk() {
     let dir = tempfile::tempdir().expect("tempdir");
     let persist_path = dir.path().to_path_buf();
     let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
-    store.create("removable".to_string(), "content".to_string());
+    store
+        .create("removable".to_string(), "content".to_string())
+        .unwrap();
     let file = persist_path.join("removable.md");
     assert!(file.exists(), "file should exist after create");
     let id = store.list()[0].id.clone();
@@ -140,8 +187,12 @@ fn delete_removes_file_from_disk() {
 #[test]
 fn search_finds_by_name() {
     let mut store = SkillStore::new();
-    store.create("rust-lint".to_string(), "# Lint tool".to_string());
-    store.create("python-format".to_string(), "# Format tool".to_string());
+    store
+        .create("rust-lint".to_string(), "# Lint tool".to_string())
+        .unwrap();
+    store
+        .create("python-format".to_string(), "# Format tool".to_string())
+        .unwrap();
     let results = store.search("rust");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].name, "rust-lint");
@@ -255,10 +306,13 @@ fn load_builtin_skills_have_trigger_patterns() {
 #[test]
 fn create_parses_trigger_patterns_from_content() {
     let mut store = SkillStore::new();
-    store.create(
-        "my-skill".to_string(),
-        "# My Skill\n<!-- trigger-patterns: my keyword, another pattern -->\nContent.".to_string(),
-    );
+    store
+        .create(
+            "my-skill".to_string(),
+            "# My Skill\n<!-- trigger-patterns: my keyword, another pattern -->\nContent."
+                .to_string(),
+        )
+        .unwrap();
     assert_eq!(
         store.list()[0].trigger_patterns,
         vec!["my keyword", "another pattern"]
@@ -292,6 +346,58 @@ fn match_prompt_is_case_insensitive() {
     ));
     let matches = store.match_prompt("I have a BUILD ERROR in my project");
     assert_eq!(matches.len(), 1);
+}
+
+#[test]
+fn match_prompt_uses_lexical_relevance_when_phrase_order_differs() {
+    let mut store = SkillStore::new();
+    store.skills.push(make_skill_with_patterns(
+        "review",
+        SkillLocation::System,
+        "review code",
+        &["code review"],
+        "system",
+    ));
+    let matches = store.match_prompt("please review code changes in this PR");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].name, "review");
+}
+
+#[test]
+fn match_prompt_ranks_more_relevant_skill_first() {
+    let mut store = SkillStore::new();
+    store.skills.push(make_skill_with_patterns(
+        "build-fix",
+        SkillLocation::System,
+        "fix builds",
+        &["build error"],
+        "system",
+    ));
+    store.skills.push(make_skill_with_patterns(
+        "review",
+        SkillLocation::System,
+        "review code",
+        &["code review"],
+        "system",
+    ));
+    let matches = store.match_prompt("review code changes before merging");
+    assert_eq!(matches[0].name, "review");
+}
+
+#[test]
+fn match_prompt_requires_trigger_overlap_before_auxiliary_fields() {
+    let mut store = SkillStore::new();
+    store.skills.push(make_skill_with_patterns(
+        "review",
+        SkillLocation::System,
+        "implement feature",
+        &["code review"],
+        "system",
+    ));
+
+    let matches = store.match_prompt("implement feature support");
+
+    assert!(matches.is_empty());
 }
 
 #[test]
@@ -359,7 +465,9 @@ fn increment_patch_does_not_touch_major_or_minor() {
 #[test]
 fn update_increments_patch_when_content_changes() {
     let mut store = SkillStore::new();
-    store.create("skill-a".to_string(), "original content".to_string());
+    store
+        .create("skill-a".to_string(), "original content".to_string())
+        .unwrap();
     let id = store.list()[0].id.clone();
     assert_eq!(store.list()[0].version, "1.0.0");
     store.update(&id, "changed content".to_string());
@@ -369,7 +477,9 @@ fn update_increments_patch_when_content_changes() {
 #[test]
 fn update_does_not_increment_when_content_unchanged() {
     let mut store = SkillStore::new();
-    store.create("skill-b".to_string(), "same content".to_string());
+    store
+        .create("skill-b".to_string(), "same content".to_string())
+        .unwrap();
     let id = store.list()[0].id.clone();
     store.update(&id, "same content".to_string());
     assert_eq!(store.list()[0].version, "1.0.0");
@@ -385,20 +495,24 @@ fn update_returns_none_for_unknown_id() {
 #[test]
 fn create_parses_version_from_frontmatter() {
     let mut store = SkillStore::new();
-    store.create(
-        "versioned".to_string(),
-        "---\nversion: 3.1.4\n---\n# Title\n".to_string(),
-    );
+    store
+        .create(
+            "versioned".to_string(),
+            "---\nversion: 3.1.4\n---\n# Title\n".to_string(),
+        )
+        .unwrap();
     assert_eq!(store.list()[0].version, "3.1.4");
 }
 
 #[test]
 fn create_defaults_version_when_no_frontmatter() {
     let mut store = SkillStore::new();
-    store.create(
-        "plain".to_string(),
-        "# Plain skill\nNo frontmatter.".to_string(),
-    );
+    store
+        .create(
+            "plain".to_string(),
+            "# Plain skill\nNo frontmatter.".to_string(),
+        )
+        .unwrap();
     assert_eq!(store.list()[0].version, "1.0.0");
 }
 
@@ -475,10 +589,12 @@ fn load_usage_sidecar_restores_persisted_values() {
 #[test]
 fn governance_update_can_quarantine_skill() {
     let mut store = SkillStore::new();
-    store.create(
-        "review-skill".to_string(),
-        "# review\n<!-- trigger-patterns: review -->".to_string(),
-    );
+    store
+        .create(
+            "review-skill".to_string(),
+            "# review\n<!-- trigger-patterns: review -->".to_string(),
+        )
+        .unwrap();
     let id = store.list()[0].id.clone();
 
     let update = store
@@ -499,10 +615,12 @@ fn governance_update_can_quarantine_skill() {
 #[test]
 fn governance_update_ignores_unknown_only_samples() {
     let mut store = SkillStore::new();
-    store.create(
-        "unknown-skill".to_string(),
-        "# unknown\n<!-- trigger-patterns: unknown -->".to_string(),
-    );
+    store
+        .create(
+            "unknown-skill".to_string(),
+            "# unknown\n<!-- trigger-patterns: unknown -->".to_string(),
+        )
+        .unwrap();
     let id = store.list()[0].id.clone();
 
     let update = store.apply_governance_outcome(
@@ -544,10 +662,12 @@ fn discover_reloads_persisted_skills_across_restart() {
 
     // First "session": create and persist a skill to disk.
     let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
-    store.create(
-        "custom-workflow".to_string(),
-        "# Custom Workflow\nDoes custom things.".to_string(),
-    );
+    store
+        .create(
+            "custom-workflow".to_string(),
+            "# Custom Workflow\nDoes custom things.".to_string(),
+        )
+        .unwrap();
     assert!(
         persist_path.join("custom-workflow.md").exists(),
         "skill file must be written to disk before restart"
@@ -574,7 +694,9 @@ fn persisted_skill_shadowing_builtin_survives_restart() {
     // First "session": create a user skill whose name matches a builtin.
     let user_content = "# review\nMy custom review skill.".to_string();
     let mut store = SkillStore::new().with_persist_dir(persist_path.clone());
-    store.create("review".to_string(), user_content.clone());
+    store
+        .create("review".to_string(), user_content.clone())
+        .unwrap();
     assert!(
         persist_path.join("review.md").exists(),
         "skill file must be written to disk before restart"

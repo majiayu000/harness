@@ -15,6 +15,74 @@ pub const LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL: &str = "LocalReviewChangesReque
 pub const LOCAL_REVIEW_BLOCKED_SIGNAL: &str = "LocalReviewBlocked";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackRepairLane {
+    LocalReview,
+    RemoteFeedback,
+}
+
+impl FeedbackRepairLane {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalReview => "local_review",
+            Self::RemoteFeedback => "remote_feedback",
+        }
+    }
+}
+
+pub(super) fn server_pr_snapshot_matches_instance(
+    instance: &WorkflowInstance,
+    snapshot: &Value,
+) -> bool {
+    if snapshot.get("snapshot_source").and_then(Value::as_str) != Some("server_github_graphql") {
+        return false;
+    }
+    let Some(expected_repo) = instance
+        .data
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(expected_pr_number) = instance.data.get("pr_number").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(expected_pr_url) = instance
+        .data
+        .get("pr_url")
+        .and_then(Value::as_str)
+        .map(normalize_pr_url)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    snapshot
+        .get("repo")
+        .and_then(Value::as_str)
+        .is_some_and(|repo| repo.trim().eq_ignore_ascii_case(expected_repo))
+        && snapshot.get("pr_number").and_then(Value::as_u64) == Some(expected_pr_number)
+        && snapshot
+            .get("pr_url")
+            .and_then(Value::as_str)
+            .map(normalize_pr_url)
+            .is_some_and(|pr_url| pr_url.eq_ignore_ascii_case(expected_pr_url))
+}
+
+fn normalize_pr_url(value: &str) -> &str {
+    value.trim().trim_end_matches('/')
+}
+
+/// Repair rounds are telemetry only — never a gate for addressing findings.
+pub fn next_feedback_repair_round(data: &Value) -> u64 {
+    data.get("feedback_repair_round")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrFeedbackWorkflowAction {
     BindPr,
     RequestLocalReview,
@@ -60,6 +128,9 @@ pub struct PrFeedbackSweepDecisionInput<'a> {
     pub pr_url: Option<&'a str>,
     pub issue_number: Option<u64>,
     pub repo: Option<&'a str>,
+    pub expected_base_ref: Option<&'a str>,
+    pub remote_fact_hash: Option<&'a str>,
+    pub remote_fact_activity_at: Option<&'a str>,
     pub summary: &'a str,
 }
 
@@ -108,6 +179,7 @@ pub struct PrFeedbackInspectDecisionInput<'a> {
     pub pr_url: Option<&'a str>,
     pub issue_number: Option<u64>,
     pub repo: Option<&'a str>,
+    pub expected_base_ref: Option<&'a str>,
     pub parent_workflow_id: Option<&'a str>,
     pub summary: &'a str,
 }
@@ -135,6 +207,18 @@ pub fn build_pr_detected_decision(
         format!("pr-detected:{}:{}", input.task_id, input.pr_number),
     ))
     .with_evidence(WorkflowEvidence::new("pr", input.pr_url))
+    // PR detection is driven by a server-observed GitHub event or API
+    // response for this PR, so the binding is server-verified by origin
+    // (GH-1766, B-005).
+    .with_evidence(WorkflowEvidence::runtime_observed(
+        super::completion_evidence::EVIDENCE_VERIFIED_PR_BINDING,
+        format!(
+            "server_observed_pr_event pr={} url={}",
+            input.pr_number, input.pr_url
+        ),
+        "server_observed_pr_event",
+        None,
+    ))
     .high_confidence();
 
     PrFeedbackDecisionOutput {
@@ -254,16 +338,41 @@ pub fn build_local_review_completed_decision(
 ) -> PrFeedbackDecisionOutput {
     match input.outcome {
         LocalReviewOutcome::Passed => {
+            if super::server_owned_eval_metadata(instance).is_none() {
+                return PrFeedbackDecisionOutput {
+                    action: PrFeedbackWorkflowAction::LocalReviewPassed,
+                    decision: WorkflowDecision::new(
+                        &instance.id,
+                        &instance.state,
+                        "local_review_passed",
+                        "ready_to_merge",
+                        input.summary,
+                    )
+                    .with_evidence(local_review_evidence(input))
+                    .high_confidence(),
+                };
+            }
             let decision = WorkflowDecision::new(
                 &instance.id,
                 &instance.state,
                 "local_review_passed",
-                "awaiting_feedback",
+                "quality_gate_pending",
                 input.summary,
             )
-            .with_command(WorkflowCommand::wait(
-                "Local review passed; waiting for remote review, checks, and mergeability.",
-                format!("local-review:{}:{}:passed", input.task_id, input.pr_number),
+            .with_command(WorkflowCommand::new(
+                super::model::WorkflowCommandType::StartChildWorkflow,
+                format!(
+                    "quality-gate:{}:{}:local-pass:{}",
+                    input.task_id, input.pr_number, instance.version
+                ),
+                serde_json::json!({
+                    "definition_id": QUALITY_GATE_DEFINITION_ID,
+                    "subject_key": format!("pr:{}", input.pr_number),
+                    "child_activity": QUALITY_GATE_ACTIVITY,
+                    "pr_number": input.pr_number,
+                    "pr_url": input.pr_url,
+                    "validation_commands": [],
+                }),
             ))
             .with_evidence(local_review_evidence(input))
             .high_confidence();
@@ -341,6 +450,9 @@ pub fn build_pr_feedback_sweep_decision(
             "pr_url": input.pr_url,
             "issue_number": input.issue_number,
             "repo": input.repo,
+            "expected_base_ref": input.expected_base_ref,
+            "remote_fact_hash": input.remote_fact_hash,
+            "remote_fact_activity_at": input.remote_fact_activity_at,
         }),
     ))
     .with_evidence(WorkflowEvidence::new(
@@ -411,6 +523,7 @@ pub fn build_pr_feedback_inspect_decision(
             "pr_url": input.pr_url,
             "issue_number": input.issue_number,
             "repo": input.repo,
+            "expected_base_ref": input.expected_base_ref,
             "parent_workflow_id": input.parent_workflow_id,
         }),
     ))

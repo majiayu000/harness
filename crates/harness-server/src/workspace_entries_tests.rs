@@ -30,7 +30,10 @@ fn workspace_entries_return_active_workspace_metadata_sorted_by_task_id() {
                 created_at,
                 owner_session: mgr.owner_session.clone(),
                 run_generation: 1,
+                acquisition_id: "test-acquisition".to_string(),
+                state: ActiveWorkspaceState::Ready,
                 _pool_permit: None,
+                _repository_write_lease: None,
             },
         );
         mgr.active_paths.insert(workspace_path, task_id);
@@ -54,4 +57,159 @@ fn workspace_entries_return_active_workspace_metadata_sorted_by_task_id() {
     );
     assert_eq!(entries[0].branch, "harness/task-a");
     assert_eq!(entries[0].created_at, created_at);
+}
+
+#[tokio::test]
+async fn cancelled_preparation_marks_workspace_cleanup_required() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace_path = tmp.path().join("workspaces/task-a");
+    std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+    let mgr = WorkspaceManager::new(WorkspaceConfig {
+        root: tmp.path().join("workspaces"),
+        ..Default::default()
+    })
+    .expect("manager");
+    let task_id = TaskId("task-a".to_string());
+    mgr.active.insert(
+        task_id.clone(),
+        ActiveWorkspace {
+            workspace_path,
+            source_repo: tmp.path().join("repo"),
+            repo: None,
+            runtime_workflow_id: None,
+            workspace_key: "workspace-key".to_string(),
+            project_key: "project-key".to_string(),
+            slot_index: 0,
+            branch: "harness/task-a".to_string(),
+            created_at: std::time::SystemTime::now(),
+            owner_session: mgr.owner_session.clone(),
+            run_generation: 1,
+            acquisition_id: "acquisition-a".to_string(),
+            state: ActiveWorkspaceState::Ready,
+            _pool_permit: None,
+            _repository_write_lease: None,
+        },
+    );
+
+    let guard = mgr
+        .begin_workspace_preparation(&task_id, "acquisition-a")
+        .expect("begin preparation");
+    assert_eq!(
+        mgr.active.get(&task_id).expect("active").state,
+        ActiveWorkspaceState::Preparing
+    );
+    drop(guard);
+    assert_eq!(
+        mgr.active.get(&task_id).expect("active").state,
+        ActiveWorkspaceState::CleanupRequired
+    );
+    let error = mgr
+        .try_reuse_active_workspace(&task_id, 1, 1, &mut None)
+        .await
+        .expect_err("cleanup-required workspace must not be reused");
+    assert!(error.to_string().contains("requires cleanup"));
+}
+
+#[test]
+fn execution_ownership_blocks_reuse_and_stale_finalization() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace_path = tmp.path().join("workspaces/task-a");
+    std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+    let mgr = Arc::new(
+        WorkspaceManager::new(WorkspaceConfig {
+            root: tmp.path().join("workspaces"),
+            ..Default::default()
+        })
+        .expect("manager"),
+    );
+    let task_id = TaskId("task-a".to_string());
+    mgr.active.insert(
+        task_id.clone(),
+        ActiveWorkspace {
+            workspace_path,
+            source_repo: tmp.path().join("repo"),
+            repo: None,
+            runtime_workflow_id: None,
+            workspace_key: "workspace-key".to_string(),
+            project_key: "project-key".to_string(),
+            slot_index: 0,
+            branch: "harness/task-a".to_string(),
+            created_at: std::time::SystemTime::now(),
+            owner_session: mgr.owner_session.clone(),
+            run_generation: 1,
+            acquisition_id: "acquisition-a".to_string(),
+            state: ActiveWorkspaceState::Ready,
+            _pool_permit: None,
+            _repository_write_lease: None,
+        },
+    );
+
+    let execution = mgr
+        .claim_workspace_execution(&task_id, "acquisition-a")
+        .expect("claim execution");
+    assert!(mgr
+        .claim_workspace_execution(&task_id, "acquisition-a")
+        .is_err());
+    assert!(mgr
+        .begin_workspace_preparation(&task_id, "acquisition-a")
+        .is_err());
+    assert!(mgr
+        .begin_workspace_finalization(&task_id, "acquisition-a", "stale-execution")
+        .is_err());
+    assert!(matches!(
+        &mgr.active.get(&task_id).expect("active").state,
+        ActiveWorkspaceState::Running(id) if id == execution.execution_id()
+    ));
+
+    mgr.begin_workspace_finalization(&task_id, "acquisition-a", execution.execution_id())
+        .expect("begin finalization");
+    drop(execution);
+    assert_eq!(
+        mgr.active.get(&task_id).expect("active").state,
+        ActiveWorkspaceState::CleanupRequired
+    );
+}
+
+#[tokio::test]
+async fn active_workspace_outside_reduced_capacity_is_not_reused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace_path = tmp.path().join("workspaces/task-a");
+    std::fs::create_dir_all(&workspace_path).expect("workspace dir");
+    let mgr = WorkspaceManager::new(WorkspaceConfig {
+        root: tmp.path().join("workspaces"),
+        ..Default::default()
+    })
+    .expect("manager");
+    let task_id = TaskId("task-a".to_string());
+    mgr.active.insert(
+        task_id.clone(),
+        ActiveWorkspace {
+            workspace_path,
+            source_repo: tmp.path().join("repo"),
+            repo: None,
+            runtime_workflow_id: None,
+            workspace_key: "workspace-key".to_string(),
+            project_key: "project-key".to_string(),
+            slot_index: 1,
+            branch: "harness/task-a".to_string(),
+            created_at: std::time::SystemTime::now(),
+            owner_session: mgr.owner_session.clone(),
+            run_generation: 1,
+            acquisition_id: "acquisition-a".to_string(),
+            state: ActiveWorkspaceState::Ready,
+            _pool_permit: None,
+            _repository_write_lease: None,
+        },
+    );
+
+    let error = mgr
+        .try_reuse_active_workspace(&task_id, 1, 1, &mut None)
+        .await
+        .expect_err("out-of-range slot must not be reused");
+
+    assert!(error.to_string().contains("reduced capacity"));
+    assert_eq!(
+        mgr.active.get(&task_id).expect("active").state,
+        ActiveWorkspaceState::CleanupRequired
+    );
 }

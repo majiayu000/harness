@@ -1,12 +1,10 @@
 use anyhow::Context;
 use chrono::{DateTime, SecondsFormat, Utc};
-use reqwest::header::{ACCEPT, USER_AGENT};
 use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::github_pr_snapshot::{errors_is_empty, value_string, value_u64};
 
-const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const OPEN_PR_HYGIENE_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,22 +122,20 @@ async fn fetch_open_pr_hygiene_page(
         }
     "#;
 
-    let mut request = client
-        .post(GITHUB_GRAPHQL_URL)
-        .header(ACCEPT, "application/vnd.github+json")
-        .header(USER_AGENT, "harness-server")
-        .json(&json!({
-            "query": query,
-            "variables": {
-                "owner": owner,
-                "repo": repo,
-                "first": i64::try_from(first).unwrap_or(100),
-                "after": after,
-            }
-        }));
-    if let Some(token) = crate::github_auth::resolve_github_token(github_token) {
-        request = request.bearer_auth(token);
-    }
+    let request = crate::github_client::apply_github_headers(
+        client
+            .post(crate::github_client::graphql_url())
+            .json(&json!({
+                "query": query,
+                "variables": {
+                    "owner": owner,
+                    "repo": repo,
+                    "first": i64::try_from(first).unwrap_or(100),
+                    "after": after,
+                }
+            })),
+        github_token,
+    );
 
     let response = tokio::time::timeout(Duration::from_secs(15), request.send()).await??;
     let status = response.status();
@@ -257,6 +253,71 @@ fn merge_state_requires_repair(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawn a one-shot HTTP stub that records the raw request it receives and
+    /// replies with `response_body`. Returns the base URL and the request log.
+    async fn spawn_recording_github_stub(
+        response_body: &'static str,
+    ) -> anyhow::Result<(String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let received_server = received.clone();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 8192];
+            let Ok(read) = socket.read(&mut buf).await else {
+                return;
+            };
+            received_server
+                .lock()
+                .await
+                .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        Ok((format!("http://{addr}"), received))
+    }
+
+    #[tokio::test]
+    async fn github_pr_hygiene_honors_stubbed_api_base_url() -> anyhow::Result<()> {
+        use crate::workspace::test_support::{async_env_lock, ScopedEnvVar};
+
+        let _env_guard = async_env_lock().lock().await;
+        let response_body = r#"{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"number":77,"url":"https://github.com/owner/repo/pull/77","title":"Refresh branch","mergeStateStatus":"DIRTY","headRefOid":"abc123","updatedAt":"2026-06-10T00:00:00Z","labels":{"nodes":[{"name":"rebase-needed"}]}}]}}}}"#;
+        let (api_base, received) = spawn_recording_github_stub(response_body).await?;
+        let _api_base_guard = ScopedEnvVar::set("HARNESS_GITHUB_API_BASE_URL", &api_base);
+
+        let prs = fetch_open_pr_hygiene("owner/repo", None, 10).await?;
+
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].pr_number, 77);
+        assert_eq!(prs[0].merge_state_status.as_deref(), Some("DIRTY"));
+
+        let requests = received.lock().await;
+        assert_eq!(
+            requests.len(),
+            1,
+            "stub server should receive exactly one request"
+        );
+        let request = &requests[0];
+        assert!(
+            request.starts_with("POST /graphql HTTP/1.1"),
+            "unexpected request line: {request}"
+        );
+        let lowered = request.to_ascii_lowercase();
+        assert!(lowered.contains("accept: application/vnd.github+json"));
+        assert!(lowered.contains("x-github-api-version: 2022-11-28"));
+        assert!(lowered.contains("user-agent: harness-server"));
+        Ok(())
+    }
 
     #[test]
     fn github_pr_hygiene_parses_open_pr_page() -> anyhow::Result<()> {

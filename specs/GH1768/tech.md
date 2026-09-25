@@ -106,6 +106,12 @@ new trait abstraction is introduced by this spec.
   validation; record `{command, exit_code, output_sha256, duration_ms}` per
   command. Command text comes only from the committed manifest — never from
   workflow data — so agent-influenced state cannot alter what is verified.
+- **Evaluator-owned verifiers**: versioned verifier assets are selected by
+  case id in trusted control code and executed against the shadow workspace
+  without being copied into that workspace or exposed in the agent prompt.
+  `gh1454_ci_contract_v1` is the first required asset; its digest is recorded
+  with the command evidence. Restore the GH1454 manifest case only after a
+  fixture proves its pinned base fails and accepted gold patch passes.
 - **Runtime artifacts**: read `workflow_artifacts` rows for the case instance
   (transcript reference, activity gate artifacts) to populate
   `RuntimeSnapshot` for the `RuntimeArtifactCompleteness` gate.
@@ -211,6 +217,7 @@ out of scope here; this spec only guarantees the events exist and are durable.
 | B-010 usage ceiling | Ceiling-breach ordering test |
 | B-011 isolation | Existing `BranchSafety`/`NoUnrelatedPrCreation` gate tests (unchanged) |
 | B-012 run-id idempotency | Run-id refusal unit test |
+| B-013 trusted GH1454 replay | Evaluator-owned verifier provenance/digest test plus pinned-base-fails and gold-patch-passes fixtures |
 
 ## Rollout / Revert
 

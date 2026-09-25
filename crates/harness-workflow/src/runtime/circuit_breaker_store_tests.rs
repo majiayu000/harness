@@ -1,6 +1,6 @@
 use super::{
-    RuntimeJob, RuntimeJobStatus, RuntimeKind, WorkflowCommand, WorkflowInstance,
-    WorkflowRuntimeStore, WorkflowSubject,
+    RuntimeJob, RuntimeJobClaimDeferOutcome, RuntimeJobStatus, RuntimeKind, WorkflowCommand,
+    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
 };
 use chrono::{Duration, Utc};
 use harness_core::db::resolve_database_url;
@@ -33,7 +33,9 @@ async fn enqueue_breaker_test_job(
         WorkflowSubject::new("issue", format!("issue:{command_key}")),
     )
     .with_id(format!("breaker-test-workflow-{command_key}"));
-    store.upsert_instance(&workflow).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&workflow)
+        .await?;
     let command = WorkflowCommand::enqueue_activity("check", format!("breaker-{command_key}"));
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
     store
@@ -145,8 +147,10 @@ async fn runtime_store_defers_owned_claim_back_to_pending() -> anyhow::Result<()
 
     let deferred = store
         .defer_runtime_job_claim_if_owned(&job.id, "worker-a", lease_expires_at, not_before)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("current lease should be deferrable"))?;
+        .await?;
+    let RuntimeJobClaimDeferOutcome::Deferred(deferred) = deferred else {
+        anyhow::bail!("current lease should be deferrable");
+    };
 
     assert_eq!(deferred.status, RuntimeJobStatus::Pending);
     assert!(deferred.lease.is_none());
@@ -162,6 +166,6 @@ async fn runtime_store_defers_owned_claim_back_to_pending() -> anyhow::Result<()
     let stale_attempt = store
         .defer_runtime_job_claim_if_owned(&job.id, "worker-a", lease_expires_at, Utc::now())
         .await?;
-    assert!(stale_attempt.is_none());
+    assert_eq!(stale_attempt, RuntimeJobClaimDeferOutcome::StaleLease);
     Ok(())
 }

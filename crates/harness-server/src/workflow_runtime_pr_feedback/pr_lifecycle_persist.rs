@@ -157,7 +157,10 @@ async fn ensure_pr_lifecycle_failure_workflow(
             workflow_id
         );
     }
-    store.insert_instance_if_absent(failure_instance).await?;
+    if store.get_instance(workflow_id).await?.is_none() {
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, failure_instance)
+            .await?;
+    }
     Ok(())
 }
 

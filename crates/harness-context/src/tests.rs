@@ -1,6 +1,8 @@
-use crate::providers::{ExecPlanProvider, StaticProvider};
+use crate::providers::{ExecPlanProvider, SkillsProvider, StaticProvider};
 use crate::*;
 use harness_core::types::{ProjectId, ThreadId};
+use harness_core::types::{SkillId, SkillLocation};
+use harness_skills::store::{Skill, SkillGovernanceStatus};
 
 fn req() -> ComposeRequest {
     ComposeRequest {
@@ -29,12 +31,58 @@ fn item(id: &str, class: ItemClass, content_len: usize, priority: Priority) -> C
     }
 }
 
+fn skill(name: &str, description: &str, trigger_patterns: &[&str]) -> Skill {
+    Skill {
+        id: SkillId::new(),
+        name: name.to_string(),
+        description: description.to_string(),
+        content: format!("# {name}\n{description}"),
+        trigger_patterns: trigger_patterns
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+        version: "1.0.0".to_string(),
+        author: "test".to_string(),
+        location: SkillLocation::System,
+        content_hash: format!("hash-{name}"),
+        usage_count: 0,
+        last_used: None,
+        quality_score: 0.5,
+        scored_samples: 0,
+        governance_status: SkillGovernanceStatus::Active,
+        canary_ratio: 1.0,
+        last_scored: None,
+    }
+}
+
 #[test]
 fn types_bytes_div_four_estimator_documents_v1_behavior() {
     let estimator = BytesDivFourEstimator;
     assert_eq!(estimator.estimate(""), 0);
     assert_eq!(estimator.estimate("abcd"), 1);
     assert_eq!(estimator.estimate("abcde"), 1);
+}
+
+#[test]
+fn compose_config_is_preview_only() {
+    let core_config = harness_core::config::misc::ContextConfig::default();
+
+    assert_eq!(ComposeConfig::default().mode, ComposeMode::Preview);
+    assert_eq!(ComposeConfig::from(&core_config).mode, ComposeMode::Preview);
+}
+
+#[test]
+fn compose_mode_normalizes_legacy_values_to_preview() {
+    for legacy_mode in ["shadow", "enforce"] {
+        let mode: ComposeMode = serde_json::from_str(&format!("\"{legacy_mode}\""))
+            .expect("legacy compose mode remains readable");
+        assert_eq!(mode, ComposeMode::Preview);
+    }
+
+    assert_eq!(
+        serde_json::to_string(&ComposeMode::Preview).expect("preview mode serializes"),
+        "\"preview\""
+    );
 }
 
 #[test]
@@ -242,14 +290,55 @@ fn manifest_serialization_omits_item_content() {
 }
 
 #[test]
+fn skills_provider_matches_reversed_prompt_terms() {
+    let provider = SkillsProvider::new(vec![skill("review", "review code", &["code review"])]);
+    let mut request = req();
+    request.task_profile.prompt = Some("please review code changes before merging".to_string());
+
+    let items = provider.propose(&request).expect("provider succeeds");
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id.as_str(), "skill:review");
+    assert!(items[0].relevance > 0.7);
+}
+
+#[test]
+fn skills_provider_ranks_by_lexical_relevance() {
+    let provider = SkillsProvider::new(vec![
+        skill("build-fix", "fix builds", &["build error"]),
+        skill("review", "review code", &["code review"]),
+    ]);
+    let mut request = req();
+    request.task_profile.prompt = Some("review code changes before merging".to_string());
+
+    let items = provider.propose(&request).expect("provider succeeds");
+
+    assert_eq!(items[0].id.as_str(), "skill:review");
+}
+
+#[test]
+fn skills_provider_requires_trigger_overlap_before_auxiliary_fields() {
+    let provider =
+        SkillsProvider::new(vec![skill("review", "implement feature", &["code review"])]);
+    let mut request = req();
+    request.task_profile.prompt = Some("implement feature support".to_string());
+
+    let items = provider.propose(&request).expect("provider succeeds");
+
+    assert!(items.is_empty());
+}
+
+#[test]
 fn providers_include_active_exec_plans_for_matching_project() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut plan = harness_exec::plan::ExecPlan::from_spec("# Ship context composer", dir.path())
         .expect("plan");
     plan.activate();
-    let provider = ExecPlanProvider::new(vec![plan.clone()]);
+    let provider = ExecPlanProvider::new(vec![std::sync::Arc::new(plan.clone())]);
     let mut request = req();
     request.project = ProjectId::from_path(dir.path());
+
+    assert_eq!(provider.id().as_str(), "exec-plan");
 
     let items = provider.propose(&request).expect("provider succeeds");
 
@@ -261,4 +350,22 @@ fn providers_include_active_exec_plans_for_matching_project() {
     assert_eq!(items[0].class, ItemClass::Contract);
     assert_eq!(items[0].priority, Priority::P0);
     assert!(items[0].content.contains("Ship context composer"));
+
+    let composition = match ContextComposer::new(ComposeConfig::default())
+        .with_provider(Box::new(provider))
+        .compose(&request)
+    {
+        Ok(composition) => composition,
+        Err(error) => panic!("composition succeeds: {error}"),
+    };
+    let manifest_item = match composition
+        .manifest
+        .items
+        .iter()
+        .find(|item| item.id.as_str() == format!("contract:exec-plan:{}", plan.id))
+    {
+        Some(item) => item,
+        None => panic!("exec plan appears in manifest"),
+    };
+    assert_eq!(manifest_item.provider_id.as_str(), "exec-plan");
 }

@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use super::dirs::dirs_data_dir;
+use super::process_env;
 use super::shutdown::ShutdownConfig;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -112,66 +113,45 @@ impl ServerConfig {
     /// - `GITHUB_WEBHOOK_SECRET`   — `github_webhook_secret`
     pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
         self.normalize_api_token();
-        if let Ok(v) = std::env::var("HARNESS_DATA_DIR") {
-            if !v.is_empty() {
-                self.data_dir = std::path::PathBuf::from(v);
-            }
+        if let Some(v) = process_env::config_value("HARNESS_DATA_DIR") {
+            self.data_dir = std::path::PathBuf::from(v);
         }
-        if let Ok(v) = std::env::var("HARNESS_PROJECT_ROOT") {
-            if !v.is_empty() {
-                self.project_root = std::path::PathBuf::from(v);
-            }
+        if let Some(v) = process_env::config_value("HARNESS_PROJECT_ROOT") {
+            self.project_root = std::path::PathBuf::from(v);
         }
-        if let Ok(v) = std::env::var("HARNESS_DATABASE_URL") {
-            if !v.is_empty() {
-                self.database_url = Some(v);
-            }
+        if let Some(v) = process_env::config_value("HARNESS_DATABASE_URL") {
+            self.database_url = Some(v);
         }
-        if let Ok(v) = std::env::var("HARNESS_DATABASE_POOL_MAX_CONNECTIONS") {
-            if !v.is_empty() {
-                self.database_pool_max_connections = Some(v.parse().map_err(|e| {
-                    anyhow::anyhow!(
-                        "HARNESS_DATABASE_POOL_MAX_CONNECTIONS={v:?} is not a valid u32: {e}"
-                    )
-                })?);
-            }
+        if let Some(v) = process_env::config_value("HARNESS_DATABASE_POOL_MAX_CONNECTIONS") {
+            self.database_pool_max_connections = Some(v.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "HARNESS_DATABASE_POOL_MAX_CONNECTIONS={v:?} is not a valid u32: {e}"
+                )
+            })?);
         }
-        if let Ok(v) = std::env::var("HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS") {
-            if !v.is_empty() {
-                self.database_pool_acquire_timeout_secs = Some(v.parse().map_err(|e| {
-                    anyhow::anyhow!(
-                        "HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS={v:?} is not a valid u64: {e}"
-                    )
-                })?);
-            }
+        if let Some(v) = process_env::config_value("HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS") {
+            self.database_pool_acquire_timeout_secs = Some(v.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "HARNESS_DATABASE_POOL_ACQUIRE_TIMEOUT_SECS={v:?} is not a valid u64: {e}"
+                )
+            })?);
         }
-        if let Ok(v) = std::env::var("HARNESS_API_TOKEN") {
-            let token = v.trim();
-            if !token.is_empty() {
-                self.api_token = Some(token.to_string());
-            }
+        if let Some(v) = process_env::trimmed_config_value("HARNESS_API_TOKEN") {
+            self.api_token = Some(v);
         }
         if self
             .github_token
             .as_deref()
             .is_none_or(|v| v.trim().is_empty())
         {
-            if let Some(v) = std::env::var("GITHUB_TOKEN")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .or_else(|| {
-                    std::env::var("GH_TOKEN")
-                        .ok()
-                        .filter(|v| !v.trim().is_empty())
-                })
+            if let Some(v) =
+                process_env::first_non_blank_config_value(&["GITHUB_TOKEN", "GH_TOKEN"])
             {
                 self.github_token = Some(v);
             }
         }
-        if let Ok(v) = std::env::var("GITHUB_WEBHOOK_SECRET") {
-            if !v.is_empty() {
-                self.github_webhook_secret = Some(v);
-            }
+        if let Some(v) = process_env::config_value("GITHUB_WEBHOOK_SECRET") {
+            self.github_webhook_secret = Some(v);
         }
         self.normalize_api_token();
         Ok(())
@@ -196,12 +176,10 @@ impl ServerConfig {
     /// value, or a hostname like `localhost:9800` that `SocketAddr` rejects)
     /// brick completely unrelated commands.
     pub fn apply_serve_env_overrides(&mut self) -> anyhow::Result<()> {
-        if let Ok(v) = std::env::var("HARNESS_HTTP_ADDR") {
-            if !v.is_empty() {
-                self.http_addr = v.parse().map_err(|e| {
-                    anyhow::anyhow!("HARNESS_HTTP_ADDR={v:?} is not a valid SocketAddr: {e}")
-                })?;
-            }
+        if let Some(v) = process_env::config_value("HARNESS_HTTP_ADDR") {
+            self.http_addr = v.parse().map_err(|e| {
+                anyhow::anyhow!("HARNESS_HTTP_ADDR={v:?} is not a valid SocketAddr: {e}")
+            })?;
         }
         Ok(())
     }

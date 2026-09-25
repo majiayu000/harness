@@ -1,11 +1,11 @@
 use super::{
     insert_author_trust_class, merge_last_decision, prompt_memory::prompt_ref_for_submission,
-    TaskId, WorkflowSubmissionRuntimeRecord, EXECUTION_PATH_WORKFLOW_RUNTIME,
+    submission_field_provenance, TaskId, WorkflowSubmissionRuntimeRecord,
+    EXECUTION_PATH_WORKFLOW_RUNTIME,
 };
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::runtime::{
-    build_declarative_submission_decision, current_declarative_workflow_definition,
-    decision_validator_for_instance, persisted_declarative_definition,
+    build_declarative_submission_decision, persisted_declarative_definition, DataProvenance,
     DeclarativeWorkflowDefinition, ValidationContext, WorkflowCommandStatus, WorkflowInstance,
     WorkflowRuntimeStore, WorkflowSubject, WorkflowSubmissionDecisionTransition,
     WorkflowSubmissionPromptPayload, DECLARATIVE_SUBMISSION_DECISION,
@@ -26,6 +26,7 @@ pub(crate) struct DeclarativeSubmissionRuntimeContext<'a> {
     pub subject_key: Option<&'a str>,
     pub repo: Option<&'a str>,
     pub author_trust_class: Option<IsolationTrustClass>,
+    pub classification_input_provenance: DataProvenance,
 }
 
 pub(crate) async fn record_declarative_submission(
@@ -38,8 +39,11 @@ pub(crate) async fn record_declarative_submission(
             ctx.definition_id
         );
     }
-    let definition =
-        resolve_declarative_definition_for_project(ctx.project_root, ctx.definition_id)?;
+    let definition = resolve_declarative_definition_for_project(
+        store.definition_registry(),
+        ctx.project_root,
+        ctx.definition_id,
+    )?;
 
     let project_id = ctx.project_root.to_string_lossy().into_owned();
     let workflow_id = declarative_workflow_id(
@@ -57,15 +61,18 @@ pub(crate) async fn record_declarative_submission(
 }
 
 pub(crate) fn resolve_declarative_definition_for_project(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     project_root: &Path,
     definition_id: &str,
 ) -> anyhow::Result<Arc<DeclarativeWorkflowDefinition>> {
-    let registered = current_declarative_workflow_definition(definition_id).ok_or_else(|| {
-        anyhow::anyhow!(
-            "workflow definition '{}' is not a registered declarative definition",
-            definition_id
-        )
-    })?;
+    let registered = registry
+        .current_declarative_definition(definition_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "workflow definition '{}' is not a registered declarative definition",
+                definition_id
+            )
+        })?;
     let document = harness_core::config::workflow::load_workflow_document(project_root)?;
     let policy = document.config.definition.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -125,7 +132,9 @@ async fn persist_new_submission(
     );
     let instance = submission_instance(ctx, project_id, &workflow_id, &prompt_ref, definition);
     let decision = build_declarative_submission_decision(definition, &instance)?;
-    let validator = decision_validator_for_instance(&instance)
+    let validator = store
+        .definition_registry()
+        .decision_validator_for_instance(&instance)
         .map_err(|error| {
             anyhow::anyhow!(
                 "declarative workflow '{}@{}' has an invalid definition pin: {error:?}",
@@ -151,7 +160,12 @@ async fn persist_new_submission(
     let mut final_instance = instance.clone();
     final_instance.state = decision.next_state.clone();
     final_instance.version = final_instance.version.saturating_add(1);
-    final_instance.data = merge_last_decision(final_instance.data, &decision.decision);
+    let data = merge_last_decision(std::mem::take(&mut final_instance.data), &decision.decision);
+    classify_declarative_submission_data(
+        &mut final_instance,
+        data,
+        ctx.classification_input_provenance,
+    )?;
     let event_id = uuid::Uuid::new_v4().to_string();
     let Some(outcome) = store
         .commit_submission_decision_transition(WorkflowSubmissionDecisionTransition {
@@ -185,6 +199,17 @@ async fn persist_new_submission(
         })?;
         return existing_submission(store, instance, definition).await;
     };
+    if !outcome.record.accepted {
+        anyhow::bail!(
+            "declarative workflow submission '{}' was rejected during atomic commit: {}",
+            workflow_id,
+            outcome
+                .record
+                .rejection_reason
+                .as_deref()
+                .unwrap_or("decision rejected")
+        );
+    }
     super::prompt_memory::cache_prompt_submission_prompt(&prompt_ref, ctx.prompt);
     Ok(WorkflowSubmissionRuntimeRecord {
         workflow_id,
@@ -215,7 +240,12 @@ pub(super) fn submission_instance(
         "external_id": ctx.external_id,
         "repo": ctx.repo,
         "depends_on": [],
+        "last_decision": DECLARATIVE_SUBMISSION_DECISION,
+        "execution_path": EXECUTION_PATH_WORKFLOW_RUNTIME,
     });
+    if !definition.activity_contracts().is_empty() {
+        data["classification_input"] = json!(ctx.prompt);
+    }
     insert_author_trust_class(&mut data, ctx.author_trust_class);
     let data = crate::workflow_runtime_policy::merge_runtime_retry_policy(ctx.project_root, data);
     WorkflowInstance::new(
@@ -228,7 +258,29 @@ pub(super) fn submission_instance(
         ),
     )
     .with_id(workflow_id)
-    .with_data(data)
+    .with_data_field_provenance(data, |field| {
+        declarative_submission_field_provenance(field, ctx.classification_input_provenance)
+    })
+}
+
+pub(super) fn classify_declarative_submission_data(
+    instance: &mut WorkflowInstance,
+    data: serde_json::Value,
+    classification_input_provenance: DataProvenance,
+) -> anyhow::Result<()> {
+    instance.replace_data_with_field_provenance(data, |field| {
+        declarative_submission_field_provenance(field, classification_input_provenance)
+    })
+}
+
+fn declarative_submission_field_provenance(
+    field: &str,
+    classification_input_provenance: DataProvenance,
+) -> DataProvenance {
+    match field {
+        "classification_input" => classification_input_provenance,
+        _ => submission_field_provenance(field),
+    }
 }
 
 async fn persist_definition_metadata(

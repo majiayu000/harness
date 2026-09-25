@@ -1,5 +1,13 @@
 # WORKFLOW.md: Declarative Definitions and Continuation Policies
 
+> Architecture relationship (updated 2026-08-30): the examples below remain the executable
+> reference for shipped definition and continuation behavior. The shipped strict `agent_contract`
+> activity policy is documented in `docs/workflow-classification-minimal-path.md`; this page does
+> not claim to enumerate every activity-policy field. Proposed vNext ownership, compiled-bundle, Evidence, authorization, and
+> decomposition contracts are in `docs/workflow-first-autonomous-change-rfc.md`; they are not yet
+> owner-approved and do not supersede this page. Runtime incompatibility and physical cutover are
+> separated in `docs/workflow-vnext-cutover-rfc.md`.
+
 This page documents the two WORKFLOW.md features that let a repository
 define workflow behavior without Rust changes:
 
@@ -40,7 +48,7 @@ definition:
       activity: implement_issue
       on_success: reviewing
       on_signal:
-        SCOPE_TOO_LARGE: blocked
+        ImplementationBlocked: blocked
     reviewing:
       activity: run_local_review
       on_success: done
@@ -112,6 +120,52 @@ cancelling the instance.
 The `definition` block does **not** deep-merge. A repo-level `definition`
 replaces the central base's declaration wholesale; state machines are
 never merged field-by-field.
+
+### Share a workflow between projects
+
+A project can select a Markdown workflow file instead of embedding its
+`definition` and activity prompts:
+
+```yaml
+workflow:
+  file: /srv/harness/workflows/review.md
+source:
+  repo: owner/project
+activities:
+  inspect_repository:
+    validation: [cargo check]
+```
+
+The selected file contains `definition`, `activities`, and a Markdown
+instruction body. See [`config/workflows/review.md`](../config/workflows/review.md)
+for a read-only example. Relative file paths resolve from the project root.
+Two projects may reference the same file and override their own validation
+commands, repository, and agent settings. Another project can select a
+different file. Activity prompts and agent contracts belong in the selected
+file; project activity overrides supply validation commands only.
+
+The selected body precedes the effective project instruction body. Selection
+replaces inherited activity policy; matching validation overrides still apply.
+Do not combine `workflow.file` with an inline `definition`, including one
+inherited from the central base. Missing or malformed files fail explicitly.
+
+Startup registers identical compiled definitions once. Different state
+machines or agent contracts with the same definition ID fail startup; use
+separate IDs for distinct flows. Ordinary activity prompts remain project-loaded
+at execution time, as with inline definitions, and are not included in the
+existing definition hash. Keep selected files unchanged during an active run
+when reproducibility matters.
+
+Submit through `POST /api/workflows/runtime/submissions` with the project's
+path, `definition_id` matching the selected definition, and a task `prompt`.
+Selecting a file alone does not redirect ordinary issue/PR/prompt submissions.
+Existing explicit intake bindings remain available. Definitions are registered
+at startup, so adding a selection requires restarting the target deployment
+under the operator's normal release procedure.
+
+This adds configuration reuse to the existing interpreter. It does not add
+new result storage, change built-in repair transitions, or automatically merge
+PRs. Projects without `workflow.file` retain their existing loading behavior.
 
 ### Intake bindings (optional)
 

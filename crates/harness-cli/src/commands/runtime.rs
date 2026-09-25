@@ -1,8 +1,30 @@
-use super::{status, RuntimeBreakerCommand, RuntimeCommand};
+use super::status;
 use anyhow::Context;
+use clap::Subcommand;
 use harness_core::config::HarnessConfig;
 use serde_json::Value;
 use std::time::Duration;
+
+#[derive(Subcommand)]
+pub enum RuntimeCommand {
+    /// Circuit breaker operator commands
+    Breaker {
+        #[command(subcommand)]
+        cmd: RuntimeBreakerCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RuntimeBreakerCommand {
+    /// Reset the circuit breaker state for a runtime profile
+    Reset {
+        /// Runtime profile to reset
+        profile: String,
+        /// Server base URL. Defaults to server.http_addr from config.
+        #[arg(long)]
+        url: Option<String>,
+    },
+}
 
 const REQUEST_TIMEOUT_SECS: u64 = 5;
 

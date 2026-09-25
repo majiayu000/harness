@@ -1,8 +1,8 @@
 use super::*;
+use crate::http::rest_contract::LegacyJson as Json;
 use crate::http::task_mutation_routes::{
     reconstruct_runtime_transcript, RuntimeTranscriptReconstructionRequest,
 };
-use axum::Json;
 use harness_workflow::runtime::{
     ActivityArtifact, ActivityErrorKind, ActivityResult, RuntimeJob, RuntimeKind,
     RuntimeTranscriptRead, WorkflowCommand, WorkflowInstance, WorkflowSubject,
@@ -39,7 +39,7 @@ async fn transcript_reconstruction_route_accepts_provider_exports_above_axum_def
         WorkflowSubject::new("issue", "large-export"),
     )
     .with_id("workflow-large-export");
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow).await?;
     let command_id = store
         .enqueue_command(
             &workflow.id,
@@ -186,7 +186,9 @@ async fn remote_completion_route_accepts_transcripts_above_axum_default_limit() 
         ),
     );
     let body = json!({
+        "lease_generation": claimed["lease_generation"],
         "lease_expires_at": claimed["lease_expires_at"],
+        "lease_proof": claimed["lease_proof"],
         "result": result,
     });
 
@@ -251,7 +253,7 @@ async fn transcript_reconstruction_route_restores_provider_export() -> anyhow::R
         WorkflowSubject::new("issue", "1704"),
     )
     .with_id("transcript-route-workflow");
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command_id = store
         .enqueue_command(
             &workflow.id,
@@ -316,7 +318,7 @@ async fn transcript_reconstruction_route_rejects_wrong_workflow() -> anyhow::Res
         WorkflowSubject::new("issue", "1704"),
     )
     .with_id("transcript-route-owner");
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command_id = store
         .enqueue_command(
             &workflow.id,
@@ -385,7 +387,7 @@ async fn exact_replay_preflight_fails_terminal_on_missing_or_corrupt_transcript(
         WorkflowSubject::new("issue", "1704"),
     )
     .with_id("corrupt-transcript-owner");
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command_id = store
         .enqueue_command(
             &workflow.id,
@@ -452,7 +454,7 @@ async fn exact_replay_hydrates_verified_transcript_before_dispatch() -> anyhow::
         WorkflowSubject::new("issue", "1704"),
     )
     .with_id("hydrate-transcript-owner");
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command_id = store
         .enqueue_command(
             &workflow.id,

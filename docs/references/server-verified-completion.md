@@ -221,13 +221,13 @@ than `pr_open`. This converts Risk C's delay-shaped hole into a gate.
 ### R4 — Prompt-task done contract
 
 `single_shot_done_decision` and `settled_done_decision` require either a
-`validation_report` artifact (server-checkable: command list + exit codes) or
-an explicit structured `no_change_rationale`. When either is present, the
-reducer attaches the umbrella `prompt_completion_evidence` kind (recording
-which alternative satisfied it), and the transition's `required_evidence`
-names only that umbrella kind — encoding the OR in the reducer, where the
-branching context lives, rather than extending `TransitionRule` with
-alternative-set semantics. Absent both, the decision is `blocked` with reason
+`validation_report` artifact (command list + claimed exit codes) or an explicit
+structured `no_change_rationale`. When either is present, the reducer attaches
+the umbrella `prompt_completion_evidence` kind as self-declared evidence; it
+does not upgrade agent output merely because the reducer parsed it. This
+transition deliberately accepts structured self-declared evidence: the
+contract prevents prose-only completion but does not claim independent
+re-execution. Absent both, the decision is `blocked` with reason
 `prompt_completion_evidence_missing`. The continuation path keeps its
 external-state semantics; only the terminal step gains an evidence
 requirement.

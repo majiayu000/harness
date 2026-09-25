@@ -207,6 +207,80 @@ else
         fail "starter explicit-bin override: exit=$status output=$output"
     fi
 
+    # Codex-only launches must not inherit the Claude backend credential.
+    fix="$(new_fixture starter-sanitized-claude-credential)"
+    printf '#!/bin/sh\nif [ -n "${ANTHROPIC_API_KEY:-}" ]; then exit 9; fi\nexit 0\n' > "$fix/operator-harness"
+    chmod +x "$fix/operator-harness"
+    set +e
+    output="$(cd "$fix" && ANTHROPIC_API_KEY=must-not-leak "$STARTER" --port 39415 --bin "$fix/operator-harness" --foreground 2>&1)"
+    status=$?
+    set -e
+    if [ "$status" -eq 0 ] &&
+        printf '%s' "$output" | grep -q "sanitized vars: -u ANTHROPIC_API_KEY"; then
+        pass "starter strips the Claude backend credential"
+    else
+        fail "starter Claude credential sanitization: exit=$status output=$output"
+    fi
+
+    # GitHub automation can require an authenticated REST token. When only gh
+    # auth is available, the starter injects its token without printing it.
+    fix="$(new_fixture starter-github-token-from-gh)"
+    mkdir -p "$fix/bin"
+    printf '%s\n' '#!/bin/sh' 'printf %s fixture-gh-token' > "$fix/bin/gh"
+    chmod +x "$fix/bin/gh"
+    printf '%s\n' '#!/bin/sh' "test \"\${GITHUB_TOKEN:-}\" = fixture-gh-token" \
+        > "$fix/operator-harness"
+    chmod +x "$fix/operator-harness"
+    set +e
+    output="$(cd "$fix" && env -u GITHUB_TOKEN -u GH_TOKEN PATH="$fix/bin:$PATH" \
+        "$STARTER" --port 39415 --bin "$fix/operator-harness" \
+        --require-github-token --foreground 2>&1)"
+    status=$?
+    set -e
+    if [ "$status" -eq 0 ] &&
+        printf '%s' "$output" | grep -q "GitHub token preflight: available source=gh_auth" &&
+        ! printf '%s' "$output" | grep -q "fixture-gh-token"; then
+        pass "starter imports gh auth token without printing it"
+    else
+        fail "starter gh-token import: exit=$status output=$output"
+    fi
+
+    # Required GitHub authentication fails before the server is launched when
+    # neither an environment token nor a usable gh login exists.
+    fix="$(new_fixture starter-github-token-required)"
+    mkdir -p "$fix/bin"
+    printf '#!/bin/sh\nexit 1\n' > "$fix/bin/gh"
+    chmod +x "$fix/bin/gh"
+    printf '#!/bin/sh\nexit 99\n' > "$fix/operator-harness"
+    chmod +x "$fix/operator-harness"
+    set +e
+    output="$(cd "$fix" && env -u GITHUB_TOKEN -u GH_TOKEN PATH="$fix/bin:$PATH" \
+        "$STARTER" --port 39416 --bin "$fix/operator-harness" \
+        --require-github-token --foreground 2>&1)"
+    status=$?
+    set -e
+    if [ "$status" -eq 5 ] &&
+        printf '%s' "$output" | grep -q "GitHub token preflight failed"; then
+        pass "starter refuses required GitHub automation without a token"
+    else
+        fail "starter missing GitHub token refusal: exit=$status output=$output"
+    fi
+
+    # Blank environment values are not usable tokens and must not bypass the
+    # same normalization applied by the server.
+    set +e
+    output="$(cd "$fix" && GITHUB_TOKEN=' ' GH_TOKEN='  ' PATH="$fix/bin:$PATH" \
+        "$STARTER" --port 39417 --bin "$fix/operator-harness" \
+        --require-github-token --foreground 2>&1)"
+    status=$?
+    set -e
+    if [ "$status" -eq 5 ] &&
+        printf '%s' "$output" | grep -q "GitHub token preflight failed"; then
+        pass "starter rejects whitespace-only GitHub tokens"
+    else
+        fail "starter whitespace GitHub token refusal: exit=$status output=$output"
+    fi
+
     # The recorded-live-PID fast path reports freshness separately from
     # process health and stays successful and non-destructive.
     fix="$(new_fixture starter-live-pid)"
@@ -224,6 +298,17 @@ else
         pass "starter live-PID path reports freshness separately from health"
     else
         fail "starter live-PID freshness report: exit=$status output=$output"
+    fi
+
+    set +e
+    output="$(cd "$fix" && "$STARTER" --port 39414 --require-github-token 2>&1)"
+    status=$?
+    set -e
+    if [ "$status" -eq 5 ] &&
+        printf '%s' "$output" | grep -q "already-running harness server"; then
+        pass "starter refuses unverifiable token preflight for a live server"
+    else
+        fail "starter live-server token preflight refusal: exit=$status output=$output"
     fi
 
     # --status reports freshness for a live recorded PID.

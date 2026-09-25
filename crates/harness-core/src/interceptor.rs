@@ -1,5 +1,8 @@
 use crate::agent::{AgentRequest, AgentResponse};
-use crate::types::{Decision, SessionId};
+use crate::{
+    run_id::RunId,
+    types::{Decision, SessionId},
+};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
@@ -75,6 +78,8 @@ pub struct ToolUseEvent {
     /// known at construction time; interceptors fall back to a fresh anonymous
     /// [`SessionId`] in that case.
     pub session_id: Option<SessionId>,
+    /// Agent run that produced the tool use, when known by the caller.
+    pub run_id: Option<RunId>,
 }
 
 /// Result returned by a [`TurnInterceptor::post_tool_use`] call.

@@ -2,7 +2,9 @@ use crate::runtime::model::{
     ActivityErrorKind, ActivityResult, WorkflowCommand, WorkflowCommandType, WorkflowDecision,
     WorkflowEvent, WorkflowEvidence, WorkflowInstance,
 };
-use crate::runtime::reason_class::{classify_stop, STOP_REASON_INVALID_AGENT_OUTPUT};
+use crate::runtime::reason_class::{
+    classify_stop, STOP_REASON_BUDGET_EXHAUSTED, STOP_REASON_INVALID_AGENT_OUTPUT,
+};
 use serde_json::{json, Value};
 
 pub(crate) fn invalid_agent_output_blocked_decision(
@@ -32,6 +34,45 @@ pub(crate) fn invalid_agent_output_blocked_decision(
             "reason": reason,
             "activity": result.activity,
             "runtime_job_id": event_field_string(event, "runtime_job_id"),
+        }),
+    ))
+    .with_evidence(runtime_completion_evidence(event, result))
+    .high_confidence()
+}
+
+/// Hard workflow budget ceiling (GH-1770 spec §4.4): the completed activity
+/// pushed the instance past its USD budget, so the workflow stops instead of
+/// scheduling more work. Recovery is the existing operator path — unblock
+/// after raising the budget — so no new lifecycle state is introduced.
+pub(crate) fn budget_exhausted_blocked_decision(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    result: &ActivityResult,
+    reason: &str,
+    evidence: Value,
+) -> WorkflowDecision {
+    WorkflowDecision::new(
+        &instance.id,
+        &instance.state,
+        "block_budget_exhausted",
+        "blocked",
+        reason,
+    )
+    .with_command(runtime_blocked_command(
+        reason,
+        Some(STOP_REASON_BUDGET_EXHAUSTED),
+        format!("runtime-completion:{}:budget-exhausted:block", event.id),
+        event,
+        result,
+    ))
+    .with_command(WorkflowCommand::new(
+        WorkflowCommandType::RequestOperatorAttention,
+        format!("runtime-completion:{}:budget-exhausted:operator", event.id),
+        json!({
+            "reason": reason,
+            "activity": result.activity,
+            "runtime_job_id": event_field_string(event, "runtime_job_id"),
+            "budget": evidence,
         }),
     ))
     .with_evidence(runtime_completion_evidence(event, result))
@@ -201,7 +242,10 @@ fn runtime_stop_metadata(
     let mut metadata = json!({
         "state": state,
         "activity": stop_activity_name(event, result),
-        "runtime_job_id": optional_json_string(event_field_string(event, "runtime_job_id")),
+        "runtime_job_id": optional_json_string(
+            event_field_string(event, "recovery_runtime_job_id")
+                .or_else(|| event_field_string(event, "runtime_job_id")),
+        ),
         "event_id": event.id,
         "recorded_at": event.created_at,
     });
@@ -232,13 +276,16 @@ fn apply_stop_classification(
 }
 
 fn stop_activity_name(event: &WorkflowEvent, result: &ActivityResult) -> String {
-    event_workflow_command(event)
-        .as_ref()
-        .and_then(WorkflowCommand::activity_name)
-        .or_else(|| (!result.activity.trim().is_empty()).then_some(result.activity.as_str()))
-        .or_else(|| event_command_type(event))
-        .unwrap_or("<unknown>")
-        .to_string()
+    event_field_string(event, "recovery_activity")
+        .or_else(|| {
+            event_workflow_command(event)
+                .as_ref()
+                .and_then(WorkflowCommand::activity_name)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| (!result.activity.trim().is_empty()).then(|| result.activity.to_string()))
+        .or_else(|| event_command_type(event).map(ToOwned::to_owned))
+        .unwrap_or_else(|| "<unknown>".to_string())
 }
 
 fn blocked_unblock_hint() -> &'static str {

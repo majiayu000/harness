@@ -2,11 +2,13 @@ use super::model::{
     ActivityErrorKind, ActivityResult, ActivitySignal, ValidationRecord, WorkflowDecisionRecord,
     WorkflowEvent, WorkflowInstance,
 };
+use super::reducer::first_valid_prompt_validation_report;
 use super::repo_memory::{
     RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord, REPO_MEMORY_CONFIG_ARTIFACT,
 };
 use super::state_registry::WorkflowTerminalState;
 use super::store::WorkflowRuntimeStore;
+use super::PROMPT_TASK_DEFINITION_ID;
 use serde_json::{json, Value};
 
 impl WorkflowRuntimeStore {
@@ -39,7 +41,13 @@ impl WorkflowRuntimeStore {
         let Some(instance) = self.get_instance(&decision.workflow_id).await? else {
             return Ok(());
         };
-        let Some(record) = extract_terminal_repo_memory_record(&instance, event, decision)? else {
+        let Some(record) = extract_terminal_repo_memory_record_with_registry(
+            &self.definition_registry,
+            &instance,
+            event,
+            decision,
+        )?
+        else {
             return Ok(());
         };
         self.insert_repo_memory_record(&record).await?;
@@ -47,7 +55,8 @@ impl WorkflowRuntimeStore {
     }
 }
 
-fn extract_terminal_repo_memory_record(
+fn extract_terminal_repo_memory_record_with_registry(
+    registry: &super::state_registry::WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     decision: &WorkflowDecisionRecord,
@@ -55,7 +64,7 @@ fn extract_terminal_repo_memory_record(
     if !decision.accepted {
         return Ok(None);
     }
-    let Some(outcome) = repo_memory_outcome(instance) else {
+    let Some(outcome) = repo_memory_outcome(registry, instance) else {
         return Ok(None);
     };
     let result: ActivityResult =
@@ -95,6 +104,20 @@ fn extract_terminal_repo_memory_record(
     ))
 }
 
+#[cfg(test)]
+fn extract_terminal_repo_memory_record(
+    instance: &WorkflowInstance,
+    event: &WorkflowEvent,
+    decision: &WorkflowDecisionRecord,
+) -> anyhow::Result<Option<RepoMemoryRecord>> {
+    extract_terminal_repo_memory_record_with_registry(
+        &super::state_registry::WorkflowDefinitionRegistry::with_builtins(),
+        instance,
+        event,
+        decision,
+    )
+}
+
 fn repo_memory_enabled_for_result(result: &ActivityResult) -> bool {
     result
         .artifacts
@@ -106,11 +129,14 @@ fn repo_memory_enabled_for_result(result: &ActivityResult) -> bool {
         .unwrap_or(false)
 }
 
-fn repo_memory_outcome(instance: &WorkflowInstance) -> Option<RepoMemoryOutcome> {
-    match (instance.state.as_str(), instance.terminal_state()?) {
-        ("done", WorkflowTerminalState::Succeeded) => Some(RepoMemoryOutcome::Done),
-        ("failed", WorkflowTerminalState::Failed) => Some(RepoMemoryOutcome::Failed),
-        _ => None,
+fn repo_memory_outcome(
+    registry: &super::state_registry::WorkflowDefinitionRegistry,
+    instance: &WorkflowInstance,
+) -> Option<RepoMemoryOutcome> {
+    match instance.terminal_state_with_registry(registry)? {
+        WorkflowTerminalState::Succeeded => Some(RepoMemoryOutcome::Done),
+        WorkflowTerminalState::Failed => Some(RepoMemoryOutcome::Failed),
+        WorkflowTerminalState::Cancelled => None,
     }
 }
 
@@ -135,11 +161,28 @@ fn validation_command_payload(
     result: &ActivityResult,
     decision: &WorkflowDecisionRecord,
 ) -> Option<Value> {
-    let validation: Vec<Value> = result
-        .validation
-        .iter()
-        .filter_map(validation_record_payload)
-        .collect();
+    let report_validation = (instance.definition_id == PROMPT_TASK_DEFINITION_ID)
+        .then(|| first_valid_prompt_validation_report(result))
+        .flatten()
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| {
+                    json!({
+                        "command": entry.command,
+                        "status": if entry.exit_code == 0 { "passed" } else { "failed" },
+                        "exit_code": entry.exit_code,
+                    })
+                })
+                .collect()
+        });
+    let validation: Vec<Value> = report_validation.unwrap_or_else(|| {
+        result
+            .validation
+            .iter()
+            .filter_map(validation_record_payload)
+            .collect()
+    });
     if validation.is_empty() {
         return None;
     }
@@ -284,6 +327,10 @@ fn clean_string(value: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[path = "memory_extract_registry_tests.rs"]
+mod registry_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::model::{
@@ -312,7 +359,7 @@ mod tests {
             WorkflowSubject::new("prompt_task", id),
         )
         .with_id(id)
-        .with_data(data)
+        .with_server_data(data)
     }
 
     fn completion_event(workflow_id: &str, result: ActivityResult) -> WorkflowEvent {
@@ -385,6 +432,94 @@ mod tests {
         assert_eq!(
             record.evidence_ref.as_deref(),
             Some(expected_evidence_ref.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_extract_records_done_report_only_validation_commands() -> anyhow::Result<()> {
+        let instance =
+            test_prompt_workflow_instance("prompt-report-only", "done", Some("owner/repo"));
+        let result = with_repo_memory_enabled(
+            ActivityResult::succeeded(
+                PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "Prompt implementation completed.",
+            )
+            .with_artifact(ActivityArtifact::new(
+                "validation_report",
+                json!([
+                    {
+                        "command": "cargo test -p harness-workflow memory_extract",
+                        "exit_code": 0,
+                    },
+                    {
+                        "command": "cargo clippy --workspace --all-targets -- -D warnings",
+                        "exit_code": 101,
+                    },
+                ]),
+            )),
+        );
+        let event = completion_event(&instance.id, result);
+        let decision = accepted_decision(&instance.id, "done");
+
+        let record = extract_terminal_repo_memory_record(&instance, &event, &decision)?
+            .expect("report-only validation should produce memory");
+
+        assert_eq!(record.outcome, RepoMemoryOutcome::Done);
+        assert_eq!(record.kind, RepoMemoryKind::ValidationCommand);
+        assert_eq!(
+            record.payload_json["detail"]["validation"],
+            json!([
+                {
+                    "command": "cargo test -p harness-workflow memory_extract",
+                    "status": "passed",
+                    "exit_code": 0,
+                },
+                {
+                    "command": "cargo clippy --workspace --all-targets -- -D warnings",
+                    "status": "failed",
+                    "exit_code": 101,
+                },
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_extract_prefers_prompt_report_over_legacy_validation() -> anyhow::Result<()> {
+        let instance =
+            test_prompt_workflow_instance("prompt-report-priority", "done", Some("owner/repo"));
+        let result = with_repo_memory_enabled(
+            ActivityResult::succeeded(
+                PROMPT_TASK_IMPLEMENT_ACTIVITY,
+                "Prompt implementation completed.",
+            )
+            .with_validation(ValidationRecord::new("legacy validation", "passed"))
+            .with_artifact(ActivityArtifact::new(
+                "validation_report",
+                json!([{ "command": "malformed report" }]),
+            ))
+            .with_artifact(ActivityArtifact::new(
+                "validation_report",
+                json!([{
+                    "command": "authoritative report",
+                    "exit_code": 0,
+                }]),
+            )),
+        );
+        let event = completion_event(&instance.id, result);
+        let decision = accepted_decision(&instance.id, "done");
+
+        let record = extract_terminal_repo_memory_record(&instance, &event, &decision)?
+            .expect("prompt validation report should produce memory");
+
+        assert_eq!(
+            record.payload_json["detail"]["validation"],
+            json!([{
+                "command": "authoritative report",
+                "status": "passed",
+                "exit_code": 0,
+            }])
         );
         Ok(())
     }
@@ -533,7 +668,9 @@ mod tests {
     ) -> anyhow::Result<Option<crate::runtime::store::RuntimeActivityCompletion>> {
         let instance =
             test_prompt_workflow_instance(workflow_id, "implementing", Some("owner/repo"));
-        store.insert_instance_if_absent(&instance).await?;
+        store
+            .force_upsert_lifecycle_state_for_test(&instance)
+            .await?;
         let command = WorkflowCommand::enqueue_activity(
             PROMPT_TASK_IMPLEMENT_ACTIVITY,
             format!("{workflow_id}:implement"),
@@ -573,9 +710,12 @@ mod tests {
                 PROMPT_TASK_IMPLEMENT_ACTIVITY,
                 "Prompt implementation completed.",
             )
-            .with_validation(ValidationRecord::new(
-                "cargo test -p harness-workflow memory_extract",
-                "passed",
+            .with_artifact(ActivityArtifact::new(
+                "validation_report",
+                json!([{
+                    "command": "cargo test -p harness-workflow memory_extract",
+                    "exit_code": 0,
+                }]),
             )),
         );
 
@@ -610,6 +750,13 @@ mod tests {
             .with_validation(ValidationRecord::new(
                 "cargo test -p harness-workflow memory_extract",
                 "passed",
+            ))
+            .with_artifact(ActivityArtifact::new(
+                "validation_report",
+                json!([{
+                    "command": "cargo test -p harness-workflow memory_extract",
+                    "exit_code": 0,
+                }]),
             )),
         );
 

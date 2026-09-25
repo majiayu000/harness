@@ -2,7 +2,7 @@
 
 ## Context
 
-harness injects context into agent threads from at least five code paths: harness-rules (loaded rule text), harness-skills (skill projection), harness-exec (ExecPlan/spec contract), the task brief itself, and harness-gc (remediation drafts). Each path decides independently what to include. This spec centralizes those decisions in a new `harness-context` crate, invoked by `harness-server` at `thread/start` and `thread/resume`.
+Harness injects context into agent threads from at least five production code paths: harness-rules (loaded rule text), harness-skills (skill projection), harness-exec (ExecPlan/spec contract), the task brief itself, and harness-gc (remediation drafts). Each path decides independently what to include. GH1806 records the current decision: `harness-context` remains a preview/debug composer invoked by `context/preview`; it does not run at `thread/start` or `thread/resume`, and it does not write to `AgentRequest.context`.
 
 CLI-side hook injections (remem, vibeguard, user hooks) are outside the composer's control by design; they are accounted for with reserved headroom (see Budget).
 
@@ -12,7 +12,7 @@ CLI-side hook injections (remem, vibeguard, user hooks) are outside the composer
 
 ```rust
 pub trait ContextProvider: Send + Sync {
-    fn id(&self) -> ProviderId;                       // "rules", "skills", "contract", "brief", "gc-drafts"
+    fn id(&self) -> ProviderId;                       // "rules", "skills", "contract", "exec-plan", "brief", "gc-drafts"
     fn propose(&self, req: &ComposeRequest) -> Result<Vec<ContextItem>, ProviderError>;
 }
 
@@ -46,8 +46,8 @@ collect → dedupe → mandatory → quota fill → redistribute → guards → 
 ```
 
 1. **Collect.** Run providers with a per-provider timeout (config, default 2s). A provider error or timeout contributes nothing, is logged at error level, and is recorded in the manifest as `provider_error` — the composition is marked degraded, never silently complete.
-2. **Dedupe.** Items sharing a `dedupe_key` collapse to one survivor: highest priority wins, ties broken by configured provider precedence (`rules > contract > skills > brief > gc-drafts`), then lexicographic item id (for determinism).
-3. **Mandatory.** All P0 items are placed first. If P0 alone exceeds the budget, composition **fails loudly** (`compose_error`), failing the thread start in enforce mode — mandatory context must never be silently trimmed.
+2. **Dedupe.** Items sharing a `dedupe_key` collapse to one survivor: highest priority wins, ties broken by configured provider precedence (`rules > contract > exec-plan > skills > brief > gc-drafts`), then lexicographic item id (for determinism).
+3. **Mandatory.** All P0 items are placed first. If P0 alone exceeds the budget, composition **fails loudly** (`compose_error`) rather than silently trimming mandatory context.
 4. **Quota fill.** Remaining budget splits into class quotas (default: Rule 30%, Skill 25%, Contract 25%, Brief 15%, Draft 5%). Within each class, items sort by `score = relevance × class_weight`, ties by item id. Each item is placed at the highest degrade level that fits its class's remaining quota: full content, else ladder steps in order, else deferred to step 5.
 5. **Redistribute.** Unused quota pools globally; deferred items compete in global score order, same degrade-to-fit rule.
 6. **Guards.**
@@ -59,7 +59,6 @@ collect → dedupe → mandatory → quota fill → redistribute → guards → 
 
 ```toml
 [context]
-mode = "shadow"                  # shadow | enforce
 budget_tokens = 24000            # per agent kind overridable: [context.claude-code] / [context.codex]
 reserved_headroom = 0.20         # fraction left free for CLI-hook injections the composer cannot see
 provider_timeout_ms = 2000
@@ -70,10 +69,10 @@ Effective budget = `budget_tokens × (1 − reserved_headroom)`. Token estimatio
 
 ### Manifest
 
-Logged through harness-observe as event kind `context_manifest`:
+Returned by `context/preview`:
 
 ```json
-{"v":1,"thread_id":"...","run_id":"ar-01j1...","mode":"shadow","ts":"...",
+{"v":1,"thread_id":"...","run_id":"ar-01j1...","mode":"preview",
  "budget":{"total":24000,"effective":19200,"used":14730},
  "items":[
    {"id":"rule:U-29","class":"rule","decision":"included","tokens":410},
@@ -83,12 +82,11 @@ Logged through harness-observe as event kind `context_manifest`:
  "provider_errors":[],"warnings":["constraint_overload:17"]}
 ```
 
-`context/manifest/get` returns the manifest for a thread; `context/preview` runs steps 1–7 for a hypothetical `ComposeRequest` without starting a thread.
+`context/preview` runs steps 1-7 for a hypothetical `ComposeRequest` without starting a thread. Manifests are returned to the caller and are not persisted by the composer.
 
 ### Modes
 
-- **Shadow (default):** pipeline runs, manifest is logged, existing injection paths remain the sole writers of agent context. Zero behavioral risk; produces the data needed to validate quotas and headroom.
-- **Enforce:** the five v1 providers' legacy direct-injection paths are disabled behind the same config flag and the composed block becomes the single injection. The flag flips per project, not globally.
+There is one active mode: `preview`. The former shadow/enforce rollout surface was removed because no production call site constructed those modes or consumed composed output. Future execution integration must introduce its own spec, tests, and migration path before composed context can affect agent requests.
 
 ### Interaction with unmanaged injectors
 
@@ -100,22 +98,22 @@ harness-observe already grades task quality. Manifests give every graded task a 
 
 ## Data Model
 
-No new store. Manifests are harness-observe events; config lives in the existing TOML. The crate is stateless between compositions.
+No new store. Preview manifests are returned in the RPC response; config lives in the existing TOML. The crate is stateless between compositions.
 
 ## Privacy and Failure Behavior
 
 - Manifests record item ids, sizes, and decisions — not full item content (content is recoverable from providers by id).
 - Provider failure: error-level log + degraded manifest, never a silent partial composition (U-29).
-- In shadow mode, composer panics/errors must never affect thread start: the composer call is isolated and its failure only produces an error event.
+- Composer errors affect only the preview RPC response. Production thread start remains on the existing prompt assembly paths.
 
 ## Verification Plan
 
 - Golden tests: fixture proposals → snapshot of composition + manifest (byte-exact, guards determinism).
 - Property tests: `used ≤ effective budget` for arbitrary item sets; every input item appears in the manifest exactly once with a decision.
 - Pipeline unit tests: dedupe precedence, P0-overflow hard failure, degrade-ladder fitting, redistribution order, constraint-count guard.
-- Integration (shadow): run a real task; assert manifest event exists and the injected context is byte-identical to a pre-composer baseline capture.
-- Integration (enforce, gated): same task with enforce on; assert the five legacy paths injected nothing and the composed block is present.
+- Preview RPC integration: assert rendered context and manifest are returned for a hypothetical request.
+- Config regression: legacy `context.mode` TOML is ignored for compatibility, and the typed config no longer exposes a mode field.
 
 ## Rollback
 
-Shadow mode is inert by construction. Enforce mode rolls back by flipping `context.mode` back to `shadow` per project — legacy injection paths are disabled behind the flag, not deleted, until enforce has run stably for an agreed period.
+Preview-only composition is inert for production execution. Roll back by disabling or removing the preview RPC route; there is no production injection flag to flip.

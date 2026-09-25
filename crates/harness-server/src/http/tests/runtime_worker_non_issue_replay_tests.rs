@@ -1,6 +1,132 @@
 use super::*;
 
 #[tokio::test]
+async fn concurrent_prompt_child_start_records_one_provenanced_event() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-prompt-child-concurrent");
+    std::fs::create_dir_all(&project_root)?;
+    let project_id = project_root.to_string_lossy().into_owned();
+    let state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let parent = harness_workflow::runtime::WorkflowInstance::new(
+        harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
+    )
+    .with_id("prompt-task-prompt-child-concurrent")
+    .with_server_data(serde_json::json!({
+        "project_id": project_id,
+        "repo": "owner/repo",
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
+        "prompt-task:owner/repo:pr:1784:feedback",
+        serde_json::json!({
+            "definition_id": harness_workflow::runtime::PROMPT_TASK_DEFINITION_ID,
+            "subject_key": "pr:1784:feedback",
+            "repo": "owner/repo",
+            "source": "github_pr_feedback",
+            "external_id": "pr-feedback:owner/repo:1784",
+            "task_id": "prompt-task:owner/repo:pr:1784:feedback",
+            "prompt": "Handle unresolved review feedback for PR 1784.",
+        }),
+    );
+    let command_id = store.enqueue_command(&parent.id, None, &command).await?;
+    let runtime_job = store
+        .enqueue_runtime_job(
+            &command_id,
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            serde_json::json!({
+                "project_id": parent.data["project_id"],
+                "command_id": command_id,
+            }),
+        )
+        .await?;
+    let claimed = store
+        .claim_next_runtime_job(
+            "concurrent-prompt-child",
+            Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await?
+        .expect("prompt child runtime job should be claimable");
+    assert_eq!(claimed.id, runtime_job.id);
+
+    let task_id = crate::task_runner::TaskId::from_str("prompt-task:owner/repo:pr:1784:feedback");
+    let submission = crate::workflow_runtime_submission::record_prompt_submission(
+        store,
+        crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
+            project_root: std::path::Path::new(
+                parent.data["project_id"]
+                    .as_str()
+                    .expect("parent project_id"),
+            ),
+            repo: None,
+            task_id: &task_id,
+            prompt: "Handle unresolved review feedback for PR 1784.",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            dependencies_blocked: false,
+            source: Some("github_pr_feedback"),
+            external_id: Some("pr-feedback:owner/repo:1784"),
+            continuation: None,
+        },
+    )
+    .await?;
+    let child = store
+        .get_instance(&submission.workflow_id)
+        .await?
+        .expect("prompt child workflow should exist before concurrent replay");
+    store
+        .attach_parent_workflow_if_missing(&child.id, &parent.id)
+        .await?
+        .expect("prompt child should remain persisted");
+
+    let first = crate::workflow_runtime_worker::execute_start_prompt_task_child_workflow_for_test(
+        &state,
+        &claimed,
+        Some(&parent),
+        &command.command,
+        "pr:1784:feedback",
+    );
+    let second = crate::workflow_runtime_worker::execute_start_prompt_task_child_workflow_for_test(
+        &state,
+        &claimed,
+        Some(&parent),
+        &command.command,
+        "pr:1784:feedback",
+    );
+    let (first, second) = tokio::join!(first, second);
+    first?;
+    second?;
+
+    let child = store
+        .get_instance_by_submission_id("prompt-task:owner/repo:pr:1784:feedback")
+        .await?
+        .expect("prompt child workflow should be persisted");
+    assert_eq!(
+        store
+            .events_for(&child.id)
+            .await?
+            .iter()
+            .filter(|event| event.event_type == "ChildWorkflowStarted")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
 ) -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
@@ -24,11 +150,11 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
         harness_workflow::runtime::WorkflowSubject::new("prompt", "owner/repo"),
     )
     .with_id("prompt-task-prompt-child-replay")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "prompt-task:owner/repo:pr:1120:feedback",
@@ -69,6 +195,7 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
         store,
         crate::workflow_runtime_submission::PromptSubmissionRuntimeContext {
             project_root: std::path::Path::new(&project_id),
+            repo: None,
             task_id: &task_id,
             prompt: "Handle unresolved review feedback for PR 1120.",
             depends_on: &[],
@@ -84,8 +211,10 @@ async fn runtime_job_worker_replays_prompt_child_without_duplicate_side_effects(
         .get_instance(&submission.workflow_id)
         .await?
         .expect("prompt child workflow should exist after submission");
-    child.parent_workflow_id = Some(parent.id.clone());
-    store.upsert_instance(&child).await?;
+    child = store
+        .attach_parent_workflow_if_missing(&child.id, &parent.id)
+        .await?
+        .expect("prompt child workflow should remain persisted");
     store
         .append_event(
             &child.id,
@@ -156,7 +285,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:227"),
     )
     .with_id("issue-quality-gate-replay-parent")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 227,
@@ -164,7 +293,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         "pr_url": "https://github.com/owner/repo/pull/77",
         "author_trust_class": "non_collaborator",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "quality-gate:issue-227:77",
@@ -208,7 +337,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "pr_number": 77,
@@ -218,7 +347,7 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         "started_by_command_id": command_id.clone(),
         "validation_commands": ["cargo check"],
     }));
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     store
         .append_event(
             &child_id,
@@ -249,11 +378,15 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
         )
         .await?;
     let validation_commands = vec!["cargo check".to_string()];
+    let validation_commands_argv = vec![vec!["cargo".to_string(), "check".to_string()]];
     let output = harness_workflow::runtime::build_quality_gate_run_decision(
         &child,
         harness_workflow::runtime::QualityGateDecisionInput {
             reason: "test quality replay",
             validation_commands: &validation_commands,
+            validation_commands_argv: &validation_commands_argv,
+            eval: None,
+            expected_head_sha: None,
         },
     );
     let record = harness_workflow::runtime::WorkflowDecisionRecord::accepted(
@@ -267,7 +400,8 @@ async fn runtime_job_worker_replays_quality_gate_child_without_duplicate_side_ef
             .await?;
     }
     child.state = "checking".to_string();
-    store.upsert_instance(&child).await?;
+    child.version += 1;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,
@@ -368,14 +502,14 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:226"),
     )
     .with_id("issue-pr-feedback-replay-parent")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 226,
         "pr_number": 77,
         "pr_url": "https://github.com/owner/repo/pull/77",
     }));
-    store.upsert_instance(&parent).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &parent).await?;
     let command = harness_workflow::runtime::WorkflowCommand::new(
         harness_workflow::runtime::WorkflowCommandType::StartChildWorkflow,
         "pr-feedback-sweep:issue-226:77",
@@ -419,7 +553,7 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
     )
     .with_id(child_id.clone())
     .with_parent(parent.id.clone())
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_id.clone(),
         "repo": "owner/repo",
         "issue_number": 226,
@@ -429,7 +563,7 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
         "started_by_runtime_job_id": runtime_job.id.clone(),
         "started_by_command_id": command_id.clone(),
     }));
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
     store
         .append_event(
             &child_id,
@@ -469,6 +603,7 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
             pr_url: Some("https://github.com/owner/repo/pull/77"),
             issue_number: Some(226),
             repo: Some("owner/repo"),
+            expected_base_ref: None,
             parent_workflow_id: Some(parent.id.as_str()),
             summary: "test pr feedback replay",
         },
@@ -484,7 +619,7 @@ async fn runtime_job_worker_replays_pr_feedback_child_without_duplicate_side_eff
             .await?;
     }
     child.state = "pending".to_string();
-    store.upsert_instance(&child).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &child).await?;
 
     let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
         &state,

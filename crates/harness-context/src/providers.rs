@@ -2,6 +2,10 @@ use crate::{
     ComposeRequest, ContextItem, ContextProvider, Degraded, ItemClass, ItemId, Priority,
     ProviderError, ProviderId,
 };
+use harness_core::retrieval::{
+    score_retrieval_candidate, KnowledgeRetriever, LexicalKnowledgeRetriever, RetrievalCandidate,
+    RetrievalField, RetrievalQuery, RetrievalSurface,
+};
 use harness_core::types::{DraftStatus, ExecPlanStatus, ProjectId};
 use harness_rules::engine::Rule;
 use harness_skills::store::Skill;
@@ -63,28 +67,26 @@ impl ContextProvider for SkillsProvider {
     }
 
     fn propose(&self, req: &ComposeRequest) -> Result<Vec<ContextItem>, ProviderError> {
-        let prompt = req
-            .task_profile
-            .prompt
-            .as_deref()
-            .unwrap_or_default()
-            .to_lowercase();
-        let mut skills = self
-            .skills
-            .iter()
-            .filter(|skill| {
-                skill.trigger_patterns.is_empty()
-                    || skill
-                        .trigger_patterns
-                        .iter()
-                        .any(|pattern| prompt.contains(&pattern.to_lowercase()))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        let prompt = req.task_profile.prompt.as_deref().unwrap_or_default();
+        let retriever = LexicalKnowledgeRetriever;
+        let mut skills = Vec::new();
+        for skill in &self.skills {
+            if skill.trigger_patterns.is_empty() {
+                skills.push((skill.clone(), 0.15));
+            } else if skill_trigger_relevance(&retriever, prompt, skill)? > 0.0 {
+                let relevance = skill_context_relevance(&retriever, prompt, skill)?;
+                skills.push((skill.clone(), relevance));
+            }
+        }
+        skills.sort_by(|(left, left_score), (right, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| right.quality_score.total_cmp(&left.quality_score))
+                .then_with(|| left.name.cmp(&right.name))
+        });
         Ok(skills
             .into_iter()
-            .map(|skill| ContextItem {
+            .map(|(skill, relevance)| ContextItem {
                 id: ItemId::new(format!("skill:{}", skill.name)),
                 class: ItemClass::Skill,
                 content: skill.content,
@@ -93,7 +95,7 @@ impl ContextProvider for SkillsProvider {
                 relevance: if skill.trigger_patterns.is_empty() {
                     0.4
                 } else {
-                    0.75
+                    (0.35 + relevance * 0.6).min(0.95) as f32
                 },
                 degrade: vec![
                     Degraded::Summary(skill.description.clone()),
@@ -104,6 +106,46 @@ impl ContextProvider for SkillsProvider {
             })
             .collect())
     }
+}
+
+fn skill_context_relevance(
+    retriever: &dyn KnowledgeRetriever,
+    prompt: &str,
+    skill: &Skill,
+) -> Result<f64, ProviderError> {
+    let mut fields = Vec::with_capacity(skill.trigger_patterns.len() + 3);
+    for pattern in &skill.trigger_patterns {
+        fields.push(RetrievalField::new(pattern, 2.0));
+    }
+    fields.push(RetrievalField::new(&skill.name, 0.8));
+    fields.push(RetrievalField::new(&skill.description, 1.2));
+    fields.push(RetrievalField::new(&skill.content, 0.25));
+    score_skill_candidate(retriever, prompt, skill, fields)
+}
+
+fn skill_trigger_relevance(
+    retriever: &dyn KnowledgeRetriever,
+    prompt: &str,
+    skill: &Skill,
+) -> Result<f64, ProviderError> {
+    let fields = skill
+        .trigger_patterns
+        .iter()
+        .map(|pattern| RetrievalField::new(pattern, 2.0))
+        .collect::<Vec<_>>();
+    score_skill_candidate(retriever, prompt, skill, fields)
+}
+
+fn score_skill_candidate(
+    retriever: &dyn KnowledgeRetriever,
+    prompt: &str,
+    skill: &Skill,
+    fields: Vec<RetrievalField<'_>>,
+) -> Result<f64, ProviderError> {
+    let query = RetrievalQuery::new(RetrievalSurface::Skill, prompt, 1);
+    let candidate = RetrievalCandidate::new(&skill.name, fields);
+    score_retrieval_candidate(retriever, &query, candidate)
+        .map_err(|error| ProviderError::new("skills", error.to_string()))
 }
 
 pub struct ContractProvider;
@@ -131,19 +173,21 @@ impl ContextProvider for ContractProvider {
     }
 }
 
+/// Holds shared handles to cached plans so that proposing never deep-clones
+/// plan contents (the server's plan cache stores `Arc<ExecPlan>`).
 pub struct ExecPlanProvider {
-    plans: Vec<harness_exec::plan::ExecPlan>,
+    plans: Vec<std::sync::Arc<harness_exec::plan::ExecPlan>>,
 }
 
 impl ExecPlanProvider {
-    pub fn new(plans: Vec<harness_exec::plan::ExecPlan>) -> Self {
+    pub fn new(plans: Vec<std::sync::Arc<harness_exec::plan::ExecPlan>>) -> Self {
         Self { plans }
     }
 }
 
 impl ContextProvider for ExecPlanProvider {
     fn id(&self) -> ProviderId {
-        ProviderId::new("contract")
+        ProviderId::new("exec-plan")
     }
 
     fn propose(&self, req: &ComposeRequest) -> Result<Vec<ContextItem>, ProviderError> {
@@ -152,7 +196,6 @@ impl ContextProvider for ExecPlanProvider {
             .iter()
             .filter(|plan| ProjectId::from_path(&plan.project_root) == req.project)
             .filter(|plan| matches!(plan.status, ExecPlanStatus::Draft | ExecPlanStatus::Active))
-            .cloned()
             .collect::<Vec<_>>();
         plans.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
 

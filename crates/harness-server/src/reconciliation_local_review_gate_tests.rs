@@ -45,7 +45,7 @@ async fn local_review_gate_runtime_reconciliation_marks_merged_pr_done() -> anyh
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:47"),
     )
     .with_id(&workflow_id)
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": project_id.as_ref(),
         "repo": "owner/repo",
         "issue_number": 47,
@@ -53,7 +53,11 @@ async fn local_review_gate_runtime_reconciliation_marks_merged_pr_done() -> anyh
         "pr_number": 79,
         "pr_url": "https://github.com/owner/repo/pull/79",
     }));
-    stores.runtime_store.upsert_instance(&instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(
+        &stores.runtime_store,
+        &instance,
+    )
+    .await?;
 
     let report = run_once_with_runtime_config(
         Some(&stores.runtime_store),
@@ -62,7 +66,7 @@ async fn local_review_gate_runtime_reconciliation_marks_merged_pr_done() -> anyh
         false,
         None,
     )
-    .await;
+    .await?;
 
     assert_eq!(report.workflow_transitions.len(), 1);
     assert_eq!(report.workflow_transitions[0].from, "local_review_gate");

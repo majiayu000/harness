@@ -305,7 +305,7 @@ fn trust_cannot_exceed_observation_source() {
             };
             let result = test_component(
                 AgentStackComponentKind::Validation,
-                repository_source("checks/specrail.py"),
+                repository_source("checks/validation.py"),
                 *observation,
                 AgentStackSelectionState::Selected,
                 *trust,

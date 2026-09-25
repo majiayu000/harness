@@ -1,8 +1,15 @@
 use chrono::{DateTime, Utc};
-use harness_core::{types::SkillId, types::SkillLocation};
+use harness_core::{
+    retrieval::{
+        score_retrieval_candidate, KnowledgeRetriever, LexicalKnowledgeRetriever,
+        RetrievalCandidate, RetrievalField, RetrievalQuery, RetrievalSurface,
+    },
+    types::SkillId,
+    types::SkillLocation,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub use crate::freshness::FreshnessClass;
 
@@ -272,18 +279,27 @@ impl SkillStore {
     }
 
     pub fn match_prompt(&self, prompt: &str) -> Vec<&Skill> {
-        let prompt_lower = prompt.to_lowercase();
-        self.skills
+        let retriever = LexicalKnowledgeRetriever;
+        let mut matches = self
+            .skills
             .iter()
-            .filter(|skill| {
-                !skill.trigger_patterns.is_empty()
-                    && skill
-                        .trigger_patterns
-                        .iter()
-                        .any(|p| prompt_lower.contains(&p.to_lowercase()))
-                    && allows_auto_injection(skill, prompt)
+            .filter_map(|skill| {
+                if skill.trigger_patterns.is_empty() || !allows_auto_injection(skill, prompt) {
+                    return None;
+                }
+                if skill_trigger_relevance(&retriever, prompt, skill) <= 0.0 {
+                    return None;
+                }
+                Some((skill, skill_prompt_relevance(&retriever, prompt, skill)))
             })
-            .collect()
+            .collect::<Vec<_>>();
+        matches.sort_by(|(left, left_score), (right, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| right.quality_score.total_cmp(&left.quality_score))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        matches.into_iter().map(|(skill, _score)| skill).collect()
     }
 
     /// Apply an outcome summary to a skill and update governance state.
@@ -393,7 +409,14 @@ impl SkillStore {
         }
     }
 
-    pub fn create(&mut self, name: String, content: String) -> &Skill {
+    pub fn create(&mut self, name: String, content: String) -> std::io::Result<&Skill> {
+        let dir = self.persist_dir.as_deref().unwrap_or_else(|| Path::new(""));
+        let path = persist_named_path(dir, &name, ".md").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "skill name must be a single filename without '..', separators, or control characters",
+            )
+        })?;
         let trigger_patterns = parse_trigger_patterns(&content);
         let version = parse_version_from_frontmatter(&content);
         let content_hash = compute_content_hash(&content);
@@ -415,23 +438,13 @@ impl SkillStore {
             canary_ratio: default_canary_ratio(),
             last_scored: None,
         };
-        self.skills.push(skill);
-        let skill_ref = match self.skills.last() {
-            Some(s) => s,
-            None => unreachable!("skill was just pushed, so it must exist"),
-        };
-        if let Some(dir) = &self.persist_dir.clone() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                tracing::warn!("failed to create skills dir {}: {e}", dir.display());
-            } else {
-                let path = dir.join(format!("{}.md", skill_ref.name));
-                if let Err(e) = std::fs::write(&path, &skill_ref.content) {
-                    tracing::warn!("failed to persist skill {}: {e}", path.display());
-                }
-                self.skill_dirs.insert(name, dir.clone());
-            }
+        if let Some(dir) = &self.persist_dir {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(path, &skill.content)?;
+            self.skill_dirs.insert(name, dir.clone());
         }
-        skill_ref
+        self.skills.push(skill);
+        Ok(self.skills.last().expect("skill was just pushed"))
     }
 
     pub fn get(&self, id: &SkillId) -> Option<&Skill> {
@@ -449,10 +462,11 @@ impl SkillStore {
         let deleted = self.skills.len() < len;
         if deleted {
             if let (Some(dir), Some(name)) = (&self.persist_dir, name) {
-                let path = dir.join(format!("{}.md", name));
-                if path.exists() {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        tracing::warn!("failed to remove skill file {}: {e}", path.display());
+                if let Some(path) = persist_named_path(dir, &name, ".md") {
+                    if path.exists() {
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            tracing::warn!("failed to remove skill file {}: {e}", path.display());
+                        }
                     }
                 }
             }
@@ -497,9 +511,10 @@ impl SkillStore {
         self.skills[idx].version = version;
         self.skills[idx].content_hash = new_hash;
         if let Some(dir) = &self.persist_dir {
-            let path = dir.join(format!("{}.md", name));
-            if let Err(e) = std::fs::write(&path, &new_content) {
-                tracing::warn!("failed to persist skill {}: {e}", path.display());
+            if let Some(path) = persist_named_path(dir, &name, ".md") {
+                if let Err(e) = std::fs::write(&path, &new_content) {
+                    tracing::warn!("failed to persist skill {}: {e}", path.display());
+                }
             }
         }
         Some(&self.skills[idx])
@@ -675,6 +690,37 @@ fn allows_auto_injection(skill: &Skill, prompt: &str) -> bool {
     }
 }
 
+fn skill_prompt_relevance(retriever: &dyn KnowledgeRetriever, prompt: &str, skill: &Skill) -> f64 {
+    let mut fields = Vec::with_capacity(skill.trigger_patterns.len() + 3);
+    for pattern in &skill.trigger_patterns {
+        fields.push(RetrievalField::new(pattern, 2.0));
+    }
+    fields.push(RetrievalField::new(&skill.name, 0.8));
+    fields.push(RetrievalField::new(&skill.description, 1.2));
+    fields.push(RetrievalField::new(&skill.content, 0.25));
+    score_skill_candidate(retriever, prompt, skill, fields)
+}
+
+fn skill_trigger_relevance(retriever: &dyn KnowledgeRetriever, prompt: &str, skill: &Skill) -> f64 {
+    let fields = skill
+        .trigger_patterns
+        .iter()
+        .map(|pattern| RetrievalField::new(pattern, 2.0))
+        .collect::<Vec<_>>();
+    score_skill_candidate(retriever, prompt, skill, fields)
+}
+
+fn score_skill_candidate(
+    retriever: &dyn KnowledgeRetriever,
+    prompt: &str,
+    skill: &Skill,
+    fields: Vec<RetrievalField<'_>>,
+) -> f64 {
+    let query = RetrievalQuery::new(RetrievalSurface::Skill, prompt, 1);
+    let candidate = RetrievalCandidate::new(&skill.name, fields);
+    score_retrieval_candidate(retriever, &query, candidate).unwrap_or(0.0)
+}
+
 fn in_canary_bucket(skill_id: &SkillId, prompt: &str, ratio: f64) -> bool {
     if ratio <= 0.0 {
         return false;
@@ -692,12 +738,32 @@ fn in_canary_bucket(skill_id: &SkillId, prompt: &str, ratio: f64) -> bool {
     bucket < threshold
 }
 
+fn persist_named_path(dir: &Path, name: &str, suffix: &str) -> Option<PathBuf> {
+    if name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.chars().any(|c| c.is_control())
+    {
+        return None;
+    }
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Some(dir.join(format!("{name}{suffix}"))),
+        _ => {
+            tracing::warn!("refusing skill path for unsafe name {name}");
+            None
+        }
+    }
+}
+
 fn persist_usage_sidecar(dir: &Path, skill_name: &str, usage: &SkillUsage) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!("failed to create usage dir {}: {e}", dir.display());
         return;
     }
-    let path = dir.join(format!("{}.usage.json", skill_name));
+    let Some(path) = persist_named_path(dir, skill_name, ".usage.json") else {
+        return;
+    };
     match serde_json::to_string(usage) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&path, json) {
@@ -712,7 +778,9 @@ fn persist_usage_sidecar(dir: &Path, skill_name: &str, usage: &SkillUsage) {
 }
 
 fn load_usage_sidecar(dir: &Path, skill_name: &str) -> SkillUsage {
-    let path = dir.join(format!("{}.usage.json", skill_name));
+    let Some(path) = persist_named_path(dir, skill_name, ".usage.json") else {
+        return SkillUsage::default();
+    };
     if !path.exists() {
         return SkillUsage::default();
     }

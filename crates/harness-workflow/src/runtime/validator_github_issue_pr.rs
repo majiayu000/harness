@@ -23,7 +23,8 @@ fn validate_operator_recovery_transition(
         ),
         (
             "blocked",
-            "implementing"
+            "planning"
+                | "implementing"
                 | "replanning"
                 | "local_review_gate"
                 | "awaiting_feedback"
@@ -104,10 +105,13 @@ pub(super) fn validate_reconciliation_only_done(
 pub(super) fn is_reconciliation_only_done_transition(decision: &WorkflowDecision) -> bool {
     decision.next_state == "done"
         && (decision.decision == "reconcile_issue_completed"
-            || matches!(
-                decision.observed_state.as_str(),
-                "blocked" | "local_review_gate"
-            ))
+            || (decision.observed_state == "blocked"
+                && matches!(
+                    decision.decision.as_str(),
+                    "reconcile_pr_merged" | "reconcile_issue_completed"
+                ))
+            || (decision.observed_state == "local_review_gate"
+                && decision.decision == "reconcile_pr_merged"))
 }
 
 fn is_pr_merge_mark_done_command(command: &WorkflowCommand) -> bool {

@@ -1,5 +1,4 @@
 use super::*;
-
 type RuntimeEventSummaryRow = (
     String,
     i64,
@@ -10,6 +9,145 @@ type RuntimeEventSummaryRow = (
     Option<i64>,
 );
 impl WorkflowRuntimeStore {
+    /// Durably consumes one pinned agent-contract attempt slot before the
+    /// model is invoked. Returning `false` means this exact slot was already
+    /// consumed (for example before a worker restart), so callers must fail
+    /// closed instead of launching the model again.
+    pub async fn reserve_agent_contract_attempt(
+        &self,
+        claimed_job: &RuntimeJob,
+        max_turns: Option<u32>,
+        primary_attempt: u32,
+        correction_attempt: u32,
+    ) -> anyhow::Result<AgentContractAttemptReservation> {
+        let runtime_job_id = &claimed_job.id;
+        let Some(claimed_lease) = claimed_job.lease.as_ref() else {
+            return Ok(AgentContractAttemptReservation::StaleLease);
+        };
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
+                .bind(runtime_job_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((data,)) = row else {
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+        };
+        let job: RuntimeJob = serde_json::from_str(&data)?;
+        if job.status != RuntimeJobStatus::Running
+            || job.lease_generation != claimed_job.lease_generation
+            || job.lease.as_ref().is_none_or(|lease| {
+                lease.owner != claimed_lease.owner || lease.expires_at <= Utc::now()
+            })
+        {
+            tx.commit().await?;
+            return Ok(AgentContractAttemptReservation::StaleLease);
+        }
+        let contract_value = job
+            .input
+            .pointer("/command/agent_contract")
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime job {runtime_job_id} does not carry a pinned agent_contract"
+                )
+            })?;
+        let contract: harness_core::config::workflow::WorkflowAgentContract =
+            serde_json::from_value(contract_value)?;
+        let activity = job
+            .input
+            .get("activity")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        contract.validate(activity)?;
+        if primary_attempt == 0 || primary_attempt > contract.max_primary_attempts {
+            anyhow::bail!(
+                "agent contract primary attempt {primary_attempt} exceeds pinned budget {}",
+                contract.max_primary_attempts
+            );
+        }
+        if correction_attempt > contract.max_corrections {
+            anyhow::bail!(
+                "agent contract correction attempt {correction_attempt} exceeds pinned budget {}",
+                contract.max_corrections
+            );
+        }
+        let reservation_key = format!("primary:{primary_attempt}:correction:{correction_attempt}");
+        let existing: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM runtime_events
+             WHERE runtime_job_id = $1
+               AND event_type = 'AgentContractAttemptStarted'
+               AND data #>> '{event,reservation_key}' = $2
+             LIMIT 1",
+        )
+        .bind(runtime_job_id)
+        .bind(&reservation_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_some() {
+            tx.commit().await?;
+            return Ok(AgentContractAttemptReservation::AlreadyReserved);
+        }
+        let workflow_id: Option<(String,)> = sqlx::query_as(
+            "SELECT command.workflow_id
+             FROM workflow_commands AS command
+             WHERE command.id = $1",
+        )
+        .bind(&job.command_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((workflow_id,)) = workflow_id else {
+            anyhow::bail!("workflow command not found: {}", job.command_id);
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("runtime_turn_budget:{workflow_id}"))
+            .execute(&mut *tx)
+            .await?;
+        if let Some(max_turns) = max_turns {
+            let (turns_started,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*)
+                 FROM runtime_events AS event
+                 JOIN runtime_jobs AS budget_job ON budget_job.id = event.runtime_job_id
+                 JOIN workflow_commands AS command ON command.id = budget_job.command_id
+                 WHERE command.workflow_id = $1
+                   AND event.event_type = 'RuntimeTurnStarted'",
+            )
+            .bind(&workflow_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if turns_started >= i64::from(max_turns) {
+                tx.commit().await?;
+                return Ok(AgentContractAttemptReservation::BudgetExhausted);
+            }
+        }
+        runtime_job_leases::append_runtime_event_tx(
+            &mut tx,
+            runtime_job_id,
+            "RuntimeTurnStarted",
+            serde_json::json!({
+                "owner": claimed_lease.owner,
+                "lease_generation": claimed_job.lease_generation,
+                "reservation_key": format!("agent_contract:{reservation_key}"),
+            }),
+        )
+        .await?;
+        runtime_job_leases::append_runtime_event_tx(
+            &mut tx,
+            runtime_job_id,
+            "AgentContractAttemptStarted",
+            serde_json::json!({
+                "reservation_key": reservation_key,
+                "primary_attempt": primary_attempt,
+                "correction_attempt": correction_attempt,
+                "max_primary_attempts": contract.max_primary_attempts,
+                "max_corrections": contract.max_corrections,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(AgentContractAttemptReservation::Reserved)
+    }
+
     pub async fn record_runtime_event(
         &self,
         runtime_job_id: &str,
@@ -27,7 +165,79 @@ impl WorkflowRuntimeStore {
         tx.commit().await?;
         Ok(event)
     }
-
+    pub async fn reserve_runtime_turn_started_for_workflow(
+        &self,
+        workflow_id: &str,
+        runtime_job_id: &str,
+        max_turns: u32,
+        payload: Value,
+    ) -> anyhow::Result<Option<RuntimeEvent>> {
+        let mut tx = self.pool.begin().await?;
+        let command_workflow_id: Option<(String,)> = sqlx::query_as(
+            "SELECT command.workflow_id
+             FROM runtime_jobs AS job
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             WHERE job.id = $1",
+        )
+        .bind(runtime_job_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((command_workflow_id,)) = command_workflow_id else {
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+        };
+        if command_workflow_id != workflow_id {
+            anyhow::bail!(
+                "runtime job {runtime_job_id} belongs to workflow {command_workflow_id}, not {workflow_id}"
+            );
+        }
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("runtime_turn_budget:{workflow_id}"))
+            .execute(&mut *tx)
+            .await?;
+        if let Some(reservation_key) = payload.get("reservation_key").and_then(Value::as_str) {
+            let existing: Option<(String,)> = sqlx::query_as(
+                "SELECT data::text
+                 FROM runtime_events
+                 WHERE runtime_job_id = $1
+                   AND event_type = 'RuntimeTurnStarted'
+                   AND data #>> '{event,reservation_key}' = $2
+                 ORDER BY sequence DESC
+                 LIMIT 1",
+            )
+            .bind(runtime_job_id)
+            .bind(reservation_key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((data,)) = existing {
+                tx.commit().await?;
+                return Ok(Some(serde_json::from_str(&data)?));
+            }
+        }
+        let (turns_started,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)
+             FROM runtime_events AS event
+             JOIN runtime_jobs AS job ON job.id = event.runtime_job_id
+             JOIN workflow_commands AS command ON command.id = job.command_id
+             WHERE command.workflow_id = $1
+               AND event.event_type = 'RuntimeTurnStarted'",
+        )
+        .bind(workflow_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if turns_started >= i64::from(max_turns) {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let event = runtime_job_leases::append_runtime_event_tx(
+            &mut tx,
+            runtime_job_id,
+            "RuntimeTurnStarted",
+            payload,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(event))
+    }
     pub async fn runtime_events_for(
         &self,
         runtime_job_id: &str,
@@ -88,7 +298,7 @@ impl WorkflowRuntimeStore {
              FROM unnest($1::text[]) AS selected(runtime_job_id)
              LEFT JOIN LATERAL (
                  SELECT COUNT(*) AS runtime_event_count,
-                        MAX(sequence) FILTER (WHERE event_type = 'RuntimeTurnStarted')
+                        MAX(sequence) FILTER (WHERE event_type = 'RuntimeAgentStarted')
                             AS latest_turn_sequence,
                         MAX(sequence) FILTER (WHERE event_type = 'ActivityResultReady')
                             AS latest_activity_result_sequence
@@ -173,19 +383,60 @@ impl WorkflowRuntimeStore {
         input: Value,
         not_before: Option<DateTime<Utc>>,
     ) -> anyhow::Result<RuntimeJob> {
+        let workflow_id: Option<(String,)> =
+            sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
+                .bind(command_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((workflow_id,)) = workflow_id else {
+            anyhow::bail!("workflow command not found: {command_id}");
+        };
+
         let mut job = RuntimeJob::pending(command_id, runtime_kind, runtime_profile, input);
         job.not_before = not_before;
         let data = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
         let runtime_kind = enum_str(&job.runtime_kind)?;
         let mut tx = self.pool.begin().await?;
-        let workflow_id: Option<(String,)> =
-            sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
-                .bind(command_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((workflow_id,)) = workflow_id else {
+        let workflow = select_instance_for_update_tx(&mut tx, &workflow_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("workflow instance not found: {workflow_id}"))?;
+        if definitions::terminal_state_for_instance_tx(
+            &mut tx,
+            &self.definition_registry,
+            &workflow,
+        )
+        .await?
+        .is_some()
+        {
+            anyhow::bail!(
+                "cannot enqueue runtime job for terminal workflow `{workflow_id}` in state `{}`",
+                workflow.state
+            );
+        }
+        let command_status: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM workflow_commands
+             WHERE id = $1 AND workflow_id = $2
+             FOR UPDATE",
+        )
+        .bind(command_id)
+        .bind(&workflow_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((command_status,)) = command_status else {
             anyhow::bail!("workflow command not found: {command_id}");
+        };
+        let command_status = WorkflowCommandStatus::try_from(command_status.as_str())?;
+        if !matches!(
+            command_status,
+            WorkflowCommandStatus::Pending
+                | WorkflowCommandStatus::Dispatching
+                | WorkflowCommandStatus::Dispatched
+                | WorkflowCommandStatus::Deferred
+        ) {
+            anyhow::bail!(
+                "cannot enqueue runtime job for command `{command_id}` in status `{command_status}`"
+            );
         };
         sqlx::query(
             "INSERT INTO runtime_jobs
@@ -217,6 +468,7 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
         command_store::enqueue_runtime_job_for_command(
             &self.pool,
+            &self.definition_registry,
             command_id,
             None,
             runtime_kind,
@@ -238,6 +490,7 @@ impl WorkflowRuntimeStore {
     ) -> anyhow::Result<RuntimeJobEnqueueOutcome> {
         command_store::enqueue_runtime_job_for_command(
             &self.pool,
+            &self.definition_registry,
             command_id,
             Some(dispatch_claim),
             runtime_kind,
@@ -253,59 +506,234 @@ impl WorkflowRuntimeStore {
         owner: &str,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
-        let mut tx = self.pool.begin().await?;
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT job.id, job.data::text
-             FROM runtime_jobs AS job
-             JOIN workflow_commands AS command ON command.id = job.command_id
-             JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
-             WHERE (
-                 job.status = 'pending'
-                 AND (job.not_before IS NULL OR job.not_before <= CURRENT_TIMESTAMP)
-             ) OR (
-                 job.status = 'running'
-                 AND job.data ? 'lease'
-                 AND (job.data->'lease' ? 'expires_at')
-                 AND (job.data->'lease'->>'expires_at')::timestamptz <= CURRENT_TIMESTAMP
-             )
-             ORDER BY
-                 CASE
-                     WHEN COALESCE(job.data #>> '{input,activity}', '') IN (
-                         'implement_issue',
-                         'implement_prompt',
-                         'inspect_pr_feedback',
-                         'address_pr_feedback'
-                     ) THEN 0
-                     ELSE 1
-                 END ASC,
-                 job.created_at ASC
-             LIMIT 1
-             FOR UPDATE OF job SKIP LOCKED",
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
+        self.claim_next_runtime_job_matching(None, None, owner, expires_at, true, true)
+            .await
+    }
+}
 
-        let Some((id, data)) = row else {
-            tx.commit().await?;
-            return Ok(None);
+#[cfg(test)]
+mod claim_delivery_tests {
+    use super::*;
+    use crate::runtime::WorkflowSubject;
+
+    #[tokio::test]
+    async fn remote_claim_delivery_audits_only_current_live_uncancelled_lease() -> anyhow::Result<()>
+    {
+        let configured = match harness_core::config::process_env::var("HARNESS_DATABASE_URL") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Ok(()),
+            Err(error) => return Err(error.into()),
         };
+        let database_url = harness_core::db::resolve_test_database_url(Some(&configured))?;
+        let dir = tempfile::tempdir()?;
+        let store =
+            WorkflowRuntimeStore::open_with_database_url(dir.path(), Some(&database_url)).await?;
+        let workflow = WorkflowInstance::new(
+            "github_issue_pr",
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "remote-claim-delivery"),
+        );
+        store
+            .force_upsert_lifecycle_state_for_test(&workflow)
+            .await?;
+        let command = WorkflowCommand::enqueue_activity(
+            "implement_issue",
+            format!("claim-delivery-{}", workflow.id),
+        );
+        let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+        let job = store
+            .enqueue_runtime_job(
+                &command_id,
+                RuntimeKind::RemoteHost,
+                "remote",
+                json!({"activity":"implement_issue"}),
+            )
+            .await?;
+        let expired = store
+            .claim_next_remote_host_runtime_job(
+                "delivery-old-owner",
+                Utc::now() - chrono::Duration::seconds(1),
+                true,
+                true,
+            )
+            .await?
+            .expect("expired claim");
+        assert_eq!(expired.id, job.id);
+        let stale_prompt = json!({"prompt_packet_digest":"stale"});
+        let stale_policy = json!({"runtime_job_id":job.id,"host_id":"delivery-old-owner"});
+        assert!(
+            !store
+                .record_remote_host_claim_delivery(
+                    &expired,
+                    Some(stale_prompt.clone()),
+                    Some(stale_policy.clone()),
+                    Some(json!({"resource_limits":{}})),
+                    Some(json!({"network_policy":{}})),
+                )
+                .await?
+        );
+        let current = store
+            .claim_next_remote_host_runtime_job(
+                "delivery-new-owner",
+                Utc::now() + chrono::Duration::minutes(5),
+                true,
+                true,
+            )
+            .await?
+            .expect("reclaimed job");
+        assert_eq!(current.id, job.id);
+        assert!(current.lease_generation > expired.lease_generation);
+        assert!(
+            !store
+                .record_remote_host_claim_delivery(
+                    &expired,
+                    Some(stale_prompt.clone()),
+                    Some(stale_policy.clone()),
+                    Some(json!({"resource_limits":{}})),
+                    Some(json!({"network_policy":{}})),
+                )
+                .await?
+        );
+        assert!(store
+            .runtime_events_for(&job.id)
+            .await?
+            .iter()
+            .all(|event| !matches!(
+                event.event_type.as_str(),
+                "RuntimePromptPrepared" | "EvalResourceLimitsApplied" | "EvalNetworkPolicyApplied"
+            )));
+        assert!(store
+            .events_for(&workflow.id)
+            .await?
+            .iter()
+            .all(|event| event.event_type != "RuntimeHostEvalCredentialPolicyIssued"));
+        assert!(
+            store
+                .record_remote_host_claim_delivery(
+                    &current,
+                    Some(json!({"prompt_packet_digest":"current"})),
+                    Some(json!({"runtime_job_id":job.id,"host_id":"delivery-new-owner"})),
+                    Some(json!({"resource_limits":{}})),
+                    Some(json!({"network_policy":{}})),
+                )
+                .await?
+        );
+        let mut cancelled = current.clone();
+        cancelled.input["cancellation_requested"] = json!({"reason":"operator"});
+        store.persist_runtime_job_data(&cancelled).await?;
+        assert!(
+            !store
+                .record_remote_host_claim_delivery(
+                    &current,
+                    Some(stale_prompt),
+                    Some(stale_policy),
+                    Some(json!({"resource_limits":{}})),
+                    Some(json!({"network_policy":{}})),
+                )
+                .await?
+        );
+        let events = store.runtime_events_for(&job.id).await?;
+        for kind in ["EvalResourceLimitsApplied", "EvalNetworkPolicyApplied"] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == kind)
+                    .count(),
+                1
+            );
+        }
+        let prepared: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "RuntimePromptPrepared")
+            .collect();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].event["prompt_packet_digest"], "current");
+        assert_eq!(
+            prepared[0].event["lease_generation"],
+            current.lease_generation
+        );
+        let events = store.events_for(&workflow.id).await?;
+        let issued: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "RuntimeHostEvalCredentialPolicyIssued")
+            .collect();
+        assert_eq!(issued.len(), 1);
+        assert_eq!(issued[0].event["host_id"], "delivery-new-owner");
 
-        let mut job: RuntimeJob = serde_json::from_str(&data)?;
-        job.claim(owner, expires_at);
-        let updated = to_jsonb_string(&job)?;
-        let status = enum_str(&job.status)?;
-        sqlx::query(
-            "UPDATE runtime_jobs
-             SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $4",
+        let command = store.get_command(&command_id).await?.expect("command");
+        let event = store
+            .append_event(&workflow.id, "ActivityCompleted", "test", json!({}))
+            .await?;
+        let result = ActivityResult::succeeded("implement_issue", "complete");
+        let mut tx = store.pool.begin().await?;
+        let rendered_evidence = super::super::evidence::record_runtime_completion_evidence_tx(
+            &mut tx, &workflow, &command, &current, &event, &result, None,
         )
-        .bind(&status)
-        .bind(job.not_before)
-        .bind(&updated)
-        .bind(&id)
-        .execute(&mut *tx)
         .await?;
+        assert_eq!(
+            rendered_evidence.location["prompt_packet_digest"],
+            "current"
+        );
+        tx.rollback().await?;
+
+        cancelled
+            .input
+            .as_object_mut()
+            .expect("job input")
+            .remove("cancellation_requested");
+        store.persist_runtime_job_data(&cancelled).await?;
+        assert_eq!(
+            store
+                .revoke_remote_host_runtime_job_leases("delivery-new-owner", Utc::now())
+                .await?,
+            1
+        );
+        let raw = store
+            .claim_next_remote_host_runtime_job(
+                "delivery-raw-owner",
+                Utc::now() + chrono::Duration::minutes(5),
+                true,
+                true,
+            )
+            .await?
+            .expect("raw reclaimed lease");
+        assert_eq!(raw.id, current.id);
+        assert!(raw.lease_generation > current.lease_generation);
+        assert!(
+            store
+                .record_remote_host_claim_delivery(
+                    &raw,
+                    None,
+                    Some(json!({"runtime_job_id":job.id,"host_id":"delivery-raw-owner"})),
+                    Some(json!({"resource_limits":{}})),
+                    Some(json!({"network_policy":{}})),
+                )
+                .await?
+        );
+        let events = store.runtime_events_for(&job.id).await?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "RuntimePromptPrepared")
+                .count(),
+            1
+        );
+        let events = store.events_for(&workflow.id).await?;
+        let issued: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "RuntimeHostEvalCredentialPolicyIssued")
+            .collect();
+        assert_eq!(issued.len(), 2);
+        assert_eq!(issued[1].event["host_id"], "delivery-raw-owner");
+        let mut tx = store.pool.begin().await?;
+        let raw_evidence = super::super::evidence::record_runtime_completion_evidence_tx(
+            &mut tx, &workflow, &command, &raw, &event, &result, None,
+        )
+        .await?;
+        assert!(raw_evidence.location.get("prompt_packet_digest").is_none());
+        assert!(raw_evidence.payload.as_ref().expect("payload")["prompt_packet_digest"].is_null());
         tx.commit().await?;
-        Ok(Some(job))
+        Ok(())
     }
 }

@@ -328,6 +328,17 @@ curl -X DELETE http://127.0.0.1:9800/projects/new-project
 | `github_webhook_secret` | — | HMAC-SHA256 secret for GitHub webhook verification |
 | `notification_broadcast_capacity` | `256` | Internal notification channel capacity |
 
+### `[workflow]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `completion_evidence_enforced` | `true` | Deployment-wide enforcement of server-verified evidence for built-in workflow completion transitions. This temporary emergency kill switch is available for one release and is not accepted in project `WORKFLOW.md` files. |
+
+Keep `completion_evidence_enforced = true` under normal operation. Setting it
+to `false` is a security-sensitive rollback that allows agent-claimed terminal
+results without server-verified evidence for every project in the Harness
+deployment. Use it only as a controlled, temporary recovery measure.
+
 ### `[intake.github]`
 
 | Field | Default | Description |
@@ -357,7 +368,7 @@ repositories sharing the token until the safe retry time from `Retry-After`,
 | `method` | `"squash"` | Merge method requested after the deterministic gate passes. |
 | `delete_branch` | `true` | Whether merge execution should request source branch cleanup where the selected executor supports it. |
 | `merge_execution` | `"agent"` | Selects the merge executor. `"agent"` keeps the current agent-executed merge path and requires server-side completion verification. `"server"` runs the merge through the GitHub REST API, then re-reads the pull request before terminal success. |
-| `verify_merge_completion` | `true` | When true, an agent-reported `merge_pr` success is accepted only after Harness re-reads GitHub and observes the PR as merged. |
+| `verify_merge_completion` | `true` | When true, Harness re-reads GitHub before accepting an agent-reported `merge_pr` success. When false, merge completion fails closed while completion-evidence enforcement is active; the deployment-wide emergency kill switch restores claim-trusting behavior. |
 
 Server-executed merge mode requires a GitHub token that can merge pull
 requests, typically a fine-grained token with repository contents write access
@@ -418,6 +429,32 @@ available at all times, including while a recheck is pending.
 | `complexity_preferred_agents` | `[]` | Optional ordered list for complex/critical routing (for example `["codex","claude"]`) |
 | `sandbox_mode` | `"danger-full-access"` | Sandbox policy: `read-only`, `read-only-with-network`, `workspace-write`, `danger-full-access` |
 | `approval_policy` | `"auto-edit"` | Approval policy for agent actions |
+| `capability_profile` | `"standard"` | Agent tool profile: `read-only`, `standard`, or explicit unrestricted opt-up `full`; Claude enforces the allowlist at its CLI boundary, while other backends retain their backend-specific sandbox/permission model |
+| `allowed_tools` | — | Optional explicit tool allowlist; overrides `capability_profile` and keeps the request scoped, including an empty deny-all list |
+
+When `capability_profile` is omitted, Harness emits a migration warning and
+uses the scoped `standard` profile. Set `full` explicitly only when unrestricted
+tool permissions are required.
+
+### `[isolation]`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `default_tier` | `"host"` | Default isolation tier: `host` or `container`; `microvm` is reserved and rejected at startup |
+| `network_allowlist` | `[]` | Exact DNS hostnames allowed through Harness's first-party proxy; scoped mode with an empty list denies all CLI networking, including model-provider connectivity |
+| `rules` | `[]` | Trust-class routing overrides such as `non_collaborator` to `container` |
+
+The bundled proxy image defaults to `harness-egress-proxy:latest`; production
+deployments should set `HARNESS_AGENT_EGRESS_PROXY_IMAGE` to an immutable image
+digest. `HARNESS_AGENT_EGRESS_PROXY` is rejected. See the
+[container tier operator guide](container-tier-operator-guide.md) for build,
+canary, fail-closed, and Linux host behavior.
+
+The proxy boundary covers the complete spawned CLI process and its tool
+children. Harness does not silently exempt model-provider traffic because a
+shell child could use the same exemption. Add every required provider endpoint
+(for example, `api.openai.com` or `api.anthropic.com`) to the exact-host list.
+On Linux, any non-empty allowlist requires `default_tier = "container"`.
 
 ### `[agents.claude]`
 
@@ -441,6 +478,15 @@ available at all times, including while a recheck is pending.
 | `cache_ttl_hours` | `12` | Setup phase cache TTL |
 | `setup_commands` | `[]` | Commands run during cloud setup phase |
 | `setup_secret_env` | `[]` | Env vars available during setup but removed for agent execution |
+
+For container-isolated Codex runs with setup commands, Harness creates a project-local
+state directory under `.harness/cloud-setup-state/`. Every setup command and the final
+Codex process share its writable `HOME` and temporary directory mounts, so installed
+tools and caches remain available across the otherwise ephemeral containers.
+When `setup_secret_env` is non-empty, container setup instead uses temporary
+HOME and temporary-directory mounts so credential files cannot reach the agent.
+Those setup runs are not cached because their isolated state is removed after
+each setup phase; persist intended non-secret outputs in the workspace.
 
 ### `[agents.review]`
 
@@ -520,6 +566,25 @@ unavailable, the scheduler falls back to the existing agent-side
 
 See [OTel Trajectory Quickstart](otel-trajectory-quickstart.md) for a local
 Tempo walkthrough.
+
+### Agent Execution Telemetry Query Path
+
+Harness keeps agent execution telemetry in four durable sinks with separate
+ownership:
+
+| Sink | Owner | Contents |
+|------|-------|----------|
+| Runtime logs / thread transcripts | agent adapter and thread manager | Raw streamed agent output and transcript items |
+| Event store | `harness-observe` | Policy-hook, rules, GC, preflight, retry, and external-signal events |
+| Workflow runtime usage | `harness-workflow` | Per-turn token and cost usage keyed by workflow, runtime job, turn, and agent |
+| OTLP trajectory | `harness-observe` exporter | Derived workflow, activity, and agent-turn spans for trace backends |
+
+The event store is the policy-hook store, not the source of truth for full
+agent turns. To answer "what did agent X do in workflow/run Y", query
+`WorkflowRuntimeStore::runtime_agent_telemetry_for_workflow(workflow_id, agent, event_store)`
+for workflow outcome, per-turn usage, and policy-hook events joined by each
+usage record's `agent_run_id`. `signals.jsonl` remains an append-only
+external-signal input and is not the runtime usage path.
 
 ### `[concurrency]`
 

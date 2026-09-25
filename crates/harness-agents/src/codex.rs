@@ -4,33 +4,50 @@ use crate::streaming::{
     log_captured_stderr_diagnostics, send_stream_item,
 };
 use async_trait::async_trait;
-use harness_core::agent::{AgentRequest, AgentResponse, CodeAgent, StreamItem};
-use harness_core::config::agents::SandboxMode;
+use harness_core::agent::{
+    AgentRequest, AgentResponse, CodeAgent, StreamItem, AGENT_OUTPUT_SCHEMA_PATH_ENV,
+};
+use harness_core::config::agents::{AgentPermissionMode, SandboxMode};
 use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig};
 use harness_core::types::Capability;
-use harness_sandbox::{wrap_command, SandboxSpec};
+use harness_sandbox::SandboxSpec;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 #[path = "codex_exec_parser.rs"]
-mod codex_exec_parser;
+pub(crate) mod codex_exec_parser;
 pub(crate) use self::codex_exec_parser::{
     parse_codex_error_item_message, parse_codex_item, parse_codex_token_usage,
 };
 use self::codex_exec_parser::{parse_codex_exec_output, stream_codex_exec_output};
+
+#[path = "codex_args.rs"]
+mod codex_args;
+#[cfg(test)]
+use self::codex_args::codex_sandbox_mode;
+use self::codex_args::{
+    push_codex_approval_policy_args, push_codex_developer_instructions_args,
+    push_codex_sandbox_args,
+};
+
+#[path = "codex_errors.rs"]
+mod codex_errors;
+use self::codex_errors::{
+    codex_explicit_failure_error, codex_nonzero_exit_error, codex_nonzero_exit_error_from_parsed,
+    codex_structured_error_from_stdout,
+};
 
 #[path = "codex_spawn.rs"]
 mod codex_spawn;
 #[cfg(test)]
 use self::codex_spawn::resolve_program_for_spawn;
 use self::codex_spawn::{codex_spawn_failure_message, log_codex_spawn_attempt};
-
-const READ_ONLY_WITH_NETWORK_PROFILE: &str = "harness_read_only_with_network";
 
 pub struct CodexAgent {
     pub cli_path: PathBuf,
@@ -52,6 +69,7 @@ pub struct CodexReviewRequest {
     pub reasoning_effort: Option<String>,
     pub sandbox_mode: SandboxMode,
     pub approval_policy: Option<String>,
+    pub permission_mode: AgentPermissionMode,
     pub env_vars: HashMap<String, String>,
 }
 
@@ -88,8 +106,35 @@ impl CodexAgent {
         self
     }
 
-    async fn run_setup_phase(&self, project_root: &Path) -> harness_core::error::Result<()> {
-        cloud_setup::run_setup_phase(&self.cloud, project_root).await
+    async fn run_setup_phase(&self, req: &AgentRequest) -> harness_core::error::Result<()> {
+        cloud_setup::run_setup_phase(
+            &self.cloud,
+            cloud_setup::CloudSetupContext {
+                project_root: &req.project_root,
+                sandbox_mode: self.effective_sandbox_mode(req),
+                permission_mode: req.effective_permission_mode(),
+                env_vars: &req.env_vars,
+                capability_token: req.capability_token.as_ref(),
+            },
+        )
+        .await
+    }
+
+    async fn run_review_setup_phase(
+        &self,
+        req: &CodexReviewRequest,
+    ) -> harness_core::error::Result<()> {
+        cloud_setup::run_setup_phase(
+            &self.cloud,
+            cloud_setup::CloudSetupContext {
+                project_root: &req.project_root,
+                sandbox_mode: req.sandbox_mode,
+                permission_mode: req.permission_mode,
+                env_vars: &req.env_vars,
+                capability_token: None,
+            },
+        )
+        .await
     }
 
     fn effective_reasoning_effort<'a>(&'a self, req: &'a AgentRequest) -> &'a str {
@@ -102,8 +147,25 @@ impl CodexAgent {
         req.sandbox_mode.unwrap_or(self.sandbox_mode)
     }
 
+    fn launch_model<'a>(&'a self, req: &'a AgentRequest) -> &'a str {
+        req.model.as_deref().unwrap_or(&self.default_model)
+    }
+
+    /// Sandbox for the codex *process* wrapper. A deny-all-tools request keeps
+    /// its declared sandbox inside codex (`base_args` still passes it) but is
+    /// not double-wrapped in an outer macOS seatbelt: nesting prevents Rust
+    /// from allocating its stack guard page during startup, and consumers see
+    /// the delegation instead of a claimed outer layer.
+    fn process_sandbox_mode(&self, req: &AgentRequest) -> SandboxMode {
+        if matches!(req.allowed_tools.as_deref(), Some([])) {
+            SandboxMode::DangerFullAccess
+        } else {
+            self.effective_sandbox_mode(req)
+        }
+    }
+
     fn base_args(&self, req: &AgentRequest) -> Vec<OsString> {
-        let model = req.model.as_deref().unwrap_or(&self.default_model);
+        let model = self.launch_model(req);
         let reasoning_effort = self.effective_reasoning_effort(req);
         let sandbox_mode = self.effective_sandbox_mode(req);
         let mut args = vec![
@@ -117,17 +179,40 @@ impl CodexAgent {
             OsString::from("-c"),
             OsString::from(format!("model_reasoning_effort=\"{}\"", reasoning_effort)),
         ];
+        let deny_all_tools = matches!(req.allowed_tools.as_deref(), Some([]));
+        if deny_all_tools {
+            // Narrow the *input* surface: no user config, rule files, or
+            // persisted session. codex-cli (checked against 0.150.1) has no
+            // flag that removes the tool surface itself — shell, file reads,
+            // web, and MCP stay launchable — so a deny-all consumer must also
+            // observe the event stream and invalidate the attempt on any tool
+            // activity; see `agent_contract_capabilities`.
+            args.push(OsString::from("--ignore-user-config"));
+            args.push(OsString::from("--ignore-rules"));
+            args.push(OsString::from("--ephemeral"));
+        }
         push_codex_sandbox_args(&mut args, sandbox_mode);
         if let Some(approval_policy) = req.approval_policy.as_deref() {
             push_codex_approval_policy_args(&mut args, approval_policy);
         }
+        if let Some(schema_path) = req
+            .env_vars
+            .get(AGENT_OUTPUT_SCHEMA_PATH_ENV)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.push(OsString::from("--output-schema"));
+            args.push(OsString::from(schema_path));
+        }
 
-        if self.cloud.enabled {
+        if self.cloud.enabled && !deny_all_tools {
             args.push(OsString::from("--ephemeral"));
         }
 
         args.push(OsString::from("-C"));
-        args.push(req.project_root.as_os_str().to_os_string());
+        args.push(OsString::from("."));
+        args.push(OsString::from("--"));
         args.push(OsString::from(req.prompt.clone()));
         args
     }
@@ -144,8 +229,6 @@ impl CodexAgent {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let mut args = vec![
-            OsString::from("-C"),
-            req.project_root.as_os_str().to_os_string(),
             OsString::from("-m"),
             OsString::from(model),
             OsString::from("-c"),
@@ -177,83 +260,116 @@ impl CodexAgent {
         args
     }
 
+    /// Plan the review spawn without launching it.
+    ///
+    /// Review must go through the same spawn contract as the execute paths.
+    /// Calling `wrap_command` directly (as this path used to) skipped container
+    /// isolation and the operator-secret env filtering that
+    /// `prepare_agent_spawn` applies.
+    async fn prepare_review_spawn(
+        &self,
+        req: &CodexReviewRequest,
+    ) -> harness_core::error::Result<(
+        crate::spawn_contract::PreparedAgentSpawn,
+        harness_core::run_id::RunIdentity,
+    )> {
+        let review_args = self.review_args(req);
+        let sandbox_spec = SandboxSpec::new(req.sandbox_mode, &req.project_root);
+
+        let mut spawn_env_vars = req.env_vars.clone();
+        spawn_env_vars.insert(
+            crate::spawn_contract::REVIEW_GIT_SAFE_WORKSPACE_ENV.to_string(),
+            "1".to_string(),
+        );
+        let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
+        run_identity.write_env_vars(&mut spawn_env_vars);
+        if self.cloud.enabled {
+            for key in &self.cloud.setup_secret_env {
+                spawn_env_vars.remove(key);
+            }
+        }
+        let container_bind_mounts = cloud_setup::apply_container_state(
+            &self.cloud,
+            &req.project_root,
+            &mut spawn_env_vars,
+        )?;
+
+        let prepared_spawn =
+            crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
+                program: &self.cli_path,
+                args: &review_args,
+                project_root: &req.project_root,
+                sandbox_spec: &sandbox_spec,
+                env_vars: &spawn_env_vars,
+                secret_env_keys: &[],
+                container_bind_mounts: &container_bind_mounts,
+                permission_mode: req.permission_mode,
+                forward_stdin: review_uses_stdin_prompt(req),
+            })
+            .await?;
+        Ok((prepared_spawn, run_identity))
+    }
+
     pub async fn execute_review(
         &self,
         req: CodexReviewRequest,
     ) -> harness_core::error::Result<AgentResponse> {
-        self.run_setup_phase(&req.project_root).await?;
+        self.run_review_setup_phase(&req).await?;
 
-        let review_args = self.review_args(&req);
         let use_stdin_prompt = review_uses_stdin_prompt(&req);
-        let sandbox_spec = SandboxSpec::new(req.sandbox_mode, &req.project_root);
-        let wrapped_command =
-            wrap_command(&self.cli_path, &review_args, &sandbox_spec).map_err(|error| {
-                harness_core::error::HarnessError::AgentExecution(format!(
-                    "sandbox setup failed for codex review: {error}"
-                ))
-            })?;
-
-        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let mut cmd = Command::new(&wrapped_command.program);
-        cmd.args(&wrapped_command.args)
-            .current_dir(&req.project_root)
-            .stdin(if use_stdin_prompt {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        crate::set_process_group(&mut cmd);
-        cmd.envs(&req.env_vars);
-        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
-        crate::spawn_contract::strip_nested_session_env(&mut cmd);
-
-        if self.cloud.enabled {
-            for key in &self.cloud.setup_secret_env {
-                cmd.env_remove(key);
-            }
-        }
+        let (prepared_spawn, run_identity) = self.prepare_review_spawn(&req).await?;
 
         tracing::debug!(
             agent = "codex",
             mode = "review",
-            program = %wrapped_command.program.display(),
-            current_dir = %req.project_root.display(),
-            sandbox_engine = ?wrapped_command.engine,
-            arg_count = wrapped_command.args.len(),
+            program = %prepared_spawn.program.display(),
+            current_dir = %prepared_spawn.current_dir.display(),
+            sandbox_engine = ?prepared_spawn.sandbox_engine,
+            arg_count = prepared_spawn.args.len(),
             has_stdin_instructions = use_stdin_prompt,
             "codex review spawn prepared"
         );
-        let mut child = cmd.spawn().map_err(|error| {
-            let message = format!(
-                "failed to run codex review: {error}; mode=review; program={}; current_dir={}; sandbox_engine={:?}; arg_count={}",
-                wrapped_command.program.display(),
-                req.project_root.display(),
-                wrapped_command.engine,
-                wrapped_command.args.len()
-            );
-            let message =
-                crate::classify_missing_workspace_spawn_failure(&error, &req.project_root, message);
-            tracing::error!(agent = "codex", mode = "review", error_kind = ?error.kind(), "{message}");
-            harness_core::error::HarnessError::AgentExecution(message)
-        })?;
-        if let Some(pid) = child.id() {
-            crate::write_provisional_agent_run_binding(
-                &run_identity,
-                "codex",
-                pid,
-                &req.project_root,
-            );
-        }
+        let spawn_project_root = req.project_root.clone();
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
+                prepared_spawn,
+                run_identity,
+                native_kind: "codex",
+                process_label: "codex review",
+                stdio: crate::spawn_supervisor::AgentStdio::piped_output(
+                    if use_stdin_prompt {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    },
+                ),
+                extra_env_removals: cloud_setup_env_removals(&self.cloud),
+                map_spawn_error: Box::new(move |error, spawn| {
+                    let message = format!(
+                        "failed to run codex review: {error}; mode=review; program={}; current_dir={}; sandbox_engine={:?}; arg_count={}",
+                        spawn.program.display(),
+                        spawn.current_dir.display(),
+                        spawn.sandbox_engine,
+                        spawn.args.len()
+                    );
+                    let message = crate::classify_missing_workspace_spawn_failure(
+                        error,
+                        &spawn_project_root,
+                        message,
+                    );
+                    harness_core::error::HarnessError::AgentExecution(message)
+                }),
+            },
+            None,
+        )
+        .await?;
+        let mut child = supervised.child;
 
         if use_stdin_prompt {
             let Some(instructions) = req.instructions.as_deref() else {
                 unreachable!("review stdin prompt requires instructions");
             };
-            let Some(mut stdin) = child.stdin.take() else {
+            let Some(mut stdin) = child.inner_mut().stdin.take() else {
                 return Err(harness_core::error::HarnessError::AgentExecution(
                     "failed to open stdin for codex review instructions".to_string(),
                 ));
@@ -268,7 +384,6 @@ impl CodexAgent {
                 })?;
         }
 
-        let mut child = crate::ManagedChild::new(child, "codex review");
         let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
         let output = child.wait_with_output(&limits).await.map_err(|error| {
             harness_core::error::HarnessError::AgentExecution(format!(
@@ -294,7 +409,11 @@ impl CodexAgent {
             stderr,
             items: Vec::new(),
             token_usage: Default::default(),
-            model: "codex".to_string(),
+            // This is the launch selection, not a provider-reported identity.
+            model: req
+                .model
+                .clone()
+                .unwrap_or_else(|| self.default_model.clone()),
             exit_code: output.status.code(),
         })
     }
@@ -314,51 +433,12 @@ fn review_uses_config_instructions(req: &CodexReviewRequest) -> bool {
     req.instructions.is_some() && !review_uses_stdin_prompt(req)
 }
 
-fn codex_structured_error_from_stdout(stdout: &str) -> Option<String> {
-    parse_codex_exec_output(stdout).ok()?.structured_error
-}
-
-fn codex_structured_error(message: impl Into<String>) -> harness_core::error::HarnessError {
-    let message = format!("codex structured error: {}", message.into());
-    if harness_core::error::is_billing_failure_message(&message) {
-        return harness_core::error::HarnessError::BillingFailed(message);
+fn cloud_setup_env_removals(cloud: &CodexCloudConfig) -> Vec<String> {
+    if cloud.enabled {
+        cloud.setup_secret_env.clone()
+    } else {
+        Vec::new()
     }
-    if harness_core::error::is_quota_failure_message(&message) {
-        return harness_core::error::HarnessError::QuotaExhausted(message);
-    }
-    harness_core::error::HarnessError::AgentExecution(message)
-}
-
-fn codex_nonzero_exit_error(
-    status: std::process::ExitStatus,
-    stderr: &str,
-    structured_error: Option<&str>,
-) -> harness_core::error::HarnessError {
-    if let Some(message) = structured_error {
-        let mut error = codex_structured_error(format!("exit {status}: {message}"));
-        if matches!(error, harness_core::error::HarnessError::AgentExecution(_))
-            && !stderr.trim().is_empty()
-        {
-            error = harness_core::error::HarnessError::AgentExecution(format!(
-                "{error}; stderr=[{stderr}]"
-            ));
-        }
-        return error;
-    }
-
-    if harness_core::error::is_billing_failure_message(stderr) {
-        return harness_core::error::HarnessError::BillingFailed(format!(
-            "codex billing failure (exit {status}): {stderr}"
-        ));
-    }
-    if harness_core::error::is_quota_failure_message(stderr) {
-        return harness_core::error::HarnessError::QuotaExhausted(format!(
-            "codex quota exhausted (exit {status}): {stderr}"
-        ));
-    }
-    harness_core::error::HarnessError::AgentExecution(format!(
-        "codex exited with {status}: {stderr}"
-    ))
 }
 
 #[async_trait]
@@ -371,6 +451,23 @@ impl CodeAgent for CodexAgent {
         vec![Capability::Read, Capability::Write, Capability::Execute]
     }
 
+    /// Claims for the `codex exec` launch path this backend owns:
+    /// `prompt_only_launch` via `--ignore-user-config --ignore-rules
+    /// --ephemeral` on deny-all requests, `pinned_output_schema` via
+    /// `--output-schema`, and `attempt_observation_stream` because the exec
+    /// JSON stream maps every item kind and surfaces unmapped kinds instead
+    /// of dropping them. A cloud-enabled instance cannot claim prompt-only
+    /// launch because it runs setup and applies container state first.
+    /// Deny-all does NOT disable codex's tools (no such CLI flag exists);
+    /// enforcement relies on observing the stream.
+    fn agent_contract_capabilities(&self) -> harness_core::agent::AgentContractCapabilities {
+        harness_core::agent::AgentContractCapabilities {
+            prompt_only_launch: !self.cloud.enabled,
+            pinned_output_schema: true,
+            attempt_observation_stream: true,
+        }
+    }
+
     async fn execute(&self, req: AgentRequest) -> harness_core::error::Result<AgentResponse> {
         if let Some(ref token) = req.capability_token {
             if token.is_expired() {
@@ -381,17 +478,18 @@ impl CodeAgent for CodexAgent {
             }
         }
 
-        self.run_setup_phase(&req.project_root).await?;
+        self.run_setup_phase(&req).await?;
 
         let base_args = self.base_args(&req);
-        let sandbox_mode = self.effective_sandbox_mode(&req);
+        let process_sandbox_mode = self.process_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
+            SandboxSpec::new(process_sandbox_mode, &req.project_root)
                 .with_allowed_write_paths(token.allowed_write_paths.clone())
         } else {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
+            SandboxSpec::new(process_sandbox_mode, &req.project_root)
         };
         let mut spawn_env_vars = req.env_vars.clone();
+        spawn_env_vars.remove(AGENT_OUTPUT_SCHEMA_PATH_ENV);
         let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
         run_identity.write_env_vars(&mut spawn_env_vars);
         if self.cloud.enabled {
@@ -399,6 +497,11 @@ impl CodeAgent for CodexAgent {
                 spawn_env_vars.remove(key);
             }
         }
+        let container_bind_mounts = cloud_setup::apply_container_state(
+            &self.cloud,
+            &req.project_root,
+            &mut spawn_env_vars,
+        )?;
         let prepared_spawn =
             crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
                 program: &self.cli_path,
@@ -406,24 +509,12 @@ impl CodeAgent for CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
-            })?;
-
-        let mut cmd = Command::new(&prepared_spawn.program);
-        cmd.args(&prepared_spawn.args)
-            .current_dir(&prepared_spawn.current_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        crate::set_process_group(&mut cmd);
-        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-
-        if self.cloud.enabled {
-            for key in &self.cloud.setup_secret_env {
-                cmd.env_remove(key);
-            }
-        }
+                secret_env_keys: &[],
+                container_bind_mounts: &container_bind_mounts,
+                permission_mode: req.effective_permission_mode(),
+                forward_stdin: false,
+            })
+            .await?;
 
         log_codex_spawn_attempt(
             &prepared_spawn.program,
@@ -432,31 +523,29 @@ impl CodeAgent for CodexAgent {
             prepared_spawn.sandbox_engine,
             "execute",
         );
-        let child = cmd.spawn().map_err(|err| {
-            let message = codex_spawn_failure_message(
-                &err,
-                &prepared_spawn.program,
-                &req,
-                prepared_spawn.sandbox_engine,
-                "execute",
-            );
-            tracing::error!(
-                agent = "codex",
-                mode = "execute",
-                error_kind = ?err.kind(),
-                "{message}"
-            );
-            harness_core::error::HarnessError::AgentExecution(message)
-        })?;
-        if let Some(pid) = child.id() {
-            crate::write_provisional_agent_run_binding(
-                &run_identity,
-                "codex",
-                pid,
-                &prepared_spawn.current_dir,
-            );
-        }
-        let mut child = crate::ManagedChild::new(child, "codex execute");
+        let spawn_error_req = req.clone();
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
+                prepared_spawn,
+                run_identity,
+                native_kind: "codex",
+                process_label: "codex execute",
+                stdio: crate::spawn_supervisor::AgentStdio::piped_output(Stdio::null()),
+                extra_env_removals: cloud_setup_env_removals(&self.cloud),
+                map_spawn_error: Box::new(move |error, spawn| {
+                    harness_core::error::HarnessError::AgentExecution(codex_spawn_failure_message(
+                        error,
+                        &spawn.program,
+                        &spawn_error_req,
+                        spawn.sandbox_engine,
+                        "execute",
+                    ))
+                }),
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
+        let mut child = supervised.child;
         let limits = crate::OutputLimits::from_stream_timeout_secs(self.stream_timeout_secs);
         let output = child.wait_with_output(&limits).await.map_err(|err| {
             harness_core::error::HarnessError::AgentExecution(format!(
@@ -473,13 +562,19 @@ impl CodeAgent for CodexAgent {
             return Err(codex_nonzero_exit_error(
                 output.status,
                 &stderr,
-                structured_error.as_deref(),
+                structured_error.as_ref(),
             ));
         }
 
         let parsed = parse_codex_exec_output(&stdout)?;
-        if let Some(message) = parsed.structured_error {
-            return Err(codex_structured_error(message));
+        if parsed.explicit_failure {
+            return Err(codex_explicit_failure_error(parsed));
+        }
+        if let Some(message) = parsed.structured_error.as_deref() {
+            tracing::error!(
+                agent = self.name(),
+                "non-terminal Codex diagnostic: {message}"
+            );
         }
         for warning in &parsed.warnings {
             tracing::warn!(agent = self.name(), "{warning}");
@@ -490,7 +585,8 @@ impl CodeAgent for CodexAgent {
             stderr,
             items: parsed.items,
             token_usage: parsed.token_usage,
-            model: "codex".to_string(),
+            // Keep oneshot responses consistent with the launch-derived stream event.
+            model: self.launch_model(&req).to_string(),
             exit_code: output.status.code(),
         })
     }
@@ -509,17 +605,19 @@ impl CodeAgent for CodexAgent {
             }
         }
 
-        self.run_setup_phase(&req.project_root).await?;
+        self.run_setup_phase(&req).await?;
 
         let base_args = self.base_args(&req);
-        let sandbox_mode = self.effective_sandbox_mode(&req);
+        let launch_model = self.launch_model(&req).to_string();
+        let process_sandbox_mode = self.process_sandbox_mode(&req);
         let sandbox_spec = if let Some(ref token) = req.capability_token {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
+            SandboxSpec::new(process_sandbox_mode, &req.project_root)
                 .with_allowed_write_paths(token.allowed_write_paths.clone())
         } else {
-            SandboxSpec::new(sandbox_mode, &req.project_root)
+            SandboxSpec::new(process_sandbox_mode, &req.project_root)
         };
         let mut spawn_env_vars = req.env_vars.clone();
+        spawn_env_vars.remove(AGENT_OUTPUT_SCHEMA_PATH_ENV);
         let run_identity = crate::resolve_agent_run_identity(&spawn_env_vars);
         run_identity.write_env_vars(&mut spawn_env_vars);
         if self.cloud.enabled {
@@ -527,6 +625,11 @@ impl CodeAgent for CodexAgent {
                 spawn_env_vars.remove(key);
             }
         }
+        let container_bind_mounts = cloud_setup::apply_container_state(
+            &self.cloud,
+            &req.project_root,
+            &mut spawn_env_vars,
+        )?;
         let prepared_spawn =
             crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
                 program: &self.cli_path,
@@ -534,24 +637,12 @@ impl CodeAgent for CodexAgent {
                 project_root: &req.project_root,
                 sandbox_spec: &sandbox_spec,
                 env_vars: &spawn_env_vars,
-            })?;
-
-        let mut cmd = Command::new(&prepared_spawn.program);
-        cmd.args(&prepared_spawn.args)
-            .current_dir(&prepared_spawn.current_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        crate::set_process_group(&mut cmd);
-        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-
-        if self.cloud.enabled {
-            for key in &self.cloud.setup_secret_env {
-                cmd.env_remove(key);
-            }
-        }
+                secret_env_keys: &[],
+                container_bind_mounts: &container_bind_mounts,
+                permission_mode: req.effective_permission_mode(),
+                forward_stdin: false,
+            })
+            .await?;
 
         log_codex_spawn_attempt(
             &prepared_spawn.program,
@@ -560,31 +651,50 @@ impl CodeAgent for CodexAgent {
             prepared_spawn.sandbox_engine,
             "execute_stream",
         );
-        let child = cmd.spawn().map_err(|error| {
-            let message = codex_spawn_failure_message(
-                &error,
-                &prepared_spawn.program,
-                &req,
-                prepared_spawn.sandbox_engine,
-                "execute_stream",
-            );
-            tracing::error!(
-                agent = "codex",
-                mode = "execute_stream",
-                error_kind = ?error.kind(),
-                "{message}"
-            );
-            harness_core::error::HarnessError::AgentExecution(message)
-        })?;
-        if let Some(pid) = child.id() {
-            crate::write_provisional_agent_run_binding(
-                &run_identity,
-                "codex",
-                pid,
-                &prepared_spawn.current_dir,
-            );
+        let spawn_error_req = req.clone();
+        let supervised = crate::spawn_supervisor::spawn_agent(
+            crate::spawn_supervisor::AgentSpawnPlan {
+                prepared_spawn,
+                run_identity,
+                native_kind: "codex",
+                process_label: "codex execute_stream",
+                stdio: crate::spawn_supervisor::AgentStdio::piped_output(Stdio::null()),
+                extra_env_removals: cloud_setup_env_removals(&self.cloud),
+                map_spawn_error: Box::new(move |error, spawn| {
+                    harness_core::error::HarnessError::AgentExecution(codex_spawn_failure_message(
+                        error,
+                        &spawn.program,
+                        &spawn_error_req,
+                        spawn.sandbox_engine,
+                        "execute_stream",
+                    ))
+                }),
+            },
+            req.capability_token.as_ref(),
+        )
+        .await?;
+        let mut child = supervised.child;
+        if child.egress_verified_before_spawn() {
+            send_stream_item(
+                &tx,
+                StreamItem::EgressVerifiedAtDispatch,
+                self.name(),
+                "egress verification",
+            )
+            .await?;
         }
-        let mut child = crate::ManagedChild::new(child, "codex execute_stream");
+        // `codex exec` does not echo the serving model in its event stream, so
+        // the launch argument is the only observable identity for this turn.
+        send_stream_item(
+            &tx,
+            StreamItem::ModelReported {
+                model: launch_model,
+                source: harness_core::agent::ModelIdentitySource::LaunchDerived,
+            },
+            self.name(),
+            "model identity observation",
+        )
+        .await?;
 
         let stderr_capture = Arc::new(Mutex::new(String::new()));
         let mut stderr_task = None;
@@ -600,7 +710,14 @@ impl CodeAgent for CodexAgent {
             .stream_timeout_secs
             .filter(|&s| s > 0)
             .map(std::time::Duration::from_secs);
-        let stream_result = stream_codex_exec_output(child.inner_mut(), &tx, idle_timeout).await;
+        let await_container_egress_canary = child.awaits_container_egress_canary();
+        let stream_result = stream_codex_exec_output(
+            child.inner_mut(),
+            &tx,
+            idle_timeout,
+            await_container_egress_canary,
+        )
+        .await;
         let stream_send_failed = matches!(
             &stream_result,
             Err(harness_core::error::HarnessError::AgentExecution(message))
@@ -649,103 +766,24 @@ impl CodeAgent for CodexAgent {
         };
         if !status.success() {
             let stderr = captured_stderr_tail(&stderr_capture);
-            return Err(codex_nonzero_exit_error(
-                status,
-                &stderr,
-                parsed.structured_error.as_deref(),
+            return Err(codex_nonzero_exit_error_from_parsed(
+                status, &stderr, &parsed,
             ));
         }
-        if let Some(message) = parsed.structured_error {
-            return Err(codex_structured_error(message));
+        if parsed.explicit_failure {
+            return Err(codex_explicit_failure_error(parsed));
         }
+        send_stream_item(
+            &tx,
+            StreamItem::TurnCompleted {
+                output: parsed.output,
+            },
+            self.name(),
+            "turn_completed",
+        )
+        .await?;
         send_stream_item(&tx, StreamItem::Done, self.name(), "done").await?;
         Ok(())
-    }
-}
-
-fn codex_sandbox_mode(mode: SandboxMode) -> &'static str {
-    match mode {
-        SandboxMode::ReadOnly | SandboxMode::ReadOnlyWithNetwork => "read-only",
-        SandboxMode::WorkspaceWrite => "workspace-write",
-        SandboxMode::DangerFullAccess => "danger-full-access",
-    }
-}
-
-fn push_codex_sandbox_args(args: &mut Vec<OsString>, mode: SandboxMode) {
-    if mode == SandboxMode::ReadOnlyWithNetwork {
-        args.push(OsString::from("-c"));
-        args.push(OsString::from(format!(
-            "default_permissions=\"{READ_ONLY_WITH_NETWORK_PROFILE}\""
-        )));
-        args.push(OsString::from("-c"));
-        args.push(OsString::from(format!(
-            "permissions.{READ_ONLY_WITH_NETWORK_PROFILE}.filesystem={{\":minimal\"=\"read\",\":project_roots\"={{\".\"=\"read\"}}}}"
-        )));
-        args.push(OsString::from("-c"));
-        args.push(OsString::from(format!(
-            "permissions.{READ_ONLY_WITH_NETWORK_PROFILE}.network.enabled=true"
-        )));
-        return;
-    }
-
-    args.push(OsString::from("-s"));
-    args.push(OsString::from(codex_sandbox_mode(mode)));
-}
-
-fn push_codex_approval_policy_args(args: &mut Vec<OsString>, approval_policy: &str) {
-    let approval_policy = escape_codex_config_string(approval_policy);
-    args.push(OsString::from("-c"));
-    args.push(OsString::from(format!(
-        "approval_policy=\"{approval_policy}\""
-    )));
-}
-
-fn push_codex_developer_instructions_args(args: &mut Vec<OsString>, instructions: &str) {
-    let instructions = escape_codex_config_string(instructions);
-    args.push(OsString::from("-c"));
-    args.push(OsString::from(format!(
-        "developer_instructions=\"{instructions}\""
-    )));
-}
-
-fn escape_codex_config_string(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '\u{08}' => escaped.push_str("\\b"),
-            '\u{0C}' => escaped.push_str("\\f"),
-            ch => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-#[cfg(test)]
-mod approval_policy_arg_tests {
-    use super::push_codex_approval_policy_args;
-
-    #[test]
-    fn approval_policy_args_escape_config_string_delimiters() {
-        let mut args = Vec::new();
-
-        push_codex_approval_policy_args(&mut args, "ask\"me\\first\nnext");
-
-        let args: Vec<String> = args
-            .into_iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            args,
-            vec![
-                "-c".to_string(),
-                "approval_policy=\"ask\\\"me\\\\first\\nnext\"".to_string()
-            ]
-        );
     }
 }
 
@@ -760,3 +798,7 @@ mod failure_tests;
 #[cfg(test)]
 #[path = "codex_review_tests.rs"]
 mod review_tests;
+
+#[cfg(all(test, unix))]
+#[path = "codex_model_response_tests.rs"]
+mod model_response_tests;

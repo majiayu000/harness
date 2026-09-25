@@ -3,76 +3,132 @@ use chrono::{Duration, Utc};
 use harness_core::{
     config::isolation::IsolationTrustClass,
     config::workflow::{
-        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
+        DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowAgentContract,
+        WorkflowDefinitionPolicy,
     },
     db::resolve_database_url,
 };
 use harness_workflow::runtime::{
-    store::RuntimeJobEnqueueOutcome, ActivityResult, ActivitySignal, RuntimeKind,
-    WorkflowCommandStatus, WorkflowCommandType,
+    build_declarative_submission_decision, store::RuntimeJobEnqueueOutcome,
+    validate_declarative_agent_contract_command, ActivityResult, ActivitySignal, DataProvenance,
+    DeclarativeWorkflowDefinition, RuntimeKind, WorkflowCommandStatus, WorkflowCommandType,
+    WorkflowDefinitionRegistry,
 };
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Once,
 };
 
 const TEST_DEFINITION_ID: &str = "submission_test_declarative";
-static REGISTER_TEST_DEFINITION: Once = Once::new();
-
 async fn open_declarative_runtime_store(dir: &Path) -> anyhow::Result<WorkflowRuntimeStore> {
     let database_url = resolve_database_url(None)?;
-    WorkflowRuntimeStore::open_with_database_url(dir, Some(&database_url)).await
+    Ok(
+        WorkflowRuntimeStore::open_with_database_url(dir, Some(&database_url))
+            .await?
+            .with_definition_registry(register_test_definition().into_shared()),
+    )
 }
 
-fn register_test_definition() {
-    REGISTER_TEST_DEFINITION.call_once(|| {
-        let policy = WorkflowDefinitionPolicy {
-            id: TEST_DEFINITION_ID.to_string(),
-            initial: "working".to_string(),
-            states: BTreeMap::from([
-                (
-                    "working".to_string(),
-                    DeclaredState {
-                        activity: Some("perform_work".to_string()),
-                        on_success: Some("done".to_string()),
-                        on_failure: Some("failed".to_string()),
-                        on_blocked: Some("blocked".to_string()),
-                        on_signal: BTreeMap::from([(
-                            "cancel".to_string(),
-                            "cancelled".to_string(),
-                        )]),
-                        ..DeclaredState::default()
-                    },
-                ),
-                (
-                    "blocked".to_string(),
-                    DeclaredState {
-                        progress: Some(DeclaredProgressMode::OperatorGate),
-                        ..DeclaredState::default()
-                    },
-                ),
-            ]),
-            terminal: BTreeMap::from([
-                ("done".to_string(), "succeeded".to_string()),
-                ("failed".to_string(), "failed".to_string()),
-                ("cancelled".to_string(), "cancelled".to_string()),
-            ]),
-            evidence_required: BTreeMap::new(),
-            recovery_targets: vec!["working".to_string()],
-            intake: None,
-        };
-        let definition = harness_workflow::runtime::build_declarative_definition(
-            &policy,
-            &BTreeMap::from([(
-                "perform_work".to_string(),
-                WorkflowActivityPolicy::default(),
-            )]),
-        )
-        .expect("test declarative definition should be valid");
-        harness_workflow::runtime::register_declarative_workflow_definitions([definition])
-            .expect("test declarative definition should register");
-    });
+fn register_test_definition() -> WorkflowDefinitionRegistry {
+    let policy = WorkflowDefinitionPolicy {
+        id: TEST_DEFINITION_ID.to_string(),
+        initial: "working".to_string(),
+        states: BTreeMap::from([
+            (
+                "working".to_string(),
+                DeclaredState {
+                    activity: Some("perform_work".to_string()),
+                    on_success: Some("done".to_string()),
+                    on_failure: Some("failed".to_string()),
+                    on_blocked: Some("blocked".to_string()),
+                    on_signal: BTreeMap::from([("cancel".to_string(), "cancelled".to_string())]),
+                    ..DeclaredState::default()
+                },
+            ),
+            (
+                "blocked".to_string(),
+                DeclaredState {
+                    progress: Some(DeclaredProgressMode::OperatorGate),
+                    ..DeclaredState::default()
+                },
+            ),
+        ]),
+        terminal: BTreeMap::from([
+            ("done".to_string(), "succeeded".to_string()),
+            ("failed".to_string(), "failed".to_string()),
+            ("cancelled".to_string(), "cancelled".to_string()),
+        ]),
+        evidence_required: BTreeMap::new(),
+        recovery_targets: vec!["working".to_string()],
+        intake: None,
+    };
+    let definition = harness_workflow::runtime::build_declarative_definition(
+        &policy,
+        &BTreeMap::from([(
+            "perform_work".to_string(),
+            WorkflowActivityPolicy::default(),
+        )]),
+    )
+    .expect("test declarative definition should be valid");
+    let mut registry = WorkflowDefinitionRegistry::with_builtins();
+    registry
+        .register_declarative_current(definition)
+        .expect("test declarative definition should register");
+    registry
+}
+
+fn agent_contract_definition() -> DeclarativeWorkflowDefinition {
+    let policy = WorkflowDefinitionPolicy {
+        id: "submission_test_agent_contract".to_string(),
+        initial: "assessing".to_string(),
+        states: BTreeMap::from([
+            (
+                "assessing".to_string(),
+                DeclaredState {
+                    activity: Some("assess".to_string()),
+                    on_signal: BTreeMap::from([("approved".to_string(), "done".to_string())]),
+                    ..DeclaredState::default()
+                },
+            ),
+            (
+                "blocked".to_string(),
+                DeclaredState {
+                    progress: Some(DeclaredProgressMode::OperatorGate),
+                    ..DeclaredState::default()
+                },
+            ),
+        ]),
+        terminal: BTreeMap::from([
+            ("done".to_string(), "succeeded".to_string()),
+            ("failed".to_string(), "failed".to_string()),
+            ("cancelled".to_string(), "cancelled".to_string()),
+        ]),
+        evidence_required: BTreeMap::new(),
+        recovery_targets: vec!["assessing".to_string()],
+        intake: None,
+    };
+    let contract: WorkflowAgentContract = serde_json::from_value(json!({
+        "input_schema": "harness.semantic_activity_input.v1",
+        "output_schema": "harness.semantic_verdict.v1",
+        "allowed_outcomes": ["approved"],
+        "tools": "none",
+        "mutation": "forbidden",
+        "workspace": "ephemeral_empty",
+        "fresh_context": true,
+    }))
+    .expect("valid agent contract");
+    harness_workflow::runtime::build_declarative_definition(
+        &policy,
+        &BTreeMap::from([(
+            "assess".to_string(),
+            WorkflowActivityPolicy {
+                prompt: Some("Assess the pinned facts.".to_string()),
+                agent_contract: Some(contract),
+                ..WorkflowActivityPolicy::default()
+            },
+        )]),
+    )
+    .expect("agent contract definition should compile")
 }
 
 fn create_test_project(root: &Path) -> anyhow::Result<PathBuf> {
@@ -107,21 +163,22 @@ Submission fixture.
 
 #[test]
 fn declarative_submission_decision_validates_against_the_registered_submission_rule() {
-    register_test_definition();
-    let definition =
-        harness_workflow::runtime::current_declarative_workflow_definition(TEST_DEFINITION_ID)
-            .expect("definition should be registered");
+    let registry = register_test_definition();
+    let definition = registry
+        .current_declarative_definition(TEST_DEFINITION_ID)
+        .expect("definition should be registered");
     let instance = WorkflowInstance::new(
         TEST_DEFINITION_ID,
         definition.definition_version(),
         definition.policy().initial.clone(),
         WorkflowSubject::new("declarative", "task:validation"),
     )
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     let decision =
         harness_workflow::runtime::build_declarative_submission_decision(&definition, &instance)
             .expect("submission decision should build");
-    let validator = harness_workflow::runtime::decision_validator_for_instance(&instance)
+    let validator = registry
+        .decision_validator_for_instance(&instance)
         .expect("pinned definition should be valid")
         .expect("pinned definition should resolve a validator");
 
@@ -135,13 +192,72 @@ fn declarative_submission_decision_validates_against_the_registered_submission_r
 }
 
 #[test]
+fn agent_contract_submission_command_matches_the_committed_instance() -> anyhow::Result<()> {
+    let definition = agent_contract_definition();
+    let project_root = Path::new("/project");
+    let task_id = TaskId::from_str("agent-contract-submission");
+    let instance = super::declarative::submission_instance(
+        &DeclarativeSubmissionRuntimeContext {
+            project_root,
+            definition_id: definition.policy().id.as_str(),
+            task_id: &task_id,
+            prompt: "Assess this submission.",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            source: None,
+            external_id: None,
+            subject_key: None,
+            repo: None,
+            author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
+        },
+        "/project",
+        "agent-contract-workflow",
+        "prompt-memory:test",
+        &definition,
+    );
+    let decision = build_declarative_submission_decision(&definition, &instance)?;
+    assert_eq!(
+        instance.data["classification_input"],
+        "Assess this submission."
+    );
+    let provenance = instance
+        .data_provenance
+        .as_ref()
+        .expect("declarative submission facts must carry provenance");
+    assert_eq!(
+        provenance.provenance_for("/classification_input"),
+        Some(DataProvenance::Server)
+    );
+    assert!(provenance
+        .value_digests
+        .contains_key("/classification_input"));
+    assert_eq!(
+        decision.commands[0].command["agent_contract_input"]["facts"]["classification_input"],
+        "Assess this submission."
+    );
+    assert_eq!(
+        decision.commands[0].command["agent_contract_input"]["provenance"]["entries"]
+            ["/classification_input"],
+        "server"
+    );
+    let mut committed = instance.clone();
+    committed.state = decision.next_state.clone();
+    committed.version = committed.version.saturating_add(1);
+    let data = merge_last_decision(std::mem::take(&mut committed.data), &decision.decision);
+    classify_submission_data(&mut committed, data)?;
+
+    assert!(validate_declarative_agent_contract_command(
+        &definition,
+        &committed,
+        &decision.commands[0],
+    )?);
+    Ok(())
+}
+
+#[test]
 fn declarative_submission_preserves_intake_identity_and_trust() {
-    register_test_definition();
-    let Some(definition) =
-        harness_workflow::runtime::current_declarative_workflow_definition(TEST_DEFINITION_ID)
-    else {
-        panic!("definition should be registered");
-    };
+    let definition = agent_contract_definition();
     let task_id = TaskId::from_str("declarative-intake-identity");
     let ctx = DeclarativeSubmissionRuntimeContext {
         project_root: Path::new("/repo"),
@@ -155,6 +271,7 @@ fn declarative_submission_preserves_intake_identity_and_trust() {
         subject_key: Some("github:owner/repo:issue:42"),
         repo: Some("owner/repo"),
         author_trust_class: Some(IsolationTrustClass::NonCollaborator),
+        classification_input_provenance: DataProvenance::External,
     };
 
     let instance = super::declarative::submission_instance(
@@ -169,6 +286,73 @@ fn declarative_submission_preserves_intake_identity_and_trust() {
     assert_eq!(instance.data["external_id"], "42");
     assert_eq!(instance.data["repo"], "owner/repo");
     assert_eq!(instance.data["author_trust_class"], "non_collaborator");
+    assert_eq!(
+        instance
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/classification_input")),
+        Some(DataProvenance::External)
+    );
+    let decision = build_declarative_submission_decision(&definition, &instance)
+        .expect("agent contract submission decision should build");
+    let mut committed = instance.clone();
+    committed.state = decision.next_state.clone();
+    committed.version = committed.version.saturating_add(1);
+    let data = merge_last_decision(std::mem::take(&mut committed.data), &decision.decision);
+    super::declarative::classify_declarative_submission_data(
+        &mut committed,
+        data,
+        DataProvenance::External,
+    )
+    .expect("committed intake facts should retain their trust classification");
+    assert_eq!(
+        committed
+            .data_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.provenance_for("/classification_input")),
+        Some(DataProvenance::External)
+    );
+    assert!(validate_declarative_agent_contract_command(
+        &definition,
+        &committed,
+        &decision.commands[0],
+    )
+    .expect("committed intake command should retain its pinned provenance"));
+}
+
+#[test]
+fn declarative_submission_without_agent_contract_keeps_prompt_out_of_facts() {
+    let registry = register_test_definition();
+    let definition = registry
+        .current_declarative_definition(TEST_DEFINITION_ID)
+        .expect("definition should be registered");
+    let task_id = TaskId::from_str("declarative-no-agent-contract");
+    let instance = super::declarative::submission_instance(
+        &DeclarativeSubmissionRuntimeContext {
+            project_root: Path::new("/repo"),
+            definition_id: TEST_DEFINITION_ID,
+            task_id: &task_id,
+            prompt: "perform the declared work",
+            depends_on: &[],
+            serialization_depends_on: &[],
+            source: None,
+            external_id: None,
+            subject_key: None,
+            repo: None,
+            author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
+        },
+        "/repo",
+        "declarative-no-agent-contract-workflow",
+        "prompt-ref",
+        &definition,
+    );
+
+    assert!(instance.data.get("classification_input").is_none());
+    assert!(instance
+        .data_provenance
+        .as_ref()
+        .is_some_and(|provenance| provenance.provenance_for("/classification_input").is_none()));
 }
 
 #[tokio::test]
@@ -176,7 +360,6 @@ async fn declarative_submission_pins_immutable_definition_metadata() -> anyhow::
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
     }
-    register_test_definition();
     let dir = tempfile::tempdir()?;
     let store = open_declarative_runtime_store(dir.path()).await?;
     let project_root = create_test_project(dir.path())?;
@@ -196,12 +379,14 @@ async fn declarative_submission_pins_immutable_definition_metadata() -> anyhow::
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
     )
     .await?;
-    let definition =
-        harness_workflow::runtime::current_declarative_workflow_definition(TEST_DEFINITION_ID)
-            .expect("definition should remain registered");
+    let definition = store
+        .definition_registry()
+        .current_declarative_definition(TEST_DEFINITION_ID)
+        .expect("definition should remain registered");
     let instance = store
         .get_instance(&record.workflow_id)
         .await?
@@ -254,6 +439,7 @@ async fn declarative_submission_enqueues_initial_activity_atomically() -> anyhow
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
     )
     .await?;
@@ -295,6 +481,7 @@ async fn declarative_submission_mapped_signal_reaches_terminal_state() -> anyhow
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
     )
     .await?;
@@ -384,6 +571,7 @@ async fn declarative_submission_can_be_cancelled_by_an_operator() -> anyhow::Res
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
     )
     .await?;
@@ -426,6 +614,7 @@ async fn declarative_submission_rejects_dependencies() -> anyhow::Result<()> {
             subject_key: None,
             repo: None,
             author_trust_class: None,
+            classification_input_provenance: DataProvenance::Server,
         },
     )
     .await
@@ -444,7 +633,18 @@ async fn declarative_submission_rejects_unknown_and_builtin_ids() -> anyhow::Res
     let store = open_declarative_runtime_store(dir.path()).await?;
     let task_id = TaskId::from_str("declarative-invalid-id");
 
-    for definition_id in ["missing_definition", PROMPT_TASK_DEFINITION_ID] {
+    // Built-in ids are registered declaratively now, so they are rejected by
+    // the project-declaration check; unknown ids still fail resolution.
+    for (definition_id, expected) in [
+        (
+            "missing_definition",
+            "is not a registered declarative definition",
+        ),
+        (
+            PROMPT_TASK_DEFINITION_ID,
+            "does not declare workflow definition",
+        ),
+    ] {
         let error = record_declarative_submission(
             &store,
             DeclarativeSubmissionRuntimeContext {
@@ -459,14 +659,13 @@ async fn declarative_submission_rejects_unknown_and_builtin_ids() -> anyhow::Res
                 subject_key: None,
                 repo: None,
                 author_trust_class: None,
+                classification_input_provenance: DataProvenance::Server,
             },
         )
         .await
         .expect_err("non-declarative definitions must be rejected");
         assert!(
-            error
-                .to_string()
-                .contains("is not a registered declarative definition"),
+            error.to_string().contains(expected),
             "unexpected error for {definition_id}: {error}"
         );
     }
@@ -506,6 +705,7 @@ async fn declarative_dedupe_and_cap_query_key_off_subject_external_id() -> anyho
                     subject_key: None,
                     repo: None,
                     author_trust_class: None,
+                    classification_input_provenance: DataProvenance::Server,
                 },
             )
             .await

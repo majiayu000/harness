@@ -15,7 +15,7 @@ async fn runtime_store_get_instance_by_pr_prefers_issue_bound_workflow() -> anyh
         WorkflowSubject::new("issue", "issue:77"),
     )
     .with_id("project-a::owner/repo::issue:77")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-a",
         "repo": "owner/repo",
         "issue_number": 77,
@@ -28,14 +28,18 @@ async fn runtime_store_get_instance_by_pr_prefers_issue_bound_workflow() -> anyh
         WorkflowSubject::new("pull_request", "pr:880"),
     )
     .with_id("project-a::owner/repo::pr:880")
-    .with_data(json!({
+    .with_server_data(json!({
         "project_id": "project-a",
         "repo": "owner/repo",
         "pr_number": 880,
     }));
-    store.upsert_instance(&issue_bound).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&issue_bound)
+        .await?;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    store.upsert_instance(&pr_only).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&pr_only)
+        .await?;
 
     let found = store
         .get_instance_by_pr("github_issue_pr", "project-a", Some("owner/repo"), 880)
@@ -46,15 +50,17 @@ async fn runtime_store_get_instance_by_pr_prefers_issue_bound_workflow() -> anyh
 }
 
 #[tokio::test]
-async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Result<()> {
+async fn runtime_worker_cancels_job_when_workflow_already_done() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let instance = issue_instance("done");
-    store.upsert_instance(&instance).await?;
+    let mut instance = issue_instance("implementing");
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let job = enqueue_workflow_runtime_job(
         &store,
         &instance.id,
@@ -65,6 +71,10 @@ async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Re
         None,
     )
     .await?;
+    instance.state = "done".to_string();
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let worker = RuntimeWorker::new(&store, "runtime-1");
     let executor = CountingRuntimeExecutor {
@@ -72,22 +82,26 @@ async fn runtime_worker_completes_job_when_workflow_already_done() -> anyhow::Re
         calls: calls.clone(),
     };
 
-    let completed = worker
-        .run_once(&executor)
-        .await?
-        .expect("worker should complete stale terminal job");
+    assert!(worker.run_once(&executor).await?.is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(completed.id, job.id);
-    assert_eq!(completed.status, RuntimeJobStatus::Succeeded);
-    let output: ActivityResult =
-        serde_json::from_value(completed.output.expect("activity result output"))?;
-    assert_eq!(output.status, ActivityStatus::Succeeded);
-    assert!(output.summary.contains("already terminal (done)"));
+    let cancelled = store
+        .get_runtime_job(&job.id)
+        .await?
+        .expect("stale terminal job should remain auditable");
+    assert_eq!(cancelled.status, RuntimeJobStatus::Cancelled);
+    assert_eq!(
+        store
+            .get_command(&job.command_id)
+            .await?
+            .expect("stale terminal command should remain auditable")
+            .status,
+        WorkflowCommandStatus::Cancelled
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Result<()> {
+async fn runtime_store_pending_dedupe_supersedes_instead_of_rewriting() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
     }
@@ -95,7 +109,9 @@ async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Res
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let instance = issue_instance("implementing").with_id("issue-dedupe-refresh");
-    store.upsert_instance(&instance).await?;
+    store
+        .force_upsert_lifecycle_state_for_test(&instance)
+        .await?;
 
     let first =
         WorkflowCommand::enqueue_activity("implement_issue", "issue:owner/repo:issue:1200:start");
@@ -131,23 +147,64 @@ async fn runtime_store_pending_dedupe_refreshes_command_payload() -> anyhow::Res
     );
     new_decision.id = "decision-new".to_string();
     store.record_decision(&new_decision).await?;
-    let duplicate_id = store
+    let superseding_id = store
         .enqueue_command(&instance.id, Some("decision-new"), &updated)
         .await?;
 
-    assert_eq!(duplicate_id, command_id);
+    // A different intent under the same dedupe key is a new attempt, not a
+    // rewrite of the old row (GH-1865).
+    assert_ne!(superseding_id, command_id);
     let commands = store.commands_for(&instance.id).await?;
-    assert_eq!(commands.len(), 1);
-    let command = &commands[0];
-    assert_eq!(command.id, command_id);
-    assert_eq!(command.status, "pending");
-    assert_eq!(command.decision_id.as_deref(), Some("decision-new"));
+    assert_eq!(commands.len(), 2, "the replaced attempt must survive");
+
+    let superseded = commands
+        .iter()
+        .find(|command| command.id == command_id)
+        .expect("the original attempt must still be readable");
+    assert_eq!(superseded.status, WorkflowCommandStatus::Superseded);
+    assert_eq!(superseded.decision_id.as_deref(), Some("decision-old"));
     assert_eq!(
-        command.command.command_type,
+        superseded.command.command_type,
+        WorkflowCommandType::EnqueueActivity,
+        "the replaced attempt must keep the intent it was minted for"
+    );
+    assert_eq!(superseded.attempt_generation, 1);
+    assert_eq!(
+        superseded.superseded_by_command_id.as_deref(),
+        Some(superseding_id.as_str())
+    );
+
+    let live = commands
+        .iter()
+        .find(|command| command.id == superseding_id)
+        .expect("the new attempt must be readable");
+    assert_eq!(live.status, WorkflowCommandStatus::Pending);
+    assert_eq!(live.decision_id.as_deref(), Some("decision-new"));
+    assert_eq!(
+        live.command.command_type,
         WorkflowCommandType::StartChildWorkflow
     );
-    assert_eq!(command.command.command["definition_id"], "github_issue_pr");
-    assert_eq!(command.command.command["subject_key"], "issue:1200");
+    assert_eq!(live.command.command["definition_id"], "github_issue_pr");
+    assert_eq!(live.command.command["subject_key"], "issue:1200");
+    assert_eq!(live.attempt_generation, 2);
+    assert!(live.superseded_by_command_id.is_none());
+
+    // A replayed enqueue of the live intent stays idempotent.
+    let replayed = store
+        .enqueue_command(&instance.id, Some("decision-new"), &updated)
+        .await?;
+    assert_eq!(replayed, superseding_id);
+    assert_eq!(store.commands_for(&instance.id).await?.len(), 2);
+
+    // A superseded attempt can never be moved back into a dispatchable state.
+    let error = store
+        .mark_command_status(&command_id, WorkflowCommandStatus::Pending)
+        .await
+        .expect_err("a superseded attempt must not be revivable");
+    assert!(
+        error.to_string().contains("superseded"),
+        "unexpected error: {error}"
+    );
     Ok(())
 }
 

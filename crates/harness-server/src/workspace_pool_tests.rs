@@ -131,6 +131,74 @@ async fn pool_slot_reuse_preserves_released_same_task_workspace() {
 }
 
 #[tokio::test]
+async fn single_writer_workspace_fails_closed_without_postgres_lease_store() -> anyhow::Result<()> {
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let manager = WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        },
+        WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        None,
+    )?;
+
+    let error = manager
+        .create_workspace(
+            &harness_core::types::TaskId("missing-global-lease".to_string()),
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            Some("issue:42"),
+            Some("owner/repo"),
+        )
+        .await
+        .expect_err("single-writer mode must reject execution without PostgreSQL lease store");
+    assert!(error
+        .to_string()
+        .contains("PostgreSQL workspace lease store"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_writer_workspace_fails_closed_without_postgres_lease_store() -> anyhow::Result<()> {
+    let source = tempfile::tempdir()?;
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+    let workspaces = tempfile::tempdir()?;
+    let manager = WorkspaceManager::new_with_pool(
+        WorkspaceConfig {
+            root: workspaces.path().to_path_buf(),
+            ..Default::default()
+        },
+        WorkspacePoolConfig::new(2, std::collections::HashMap::new()),
+        None,
+    )?;
+    let error = manager
+        .create_workspace(
+            &TaskId("multi-writer-without-store".to_string()),
+            source.path(),
+            "origin",
+            &branch,
+            1,
+            None,
+            None,
+        )
+        .await
+        .expect_err("multi-writer creation must fail closed without shared repository locking");
+    assert!(
+        error
+            .to_string()
+            .contains("PostgreSQL workspace lease store"),
+        "unexpected missing shared-lease error: {error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn remove_workspace_keeps_in_memory_slot_until_cleanup_finishes() -> anyhow::Result<()> {
     let source = tempfile::tempdir().expect("tempdir");
     init_git_repo(source.path());
@@ -144,7 +212,7 @@ async fn remove_workspace_keeps_in_memory_slot_until_cleanup_finishes() -> anyho
             hook_timeout_secs: 5,
             ..Default::default()
         },
-        WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+        WorkspacePoolConfig::new_for_local_pool_tests(1, std::collections::HashMap::new()),
         None,
     )?);
     let first_task = harness_core::types::TaskId("in-memory-remove-first".to_string());
@@ -227,7 +295,10 @@ async fn pool_slot_reuse_uses_workspace_identity_for_new_task_id() {
     };
     let mgr = WorkspaceManager::new_with_pool(
         config,
-        crate::workspace_pool::WorkspacePoolConfig::new(2, std::collections::HashMap::new()),
+        crate::workspace_pool::WorkspacePoolConfig::new_for_local_pool_tests(
+            2,
+            std::collections::HashMap::new(),
+        ),
         None,
     )
     .expect("new");
@@ -358,7 +429,7 @@ async fn create_workspace_waits_when_project_pool_is_full() {
     let mgr = std::sync::Arc::new(
         WorkspaceManager::new_with_pool(
             config,
-            WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+            WorkspacePoolConfig::new_for_local_pool_tests(1, std::collections::HashMap::new()),
             None,
         )
         .expect("new"),
@@ -432,7 +503,7 @@ async fn create_workspace_enforces_project_capacity_across_repo_slugs() {
     let mgr = std::sync::Arc::new(
         WorkspaceManager::new_with_pool(
             config,
-            WorkspacePoolConfig::new(1, std::collections::HashMap::new()),
+            WorkspacePoolConfig::new_for_local_pool_tests(1, std::collections::HashMap::new()),
             None,
         )
         .expect("new"),
@@ -493,4 +564,93 @@ async fn create_workspace_enforces_project_capacity_across_repo_slugs() {
     mgr.remove_workspace(&second_task)
         .await
         .expect("remove second");
+}
+
+#[tokio::test]
+async fn reduced_capacity_waits_for_out_of_range_slots_to_exit() {
+    let source = tempfile::tempdir().expect("tempdir");
+    init_git_repo(source.path());
+    let branch = current_branch(source.path());
+    let workspaces = tempfile::tempdir().expect("tempdir");
+    let mgr = std::sync::Arc::new(
+        WorkspaceManager::new_with_pool(
+            WorkspaceConfig {
+                root: workspaces.path().to_path_buf(),
+                ..Default::default()
+            },
+            WorkspacePoolConfig::new_for_local_pool_tests(4, std::collections::HashMap::new()),
+            None,
+        )
+        .expect("manager"),
+    );
+    let mut tasks = Vec::new();
+    for index in 0..3 {
+        let task_id = TaskId(format!("capacity-old-{index}"));
+        let lease = mgr
+            .create_workspace_with_options(
+                &task_id,
+                source.path(),
+                "origin",
+                &branch,
+                1,
+                Some(&format!("issue:{index}")),
+                Some("owner/repo"),
+                WorkspaceCreateOptions {
+                    workspace_capacity_override: Some(4),
+                    repository_write_lease: RepositoryWriteLeaseInput::NotRequired,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("old-capacity workspace");
+        assert_eq!(lease.slot_index, index);
+        tasks.push(task_id);
+    }
+
+    let retry_task = TaskId("capacity-new".to_string());
+    let manager = mgr.clone();
+    let source_path = source.path().to_path_buf();
+    let retry_branch = branch.clone();
+    let retry_task_for_spawn = retry_task.clone();
+    let retry = tokio::spawn(async move {
+        manager
+            .create_workspace_with_options(
+                &retry_task_for_spawn,
+                &source_path,
+                "origin",
+                &retry_branch,
+                1,
+                Some("issue:new"),
+                Some("owner/repo"),
+                WorkspaceCreateOptions {
+                    workspace_capacity_override: Some(2),
+                    repository_write_lease: RepositoryWriteLeaseInput::NotRequired,
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!retry.is_finished(), "slot 2 must block reduced admission");
+
+    mgr.release_workspace(&tasks[2]).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !retry.is_finished(),
+        "slots 0 and 1 still fill the new capacity"
+    );
+    mgr.release_workspace(&tasks[1]).await;
+    let lease = tokio::time::timeout(Duration::from_secs(5), retry)
+        .await
+        .expect("reduced admission should resume")
+        .expect("retry join")
+        .expect("retry workspace");
+    assert_eq!(lease.slot_index, 1);
+
+    mgr.remove_workspace(&tasks[0])
+        .await
+        .expect("remove old slot");
+    mgr.remove_workspace(&retry_task)
+        .await
+        .expect("remove retry");
 }

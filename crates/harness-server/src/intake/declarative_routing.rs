@@ -204,6 +204,7 @@ async fn dispatch(
             subject_key: Some(subject_key),
             repo: issue.repo.as_deref(),
             author_trust_class: Some(issue.author_trust_class),
+            classification_input_provenance: harness_workflow::runtime::DataProvenance::External,
         },
     )
     .await?;

@@ -28,7 +28,7 @@ async fn empty_data_dir_produces_empty_project_registry() {
     let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
         return;
     };
-    let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
+    let bundle = build_registry(&server, dir.path(), dir.path(), Some(&tasks))
         .await
         .expect("build_registry should succeed");
     let project_registry = bundle.project_registry.as_ref().unwrap_or_else(|| {
@@ -64,7 +64,7 @@ async fn plan_cache_hydrated_from_db() {
     plan_db.upsert(&plan).await.expect("upsert plan");
     let plan_id = plan.id.as_str().to_string();
 
-    let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
+    let bundle = build_registry(&server, dir.path(), dir.path(), Some(&tasks))
         .await
         .expect("build_registry");
     assert!(
@@ -79,7 +79,7 @@ async fn build_registry_opens_project_registry_from_shared_schema() {
     let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
         return;
     };
-    let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
+    let bundle = build_registry(&server, dir.path(), dir.path(), Some(&tasks))
         .await
         .expect("build_registry should succeed");
     let project_registry = bundle
@@ -89,6 +89,32 @@ async fn build_registry_opens_project_registry_from_shared_schema() {
     assert_eq!(
         project_registry.schema(),
         crate::project_registry::PROJECT_REGISTRY_SCHEMA
+    );
+}
+
+#[tokio::test]
+async fn workspace_pool_config_fails_closed_when_project_registry_read_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some((server, tasks)) = make_test_server_and_tasks(dir.path()).await else {
+        return;
+    };
+    let bundle = build_registry(&server, dir.path(), dir.path(), Some(&tasks))
+        .await
+        .expect("build_registry should succeed");
+    let project_registry = bundle
+        .project_registry
+        .as_ref()
+        .expect("project registry should be ready");
+    project_registry.pool().close().await;
+
+    let result = crate::http::builders::workspace_pool_config::build_workspace_pool_config(
+        &server,
+        Some(project_registry),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "project limit resolution must fail closed when the registry cannot be read"
     );
 }
 
@@ -103,7 +129,7 @@ async fn runtime_state_failure_is_recorded_as_optional() {
             "runtime_state_store",
             "pool timed out while waiting for an open connection",
         )],
-        build_registry(&server, dir.path(), dir.path(), &tasks),
+        build_registry(&server, dir.path(), dir.path(), Some(&tasks)),
     )
     .await
     .expect("build_registry should succeed");
@@ -137,17 +163,18 @@ async fn invalid_workflow_schema_namespace_disables_optional_workflow_stores() {
         return;
     };
 
-    let bundle = build_registry(&server, dir.path(), dir.path(), &tasks)
+    let bundle = build_registry(&server, dir.path(), dir.path(), Some(&tasks))
         .await
-        .expect("optional workflow-store context failures should not abort startup");
+        .expect("optional workflow-store context failures should not abort build_registry");
 
     assert!(
         bundle.project_registry.is_some(),
-        "critical stores should stay ready: {:?}",
+        "critical stores that do not depend on the workflow namespace should stay ready: {:?}",
         bundle.startup_results
     );
     assert!(bundle.issue_workflow_store.is_none());
     assert!(bundle.project_workflow_store.is_none());
+    assert!(bundle.workflow_runtime_store.is_none());
     for name in ["issue_workflow_store", "project_workflow_store"] {
         let status = bundle
             .startup_results
@@ -157,6 +184,26 @@ async fn invalid_workflow_schema_namespace_disables_optional_workflow_stores() {
         assert!(!status.is_critical());
         assert!(!status.ready);
     }
+    let runtime_status = bundle
+        .startup_results
+        .iter()
+        .find(|status| status.name == "workflow_runtime_store")
+        .expect("workflow_runtime_store startup result");
+    assert!(runtime_status.is_critical());
+    assert!(!runtime_status.ready);
+}
+
+#[test]
+fn bootstrap_failure_records_workflow_runtime_as_critical() {
+    let statuses =
+        super::super::registry_failures::failed_registry_startup_results("database unavailable");
+    let runtime_status = statuses
+        .iter()
+        .find(|status| status.name == "workflow_runtime_store")
+        .expect("workflow_runtime_store status");
+
+    assert!(!runtime_status.ready);
+    assert!(runtime_status.is_critical());
 }
 
 #[test]
@@ -180,7 +227,7 @@ async fn project_registry_failure_is_recorded_as_critical() {
     };
     let bundle = super::super::with_forced_startup_failures(
         &[("project_registry", "failed to open Postgres bootstrap pool")],
-        build_registry(&server, dir.path(), dir.path(), &tasks),
+        build_registry(&server, dir.path(), dir.path(), Some(&tasks)),
     )
     .await
     .expect("build_registry should succeed");

@@ -14,6 +14,7 @@ use harness_core::types::{
     Signal, SignalType,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 /// Default tools allowed during GC agent execution.
@@ -38,6 +39,7 @@ pub struct GcAgent {
     project_root: PathBuf,
     /// Path to the checkpoint file; `None` disables checkpoint-based scanning.
     checkpoint_path: Option<PathBuf>,
+    agent_env_vars: HashMap<String, String>,
 }
 
 impl GcAgent {
@@ -53,12 +55,18 @@ impl GcAgent {
             draft_store,
             project_root,
             checkpoint_path: None,
+            agent_env_vars: HashMap::new(),
         }
     }
 
     /// Configure the checkpoint file path used for incremental scanning.
     pub fn with_checkpoint(mut self, path: PathBuf) -> Self {
         self.checkpoint_path = Some(path);
+        self
+    }
+
+    pub fn with_agent_env_vars(mut self, env_vars: HashMap<String, String>) -> Self {
+        self.agent_env_vars = env_vars;
         self
     }
 
@@ -190,6 +198,7 @@ impl GcAgent {
                     project_root: project.root.clone(),
                     allowed_tools: Some(allowed_tools.clone()),
                     max_budget_usd: Some(self.config.budget_per_signal_usd),
+                    env_vars: self.agent_env_vars.clone(),
                     ..Default::default()
                 })
                 .await;

@@ -15,7 +15,7 @@ See `product.md`.
 | Workspace cleanup | `crates/harness-server/src/workspace_helpers.rs` (`cleanup_workspace_path`) | Removes worktrees, prunes stale metadata | Primary deletion path to gate |
 | Workspace create/reconcile | `crates/harness-server/src/workspace_create.rs`, `workspace_startup_reconcile_tests.rs` | Reconciles registered worktrees vs disk | Lease/registration source of truth |
 | Orphan reaper | `crates/harness-server/src/http/orphan_reaper.rs` | Reaps orphaned workspace resources | Second deletion path to gate |
-| CLI GC | `crates/harness-cli/src/gc.rs`, `crates/harness-gc/src/gc_agent.rs` | User/agent-initiated GC | Third deletion path to gate |
+| CLI GC | `crates/harness-cli/src/commands/gc.rs`, `crates/harness-gc/src/gc_agent.rs` | User/agent-initiated GC | Third deletion path to gate |
 | Spawn preflight | `crates/harness-server/src/task_runner/spawn.rs` (`workspace path missing before task turn`, `record_workspace_lifecycle_failure`) | Detects missing workspace before/after a turn | Existing detection layer; keep as defense-in-depth |
 | Workspace lease | spawn.rs lease admission (`workspace_owner`, `run_generation`, `slot_index`) | Task admission records owner/generation | The reference data the GC check reads |
 | Agent error surface | `crates/harness-agents/src/codex.rs:360-405` | Formats `failed to run codex: No such file or directory` with `current_dir_exists` diagnostics | Misattribution fix: classify missing-cwd before blaming the binary |

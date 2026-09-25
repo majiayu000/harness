@@ -1,12 +1,13 @@
 use super::*;
 use crate::workflow_runtime_worker::runtime_profile::resolve_runtime_settings;
 use harness_workflow::runtime::{
-    RegisteredWorkflowDefinition, RepoMemoryKind, RepoMemoryOutcome, RepoMemoryRecord,
-    RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
+    DataProvenance, RegisteredWorkflowDefinition, RepoMemoryKind, RepoMemoryOutcome,
+    RepoMemoryRecord, RetrievedRepoMemoryRecord, RuntimeKind, TransitionAllowlist, TransitionRule,
     WorkflowDefinitionRegistry, WorkflowProgressMode, WorkflowRuntimeRecoveryAction,
     WorkflowRuntimeStore, WorkflowStateDefinition, WorkflowSubject, ISSUE_PLAN_ACTIVITY,
-    ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, PR_REPAIR_SNAPSHOT_ARTIFACT,
-    SERVER_PR_SNAPSHOT_ARTIFACT,
+    ISSUE_PLAN_ARTIFACT, ISSUE_PLAN_READY_SIGNAL, LOCAL_REVIEW_ACTIVITY,
+    LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
+    PR_REPAIR_SNAPSHOT_ARTIFACT, SERVER_PR_SNAPSHOT_ARTIFACT,
 };
 
 fn resolved_settings_for_tests(profile: &RuntimeProfile) -> ResolvedRuntimeSettings {
@@ -46,19 +47,15 @@ fn activity_result_schema_describes_issue_implementation_terminal_evidence_contr
 
     assert_eq!(
         schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
-        "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_or_blocked_with_scope_too_large_signal_else_blocked"
+        "pr_open_with_pull_request_artifact_or_done_with_closed_issue_signal_else_blocked"
     );
     assert_eq!(
         schema["activity_contract"]["accepted_signals"][0],
         ISSUE_CLOSED_SIGNAL
     );
     assert_eq!(
-        schema["activity_contract"]["accepted_signals"][2],
-        SCOPE_TOO_LARGE_SIGNAL
-    );
-    assert_eq!(
         schema["activity_contract"]["success_requires"],
-        "pull_request_artifact_or_closed_issue_or_scope_too_large_signal; deferred submission mode requires candidate_branch instead of pull_request"
+        "pull_request_artifact_or_closed_issue_signal; deferred submission mode requires candidate_branch instead of pull_request"
     );
     assert!(schema["activity_contract"]["accepted_artifacts"]
         .as_array()
@@ -70,14 +67,6 @@ fn activity_result_schema_describes_issue_implementation_terminal_evidence_contr
     assert_eq!(
         schema["agent_summary_contract"]["signals"]["IssueAlreadyResolved"],
         "Use when the task is already resolved before a PR is created. Include state=closed or state=resolved plus issue_number or issue_url."
-    );
-    assert_eq!(
-        schema["transition_contract"]["on_succeeded"]["pr_scope_guard"]["threshold_config"],
-        "workflow_file.config.pr_scope_guard; defaults are enabled=true, max_files_changed=30, max_lines_added=1500."
-    );
-    assert_eq!(
-        schema["agent_summary_contract"]["signals"]["SCOPE_TOO_LARGE"],
-        "Use when pr_scope_guard is enabled and the diff exceeds configured max_files_changed or max_lines_added. Include base_ref, files_changed, lines_added, max_files_changed, max_lines_added, and decomposition_skeleton."
     );
 }
 
@@ -105,6 +94,13 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
         schema["transition_contract"]["on_succeeded"]["reducer_next_state"],
         "local_review_gate"
     );
+    assert_eq!(
+        schema["transition_contract"]["on_failed"]["reducer_next_state"],
+        "local_review_gate"
+    );
+    assert!(schema["transition_contract"]["on_failed"]["retry_policy"]
+        .as_str()
+        .is_some_and(|value| value.contains("MUST NOT replay")));
     assert_eq!(
         schema["activity_contract"]["accepted_artifacts"][1],
         PR_REPAIR_SNAPSHOT_ARTIFACT
@@ -136,6 +132,16 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
         .is_some_and(|items| items.iter().any(|item| item
             .as_str()
             .is_some_and(|value| value.contains("pr_hygiene update/rebase")))));
+    assert!(schema["agent_summary_contract"]["must_include"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item
+            .as_str()
+            .is_some_and(|value| value.contains("DIRTY or BEHIND")))));
+    assert!(schema["agent_summary_contract"]["must_not_include"]
+        .as_array()
+        .is_some_and(|items| items.contains(&json!(
+            "waiting for hosted CI or newly generated feedback after the repair push"
+        ))));
     assert!(
         schema["transition_contract"]["on_succeeded"]["required_summary"]
             .as_str()
@@ -168,6 +174,45 @@ fn activity_result_schema_reminds_pr_feedback_to_recheck_pr_state() {
             ["validation_commands"]
             .as_str()
             .is_some_and(|value| value.contains("successful status"))
+    );
+}
+
+#[test]
+fn activity_result_schema_requires_exactly_one_local_review_outcome() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": LOCAL_REVIEW_ACTIVITY
+        }),
+    );
+    let workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "local_review_gate",
+        WorkflowSubject::new("issue", "issue:123"),
+    )
+    .with_id("issue-123");
+
+    let schema = activity_result_schema(&job, Some(&workflow));
+
+    assert_eq!(
+        schema["activity_contract"]["success_requires"],
+        "exactly_one_local_review_outcome_signal"
+    );
+    assert_eq!(
+        schema["activity_contract"]["accepted_signals"],
+        json!([
+            LOCAL_REVIEW_PASSED_SIGNAL,
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            LOCAL_REVIEW_BLOCKED_SIGNAL,
+        ])
+    );
+    assert!(
+        schema["agent_summary_contract"]["signals"][LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL]
+            .as_str()
+            .is_some_and(|value| value.contains("actionable_blocker_count"))
     );
 }
 
@@ -412,6 +457,7 @@ fn activity_result_schema_describes_pr_feedback_child_contract() {
     assert!(snapshot_fields.contains(&json!("snapshot_source")));
     assert!(snapshot_fields.contains(&json!("head_oid")));
     assert!(snapshot_fields.contains(&json!("review_threads_complete")));
+    assert!(snapshot_fields.contains(&json!("actionable_blocker_count")));
     assert!(schema["workflow_decision_contract"]["allowed_transitions"]
         .as_array()
         .expect("allowed transitions should be an array")
@@ -438,12 +484,13 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
 
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         None,
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
-        &resolved_settings_for_tests(&runtime_profile),
+        Some(&resolved_settings_for_tests(&runtime_profile)),
         &workflow_document,
         &[],
         None,
@@ -462,6 +509,59 @@ fn runtime_prompt_packet_includes_workflow_file_contract() {
 }
 
 #[test]
+fn prompt_task_packet_describes_disjunctive_completion_evidence_contract() {
+    let job = RuntimeJob::pending(
+        "command-prompt",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": PROMPT_TASK_IMPLEMENT_ACTIVITY }),
+    );
+    let workflow = WorkflowInstance::new(
+        PROMPT_TASK_DEFINITION_ID,
+        1,
+        "implementing",
+        WorkflowSubject::new("prompt", "TEAM-123"),
+    )
+    .with_id("prompt-workflow-1");
+
+    let schema = activity_result_schema(&job, Some(&workflow));
+    let artifacts = &schema["agent_summary_contract"]["artifacts"];
+
+    assert_eq!(artifacts["validation_report"]["type"], "array");
+    assert_eq!(artifacts["validation_report"]["min_items"], 1);
+    assert_eq!(
+        artifacts["validation_report"]["item_fields"],
+        json!(["command", "exit_code"])
+    );
+    assert_eq!(artifacts["no_change_rationale"]["type"], "string");
+    assert_eq!(artifacts["no_change_rationale"]["non_blank"], true);
+    assert_eq!(
+        artifacts["pull_request"]["fields"],
+        json!(["pr_number", "pr_url"])
+    );
+    assert!(schema["activity_contract"]["accepted_artifacts"]
+        .as_array()
+        .is_some_and(|items| items.contains(&json!("pull_request"))));
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("Free-text validation records do not satisfy"))
+    );
+}
+
+#[test]
+fn activity_result_json_schema_is_codex_strict_compatible() {
+    let schema = activity_result_json_schema("implement_prompt");
+    assert_eq!(
+        schema["properties"]["signals"]["items"]["properties"]["signal"],
+        json!({"$ref": "#/$defs/json_payload"})
+    );
+    #[rustfmt::skip]
+    fn walk(schema: &Value) { if schema.get("type") == Some(&json!("object")) || schema.get("type").and_then(Value::as_array).is_some_and(|items| items.contains(&json!("object"))) { assert_eq!(schema.get("additionalProperties"), Some(&Value::Bool(false))); let properties = schema["properties"].as_object().unwrap_or_else(|| panic!("object schema must declare properties")); let required = schema["required"].as_array().unwrap_or_else(|| panic!("object schema must declare required")); assert_eq!(required.len(), properties.len()); assert!(properties.keys().all(|key| required.contains(&json!(key)))); } match schema { Value::Array(items) => items.iter().for_each(walk), Value::Object(object) => object.values().for_each(walk), _ => {} } }
+    walk(&schema);
+}
+
+#[test]
 fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
     let job = RuntimeJob::pending(
         "command-continue",
@@ -476,28 +576,32 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
         WorkflowSubject::new("prompt", "TEAM-123"),
     )
     .with_id("prompt-workflow-1")
-    .with_data(json!({
-        "continuation": {
-            "policy": {
-                "max_attempts": 4,
-                "attempt_delay_secs": 30,
-                "active_states": ["In Progress"],
-                "no_progress_limit": 3
-            },
-            "attempt": 2,
-            "last_external_state": "In Progress",
-            "last_summary": "Created the implementation branch.",
-            "same_state_count": 0
-        }
-    }));
+    .with_classified_data(
+        json!({
+            "continuation": {
+                "policy": {
+                    "max_attempts": 4,
+                    "attempt_delay_secs": 30,
+                    "active_states": ["In Progress"],
+                    "no_progress_limit": 3
+                },
+                "attempt": 2,
+                "last_external_state": "In Progress",
+                "last_summary": "Created the implementation branch.",
+                "same_state_count": 0
+            }
+        }),
+        DataProvenance::Agent,
+    );
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         Some(&workflow),
         Path::new("/workspaces/job-continue"),
         Path::new("/repo"),
         &runtime_profile,
-        &resolved_settings_for_tests(&runtime_profile),
+        Some(&resolved_settings_for_tests(&runtime_profile)),
         &WorkflowDocument::default(),
         &[],
         None,
@@ -505,19 +609,42 @@ fn prompt_continuation_packet_includes_attempt_context_and_signal_contract() {
     .expect("continuation prompt packet should build");
 
     assert_eq!(packet["continuation_context"]["attempt"], 2);
-    assert_eq!(
-        packet["continuation_context"]["previous_external_state"],
-        "In Progress"
-    );
+    assert!(packet["continuation_context"]["previous_external_state"]
+        .as_str()
+        .is_some_and(|value| value.contains("<external_data>\nIn Progress\n</external_data>")));
     assert_eq!(
         packet["activity_result_schema"]["continuation_signal_contract"]["required_signal_type"],
         "external_state"
     );
+    let schema = &packet["activity_result_schema"];
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("validation_report"))
+    );
+    assert!(
+        schema["transition_contract"]["on_succeeded"]["success_requires"]
+            .as_str()
+            .is_some_and(|value| value.contains("no_change_rationale"))
+    );
+    assert!(
+        schema["agent_summary_contract"]["artifacts"]["validation_report"]["required_when"]
+            .as_str()
+            .is_some_and(|value| value.contains("use this or no_change_rationale"))
+    );
+    assert!(
+        schema["agent_summary_contract"]["artifacts"]["no_change_rationale"]["required_when"]
+            .as_str()
+            .is_some_and(|value| value.contains("use this or validation_report"))
+    );
     let prompt = build_runtime_job_prompt(&packet, Some("Continue TEAM-123."));
     assert!(prompt.contains("Continuation context:"));
     assert!(prompt.contains("Attempt: 2"));
-    assert!(prompt.contains("Previous external state: In Progress"));
-    assert!(prompt.contains("Previous attempt summary: Created the implementation branch."));
+    assert!(prompt.contains("Previous external state:"));
+    assert!(prompt.contains("<external_data>\nIn Progress\n</external_data>"));
+    assert!(
+        prompt.contains("<external_data>\nCreated the implementation branch.\n</external_data>")
+    );
 }
 
 #[test]
@@ -541,12 +668,13 @@ fn runtime_prompt_packet_describes_deferred_candidate_submission_contract() {
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
 
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         None,
         Path::new("/workspaces/issue-1449-c1"),
         Path::new("/repo"),
         &runtime_profile,
-        &resolved_settings_for_tests(&runtime_profile),
+        Some(&resolved_settings_for_tests(&runtime_profile)),
         &workflow_document,
         &[],
         None,
@@ -595,12 +723,13 @@ fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
     }];
 
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         None,
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
-        &resolved_settings_for_tests(&runtime_profile),
+        Some(&resolved_settings_for_tests(&runtime_profile)),
         &workflow_document,
         &repo_memory,
         None,
@@ -634,6 +763,77 @@ fn memory_inject_prompt_packet_includes_fenced_repo_memory_section() {
 }
 
 #[test]
+fn model_facing_prompt_matches_frozen_v1_fixture_while_durable_packet_remains_v2() {
+    // Fixed inputs, identical to the original fixture generation from pre-v2
+    // commit f55eea8b: fixed job/command IDs, fixed roots/profile/input, no
+    // workflow, no memory, and a non-empty prompt template. The frozen fixture
+    // was re-rendered when the ActivityResult contract gained its strict
+    // output-schema form (json_schema, required arrays, nullable error
+    // fields), and again when WorkflowConfig gained the runtime_budget_policy
+    // section (GH-1770); the fixed input bytes still match the current
+    // default configuration.
+    let mut job = RuntimeJob::pending(
+        "command-fixture-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({ "activity": "implement_issue" }),
+    );
+    job.id = "runtime-job-fixture-1".to_string();
+    let workflow_document = WorkflowDocument {
+        prompt_template: "Follow the repository workflow prompt.".to_string(),
+        source_path: Some("/repo/WORKFLOW.md".to_string()),
+        ..Default::default()
+    };
+    let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
+    let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        &job,
+        None,
+        Path::new("/workspaces/job-1"),
+        Path::new("/repo"),
+        &runtime_profile,
+        Some(&resolved_settings_for_tests(&runtime_profile)),
+        &workflow_document,
+        &[],
+        None,
+    )
+    .expect("fixture prompt packet should build");
+
+    // Durable evidence carries the current audit schema and keeps every audit
+    // field and template. The constant is referenced rather than pinned to a
+    // literal: this test exists to freeze the *model-facing* bytes, and the
+    // durable schema is expected to move as audit content evolves.
+    assert_eq!(packet["schema"], RUNTIME_PROMPT_PACKET_SCHEMA);
+    assert!(packet.get("context_provenance").is_some());
+    assert!(packet.get("resolved_runtime_settings").is_some());
+    assert_eq!(
+        packet["workflow_file"]["prompt_template"],
+        "Follow the repository workflow prompt."
+    );
+
+    // The complete rendered prompt matches the independent frozen pre-v2
+    // bytes; the expected value is not derived from the current v2 packet.
+    let prompt = build_runtime_job_prompt(&packet, None);
+    assert_eq!(
+        prompt,
+        include_str!("prompt_packet/fixtures/model_facing_prompt_v1.txt")
+    );
+
+    // The rendered packet JSON is v1, excludes the template and audit fields,
+    // and appends the non-empty template exactly once.
+    assert!(prompt.contains("\"schema\": \"harness.runtime.prompt_packet.v1\""));
+    assert!(!prompt.contains("prompt_template"));
+    assert!(!prompt.contains("context_provenance"));
+    assert!(!prompt.contains("resolved_runtime_settings"));
+    assert_eq!(
+        prompt
+            .matches("Repository workflow prompt template:")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
     let job = RuntimeJob::pending(
         "command-1",
@@ -648,12 +848,13 @@ fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
     let runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
 
     let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
         &job,
         None,
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
-        &resolved_settings_for_tests(&runtime_profile),
+        Some(&resolved_settings_for_tests(&runtime_profile)),
         &workflow_document,
         &[],
         None,
@@ -664,4 +865,57 @@ fn memory_inject_fresh_repo_gets_no_repo_memory_section() {
     let prompt = build_runtime_job_prompt(&packet, None);
     assert!(!prompt.contains("Repo memory:"));
     assert!(!prompt.contains("```repo-memory"));
+}
+
+#[test]
+fn cursor_builtin_prompt_preserves_evidence_and_omits_unrelated_protocol() {
+    let job = RuntimeJob::pending(
+        "cursor-contract",
+        RuntimeKind::Cursor,
+        "cursor",
+        json!({"command":{"activity":LOCAL_REVIEW_ACTIVITY,"local_review_result":{"summary":"Prior finding evidence"}}}),
+    );
+    let workflow = WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "local_review_gate",
+        WorkflowSubject::new("issue", "123"),
+    )
+    .with_server_data(
+        json!({"repo":"owner/repo","issue_plan":{"summary":"Original acceptance criteria"}}),
+    );
+    let profile = RuntimeProfile::new("cursor", RuntimeKind::Cursor);
+    let packet = build_runtime_prompt_packet(
+        &WorkflowDefinitionRegistry::with_builtins(),
+        &job,
+        Some(&workflow),
+        Path::new("/repo"),
+        Path::new("/repo"),
+        &profile,
+        Some(&resolved_settings_for_tests(&profile)),
+        &WorkflowDocument::default(),
+        &[],
+        None,
+    )
+    .expect("Cursor packet");
+    let prompt = build_runtime_job_prompt(&packet, None);
+    assert!(prompt.contains("Original acceptance criteria"));
+    assert!(prompt.contains("Prior finding evidence"));
+    assert!(prompt.contains("LocalReviewChangesRequested"));
+    assert!(prompt.contains("harness-activity-result"));
+    assert!(!prompt.contains("harness.runtime.json_payload.v1"));
+    assert!(!prompt.contains("workflow_decision_contract"));
+    assert!(!prompt.contains("\"command_type\""));
+    assert!(!prompt.contains("runtime_budget_policy"));
+    assert!(
+        prompt.find("Original acceptance criteria").unwrap()
+            < prompt.find("Activity result contract:").unwrap()
+    );
+    assert!(packet
+        .pointer("/activity_result_schema/json_schema")
+        .is_some());
+    assert!(packet.pointer("/workflow_file/config").is_some());
+    assert!(packet
+        .pointer("/untrusted_command_input/agent_fields/command/local_review_result")
+        .is_some());
 }

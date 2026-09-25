@@ -28,6 +28,7 @@ pub(crate) async fn build_intake(
     registry: &RegistryBundle,
     project_root: &Path,
     _data_dir: &Path,
+    background_loops: &std::sync::Arc<crate::http::background::BackgroundLoopHealth>,
 ) -> anyhow::Result<IntakeBundle> {
     let events = engines
         .events
@@ -44,7 +45,9 @@ pub(crate) async fn build_intake(
             .map(|threshold_mb| {
                 let poll_secs = server.config.concurrency.memory_poll_interval_secs;
                 tracing::info!(threshold_mb, poll_secs, "memory pressure monitor enabled");
-                crate::memory_monitor::start(threshold_mb, poll_secs)
+                let handle = background_loops
+                    .register_loop_with_interval("memory_pressure_monitor", poll_secs.max(1));
+                crate::memory_monitor::start_registered(handle, threshold_mb, poll_secs)
             });
     let issue_queue_config = runtime_issue_concurrency_config(server, registry).await;
     let review_queue_config = runtime_review_concurrency_config(server, registry).await;
@@ -191,6 +194,7 @@ pub(crate) async fn build_intake(
             gc_cfg.auto_adopt,
             gc_cfg.auto_adopt_path_prefix.clone(),
             gc_cfg.gc_run_timeout_secs,
+            server.config.clone(),
         ))
     };
 
@@ -380,7 +384,7 @@ mod tests {
             &server,
             dir,
             dir,
-            storage.tasks.as_ref().expect("tasks store"),
+            storage.tasks.as_ref(),
         )
         .await
         .expect("registry");
@@ -418,6 +422,7 @@ mod tests {
             &registry,
             dir.path(),
             dir.path(),
+            &std::sync::Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         )
         .await
         .expect("build_intake");
@@ -489,7 +494,7 @@ mod tests {
             &server,
             dir.path(),
             dir.path(),
-            storage.tasks.as_ref().expect("tasks store"),
+            storage.tasks.as_ref(),
         )
         .await
         .expect("registry");
@@ -501,6 +506,7 @@ mod tests {
             &registry,
             dir.path(),
             dir.path(),
+            &std::sync::Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         )
         .await
         .expect("build_intake");
@@ -546,7 +552,7 @@ mod tests {
             &server,
             dir.path(),
             dir.path(),
-            storage.tasks.as_ref().expect("tasks store"),
+            storage.tasks.as_ref(),
         )
         .await
         .expect("registry");
@@ -558,6 +564,7 @@ mod tests {
             &registry,
             dir.path(),
             dir.path(),
+            &std::sync::Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         )
         .await
         .expect("build_intake");

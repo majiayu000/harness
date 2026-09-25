@@ -1,6 +1,7 @@
 use crate::github_pr_snapshot::{
-    fetch_github_pr_snapshot, github_pr_snapshot_failure_result, pr_readiness_for_snapshot,
-    GitHubPrSnapshotArtifacts, GitHubPrSnapshotTarget,
+    eval_draft_snapshot_allows_validation, fetch_github_pr_snapshot,
+    github_pr_snapshot_failure_result, pr_readiness_for_snapshot, GitHubPrSnapshotArtifacts,
+    GitHubPrSnapshotTarget,
 };
 use crate::http::AppState;
 use harness_workflow::runtime::{
@@ -50,7 +51,15 @@ pub(super) async fn execute_pr_feedback_inspection(
                         readiness = readiness.as_str(),
                         "server-owned PR feedback inspection collected remote facts"
                     );
-                    artifacts.activity_result(&activity)
+                    if workflow
+                        .and_then(harness_workflow::runtime::server_owned_eval_metadata)
+                        .is_some()
+                        && eval_draft_snapshot_allows_validation(&artifacts.normalized_snapshot)
+                    {
+                        artifacts.eval_draft_validation_activity_result(&activity)
+                    } else {
+                        artifacts.activity_result(&activity)
+                    }
                 }
                 Err(error) => ActivityResult::failed(
                     activity,
@@ -149,12 +158,12 @@ fn json_u64_field(value: &Value, field: &str) -> Option<u64> {
 }
 
 fn repo_slug_from_url(pr_url: &str) -> Option<String> {
-    harness_core::prompts::parse_github_pr_url(pr_url)
+    harness_agents::output_parsing::parse_github_pr_url(pr_url)
         .map(|(owner, repo, _)| format!("{owner}/{repo}"))
 }
 
 fn pr_number_from_url(pr_url: &str) -> Option<u64> {
-    harness_core::prompts::parse_github_pr_url(pr_url).map(|(_, _, number)| number)
+    harness_agents::output_parsing::parse_github_pr_url(pr_url).map(|(_, _, number)| number)
 }
 
 #[cfg(test)]
@@ -185,7 +194,7 @@ mod tests {
             "inspecting",
             WorkflowSubject::new("pr", "pr:77"),
         )
-        .with_data(json!({
+        .with_server_data(json!({
             "repo": "owner/repo",
             "pr_number": 77,
             "pr_url": "https://github.com/owner/repo/pull/77"

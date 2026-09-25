@@ -15,7 +15,7 @@ use crate::server::HarnessServer;
 /// Outputs of the registry initialization phase.
 pub(crate) struct RegistryBundle {
     pub plan_db: Option<PlanDb>,
-    pub plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    pub plan_cache: Arc<DashMap<String, std::sync::Arc<harness_exec::plan::ExecPlan>>>,
     pub issue_workflow_store: Option<Arc<harness_workflow::issue_lifecycle::IssueWorkflowStore>>,
     pub project_workflow_store:
         Option<Arc<harness_workflow::project_lifecycle::ProjectWorkflowStore>>,
@@ -29,13 +29,13 @@ pub(crate) struct RegistryBundle {
 /// Initialize plan DB, plan cache, project registry, workspace manager, and
 /// runtime state store.
 ///
-/// Must follow `build_storage` (uses `storage.tasks` for orphan cleanup) —
-/// callers must pass `tasks` explicitly for that cleanup step.
+/// Must follow `build_storage` (uses `storage.tasks` for orphan cleanup when
+/// present). Callers pass `tasks` explicitly for that cleanup step.
 pub(crate) async fn build_registry(
     server: &Arc<HarnessServer>,
     data_dir: &Path,
     project_root: &Path,
-    tasks: &Arc<crate::task_runner::TaskStore>,
+    tasks: Option<&Arc<crate::task_runner::TaskStore>>,
 ) -> anyhow::Result<RegistryBundle> {
     let configured_database_url = server.config.server.database_url.as_deref();
     // Fail closed: a malformed WORKFLOW.md must abort startup rather than
@@ -48,9 +48,15 @@ pub(crate) async fn build_registry(
                 project_root.display()
             )
         })?;
+    // Cloned before `storage` is moved out: the runtime store enforces the
+    // same policy at activity completion that the dispatcher enforces
+    // pre-dispatch (GH-1770).
+    let runtime_budget_policy = workflow_config.runtime_budget_policy.clone();
+    let mut workflow_definition_registry = server.configure_workflow_definition_registry()?;
     let workflow_ns = workflow_config.storage.schema_namespace;
     let mut startup_results = Vec::new();
-    let plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>> = Arc::new(DashMap::new());
+    let plan_cache: Arc<DashMap<String, std::sync::Arc<harness_exec::plan::ExecPlan>>> =
+        Arc::new(DashMap::new());
 
     let database_url = match harness_core::db::resolve_database_url(configured_database_url) {
         Ok(database_url) => database_url,
@@ -118,7 +124,7 @@ pub(crate) async fn build_registry(
             Ok(plans) => {
                 let count = plans.len();
                 for plan in plans {
-                    plan_cache.insert(plan.id.as_str().to_string(), plan);
+                    plan_cache.insert(plan.id.as_str().to_string(), std::sync::Arc::new(plan));
                 }
                 if count > 0 {
                     tracing::debug!(count, "plan cache: loaded {} plan(s) from db", count);
@@ -258,7 +264,7 @@ pub(crate) async fn build_registry(
         match super::forced_startup_error("workflow_runtime_store") {
             Some(error) => {
                 startup_results
-                    .push(StoreStartupResult::optional("workflow_runtime_store").failed(error));
+                    .push(StoreStartupResult::critical("workflow_runtime_store").failed(error));
                 None
             }
             None => match async {
@@ -269,27 +275,29 @@ pub(crate) async fn build_registry(
                     &context,
                     &setup_pool,
                 )
-                .await?;
+                .await?
+                .with_budget_policy(runtime_budget_policy.clone());
                 let historical_definitions = store.list_persisted_declarative_definitions().await?;
-                harness_workflow::runtime::register_historical_declarative_workflow_definitions(
-                    historical_definitions,
-                )?;
-                Ok::<_, anyhow::Error>(store)
+                workflow_definition_registry
+                    .register_declarative_historical_batch(historical_definitions)?;
+                Ok::<_, anyhow::Error>(
+                    store.with_definition_registry(workflow_definition_registry.into_shared()),
+                )
             }
             .await
             {
                 Ok(store) => {
-                    startup_results.push(StoreStartupResult::optional("workflow_runtime_store"));
+                    startup_results.push(StoreStartupResult::critical("workflow_runtime_store"));
                     Some(Arc::new(store))
                 }
                 Err(error) => {
                     startup_results.push(
-                        StoreStartupResult::optional("workflow_runtime_store")
+                        StoreStartupResult::critical("workflow_runtime_store")
                             .failed(error.to_string()),
                     );
-                    tracing::warn!(
+                    tracing::error!(
                         schema = %schema,
-                        "workflow runtime store init failed, generic workflow decisions will not persist: {error}"
+                        "workflow runtime store init failed: {error}"
                     );
                     None
                 }
@@ -417,10 +425,15 @@ pub(crate) async fn build_registry(
                 .push(StoreStartupResult::optional("workspace_lease_store").failed(error));
             None
         }
-        None => match crate::workspace_lease_store::WorkspaceLeaseStore::open_shared_with_data_dir(
+        None => match crate::workspace_lease_store::WorkspaceLeaseStore::open_shared_with_data_dir_and_repository_lock_capacity(
             &task_context,
             &setup_pool,
             data_dir,
+            server
+                .config
+                .concurrency
+                .max_concurrent_tasks
+                .saturating_add(1),
         )
         .await
         {
@@ -441,29 +454,44 @@ pub(crate) async fn build_registry(
         },
     };
 
-    let workspace_pool_config = super::workspace_pool_config::build_workspace_pool_config(
+    let workspace_mgr = match super::workspace_pool_config::build_workspace_pool_config(
         server,
         project_registry.as_ref(),
     )
-    .await;
-    let workspace_mgr = match crate::workspace::WorkspaceManager::new_with_pool(
-        server.config.workspace.clone(),
-        workspace_pool_config,
-        workspace_lease_store,
-    ) {
-        Ok(mgr) => {
-            startup_results.push(StoreStartupResult::optional("workspace_manager"));
-            tracing::debug!(
-                root = %server.config.workspace.root.display(),
-                "workspace manager initialized"
-            );
-            Some(Arc::new(mgr))
+    .await
+    {
+        Ok(workspace_pool_config) => {
+            match crate::workspace::WorkspaceManager::new_with_pool_and_capacity_source(
+                server.config.workspace.clone(),
+                workspace_pool_config,
+                workspace_lease_store,
+                server.clone(),
+                project_registry.clone(),
+            ) {
+                Ok(mgr) => {
+                    startup_results.push(StoreStartupResult::optional("workspace_manager"));
+                    tracing::debug!(
+                        root = %server.config.workspace.root.display(),
+                        "workspace manager initialized"
+                    );
+                    Some(Arc::new(mgr))
+                }
+                Err(error) => {
+                    startup_results.push(
+                        StoreStartupResult::optional("workspace_manager").failed(error.to_string()),
+                    );
+                    tracing::warn!(
+                    "failed to initialize workspace manager: {error}; running without workspace isolation"
+                );
+                    None
+                }
+            }
         }
-        Err(e) => {
+        Err(error) => {
             startup_results
-                .push(StoreStartupResult::optional("workspace_manager").failed(e.to_string()));
-            tracing::warn!(
-                "failed to initialize workspace manager: {e}; running without workspace isolation"
+                .push(StoreStartupResult::optional("workspace_manager").failed(error.to_string()));
+            tracing::error!(
+                "failed to resolve workspace concurrency limits: {error}; running without workspace isolation"
             );
             None
         }
@@ -471,27 +499,32 @@ pub(crate) async fn build_registry(
 
     // Reconcile stale workspaces from any previous crash before new task admission.
     if let Some(ref wmgr) = workspace_mgr {
-        match tasks.list_all_summaries_with_terminal().await {
-            Ok(task_summaries) => {
-                match wmgr.reconcile_startup(project_root, &task_summaries).await {
-                    Ok(summary) => {
-                        tracing::info!(
-                            removed = summary.removed,
-                            preserved = summary.preserved,
-                            migrated = summary.migrated,
-                            released_leases = summary.released_leases,
-                            "workspace startup reconciliation complete"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("workspace startup reconciliation failed: {e}");
+        match tasks {
+            Some(tasks) => match tasks.list_all_summaries_with_terminal().await {
+                Ok(task_summaries) => {
+                    match wmgr.reconcile_startup(project_root, &task_summaries).await {
+                        Ok(summary) => {
+                            tracing::info!(
+                                removed = summary.removed,
+                                preserved = summary.preserved,
+                                migrated = summary.migrated,
+                                released_leases = summary.released_leases,
+                                "workspace startup reconciliation complete"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("workspace startup reconciliation failed: {e}");
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load task summaries for workspace reconciliation: {e}; skipping cleanup"
-                );
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load task summaries for workspace reconciliation: {e}; skipping cleanup"
+                    );
+                }
+            },
+            None => {
+                tracing::warn!("task store unavailable; skipping workspace startup reconciliation");
             }
         }
     }

@@ -168,7 +168,7 @@ fn configured_model(config: &CompressionConfig) -> Option<ApiCompressModel> {
     if !config.is_active() {
         return None;
     }
-    let api_key = std::env::var("ANTHROPIC_API_KEY").ok()?;
+    let api_key = harness_core::config::process_env::var("ANTHROPIC_API_KEY").ok()?;
     if api_key.trim().is_empty() {
         return None;
     }

@@ -1,7 +1,8 @@
 use harness_core::db::{pg_open_pool, resolve_test_database_url, PgStoreContext, TestSchemaGuard};
 use harness_core::types::TaskId as CoreTaskId;
-use harness_server::task_db::TaskDb;
-use harness_server::task_runner::{TaskKind, TaskPhase, TaskSchedulerState, TaskState, TaskStatus};
+use harness_server::server::test_support::{
+    TaskDb, TaskKind, TaskPhase, TaskSchedulerState, TaskState, TaskStatus,
+};
 
 fn retention_task_state(id: &str, status: TaskStatus) -> TaskState {
     TaskState {

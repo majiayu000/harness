@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub async fn update_status(
     store: &TaskStore,
     task_id: &TaskId,
@@ -163,6 +164,7 @@ pub async fn mark_terminal_once(
 }
 
 /// Mutate a task in the cache then persist to SQLite.
+#[cfg(test)]
 pub async fn mutate_and_persist(
     store: &TaskStore,
     id: &TaskId,

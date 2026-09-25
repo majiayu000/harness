@@ -1,6 +1,9 @@
+use super::runtime_completion_budget::budget_ceiling_blocked_decision;
+use super::runtime_completion_pr_feedback::apply_pr_feedback_completion_data_side_effect;
 use super::{
-    apply_inline_command_side_effect, command_store, insert_decision_record_tx, insert_event_tx,
-    select_instance_for_update_tx, upsert_instance_tx, WorkflowRuntimeStore,
+    apply_inline_command_side_effect, command_store, commit_decision_instance_tx,
+    fence_terminal_transition_tx, insert_decision_record_once_tx, insert_event_tx,
+    select_instance_for_update_tx, RuntimeBudgetPolicy, WorkflowRuntimeStore,
 };
 use crate::runtime::model::{
     ActivityResult, ActivityStatus, WorkflowCommand, WorkflowDecision, WorkflowDecisionRecord,
@@ -10,25 +13,28 @@ use crate::runtime::prompt_task::{
     prompt_continuation_state_from_data, PromptContinuationState, PROMPT_TASK_DEFINITION_ID,
 };
 use crate::runtime::reducer::{
-    invalid_agent_output_blocked_decision, reduce_runtime_job_completed,
+    invalid_agent_output_blocked_decision, reduce_runtime_job_completed_with_registry,
 };
-use crate::runtime::state_registry::{
-    resolve_declarative_definition, DeclarativeDefinitionResolution,
-};
+use crate::runtime::state_registry::{DeclarativeDefinitionResolution, WorkflowDefinitionRegistry};
 use crate::runtime::status::WorkflowCommandStatus;
-use crate::runtime::validator::{ValidationContext, WorkflowDecisionRejectionKind};
+use crate::runtime::validator::{
+    ValidationContext, WorkflowDecisionRejection, WorkflowDecisionRejectionKind,
+};
 use serde_json::Value;
 
 pub(super) fn validator_for_instance(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
 ) -> anyhow::Result<Option<crate::runtime::validator::DecisionValidator>> {
-    crate::runtime::state_registry::decision_validator_for_instance(instance).map_err(|error| {
-        anyhow::anyhow!(
-            "invalid declarative definition pin for workflow '{}': {:?}",
-            instance.id,
-            error
-        )
-    })
+    registry
+        .decision_validator_for_instance(instance)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "invalid declarative definition pin for workflow '{}': {:?}",
+                instance.id,
+                error
+            )
+        })
 }
 
 impl WorkflowRuntimeStore {
@@ -54,9 +60,15 @@ impl WorkflowRuntimeStore {
             payload,
         )
         .await?;
-        let decision =
-            apply_runtime_completion_decision_for_instance_tx(&mut tx, instance, source, &event)
-                .await?;
+        let decision = apply_runtime_completion_decision_for_instance_tx(
+            &mut tx,
+            &self.definition_registry,
+            instance,
+            source,
+            &event,
+            &self.budget_policy,
+        )
+        .await?;
         tx.commit().await?;
         if let Some(decision) = decision.as_ref() {
             self.record_terminal_repo_memory_for_completion(&event, decision)
@@ -82,6 +94,7 @@ impl WorkflowRuntimeStore {
             insert_event_tx(&mut tx, workflow_id, "RuntimeJobCompleted", source, payload).await?;
         let record = persist_runtime_completion_decision_tx(
             &mut tx,
+            &self.definition_registry,
             instance,
             source,
             &event,
@@ -95,26 +108,65 @@ impl WorkflowRuntimeStore {
 
 pub(super) async fn apply_runtime_completion_decision_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registry: &WorkflowDefinitionRegistry,
     workflow_id: &str,
     source: &str,
     event: &WorkflowEvent,
+    budget_policy: &RuntimeBudgetPolicy,
 ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
     let Some(instance) = select_instance_for_update_tx(tx, workflow_id).await? else {
         return Ok(None);
     };
-    apply_runtime_completion_decision_for_instance_tx(tx, instance, source, event).await
+    apply_runtime_completion_decision_for_instance_tx(
+        tx,
+        registry,
+        instance,
+        source,
+        event,
+        budget_policy,
+    )
+    .await
 }
 
 async fn apply_runtime_completion_decision_for_instance_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registry: &WorkflowDefinitionRegistry,
     instance: WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
+    budget_policy: &RuntimeBudgetPolicy,
 ) -> anyhow::Result<Option<WorkflowDecisionRecord>> {
-    let driverless_decision = driverless_structured_completion_decision(&instance, source, event)?;
-    let Some(decision) = reduce_runtime_job_completed(&instance, event)? else {
+    let driverless_decision =
+        driverless_structured_completion_decision(registry, &instance, source, event)?;
+    let Some(decision) = reduce_runtime_job_completed_with_registry(registry, &instance, event)?
+    else {
         return Ok(None);
     };
+    // Hard workflow budget ceiling (GH-1770 §4.4). Checked before the policy
+    // fallbacks below: those already stop the workflow, so a budget block on
+    // top of them would only mask the real reason.
+    if let Some(budget_decision) = budget_ceiling_blocked_decision(
+        tx,
+        budget_policy,
+        registry,
+        &instance,
+        source,
+        event,
+        &decision,
+    )
+    .await?
+    {
+        return persist_runtime_completion_decision_tx(
+            tx,
+            registry,
+            instance,
+            source,
+            event,
+            budget_decision,
+        )
+        .await
+        .map(Some);
+    }
     // Preserve the requested liveness rejection only when the reducer found no
     // authoritative domain outcome and would apply its generic invalid-output policy.
     // The separate blocked policy decision remains the committed outcome, so the
@@ -123,6 +175,7 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         if let Some(driverless_decision) = driverless_decision {
             let rejected = persist_runtime_completion_decision_tx(
                 tx,
+                registry,
                 instance.clone(),
                 source,
                 event,
@@ -147,6 +200,7 @@ async fn apply_runtime_completion_decision_for_instance_tx(
             ));
             let policy = persist_runtime_completion_decision_tx(
                 tx,
+                registry,
                 instance,
                 source,
                 event,
@@ -166,12 +220,19 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         }
     }
 
-    if declarative_decision_missing_required_evidence(&instance, source, event, &decision) {
-        let rejected =
-            persist_runtime_completion_decision_tx(tx, instance.clone(), source, event, decision)
-                .await?;
+    if declarative_decision_requires_blocked_fallback(registry, &instance, source, event, &decision)
+    {
+        let rejected = persist_runtime_completion_decision_tx(
+            tx,
+            registry,
+            instance.clone(),
+            source,
+            event,
+            decision,
+        )
+        .await?;
         if rejected.accepted {
-            anyhow::bail!("missing-evidence declarative decision unexpectedly passed validation");
+            anyhow::bail!("insufficient-evidence decision unexpectedly passed validation");
         }
         let result: ActivityResult =
             serde_json::from_value(event.event.get("activity_result").cloned().ok_or_else(
@@ -186,7 +247,7 @@ async fn apply_runtime_completion_decision_for_instance_tx(
             event,
             &result,
             &format!(
-                "declarative transition was rejected for missing evidence: {rejection_reason}"
+                "transition was rejected for insufficient trusted evidence: {rejection_reason}"
             ),
         )
         .with_evidence(WorkflowEvidence::new(
@@ -196,12 +257,18 @@ async fn apply_runtime_completion_decision_for_instance_tx(
                 rejected.id
             ),
         ));
-        let policy =
-            persist_runtime_completion_decision_tx(tx, instance, source, event, policy_decision)
-                .await?;
+        let policy = persist_runtime_completion_decision_tx(
+            tx,
+            registry,
+            instance,
+            source,
+            event,
+            policy_decision,
+        )
+        .await?;
         if !policy.accepted {
             anyhow::bail!(
-                "blocked policy decision was rejected after missing declarative evidence: {}",
+                "blocked policy decision was rejected after insufficient trusted evidence: {}",
                 policy
                     .rejection_reason
                     .as_deref()
@@ -211,24 +278,25 @@ async fn apply_runtime_completion_decision_for_instance_tx(
         return Ok(Some(policy));
     }
 
-    persist_runtime_completion_decision_tx(tx, instance, source, event, decision)
+    persist_runtime_completion_decision_tx(tx, registry, instance, source, event, decision)
         .await
         .map(Some)
 }
 
-fn declarative_decision_missing_required_evidence(
+fn declarative_decision_requires_blocked_fallback(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
     decision: &WorkflowDecision,
 ) -> bool {
     if !matches!(
-        resolve_declarative_definition(instance),
+        registry.resolve_declarative_definition(instance),
         DeclarativeDefinitionResolution::Resolved(_)
     ) {
         return false;
     }
-    let Ok(Some(validator)) = validator_for_instance(instance) else {
+    let Ok(Some(validator)) = validator_for_instance(registry, instance) else {
         return false;
     };
     matches!(
@@ -237,7 +305,12 @@ fn declarative_decision_missing_required_evidence(
             decision,
             &ValidationContext::new(source, event.created_at),
         ),
-        Err(error) if error.kind == WorkflowDecisionRejectionKind::MissingRequiredEvidence
+        Err(error)
+            if matches!(
+                error.kind,
+                WorkflowDecisionRejectionKind::MissingRequiredEvidence
+                    | WorkflowDecisionRejectionKind::InsufficientEvidenceTrust
+            )
     )
 }
 
@@ -249,6 +322,7 @@ fn is_generic_invalid_structured_fallback(decision: &WorkflowDecision) -> bool {
 }
 
 fn driverless_structured_completion_decision(
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
@@ -267,10 +341,11 @@ fn driverless_structured_completion_decision(
         .find_map(|artifact| {
             serde_json::from_value::<WorkflowDecision>(artifact.artifact.clone()).ok()
         })
+        .map(crate::runtime::completion_evidence::downgrade_agent_authored_decision)
     else {
         return Ok(None);
     };
-    let Ok(Some(validator)) = validator_for_instance(instance) else {
+    let Ok(Some(validator)) = validator_for_instance(registry, instance) else {
         return Ok(None);
     };
     let rejection = validator.validate(
@@ -288,37 +363,72 @@ fn driverless_structured_completion_decision(
 
 async fn persist_runtime_completion_decision_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    mut instance: WorkflowInstance,
+    registry: &WorkflowDefinitionRegistry,
+    instance: WorkflowInstance,
     source: &str,
     event: &WorkflowEvent,
     decision: WorkflowDecision,
 ) -> anyhow::Result<WorkflowDecisionRecord> {
-    let record = match validator_for_instance(&instance) {
-        Ok(Some(validator)) => match validator.validate(
-            &instance,
-            &decision,
-            &ValidationContext::new(source, event.created_at),
-        ) {
-            Ok(()) => WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone())),
-            Err(error) => WorkflowDecisionRecord::rejected(
-                decision,
-                Some(event.id.clone()),
-                error.to_string(),
-            ),
-        },
+    let validation_context = runtime_completion_validation_context(source, event);
+    persist_runtime_completion_decision_with_context_tx(
+        tx,
+        registry,
+        instance,
+        event,
+        decision,
+        validation_context,
+    )
+    .await
+}
+
+async fn persist_runtime_completion_decision_with_context_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registry: &WorkflowDefinitionRegistry,
+    mut instance: WorkflowInstance,
+    event: &WorkflowEvent,
+    decision: WorkflowDecision,
+    validation_context: ValidationContext,
+) -> anyhow::Result<WorkflowDecisionRecord> {
+    let current = instance.clone();
+    let record = match validator_for_instance(registry, &instance) {
+        Ok(Some(validator)) => {
+            match validator.validate(&instance, &decision, &validation_context) {
+                Ok(()) => {
+                    WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone()))
+                }
+                Err(error) => WorkflowDecisionRecord::rejected(
+                    decision,
+                    Some(event.id.clone()),
+                    error.to_string(),
+                ),
+            }
+        }
         Ok(None) => WorkflowDecisionRecord::rejected(
             decision,
             Some(event.id.clone()),
             "unknown workflow definition for runtime completion",
         ),
-        Err(_error) if is_definition_pin_safety_decision(&instance, source, event, &decision) => {
-            WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone()))
+        Err(_error) if validation_context.allow_definition_pin_safety_decision => {
+            match validate_definition_pin_safety_transition(
+                &instance,
+                &decision,
+                &validation_context,
+            ) {
+                Ok(()) => {
+                    WorkflowDecisionRecord::accepted(decision.clone(), Some(event.id.clone()))
+                }
+                Err(error) => WorkflowDecisionRecord::rejected(
+                    decision,
+                    Some(event.id.clone()),
+                    error.to_string(),
+                ),
+            }
         }
         Err(error) => {
             WorkflowDecisionRecord::rejected(decision, Some(event.id.clone()), error.to_string())
         }
     };
-    insert_decision_record_tx(tx, &record).await?;
+    insert_decision_record_once_tx(tx, &record).await?;
 
     if record.accepted {
         if apply_prompt_continuation_side_effect(tx, &mut instance, &record.decision).await?
@@ -337,36 +447,78 @@ async fn persist_runtime_completion_decision_tx(
                 apply_inline_command_side_effect(&mut instance, followup)?;
             }
         }
+        apply_runtime_completion_data_side_effect(&mut instance, &record.decision, event)?;
         instance.state = record.decision.next_state.clone();
         instance.version = instance.version.saturating_add(1);
-        upsert_instance_tx(tx, &instance).await?;
+        fence_terminal_transition_tx(tx, registry, &instance).await?;
+        commit_decision_instance_tx(tx, &current, &instance, &record, false).await?;
     }
 
     Ok(record)
 }
 
-fn is_definition_pin_safety_decision(
-    instance: &WorkflowInstance,
-    source: &str,
-    event: &WorkflowEvent,
+fn runtime_completion_validation_context(source: &str, event: &WorkflowEvent) -> ValidationContext {
+    ValidationContext::new(source, event.created_at).allow_definition_pin_safety_decision()
+}
+
+fn apply_runtime_completion_data_side_effect(
+    instance: &mut WorkflowInstance,
     decision: &WorkflowDecision,
-) -> bool {
-    if source.trim().is_empty()
-        || event.source != source
-        || event.event_type != "RuntimeJobCompleted"
+    event: &WorkflowEvent,
+) -> anyhow::Result<()> {
+    if instance.definition_id == "github_issue_pr" {
+        let mut writes = Vec::new();
+        for command in &decision.commands {
+            if let Some(plan) = command.command.get("issue_plan") {
+                writes.push(crate::runtime::WorkflowDataWrite::set(
+                    "issue_plan",
+                    plan.clone(),
+                    crate::runtime::DataProvenance::Agent,
+                ));
+            }
+        }
+        if let Some(result) = event.event.get("activity_result") {
+            if result.get("activity").and_then(Value::as_str) == Some("address_pr_feedback") {
+                writes.push(crate::runtime::WorkflowDataWrite::set(
+                    "previous_repair",
+                    serde_json::json!({"event_id":event.id,"result":result}),
+                    crate::runtime::DataProvenance::Agent,
+                ));
+            }
+        }
+        instance.apply_data_writes(writes)?;
+    }
+    apply_pr_feedback_completion_data_side_effect(instance, decision, event)
+}
+
+fn validate_definition_pin_safety_transition(
+    instance: &WorkflowInstance,
+    decision: &WorkflowDecision,
+    context: &ValidationContext,
+) -> Result<(), WorkflowDecisionRejection> {
+    if !context.allow_definition_pin_safety_decision {
+        return Err(WorkflowDecisionRejection::new(
+            WorkflowDecisionRejectionKind::TransitionNotAllowed,
+            "definition-pin safety transition requires explicit validation context",
+        ));
+    }
+    if context.actor.trim().is_empty()
         || decision.workflow_id != instance.id
         || decision.observed_state != instance.state
         || decision.next_state != "blocked"
         || decision.decision != "definition_version_missing"
         || decision.commands.len() != 2
     {
-        return false;
+        return Err(WorkflowDecisionRejection::new(
+            WorkflowDecisionRejectionKind::TransitionNotAllowed,
+            "definition-pin safety transition does not match the pinned-definition blocked policy",
+        ));
     }
     let expected = [
         crate::runtime::model::WorkflowCommandType::MarkBlocked,
         crate::runtime::model::WorkflowCommandType::RequestOperatorAttention,
     ];
-    decision
+    if !decision
         .commands
         .iter()
         .zip(expected)
@@ -375,6 +527,23 @@ fn is_definition_pin_safety_decision(
                 && !command.dedupe_key.trim().is_empty()
                 && command.command.is_object()
         })
+    {
+        return Err(WorkflowDecisionRejection::new(
+            WorkflowDecisionRejectionKind::CommandNotAllowed,
+            "definition-pin safety transition has invalid commands",
+        ));
+    }
+    if !decision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.kind == "definition_pin_error")
+    {
+        return Err(WorkflowDecisionRejection::new(
+            WorkflowDecisionRejectionKind::MissingRequiredEvidence,
+            "definition-pin safety transition requires definition_pin_error evidence",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,14 +561,17 @@ async fn apply_prompt_continuation_side_effect(
     instance: &mut WorkflowInstance,
     decision: &WorkflowDecision,
 ) -> anyhow::Result<PromptContinuationSideEffect> {
+    let missing_completion_evidence_for_continuation = decision.decision
+        == "prompt_completion_evidence_missing"
+        && instance.data.get("continuation").is_some();
     if instance.definition_id != PROMPT_TASK_DEFINITION_ID
-        || !matches!(
+        || (!matches!(
             decision.decision.as_str(),
             "continue_prompt_task"
                 | "finish_prompt_task_external_settled"
                 | "prompt_continuation_exhausted"
                 | "prompt_continuation_no_progress"
-        )
+        ) && !missing_completion_evidence_for_continuation)
     {
         return Ok(PromptContinuationSideEffect::Applied);
     }
@@ -457,15 +629,19 @@ async fn apply_prompt_continuation_side_effect(
             continuation.attempt
         );
     }
-    let data = instance
-        .data
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("prompt task instance data must be a JSON object"))?;
-    data.insert(
-        "continuation".to_string(),
-        serde_json::to_value(continuation)?,
-    );
+    persist_prompt_continuation(instance, continuation)?;
     Ok(PromptContinuationSideEffect::Applied)
+}
+
+fn persist_prompt_continuation(
+    instance: &mut WorkflowInstance,
+    continuation: PromptContinuationState,
+) -> anyhow::Result<()> {
+    instance.set_data_field(
+        "continuation",
+        serde_json::to_value(continuation)?,
+        crate::runtime::DataProvenance::Agent,
+    )
 }
 
 async fn require_durable_continuation_replay(

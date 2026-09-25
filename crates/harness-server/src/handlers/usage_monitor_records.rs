@@ -108,7 +108,7 @@ pub(super) fn usage_record_from_runtime_usage(
     price_catalog: &PriceCatalog,
     candidate_attributions: &usage_monitor_candidate::CandidateAttributionIndex,
 ) -> anyhow::Result<UsageRecord> {
-    if record.metrics.total_tokens() == 0 {
+    if record.metrics.is_zero_token_usage() {
         anyhow::bail!("runtime usage row {} has zero tokens", record.id);
     }
     let payload = json!({

@@ -13,6 +13,7 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
         return;
     }
 
+    let handle = state.background_loops.register_loop("workflow_watchdog");
     let weak_state = Arc::downgrade(state);
     tokio::spawn(async move {
         // workflow_id -> last observed stopped state; alerts fire on the
@@ -25,21 +26,26 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
             let Some(state) = weak_state.upgrade() else {
                 break;
             };
-            let workflow_cfg = match harness_core::config::workflow::load_workflow_config(
-                &state.core.project_root,
-            ) {
-                Ok(config) => config,
-                Err(error) => {
-                    tracing::warn!("workflow watchdog config load failed: {error}");
-                    drop(state);
-                    tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RETRY_SECS)).await;
-                    continue;
-                }
-            };
+            let workflow_cfg =
+                match crate::http::background::load_workflow_config_for_loop(&state, &handle).await
+                {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::error!(
+                            loop_name = handle.name(),
+                            "workflow watchdog config load failed: {error}"
+                        );
+                        drop(state);
+                        tokio::time::sleep(std::time::Duration::from_secs(CONFIG_RETRY_SECS)).await;
+                        continue;
+                    }
+                };
             let interval = std::time::Duration::from_secs(
                 workflow_cfg.storage.workflow_watchdog_interval_secs.max(1),
             );
+            handle.set_interval(interval.as_secs());
             if workflow_cfg.storage.workflow_watchdog_enabled {
+                let mut tick_error: Option<String> = None;
                 if let Some(store) = state.core.workflow_runtime_store.as_ref() {
                     let cutoff = Utc::now()
                         - chrono::Duration::minutes(
@@ -76,7 +82,12 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
                                 );
                             }
                         }
-                        Err(error) => tracing::warn!("workflow watchdog tick failed: {error}"),
+                        Err(error) => {
+                            if tick_error.is_none() {
+                                tick_error = Some(error.to_string());
+                            }
+                            tracing::warn!("workflow watchdog tick failed: {error}")
+                        }
                     }
 
                     match store
@@ -99,6 +110,9 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
                             }
                         }
                         Err(error) => {
+                            if tick_error.is_none() {
+                                tick_error = Some(error.to_string());
+                            }
                             tracing::error!(
                                 "workflow watchdog driverless-progress scan failed: {error}"
                             );
@@ -171,13 +185,21 @@ pub(super) fn spawn_workflow_watchdog(state: &Arc<AppState>) {
                                 }
                             }
                             Err(error) => {
+                                if tick_error.is_none() {
+                                    tick_error = Some(error.to_string());
+                                }
                                 tracing::warn!("workflow alert scan failed: {error}")
                             }
                         }
                     }
                 }
+                match tick_error {
+                    Some(error) => handle.tick_failed(&error),
+                    None => handle.tick_ok(),
+                }
             } else {
                 tracing::debug!("workflow watchdog disabled by config; re-checking next interval");
+                handle.tick_ok();
             }
 
             drop(state);

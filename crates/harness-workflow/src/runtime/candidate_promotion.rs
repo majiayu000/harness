@@ -209,6 +209,7 @@ pub fn deferred_candidate_result_decision(
 }
 
 pub fn candidate_promotion_success_decision(
+    registry: &crate::runtime::WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -226,11 +227,12 @@ pub fn candidate_promotion_success_decision(
         return None;
     }
     Some(candidate_promotion_success_decision_inner(
-        instance, event, result, command,
+        registry, instance, event, result, command,
     ))
 }
 
 fn candidate_promotion_success_decision_inner(
+    registry: &crate::runtime::WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     event: &WorkflowEvent,
     result: &ActivityResult,
@@ -238,6 +240,25 @@ fn candidate_promotion_success_decision_inner(
 ) -> anyhow::Result<WorkflowDecision> {
     let (pr_number, pr_url) = pull_request_artifact(result)
         .ok_or_else(|| anyhow::anyhow!("promote_candidate_pr succeeded without pull_request"))?;
+    let binding = match super::reducer::verified_pr_binding_evidence_with_registry(
+        registry,
+        result,
+        pr_number,
+        &pr_url,
+        Some((
+            super::reducer::GITHUB_ISSUE_PR_DEFINITION_ID,
+            "implementing",
+            "pr_open",
+        )),
+    ) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            return Ok(super::reducer::pr_binding_verification_blocked_decision(
+                instance, event, result, &reason,
+            ));
+        }
+    };
+    let pr_url = binding.canonical_pr_url;
     let context = promotion_command_context(command)?;
     let plan = candidate_promotion_plan(&context.selection, context.failed_promotions)?;
     if plan.selected.candidate_id != context.candidate_id {
@@ -265,6 +286,7 @@ fn candidate_promotion_success_decision_inner(
         format!("candidate-promotion:{}:bind-pr:{pr_number}", event.id),
     ))
     .with_evidence(WorkflowEvidence::new("pull_request", pr_url))
+    .with_evidence(binding.evidence)
     .with_evidence(WorkflowEvidence::new(
         "candidate",
         format!("candidate_id={}", plan.selected.candidate_id),
@@ -694,9 +716,21 @@ mod tests {
                     "pr_number": 1526,
                     "pr_url": "https://github.com/owner/repo/pull/1526",
                 }),
+            ))
+            // GH-1766: the server verifies the claimed PR before the reducer
+            // may mint BindPr.
+            .with_artifact(ActivityArtifact::new(
+                crate::runtime::completion_evidence::ARTIFACT_VERIFIED_PR_BINDING,
+                json!({
+                    "pr_number": 1526,
+                    "repo": "owner/repo",
+                    "head_oid": "abc123",
+                    "snapshot_source": "server_github_graphql",
+                }),
             ));
 
         let decision = candidate_promotion_success_decision_inner(
+            &crate::runtime::WorkflowDefinitionRegistry::with_builtins(),
             &issue_instance(),
             &event(command.clone()),
             &result,
@@ -704,6 +738,8 @@ mod tests {
         )?;
 
         assert_eq!(decision.next_state, "pr_open");
+        assert!(decision.evidence.iter().any(|evidence| evidence.kind
+            == crate::runtime::completion_evidence::EVIDENCE_VERIFIED_PR_BINDING));
         assert_eq!(
             decision
                 .commands

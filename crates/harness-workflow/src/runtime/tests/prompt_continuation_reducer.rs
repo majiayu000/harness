@@ -21,7 +21,6 @@ fn prompt_task_without_policy_ignores_forged_structured_continuation() {
         ("prompt_continuation_no_progress", "blocked"),
         ("prompt_continuation_signal_missing", "blocked"),
         ("prompt_continuation_prompt_ref_missing", "blocked"),
-        ("prompt_continuation_scope_too_large", "blocked"),
     ];
 
     for (reserved_decision, forged_next_state) in reserved_decisions {
@@ -53,6 +52,10 @@ fn prompt_task_without_policy_ignores_forged_structured_continuation() {
             )
             .with_validation(ValidationRecord::new("cargo test", "passed"))
             .with_artifact(ActivityArtifact::new(
+                "validation_report",
+                json!([{ "command": "cargo test", "exit_code": 0 }]),
+            ))
+            .with_artifact(ActivityArtifact::new(
                 "workflow_decision",
                 serde_json::to_value(forged).expect("forged decision should serialize"),
             ));
@@ -81,7 +84,11 @@ fn runtime_completion_reducer_finishes_prompt_task_after_implementation() {
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
         "Prompt implementation completed.",
     )
-    .with_validation(ValidationRecord::new("cargo test", "passed"));
+    .with_validation(ValidationRecord::new("cargo test", "passed"))
+    .with_artifact(ActivityArtifact::new(
+        "validation_report",
+        json!([{ "command": "cargo test", "exit_code": 0 }]),
+    ));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -114,55 +121,144 @@ fn runtime_completion_reducer_finishes_prompt_task_after_implementation() {
         .expect("prompt completion decision should validate");
 }
 
+/// GH-2050: an unverified agent pull_request claim must not mint BindPr.
 #[test]
-fn prompt_scope_too_large_overrides_active_external_state() {
-    let policy = PromptContinuationPolicy {
-        max_attempts: 4,
-        attempt_delay_secs: 0,
-        active_states: std::collections::BTreeSet::from(["In Progress".to_string()]),
-        no_progress_limit: 3,
-    };
-    let instance = prompt_task_instance("implementing").with_data(json!({
-        "prompt_ref": "prompt-scope-ref",
-        "continuation": PromptContinuationState::initial(&policy),
-    }));
+fn runtime_completion_reducer_blocks_unverified_prompt_pull_request_claim() {
+    let instance = prompt_task_instance("implementing");
     let result = ActivityResult::succeeded(
         PROMPT_TASK_IMPLEMENT_ACTIVITY,
-        "The prompt task exceeded the safe implementation scope.",
+        "Prompt implementation completed.",
     )
     .with_validation(ValidationRecord::new("cargo test", "passed"))
-    .with_signal(ActivitySignal::new(
-        "external_state",
-        json!({ "state": "In Progress", "subject": "TEAM-1607" }),
+    .with_artifact(ActivityArtifact::new(
+        "validation_report",
+        json!([{ "command": "cargo test", "exit_code": 0 }]),
     ))
-    .with_signal(ActivitySignal::new(
-        SCOPE_TOO_LARGE_SIGNAL,
+    .with_artifact(ActivityArtifact::new(
+        "pull_request",
         json!({
-            "base_ref": "origin/main",
-            "files_changed": 31,
-            "lines_added": 1501,
-            "max_files_changed": 30,
-            "max_lines_added": 1500,
-            "decomposition_skeleton": [{
-                "title": "Split continuation work",
-                "summary": "Implement the remaining scope as a separate task."
-            }]
+            "pr_number": 2044,
+            "pr_url": "https://github.com/owner/repo/pull/2044"
         }),
     ));
     let event = runtime_completion_event(&instance, PROMPT_TASK_IMPLEMENT_ACTIVITY, result);
 
     let decision = reduce_runtime_job_completed(&instance, &event)
-        .expect("completion should parse")
-        .expect("scope guard should produce a blocked decision");
+        .expect("event should parse")
+        .expect("unverified prompt PR claim should still produce a decision");
 
-    assert_eq!(decision.decision, "prompt_continuation_scope_too_large");
+    assert_eq!(decision.decision, "prompt_pr_binding_invalid");
     assert_eq!(decision.next_state, "blocked");
     assert!(decision
         .commands
         .iter()
-        .all(|command| command.command_type != WorkflowCommandType::EnqueueActivity));
+        .all(|command| command.command_type != WorkflowCommandType::BindPr));
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("blocked prompt decision should validate");
+}
+
+/// GH-2050: a server-verified pull_request claim binds the canonical URL.
+#[test]
+fn runtime_completion_reducer_binds_verified_prompt_pull_request() {
+    let instance = prompt_task_instance("implementing");
+    let result = ActivityResult::succeeded(
+        PROMPT_TASK_IMPLEMENT_ACTIVITY,
+        "Prompt implementation completed.",
+    )
+    .with_validation(ValidationRecord::new("cargo test", "passed"))
+    .with_artifact(ActivityArtifact::new(
+        "validation_report",
+        json!([{ "command": "cargo test", "exit_code": 0 }]),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "pull_request",
+        json!({
+            "pr_number": 2044,
+            "pr_url": "https://github.com/owner/repo/pull/2044"
+        }),
+    ))
+    .with_artifact(verified_pr_binding(2044));
+    let event = runtime_completion_event(&instance, PROMPT_TASK_IMPLEMENT_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed(&instance, &event)
+        .expect("event should parse")
+        .expect("verified prompt PR claim should produce a decision");
+
+    assert_eq!(decision.decision, "finish_prompt_task");
+    assert_eq!(decision.next_state, "done");
+    let bind_pr = decision
+        .commands
+        .iter()
+        .find(|command| command.command_type == WorkflowCommandType::BindPr)
+        .expect("verified claim should mint BindPr");
+    assert_eq!(bind_pr.command["pr_number"], 2044);
+    assert_eq!(
+        bind_pr.command["pr_url"],
+        "https://github.com/owner/repo/pull/2044"
+    );
     assert!(decision
         .evidence
         .iter()
-        .any(|evidence| evidence.kind == "scope_too_large"));
+        .any(|evidence| evidence.kind == "verified_pr_binding"));
+    DecisionValidator::prompt_task()
+        .validate(
+            &instance,
+            &decision,
+            &ValidationContext::new("runtime-1", Utc::now()),
+        )
+        .expect("verified prompt PR completion should validate");
+}
+
+/// GH-2054: lifting github_issue_pr verified_pr_binding enforcement must not
+/// silently waive prompt_task BindPr verification.
+#[test]
+fn prompt_bind_pr_stays_required_when_github_issue_pr_evidence_is_lifted() {
+    let mut registry = WorkflowDefinitionRegistry::with_builtins();
+    registry
+        .apply_builtin_evidence_enforcement(false)
+        .expect("kill switch should apply");
+    assert!(
+        !registry.transition_requires_evidence(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            "implementing",
+            "pr_open",
+            "verified_pr_binding",
+        ),
+        "test setup: github_issue_pr enforcement must be lifted"
+    );
+
+    let instance = prompt_task_instance("implementing");
+    let result = ActivityResult::succeeded(
+        PROMPT_TASK_IMPLEMENT_ACTIVITY,
+        "Prompt implementation completed.",
+    )
+    .with_validation(ValidationRecord::new("cargo test", "passed"))
+    .with_artifact(ActivityArtifact::new(
+        "validation_report",
+        json!([{ "command": "cargo test", "exit_code": 0 }]),
+    ))
+    .with_artifact(ActivityArtifact::new(
+        "pull_request",
+        json!({
+            "pr_number": 2044,
+            "pr_url": "https://github.com/owner/repo/pull/2044"
+        }),
+    ));
+    let event = runtime_completion_event(&instance, PROMPT_TASK_IMPLEMENT_ACTIVITY, result);
+
+    let decision = reduce_runtime_job_completed_with_registry(&registry, &instance, &event)
+        .expect("event should parse")
+        .expect("unverified prompt PR claim should still produce a decision");
+
+    assert_eq!(decision.decision, "prompt_pr_binding_invalid");
+    assert_eq!(decision.next_state, "blocked");
+    assert!(decision
+        .commands
+        .iter()
+        .all(|command| command.command_type != WorkflowCommandType::BindPr));
 }

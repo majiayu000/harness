@@ -58,6 +58,10 @@ pub enum DispatchBarrierReasonCode {
     RuntimePolicyDisabled,
     WorkflowConfigInvalid,
     IsolationTierUnavailable,
+    AgentContractEnforcementUnavailable,
+    WorkflowBudgetExhausted,
+    ProfileDailyCapReached,
+    ProfileDailyThrottled,
 }
 
 impl DispatchBarrierReasonCode {
@@ -66,6 +70,10 @@ impl DispatchBarrierReasonCode {
             Self::RuntimePolicyDisabled => "runtime_policy_disabled",
             Self::WorkflowConfigInvalid => "workflow_config_invalid",
             Self::IsolationTierUnavailable => "isolation_tier_unavailable",
+            Self::AgentContractEnforcementUnavailable => "agent_contract_enforcement_unavailable",
+            Self::WorkflowBudgetExhausted => "workflow_budget_exhausted",
+            Self::ProfileDailyCapReached => "profile_daily_cap_reached",
+            Self::ProfileDailyThrottled => "profile_daily_throttled",
         }
     }
 }
@@ -213,6 +221,7 @@ impl DispatchBarrier {
             }
             DispatchBarrierReasonCode::RuntimePolicyDisabled
             | DispatchBarrierReasonCode::WorkflowConfigInvalid
+            | DispatchBarrierReasonCode::WorkflowBudgetExhausted
                 if self.required_tier.is_some() || self.trust_class.is_some() =>
             {
                 anyhow::bail!("non-isolation barrier must not include isolation evidence")
@@ -232,7 +241,7 @@ impl super::store::WorkflowRuntimeStore {
         now: DateTime<Utc>,
         backoff: DispatchBackoffPolicy,
     ) -> anyhow::Result<DeferClaimedCommandOutcome> {
-        use super::{WorkflowCommandStatus, WorkflowInstance};
+        use super::WorkflowCommandStatus;
 
         let generation = i64::try_from(dispatch_claim_generation)
             .map_err(|_| anyhow::anyhow!("dispatch claim generation exceeds PostgreSQL BIGINT"))?;
@@ -252,7 +261,7 @@ impl super::store::WorkflowRuntimeStore {
                 .fetch_optional(&mut *tx)
                 .await?;
         let workflow = workflow_data
-            .map(|(data,)| serde_json::from_str::<WorkflowInstance>(&data))
+            .map(|(data,)| super::store::workflow_instance_from_persisted_json(&data))
             .transpose()?;
         let row: Option<ClaimedCommandRow> = sqlx::query_as(
             "SELECT workflow_id, status, dispatch_owner, dispatch_lease_expires_at,
@@ -318,12 +327,18 @@ impl super::store::WorkflowRuntimeStore {
             return Ok(DeferClaimedCommandOutcome::StaleClaim);
         }
 
-        if let Some(workflow) = workflow.as_ref().filter(|workflow| workflow.is_terminal()) {
-            let terminal_status = if workflow.state == "cancelled" {
-                WorkflowCommandStatus::Cancelled
-            } else {
-                WorkflowCommandStatus::Skipped
-            };
+        if let Some(terminal_state) = match workflow.as_ref() {
+            Some(workflow) => {
+                super::store::terminal_state_for_instance_tx(
+                    &mut tx,
+                    &self.definition_registry,
+                    workflow,
+                )
+                .await?
+            }
+            None => None,
+        } {
+            let terminal_status = super::store::terminal_command_status(terminal_state);
             sqlx::query(
                 "UPDATE workflow_commands
                  SET status = $2, dispatch_owner = NULL,
@@ -444,6 +459,35 @@ mod tests {
             Utc::now(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn budget_barrier_rejects_isolation_evidence() {
+        let result = DispatchBarrier::new(
+            DispatchBarrierReasonCode::WorkflowBudgetExhausted,
+            "spent 15.00 of 15.00 USD",
+            "/project",
+            "command",
+            "workflow",
+            Some("container".to_string()),
+            None,
+            "owner",
+            1,
+            1,
+            Utc::now(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn budget_barrier_reason_code_serializes_as_workflow_budget_exhausted() {
+        assert_eq!(
+            DispatchBarrierReasonCode::WorkflowBudgetExhausted.as_str(),
+            "workflow_budget_exhausted"
+        );
+        let json = serde_json::to_string(&DispatchBarrierReasonCode::WorkflowBudgetExhausted)
+            .expect("reason code serializes");
+        assert_eq!(json, "\"workflow_budget_exhausted\"");
     }
 
     #[test]

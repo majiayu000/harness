@@ -1,23 +1,50 @@
-use crate::codex::{parse_codex_error_item_message, parse_codex_item, parse_codex_token_usage};
 use crate::streaming::capture_agent_stderr_diagnostics;
 use async_trait::async_trait;
-use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
+use harness_core::agent::{
+    AgentAdapter, AgentDiagnosticSeverity, AgentEvent, AgentRequest, ApprovalDecision,
+};
 use harness_core::config::agents::{CodexAgentConfig, CodexCloudConfig, SandboxMode};
 use harness_sandbox::SandboxSpec;
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::ChildStdout;
-use tokio::sync::{mpsc, Mutex};
-
-type StdoutLines = Lines<BufReader<ChildStdout>>;
+use std::time::Duration;
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::time::Instant;
 const MAX_PROTOCOL_LINE_PREVIEW: usize = 240;
-
-fn prepare_app_server_spawn(
+mod attempt;
+mod bounded_frame;
+mod protocol;
+use self::attempt::{
+    absolute_init_deadline_error, cancelled_error, frame_write_deadline_error,
+    overlapping_start_error, stale_generation_error, stop_cleanup_deadline_error,
+    wait_until_cancelled, ActiveAttempt, AttemptDeadlines, TurnAttemptGuard,
+};
+use self::bounded_frame::{
+    map_frame_read_error, BoundedStdoutReader, DEFAULT_MAX_PROTOCOL_FRAME_BYTES,
+};
+type StdoutFrames = BoundedStdoutReader<ChildStdout>;
+/// Parse one Codex app-server JSON-RPC line.
+///
+/// ```
+/// use harness_agents::codex_adapter::parse_codex_message;
+///
+/// assert!(parse_codex_message(r#"{"method":"custom/unknown","params":{}}"#).is_some());
+/// ```
+pub use self::protocol::parse_codex_message;
+use self::protocol::{
+    approval_decision_result, notification_payload, protocol_line_preview, response_id_matches,
+    thread_id_from_result, thread_start_params, turn_start_params,
+};
+#[cfg(test)]
+use self::protocol::{sandbox_mode_value, sandbox_policy_value};
+async fn prepare_app_server_spawn(
     cli_path: &std::path::Path,
-    req: &TurnRequest,
+    cloud: &CodexCloudConfig,
+    req: &AgentRequest,
 ) -> harness_core::error::Result<crate::spawn_contract::PreparedAgentSpawn> {
     let args = [
         OsString::from("app-server"),
@@ -31,15 +58,23 @@ fn prepare_app_server_spawn(
     } else {
         SandboxSpec::new(sandbox_mode, &req.project_root)
     };
+    let mut spawn_env_vars = req.env_vars.clone();
+    let container_bind_mounts =
+        crate::cloud_setup::apply_container_state(cloud, &req.project_root, &mut spawn_env_vars)?;
     crate::spawn_contract::prepare_agent_spawn(crate::spawn_contract::AgentSpawnInput {
         program: cli_path,
         args: &args,
         project_root: &req.project_root,
         sandbox_spec: &sandbox_spec,
-        env_vars: &req.env_vars,
+        env_vars: &spawn_env_vars,
+        secret_env_keys: &[],
+        container_bind_mounts: &container_bind_mounts,
+        permission_mode: req.permission_mode,
+        // The app-server protocol is driven over the child's stdin.
+        forward_stdin: true,
     })
+    .await
 }
-
 pub struct CodexAdapter {
     cli_path: PathBuf,
     default_model: String,
@@ -47,17 +82,34 @@ pub struct CodexAdapter {
     cloud: CodexCloudConfig,
     sandbox_mode: SandboxMode,
     state: Arc<Mutex<AdapterState>>,
+    /// Wakes waiters when the current attempt's cancel flag is set. Signalling
+    /// does not require holding the lifecycle mutex across protocol I/O.
+    cancel_notify: Arc<Notify>,
+    deadlines: AttemptDeadlines,
+    /// Private per-frame stdout bound (#2095 §3.4). Injectable in tests only.
+    max_protocol_frame_bytes: usize,
 }
-
 struct AdapterState {
-    child: Option<tokio::process::Child>,
-    stdin: Option<tokio::process::ChildStdin>,
-    stdout_lines: Option<StdoutLines>,
+    child: Option<crate::ManagedChild>,
+    stdin: Option<ChildStdin>,
+    stdout_lines: Option<StdoutFrames>,
     next_id: u64,
     thread_id: Option<String>,
+    /// Remains mirrored from `active_attempt.remote_turn_id` for interrupt/steer.
     active_turn_id: Option<String>,
+    child_workspace: Option<PathBuf>,
+    spawn_policy_fingerprint: Option<crate::spawn_contract::AdapterSpawnPolicyFingerprint>,
+    egress_verified_at_dispatch: bool,
+    /// Last failed cleanup outcome. Retained so a later `terminate_and_drain`
+    /// cannot report success merely because `child` is now `None`, and so
+    /// `ensure_child` cannot spawn a replacement until cleanup is confirmed.
+    failed_cleanup: Option<String>,
+    next_generation: u64,
+    active_attempt: Option<ActiveAttempt>,
+    /// Set after a cancelled/timed-out write that may have sent partial bytes.
+    /// The session must be terminated; never append another JSON frame.
+    protocol_poisoned: bool,
 }
-
 impl AdapterState {
     fn new() -> Self {
         Self {
@@ -67,29 +119,170 @@ impl AdapterState {
             next_id: 1,
             thread_id: None,
             active_turn_id: None,
+            child_workspace: None,
+            spawn_policy_fingerprint: None,
+            egress_verified_at_dispatch: false,
+            failed_cleanup: None,
+            next_generation: 1,
+            active_attempt: None,
+            protocol_poisoned: false,
         }
     }
-
     fn next_request_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         id
     }
-
     fn child_ready(&self) -> bool {
-        self.child.is_some() && self.stdin.is_some() && self.stdout_lines.is_some()
+        self.failed_cleanup.is_none()
+            && !self.protocol_poisoned
+            && self.child.is_some()
+            && self.stdin.is_some()
+            && self.stdout_lines.is_some()
     }
-
-    async fn reset_child(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
+    /// Whether this adapter session may start or reuse a child process.
+    #[cfg(test)]
+    fn permits_child_reuse(&self) -> bool {
+        self.failed_cleanup.is_none() && !self.protocol_poisoned
+    }
+    fn clear_protocol_handles(&mut self) {
         self.stdin = None;
         self.stdout_lines = None;
         self.thread_id = None;
         self.active_turn_id = None;
+        self.child_workspace = None;
+        self.spawn_policy_fingerprint = None;
+        self.egress_verified_at_dispatch = false;
+        self.protocol_poisoned = false;
     }
+    fn begin_attempt(&mut self) -> harness_core::error::Result<u64> {
+        if self.active_attempt.is_some() {
+            return Err(overlapping_start_error());
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        self.active_attempt = Some(ActiveAttempt {
+            generation,
+            cancel_requested: false,
+            remote_turn_id: None,
+        });
+        self.active_turn_id = None;
+        Ok(generation)
+    }
+    fn clear_attempt_if_current(&mut self, generation: u64) {
+        if self
+            .active_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.generation == generation)
+        {
+            self.active_attempt = None;
+            self.active_turn_id = None;
+        }
+    }
+    fn generation_is_current(&self, generation: u64) -> bool {
+        self.active_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.generation == generation)
+    }
+    fn cancel_requested_for(&self, generation: u64) -> bool {
+        self.active_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.generation == generation && attempt.cancel_requested)
+    }
+    fn set_remote_turn_id(&mut self, generation: u64, turn_id: String) -> bool {
+        let Some(attempt) = self.active_attempt.as_mut() else {
+            return false;
+        };
+        if attempt.generation != generation {
+            return false;
+        }
+        attempt.remote_turn_id = Some(turn_id.clone());
+        self.active_turn_id = Some(turn_id);
+        true
+    }
+    /// Terminate the managed child and confirm descendant cleanup.
+    ///
+    /// `Ok(())` means required process/descendant cleanup succeeded. Protocol
+    /// handles are always cleared because they are unusable after terminate.
+    /// On cleanup failure the `ManagedChild` owner is retained and the failure
+    /// outcome is remembered so retries cannot become false successes.
+    async fn reset_child(&mut self) -> harness_core::error::Result<()> {
+        self.reset_child_with_deadline(DEFAULT_STOP_CLEANUP_FROM_STATE)
+            .await
+    }
+
+    async fn reset_child_with_deadline(
+        &mut self,
+        stop_cleanup: Duration,
+    ) -> harness_core::error::Result<()> {
+        self.clear_protocol_handles();
+
+        let Some(mut child) = self.child.take() else {
+            if let Some(message) = self.failed_cleanup.clone() {
+                return Err(harness_core::error::HarnessError::AgentExecution(message));
+            }
+            return Ok(());
+        };
+
+        child.terminate_now();
+        match tokio::time::timeout(stop_cleanup, child.wait_and_cleanup_descendants()).await {
+            Ok(Ok(_)) => {
+                self.failed_cleanup = None;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                let message = format!("failed to clean up codex app-server child: {error}");
+                tracing::warn!("{message}");
+                self.failed_cleanup = Some(message.clone());
+                self.child = Some(child);
+                Err(harness_core::error::HarnessError::AgentExecution(message))
+            }
+            Err(_) => {
+                let message = stop_cleanup_deadline_error(stop_cleanup).to_string();
+                tracing::warn!("{message}");
+                self.failed_cleanup = Some(message.clone());
+                self.child = Some(child);
+                Err(harness_core::error::HarnessError::AgentExecution(message))
+            }
+        }
+    }
+}
+
+/// Fallback when `reset_child` is called without adapter deadlines (tests / Drop).
+const DEFAULT_STOP_CLEANUP_FROM_STATE: Duration = attempt::DEFAULT_STOP_CLEANUP_DEADLINE;
+
+fn attach_cleanup_failure(
+    primary: harness_core::error::HarnessError,
+    cleanup: harness_core::error::HarnessError,
+) -> harness_core::error::HarnessError {
+    harness_core::error::HarnessError::AgentExecution(format!(
+        "{primary}; cleanup failed: {cleanup}"
+    ))
+}
+
+async fn reset_after_error(
+    state: &mut AdapterState,
+    primary: harness_core::error::HarnessError,
+    stop_cleanup: Duration,
+) -> harness_core::error::HarnessError {
+    match state.reset_child_with_deadline(stop_cleanup).await {
+        Ok(()) => primary,
+        Err(cleanup) => attach_cleanup_failure(primary, cleanup),
+    }
+}
+
+fn cloud_setup_env_removals(cloud: &CodexCloudConfig) -> Vec<String> {
+    if cloud.enabled {
+        cloud.setup_secret_env.clone()
+    } else {
+        Vec::new()
+    }
+}
+
+fn app_server_stall_timeout(req: &AgentRequest) -> Option<Duration> {
+    req.timeout_secs
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +292,15 @@ pub enum ParsedCodexMessage {
     TurnStarted { turn_id: String },
     Response { id: Value, result: Value },
     Ignore,
+}
+
+fn log_codex_diagnostic(severity: AgentDiagnosticSeverity, message: &str) {
+    match severity {
+        AgentDiagnosticSeverity::Warning => tracing::warn!(agent = "codex", "{message}"),
+        AgentDiagnosticSeverity::Error => {
+            tracing::error!(agent = "codex", "non-terminal Codex diagnostic: {message}")
+        }
+    }
 }
 
 impl CodexAdapter {
@@ -118,10 +320,31 @@ impl CodexAdapter {
             cloud: config.cloud,
             sandbox_mode,
             state: Arc::new(Mutex::new(AdapterState::new())),
+            cancel_notify: Arc::new(Notify::new()),
+            deadlines: AttemptDeadlines::default(),
+            max_protocol_frame_bytes: DEFAULT_MAX_PROTOCOL_FRAME_BYTES,
         }
     }
 
-    fn effective_turn_request(&self, mut req: TurnRequest) -> TurnRequest {
+    /// Test-only private deadline injection (#2095 §3.3).
+    #[cfg(test)]
+    fn with_deadlines(mut self, deadlines: AttemptDeadlines) -> Self {
+        self.deadlines = deadlines;
+        self
+    }
+
+    /// Test-only private frame-size injection (#2095 §3.4).
+    #[cfg(test)]
+    fn with_max_protocol_frame_bytes(mut self, max_protocol_frame_bytes: usize) -> Self {
+        self.max_protocol_frame_bytes = max_protocol_frame_bytes;
+        self
+    }
+
+    fn wrap_stdout(&self, stdout: ChildStdout) -> StdoutFrames {
+        BoundedStdoutReader::new(BufReader::new(stdout), self.max_protocol_frame_bytes)
+    }
+
+    fn effective_turn_request(&self, mut req: AgentRequest) -> AgentRequest {
         if req.model.is_none() {
             req.model = Some(self.default_model.clone());
         }
@@ -141,13 +364,38 @@ impl CodexAdapter {
         req
     }
 
-    async fn send_json_line(
-        state: &mut AdapterState,
+    async fn ensure_attempt_not_cancelled(
+        &self,
+        generation: u64,
+    ) -> harness_core::error::Result<()> {
+        let state = self.state.lock().await;
+        if !state.generation_is_current(generation) {
+            return Err(stale_generation_error());
+        }
+        if state.cancel_requested_for(generation) {
+            return Err(cancelled_error());
+        }
+        Ok(())
+    }
+
+    async fn poison_and_reset(
+        &self,
+        generation: u64,
+        primary: harness_core::error::HarnessError,
+    ) -> harness_core::error::HarnessError {
+        let mut state = self.state.lock().await;
+        if state.generation_is_current(generation) {
+            state.protocol_poisoned = true;
+        }
+        reset_after_error(&mut state, primary, self.deadlines.stop_cleanup).await
+    }
+
+    async fn send_json_line_for_attempt(
+        &self,
+        generation: u64,
         payload: &Value,
     ) -> harness_core::error::Result<()> {
-        let stdin = state.stdin.as_mut().ok_or_else(|| {
-            harness_core::error::HarnessError::AgentExecution("codex stdin not available".into())
-        })?;
+        self.ensure_attempt_not_cancelled(generation).await?;
 
         let mut line = serde_json::to_string(payload).map_err(|error| {
             harness_core::error::HarnessError::AgentExecution(format!(
@@ -155,7 +403,128 @@ impl CodexAdapter {
             ))
         })?;
         line.push('\n');
+        let bytes = line.into_bytes();
 
+        let mut stdin = {
+            let mut state = self.state.lock().await;
+            if !state.generation_is_current(generation) {
+                return Err(stale_generation_error());
+            }
+            if state.protocol_poisoned {
+                return Err(harness_core::error::HarnessError::AgentExecution(
+                    "codex protocol session is poisoned after a partial write".into(),
+                ));
+            }
+            if state.cancel_requested_for(generation) {
+                return Err(cancelled_error());
+            }
+            state.stdin.take().ok_or_else(|| {
+                harness_core::error::HarnessError::AgentExecution(
+                    "codex stdin not available".into(),
+                )
+            })?
+        };
+
+        // Lifecycle lock is released during write so interrupt can publish cancel.
+        let write = async {
+            stdin.write_all(&bytes).await.map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "failed to write to codex: {error}"
+                ))
+            })?;
+            stdin.flush().await.map_err(|error| {
+                harness_core::error::HarnessError::AgentExecution(format!(
+                    "failed to flush codex stdin: {error}"
+                ))
+            })?;
+            Ok::<(), harness_core::error::HarnessError>(())
+        };
+
+        let write_deadline = self.deadlines.frame_write;
+        let outcome = tokio::select! {
+            biased;
+            _ = wait_until_cancelled(&self.state, &self.cancel_notify, generation) => {
+                Err(cancelled_error())
+            }
+            result = tokio::time::timeout(write_deadline, write) => {
+                match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(frame_write_deadline_error(write_deadline)),
+                }
+            }
+        };
+
+        match outcome {
+            Ok(()) => {
+                let mut state = self.state.lock().await;
+                if !state.generation_is_current(generation) {
+                    drop(stdin);
+                    return Err(stale_generation_error());
+                }
+                state.stdin = Some(stdin);
+                Ok(())
+            }
+            Err(error) => {
+                drop(stdin);
+                Err(self.poison_and_reset(generation, error).await)
+            }
+        }
+    }
+
+    async fn send_request_for_attempt(
+        &self,
+        generation: u64,
+        method: &str,
+        params: Value,
+    ) -> harness_core::error::Result<u64> {
+        let id = {
+            let mut state = self.state.lock().await;
+            if !state.generation_is_current(generation) {
+                return Err(stale_generation_error());
+            }
+            state.next_request_id()
+        };
+        let payload = json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.send_json_line_for_attempt(generation, &payload)
+            .await?;
+        Ok(id)
+    }
+
+    async fn send_notification_for_attempt(
+        &self,
+        generation: u64,
+        method: &str,
+        params: Value,
+    ) -> harness_core::error::Result<()> {
+        self.send_json_line_for_attempt(generation, &notification_payload(method, params))
+            .await
+    }
+
+    async fn send_response_unlocked(
+        state: &mut AdapterState,
+        id: Value,
+        result: Value,
+    ) -> harness_core::error::Result<()> {
+        // Approval responses are rare control replies; keep single-writer ordering
+        // by writing while the caller holds the lifecycle lock briefly.
+        let payload = json!({
+            "id": id,
+            "result": result,
+        });
+        let stdin = state.stdin.as_mut().ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution("codex stdin not available".into())
+        })?;
+        let mut line = serde_json::to_string(&payload).map_err(|error| {
+            harness_core::error::HarnessError::AgentExecution(format!(
+                "failed to serialize codex payload: {error}"
+            ))
+        })?;
+        line.push('\n');
         stdin.write_all(line.as_bytes()).await.map_err(|error| {
             harness_core::error::HarnessError::AgentExecution(format!(
                 "failed to write to codex: {error}"
@@ -168,54 +537,24 @@ impl CodexAdapter {
         })
     }
 
-    async fn send_request(
-        state: &mut AdapterState,
-        method: &str,
-        params: Value,
-    ) -> harness_core::error::Result<u64> {
-        let id = state.next_request_id();
-        let payload = json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        Self::send_json_line(state, &payload).await?;
-        Ok(id)
-    }
-
-    async fn send_notification(
-        state: &mut AdapterState,
-        method: &str,
-        params: Value,
-    ) -> harness_core::error::Result<()> {
-        Self::send_json_line(state, &notification_payload(method, params)).await
-    }
-
-    async fn send_response(
-        state: &mut AdapterState,
-        id: Value,
-        result: Value,
-    ) -> harness_core::error::Result<()> {
-        let payload = json!({
-            "id": id,
-            "result": result,
-        });
-        Self::send_json_line(state, &payload).await
-    }
-
     async fn read_next_message(
-        lines: &mut StdoutLines,
+        lines: &mut StdoutFrames,
     ) -> harness_core::error::Result<Option<ParsedCodexMessage>> {
-        let Some(line) = lines.next_line().await.map_err(|error| {
-            harness_core::error::HarnessError::AgentExecution(format!(
-                "failed reading codex app-server stdout: {error}"
-            ))
-        })?
+        let max_frame_bytes = lines.max_frame_bytes();
+        let Some(line) = lines
+            .next_frame()
+            .await
+            .map_err(|error| map_frame_read_error(error, max_frame_bytes))?
         else {
             return Ok(None);
         };
         if line.trim().is_empty() {
             return Ok(Some(ParsedCodexMessage::Ignore));
+        }
+        if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
+            return Ok(Some(ParsedCodexMessage::Event(
+                AgentEvent::EgressVerifiedAtDispatch,
+            )));
         }
         parse_codex_message(&line).map(Some).ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(format!(
@@ -225,155 +564,417 @@ impl CodexAdapter {
         })
     }
 
-    async fn ensure_child(
-        &self,
-        req: &TurnRequest,
-        state: &mut AdapterState,
-    ) -> harness_core::error::Result<()> {
-        if state.child_ready() {
-            return Ok(());
+    async fn read_next_message_with_timeout(
+        lines: &mut StdoutFrames,
+        stall_timeout: Option<Duration>,
+        phase: &str,
+    ) -> harness_core::error::Result<Option<ParsedCodexMessage>> {
+        let read = Self::read_next_message(lines);
+        let Some(stall_timeout) = stall_timeout else {
+            return read.await;
+        };
+        match tokio::time::timeout(stall_timeout, read).await {
+            Ok(result) => result,
+            Err(_) => Err(harness_core::error::HarnessError::AgentExecution(format!(
+                "codex app-server {phase} stalled for {stall_timeout:?} without stdout"
+            ))),
         }
-        if state.child.is_some() {
-            tracing::warn!(
-                "codex app-server state is incomplete; restarting before starting a new turn"
-            );
-            state.reset_child().await;
-        }
+    }
 
-        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
-        let prepared_spawn = prepare_app_server_spawn(&self.cli_path, req)?;
-        let mut cmd = tokio::process::Command::new(&prepared_spawn.program);
-        cmd.args(&prepared_spawn.args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .current_dir(&prepared_spawn.current_dir)
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        crate::set_process_group(&mut cmd);
-        crate::spawn_contract::apply_process_env(&mut cmd, &prepared_spawn);
-        crate::apply_agent_run_identity_env(&mut cmd, &run_identity);
-        if self.cloud.enabled {
-            for key in &self.cloud.setup_secret_env {
-                cmd.env_remove(key);
+    async fn read_next_message_cancellable(
+        &self,
+        lines: &mut StdoutFrames,
+        generation: u64,
+        stall_timeout: Option<Duration>,
+        absolute_deadline: Option<Instant>,
+        phase: &str,
+    ) -> harness_core::error::Result<Option<ParsedCodexMessage>> {
+        self.ensure_attempt_not_cancelled(generation).await?;
+        if let Some(deadline) = absolute_deadline {
+            if Instant::now() >= deadline {
+                return Err(absolute_init_deadline_error(self.deadlines.absolute_init));
             }
         }
 
-        let mut child = cmd.spawn().map_err(|error| {
-            let message = crate::classify_missing_workspace_spawn_failure(
-                &error,
-                &req.project_root,
-                format!("failed to spawn codex app-server: {error}"),
-            );
-            harness_core::error::HarnessError::AgentExecution(message)
-        })?;
-        if let Some(pid) = child.id() {
-            crate::write_provisional_agent_run_binding(
-                &run_identity,
-                "codex",
-                pid,
-                &req.project_root,
-            );
+        let read = Self::read_next_message_with_timeout(lines, stall_timeout, phase);
+        let absolute_wait = async {
+            match absolute_deadline {
+                Some(deadline) => {
+                    tokio::time::sleep_until(deadline).await;
+                    Err(absolute_init_deadline_error(self.deadlines.absolute_init))
+                }
+                None => {
+                    std::future::pending::<harness_core::error::Result<Option<ParsedCodexMessage>>>(
+                    )
+                    .await
+                }
+            }
+        };
+
+        tokio::select! {
+            biased;
+            _ = wait_until_cancelled(&self.state, &self.cancel_notify, generation) => {
+                Err(cancelled_error())
+            }
+            result = absolute_wait => result,
+            result = read => result,
+        }
+    }
+
+    async fn send_event_cancellable(
+        &self,
+        tx: &mpsc::Sender<AgentEvent>,
+        generation: u64,
+        event: AgentEvent,
+    ) -> harness_core::error::Result<()> {
+        self.ensure_attempt_not_cancelled(generation).await?;
+        tokio::select! {
+            biased;
+            _ = wait_until_cancelled(&self.state, &self.cancel_notify, generation) => {
+                Err(cancelled_error())
+            }
+            result = tx.send(event) => {
+                result.map_err(|error| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "codex app-server event receiver closed: {error}"
+                    ))
+                })
+            }
+        }
+    }
+
+    async fn maybe_deliver_pending_interrupt(
+        &self,
+        generation: u64,
+    ) -> harness_core::error::Result<()> {
+        let (thread_id, turn_id) = {
+            let state = self.state.lock().await;
+            if !state.cancel_requested_for(generation) {
+                return Ok(());
+            }
+            let thread_id = state.thread_id.clone();
+            let turn_id = state
+                .active_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.remote_turn_id.clone());
+            match (thread_id, turn_id) {
+                (Some(thread_id), Some(turn_id)) => (thread_id, turn_id),
+                _ => return Ok(()),
+            }
+        };
+        let _ = self
+            .send_request_for_attempt(
+                generation,
+                "turn/interrupt",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+    async fn ensure_child(
+        &self,
+        req: &AgentRequest,
+        generation: u64,
+    ) -> harness_core::error::Result<()> {
+        self.ensure_attempt_not_cancelled(generation).await?;
+        let requested_fingerprint =
+            crate::spawn_contract::adapter_spawn_policy_fingerprint(req, self.sandbox_mode);
+
+        {
+            let mut state = self.state.lock().await;
+            if !state.generation_is_current(generation) {
+                return Err(stale_generation_error());
+            }
+            if state.child_ready()
+                && state.spawn_policy_fingerprint.as_ref() == Some(&requested_fingerprint)
+            {
+                if let Some(child) = state.child.as_ref() {
+                    match child.validate_egress_proxy().await {
+                        Ok(()) => return Ok(()),
+                        Err(error) => tracing::warn!(
+                            "codex app-server egress proxy is unavailable; restarting before starting a new turn: {error}"
+                        ),
+                    }
+                }
+            }
+            if state.child.is_some() || state.failed_cleanup.is_some() || state.protocol_poisoned {
+                tracing::warn!("codex app-server spawn policy changed, cleanup failed, poisoned, or state is incomplete; restarting before starting a new turn");
+                state
+                    .reset_child_with_deadline(self.deadlines.stop_cleanup)
+                    .await?;
+            }
         }
 
-        if let Some(stderr) = child.stderr.take() {
+        self.ensure_attempt_not_cancelled(generation).await?;
+        let run_identity = crate::resolve_agent_run_identity(&req.env_vars);
+        let prepared_spawn = {
+            let spawn = prepare_app_server_spawn(&self.cli_path, &self.cloud, req);
+            tokio::select! {
+                biased;
+                _ = wait_until_cancelled(&self.state, &self.cancel_notify, generation) => {
+                    return Err(cancelled_error());
+                }
+                result = spawn => result?,
+            }
+        };
+        let spawn_project_root = req.project_root.clone();
+        let supervised = {
+            let spawn = crate::spawn_supervisor::spawn_agent(
+                crate::spawn_supervisor::AgentSpawnPlan {
+                    prepared_spawn,
+                    run_identity,
+                    native_kind: "codex",
+                    process_label: "codex app-server",
+                    stdio: crate::spawn_supervisor::AgentStdio::piped_output(
+                        std::process::Stdio::piped(),
+                    ),
+                    extra_env_removals: cloud_setup_env_removals(&self.cloud),
+                    map_spawn_error: Box::new(move |error, _spawn| {
+                        let message = crate::classify_missing_workspace_spawn_failure(
+                            error,
+                            &spawn_project_root,
+                            format!("failed to spawn codex app-server: {error}"),
+                        );
+                        harness_core::error::HarnessError::AgentExecution(message)
+                    }),
+                },
+                req.capability_token.as_ref(),
+            );
+            tokio::select! {
+                biased;
+                _ = wait_until_cancelled(&self.state, &self.cancel_notify, generation) => {
+                    return Err(cancelled_error());
+                }
+                result = spawn => result?,
+            }
+        };
+        let child_workspace = supervised.prepared_spawn.child_workspace.clone();
+        let mut child = supervised.child;
+        let await_container_egress_canary = child.awaits_container_egress_canary();
+        let mut egress_verified_at_dispatch = child.egress_verified_before_spawn();
+
+        if let Some(stderr) = child.inner_mut().stderr.take() {
             tokio::spawn(async move {
                 capture_agent_stderr_diagnostics(stderr, "codex", None).await;
             });
         }
 
-        let stdout = child.stdout.take().ok_or_else(|| {
+        let stdout = child.inner_mut().stdout.take().ok_or_else(|| {
             harness_core::error::HarnessError::AgentExecution(
                 "codex app-server stdout unavailable".into(),
             )
         })?;
-        state.stdin = child.stdin.take();
-        state.stdout_lines = Some(BufReader::new(stdout).lines());
-        state.child = Some(child);
-
-        let init_id = Self::send_request(
-            state,
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "harness",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": {
-                    "experimentalApi": true,
-                }
-            }),
-        )
-        .await?;
-
-        let mut lines = state.stdout_lines.take().ok_or_else(|| {
-            harness_core::error::HarnessError::AgentExecution(
-                "codex stdout reader not available".into(),
-            )
-        })?;
-        loop {
-            match Self::read_next_message(&mut lines).await? {
-                Some(ParsedCodexMessage::Response { id, .. })
-                    if response_id_matches(&id, init_id) =>
-                {
-                    break;
-                }
-                Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
-                    tracing::warn!(agent = "codex", "{message}");
-                }
-                Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
-                    return Err(harness_core::error::HarnessError::AgentExecution(message));
-                }
-                Some(_) => {}
-                None => {
-                    return Err(harness_core::error::HarnessError::AgentExecution(
-                        "codex app-server exited during initialize".into(),
-                    ));
-                }
+        {
+            let mut state = self.state.lock().await;
+            if !state.generation_is_current(generation) {
+                drop(child);
+                drop(stdout);
+                return Err(stale_generation_error());
             }
+            state.stdin = child.inner_mut().stdin.take();
+            state.stdout_lines = Some(self.wrap_stdout(stdout));
+            state.child = Some(child);
+            state.child_workspace = Some(child_workspace.clone());
         }
 
-        Self::send_notification(state, "initialized", Value::Null).await?;
+        let stall_timeout = app_server_stall_timeout(req);
+        let absolute_deadline = Instant::now() + self.deadlines.absolute_init;
 
-        let thread_id_request =
-            Self::send_request(state, "thread/start", thread_start_params(req)).await?;
+        let init_id = match self
+            .send_request_for_attempt(
+                generation,
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "harness",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": {
+                        "experimentalApi": true,
+                    }
+                }),
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(error) => return Err(error),
+        };
 
-        loop {
-            match Self::read_next_message(&mut lines).await? {
-                Some(ParsedCodexMessage::ThreadStarted { thread_id }) => {
-                    state.thread_id = Some(thread_id);
-                    break;
-                }
-                Some(ParsedCodexMessage::Response { id, result })
-                    if response_id_matches(&id, thread_id_request) =>
+        let mut lines = {
+            let mut state = self.state.lock().await;
+            if !state.generation_is_current(generation) {
+                return Err(stale_generation_error());
+            }
+            state.stdout_lines.take().ok_or_else(|| {
+                harness_core::error::HarnessError::AgentExecution(
+                    "codex stdout reader not available".into(),
+                )
+            })?
+        };
+
+        let protocol_result = async {
+            loop {
+                match self
+                    .read_next_message_cancellable(
+                        &mut lines,
+                        generation,
+                        stall_timeout,
+                        Some(absolute_deadline),
+                        "initialize",
+                    )
+                    .await?
                 {
-                    if let Some(thread_id) = thread_id_from_result(&result) {
+                    Some(ParsedCodexMessage::Response { id, .. })
+                        if response_id_matches(&id, init_id) =>
+                    {
+                        break;
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
+                        tracing::warn!(agent = "codex", "{message}");
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Diagnostic {
+                        severity,
+                        message,
+                    })) => {
+                        log_codex_diagnostic(severity, &message);
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(message));
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::EgressVerifiedAtDispatch))
+                        if await_container_egress_canary =>
+                    {
+                        egress_verified_at_dispatch = true;
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            "codex app-server exited during initialize".into(),
+                        ));
+                    }
+                }
+            }
+
+            self.send_notification_for_attempt(generation, "initialized", Value::Null)
+                .await?;
+
+            let thread_id_request = self
+                .send_request_for_attempt(
+                    generation,
+                    "thread/start",
+                    thread_start_params(req, &child_workspace),
+                )
+                .await?;
+
+            loop {
+                match self
+                    .read_next_message_cancellable(
+                        &mut lines,
+                        generation,
+                        stall_timeout,
+                        Some(absolute_deadline),
+                        "thread/start",
+                    )
+                    .await?
+                {
+                    Some(ParsedCodexMessage::ThreadStarted { thread_id }) => {
+                        let mut state = self.state.lock().await;
+                        if !state.generation_is_current(generation) {
+                            return Err(stale_generation_error());
+                        }
                         state.thread_id = Some(thread_id);
                         break;
                     }
-                }
-                Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
-                    tracing::warn!(agent = "codex", "{message}");
-                }
-                Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
-                    return Err(harness_core::error::HarnessError::AgentExecution(message));
-                }
-                Some(_) => {}
-                None => {
-                    return Err(harness_core::error::HarnessError::AgentExecution(
-                        "codex app-server exited before thread/start completed".into(),
-                    ));
+                    Some(ParsedCodexMessage::Response { id, result })
+                        if response_id_matches(&id, thread_id_request) =>
+                    {
+                        if let Some(thread_id) = thread_id_from_result(&result) {
+                            let mut state = self.state.lock().await;
+                            if !state.generation_is_current(generation) {
+                                return Err(stale_generation_error());
+                            }
+                            state.thread_id = Some(thread_id);
+                            break;
+                        }
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
+                        tracing::warn!(agent = "codex", "{message}");
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Diagnostic {
+                        severity,
+                        message,
+                    })) => {
+                        log_codex_diagnostic(severity, &message);
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::Error { message })) => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(message));
+                    }
+                    Some(ParsedCodexMessage::Event(AgentEvent::EgressVerifiedAtDispatch))
+                        if await_container_egress_canary =>
+                    {
+                        egress_verified_at_dispatch = true;
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            "codex app-server exited before thread/start completed".into(),
+                        ));
+                    }
                 }
             }
+            if await_container_egress_canary && !egress_verified_at_dispatch {
+                return Err(harness_core::error::HarnessError::AgentExecution(
+                    "codex app-server started before the container egress canary reported success"
+                        .into(),
+                ));
+            }
+            Ok(())
         }
+        .await;
 
-        state.stdout_lines = Some(lines);
-
-        Ok(())
+        match protocol_result {
+            Ok(()) => {
+                let mut state = self.state.lock().await;
+                if !state.generation_is_current(generation) {
+                    drop(lines);
+                    return Err(stale_generation_error());
+                }
+                state.stdout_lines = Some(lines);
+                state.spawn_policy_fingerprint = Some(requested_fingerprint);
+                state.egress_verified_at_dispatch = egress_verified_at_dispatch;
+                Ok(())
+            }
+            Err(error) => {
+                drop(lines);
+                Err(self.poison_and_reset(generation, error).await)
+            }
+        }
     }
 
     async fn clear_active_turn_id(&self) {
-        self.state.lock().await.active_turn_id = None;
+        let mut state = self.state.lock().await;
+        state.active_turn_id = None;
+        if let Some(attempt) = state.active_attempt.as_mut() {
+            attempt.remote_turn_id = None;
+        }
+    }
+
+    async fn finish_attempt_success(
+        &self,
+        generation: u64,
+        lines: StdoutFrames,
+    ) -> harness_core::error::Result<()> {
+        let mut state = self.state.lock().await;
+        if !state.generation_is_current(generation) {
+            drop(lines);
+            return Err(stale_generation_error());
+        }
+        state.stdout_lines = Some(lines);
+        state.clear_attempt_if_current(generation);
+        Ok(())
     }
 }
 
@@ -385,70 +986,248 @@ impl AgentAdapter for CodexAdapter {
 
     async fn start_turn(
         &self,
-        req: TurnRequest,
+        req: AgentRequest,
         tx: mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         let req = self.effective_turn_request(req);
-        crate::cloud_setup::run_setup_phase(&self.cloud, &req.project_root).await?;
-        let mut state = self.state.lock().await;
-        self.ensure_child(&req, &mut state).await?;
+        crate::spawn_supervisor::validate_capability_token(req.capability_token.as_ref())?;
 
-        let thread_id = state.thread_id.clone().ok_or_else(|| {
-            harness_core::error::HarnessError::AgentExecution(
-                "codex thread/start did not yield a thread id".into(),
+        let generation = {
+            let mut state = self.state.lock().await;
+            state.begin_attempt()?
+        };
+        let attempt_guard =
+            TurnAttemptGuard::new(self.state.clone(), self.cancel_notify.clone(), generation);
+
+        let setup = crate::cloud_setup::run_setup_phase(
+            &self.cloud,
+            crate::cloud_setup::CloudSetupContext {
+                project_root: &req.project_root,
+                sandbox_mode: req.sandbox_mode.unwrap_or(self.sandbox_mode),
+                permission_mode: req.permission_mode,
+                env_vars: &req.env_vars,
+                capability_token: req.capability_token.as_ref(),
+            },
+        );
+        tokio::select! {
+            biased;
+            _ = wait_until_cancelled(&self.state, &self.cancel_notify, generation) => {
+                let error = self.poison_and_reset(generation, cancelled_error()).await;
+                self.state.lock().await.clear_attempt_if_current(generation);
+                attempt_guard.disarm();
+                return Err(error);
+            }
+            result = setup => {
+                if let Err(error) = result {
+                    self.state.lock().await.clear_attempt_if_current(generation);
+                    attempt_guard.disarm();
+                    return Err(error);
+                }
+            }
+        }
+
+        if let Err(error) = self.ensure_child(&req, generation).await {
+            self.state.lock().await.clear_attempt_if_current(generation);
+            attempt_guard.disarm();
+            return Err(error);
+        }
+
+        let (egress_verified, thread_id, child_workspace) = {
+            let state = self.state.lock().await;
+            if !state.generation_is_current(generation) {
+                attempt_guard.disarm();
+                return Err(stale_generation_error());
+            }
+            if state.cancel_requested_for(generation) {
+                let error = cancelled_error();
+                drop(state);
+                let error = self.poison_and_reset(generation, error).await;
+                self.state.lock().await.clear_attempt_if_current(generation);
+                attempt_guard.disarm();
+                return Err(error);
+            }
+            (
+                state.egress_verified_at_dispatch,
+                state.thread_id.clone(),
+                state.child_workspace.clone(),
             )
-        })?;
+        };
 
-        Self::send_request(
-            &mut state,
-            "turn/start",
-            turn_start_params(&req, &thread_id),
-        )
-        .await?;
+        if egress_verified {
+            if let Err(error) = self
+                .send_event_cancellable(&tx, generation, AgentEvent::EgressVerifiedAtDispatch)
+                .await
+            {
+                let error = self.poison_and_reset(generation, error).await;
+                self.state.lock().await.clear_attempt_if_current(generation);
+                attempt_guard.disarm();
+                return Err(error);
+            }
+        }
 
-        let mut lines = state.stdout_lines.take().ok_or_else(|| {
-            harness_core::error::HarnessError::AgentExecution(
-                "codex stdout reader not available".into(),
+        let thread_id = match thread_id {
+            Some(thread_id) => thread_id,
+            None => {
+                let error = self
+                    .poison_and_reset(
+                        generation,
+                        harness_core::error::HarnessError::AgentExecution(
+                            "codex thread/start did not yield a thread id".into(),
+                        ),
+                    )
+                    .await;
+                self.state.lock().await.clear_attempt_if_current(generation);
+                attempt_guard.disarm();
+                return Err(error);
+            }
+        };
+        let child_workspace = match child_workspace {
+            Some(child_workspace) => child_workspace,
+            None => {
+                let error = self
+                    .poison_and_reset(
+                        generation,
+                        harness_core::error::HarnessError::AgentExecution(
+                            "codex child workspace unavailable".into(),
+                        ),
+                    )
+                    .await;
+                self.state.lock().await.clear_attempt_if_current(generation);
+                attempt_guard.disarm();
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self
+            .send_request_for_attempt(
+                generation,
+                "turn/start",
+                turn_start_params(&req, &thread_id, &child_workspace),
             )
-        })?;
-        drop(state);
+            .await
+        {
+            self.state.lock().await.clear_attempt_if_current(generation);
+            attempt_guard.disarm();
+            return Err(error);
+        }
+
+        let mut lines = {
+            let mut state = self.state.lock().await;
+            if !state.generation_is_current(generation) {
+                attempt_guard.disarm();
+                return Err(stale_generation_error());
+            }
+            state.stdout_lines.take().ok_or_else(|| {
+                harness_core::error::HarnessError::AgentExecution(
+                    "codex stdout reader not available".into(),
+                )
+            })?
+        };
 
         let mut turn_completed = false;
         let mut receiver_closed = false;
         let mut stdout_closed = false;
-        while let Some(message) = Self::read_next_message(&mut lines).await? {
-            match message {
-                ParsedCodexMessage::TurnStarted { turn_id } => {
-                    let mut guard = self.state.lock().await;
-                    guard.active_turn_id = Some(turn_id);
-                    drop(guard);
-                    if tx.send(AgentEvent::TurnStarted).await.is_err() {
-                        receiver_closed = true;
-                        break;
+        let stall_timeout = app_server_stall_timeout(&req);
+        let read_result = async {
+            while let Some(message) = self
+                .read_next_message_cancellable(&mut lines, generation, stall_timeout, None, "turn")
+                .await?
+            {
+                match message {
+                    ParsedCodexMessage::TurnStarted { turn_id } => {
+                        {
+                            let mut guard = self.state.lock().await;
+                            if !guard.set_remote_turn_id(generation, turn_id) {
+                                return Err(stale_generation_error());
+                            }
+                        }
+                        self.maybe_deliver_pending_interrupt(generation).await?;
+                        if let Err(error) = self
+                            .send_event_cancellable(&tx, generation, AgentEvent::TurnStarted)
+                            .await
+                        {
+                            if matches!(
+                                &error,
+                                harness_core::error::HarnessError::AgentExecution(message)
+                                    if message.contains("event receiver closed")
+                            ) {
+                                receiver_closed = true;
+                                break;
+                            }
+                            return Err(error);
+                        }
                     }
-                }
-                ParsedCodexMessage::ThreadStarted { thread_id } => {
-                    self.state.lock().await.thread_id = Some(thread_id);
-                }
-                ParsedCodexMessage::Response { .. } | ParsedCodexMessage::Ignore => {}
-                ParsedCodexMessage::Event(event) => {
-                    let is_terminal = matches!(
-                        event,
-                        AgentEvent::TurnCompleted { .. } | AgentEvent::Error { .. }
-                    );
-                    if is_terminal {
-                        self.clear_active_turn_id().await;
+                    ParsedCodexMessage::ThreadStarted { thread_id } => {
+                        let mut guard = self.state.lock().await;
+                        if !guard.generation_is_current(generation) {
+                            return Err(stale_generation_error());
+                        }
+                        guard.thread_id = Some(thread_id);
                     }
-                    if tx.send(event).await.is_err() {
-                        receiver_closed = true;
-                        break;
-                    }
-                    if is_terminal {
-                        turn_completed = true;
-                        break;
+                    ParsedCodexMessage::Response { .. } | ParsedCodexMessage::Ignore => {}
+                    ParsedCodexMessage::Event(event) => {
+                        let is_terminal = matches!(
+                            event,
+                            AgentEvent::TurnCompleted { .. }
+                                | AgentEvent::TurnCancelled { .. }
+                                | AgentEvent::Error { .. }
+                        );
+                        if is_terminal {
+                            self.clear_active_turn_id().await;
+                        }
+                        if let Err(error) =
+                            self.send_event_cancellable(&tx, generation, event).await
+                        {
+                            if matches!(
+                                &error,
+                                harness_core::error::HarnessError::AgentExecution(message)
+                                    if message.contains("event receiver closed")
+                            ) {
+                                receiver_closed = true;
+                                break;
+                            }
+                            return Err(error);
+                        }
+                        if is_terminal {
+                            turn_completed = true;
+                            break;
+                        }
                     }
                 }
             }
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = read_result {
+            drop(lines);
+            let error = if matches!(
+                &error,
+                harness_core::error::HarnessError::AgentExecution(message)
+                    if message.contains("cancelled before completion")
+            ) {
+                // Cancelled attempts stop via supervisor when interrupt cannot finish
+                // within the stop budget; terminate retains cleanup ownership.
+                let stop = async {
+                    let mut state = self.state.lock().await;
+                    state
+                        .reset_child_with_deadline(self.deadlines.stop_cleanup)
+                        .await
+                };
+                match tokio::time::timeout(self.deadlines.stop_cleanup, stop).await {
+                    Ok(Ok(())) => error,
+                    Ok(Err(cleanup)) => attach_cleanup_failure(error, cleanup),
+                    Err(_) => attach_cleanup_failure(
+                        error,
+                        stop_cleanup_deadline_error(self.deadlines.stop_cleanup),
+                    ),
+                }
+            } else {
+                self.poison_and_reset(generation, error).await
+            };
+            self.state.lock().await.clear_attempt_if_current(generation);
+            attempt_guard.disarm();
+            return Err(error);
         }
         if !turn_completed && !receiver_closed {
             stdout_closed = true;
@@ -456,54 +1235,115 @@ impl AgentAdapter for CodexAdapter {
 
         if stdout_closed {
             drop(lines);
-            let mut state = self.state.lock().await;
-            state.reset_child().await;
-            return Err(harness_core::error::HarnessError::AgentExecution(
-                "codex app-server stdout closed before turn/completed".into(),
-            ));
+            let error = self
+                .poison_and_reset(
+                    generation,
+                    harness_core::error::HarnessError::AgentExecution(
+                        "codex app-server stdout closed before turn/completed".into(),
+                    ),
+                )
+                .await;
+            self.state.lock().await.clear_attempt_if_current(generation);
+            attempt_guard.disarm();
+            return Err(error);
         }
 
-        self.state.lock().await.stdout_lines = Some(lines);
         if receiver_closed {
-            return Err(harness_core::error::HarnessError::AgentExecution(
-                "codex event receiver closed before turn/completed".into(),
-            ));
+            drop(lines);
+            let error = self
+                .poison_and_reset(
+                    generation,
+                    harness_core::error::HarnessError::AgentExecution(
+                        "codex event receiver closed before turn/completed".into(),
+                    ),
+                )
+                .await;
+            self.state.lock().await.clear_attempt_if_current(generation);
+            attempt_guard.disarm();
+            return Err(error);
         }
-        Ok(())
+
+        let result = self.finish_attempt_success(generation, lines).await;
+        attempt_guard.disarm();
+        result
     }
 
     async fn interrupt(&self) -> harness_core::error::Result<()> {
-        let mut state = self.state.lock().await;
-        let Some(thread_id) = state.thread_id.clone() else {
-            return Ok(());
+        let (generation, thread_id, turn_id) = {
+            let mut state = self.state.lock().await;
+            let (generation, turn_id) = match state.active_attempt.as_mut() {
+                Some(attempt) => {
+                    attempt.cancel_requested = true;
+                    (attempt.generation, attempt.remote_turn_id.clone())
+                }
+                None => {
+                    // Idle interrupt must not poison a future attempt (#2095 invariant 7).
+                    return Ok(());
+                }
+            };
+            let thread_id = state.thread_id.clone();
+            self.cancel_notify.notify_waiters();
+            (generation, thread_id, turn_id)
         };
-        let Some(turn_id) = state.active_turn_id.clone() else {
-            return Ok(());
-        };
-        Self::send_request(
-            &mut state,
-            "turn/interrupt",
-            json!({
-                "threadId": thread_id,
-                "turnId": turn_id,
-            }),
-        )
-        .await?;
+
+        if let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) {
+            // Best-effort interrupt delivery without holding the lifecycle lock.
+            let _ = self
+                .send_request_for_attempt(
+                    generation,
+                    "turn/interrupt",
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                    }),
+                )
+                .await;
+        }
         Ok(())
     }
 
-    async fn steer(&self, text: String) -> harness_core::error::Result<()> {
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
-        let thread_id = state.thread_id.clone().ok_or_else(|| {
-            harness_core::error::HarnessError::AgentExecution("codex thread id unavailable".into())
-        })?;
-        let turn_id = state.active_turn_id.clone().ok_or_else(|| {
-            harness_core::error::HarnessError::AgentExecution(
-                "codex active turn unavailable".into(),
-            )
-        })?;
-        Self::send_request(
-            &mut state,
+        if let Some(attempt) = state.active_attempt.as_mut() {
+            attempt.cancel_requested = true;
+            self.cancel_notify.notify_waiters();
+        }
+        let result = state
+            .reset_child_with_deadline(self.deadlines.stop_cleanup)
+            .await;
+        state.active_attempt = None;
+        result
+    }
+
+    async fn steer(&self, text: String) -> harness_core::error::Result<()> {
+        let generation = {
+            let state = self.state.lock().await;
+            state
+                .active_attempt
+                .as_ref()
+                .map(|attempt| attempt.generation)
+                .ok_or_else(|| {
+                    harness_core::error::HarnessError::AgentExecution(
+                        "codex active turn unavailable".into(),
+                    )
+                })?
+        };
+        let (thread_id, turn_id) = {
+            let state = self.state.lock().await;
+            let thread_id = state.thread_id.clone().ok_or_else(|| {
+                harness_core::error::HarnessError::AgentExecution(
+                    "codex thread id unavailable".into(),
+                )
+            })?;
+            let turn_id = state.active_turn_id.clone().ok_or_else(|| {
+                harness_core::error::HarnessError::AgentExecution(
+                    "codex active turn unavailable".into(),
+                )
+            })?;
+            (thread_id, turn_id)
+        };
+        self.send_request_for_attempt(
+            generation,
             "turn/steer",
             json!({
                 "threadId": thread_id,
@@ -529,261 +1369,85 @@ impl AgentAdapter for CodexAdapter {
         let request_id: Value =
             serde_json::from_str(&id).unwrap_or_else(|_| Value::String(id.clone()));
         let result = approval_decision_result(decision);
-        Self::send_response(&mut state, request_id, result).await
+        Self::send_response_unlocked(&mut state, request_id, result).await
     }
-}
-
-fn protocol_line_preview(line: &str) -> String {
-    let mut chars = line.chars();
-    let mut preview: String = chars.by_ref().take(MAX_PROTOCOL_LINE_PREVIEW).collect();
-    if chars.next().is_some() {
-        preview.push_str("...");
-    }
-    preview
-}
-
-fn notification_payload(method: &str, params: Value) -> Value {
-    json!({
-        "method": method,
-        "params": params,
-    })
-}
-
-fn approval_decision_result(decision: ApprovalDecision) -> Value {
-    match decision {
-        ApprovalDecision::Accept => json!({ "decision": "accept" }),
-        ApprovalDecision::Reject { reason } => json!({
-            "decision": "decline",
-            "reason": reason,
-        }),
-    }
-}
-
-fn sandbox_mode_value(mode: Option<SandboxMode>) -> Option<String> {
-    mode.map(|value| {
-        match value {
-            SandboxMode::ReadOnly | SandboxMode::ReadOnlyWithNetwork => "read-only",
-            SandboxMode::WorkspaceWrite => "workspace-write",
-            SandboxMode::DangerFullAccess => "danger-full-access",
-        }
-        .to_string()
-    })
-}
-
-fn sandbox_policy_value(mode: Option<SandboxMode>, project_root: &PathBuf) -> Option<Value> {
-    mode.map(|value| match value {
-        SandboxMode::ReadOnly => json!({ "type": "readOnly" }),
-        SandboxMode::ReadOnlyWithNetwork => json!({
-            "type": "readOnly",
-            "networkAccess": true,
-        }),
-        SandboxMode::WorkspaceWrite => json!({
-            "type": "workspaceWrite",
-            "writableRoots": [project_root],
-        }),
-        SandboxMode::DangerFullAccess => json!({ "type": "dangerFullAccess" }),
-    })
-}
-
-fn thread_start_params(req: &TurnRequest) -> Value {
-    json!({
-        "cwd": req.project_root,
-        "model": req.model,
-        "sandbox": sandbox_mode_value(req.sandbox_mode),
-        "approvalPolicy": req.approval_policy,
-        "ephemeral": true,
-    })
-}
-
-fn turn_start_params(req: &TurnRequest, thread_id: &str) -> Value {
-    json!({
-        "threadId": thread_id,
-        "cwd": req.project_root,
-        "model": req.model,
-        "effort": req.reasoning_effort,
-        "sandboxPolicy": sandbox_policy_value(req.sandbox_mode, &req.project_root),
-        "approvalPolicy": req.approval_policy,
-        "input": [
-            {
-                "type": "text",
-                "text": req.prompt,
-            }
-        ],
-    })
-}
-
-fn response_id_matches(actual: &Value, expected: u64) -> bool {
-    actual.as_u64() == Some(expected) || actual.as_str() == Some(&expected.to_string())
-}
-
-fn request_id_string(id: &Value) -> String {
-    match id {
-        Value::String(value) => value.clone(),
-        other => other.to_string(),
-    }
-}
-
-fn thread_id_from_result(result: &Value) -> Option<String> {
-    result
-        .get("thread")
-        .and_then(|thread| thread.get("id"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| {
-            result
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-}
-
-fn parse_app_server_agent_event(
-    method: &str,
-    params: &Value,
-    id: Option<&Value>,
-) -> ParsedCodexMessage {
-    match method {
-        "thread/started" => {
-            let thread_id = params
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            ParsedCodexMessage::ThreadStarted { thread_id }
-        }
-        "turn/started" => {
-            let turn_id = params
-                .get("turn")
-                .and_then(|turn| turn.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            ParsedCodexMessage::TurnStarted { turn_id }
-        }
-        "item/agentMessage/delta" => ParsedCodexMessage::Event(AgentEvent::MessageDelta {
-            text: params
-                .get("delta")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        }),
-        "item/commandExecution/outputDelta" => {
-            ParsedCodexMessage::Event(AgentEvent::ToolOutputDelta {
-                item_id: params
-                    .get("itemId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                text: params
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            })
-        }
-        "item/started" => params
-            .get("item")
-            .and_then(parse_codex_item)
-            .map(|item| ParsedCodexMessage::Event(AgentEvent::ItemStartedPayload { item }))
-            .unwrap_or(ParsedCodexMessage::Ignore),
-        "item/completed" => params
-            .get("item")
-            .map(|item| {
-                if let Some(message) = parse_codex_error_item_message(item) {
-                    ParsedCodexMessage::Event(AgentEvent::Error { message })
-                } else {
-                    parse_codex_item(item)
-                        .map(|item| {
-                            ParsedCodexMessage::Event(AgentEvent::ItemCompletedPayload { item })
-                        })
-                        .unwrap_or(ParsedCodexMessage::Ignore)
-                }
-            })
-            .unwrap_or(ParsedCodexMessage::Ignore),
-        "thread/tokenUsage/updated" => params
-            .get("tokenUsage")
-            .and_then(|usage| usage.get("total"))
-            .and_then(parse_codex_token_usage)
-            .map(|usage| ParsedCodexMessage::Event(AgentEvent::TokenUsage { usage }))
-            .unwrap_or(ParsedCodexMessage::Ignore),
-        "warning" => ParsedCodexMessage::Event(AgentEvent::Warning {
-            message: params
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown warning")
-                .to_string(),
-        }),
-        "error" => ParsedCodexMessage::Event(AgentEvent::Error {
-            message: params
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .or_else(|| params.get("message").and_then(Value::as_str))
-                .unwrap_or("unknown error")
-                .to_string(),
-        }),
-        "turn/completed" => ParsedCodexMessage::Event(AgentEvent::TurnCompleted {
-            output: params
-                .get("turn")
-                .and_then(|turn| turn.get("items"))
-                .and_then(Value::as_array)
-                .and_then(|items| items.iter().rev().find_map(parse_codex_item))
-                .and_then(|item| match item {
-                    harness_core::types::Item::AgentReasoning { content } => Some(content),
-                    _ => None,
-                })
-                .unwrap_or_default(),
-        }),
-        "item/commandExecution/requestApproval"
-        | "item/fileChange/requestApproval"
-        | "item/permissions/requestApproval" => {
-            ParsedCodexMessage::Event(AgentEvent::ApprovalRequest {
-                id: id.map(request_id_string).unwrap_or_default(),
-                command: params
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .or_else(|| params.get("reason").and_then(Value::as_str))
-                    .unwrap_or(method)
-                    .to_string(),
-            })
-        }
-        _ => ParsedCodexMessage::Ignore,
-    }
-}
-
-pub fn parse_codex_message(line: &str) -> Option<ParsedCodexMessage> {
-    let value: Value = serde_json::from_str(line).ok()?;
-
-    if let Some(method) = value.get("method").and_then(Value::as_str) {
-        let params = value.get("params").cloned().unwrap_or(Value::Null);
-        return Some(parse_app_server_agent_event(
-            method,
-            &params,
-            value.get("id"),
-        ));
-    }
-
-    if let Some(id) = value.get("id") {
-        if let Some(error) = value.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-                .to_string();
-            return Some(ParsedCodexMessage::Event(AgentEvent::Error { message }));
-        }
-        if let Some(result) = value.get("result") {
-            return Some(ParsedCodexMessage::Response {
-                id: id.clone(),
-                result: result.clone(),
-            });
-        }
-    }
-
-    Some(ParsedCodexMessage::Ignore)
 }
 
 #[cfg(test)]
 #[path = "codex_adapter_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod spawn_policy_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn ready_child_restarts_when_spawn_policy_changes() -> anyhow::Result<()> {
+        let project = tempfile::tempdir()?;
+        let adapter = CodexAdapter::new(project.path().join("missing-codex"));
+        let request = AgentRequest {
+            prompt: "ping".to_string(),
+            prompt_layers: None,
+            project_root: project.path().to_path_buf(),
+            permission_mode: harness_core::config::agents::AgentPermissionMode::Full,
+            model: None,
+            reasoning_effort: None,
+            execution_phase: None,
+            sandbox_mode: Some(SandboxMode::DangerFullAccess),
+            approval_policy: None,
+            allowed_tools: None,
+            max_budget_usd: None,
+            context: Vec::new(),
+            timeout_secs: None,
+            env_vars: HashMap::new(),
+            capability_token: None,
+        };
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("60")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        crate::set_process_group(&mut command);
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing stdout"))?;
+        let generation = {
+            let mut state = adapter.state.lock().await;
+            let generation = state.begin_attempt()?;
+            state.stdin = Some(stdin);
+            state.stdout_lines = Some(adapter.wrap_stdout(stdout));
+            state.child = Some(crate::ManagedChild::new(child, "codex policy test"));
+            state.spawn_policy_fingerprint =
+                Some(crate::spawn_contract::adapter_spawn_policy_fingerprint(
+                    &request,
+                    adapter.sandbox_mode,
+                ));
+            generation
+        };
+
+        adapter.ensure_child(&request, generation).await?;
+        let mut scoped = request;
+        scoped.permission_mode = harness_core::config::agents::AgentPermissionMode::Scoped;
+        adapter
+            .ensure_child(&scoped, generation)
+            .await
+            .expect_err("changed policy must attempt a fresh spawn");
+
+        let state = adapter.state.lock().await;
+        assert!(state.child.is_none());
+        assert!(state.spawn_policy_fingerprint.is_none());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "codex_adapter_receiver_tests.rs"]
+mod receiver_tests;

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,9 +106,17 @@ pub struct RuntimeJobSnapshot {
     #[serde(default)]
     pub activity: Option<String>,
     pub artifact_count: u64,
+    #[serde(default)]
+    pub artifacts: Vec<RuntimeArtifactSnapshot>,
     pub terminal_state: Option<String>,
     #[serde(default)]
     pub error_kind: Option<RuntimeErrorKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeArtifactSnapshot {
+    pub artifact_type: String,
+    pub artifact: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +164,24 @@ pub struct UsageSnapshot {
     pub cost_usd_micros: Option<u64>,
     pub token_confidence: Confidence,
     pub cost_confidence: Confidence,
+}
+
+impl UsageSnapshot {
+    pub fn derived_total_tokens(&self) -> Option<u64> {
+        let has_components = self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cached_input_tokens.is_some();
+        self.total_tokens.or_else(|| {
+            has_components.then(|| {
+                harness_observe::usage::derived_total_tokens(
+                    None,
+                    self.input_tokens.unwrap_or(0),
+                    self.output_tokens.unwrap_or(0),
+                    0,
+                )
+            })
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

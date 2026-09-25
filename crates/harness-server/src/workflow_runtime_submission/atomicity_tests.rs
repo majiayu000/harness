@@ -51,7 +51,16 @@ async fn rejected_new_issue_submission_does_not_persist_live_instance_or_command
         "invalid issue submission transition",
     );
 
-    let result = commit::apply_decision(&store, instance, true, decision, &ctx, json!({})).await?;
+    let result = commit::apply_decision(
+        &store,
+        instance,
+        true,
+        decision,
+        &ctx,
+        json!({}),
+        || async { Ok(()) },
+    )
+    .await?;
 
     assert!(!result.accepted);
     assert!(result.rejection_reason.is_some());
@@ -152,6 +161,98 @@ async fn accepted_issue_replay_repairs_pending_command_without_advancing_instanc
 }
 
 #[tokio::test]
+async fn concurrent_mixed_case_issue_submissions_share_one_canonical_workflow() -> anyhow::Result<()>
+{
+    let Some(_database_url) = crate::test_helpers::configured_test_database_url()? else {
+        return Ok(());
+    };
+
+    let dir = tempfile::tempdir()?;
+    let store = open_runtime_store(dir.path()).await?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_id = TaskId::from_str("mixed-case-concurrent-issue");
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let first_barrier = barrier.clone();
+    let second_barrier = barrier;
+
+    let (first, second) = tokio::join!(
+        record_issue_submission_with_admission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("Owner/Repo"),
+                issue_number: 411,
+                task_id: &task_id,
+                labels: &[],
+                force_execute: true,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+                source: Some("github"),
+                external_id: Some("issue:411"),
+                remote_fact_hash: None,
+                author_trust_class: None,
+            },
+            move || {
+                let barrier = first_barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    Ok(())
+                }
+            },
+        ),
+        record_issue_submission_with_admission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 411,
+                task_id: &task_id,
+                labels: &[],
+                force_execute: true,
+                additional_prompt: None,
+                depends_on: &[],
+                dependencies_blocked: false,
+                source: Some("github"),
+                external_id: Some("issue:411"),
+                remote_fact_hash: None,
+                author_trust_class: None,
+            },
+            move || {
+                let barrier = second_barrier.clone();
+                async move {
+                    barrier.wait().await;
+                    Ok(())
+                }
+            },
+        )
+    );
+
+    assert_eq!(
+        [&first, &second]
+            .into_iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1,
+        "the canonical workflow lock must serialize competing first submissions"
+    );
+    let project_id = project_root.to_string_lossy();
+    let canonical_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("owner/repo"), 411);
+    let mixed_case_id =
+        harness_workflow::issue_lifecycle::workflow_id(&project_id, Some("Owner/Repo"), 411);
+    let instance = store
+        .get_instance(&canonical_id)
+        .await?
+        .expect("canonical issue workflow should be persisted");
+    assert_eq!(instance.data["repo"], "owner/repo");
+    assert!(store.get_instance(&mixed_case_id).await?.is_none());
+    assert_eq!(store.commands_for(&canonical_id).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -173,9 +274,11 @@ async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyho
     );
     let mut live_instance = stale_instance.clone();
     live_instance.version = live_instance.version.saturating_add(1);
-    store.upsert_instance(&live_instance).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &live_instance)
+        .await?;
     let ctx = PromptSubmissionRuntimeContext {
         project_root: &project_root,
+        repo: None,
         task_id: &task_id,
         prompt,
         depends_on: &[],
@@ -193,6 +296,7 @@ async fn conflicted_prompt_submission_does_not_persist_prompt_payload() -> anyho
         &stale_instance.data,
         &prompt_ref,
         &[],
+        None,
     );
     let output = build_prompt_submission_decision(
         &stale_instance,
@@ -242,6 +346,7 @@ async fn accepted_prompt_replay_with_new_prompt_keeps_referenced_payload() -> an
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: first_prompt,
             depends_on: &[],
@@ -272,6 +377,7 @@ async fn accepted_prompt_replay_with_new_prompt_keeps_referenced_payload() -> an
         &store,
         PromptSubmissionRuntimeContext {
             project_root: &project_root,
+            repo: None,
             task_id: &task_id,
             prompt: replay_prompt,
             depends_on: &[],

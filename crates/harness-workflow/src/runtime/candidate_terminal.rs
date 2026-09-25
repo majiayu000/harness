@@ -102,7 +102,7 @@ fn candidate_outcome(result: &ActivityResult) -> CandidateOutcome {
         }
         ActivityStatus::Failed => CandidateOutcome::Failed,
         ActivityStatus::Cancelled => CandidateOutcome::Cancelled,
-        ActivityStatus::Blocked => CandidateOutcome::Failed,
+        ActivityStatus::Blocked | ActivityStatus::SucceededWithBlockers => CandidateOutcome::Failed,
         ActivityStatus::Succeeded => CandidateOutcome::Succeeded,
     }
 }

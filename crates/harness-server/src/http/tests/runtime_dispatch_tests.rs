@@ -1,4 +1,400 @@
 use super::*;
+use std::collections::BTreeMap;
+
+struct DispatchContractAgent {
+    enforceable: bool,
+}
+
+#[async_trait::async_trait]
+impl harness_core::agent::AgentBackend for DispatchContractAgent {
+    fn name(&self) -> &str {
+        "dispatch-contract-agent"
+    }
+
+    fn agent_contract_capabilities(&self) -> harness_core::agent::AgentContractCapabilities {
+        if !self.enforceable {
+            return harness_core::agent::AgentContractCapabilities::default();
+        }
+        harness_core::agent::AgentContractCapabilities {
+            prompt_only_launch: true,
+            pinned_output_schema: true,
+            attempt_observation_stream: true,
+        }
+    }
+}
+
+struct ContractDispatchResult {
+    enqueued: usize,
+    deferred: usize,
+    skipped: usize,
+    runtime_jobs: usize,
+    command_status: harness_workflow::runtime::WorkflowCommandStatus,
+    completion_events: usize,
+}
+
+fn contract_dispatch_definition(
+) -> anyhow::Result<harness_workflow::runtime::DeclarativeWorkflowDefinition> {
+    let contract: harness_core::config::workflow::WorkflowAgentContract =
+        serde_json::from_value(serde_json::json!({
+            "input_schema": "harness.semantic_activity_input.v1",
+            "output_schema": "harness.semantic_verdict.v1",
+            "allowed_outcomes": ["small", "large"],
+            "tools": "none",
+            "mutation": "forbidden",
+            "workspace": "ephemeral_empty",
+            "fresh_context": true,
+            "max_primary_attempts": 1,
+            "max_corrections": 1
+        }))
+        .expect("valid dispatch contract fixture");
+    let policy = harness_core::config::workflow::WorkflowDefinitionPolicy {
+        id: "contract_workflow".to_string(),
+        initial: "classifying".to_string(),
+        states: BTreeMap::from([
+            (
+                "classifying".to_string(),
+                harness_core::config::workflow::DeclaredState {
+                    activity: Some("classify_scope".to_string()),
+                    on_failure: Some("blocked".to_string()),
+                    on_signal: BTreeMap::from([
+                        ("small".to_string(), "done".to_string()),
+                        ("large".to_string(), "blocked".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "blocked".to_string(),
+                harness_core::config::workflow::DeclaredState {
+                    progress: Some(
+                        harness_core::config::workflow::DeclaredProgressMode::OperatorGate,
+                    ),
+                    ..Default::default()
+                },
+            ),
+        ]),
+        terminal: BTreeMap::from([
+            ("done".to_string(), "succeeded".to_string()),
+            ("failed".to_string(), "failed".to_string()),
+            ("cancelled".to_string(), "cancelled".to_string()),
+        ]),
+        evidence_required: BTreeMap::new(),
+        recovery_targets: vec!["classifying".to_string()],
+        intake: None,
+    };
+    let activity_policies = BTreeMap::from([(
+        "classify_scope".to_string(),
+        harness_core::config::workflow::WorkflowActivityPolicy {
+            prompt: Some("Classify only the supplied facts.".to_string()),
+            agent_contract: Some(contract),
+            ..Default::default()
+        },
+    )]);
+    harness_workflow::runtime::build_declarative_definition(&policy, &activity_policies)
+}
+
+async fn dispatch_contract_with_backend<F>(
+    enforceable: bool,
+    runtime_enabled: bool,
+    corrupt_instance_pin: bool,
+    mutate_command: F,
+) -> anyhow::Result<ContractDispatchResult>
+where
+    F: FnOnce(&mut harness_workflow::runtime::WorkflowCommand),
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(ContractDispatchResult {
+            enqueued: 0,
+            deferred: 0,
+            skipped: 0,
+            runtime_jobs: 0,
+            command_status: harness_workflow::runtime::WorkflowCommandStatus::Pending,
+            completion_events: 0,
+        });
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("contract-project");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        format!(
+            "---\nruntime_dispatch:\n  enabled: {runtime_enabled}\n  runtime_profile: codex-contract\n  timeout_secs: 30\nruntime_worker:\n  enabled: {runtime_enabled}\n---\n"
+        ),
+    )?;
+    let mut registry = harness_agents::registry::AgentRegistry::new("codex");
+    registry.register(
+        "codex",
+        Arc::new(DispatchContractAgent { enforceable: false }),
+    );
+    registry.register_turn_backend_factory("codex", move || {
+        Arc::new(DispatchContractAgent { enforceable })
+    })?;
+    let state = make_test_state_with_workflow_runtime_config_and_registry(
+        dir.path(),
+        &project_root,
+        harness_core::config::HarnessConfig::default(),
+        registry,
+    )
+    .await?;
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let definition = contract_dispatch_definition()?;
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        definition.policy().id.clone(),
+        definition.definition_version(),
+        definition.policy().initial.clone(),
+        harness_workflow::runtime::WorkflowSubject::new("test", "contract-dispatch"),
+    )
+    .with_id("contract-dispatch")
+    .with_server_data(serde_json::json!({
+        "definition_hash": definition.definition_hash(),
+        "project_id": project_root,
+        "scope": "small"
+    }));
+    store
+        .persist_definition_version(
+            &harness_workflow::runtime::persisted_declarative_definition(&definition, None),
+        )
+        .await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let mut command =
+        harness_workflow::runtime::build_declarative_submission_decision(&definition, &workflow)?
+            .commands
+            .into_iter()
+            .next()
+            .expect("contract submission must enqueue its initial activity");
+    let original_command = command.clone();
+    mutate_command(&mut command);
+    let command_id = store
+        .enqueue_command(
+            &workflow.id,
+            None,
+            if corrupt_instance_pin {
+                &original_command
+            } else {
+                &command
+            },
+        )
+        .await?;
+    if corrupt_instance_pin {
+        let mut corrupted = workflow.clone();
+        corrupted.remove_data_field(
+            "definition_hash",
+            harness_workflow::runtime::DataProvenance::Server,
+        )?;
+        sqlx::query("UPDATE workflow_instances SET data = $2::jsonb WHERE id = $1")
+            .bind(&workflow.id)
+            .bind(serde_json::to_string(&corrupted)?)
+            .execute(store.pool())
+            .await?;
+        sqlx::query("UPDATE workflow_commands SET data = $2::jsonb WHERE id = $1")
+            .bind(&command_id)
+            .bind(serde_json::to_string(&command)?)
+            .execute(store.pool())
+            .await?;
+    }
+    let mut profile = harness_workflow::runtime::RuntimeProfile::new(
+        "codex-contract",
+        harness_workflow::runtime::RuntimeKind::CodexExec,
+    );
+    profile.timeout_secs = Some(30);
+
+    let tick = super::background::run_runtime_command_dispatch_tick(&state, profile, 10).await?;
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    let command_status = store.commands_for(&workflow.id).await?[0].status;
+    let completion_events = store
+        .events_for(&workflow.id)
+        .await?
+        .into_iter()
+        .filter(|event| event.event_type == "RuntimeJobCompleted")
+        .count();
+    Ok(ContractDispatchResult {
+        enqueued: tick.enqueued,
+        deferred: tick.deferred,
+        skipped: tick.skipped,
+        runtime_jobs: jobs.len(),
+        command_status,
+        completion_events,
+    })
+}
+
+#[tokio::test]
+async fn runtime_dispatch_authorizes_contract_only_from_selected_backend_capabilities(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, false, |_| {}).await?;
+    assert_eq!(result.enqueued, 1);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.runtime_jobs, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_defers_contract_for_nonconforming_selected_backend() -> anyhow::Result<()>
+{
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(false, true, false, |_| {}).await?;
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_malformed_present_contract_instead_of_deferring(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, false, false, |command| {
+        command.command["agent_contract"] = serde_json::Value::Null;
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_when_pinned_contract_marker_is_removed() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, false, |command| {
+        command
+            .command
+            .as_object_mut()
+            .expect("contract command payload")
+            .remove("agent_contract");
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_when_contract_identity_and_type_are_all_corrupted(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, true, |command| {
+        command.command_type = harness_workflow::runtime::WorkflowCommandType::MarkBlocked;
+        command
+            .command
+            .as_object_mut()
+            .expect("contract command payload")
+            .remove("agent_contract");
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_when_contract_command_type_is_substituted() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, false, |command| {
+        command.command_type = harness_workflow::runtime::WorkflowCommandType::MarkBlocked;
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_incomplete_contract_envelope_before_disabled_policy(
+) -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, false, false, |command| {
+        command
+            .command
+            .as_object_mut()
+            .expect("contract command payload")
+            .remove("prompt");
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_dispatch_fails_semantic_input_substituted_after_pinning() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let result = dispatch_contract_with_backend(true, true, false, |command| {
+        command.command["agent_contract_input"]["facts"]["scope"] = serde_json::json!("large");
+    })
+    .await?;
+
+    assert_eq!(result.enqueued, 0);
+    assert_eq!(result.deferred, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.runtime_jobs, 0);
+    assert_eq!(
+        result.command_status,
+        harness_workflow::runtime::WorkflowCommandStatus::Failed
+    );
+    assert_eq!(result.completion_events, 1);
+    Ok(())
+}
 
 #[tokio::test]
 async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result<()> {
@@ -26,12 +422,12 @@ async fn runtime_command_dispatch_tick_enqueues_runtime_jobs() -> anyhow::Result
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:123"),
     )
     .with_id("issue-123")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 123,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-1");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -117,7 +513,7 @@ async fn runtime_command_dispatch_tick_honors_prompt_execution_policy() -> anyho
         harness_workflow::runtime::WorkflowSubject::new("prompt", "periodic-review:test"),
     )
     .with_id("prompt-execution-policy")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "execution_policy": {
             "task_kind": "review",
@@ -127,7 +523,7 @@ async fn runtime_command_dispatch_tick_honors_prompt_execution_policy() -> anyho
             "priority": 1,
         }
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command = harness_workflow::runtime::WorkflowCommand::enqueue_activity(
         "implement_prompt",
         "prompt-policy-implement",
@@ -206,13 +602,13 @@ async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fall
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:126"),
     )
     .with_id("issue-126")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 126,
         "author_trust_class": "non_collaborator",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-126");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -377,6 +773,103 @@ async fn runtime_command_dispatch_tick_defers_unavailable_isolation_without_fall
 }
 
 #[tokio::test]
+async fn eval_isolation_command_policy_selects_remote_host_runtime_job() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let project_root = dir.path().join("project-eval-isolation");
+    std::fs::create_dir(&project_root)?;
+    std::fs::write(
+        project_root.join("WORKFLOW.md"),
+        "---\nruntime_dispatch:\n  enabled: true\nruntime_worker:\n  enabled: true\n---\n",
+    )?;
+    let mut state = make_test_state_with_workflow_runtime(dir.path()).await?;
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .isolation_availability =
+        harness_core::config::isolation::IsolationAvailability::new(vec![
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Host,
+            ),
+            harness_core::config::isolation::IsolationTierStatus::available(
+                harness_core::config::isolation::IsolationTier::Container,
+            ),
+        ]);
+    let store = state
+        .core
+        .workflow_runtime_store
+        .as_ref()
+        .expect("workflow runtime store should be configured");
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1750"),
+    )
+    .with_id("eval-isolation-issue-1750")
+    .with_server_data(serde_json::json!({
+        "project_id": project_root,
+        "repo": "owner/repo",
+        "issue_number": 1750,
+    }));
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
+    let command = harness_workflow::runtime::WorkflowCommand::new(
+        harness_workflow::runtime::WorkflowCommandType::EnqueueActivity,
+        "eval-isolation-implement",
+        serde_json::json!({
+            "activity": "implement_issue",
+            "eval": {
+                "timeout_secs": 1800,
+                "isolation": {
+                    "tier": "container",
+                    "runtime_kind": "remote_host",
+                    "runtime_profile": "eval-isolated-runtime-host",
+                    "sandbox": "workspace-write",
+                    "backend": "container_runtime_host",
+                    "image": "harness-eval-runner:local",
+                    "lifecycle": "ephemeral",
+                    "cleanup_required": true
+                }
+            }
+        }),
+    );
+    let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
+
+    let tick = super::background::run_runtime_command_dispatch_tick(
+        &state,
+        harness_workflow::runtime::RuntimeProfile::new(
+            "server-default-codex",
+            harness_workflow::runtime::RuntimeKind::CodexJsonrpc,
+        ),
+        10,
+    )
+    .await?;
+
+    assert_eq!(tick.enqueued, 1);
+    assert_eq!(tick.deferred, 0);
+    let jobs = store.runtime_jobs_for_command(&command_id).await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].runtime_kind,
+        harness_workflow::runtime::RuntimeKind::RemoteHost
+    );
+    assert_eq!(jobs[0].runtime_profile, "eval-isolated-runtime-host");
+    assert_eq!(jobs[0].input["isolation"]["tier"], "container");
+    assert_eq!(
+        jobs[0].input["runtime_profile"]["sandbox"],
+        "workspace-write"
+    );
+    assert_eq!(jobs[0].input["runtime_profile"]["timeout_secs"], 1800);
+    assert_eq!(
+        jobs[0].input["command"]["eval"]["isolation"]["image"],
+        "harness-eval-runner:local"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_command_dispatch_tick_defers_malformed_workflow_config() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
@@ -402,12 +895,12 @@ async fn runtime_command_dispatch_tick_defers_malformed_workflow_config() -> any
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:124"),
     )
     .with_id("issue-124")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 124,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-124");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -532,12 +1025,12 @@ async fn runtime_command_dispatch_tick_retries_non_workflow_config_errors() -> a
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:125"),
     )
     .with_id("issue-125")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 125,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("replan_issue", "replan-125");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -595,7 +1088,7 @@ async fn runtime_pr_feedback_sweep_tick_enqueues_runtime_command() -> anyhow::Re
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:226"),
     )
     .with_id("issue-226")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 226,
@@ -603,7 +1096,7 @@ async fn runtime_pr_feedback_sweep_tick_enqueues_runtime_command() -> anyhow::Re
         "pr_url": "https://github.com/owner/repo/pull/77",
         "task_id": "runtime-task-226",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 10).await?;
 
@@ -657,22 +1150,36 @@ async fn runtime_pr_feedback_sweep_recovers_pr_binding_from_bind_pr_command() ->
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:230"),
     )
     .with_id("issue-230")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 230,
         "task_id": "runtime-task-230",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let bind_pr = harness_workflow::runtime::WorkflowCommand::bind_pr(
         80,
         "https://github.com/owner/repo/pull/80",
         "issue-230-bind-pr-80",
     );
+    // Repair only honors bind_pr evidence minted by an accepted decision
+    // (GH-1864), so the fixture commits one the way the production path does.
+    let bind_decision = harness_workflow::runtime::WorkflowDecisionRecord::accepted(
+        harness_workflow::runtime::WorkflowDecision::new(
+            &workflow.id,
+            "pr_open",
+            "bind_pr",
+            "pr_open",
+            "agent reported the pull request",
+        )
+        .with_command(bind_pr.clone()),
+        None,
+    );
+    store.record_decision(&bind_decision).await?;
     store
         .enqueue_command_with_status(
             &workflow.id,
-            None,
+            Some(&bind_decision.id),
             &bind_pr,
             harness_workflow::runtime::WorkflowCommandStatus::Skipped,
         )
@@ -732,7 +1239,7 @@ async fn runtime_pr_feedback_sweep_limit_ignores_skipped_workflows() -> anyhow::
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:227"),
     )
     .with_id("issue-227")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 227,
@@ -740,7 +1247,8 @@ async fn runtime_pr_feedback_sweep_limit_ignores_skipped_workflows() -> anyhow::
         "pr_url": "https://github.com/owner/repo/pull/78",
         "task_id": "runtime-task-227",
     }));
-    store.upsert_instance(&valid_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &valid_workflow)
+        .await?;
     let skipped_workflow = harness_workflow::runtime::WorkflowInstance::new(
         "github_issue_pr",
         1,
@@ -748,13 +1256,14 @@ async fn runtime_pr_feedback_sweep_limit_ignores_skipped_workflows() -> anyhow::
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:228"),
     )
     .with_id("issue-228")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 228,
         "task_id": "runtime-task-228",
     }));
-    store.upsert_instance(&skipped_workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &skipped_workflow)
+        .await?;
 
     let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 1).await?;
 
@@ -791,7 +1300,7 @@ async fn runtime_pr_feedback_sweep_respects_project_runtime_policy() -> anyhow::
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:229"),
     )
     .with_id("issue-229")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 229,
@@ -799,7 +1308,7 @@ async fn runtime_pr_feedback_sweep_respects_project_runtime_policy() -> anyhow::
         "pr_url": "https://github.com/owner/repo/pull/79",
         "task_id": "runtime-task-229",
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     let tick = super::background::run_runtime_pr_feedback_sweep_tick(&state, 10).await?;
 
@@ -848,12 +1357,12 @@ async fn runtime_command_dispatch_tick_uses_command_project_policy_when_server_r
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:224"),
     )
     .with_id("issue-224")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 224,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-224");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -908,12 +1417,12 @@ async fn runtime_command_dispatch_tick_defers_disabled_policy_without_agent_metr
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:225"),
     )
     .with_id("issue-225")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "repo": "owner/repo",
         "issue_number": 225,
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command =
         harness_workflow::runtime::WorkflowCommand::enqueue_activity("implement_issue", "impl-225");
     let command_id = store.enqueue_command(&workflow.id, None, &command).await?;
@@ -1051,7 +1560,7 @@ fn auto_merge_snapshot_gate_accepts_ready_matching_head() -> anyhow::Result<()> 
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:77"),
     )
     .with_id("issue-77")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 77,
         "pr_number": 77,
@@ -1094,7 +1603,7 @@ fn auto_merge_snapshot_gate_accepts_fresh_ready_head_when_stored_head_changed() 
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:78"),
     )
     .with_id("issue-78")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 78,
         "pr_number": 78,
@@ -1124,7 +1633,7 @@ fn auto_merge_snapshot_gate_persists_fresh_head_when_workflow_head_missing() -> 
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:80"),
     )
     .with_id("issue-80")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 80,
         "pr_number": 80,
@@ -1153,7 +1662,7 @@ fn auto_merge_snapshot_gate_honors_relaxed_policy_fields() -> anyhow::Result<()>
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:79"),
     )
     .with_id("issue-79")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 79,
         "pr_number": 79,
@@ -1200,7 +1709,7 @@ fn auto_merge_snapshot_gate_rejects_wrong_base_ref() -> anyhow::Result<()> {
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:81"),
     )
     .with_id("issue-81")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 81,
         "pr_number": 81,
@@ -1233,7 +1742,7 @@ fn auto_merge_snapshot_gate_allows_unknown_expected_base() -> anyhow::Result<()>
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:82"),
     )
     .with_id("issue-82")
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "repo": "owner/repo",
         "issue_number": 82,
         "pr_number": 82,
@@ -1254,5 +1763,48 @@ fn auto_merge_snapshot_gate_allows_unknown_expected_base() -> anyhow::Result<()>
         panic!("unknown expected base should not block an otherwise ready snapshot");
     };
     assert!(prepared.data.get("expected_base_ref").is_none());
+    Ok(())
+}
+
+#[test]
+fn auto_merge_no_checks_requires_current_local_review_and_complete_facts() -> anyhow::Result<()> {
+    let workflow = harness_workflow::runtime::WorkflowInstance::new(
+        "github_issue_pr",
+        1,
+        "ready_to_merge",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "77"),
+    )
+    .with_server_data(serde_json::json!({"merge_review_head_sha":"abc123"}));
+    let mut snapshot = ready_auto_merge_snapshot("abc123");
+    snapshot.normalized_snapshot["status_check_rollup_state"] = serde_json::Value::Null;
+    snapshot.normalized_snapshot["statusCheckRollup"] = serde_json::Value::Null;
+    snapshot.normalized_snapshot["status_check_contexts"] = serde_json::json!([]);
+    snapshot.normalized_snapshot["status_check_contexts_complete"] = serde_json::json!(true);
+    let policy = auto_merge_policy(true, true);
+    assert!(matches!(
+        super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+            &workflow, &snapshot, &policy
+        )?,
+        super::auto_merge::AutoMergeSnapshotGate::Ready(_)
+    ));
+    for (field, value) in [
+        ("head_oid", serde_json::json!("changed-head")),
+        ("status_check_contexts_complete", serde_json::json!(false)),
+        ("statusCheckRollup", serde_json::json!({"state":"PENDING"})),
+        ("status_check_rollup_state", serde_json::json!("FAILURE")),
+        ("merge_state_status", serde_json::json!("BLOCKED")),
+    ] {
+        let mut incomplete = snapshot.clone();
+        incomplete.normalized_snapshot[field] = value;
+        assert_eq!(
+            super::auto_merge::prepare_auto_merge_workflow_from_snapshot(
+                &workflow,
+                &incomplete,
+                &policy
+            )?,
+            super::auto_merge::AutoMergeSnapshotGate::NotReady,
+            "{field}"
+        );
+    }
     Ok(())
 }

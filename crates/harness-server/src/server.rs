@@ -7,6 +7,23 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Narrow compatibility surface for integration tests that exercise server internals.
+///
+/// These exports are not a stable application API. Keeping them here avoids exposing
+/// the implementation modules themselves while the tests are migrated incrementally.
+#[doc(hidden)]
+pub mod test_support {
+    pub use crate::event_replay::{TaskEvent, TaskEventLog};
+    pub use crate::handlers::gc::{gc_adopt, gc_run};
+    pub use crate::hook_enforcer::HookEnforcer;
+    pub use crate::http::{build_app_state, AppState};
+    pub use crate::task_db::{migrate_legacy_task_db_if_needed, TaskDb, TASK_DB_SCHEMA};
+    pub use crate::task_runner::{
+        SchedulerAuthorityState, TaskKind, TaskPhase, TaskSchedulerState, TaskState, TaskStatus,
+        TaskStore,
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeLogState {
     Disabled,
@@ -107,22 +124,33 @@ impl HarnessServer {
 
     /// Start in stdio mode (JSON-RPC over stdin/stdout).
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
-        self.register_declarative_workflow_definitions()?;
         let state = crate::http::build_app_state(Arc::new(self)).await?;
-        harness_workflow::runtime::freeze_workflow_definition_registry();
         crate::stdio::serve(state).await
     }
 
     /// Start in HTTP + WebSocket mode.
     pub async fn serve_http(self: Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
-        self.register_declarative_workflow_definitions()?;
         crate::http::serve(self, addr).await
     }
 
-    fn register_declarative_workflow_definitions(&self) -> anyhow::Result<()> {
-        harness_workflow::runtime::register_declarative_workflow_definitions(
-            self.load_declarative_workflow_definitions()?,
-        )
+    pub(crate) fn configure_workflow_definition_registry(
+        &self,
+    ) -> anyhow::Result<harness_workflow::runtime::WorkflowDefinitionRegistry> {
+        let mut registry = harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins();
+        let enforced = self.completion_evidence_enforced();
+        if !enforced {
+            tracing::warn!(
+                "deployment-wide workflow completion-evidence enforcement is disabled; terminal transitions accept agent-claimed results without server-verified evidence"
+            );
+        }
+        registry.apply_builtin_evidence_enforcement(enforced)?;
+        registry
+            .register_declarative_current_batch(self.load_declarative_workflow_definitions()?)?;
+        Ok(registry)
+    }
+
+    fn completion_evidence_enforced(&self) -> bool {
+        self.config.workflow.completion_evidence_enforced
     }
 
     fn load_declarative_workflow_definitions(
@@ -160,7 +188,20 @@ impl HarnessServer {
                     project_root.display()
                 )
             })?;
-            definitions.push(definition);
+            if let Some(existing) = definitions.iter().find(
+                |existing: &&harness_workflow::runtime::DeclarativeWorkflowDefinition| {
+                    existing.policy().id == definition.policy().id
+                },
+            ) {
+                if existing.definition_hash() != definition.definition_hash() {
+                    anyhow::bail!(
+                        "workflow '{}' has conflicting definitions across projects",
+                        definition.policy().id
+                    );
+                }
+            } else {
+                definitions.push(definition);
+            }
         }
         Ok(definitions)
     }
@@ -243,6 +284,15 @@ mod tests {
     }
 
     #[test]
+    fn startup_policy_reads_the_deployment_global_harness_config() {
+        let mut config = HarnessConfig::default();
+        config.workflow.completion_evidence_enforced = false;
+        let server = HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("test"));
+
+        assert!(!server.completion_evidence_enforced());
+    }
+
+    #[test]
     fn declarative_definitions_compile_as_an_atomic_startup_batch() -> anyhow::Result<()> {
         let project = tempfile::tempdir()?;
         std::fs::write(
@@ -278,6 +328,70 @@ Review documentation.
         registry.register_declarative_current_batch(definitions)?;
         registry.freeze();
         assert!(registry.is_frozen());
+        Ok(())
+    }
+    #[test]
+    fn shared_workflow_registers_once_and_resolves_each_project() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let flow = include_str!("../../../config/workflows/review.md");
+        std::fs::write(root.path().join("review.md"), flow)?;
+        std::fs::write(
+            root.path().join("other.md"),
+            flow.replace("repository_review", "other_review"),
+        )?;
+        let mut config = HarnessConfig::default();
+        config.server.project_root = root.path().join("rust");
+        let mut server =
+            HarnessServer::new(config, ThreadManager::new(), AgentRegistry::new("test"));
+        for (name, file, validation) in [
+            ("rust", "review.md", "cargo check"),
+            ("web", "review.md", "bun test"),
+            ("other", "other.md", "npm test"),
+        ] {
+            let project = root.path().join(name);
+            std::fs::create_dir(&project)?;
+            std::fs::write(project.join("WORKFLOW.md"), format!("---\nworkflow: {{file: ../{file}}}\nactivities:\n  inspect_repository:\n    validation: [{validation}]\n---\n"))?;
+            server.startup_projects.push(ProjectEntry {
+                name: name.into(),
+                root: project,
+                default: false,
+                default_agent: None,
+                max_concurrent: None,
+            });
+        }
+        let definitions = server.load_declarative_workflow_definitions()?;
+        assert_eq!(definitions.len(), 2);
+        let mut registry = harness_workflow::runtime::WorkflowDefinitionRegistry::new();
+        registry.register_declarative_current_batch(definitions)?;
+        registry.freeze();
+        for (name, id) in [
+            ("rust", "repository_review"),
+            ("web", "repository_review"),
+            ("other", "other_review"),
+        ] {
+            crate::workflow_runtime_submission::resolve_declarative_definition_for_project(
+                &registry,
+                &root.path().join(name),
+                id,
+            )?;
+        }
+        assert!(
+            crate::workflow_runtime_submission::resolve_declarative_definition_for_project(
+                &registry,
+                &root.path().join("rust"),
+                "other_review"
+            )
+            .is_err()
+        );
+        std::fs::write(
+            root.path().join("other.md"),
+            flow.replace("reviewing", "inspecting"),
+        )?;
+        assert!(server
+            .load_declarative_workflow_definitions()
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting definitions"));
         Ok(())
     }
 }

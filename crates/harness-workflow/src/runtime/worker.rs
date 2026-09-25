@@ -2,7 +2,8 @@ use super::model::{
     ActivityResult, ActivityStatus, RuntimeJob, RuntimeKind, RuntimeProfile, WorkflowCommand,
     WorkflowCommandRecord, WorkflowInstance,
 };
-use super::store::WorkflowRuntimeStore;
+use super::store::{RuntimeJobClaimDeferOutcome, WorkflowRuntimeStore};
+use super::WorkflowTerminalState;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -19,7 +20,19 @@ pub trait RuntimeJobExecutor: Send + Sync {
         None
     }
 
+    /// Reserve execution capacity without waiting while holding a worker slot.
+    /// Returning a deadline releases the claim back to the pending queue.
+    async fn prepare_execution(&self, _job: &RuntimeJob) -> anyhow::Result<Option<DateTime<Utc>>> {
+        Ok(None)
+    }
+
     async fn execute(&self, job: RuntimeJob) -> ActivityResult;
+
+    /// Cancel the in-flight execution of `job`: the executor interrupts the
+    /// agent process and releases its workspace so a reclaimer never runs
+    /// against a dirty tree (GH-1877). The `execute` future then resolves to
+    /// a cancelled/failed result shortly after.
+    async fn cancel_execution(&self, _job: &RuntimeJob) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +104,7 @@ impl<'a> RuntimeWorker<'a> {
             match claim_guard.before_execute(&job, Utc::now(), lease_expires_at) {
                 RuntimeJobClaimDecision::Proceed => {}
                 RuntimeJobClaimDecision::Defer { not_before, reason } => {
-                    let Some(_) = self
+                    let outcome = self
                         .store
                         .defer_runtime_job_claim_if_owned(
                             &job.id,
@@ -99,15 +112,16 @@ impl<'a> RuntimeWorker<'a> {
                             lease_expires_at,
                             not_before,
                         )
-                        .await?
-                    else {
+                        .await?;
+                    if !matches!(outcome, RuntimeJobClaimDeferOutcome::Deferred(_)) {
                         tracing::warn!(
                             runtime_job_id = %job.id,
                             owner = %self.owner,
-                            "runtime job claim defer ignored because the worker no longer owns the lease"
+                            ?outcome,
+                            "runtime job claim defer was not applied"
                         );
                         return Ok(None);
-                    };
+                    }
                     self.store
                         .record_runtime_event(
                             &job.id,
@@ -138,35 +152,57 @@ impl<'a> RuntimeWorker<'a> {
         let consumes_runtime_turn = executor.consumes_runtime_turn(&job);
         let result = match self.terminal_workflow_result(&job).await? {
             Some(result) => result,
-            None => {
-                match self
-                    .max_turns_budget_result(&job, consumes_runtime_turn)
-                    .await?
-                {
-                    Some(result) => result,
-                    None => match executor.preflight_result(&job).await {
-                        Some(result) => result,
-                        None => {
-                            if consumes_runtime_turn {
+            None => match executor.preflight_result(&job).await {
+                Some(result) => result,
+                None => {
+                    let preparation_error = match executor.prepare_execution(&job).await {
+                        Ok(Some(not_before)) => {
+                            let outcome = self
+                                .store
+                                .defer_runtime_job_claim_if_owned(
+                                    &job.id,
+                                    &self.owner,
+                                    lease_expires_at,
+                                    not_before,
+                                )
+                                .await?;
+                            if matches!(outcome, RuntimeJobClaimDeferOutcome::Deferred(_)) {
                                 self.store
                                     .record_runtime_event(
                                         &job.id,
-                                        "RuntimeTurnStarted",
+                                        "RuntimeJobClaimDeferred",
                                         json!({
-                                            "owner": self.owner.as_str(),
+                                            "owner": self.owner, "not_before": not_before,
+                                            "reason": "execution capacity unavailable",
                                         }),
                                     )
                                     .await?;
                             }
-                            let execution = self
-                                .execute_with_lease_renewal(&job, executor, lease_expires_at)
-                                .await?;
-                            lease_expires_at = execution.lease_expires_at;
-                            execution.result
+                            return Ok(None);
                         }
-                    },
+                        Ok(None) => None,
+                        Err(error) => Some(ActivityResult::failed(
+                            runtime_job_activity_name(&job),
+                            "Execution admission failed.",
+                            error.to_string(),
+                        )),
+                    };
+                    if let Some(result) = preparation_error {
+                        result
+                    } else if let Some(result) = self
+                        .reserve_runtime_turn_started(&job, consumes_runtime_turn)
+                        .await?
+                    {
+                        result
+                    } else {
+                        let execution = self
+                            .execute_with_lease_renewal(&job, executor, lease_expires_at)
+                            .await?;
+                        lease_expires_at = execution.lease_expires_at;
+                        execution.result
+                    }
                 }
-            }
+            },
         };
         let (result, transcript) = super::transcript::prepare_runtime_transcript(&job, result)?;
         let Some(completion) = self
@@ -180,20 +216,26 @@ impl<'a> RuntimeWorker<'a> {
             )
             .await?
         else {
+            // The lease was lost mid-turn. The completed work must not
+            // vanish: persist it to the dead-letter table so reconciliation
+            // can decide whether it still applies (GH-1878).
+            self.store
+                .record_lease_expired_completion(
+                    &job.id,
+                    &self.owner,
+                    job.lease_generation,
+                    lease_expires_at,
+                    &result,
+                    transcript.as_ref(),
+                )
+                .await?;
             tracing::warn!(
                 runtime_job_id = %job.id,
                 owner = %self.owner,
-                "runtime job completion ignored because the worker no longer owns the lease"
+                "runtime job completion rejected because the worker no longer owns the lease; recorded to dead-letter"
             );
             return Ok(None);
         };
-        self.store
-            .record_runtime_event(
-                &job.id,
-                "ActivityResultReady",
-                serde_json::to_value(&result)?,
-            )
-            .await?;
         if let Some(event) = completion.workflow_event.as_ref() {
             self.propagate_pr_feedback_child_completion(&event.workflow_id, event)
                 .await?;
@@ -213,18 +255,20 @@ impl<'a> RuntimeWorker<'a> {
         let Some(instance) = self.store.get_instance(workflow_id).await? else {
             return Ok(None);
         };
-        if !instance.is_terminal() {
+        let Some(terminal_state) = self.store.terminal_state_for_instance(&instance).await? else {
             return Ok(None);
-        }
+        };
         let activity = runtime_job_activity_name(job);
         let summary = format!(
             "Workflow {} was already terminal ({}) before runtime execution.",
             instance.id, instance.state
         );
-        let result = match instance.state.as_str() {
-            "cancelled" => ActivityResult::cancelled(activity, summary),
-            "failed" => ActivityResult::failed(activity, summary, "workflow already failed"),
-            _ => ActivityResult::succeeded(activity, summary),
+        let result = match terminal_state {
+            WorkflowTerminalState::Cancelled => ActivityResult::cancelled(activity, summary),
+            WorkflowTerminalState::Failed => {
+                ActivityResult::failed(activity, summary, "workflow already failed")
+            }
+            WorkflowTerminalState::Succeeded => ActivityResult::succeeded(activity, summary),
         };
         Ok(Some(result))
     }
@@ -263,12 +307,26 @@ impl<'a> RuntimeWorker<'a> {
                         )
                         .await?
                     else {
-                        return Ok(RuntimeJobExecution {
-                            result: ActivityResult::failed(
+                        // Lease lost mid-turn: cancel the in-flight agent and
+                        // wait for the executor's cleanup (agent termination +
+                        // workspace release) so a reclaimer never sees a
+                        // dirty tree. Bounded by a grace period; if cleanup
+                        // does not finish, the future is dropped and the
+                        // workspace reaper is the backstop (GH-1877).
+                        executor.cancel_execution(job).await;
+                        let cleanup_grace = std::time::Duration::from_secs(30);
+                        let result = match tokio::time::timeout(cleanup_grace, &mut execution)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => ActivityResult::failed(
                                 activity,
                                 "Runtime job lease was lost before the agent completed.",
-                                "Another runtime worker reclaimed the job after this worker's lease expired.",
+                                "Another runtime worker reclaimed the job after this worker's lease expired; agent cleanup exceeded the grace period.",
                             ),
+                        };
+                        return Ok(RuntimeJobExecution {
+                            result,
                             lease_expires_at,
                         });
                     };
@@ -296,6 +354,12 @@ impl<'a> RuntimeWorker<'a> {
         if !runtime_event_result_succeeded(event) {
             return Ok(());
         }
+        if child.state == "blocked"
+            && child.data.get("stop_reason_code").and_then(Value::as_str)
+                == Some(super::STOP_REASON_INVALID_AGENT_OUTPUT)
+        {
+            return Ok(());
+        }
         if matches!(child.state.as_str(), "pending" | "inspecting") {
             return Ok(());
         }
@@ -306,7 +370,7 @@ impl<'a> RuntimeWorker<'a> {
             .commit_parent_runtime_completion(
                 parent_workflow_id,
                 &self.owner,
-                merge_child_completion_payload(event, &child.id),
+                merge_child_completion_payload(event, &child),
             )
             .await?;
         Ok(())
@@ -336,13 +400,13 @@ impl<'a> RuntimeWorker<'a> {
             .commit_parent_runtime_completion(
                 parent_workflow_id,
                 &self.owner,
-                merge_child_completion_payload(event, &child.id),
+                merge_child_completion_payload(event, &child),
             )
             .await?;
         Ok(())
     }
 
-    async fn max_turns_budget_result(
+    async fn reserve_runtime_turn_started(
         &self,
         job: &RuntimeJob,
         consumes_runtime_turn: bool,
@@ -350,22 +414,45 @@ impl<'a> RuntimeWorker<'a> {
         if !consumes_runtime_turn {
             return Ok(None);
         }
-        let Some(profile) = runtime_profile_for_job(job)? else {
+        let payload = json!({
+            "owner": self.owner.as_str(),
+            "lease_generation": job.lease_generation,
+            "reservation_key": format!("runtime_worker:{}:{}", job.id, job.lease_generation),
+        });
+        let budget = match runtime_profile_for_job(job)? {
+            Some(profile) => match profile.max_turns {
+                Some(max_turns) => self
+                    .store
+                    .get_command(&job.command_id)
+                    .await?
+                    .map(|command| (command, profile, max_turns)),
+                None => None,
+            },
+            None => None,
+        };
+        let Some((command, profile, max_turns)) = budget else {
+            self.store
+                .record_runtime_event(&job.id, "RuntimeTurnStarted", payload)
+                .await?;
             return Ok(None);
         };
-        let Some(max_turns) = profile.max_turns else {
-            return Ok(None);
-        };
-        let Some(command) = self.store.get_command(&job.command_id).await? else {
-            return Ok(None);
-        };
-        let turns_started = self
+        if self
             .store
-            .runtime_turns_started_for_workflow(&command.workflow_id, Some(&job.id))
-            .await?;
-        if turns_started < i64::from(max_turns) {
+            .reserve_runtime_turn_started_for_workflow(
+                &command.workflow_id,
+                &job.id,
+                max_turns,
+                payload,
+            )
+            .await?
+            .is_some()
+        {
             return Ok(None);
         }
+        let turns_started = self
+            .store
+            .runtime_turns_started_for_workflow(&command.workflow_id, None)
+            .await?;
         Ok(Some(runtime_budget_blocked_result(
             &command,
             &profile,
@@ -404,14 +491,25 @@ fn runtime_event_result_succeeded(event: &super::model::WorkflowEvent) -> bool {
 
 fn merge_child_completion_payload(
     event: &super::model::WorkflowEvent,
-    child_workflow_id: &str,
+    child: &WorkflowInstance,
 ) -> serde_json::Value {
     let mut payload = event.event.clone();
     if let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "child_workflow_id".to_string(),
-            serde_json::json!(child_workflow_id),
-        );
+        object.insert("child_workflow_id".to_string(), serde_json::json!(child.id));
+        if let Some(runtime_job_id) = child
+            .data
+            .get("started_by_runtime_job_id")
+            .and_then(Value::as_str)
+        {
+            object.insert(
+                "recovery_activity".to_string(),
+                serde_json::json!("start_child_workflow"),
+            );
+            object.insert(
+                "recovery_runtime_job_id".to_string(),
+                serde_json::json!(runtime_job_id),
+            );
+        }
         if let Some(artifacts) = object
             .get_mut("activity_result")
             .and_then(serde_json::Value::as_object_mut)
@@ -448,28 +546,38 @@ pub(super) fn apply_failure_reason_side_effect(
     {
         return Ok(());
     }
-    if !instance.data.is_object() {
-        instance.data = json!({});
-    }
-    let data = instance
-        .data
-        .as_object_mut()
-        .context("workflow instance data is not an object")?;
+    let mut writes = Vec::new();
     if let Some(reason) = reason {
-        data.insert("failure_reason".to_string(), json!(reason));
+        writes.push(super::WorkflowDataWrite::set(
+            "failure_reason",
+            json!(reason),
+            super::DataProvenance::Agent,
+        ));
         if command.command_type == super::model::WorkflowCommandType::MarkBlocked {
-            data.insert("blocked_reason".to_string(), json!(reason));
+            writes.push(super::WorkflowDataWrite::set(
+                "blocked_reason",
+                json!(reason),
+                super::DataProvenance::Agent,
+            ));
         }
     }
     for field in STOP_STRING_FIELDS {
         if let Some(value) = command_string_field(command, field) {
-            data.insert((*field).to_string(), json!(value));
+            writes.push(super::WorkflowDataWrite::set(
+                *field,
+                json!(value),
+                super::DataProvenance::Agent,
+            ));
         }
     }
     if let Some(last_stop) = command.command.get("last_stop") {
-        data.insert("last_stop".to_string(), last_stop.clone());
+        writes.push(super::WorkflowDataWrite::set(
+            "last_stop",
+            last_stop.clone(),
+            super::DataProvenance::Agent,
+        ));
     }
-    Ok(())
+    instance.apply_data_writes(writes)
 }
 
 const STOP_STRING_FIELDS: &[&str] = &[

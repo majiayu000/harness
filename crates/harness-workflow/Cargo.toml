@@ -10,7 +10,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-harness-core = { workspace = true }
+harness-core = { workspace = true, features = ["db-postgres"] }
+harness-sandbox = { workspace = true }
 harness-observe = { workspace = true }
 harness-exec = { workspace = true }
 tokio = { workspace = true }
@@ -29,6 +30,7 @@ tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
+shlex = { workspace = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }

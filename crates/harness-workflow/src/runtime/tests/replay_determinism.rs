@@ -18,10 +18,21 @@ fn runtime_completion_validation_uses_event_time_for_replayed_lease() -> anyhow:
         "https://github.com/owner/repo/pull/123",
         "bind-pr-123",
     ));
-    let result =
-        ActivityResult::succeeded("implement_issue", "created pull request").with_artifact(
-            ActivityArtifact::new("workflow_decision", serde_json::to_value(&decision)?),
-        );
+    let result = ActivityResult::succeeded("implement_issue", "created pull request")
+        .with_artifact(ActivityArtifact::new(
+            "workflow_decision",
+            serde_json::to_value(&decision)?,
+        ))
+        // GH-1766: server-verified binding for the claimed PR.
+        .with_artifact(ActivityArtifact::new(
+            crate::runtime::completion_evidence::ARTIFACT_VERIFIED_PR_BINDING,
+            json!({
+                "pr_number": 123,
+                "repo": "owner/repo",
+                "head_oid": "abc123",
+                "snapshot_source": "server_github_graphql",
+            }),
+        ));
     let mut event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-1")
         .with_payload(json!({
             "activity_result": result,

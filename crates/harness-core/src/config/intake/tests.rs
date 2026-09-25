@@ -95,6 +95,54 @@ fn github_find_repo_config_supports_single_repo_shorthand() {
 }
 
 #[test]
+fn github_repo_config_identity_is_case_insensitive() {
+    let config = GitHubIntakeConfig {
+        repo: "Owner/Default".to_string(),
+        repos: vec![GitHubRepoConfig {
+            repo: "Owner/Repo".to_string(),
+            label: "case-insensitive".to_string(),
+            project_root: None,
+            auto_merge: Some(true),
+            auto_recovery: Some(true),
+            merge_method: None,
+            delete_branch: None,
+            require_review_threads_resolved: None,
+            require_clean_merge_state: None,
+        }],
+        ..GitHubIntakeConfig::default()
+    };
+
+    let repo = config
+        .find_repo_config("owner/repo")
+        .expect("mixed-case repo config should match canonical identity");
+    assert_eq!(repo.label, "case-insensitive");
+    assert!(config.auto_merge_policy_for_repo("owner/repo").enabled);
+    assert!(config.auto_recovery_enabled_for_repo("owner/repo"));
+    assert!(config.find_repo_config("owner/default").is_some());
+}
+
+#[test]
+fn effective_repos_deduplicates_case_variants() {
+    let config = GitHubIntakeConfig {
+        repo: "owner/repo".to_string(),
+        repos: vec![GitHubRepoConfig {
+            repo: "Owner/Repo".to_string(),
+            label: "configured".to_string(),
+            project_root: None,
+            auto_merge: None,
+            auto_recovery: None,
+            merge_method: None,
+            delete_branch: None,
+            require_review_threads_resolved: None,
+            require_clean_merge_state: None,
+        }],
+        ..GitHubIntakeConfig::default()
+    };
+
+    assert_eq!(config.effective_repos().len(), 1);
+}
+
+#[test]
 fn github_discovery_driver_defaults_to_direct_rest() {
     let config = GitHubIntakeConfig::default();
 

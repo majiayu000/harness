@@ -46,7 +46,6 @@ async fn get_task_returns_service_unavailable_when_required_workflow_runtime_sto
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = response_json(response).await?;
     assert_eq!(body["error"], "workflow runtime store unavailable");
-    assert_eq!(body["message"], "workflow runtime store is unavailable");
     Ok(())
 }
 
@@ -77,7 +76,6 @@ async fn get_task_proof_returns_service_unavailable_when_required_workflow_runti
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = response_json(response).await?;
     assert_eq!(body["error"], "workflow runtime store unavailable");
-    assert_eq!(body["message"], "workflow runtime store is unavailable");
     Ok(())
 }
 

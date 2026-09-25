@@ -39,14 +39,6 @@ pub(super) fn default_force_execute_label() -> String {
     "force-execute".to_string()
 }
 
-pub(super) fn default_pr_scope_guard_max_files_changed() -> u32 {
-    30
-}
-
-pub(super) fn default_pr_scope_guard_max_lines_added() -> u32 {
-    1500
-}
-
 pub(super) fn default_feedback_sweep_interval_secs() -> u64 {
     60
 }

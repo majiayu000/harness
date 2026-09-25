@@ -523,7 +523,8 @@ fn empty_and_omitted_commands_share_progress_rejection() {
 
 #[test]
 fn wait_and_inline_commands_do_not_drive_progress() {
-    let validator = DecisionValidator::new(
+    let validator = DecisionValidator::for_definition(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
         super::validator::TransitionAllowlist::default().allow(
             "implementing",
             "implementing",
@@ -534,6 +535,8 @@ fn wait_and_inline_commands_do_not_drive_progress() {
                 WorkflowCommandType::RequestOperatorAttention,
             ],
         ),
+        crate::runtime::WorkflowDefinitionRegistry::with_builtins()
+            .states_for_definition(GITHUB_ISSUE_PR_DEFINITION_ID),
     );
     let cases = [
         WorkflowCommand::wait("still waiting", "non-driver:wait"),
@@ -635,7 +638,14 @@ fn allows_declared_non_command_progress_modes() {
         "quality_passed",
         "passed",
         "quality checks passed",
-    );
+    )
+    // GH-1766: the gate transition requires the server validation digest.
+    .with_evidence(crate::runtime::model::WorkflowEvidence::reexecuted(
+        crate::runtime::completion_evidence::EVIDENCE_SERVER_VALIDATION_DIGEST,
+        "server executed 1 validation command(s), all exit 0",
+        "server_validation_digest:1_commands",
+        None,
+    ));
     DecisionValidator::quality_gate()
         .validate(&terminal, &terminal_decision, &validation_context())
         .expect("terminal targets do not require runtime-job-producing commands");

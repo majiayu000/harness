@@ -1,22 +1,29 @@
+use super::rest_contract::{
+    ContractJson, ContractQuery, LegacyJson as Json, PrimitivePath as Path,
+};
 use super::state::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use harness_core::agent::ApprovalDecision;
+use harness_protocol::rest::{
+    WorkflowEvidenceArtifact as RestWorkflowEvidenceArtifact,
+    WorkflowEvidenceExportResponse as RestWorkflowEvidenceExportResponse,
+    WorkflowEvidenceQuery as RestWorkflowEvidenceQuery,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Serialize)]
-struct ApprovalResponse {
+pub(super) struct ApprovalResponse {
     accepted: bool,
 }
 
 #[derive(Debug, Serialize)]
-struct RuntimeSubmissionArtifact {
+pub(super) struct RuntimeSubmissionArtifact {
     task_id: String,
     turn: i64,
     artifact_type: String,
@@ -25,12 +32,45 @@ struct RuntimeSubmissionArtifact {
 }
 
 #[derive(Debug, Serialize)]
-struct RuntimeSubmissionPrompt {
+pub(super) struct RuntimeSubmissionPrompt {
     task_id: String,
     turn: i64,
     phase: String,
     prompt: String,
     created_at: String,
+}
+
+pub(crate) async fn get_evidence(
+    State(state): State<Arc<AppState>>,
+    ContractQuery(query): ContractQuery<RestWorkflowEvidenceQuery>,
+) -> Response {
+    get_evidence_response(state, query, false).await
+}
+
+pub(crate) async fn get_evidence_export(
+    State(state): State<Arc<AppState>>,
+    ContractQuery(query): ContractQuery<RestWorkflowEvidenceQuery>,
+) -> Response {
+    get_evidence_response(state, query, true).await
+}
+
+async fn get_evidence_response(
+    state: Arc<AppState>,
+    query: RestWorkflowEvidenceQuery,
+    default_include_payload: bool,
+) -> Response {
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_response(),
+    };
+    let query = workflow_evidence_query(query, default_include_payload);
+    match store.export_workflow_run_evidence(query).await {
+        Ok(export) => ContractJson(workflow_evidence_export_response(export)).into_response(),
+        Err(error) => {
+            tracing::error!("get_runtime_evidence: runtime evidence lookup failed: {error}");
+            internal_server_error()
+        }
+    }
 }
 
 pub(crate) async fn respond_to_approval(
@@ -93,8 +133,8 @@ pub(crate) async fn get_artifacts(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if state.core.workflow_runtime_store.is_none() {
-        return runtime_store_unavailable();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
     let task_id = harness_core::types::TaskId(id);
     match runtime_artifacts_by_handle(&state, &task_id).await {
@@ -111,8 +151,8 @@ pub(crate) async fn get_prompts(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if state.core.workflow_runtime_store.is_none() {
-        return runtime_store_unavailable();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
     let task_id = harness_core::types::TaskId(id);
     match runtime_prompts_by_handle(&state, &task_id).await {
@@ -284,10 +324,63 @@ fn internal_server_error() -> Response {
         .into_response()
 }
 
-fn runtime_store_unavailable() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({"error": "workflow runtime store unavailable"})),
-    )
-        .into_response()
+fn workflow_evidence_query(
+    query: RestWorkflowEvidenceQuery,
+    default_include_payload: bool,
+) -> harness_workflow::runtime::WorkflowRunEvidenceQuery {
+    harness_workflow::runtime::WorkflowRunEvidenceQuery {
+        project_id: query.project_id,
+        commit_sha: query.commit_sha,
+        suite: query.suite,
+        decision: query.decision,
+        created_after: query.created_after,
+        created_before: query.created_before,
+        include_payload: query.include_payload.unwrap_or(default_include_payload),
+        limit: query
+            .limit
+            .unwrap_or(harness_workflow::runtime::WORKFLOW_RUN_EVIDENCE_DEFAULT_LIMIT),
+    }
+}
+
+fn workflow_evidence_export_response(
+    export: harness_workflow::runtime::WorkflowRunEvidenceExport,
+) -> RestWorkflowEvidenceExportResponse {
+    RestWorkflowEvidenceExportResponse {
+        schema: export.schema,
+        generated_at: export.generated_at,
+        limit: export.limit,
+        count: export.records.len(),
+        records: export
+            .records
+            .into_iter()
+            .map(workflow_evidence_artifact_response)
+            .collect(),
+    }
+}
+
+fn workflow_evidence_artifact_response(
+    record: harness_workflow::runtime::WorkflowRunEvidence,
+) -> RestWorkflowEvidenceArtifact {
+    RestWorkflowEvidenceArtifact {
+        id: record.id,
+        workflow_id: record.workflow_id,
+        command_id: record.command_id,
+        runtime_job_id: record.runtime_job_id,
+        project_id: record.project_id,
+        commit_sha: record.commit_sha,
+        stack: record.stack,
+        suite: record.suite,
+        baseline: record.baseline,
+        decision: record.decision,
+        schema: record.evidence_schema,
+        digest: record.digest,
+        trust: record.trust,
+        location: record.location,
+        retention_class: record.retention_class,
+        payload: record.payload,
+        payload_expires_at: record.payload_expires_at,
+        payload_expired_at: record.payload_expired_at,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
 }

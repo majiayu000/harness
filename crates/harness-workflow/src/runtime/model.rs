@@ -1,10 +1,14 @@
-use super::terminal_state::{workflow_terminal_state_for_instance, WorkflowTerminalState};
 use chrono::{DateTime, Utc};
+use harness_core::claim_trust::ClaimProvenance;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub use super::command_record::WorkflowCommandRecord;
+
+#[path = "model_runtime_profile.rs"]
+mod runtime_profile;
+pub use runtime_profile::{RuntimeKind, RuntimeProfile};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowDefinition {
@@ -84,66 +88,17 @@ pub struct WorkflowInstance {
     pub parent_workflow_id: Option<String>,
     #[serde(default)]
     pub data: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_provenance: Option<super::data_provenance::WorkflowDataProvenance>,
+    /// Informational mutation counter, NOT a concurrency guard. All writes go
+    /// through `SELECT ... FOR UPDATE` with an explicit `expected_state`; do
+    /// not use this field for optimistic locking — a writer that does will
+    /// silently lose updates (GH-1877 Cluster B).
     pub version: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease: Option<WorkflowLease>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-impl WorkflowInstance {
-    pub fn new(
-        definition_id: impl Into<String>,
-        definition_version: u32,
-        state: impl Into<String>,
-        subject: WorkflowSubject,
-    ) -> Self {
-        let now = Utc::now();
-        Self {
-            id: Uuid::new_v4().to_string(),
-            definition_id: definition_id.into(),
-            definition_version,
-            state: state.into(),
-            subject,
-            parent_workflow_id: None,
-            data: Value::Object(Default::default()),
-            version: 0,
-            lease: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    pub fn is_terminal(&self) -> bool {
-        self.terminal_state().is_some()
-    }
-
-    pub fn terminal_state(&self) -> Option<WorkflowTerminalState> {
-        workflow_terminal_state_for_instance(self)
-    }
-
-    pub fn with_id(mut self, id: impl Into<String>) -> Self {
-        self.id = id.into();
-        self
-    }
-
-    pub fn with_data(mut self, data: Value) -> Self {
-        self.data = data;
-        self
-    }
-
-    pub fn with_parent(mut self, parent_workflow_id: impl Into<String>) -> Self {
-        self.parent_workflow_id = Some(parent_workflow_id.into());
-        self
-    }
-
-    pub fn with_lease(mut self, owner: impl Into<String>, expires_at: DateTime<Utc>) -> Self {
-        self.lease = Some(WorkflowLease {
-            owner: owner.into(),
-            expires_at,
-        });
-        self
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -335,10 +290,24 @@ pub enum DecisionConfidence {
     High,
 }
 
+/// Evidence proving a bound PR was resolved through GitHub, not taken from the
+/// agent artifact alone.
+pub const EVIDENCE_VERIFIED_PR_BINDING: &str = "verified_pr_binding";
+
+/// Evidence carrying the digest of validation commands the server re-executed
+/// itself, rather than the agent's claim that they passed.
+pub const EVIDENCE_SERVER_VALIDATION_DIGEST: &str = "server_validation_digest";
+
+/// Evidence that a prompt task presented either a validation report or a
+/// structured no-change rationale before claiming completion.
+pub const EVIDENCE_PROMPT_COMPLETION: &str = "prompt_completion_evidence";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowEvidence {
     pub kind: String,
     pub summary: String,
+    #[serde(default)]
+    pub provenance: ClaimProvenance,
 }
 
 impl WorkflowEvidence {
@@ -346,7 +315,40 @@ impl WorkflowEvidence {
         Self {
             kind: kind.into(),
             summary: summary.into(),
+            provenance: ClaimProvenance::default(),
         }
+    }
+
+    pub fn with_provenance(mut self, provenance: ClaimProvenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    pub fn runtime_observed(
+        kind: impl Into<String>,
+        summary: impl Into<String>,
+        source: impl Into<String>,
+        event_ref: Option<String>,
+    ) -> Self {
+        Self::new(kind, summary)
+            .with_provenance(ClaimProvenance::runtime_observed(source, event_ref))
+    }
+
+    pub fn reexecuted(
+        kind: impl Into<String>,
+        summary: impl Into<String>,
+        command: impl Into<String>,
+        output_sha256: Option<String>,
+    ) -> Self {
+        Self::new(kind, summary)
+            .with_provenance(ClaimProvenance::reexecuted(command, output_sha256))
+    }
+
+    pub fn validate_claim_trust(&self) -> Result<(), String> {
+        if self.kind.trim().is_empty() {
+            return Err("workflow evidence kind must not be empty".to_string());
+        }
+        self.provenance.validate()
     }
 }
 
@@ -445,67 +447,21 @@ impl WorkflowDecisionRecord {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RuntimeKind {
-    CodexExec,
-    CodexJsonrpc,
-    ClaudeCode,
-    AnthropicApi,
-    RemoteHost,
-}
-
-impl RuntimeKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::CodexExec => "codex_exec",
-            Self::CodexJsonrpc => "codex_jsonrpc",
-            Self::ClaudeCode => "claude_code",
-            Self::AnthropicApi => "anthropic_api",
-            Self::RemoteHost => "remote_host",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RuntimeProfile {
-    pub name: String,
-    pub kind: RuntimeKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_turns: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_secs: Option<u64>,
-}
-
-impl RuntimeProfile {
-    pub fn new(name: impl Into<String>, kind: RuntimeKind) -> Self {
-        Self {
-            name: name.into(),
-            kind,
-            model: None,
-            reasoning_effort: None,
-            sandbox: None,
-            approval_policy: None,
-            max_turns: None,
-            timeout_secs: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum RuntimeJobStatus {
     Pending,
     Running,
     Succeeded,
     Failed,
     Cancelled,
+}
+
+impl RuntimeJobStatus {
+    pub fn is_active(self) -> bool {
+        match self {
+            Self::Pending | Self::Running => true,
+            Self::Succeeded | Self::Failed | Self::Cancelled => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -533,14 +489,24 @@ pub struct RuntimeJob {
     pub updated_at: DateTime<Utc>,
 }
 
+pub const RUNTIME_PROFILE_SNAPSHOT_HASH_KEY: &str = "_runtime_profile_snapshot_hash";
+
 impl RuntimeJob {
     pub fn pending(
         command_id: impl Into<String>,
         runtime_kind: RuntimeKind,
         runtime_profile: impl Into<String>,
-        input: Value,
+        mut input: Value,
     ) -> Self {
         let now = Utc::now();
+        if let Some(profile) = input.get("runtime_profile").cloned() {
+            if let Some(object) = input.as_object_mut() {
+                object.insert(
+                    RUNTIME_PROFILE_SNAPSHOT_HASH_KEY.to_string(),
+                    Value::String(super::remote_facts::stable_remote_fact_hash(&profile)),
+                );
+            }
+        }
         Self {
             id: Uuid::new_v4().to_string(),
             command_id: command_id.into(),
@@ -564,6 +530,10 @@ impl RuntimeJob {
         self
     }
 
+    pub fn is_eval_job(&self) -> bool {
+        self.input.get("eval").is_some() || self.input.pointer("/command/eval").is_some()
+    }
+
     pub fn claim(&mut self, owner: impl Into<String>, expires_at: DateTime<Utc>) {
         self.status = RuntimeJobStatus::Running;
         self.lease_generation = self.lease_generation.saturating_add(1);
@@ -581,6 +551,7 @@ impl RuntimeJob {
     pub fn complete(&mut self, result: &ActivityResult) -> anyhow::Result<()> {
         self.status = match result.status {
             ActivityStatus::Succeeded => RuntimeJobStatus::Succeeded,
+            ActivityStatus::SucceededWithBlockers => RuntimeJobStatus::Failed,
             ActivityStatus::Failed => RuntimeJobStatus::Failed,
             ActivityStatus::Blocked => RuntimeJobStatus::Failed,
             ActivityStatus::Cancelled => RuntimeJobStatus::Cancelled,
@@ -627,6 +598,7 @@ impl RuntimeEvent {
 #[serde(rename_all = "snake_case")]
 pub enum ActivityStatus {
     Succeeded,
+    SucceededWithBlockers,
     Failed,
     Blocked,
     Cancelled,

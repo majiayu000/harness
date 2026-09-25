@@ -6,7 +6,7 @@ the Codex and Claude CLIs plus basic repository tools.
 Current pinned inputs:
 
 - Base image: `docker.io/library/node:22-bookworm-slim@sha256:813a7480f28fdadac1f7f5c824bcdad435b5bc1322a5968bbbdef8d058f9dff4`
-- Codex CLI package: `@openai/codex@0.142.5`
+- Codex CLI package: `@openai/codex@0.153.4`
 - Claude Code package: `@anthropic-ai/claude-code@2.1.201`
 
 Build and verify locally:

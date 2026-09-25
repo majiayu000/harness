@@ -9,7 +9,7 @@ pub(crate) fn failed_registry_startup_results(error: &str) -> Vec<StoreStartupRe
         StoreStartupResult::critical("plan_db").failed(error),
         StoreStartupResult::optional("issue_workflow_store").failed(error),
         StoreStartupResult::optional("project_workflow_store").failed(error),
-        StoreStartupResult::optional("workflow_runtime_store").failed(error),
+        StoreStartupResult::critical("workflow_runtime_store").failed(error),
         StoreStartupResult::critical("project_registry").failed(error),
         StoreStartupResult::optional("workspace_lease_store").failed(error),
         StoreStartupResult::optional("workspace_manager").failed(error),
@@ -18,7 +18,7 @@ pub(crate) fn failed_registry_startup_results(error: &str) -> Vec<StoreStartupRe
 }
 
 pub(crate) fn failed_registry_bundle(
-    plan_cache: Arc<DashMap<String, harness_exec::plan::ExecPlan>>,
+    plan_cache: Arc<DashMap<String, std::sync::Arc<harness_exec::plan::ExecPlan>>>,
     error: &str,
 ) -> RegistryBundle {
     RegistryBundle {

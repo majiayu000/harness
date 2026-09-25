@@ -6,8 +6,29 @@ use crate::server::HarnessServer;
 pub(crate) async fn build_workspace_pool_config(
     server: &HarnessServer,
     project_registry: Option<&Arc<crate::project_registry::ProjectRegistry>>,
-) -> crate::workspace_pool::WorkspacePoolConfig {
-    let mut per_project = server
+) -> anyhow::Result<crate::workspace_pool::WorkspacePoolConfig> {
+    let mut per_project = configured_project_limits(server);
+
+    if let Some(registry) = project_registry {
+        for project in registry.list().await? {
+            if !project.active {
+                continue;
+            }
+            let Some(limit) = project.max_concurrent else {
+                continue;
+            };
+            per_project.insert(
+                crate::workspace_pool::project_limit_key(&project.root),
+                (limit as usize).max(1),
+            );
+        }
+    }
+
+    Ok(workspace_pool_config_from_limits(server, per_project))
+}
+
+fn configured_project_limits(server: &HarnessServer) -> std::collections::HashMap<String, usize> {
+    server
         .config
         .concurrency
         .per_project
@@ -18,30 +39,13 @@ pub(crate) async fn build_workspace_pool_config(
                 (*limit).max(1),
             )
         })
-        .collect::<std::collections::HashMap<_, _>>();
+        .collect()
+}
 
-    if let Some(registry) = project_registry {
-        match registry.list().await {
-            Ok(projects) => {
-                for project in projects {
-                    if !project.active {
-                        continue;
-                    }
-                    let Some(limit) = project.max_concurrent else {
-                        continue;
-                    };
-                    per_project.insert(
-                        crate::workspace_pool::project_limit_key(&project.root),
-                        (limit as usize).max(1),
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!("workspace pool: failed to load registry project limits: {error}");
-            }
-        }
-    }
-
+fn workspace_pool_config_from_limits(
+    server: &HarnessServer,
+    mut per_project: std::collections::HashMap<String, usize>,
+) -> crate::workspace_pool::WorkspacePoolConfig {
     for project in &server.startup_projects {
         let Some(limit) = project.max_concurrent else {
             continue;

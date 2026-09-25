@@ -4,11 +4,13 @@ use super::{
 };
 use crate::runtime::model::WorkflowInstance;
 use crate::runtime::validator::{ValidationContext, WorkflowDecisionRejectionKind};
+use crate::runtime::WorkflowDefinitionRegistry;
 use chrono::Utc;
 use serde_json::json;
 
 pub(super) async fn validate_request_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registry: &WorkflowDefinitionRegistry,
     instance: &WorkflowInstance,
     request: &WorkflowRuntimeRecoveryRequest<'_>,
     plan: &RecoveryDispatchPlan,
@@ -22,7 +24,7 @@ pub(super) async fn validate_request_tx(
         "recovery-validation-preview",
         request.evidence,
     );
-    let Some(validator) = validator_for_instance(instance)? else {
+    let Some(validator) = validator_for_instance(registry, instance)? else {
         anyhow::bail!(
             "workflow runtime recovery cannot validate definition {}",
             instance.definition_id

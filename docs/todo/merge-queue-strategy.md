@@ -59,4 +59,4 @@ These 5 PRs have deep code conflicts and need manual resolution or recreation:
 | #650 | CI failing (Security Audit, Test) | Fix CI or close |
 | #653 | `http.rs`, `task_executor.rs`, `task_runner.rs` (file delete/modify) | Close — large refactor needs fresh approach |
 | #655 | `http.rs`, `task_db.rs`, `task_runner.rs` | Recreate from latest main |
-| #659 | `event_replay.rs` | Close — #661 (merged) covers same area |
+| #659 | `event_replay/mod.rs` | Close — #661 (merged) covers same area |

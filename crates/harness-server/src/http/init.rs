@@ -81,10 +81,10 @@ fn feishu_alert_credentials(
     let feishu = config.intake.feishu.as_ref();
     let app_id = feishu
         .and_then(|f| f.app_id.clone())
-        .or_else(|| std::env::var("FEISHU_APP_ID").ok())?;
+        .or_else(|| harness_core::config::process_env::var("FEISHU_APP_ID").ok())?;
     let app_secret = feishu
         .and_then(|f| f.app_secret.clone())
-        .or_else(|| std::env::var("FEISHU_APP_SECRET").ok())?;
+        .or_else(|| harness_core::config::process_env::var("FEISHU_APP_SECRET").ok())?;
     Some((app_id, app_secret))
 }
 
@@ -147,16 +147,22 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     if let Some(error) = startup_failure_error(&startup_statuses) {
         return Err(error);
     }
-    let tasks = storage
-        .tasks
-        .as_ref()
-        .expect("critical task store should be present after startup validation")
-        .clone();
-    let postgres_catalog = crate::postgres_catalog::PostgresCatalogMonitor::new(
-        tasks.postgres_pool(),
-        crate::postgres_catalog::PostgresCatalogThresholds::from_server(&server.config.server),
-    )
-    .await;
+    let tasks = storage.tasks.clone();
+    let postgres_catalog = match tasks.as_ref() {
+        Some(tasks) => {
+            crate::postgres_catalog::PostgresCatalogMonitor::new(
+                tasks.postgres_pool(),
+                crate::postgres_catalog::PostgresCatalogThresholds::from_server(
+                    &server.config.server,
+                ),
+            )
+            .await
+        }
+        None => crate::postgres_catalog::PostgresCatalogMonitor::unavailable(
+            crate::postgres_catalog::PostgresCatalogThresholds::from_server(&server.config.server),
+            "task store unavailable",
+        ),
+    };
 
     // Phase 2: engines — rule engine, event store (+purge task), GC agent, skill store.
     // Depends on: storage (none directly, but must precede registry which uses storage.tasks).
@@ -167,8 +173,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     }
     // Phase 3: registry — thread DB, plan DB + cache, project registry, workspace manager,
     // runtime state store.
-    // Depends on: storage.tasks (orphan-worktree cleanup reads terminal task IDs).
-    let registry = builders::registry::build_registry(&server, &dir, &project_root, &tasks).await?;
+    // Depends on: storage.tasks (orphan-worktree cleanup reads terminal task IDs when present).
+    let registry =
+        builders::registry::build_registry(&server, &dir, &project_root, tasks.as_ref()).await?;
     startup_statuses.extend(registry.startup_results.clone());
     if let Some(error) = startup_failure_error(&startup_statuses) {
         return Err(error);
@@ -178,9 +185,20 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     // completion callback.
     // Depends on: engines.gc_agent + engines.events (quality trigger),
     //             registry.project_registry (unused directly but ordering is stable).
-    let intake =
-        builders::intake::build_intake(&server, &storage, &engines, &registry, &project_root, &dir)
-            .await?;
+    // The loop-health registry is created here so the memory-pressure monitor
+    // can register itself during this phase and still land in AppState below
+    // (GH-1981).
+    let background_loops = Arc::new(crate::http::background::BackgroundLoopHealth::new());
+    let intake = builders::intake::build_intake(
+        &server,
+        &storage,
+        &engines,
+        &registry,
+        &project_root,
+        &dir,
+        &background_loops,
+    )
+    .await?;
     // Validate bindings against the sources that were actually registered for
     // poll_tick. Configured webhook-only sources and disabled pollers cannot
     // silently pass startup validation (GH-1656, B-002).
@@ -197,8 +215,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     //             registry.workspace_mgr + registry.project_registry (execution service),
     //             intake.task_queue + intake.completion_callback (execution service).
     let services =
-        builders::services::build_services(&server, &storage, &engines, &registry, &project_root)
-            .await?;
+        builders::services::build_services(&server, &storage, &registry, &project_root).await?;
 
     let configured_capacity = server.config.server.notification_broadcast_capacity;
     let notification_broadcast_capacity = configured_capacity.max(1);
@@ -227,7 +244,8 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             server.config.workflow.circuit_breaker.clone(),
         ),
     );
-    let isolation_availability = crate::isolation_health::probe_isolation_availability().await;
+    let isolation_availability =
+        crate::isolation_health::probe_isolation_availability(&server.config).await;
     let isolation_required_unavailable = !isolation_availability
         .unavailable_required_tiers(&server.config.isolation)
         .is_empty();
@@ -259,6 +277,7 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
     };
 
     Ok(AppState {
+        background_loops,
         core: CoreServices {
             server,
             project_root,
@@ -272,7 +291,9 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             plan_cache: registry.plan_cache,
             issue_workflow_store: registry.issue_workflow_store,
             project_workflow_store: registry.project_workflow_store,
-            workflow_runtime_store: registry.workflow_runtime_store,
+            workflow_runtime_store: Some(registry.workflow_runtime_store.expect(
+                "critical workflow runtime store should be present after startup validation",
+            )),
             project_registry: Some(
                 registry
                     .project_registry
@@ -319,7 +340,6 @@ pub async fn build_app_state(server: Arc<HarnessServer>) -> anyhow::Result<AppSt
             initialized: Arc::new(AtomicBool::new(false)),
             ws_shutdown_tx: broadcast::channel(1).0,
         },
-        interceptors: services.interceptors,
         startup_statuses,
         degraded_subsystems,
         intake: {
@@ -432,7 +452,7 @@ pub(crate) fn build_completion_callback(
                 if let task_runner::TaskStatus::Done = &task.status {
                     if let Some(pr_url) = task.pr_url.as_deref() {
                         if let Some((owner, repo, pr_num)) =
-                            harness_core::prompts::parse_github_pr_url(pr_url)
+                            harness_agents::output_parsing::parse_github_pr_url(pr_url)
                         {
                             let resolved_token =
                                 crate::github_auth::resolve_github_token(github_token.as_deref());
@@ -623,17 +643,17 @@ async fn post_review_bot_comment(
     body: &str,
     github_token: &str,
 ) -> anyhow::Result<()> {
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments");
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {github_token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", "harness-bot")
-        .json(&serde_json::json!({ "body": body }))
-        .send()
-        .await?;
+    let url = format!(
+        "{}/repos/{owner}/{repo}/issues/{pr_number}/comments",
+        crate::github_client::github_api_base_url()
+    );
+    let client = crate::github_client::github_request();
+    let resp = crate::github_client::apply_github_headers(
+        client.post(&url).json(&serde_json::json!({ "body": body })),
+        Some(github_token),
+    )
+    .send()
+    .await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -662,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_app_state_aborts_on_pool_timeout_for_critical_task_store() {
+    async fn build_app_state_continues_when_optional_task_store_fails() {
         if resolve_database_url(None).is_err() {
             return;
         }
@@ -676,11 +696,34 @@ mod tests {
             build_app_state(server),
         )
         .await;
+        let state = match result {
+            Ok(state) => state,
+            Err(err) => panic!("optional task store failure must not abort startup: {err}"),
+        };
+        assert!(state.core.tasks.is_none());
+        assert!(state.degraded_subsystems.contains(&"tasks"));
+    }
+
+    #[tokio::test]
+    async fn build_app_state_aborts_on_critical_workflow_runtime_store_failure() {
+        if resolve_database_url(None).is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = make_test_server(dir.path());
+        let result = builders::with_forced_startup_failures(
+            &[(
+                "workflow_runtime_store",
+                "pool timed out while waiting for an open connection",
+            )],
+            build_app_state(server),
+        )
+        .await;
         let err = match result {
-            Ok(_) => panic!("critical task store failure must abort startup"),
+            Ok(_) => panic!("critical workflow runtime store failure must abort startup"),
             Err(err) => err,
         };
         assert!(crate::test_helpers::is_pool_timeout(&err));
-        assert!(err.to_string().contains("tasks"));
+        assert!(err.to_string().contains("workflow_runtime_store"));
     }
 }

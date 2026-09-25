@@ -1,5 +1,67 @@
 use super::*;
 
+async fn spawn_graphql_responses(
+    responses: Vec<String>,
+) -> anyhow::Result<(String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>)> {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let received_server = std::sync::Arc::clone(&received);
+    tokio::spawn(async move {
+        for response_body in responses {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(request) = read_http_request(&mut socket).await else {
+                return;
+            };
+            received_server.lock().await.push(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok((format!("http://{addr}"), received))
+}
+
+async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 4_096];
+    loop {
+        let read = socket.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.len() > 64 * 1_024 {
+            return None;
+        }
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let header_end = header_end + 4;
+        let headers = std::str::from_utf8(&request[..header_end]).ok()?;
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })?;
+        if request.len() >= header_end + content_length {
+            break;
+        }
+    }
+    String::from_utf8(request).ok()
+}
+
 fn ready_pr() -> Value {
     json!({
         "number": 77,
@@ -51,6 +113,7 @@ fn maps_graphql_pr_to_runtime_snapshot_artifact() {
     assert_eq!(snapshot["review_decision"], "APPROVED");
     assert_eq!(snapshot["is_draft"], false);
     assert_eq!(snapshot["active_unresolved_review_threads_count"], 0);
+    assert_eq!(snapshot["actionable_blocker_count"], 0);
     assert_eq!(snapshot["changed_files"][0]["path"], "src/lib.rs");
     assert_eq!(snapshot["closing_issues"][0]["number"], 12);
     assert_eq!(snapshot["closing_issues_complete"], true);
@@ -160,6 +223,226 @@ fn pr_remote_fact_hash_ignores_observed_at() -> anyhow::Result<()> {
 }
 
 #[test]
+fn pr_remote_fact_hash_ignores_repo_case() -> anyhow::Result<()> {
+    let upper_target = GitHubPrSnapshotTarget::new("Owner/Repo", 77)?;
+    let lower_target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+    let upper = GitHubPrSnapshotArtifacts {
+        raw_pr: ready_pr(),
+        normalized_snapshot: normalize_github_pr_snapshot(&upper_target, &ready_pr())?,
+    }
+    .remote_fact_snapshot()?;
+    let lower = GitHubPrSnapshotArtifacts {
+        raw_pr: ready_pr(),
+        normalized_snapshot: normalize_github_pr_snapshot(&lower_target, &ready_pr())?,
+    }
+    .remote_fact_snapshot()?;
+
+    assert_eq!(upper.fact_hash, lower.fact_hash);
+    assert_ne!(upper.facts["repo"], lower.facts["repo"]);
+    Ok(())
+}
+
+#[test]
+fn pr_remote_fact_hash_tracks_check_run_identity() -> anyhow::Result<()> {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+    let mut first_pr = ready_pr();
+    first_pr["statusCheckRollup"] = json!({
+        "state": "FAILURE",
+        "contexts": {
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [{
+                "__typename": "CheckRun",
+                "id": "CR_first",
+                "databaseId": 101,
+                "name": "Test",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+            }]
+        }
+    });
+    let mut second_pr = first_pr.clone();
+    second_pr["statusCheckRollup"]["contexts"]["nodes"][0]["id"] = json!("CR_second");
+    second_pr["statusCheckRollup"]["contexts"]["nodes"][0]["databaseId"] = json!(102);
+    second_pr["statusCheckRollup"]["contexts"]["nodes"][0]["detailsUrl"] =
+        json!("https://github.com/owner/repo/actions/runs/102");
+
+    let first = normalize_github_pr_snapshot(&target, &first_pr)?;
+    let second = normalize_github_pr_snapshot(&target, &second_pr)?;
+
+    assert_eq!(first["status_check_contexts"][0]["id"], "CR_first");
+    assert_eq!(second["status_check_contexts"][0]["id"], "CR_second");
+    let first = GitHubPrSnapshotArtifacts {
+        raw_pr: first_pr,
+        normalized_snapshot: first,
+    }
+    .remote_fact_snapshot()?;
+    let second = GitHubPrSnapshotArtifacts {
+        raw_pr: second_pr,
+        normalized_snapshot: second,
+    }
+    .remote_fact_snapshot()?;
+    assert_ne!(first.fact_hash, second.fact_hash);
+    Ok(())
+}
+
+#[test]
+fn github_pr_snapshot_query_requests_check_run_identity() {
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("contexts(first: 100)"));
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("... on CheckRun"));
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("databaseId"));
+    assert!(GITHUB_PR_SNAPSHOT_QUERY.contains("... on StatusContext"));
+}
+
+#[tokio::test]
+async fn fetches_all_status_check_context_pages() -> anyhow::Result<()> {
+    let mut first_pr = ready_pr();
+    first_pr["statusCheckRollup"] = json!({
+        "id": "SCR_rollup",
+        "state": "FAILURE",
+        "contexts": {
+            "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"},
+            "nodes": [{
+                "__typename": "CheckRun",
+                "id": "CR_first",
+                "databaseId": 101,
+                "name": "Test 1",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+            }]
+        }
+    });
+    let responses = vec![
+        json!({
+            "data": {
+                "repository": {
+                    "pullRequest": first_pr
+                }
+            }
+        })
+        .to_string(),
+        json!({
+            "data": {
+                "node": {
+                    "contexts": {
+                        "pageInfo": {"hasNextPage": false, "endCursor": "cursor-2"},
+                        "nodes": [{
+                            "__typename": "CheckRun",
+                            "id": "CR_second",
+                            "databaseId": 102,
+                            "name": "Test 2",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE",
+                            "detailsUrl": "https://github.com/owner/repo/actions/runs/102"
+                        }]
+                    }
+                }
+            }
+        })
+        .to_string(),
+    ];
+    let (graphql_url, received) = spawn_graphql_responses(responses).await?;
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+
+    let artifacts =
+        fetch_github_pr_snapshot_with_client(&reqwest::Client::new(), &target, None, &graphql_url)
+            .await?;
+
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts_complete"],
+        true
+    );
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let received = received.lock().await;
+    assert_eq!(received.len(), 2);
+    assert!(received[1].contains(r#""after":"cursor-1""#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn caps_status_check_context_pages_and_marks_snapshot_incomplete() -> anyhow::Result<()> {
+    let mut first_pr = ready_pr();
+    first_pr["statusCheckRollup"] = json!({
+        "id": "SCR_rollup",
+        "state": "FAILURE",
+        "contexts": {
+            "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"},
+            "nodes": [{
+                "__typename": "CheckRun",
+                "id": "CR_1",
+                "databaseId": 101,
+                "name": "Test 1",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/owner/repo/actions/runs/101"
+            }]
+        }
+    });
+    let mut responses = vec![json!({
+        "data": {
+            "repository": {
+                "pullRequest": first_pr
+            }
+        }
+    })
+    .to_string()];
+    for page in 2..=4 {
+        responses.push(
+            json!({
+                "data": {
+                    "node": {
+                        "contexts": {
+                            "pageInfo": {
+                                "hasNextPage": true,
+                                "endCursor": format!("cursor-{page}")
+                            },
+                            "nodes": [{
+                                "__typename": "CheckRun",
+                                "id": format!("CR_{page}"),
+                                "databaseId": 100 + page,
+                                "name": format!("Test {page}"),
+                                "status": "COMPLETED",
+                                "conclusion": "FAILURE",
+                                "detailsUrl": format!(
+                                    "https://github.com/owner/repo/actions/runs/{}",
+                                    100 + page
+                                )
+                            }]
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+    }
+    let (graphql_url, received) = spawn_graphql_responses(responses).await?;
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+
+    let artifacts =
+        fetch_github_pr_snapshot_with_client(&reqwest::Client::new(), &target, None, &graphql_url)
+            .await?;
+
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts_complete"],
+        false
+    );
+    assert_eq!(
+        artifacts.normalized_snapshot["status_check_contexts"]
+            .as_array()
+            .map(Vec::len),
+        Some(4)
+    );
+    assert_eq!(received.lock().await.len(), 4);
+    Ok(())
+}
+
+#[test]
 fn ready_pr_emits_pr_ready_to_merge_signal() {
     let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
     let snapshot = normalize_github_pr_snapshot(&target, &ready_pr()).unwrap();
@@ -197,7 +480,25 @@ fn unresolved_review_threads_emit_blocking_feedback() {
     let signal = pr_feedback_signal_for_snapshot(&snapshot);
 
     assert_eq!(snapshot["active_unresolved_review_threads_count"], 1);
+    assert_eq!(snapshot["actionable_blocker_count"], 1);
     assert_eq!(signal.signal_type, "FeedbackFound");
+    assert_eq!(signal.signal["actionable_blocker_count"], 1);
+}
+
+#[test]
+fn outdated_unresolved_review_threads_do_not_pollute_blocker_count() {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77).unwrap();
+    let mut pr = ready_pr();
+    pr["reviewThreads"]["nodes"] = json!([
+        {"id": "thread-1", "path": "src/lib.rs", "line": 10, "isResolved": false, "isOutdated": true}
+    ]);
+    let snapshot = normalize_github_pr_snapshot(&target, &pr).unwrap();
+
+    let signal = pr_feedback_signal_for_snapshot(&snapshot);
+
+    assert_eq!(snapshot["active_unresolved_review_threads_count"], 0);
+    assert_eq!(snapshot["actionable_blocker_count"], 0);
+    assert_eq!(signal.signal_type, "PrReadyToMerge");
 }
 
 #[test]
@@ -259,4 +560,46 @@ fn github_graphql_error_is_failed_external_dependency() {
         result.artifacts[0].artifact_type,
         SERVER_PR_SNAPSHOT_ERROR_ARTIFACT
     );
+}
+
+#[test]
+fn eval_draft_activity_result_requests_evaluator_validation() {
+    let snapshot = json!({
+        "snapshot_source": "server_github_graphql",
+        "state": "OPEN",
+        "pr_number": 77,
+        "pr_url": "https://github.com/owner/repo/pull/77",
+        "head_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "is_draft": true,
+        "expected_base_ref": "main",
+        "base_ref": "main",
+    });
+    assert!(eval_draft_snapshot_allows_validation(&snapshot));
+    let artifacts = GitHubPrSnapshotArtifacts {
+        raw_pr: snapshot.clone(),
+        normalized_snapshot: snapshot,
+    };
+
+    let result = artifacts.eval_draft_validation_activity_result("inspect_pr_feedback");
+
+    assert_eq!(result.signals.len(), 1);
+    assert_eq!(result.signals[0].signal_type, "PrReadyToMerge");
+    assert!(result.summary.contains("eval draft"));
+}
+
+#[test]
+fn absent_rollup_is_not_evidence_of_no_checks() -> anyhow::Result<()> {
+    let target = GitHubPrSnapshotTarget::new("owner/repo", 77)?;
+    let mut pr = ready_pr();
+    pr["statusCheckRollup"] = Value::Null;
+    assert_eq!(
+        normalize_github_pr_snapshot(&target, &pr)?["status_check_contexts_complete"],
+        true
+    );
+    pr.as_object_mut().unwrap().remove("statusCheckRollup");
+    assert_eq!(
+        normalize_github_pr_snapshot(&target, &pr)?["status_check_contexts_complete"],
+        false
+    );
+    Ok(())
 }

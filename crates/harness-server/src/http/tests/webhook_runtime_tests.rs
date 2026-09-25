@@ -93,6 +93,128 @@ async fn feishu_webhook_rejects_invalid_token() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn feishu_webhook_enqueues_through_execution_service() -> anyhow::Result<()> {
+    use crate::services::execution::{EnqueueTaskError, ExecutionService, QueueDomain};
+    use crate::workflow_runtime_submission::{CreateTaskRequest, TaskId};
+    use std::sync::Mutex;
+
+    struct RecordingExecutionService {
+        enqueues: Mutex<Vec<CreateTaskRequest>>,
+        domain_enqueues: Mutex<Vec<(CreateTaskRequest, QueueDomain)>>,
+    }
+
+    #[async_trait]
+    impl ExecutionService for RecordingExecutionService {
+        async fn enqueue(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError> {
+            self.enqueues.lock().expect("enqueues lock").push(req);
+            Ok(TaskId::from_str("feishu-recorded-task"))
+        }
+
+        async fn enqueue_in_domain(
+            &self,
+            req: CreateTaskRequest,
+            queue_domain: QueueDomain,
+        ) -> Result<TaskId, EnqueueTaskError> {
+            self.domain_enqueues
+                .lock()
+                .expect("domain enqueues lock")
+                .push((req, queue_domain));
+            Err(EnqueueTaskError::Internal(
+                "feishu webhook must call enqueue, not enqueue_in_domain".to_string(),
+            ))
+        }
+
+        async fn enqueue_background(
+            &self,
+            _req: CreateTaskRequest,
+        ) -> Result<TaskId, EnqueueTaskError> {
+            Err(EnqueueTaskError::Internal(
+                "feishu webhook must call enqueue, not enqueue_background".to_string(),
+            ))
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.intake.feishu = Some(make_feishu_config(Some("secret-123")));
+    let mut state = make_read_only_route_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let recorder = Arc::new(RecordingExecutionService {
+        enqueues: Mutex::new(Vec::new()),
+        domain_enqueues: Mutex::new(Vec::new()),
+    });
+    let state_mut = Arc::get_mut(&mut state).expect("exclusive AppState for test");
+    state_mut.execution_svc = recorder.clone();
+    let project_root = state.core.project_root.clone();
+    let app = webhook_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook/feishu")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    feishu_event_payload(Some("secret-123")).to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await?;
+    assert_eq!(json["ok"], true);
+
+    let enqueues = recorder.enqueues.lock().expect("enqueues lock");
+    assert_eq!(enqueues.len(), 1);
+    assert!(recorder
+        .domain_enqueues
+        .lock()
+        .expect("domain enqueues lock")
+        .is_empty());
+    assert_eq!(enqueues[0].project.as_ref(), Some(&project_root));
+    assert!(enqueues[0]
+        .prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.contains("fix login bug")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn feishu_webhook_maps_execution_service_enqueue_failure() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = harness_core::config::HarnessConfig::default();
+    config.intake.feishu = Some(make_feishu_config(Some("secret-123")));
+    let state = make_read_only_route_test_state_with(
+        dir.path(),
+        config,
+        harness_agents::registry::AgentRegistry::new("test"),
+    )
+    .await?;
+    let app = webhook_app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhook/feishu")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    feishu_event_payload(Some("secret-123")).to_string(),
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let json = response_json(response).await?;
+    assert_eq!(json["error"], "failed to enqueue task");
+    Ok(())
+}
+
+#[tokio::test]
 async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     init_fake_git_repo(dir.path())?;
@@ -111,7 +233,7 @@ async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow:
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -141,7 +263,10 @@ async fn webhook_issues_opened_with_mention_schedules_runtime_issue() -> anyhow:
     let json = response_json(response).await?;
     assert_eq!(json["status"], "planning");
     assert_eq!(json["execution_path"], "workflow_runtime");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     assert_runtime_issue_submission(
         &state,
         dir.path(),
@@ -167,7 +292,7 @@ async fn webhook_issues_opened_requires_workflow_runtime_store() -> anyhow::Resu
     });
     let (state, _agent) =
         make_test_state_with_agent_and_config(dir.path(), dir.path(), config).await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -193,13 +318,13 @@ async fn webhook_issues_opened_requires_workflow_runtime_store() -> anyhow::Resu
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let json = response_json(response).await?;
+    assert_eq!(json["error"], "workflow runtime store unavailable");
     assert_eq!(
-        json["error"],
-        "workflow runtime store is required for submissions"
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
     );
-    assert_eq!(state.core.tasks.count(), before_count);
     Ok(())
 }
 
@@ -309,7 +434,7 @@ async fn webhook_routes_runtime_prompt_to_repo_specific_project_root() -> anyhow
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -345,7 +470,10 @@ async fn webhook_routes_runtime_prompt_to_repo_specific_project_root() -> anyhow
     assert_eq!(json["status"], "implementing");
     assert_eq!(json["execution_path"], "workflow_runtime");
     let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     assert_runtime_prompt_submission(&state, repo_b_dir.path(), runtime_task_id).await?;
     Ok(())
 }
@@ -410,7 +538,7 @@ async fn webhook_ignores_issue_tasks_when_repo_is_unmapped() -> anyhow::Result<(
             .contains("not configured"),
         "reason should explain why the repo was ignored"
     );
-    assert_eq!(state.core.tasks.count(), 0);
+    assert_eq!(state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0), 0);
     Ok(())
 }
 
@@ -437,7 +565,7 @@ async fn webhook_pull_request_review_changes_requested_requests_local_review_gat
         harness_agents::registry::AgentRegistry::new("test"),
     )
     .await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({
@@ -474,7 +602,10 @@ async fn webhook_pull_request_review_changes_requested_requests_local_review_gat
     assert_eq!(json["workflow_state"], "local_review_gate");
     assert_eq!(json["execution_path"], "workflow_runtime");
     let runtime_task_id = json["task_id"].as_str().expect("task id should be present");
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     let store = state
         .core
         .workflow_runtime_store
@@ -493,7 +624,7 @@ async fn webhook_ping_event_returns_accepted_without_creating_task() -> anyhow::
     let dir = tempfile::tempdir()?;
     let secret = "secret";
     let (state, _agent) = make_test_state_with_agent(dir.path(), Some(secret)).await?;
-    let before_count = state.core.tasks.count();
+    let before_count = state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0);
     let app = webhook_app(state.clone());
 
     let payload = serde_json::json!({ "zen": "Design for failure." });
@@ -513,7 +644,10 @@ async fn webhook_ping_event_returns_accepted_without_creating_task() -> anyhow::
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(state.core.tasks.count(), before_count);
+    assert_eq!(
+        state.core.tasks.as_ref().map(|t| t.count()).unwrap_or(0),
+        before_count
+    );
     Ok(())
 }
 

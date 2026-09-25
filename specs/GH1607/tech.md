@@ -170,9 +170,8 @@ scheduler.
 
 ## Edge Cases
 
-- Agent reports `external_state` but also emits `SCOPE_TOO_LARGE` or
-  another blocking signal: blocking signals win; the continuation check
-  runs only on the success path after existing signal handling.
+- Agent reports `external_state` with a non-success activity outcome: status
+  routing wins; the continuation check runs only on the success path.
 - Restart between completion commit and dispatch of attempt N+1: the
   outbox command with the attempt-scoped dedupe key survives; dispatch
   resumes; re-reduction of the same completion event is idempotent via

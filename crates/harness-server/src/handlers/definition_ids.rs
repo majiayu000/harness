@@ -13,7 +13,7 @@
 //! mutating the process-global registry.
 
 use harness_workflow::runtime::{
-    known_workflow_definition_ids, PR_FEEDBACK_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
+    WorkflowDefinitionRegistry, PR_FEEDBACK_DEFINITION_ID, QUALITY_GATE_DEFINITION_ID,
 };
 
 /// All definition ids for operator enumeration, from the frozen registry, in
@@ -21,8 +21,10 @@ use harness_workflow::runtime::{
 ///
 /// Errors when the registry reports no definitions (B-006) — impossible after a
 /// healthy startup, where the built-ins are always registered.
-pub fn operator_definition_ids() -> anyhow::Result<Vec<String>> {
-    sorted_non_empty(known_workflow_definition_ids())
+pub fn operator_definition_ids(
+    registry: &WorkflowDefinitionRegistry,
+) -> anyhow::Result<Vec<String>> {
+    sorted_non_empty(registry.known_definition_ids())
 }
 
 /// Definition ids for active-count surfaces (dashboard active counts, overview).
@@ -33,8 +35,10 @@ pub fn operator_definition_ids() -> anyhow::Result<Vec<String>> {
 /// runtime metrics" (commit 8d0fa39a), where active counts enumerated only the
 /// two top-level built-ins. Declarative definitions are always included: they
 /// are top-level and never shadow a built-in parent (B-002, B-003).
-pub fn active_count_definition_ids() -> anyhow::Result<Vec<String>> {
-    Ok(exclude_builtin_children(operator_definition_ids()?))
+pub fn active_count_definition_ids(
+    registry: &WorkflowDefinitionRegistry,
+) -> anyhow::Result<Vec<String>> {
+    Ok(exclude_builtin_children(operator_definition_ids(registry)?))
 }
 
 /// Sort ids and reject an empty set. Pure so it is testable without the global
@@ -110,7 +114,8 @@ mod tests {
     #[test]
     fn operator_ids_from_global_registry_include_all_builtins(/* B-001 */) {
         // The process-global registry is always seeded with the four built-ins.
-        let ids = operator_definition_ids().expect("built-ins registered");
+        let ids = operator_definition_ids(&WorkflowDefinitionRegistry::with_builtins())
+            .expect("built-ins registered");
         for expected in [
             GITHUB_ISSUE_PR_DEFINITION_ID,
             PR_FEEDBACK_DEFINITION_ID,

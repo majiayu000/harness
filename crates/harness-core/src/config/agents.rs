@@ -3,92 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-/// Preset capability profile that determines which tools an agent may use.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CapabilityProfile {
-    /// Read-only access: Read, Grep, Glob only. Suitable for GC/review agents.
-    ReadOnly,
-    /// Standard access: Read, Write, Edit, Bash. Suitable for implementation agents.
-    Standard,
-    /// Full access — all tools. Default profile.
-    #[default]
-    Full,
-}
+mod permissions;
 
-impl CapabilityProfile {
-    /// Returns the explicit tool list for this profile, or `None` for `Full`
-    /// (meaning no restriction is applied to the CLI invocation).
-    pub fn tools(self) -> Option<Vec<String>> {
-        match self {
-            CapabilityProfile::ReadOnly => Some(vec![
-                "Read".to_string(),
-                "Grep".to_string(),
-                "Glob".to_string(),
-            ]),
-            CapabilityProfile::Standard => Some(vec![
-                "Read".to_string(),
-                "Write".to_string(),
-                "Edit".to_string(),
-                "Bash".to_string(),
-            ]),
-            CapabilityProfile::Full => None,
-        }
-    }
-
-    /// Human-readable description injected into the agent prompt as context.
-    pub fn prompt_note(self) -> Option<&'static str> {
-        match self {
-            CapabilityProfile::ReadOnly => Some(
-                "Tool restriction: you are operating in read-only mode. \
-                 Only Read, Grep, and Glob are permitted. \
-                 Do NOT call Write, Edit, Bash, or any other tool.",
-            ),
-            CapabilityProfile::Standard => Some(
-                "Tool restriction: you are operating in standard mode. \
-                 Only Read, Write, Edit, and Bash are permitted. \
-                 Do NOT call tools outside this list.",
-            ),
-            CapabilityProfile::Full => None,
-        }
-    }
-}
-
-/// Controls how much autonomy the agent has when executing tasks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalPolicy {
-    /// Agent suggests changes but does not apply them.
-    Suggest,
-    /// Agent can edit files but requires human approval for shell commands.
-    #[default]
-    AutoEdit,
-    /// Agent has full autonomy — no approval gates.
-    FullAuto,
-}
-
-/// OS-level sandbox mode for agent subprocess execution.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SandboxMode {
-    ReadOnly,
-    ReadOnlyWithNetwork,
-    WorkspaceWrite,
-    #[default]
-    DangerFullAccess,
-}
-
-impl std::fmt::Display for SandboxMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let value = match self {
-            SandboxMode::ReadOnly => "read-only",
-            SandboxMode::ReadOnlyWithNetwork => "read-only-with-network",
-            SandboxMode::WorkspaceWrite => "workspace-write",
-            SandboxMode::DangerFullAccess => "danger-full-access",
-        };
-        write!(f, "{value}")
-    }
-}
+pub use permissions::{AgentPermissionMode, ApprovalPolicy, CapabilityProfile, SandboxMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentsConfig {
@@ -102,6 +19,10 @@ pub struct AgentsConfig {
     pub claude: ClaudeAgentConfig,
     pub codex: CodexAgentConfig,
     pub anthropic_api: AnthropicApiConfig,
+    #[serde(default)]
+    pub opencode: OpenCodeAgentConfig,
+    #[serde(default)]
+    pub cursor: CursorAgentConfig,
     #[serde(default)]
     pub review: AgentReviewConfig,
     #[serde(default)]
@@ -147,6 +68,16 @@ impl AgentsConfig {
         }
         self.capability_profile.tools()
     }
+
+    /// Resolve whether the effective agent permissions are scoped or full.
+    /// An explicit `allowed_tools` value always selects scoped mode, including
+    /// an empty deny-all list, even when `capability_profile = "full"`.
+    pub fn resolve_permission_mode(&self) -> AgentPermissionMode {
+        if self.allowed_tools.is_some() {
+            return AgentPermissionMode::Scoped;
+        }
+        self.capability_profile.permission_mode()
+    }
 }
 
 impl Default for AgentsConfig {
@@ -157,6 +88,8 @@ impl Default for AgentsConfig {
             claude: ClaudeAgentConfig::default(),
             codex: CodexAgentConfig::default(),
             anthropic_api: AnthropicApiConfig::default(),
+            opencode: OpenCodeAgentConfig::default(),
+            cursor: CursorAgentConfig::default(),
             review: AgentReviewConfig::default(),
             approval_policy: ApprovalPolicy::default(),
             sandbox_mode: SandboxMode::default(),
@@ -746,6 +679,40 @@ pub struct AnthropicApiConfig {
     pub default_model: String,
     #[serde(default = "default_anthropic_api_max_tokens")]
     pub max_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenCodeAgentConfig {
+    pub cli_path: PathBuf,
+    /// Empty string means "use opencode's own configured default model".
+    #[serde(default)]
+    pub default_model: String,
+}
+
+impl Default for OpenCodeAgentConfig {
+    fn default() -> Self {
+        Self {
+            cli_path: PathBuf::from("opencode"),
+            default_model: String::new(),
+        }
+    }
+}
+
+/// Local Cursor Agent CLI configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CursorAgentConfig {
+    pub cli_path: PathBuf,
+    pub default_model: String,
+}
+
+impl Default for CursorAgentConfig {
+    fn default() -> Self {
+        Self {
+            cli_path: PathBuf::from("cursor-agent"),
+            default_model: "auto".to_string(),
+        }
+    }
 }
 
 fn default_anthropic_api_max_tokens() -> u32 {

@@ -3,8 +3,8 @@ use harness_core::config::workflow::{
     DeclaredProgressMode, DeclaredState, WorkflowActivityPolicy, WorkflowDefinitionPolicy,
 };
 use harness_workflow::runtime::{
-    build_declarative_definition, DeclarativeDefinitionResolution, RuntimeKind, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID,
+    build_declarative_definition, DataProvenance, DeclarativeDefinitionResolution, RuntimeKind,
+    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -63,7 +63,7 @@ fn declarative_activity_policy_binds_exactly_and_missing_policy_fails_closed() {
         "working",
         WorkflowSubject::new("declarative", "task:policy-test"),
     )
-    .with_data(json!({ "definition_hash": definition.definition_hash() }));
+    .with_server_data(json!({ "definition_hash": definition.definition_hash() }));
     let job = RuntimeJob::pending(
         "command-policy",
         RuntimeKind::CodexJsonrpc,
@@ -76,6 +76,7 @@ fn declarative_activity_policy_binds_exactly_and_missing_policy_fails_closed() {
         WorkflowActivityPolicy {
             prompt: Some("Inspect only the declared repository surface.".to_string()),
             validation: vec!["cargo check -p harness-server --all-targets".to_string()],
+            agent_contract: None,
         },
     );
     let mut packet = json!({
@@ -141,6 +142,7 @@ fn built_in_or_unmatched_activity_does_not_bind_declarative_activity_policy() {
         WorkflowActivityPolicy {
             prompt: Some("Must not bind to built-in behavior.".to_string()),
             validation: vec!["false".to_string()],
+            agent_contract: None,
         },
     );
     let mut packet = json!({
@@ -182,10 +184,16 @@ fn runtime_prompt_packet_omits_duplicated_additional_prompt() {
         "planning",
         WorkflowSubject::new("issue", "issue:42"),
     )
-    .with_data(json!({
-        "additional_prompt": "Inspect the existing pull request.",
-        "issue_number": 42
-    }));
+    .with_data_field_provenance(
+        json!({
+            "additional_prompt": "Inspect the existing pull request.",
+            "issue_number": 42
+        }),
+        |field| match field {
+            "additional_prompt" => DataProvenance::External,
+            _ => DataProvenance::Server,
+        },
+    );
     let mut runtime_profile = RuntimeProfile::new("codex-default", RuntimeKind::CodexJsonrpc);
     runtime_profile.timeout_secs = Some(3600);
     let resolved_settings =
@@ -199,12 +207,13 @@ fn runtime_prompt_packet_omits_duplicated_additional_prompt() {
         .unwrap_or_else(|error| panic!("test runtime settings should resolve: {error}"));
 
     let packet = build_runtime_prompt_packet(
+        &harness_workflow::runtime::WorkflowDefinitionRegistry::with_builtins(),
         &job,
         Some(&workflow),
         Path::new("/workspaces/job-1"),
         Path::new("/repo"),
         &runtime_profile,
-        &resolved_settings,
+        Some(&resolved_settings),
         &WorkflowDocument::default(),
         &[],
         None,
@@ -214,8 +223,11 @@ fn runtime_prompt_packet_omits_duplicated_additional_prompt() {
     assert!(packet["workflow"]["data"]
         .get("additional_prompt")
         .is_none());
-    assert_eq!(
-        packet["command_input"]["command"]["additional_prompt"],
-        "Inspect the existing pull request."
-    );
+    assert!(packet["command_input"]["command"]
+        .get("additional_prompt")
+        .is_none());
+    assert!(packet
+        .pointer("/untrusted_command_input/external_fields/command/additional_prompt")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.contains("Inspect the existing pull request.")));
 }

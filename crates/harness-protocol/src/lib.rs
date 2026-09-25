@@ -3,6 +3,7 @@ pub mod context;
 pub mod contract;
 pub mod methods;
 pub mod notifications;
+pub mod rest;
 
 pub use methods::{
     AGENT_ERROR, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,

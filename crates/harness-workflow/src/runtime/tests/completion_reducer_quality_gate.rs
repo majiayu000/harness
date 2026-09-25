@@ -3,11 +3,17 @@
 fn quality_gate_run_decision_starts_runtime_activity() {
     let instance = quality_gate_instance("pending");
     let commands = vec!["cargo check".to_string(), "cargo test".to_string()];
+    let command_argv = vec![vec!["cargo".to_string(), "check".to_string()]];
+    let eval = json!({"eval_run_id": "run-1", "case_id": "case-1"});
+    let expected_head_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let output = build_quality_gate_run_decision(
         &instance,
         QualityGateDecisionInput {
             reason: "Run validation before merge.",
             validation_commands: &commands,
+            validation_commands_argv: &command_argv,
+            eval: Some(&eval),
+            expected_head_sha: Some(expected_head_sha),
         },
     );
 
@@ -21,6 +27,15 @@ fn quality_gate_run_decision_starts_runtime_activity() {
     assert_eq!(
         output.decision.commands[0].command["validation_commands"][1],
         "cargo test"
+    );
+    assert_eq!(
+        output.decision.commands[0].command["validation_commands_argv"][0],
+        serde_json::json!(["cargo", "check"])
+    );
+    assert_eq!(output.decision.commands[0].command["eval"], eval);
+    assert_eq!(
+        output.decision.commands[0].command["expected_head_sha"],
+        expected_head_sha
     );
     DecisionValidator::quality_gate()
         .validate(
@@ -43,7 +58,10 @@ fn runtime_completion_reducer_passes_quality_gate_after_success() {
             }),
         ))
         .with_validation(ValidationRecord::new("cargo check", "passed"))
-        .with_validation(ValidationRecord::new("cargo test", "passed"));
+        .with_validation(ValidationRecord::new("cargo test", "passed"))
+        // GH-1766 B-003: the server re-runs the validation commands and
+        // attaches the digest; an agent claim alone cannot pass the gate.
+        .with_artifact(server_validation_digest_ok(&["cargo check", "cargo test"]));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -83,7 +101,8 @@ fn runtime_completion_reducer_marks_issue_pr_ready_after_quality_gate_pass() {
                 "validation": "passed"
             }),
         ))
-        .with_validation(ValidationRecord::new("cargo check", "passed"));
+        .with_validation(ValidationRecord::new("cargo check", "passed"))
+        .with_artifact(server_validation_digest_ok(&["cargo check"]));
     let event = WorkflowEvent::new(
         &instance.id,
         1,
@@ -320,6 +339,10 @@ fn runtime_completion_reducer_blocks_quality_gate_invalid_structured_decision_wi
             }),
         ))
         .with_validation(ValidationRecord::new("cargo test", "passed"))
+        // The gate contract itself is satisfied (GH-1766 digest present) so
+        // the block below comes from the stale structured decision, not from
+        // missing validation evidence.
+        .with_artifact(server_validation_digest_ok(&["cargo test"]))
         .with_artifact(ActivityArtifact::new(
             "workflow_decision",
             serde_json::to_value(&proposed_decision).expect("decision should serialize"),
@@ -348,7 +371,7 @@ fn runtime_completion_reducer_blocks_quality_gate_invalid_structured_decision_wi
 
 #[test]
 fn runtime_completion_reducer_retries_quality_gate_transient_failure() {
-    let instance = quality_gate_instance("checking").with_data(json!({
+    let instance = quality_gate_instance("checking").with_server_data(json!({
         "runtime_retry_policy": {
             "activity_retries": {
                 "run_quality_gate": {

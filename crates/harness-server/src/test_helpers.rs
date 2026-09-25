@@ -122,6 +122,56 @@ use crate::{http::AppState, server::HarnessServer, thread_manager::ThreadManager
 use harness_agents::registry::AgentRegistry;
 use harness_core::config::HarnessConfig;
 
+/// Fixture-only writer for a workflow row the public API refuses to produce.
+///
+/// The public `upsert_instance` is insert-only (GH-1784), so a fixture that
+/// needs a mid-lifecycle row has no validated path to it. This is the
+/// harness-server counterpart of the workflow crate's
+/// `force_upsert_lifecycle_state_for_test`, which is not reachable across the
+/// crate boundary.
+///
+/// It bypasses **only** the GH-1784 lifecycle rules. It does **not** bypass
+/// the GH-1771 row-level provenance invariant: the instance's `workflow.data`
+/// must still be fully covered by a provenance sidecar whose digests match
+/// it. Lifecycle position is what a fixture may fabricate; a sidecar that
+/// lies about its own data is a corrupt row no test needs.
+///
+/// Reach for a classified write API first. Use this only when the row's
+/// *lifecycle position* is what the fixture is constructing.
+#[cfg(test)]
+pub async fn force_upsert_runtime_lifecycle_state_for_test(
+    store: &harness_workflow::runtime::WorkflowRuntimeStore,
+    instance: &harness_workflow::runtime::WorkflowInstance,
+) -> anyhow::Result<()> {
+    instance.validate_data_provenance()?;
+    let data = serde_json::to_string(instance)?;
+    sqlx::query(
+        "INSERT INTO workflow_instances
+            (id, definition_id, state, subject_type, subject_key, parent_workflow_id, data, version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+         ON CONFLICT (id) DO UPDATE SET
+            definition_id = EXCLUDED.definition_id,
+            state = EXCLUDED.state,
+            subject_type = EXCLUDED.subject_type,
+            subject_key = EXCLUDED.subject_key,
+            parent_workflow_id = EXCLUDED.parent_workflow_id,
+            data = EXCLUDED.data,
+            version = EXCLUDED.version,
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(&instance.id)
+    .bind(&instance.definition_id)
+    .bind(&instance.state)
+    .bind(&instance.subject.subject_type)
+    .bind(&instance.subject.subject_key)
+    .bind(&instance.parent_workflow_id)
+    .bind(&data)
+    .bind(instance.version as i64)
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
 /// Create a temp directory under a writable base path without mutating
 /// global state (`HOME` env var).  Tries `$HOME` first; falls back to
 /// `$CWD/.harness-test-home` if `$HOME` is not writable.
@@ -174,6 +224,19 @@ pub fn test_database_url() -> anyhow::Result<String> {
     Ok(url)
 }
 
+pub fn configured_test_database_url() -> anyhow::Result<Option<String>> {
+    configure_test_pg_pool_defaults();
+    let configured = match std::env::var("HARNESS_DATABASE_URL") {
+        Ok(configured) => configured,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if configured.trim().is_empty() {
+        anyhow::bail!("HARNESS_DATABASE_URL is configured but blank");
+    }
+    Ok(Some(resolve_test_database_url(Some(&configured))?))
+}
+
 pub fn is_pool_timeout(err: &anyhow::Error) -> bool {
     err.to_string()
         .contains("pool timed out while waiting for an open connection")
@@ -194,6 +257,15 @@ pub async fn make_test_state_with_registry(
     agent_registry: AgentRegistry,
 ) -> anyhow::Result<AppState> {
     make_state_inner(dir, dir, agent_registry, HarnessConfig::default()).await
+}
+
+#[cfg(test)]
+pub async fn make_test_state_with_project_root_and_registry(
+    dir: &std::path::Path,
+    project_root: &std::path::Path,
+    agent_registry: AgentRegistry,
+) -> anyhow::Result<AppState> {
+    make_state_inner(dir, project_root, agent_registry, HarnessConfig::default()).await
 }
 
 /// Build a test `AppState` wrapped in `Arc`, using separate data and project-root directories.
@@ -275,20 +347,21 @@ async fn make_state_inner(
         )
         .await?,
     );
-    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+    let execution_svc = crate::services::execution::DefaultExecutionService::new_for_tests(
         Arc::new(server.config.clone()),
         Some(workflow_runtime_store.clone()),
         None,
         vec![],
     );
     Ok(AppState {
+        background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         core: crate::http::CoreServices {
             server,
             project_root: project_root.to_path_buf(),
             home_dir: std::env::var("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| project_root.to_path_buf()),
-            tasks,
+            tasks: Some(tasks),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
@@ -338,7 +411,6 @@ async fn make_state_inner(
             initialized: Arc::new(AtomicBool::new(true)),
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
-        interceptors: vec![],
         startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {

@@ -2,7 +2,7 @@ use harness_core::interceptor::{InterceptResult, ToolUseEvent, TurnInterceptor};
 use harness_core::types::{Decision, EventFilters, SessionId};
 use harness_observe::event_store::EventStore;
 use harness_rules::engine::{Guard, RuleEngine};
-use harness_server::hook_enforcer::HookEnforcer;
+use harness_server::server::test_support::HookEnforcer;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -82,6 +82,7 @@ async fn post_tool_use_violation_is_logged_to_event_store() -> anyhow::Result<()
         tool_name: "write_file".to_string(),
         affected_files: vec![PathBuf::from("src/lib.rs")],
         session_id: Some(session.clone()),
+        run_id: None,
     };
 
     let result = enforcer.post_tool_use(&event, &project).await;
@@ -157,6 +158,7 @@ async fn no_violations_pass_through_without_event() -> anyhow::Result<()> {
         tool_name: "write_file".to_string(),
         affected_files: vec![PathBuf::from("src/lib.rs")],
         session_id: None,
+        run_id: None,
     };
 
     let result = enforcer.post_tool_use(&event, &project).await;

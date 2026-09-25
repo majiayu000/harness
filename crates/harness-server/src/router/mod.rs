@@ -4,7 +4,7 @@
 //! Harness threads (stdio, WebSocket, or HTTP `/rpc`).  It deliberately does
 //! **not** handle task submission or project registration; those operations are
 //! part of the operator-facing control plane and are exclusively served by the
-//! HTTP REST routes defined in `http.rs`.
+//! HTTP REST routes defined in `http/mod.rs`.
 //!
 //! See `docs/api-contract.md` for the full transport role description.
 
@@ -93,9 +93,10 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
         Method::EventQuery { filters } => {
             Some(handlers::observe::event_query(state, id, filters).await)
         }
-        Method::MetricsCollect { project_root } => {
-            Some(handlers::observe::metrics_collect(state, id, project_root).await)
-        }
+        Method::MetricsCollect {
+            project_root,
+            run_id,
+        } => Some(handlers::observe::metrics_collect(state, id, project_root, run_id).await),
         Method::MetricsQuery { filters } => {
             Some(handlers::observe::metrics_query(state, id, filters).await)
         }

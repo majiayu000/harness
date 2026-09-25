@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 pub(super) struct CapturingAgent {
     pub(super) prompts: Mutex<Vec<String>>,
@@ -14,10 +15,14 @@ impl CapturingAgent {
 
 pub(super) struct RuntimeStreamAgent {
     pub(super) prompts: Mutex<Vec<String>>,
+    pub(super) env_vars: Mutex<Vec<HashMap<String, String>>>,
+    outputs: Mutex<Vec<String>>,
     pub(super) models: Mutex<Vec<Option<String>>>,
     pub(super) reasoning_efforts: Mutex<Vec<Option<String>>>,
     pub(super) sandbox_modes: Mutex<Vec<Option<SandboxMode>>>,
     pub(super) approval_policies: Mutex<Vec<Option<String>>>,
+    pub(super) permission_modes: Mutex<Vec<harness_core::config::agents::AgentPermissionMode>>,
+    pub(super) allowed_tools: Mutex<Vec<Option<Vec<String>>>>,
 }
 
 pub(super) struct FailingStreamAgent {
@@ -27,12 +32,20 @@ pub(super) struct FailingStreamAgent {
 
 impl RuntimeStreamAgent {
     pub(super) fn new() -> Arc<Self> {
+        Self::new_with_outputs(Vec::new())
+    }
+
+    pub(super) fn new_with_outputs(outputs: Vec<String>) -> Arc<Self> {
         Arc::new(Self {
             prompts: Mutex::new(Vec::new()),
+            env_vars: Mutex::new(Vec::new()),
+            outputs: Mutex::new(outputs),
             models: Mutex::new(Vec::new()),
             reasoning_efforts: Mutex::new(Vec::new()),
             sandbox_modes: Mutex::new(Vec::new()),
             approval_policies: Mutex::new(Vec::new()),
+            permission_modes: Mutex::new(Vec::new()),
+            allowed_tools: Mutex::new(Vec::new()),
         })
     }
 }
@@ -135,6 +148,12 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
+        self.permission_modes.lock().await.push(req.permission_mode);
+        self.allowed_tools
+            .lock()
+            .await
+            .push(req.allowed_tools.clone());
+        self.env_vars.lock().await.push(req.env_vars.clone());
         self.prompts.lock().await.push(req.prompt);
         Ok(successful_agent_response())
     }
@@ -154,28 +173,44 @@ impl CodeAgent for RuntimeStreamAgent {
             .lock()
             .await
             .push(req.approval_policy.clone());
-        // Probe the runtime-job activity name from the prompt so the fenced
-        // result block reports the correct `activity`. The activity is the
-        // top `Activity:` line in the prompt packet header. Falling back to
-        // "implement_issue" keeps the existing tests stable when no header
-        // is found.
-        let activity = req
-            .prompt
-            .lines()
-            .find_map(|line| line.strip_prefix("Activity: ").map(str::trim))
-            .unwrap_or("implement_issue")
-            .to_string();
+        self.permission_modes.lock().await.push(req.permission_mode);
+        self.allowed_tools
+            .lock()
+            .await
+            .push(req.allowed_tools.clone());
+        self.env_vars.lock().await.push(req.env_vars.clone());
+        let mut outputs = self.outputs.lock().await;
+        let content = match (!outputs.is_empty()).then(|| outputs.remove(0)) {
+            Some(content) => content,
+            None => {
+                // Probe the runtime-job activity name from the prompt so the
+                // fenced result block reports the correct `activity`.
+                let activity = req
+                    .prompt
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Activity: ").map(str::trim))
+                    .unwrap_or("implement_issue");
+                format!(
+                    "runtime done\n\n```harness-activity-result\n{{\"activity\":\"{activity}\",\"status\":\"succeeded\",\"summary\":\"runtime done\"}}\n```"
+                )
+            }
+        };
         self.prompts.lock().await.push(req.prompt);
-        let fenced = format!(
-            "runtime done\n\n```harness-activity-result\n{{\"activity\":\"{activity}\",\"status\":\"succeeded\",\"summary\":\"runtime done\"}}\n```"
-        );
         let _ = tx
             .send(StreamItem::ItemCompleted {
-                item: Item::AgentReasoning { content: fenced },
+                item: Item::AgentReasoning { content },
             })
             .await;
         let _ = tx.send(StreamItem::Done).await;
         Ok(())
+    }
+
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.execute_stream(req, tx).await
     }
 }
 
@@ -205,6 +240,13 @@ impl CodeAgent for FailingStreamAgent {
         Err(harness_core::error::HarnessError::AgentExecution(
             self.error.clone(),
         ))
+    }
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.execute_stream(req, tx).await
     }
 }
 
@@ -236,6 +278,13 @@ impl CodeAgent for BlockingAgent {
             .await;
         let _ = tx.send(StreamItem::Done).await;
         Ok(())
+    }
+    async fn start_turn(
+        &self,
+        req: AgentRequest,
+        tx: tokio::sync::mpsc::Sender<StreamItem>,
+    ) -> harness_core::error::Result<()> {
+        self.execute_stream(req, tx).await
     }
 }
 
@@ -308,7 +357,7 @@ pub(super) async fn make_test_state_with_project_root(
     let mut review_queue_config = server.config.concurrency.clone();
     review_queue_config.max_concurrent_tasks = server.config.review.max_concurrent_tasks.max(1);
     let review_task_queue = Arc::new(crate::task_queue::TaskQueue::new(&review_queue_config));
-    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+    let execution_svc = crate::services::execution::DefaultExecutionService::new_for_tests(
         Arc::new(server.config.clone()),
         None,
         None,
@@ -316,13 +365,14 @@ pub(super) async fn make_test_state_with_project_root(
     );
     drop(db_state_guard);
     Ok(Arc::new(AppState {
+        background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         core: crate::http::CoreServices {
             server,
             project_root: project_root.to_path_buf(),
             home_dir: std::env::var("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| project_root.to_path_buf()),
-            tasks,
+            tasks: Some(tasks),
             plan_db: None,
             plan_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             issue_workflow_store: None,
@@ -376,7 +426,6 @@ pub(super) async fn make_test_state_with_project_root(
             initialized: Arc::new(AtomicBool::new(true)),
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
-        interceptors: vec![],
         startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {
@@ -444,13 +493,33 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         )
         .await?,
     );
-    let execution_svc = crate::services::execution::DefaultExecutionService::new(
+    let execution_svc = crate::services::execution::DefaultExecutionService::new_for_tests(
         Arc::new(state.core.server.config.clone()),
         Some(workflow_runtime_store.clone()),
         None,
         vec![],
     );
+    let mut workspace_config = state.core.server.config.workspace.clone();
+    workspace_config.use_data_dir_default_root(dir);
+    let workspace_lease_store = Arc::new(
+        crate::workspace_lease_store::WorkspaceLeaseStore::open(
+            &harness_core::config::dirs::default_db_path(dir, "workspace_leases"),
+        )
+        .await?,
+    );
+    let workspace_pool_config =
+        crate::http::builders::workspace_pool_config::build_workspace_pool_config(
+            state.core.server.as_ref(),
+            None,
+        )
+        .await?;
+    let workspace_mgr = Arc::new(crate::workspace::WorkspaceManager::new_with_pool(
+        workspace_config,
+        workspace_pool_config,
+        Some(workspace_lease_store),
+    )?);
     Ok(Arc::new(AppState {
+        background_loops: Arc::new(crate::http::background::BackgroundLoopHealth::new()),
         core: crate::http::CoreServices {
             server: state.core.server.clone(),
             project_root: state.core.project_root.clone(),
@@ -479,7 +548,7 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
         concurrency: crate::http::ConcurrencyServices {
             task_queue: state.concurrency.task_queue.clone(),
             review_task_queue: state.concurrency.review_task_queue.clone(),
-            workspace_mgr: None,
+            workspace_mgr: Some(workspace_mgr),
         },
         #[cfg(test)]
         _db_state_guard: None,
@@ -499,7 +568,6 @@ pub(super) async fn make_test_state_with_workflow_runtime_config_and_registry(
             initialized: Arc::new(AtomicBool::new(true)),
             ws_shutdown_tx: tokio::sync::broadcast::channel(1).0,
         },
-        interceptors: vec![],
         startup_statuses: vec![],
         degraded_subsystems: vec![],
         intake: crate::http::IntakeServices {

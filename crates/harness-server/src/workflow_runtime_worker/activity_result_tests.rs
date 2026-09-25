@@ -1,5 +1,10 @@
 use super::*;
-use harness_workflow::runtime::{ActivityStatus, RuntimeKind};
+use harness_core::types::TurnFailureKind;
+use harness_workflow::runtime::{
+    ActivityStatus, RuntimeKind, GITHUB_ISSUE_PR_DEFINITION_ID, LOCAL_REVIEW_ACTIVITY,
+    LOCAL_REVIEW_BLOCKED_SIGNAL, LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL, LOCAL_REVIEW_PASSED_SIGNAL,
+    PROMPT_TASK_DEFINITION_ID,
+};
 
 #[test]
 fn activity_result_from_turn_fails_when_no_fenced_block_present() {
@@ -141,19 +146,21 @@ fn activity_result_from_turn_parses_structured_activity_result_block() {
             "activity": "implement_issue"
         }),
     );
+    let final_result = r#"{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed.","artifacts":[{"artifact_type":"workflow_decision","artifact":{"encoding":"harness.runtime.json_payload.v1","json":"{\"workflow_id\":\"wf-1\",\"observed_state\":\"implementing\",\"decision\":\"continue\",\"next_state\":\"implementing\",\"reason\":\"needs review\",\"confidence\":\"high\",\"commands\":[{\"command_type\":\"enqueue_activity\",\"dedupe_key\":\"wf-1:review\",\"command\":{\"activity\":\"run_local_review\",\"note\":\"nested payload\"}}]}"}},{"artifact_type":"no_change_rationale","artifact":{"encoding":"harness.runtime.json_payload.v1","json":"\"No changes were needed\""}}],"signals":[{"signal_type":"external_state","signal":{"encoding":"harness.runtime.json_payload.v1","json":"{\"state\":\"Done\",\"subject\":{\"issue_number\":1756}}"}}],"validation":[],"error":null,"error_kind":null}"#;
     let items = vec![Item::AgentReasoning {
-        content: r#"Work completed.
+        content: format!(
+            r#"Work completed.
 
 ```harness-activity-result
-{"activity":"implement_issue","status":"succeeded","summary":"stale summary","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":66,"pr_url":"https://github.com/owner/repo/pull/66"}}]}
+{{"activity":"implement_issue","status":"succeeded","summary":"stale summary","artifacts":[{{"artifact_type":"pull_request","artifact":{{"pr_number":66,"pr_url":"https://github.com/owner/repo/pull/66"}}}}]}}
 ```
 
 Final result:
 
 ```harness-activity-result
-{"activity":"implement_issue","status":"succeeded","summary":"Implementation completed.","artifacts":[{"artifact_type":"pull_request","artifact":{"pr_number":77,"pr_url":"https://github.com/owner/repo/pull/77"}}]}
+{final_result}
 ```"#
-            .to_string(),
+        ),
     }];
 
     let result = activity_result_from_turn(
@@ -170,12 +177,21 @@ Final result:
     assert_eq!(result.activity, "implement_issue");
     assert_eq!(result.status, ActivityStatus::Succeeded);
     assert_eq!(result.summary, "Implementation completed.");
-    let pr_artifact = artifact_by_type(&result, "pull_request");
-    assert_eq!(pr_artifact.artifact["pr_number"], 77);
+    let decision = artifact_by_type(&result, "workflow_decision");
     assert_eq!(
-        pr_artifact.artifact["pr_url"],
-        "https://github.com/owner/repo/pull/77"
+        decision.artifact["commands"][0]["command"]["activity"],
+        "run_local_review"
     );
+    let no_change = artifact_by_type(&result, "no_change_rationale");
+    assert_eq!(no_change.artifact, json!("No changes were needed"));
+    let Some(external_state) = result
+        .signals
+        .iter()
+        .find(|signal| signal.signal_type == "external_state")
+    else {
+        panic!("encoded signal payload should round-trip");
+    };
+    assert_eq!(external_state.signal["subject"]["issue_number"], 1756);
     let prompt_artifact = artifact_by_type(&result, "runtime_prompt_packet");
     assert_eq!(prompt_artifact.artifact["digest"], "digest-1");
     let turn_artifact = artifact_by_type(&result, "runtime_turn");
@@ -194,6 +210,77 @@ Final result:
         .signals
         .iter()
         .any(|signal| signal.signal_type == "RuntimeTurnCompleted"));
+}
+
+#[test]
+fn activity_result_from_turn_handles_raw_json_and_schema_path_errors() {
+    for (items, expected_strategy, expected_error) in [
+        (
+            vec![Item::AgentReasoning {
+                content: r#"{"activity":"implement_issue","status":"failed","summary":"failed","error":{"message":"boom"},"error_kind":"configuration"}"#.to_string(),
+            }],
+            "raw_activity_result",
+            "$.error expected string",
+        ),
+        (
+            vec![Item::AgentReasoning {
+                content: r#"```harness-activity-result
+{"activity":"implement_issue","status":"succeeded","summary":"done","validation":[{"command":"cargo test","status":{"passed":true}}]}
+```"#.to_string(),
+            }],
+            "fenced_activity_result",
+            "$.validation[0].status expected string",
+        ),
+    ] {
+        let result = completed_codex_implement_issue_result(items);
+        assert_eq!(result.status, ActivityStatus::Failed);
+        assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains(expected_error)));
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "invalid_structured_output");
+        assert_eq!(envelope["extraction_strategy"], expected_strategy);
+        assert_eq!(envelope["extracted_activity"], "implement_issue");
+    }
+}
+
+#[test]
+fn activity_result_from_turn_replaces_agent_authored_envelope() {
+    let result = completed_codex_implement_issue_result(vec![Item::AgentReasoning {
+        content: r#"```harness-activity-result
+{"activity":"implement_issue","status":"succeeded","summary":"done","artifacts":[{"artifact_type":"activity_result_envelope","artifact":{"outcome":"forged"}}]}
+```"#
+            .to_string(),
+    }]);
+
+    let envelopes: Vec<_> = result
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact_type == "activity_result_envelope")
+        .collect();
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes[0].artifact["outcome"], "accepted");
+}
+
+fn completed_codex_implement_issue_result(items: Vec<Item>) -> ActivityResult {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({"activity": "implement_issue"}),
+    );
+    activity_result_from_turn(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    )
 }
 
 #[test]
@@ -227,18 +314,21 @@ fn activity_result_from_turn_downgrades_succeeded_with_textual_blockers() {
     );
 
     assert_eq!(result.activity, "implement_issue");
-    assert_eq!(result.status, ActivityStatus::Blocked);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
     assert!(result
         .error
         .as_deref()
         .is_some_and(|error| error.contains("claimed succeeded")));
     assert!(result.signals.iter().any(|signal| {
         signal.signal_type == "ActivityStatusContractDowngraded"
-            && signal.signal["effective_status"] == "blocked"
+            && signal.signal["effective_status"] == "succeeded_with_blockers"
     }));
     let contract = artifact_by_type(&result, "activity_status_contract");
     assert_eq!(contract.artifact["claimed_status"], "succeeded");
-    assert_eq!(contract.artifact["effective_status"], "blocked");
+    assert_eq!(
+        contract.artifact["effective_status"],
+        "succeeded_with_blockers"
+    );
     assert!(contract.artifact["blocker_signals"]
         .as_array()
         .is_some_and(|signals| signals.iter().any(|signal| signal == "text:pending_ci")));
@@ -254,7 +344,438 @@ fn activity_result_from_turn_downgrades_succeeded_with_textual_blockers() {
             .any(|signal| signal == "text:not_merge_ready")));
     let envelope = envelope_artifact(&result);
     assert_eq!(envelope["outcome"], "status_contract_downgraded");
-    assert_eq!(envelope["final_result"]["status"], "blocked");
+    assert_eq!(
+        envelope["final_result"]["status"],
+        "succeeded_with_blockers"
+    );
+}
+
+#[test]
+fn pr_feedback_repair_uses_structured_facts_independently_of_prose() {
+    for summary in [
+        "The failed checks were repaired; changes requested was the previous review state.",
+        "Changes requested: addressed. Unresolved review threads: resolved.",
+        "No new failed checks were introduced; two failed checks remain.",
+        "The PR is not merge-ready; requested changes remain.",
+    ] {
+        let mut claimed = ActivityResult::succeeded("address_pr_feedback", summary).with_artifact(
+            ActivityArtifact::new(
+                "pr_repair_snapshot",
+                json!({
+                    "fresh_pr_state": {
+                        "merge_state_status": "CLEAN",
+                        "failed_checks": 0,
+                        "open_review_threads": 0,
+                        "review_decision": "APPROVED"
+                    }
+                }),
+            ),
+        );
+        claimed.error = Some(summary.to_string());
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+        assert!(
+            !changed,
+            "prose must not override structured facts: {summary}"
+        );
+        assert_eq!(result.status, ActivityStatus::Succeeded);
+    }
+}
+
+#[test]
+fn pr_feedback_repair_preserves_structured_signals_despite_positive_prose() {
+    for signal in ["ChangesRequested", "ChecksFailed"] {
+        let claimed = ActivityResult::succeeded("address_pr_feedback", "Everything is resolved.")
+            .with_signal(ActivitySignal::new(signal, json!({})));
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+        assert!(status_contract_blockers_from_result(&result).contains(&format!("signal:{signal}")));
+    }
+}
+
+#[test]
+fn pr_feedback_repair_can_return_while_new_checks_are_pending() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Pushed the repair. No new failed checks; CI is still in progress.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "pr_repair_snapshot",
+        json!({
+            "fresh_pr_state": {
+                "mergeable": "MERGEABLE",
+                "merge_state_status": "BLOCKED",
+                "pending_checks": 5,
+                "failed_checks": 0
+            }
+        }),
+    ));
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+}
+
+#[test]
+fn pr_feedback_repair_keeps_actual_check_and_merge_blockers() {
+    for artifact in [
+        json!({ "failed_checks": 1 }),
+        json!({ "merge_state_status": "DIRTY" }),
+    ] {
+        let claimed = ActivityResult::succeeded("address_pr_feedback", "Everything is resolved.")
+            .with_artifact(ActivityArtifact::new("pr_repair_snapshot", artifact));
+
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+        assert!(changed);
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    }
+}
+
+#[test]
+fn pr_feedback_repair_defers_remote_readiness_but_keeps_failed_checks() {
+    let pending = ActivityResult::succeeded("address_pr_feedback", "Repair pushed.").with_artifact(
+        ActivityArtifact::new(
+            "pr_repair_snapshot",
+            json!({
+                "fresh_pr_state": {
+                    "merge_state_status": "BLOCKED",
+                    "pending_checks": 2,
+                    "failed_checks": 0
+                }
+            }),
+        ),
+    );
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), pending);
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+
+    for fresh_pr_state in [
+        json!({ "merge_state_status": "BLOCKED", "failed_checks": 0 }),
+        json!({
+            "merge_state_status": "BLOCKED",
+            "pending_checks": 2
+        }),
+        json!({
+            "merge_state_status": "BLOCKED",
+            "pending_checks": 2,
+            "failed_checks": 1
+        }),
+    ] {
+        let has_failed_checks = fresh_pr_state["failed_checks"]
+            .as_u64()
+            .is_some_and(|count| count > 0);
+        let claimed = ActivityResult::succeeded("address_pr_feedback", "Repair pushed.")
+            .with_artifact(ActivityArtifact::new(
+                "pr_repair_snapshot",
+                json!({ "fresh_pr_state": fresh_pr_state }),
+            ));
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+        assert_eq!(changed, has_failed_checks);
+        assert_eq!(
+            result.status,
+            if has_failed_checks {
+                ActivityStatus::SucceededWithBlockers
+            } else {
+                ActivityStatus::Succeeded
+            }
+        );
+    }
+}
+
+#[test]
+fn issue_implementation_keeps_failed_checks_reported_only_in_summary() {
+    let claimed = ActivityResult::succeeded(
+        "implement_issue",
+        "The repair was pushed, but hosted CI still has failed checks.",
+    )
+    .with_artifact(ActivityArtifact::new(
+        "pr_repair_snapshot",
+        json!({
+            "fresh_pr_state": {
+                "mergeable": "MERGEABLE",
+                "merge_state_status": "BLOCKED",
+                "pending_checks": 2
+            }
+        }),
+    ));
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:failing_checks"));
+}
+
+#[test]
+fn issue_implementation_keeps_non_ci_blockers_reported_in_summary() {
+    for blocker_summary in [
+        "The repair was pushed, but the review state remains changes requested.",
+        "The repair was pushed, but an unresolved review thread remains.",
+        "The repair was pushed, but the PR is not merge-ready.",
+        "The repair was pushed, but a quota notice blocks review.",
+    ] {
+        let claimed = ActivityResult::succeeded("implement_issue", blocker_summary);
+
+        let (changed, result) =
+            enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+        assert!(
+            changed,
+            "summary blocker must be preserved: {blocker_summary}"
+        );
+        assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    }
+}
+
+#[test]
+fn pr_feedback_repair_does_not_treat_addressed_requested_changes_as_a_blocker() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Addressed the requested changes and pushed the repair.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+}
+
+#[test]
+fn pr_feedback_repair_does_not_treat_resolved_review_threads_as_a_blocker() {
+    let claimed = ActivityResult::succeeded(
+        "address_pr_feedback",
+        "Resolved all unresolved review threads and pushed the repair.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(!changed);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+}
+
+#[test]
+fn issue_implementation_keeps_requested_changes_remain_blocking() {
+    let claimed = ActivityResult::succeeded(
+        "implement_issue",
+        "The repair was pushed, but requested changes remain.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:requested_changes"));
+}
+
+#[test]
+fn negated_check_delta_does_not_hide_a_remaining_failed_check_clause() {
+    let claimed = ActivityResult::succeeded(
+        "implement_issue",
+        "No new failed checks were introduced; two failed checks remain.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:failing_checks"));
+}
+
+#[test]
+fn comma_joined_negated_check_delta_does_not_hide_a_remaining_failed_check_clause() {
+    let claimed = ActivityResult::succeeded(
+        "implement_issue",
+        "No new failed checks were introduced, two failed checks remain.",
+    );
+
+    let (changed, result) =
+        enforce_activity_status_contract(Some(GITHUB_ISSUE_PR_DEFINITION_ID), claimed);
+
+    assert!(changed);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
+    assert!(status_contract_blockers_from_result(&result)
+        .iter()
+        .any(|blocker| blocker == "text:failing_checks"));
+}
+
+#[test]
+fn activity_result_from_turn_preserves_prompt_nonzero_validation_report() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": "implement_prompt"
+        }),
+    );
+    let items = vec![Item::AgentReasoning {
+        content: r#"Prompt implementation report.
+
+```harness-activity-result
+{"activity":"implement_prompt","status":"succeeded","summary":"Implementation completed; validation reported failed checks.","artifacts":[{"artifact_type":"validation_report","artifact":[{"command":"cargo clippy","exit_code":101}]}]}
+```"#
+            .to_string(),
+    }];
+
+    let result = activity_result_from_turn_with_workflow(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+        Some(PROMPT_TASK_DEFINITION_ID),
+    );
+
+    assert_eq!(result.activity, "implement_prompt");
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+    assert!(!result
+        .signals
+        .iter()
+        .any(|signal| signal.signal_type == "ActivityStatusContractDowngraded"));
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "accepted");
+    assert_eq!(envelope["final_result"]["status"], "succeeded");
+}
+
+#[test]
+fn activity_result_from_turn_preserves_declared_local_review_outcomes() {
+    for (signal_type, summary) in [
+        (LOCAL_REVIEW_PASSED_SIGNAL, "Local review passed."),
+        (
+            LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL,
+            "Local review requested fixes.",
+        ),
+        (
+            LOCAL_REVIEW_BLOCKED_SIGNAL,
+            "Local review could not complete.",
+        ),
+    ] {
+        let job = RuntimeJob::pending(
+            "command-1",
+            RuntimeKind::CodexJsonrpc,
+            "codex-default",
+            json!({
+                "activity": LOCAL_REVIEW_ACTIVITY
+            }),
+        );
+        let content = format!(
+            r#"Local review report.
+
+```harness-activity-result
+{{"activity":"{LOCAL_REVIEW_ACTIVITY}","status":"succeeded","summary":"{summary}","signals":[{{"signal_type":"{signal_type}","signal":{{"pr_number":77,"pr_url":"https://github.com/owner/repo/pull/77"}}}}]}}
+```"#
+        );
+        let items = vec![Item::AgentReasoning { content }];
+
+        let result = activity_result_from_turn_with_workflow(
+            &job,
+            &TurnStatus::Completed,
+            &items,
+            &ThreadId::from_str("thread-1"),
+            &TurnId::from_str("turn-1"),
+            "codex",
+            Path::new("/project"),
+            "digest-1",
+            Some(GITHUB_ISSUE_PR_DEFINITION_ID),
+        );
+
+        assert_eq!(result.activity, LOCAL_REVIEW_ACTIVITY);
+        assert_eq!(
+            result.status,
+            ActivityStatus::Succeeded,
+            "{signal_type} should remain available to the reducer"
+        );
+        assert!(result
+            .signals
+            .iter()
+            .any(|signal| signal.signal_type == signal_type));
+        assert!(!result
+            .signals
+            .iter()
+            .any(|signal| signal.signal_type == "ActivityStatusContractDowngraded"));
+        let envelope = envelope_artifact(&result);
+        assert_eq!(envelope["outcome"], "accepted");
+        assert_eq!(envelope["final_result"]["status"], "succeeded");
+    }
+}
+
+#[test]
+fn activity_result_from_turn_preserves_local_review_changes_requested_with_unresolved_threads() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexJsonrpc,
+        "codex-default",
+        json!({
+            "activity": LOCAL_REVIEW_ACTIVITY
+        }),
+    );
+    let items = vec![Item::AgentReasoning {
+        content: r#"Local review report.
+
+```harness-activity-result
+{"activity":"run_local_review","status":"succeeded","summary":"Local review found two unresolved review threads on PR #1914 and requested changes.","artifacts":[{"artifact_type":"local_review_findings","artifact":{"unresolved_review_threads":[{"path":"AGENTS.md","line":61,"body":"Use the review verdicts accepted by the parser."},{"path":"CLAUDE.md","line":14,"body":"Require Codex-variable stripping in equivalent launchers."}],"blockers":["two unresolved review threads"]}}],"signals":[{"signal_type":"LocalReviewChangesRequested","signal":{"pr_number":1914,"pr_url":"https://github.com/majiayu000/harness/pull/1914"}}],"validation":[],"error":null,"error_kind":null}
+```"#
+            .to_string(),
+    }];
+
+    let result = activity_result_from_turn_with_workflow(
+        &job,
+        &TurnStatus::Completed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+        Some(GITHUB_ISSUE_PR_DEFINITION_ID),
+    );
+
+    assert_eq!(result.activity, LOCAL_REVIEW_ACTIVITY);
+    assert_eq!(result.status, ActivityStatus::Succeeded);
+    assert!(result
+        .signals
+        .iter()
+        .any(|signal| signal.signal_type == LOCAL_REVIEW_CHANGES_REQUESTED_SIGNAL));
+    assert!(!result
+        .signals
+        .iter()
+        .any(|signal| signal.signal_type == "ActivityStatusContractDowngraded"));
+    let findings = artifact_by_type(&result, "local_review_findings");
+    assert_eq!(
+        findings.artifact["unresolved_review_threads"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        findings.artifact["blockers"],
+        json!(["two unresolved review threads"])
+    );
+    let envelope = envelope_artifact(&result);
+    assert_eq!(envelope["outcome"], "accepted");
+    assert_eq!(envelope["final_result"]["status"], "succeeded");
 }
 
 #[test]
@@ -287,7 +808,7 @@ fn activity_result_from_turn_downgrades_succeeded_with_structured_blockers() {
         "digest-1",
     );
 
-    assert_eq!(result.status, ActivityStatus::Blocked);
+    assert_eq!(result.status, ActivityStatus::SucceededWithBlockers);
     let contract = artifact_by_type(&result, "activity_status_contract");
     let Some(blockers) = contract.artifact["blocker_signals"].as_array() else {
         panic!("blocker signals should be recorded");
@@ -466,7 +987,7 @@ fn activity_result_from_turn_fails_mismatched_structured_activity() {
     assert_eq!(result.summary, "Structured activity result was invalid.");
     assert_eq!(
         result.error.as_deref(),
-        Some("activity result block reported activity `replan_issue`, expected `implement_issue`")
+        Some("activity result JSON reported activity `replan_issue`, expected `implement_issue`")
     );
     assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
     assert!(!result
@@ -528,7 +1049,7 @@ Final result:
     assert!(result
         .error
         .as_deref()
-        .is_some_and(|error| error.starts_with("activity result block is invalid JSON:")));
+        .is_some_and(|error| error.starts_with("activity result JSON is invalid:")));
     assert_eq!(result.error_kind, Some(ActivityErrorKind::Configuration));
     assert!(!result
         .artifacts
@@ -560,6 +1081,7 @@ fn activity_result_from_turn_classifies_timeout_error_kind() {
     let items = vec![Item::Error {
         code: 1,
         message: "Agent turn timed out after 30s".to_string(),
+        failure_kind: None,
     }];
 
     let result = activity_result_from_turn(
@@ -583,6 +1105,43 @@ fn activity_result_from_turn_classifies_timeout_error_kind() {
     let envelope = envelope_artifact(&result);
     assert_eq!(envelope["outcome"], "turn_failed");
     assert_eq!(envelope["extraction_strategy"], "not_attempted");
+}
+
+#[test]
+fn activity_result_from_turn_preserves_typed_upstream_failure_kind() {
+    let job = RuntimeJob::pending(
+        "command-1",
+        RuntimeKind::CodexExec,
+        "codex-default",
+        json!({
+            "activity": "implement_issue"
+        }),
+    );
+    let items = vec![Item::typed_error(
+        "agent upstream failure: provider temporarily unavailable",
+        TurnFailureKind::Upstream,
+    )];
+
+    let result = activity_result_from_turn(
+        &job,
+        &TurnStatus::Failed,
+        &items,
+        &ThreadId::from_str("thread-1"),
+        &TurnId::from_str("turn-1"),
+        "codex",
+        Path::new("/project"),
+        "digest-1",
+    );
+
+    assert_eq!(result.status, ActivityStatus::Failed);
+    assert_eq!(
+        result.error_kind,
+        Some(ActivityErrorKind::ExternalDependency)
+    );
+    assert_eq!(
+        result.error.as_deref(),
+        Some("agent upstream failure: provider temporarily unavailable")
+    );
 }
 
 fn envelope_artifact(result: &ActivityResult) -> &serde_json::Value {

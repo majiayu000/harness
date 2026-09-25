@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::alert::AlertClass;
 
+use super::process_env;
+
 fn default_dedup_cooldown_secs() -> u64 {
     300
 }
@@ -32,6 +34,10 @@ fn default_backoff_base_ms() -> u64 {
 
 fn default_heartbeat_interval_secs() -> u64 {
     60
+}
+
+fn default_pool_starvation_ticks() -> u32 {
+    20
 }
 
 /// Delivery channel kind. Slack and Feishu are formatters over the same
@@ -87,7 +93,7 @@ impl AlertChannelConfig {
         self.url
             .clone()
             .filter(|u| !u.trim().is_empty())
-            .or_else(|| std::env::var(self.url_env_var()).ok())
+            .or_else(|| process_env::non_blank_config_value(&self.url_env_var()))
             .filter(|u| !u.trim().is_empty())
     }
 }
@@ -158,6 +164,11 @@ pub struct AlertingConfig {
     pub channels: Vec<AlertChannelConfig>,
     #[serde(default)]
     pub heartbeat: AlertingHeartbeatConfig,
+    /// Consecutive empty dispatcher ticks before the pool-starvation probe
+    /// runs (GH-1895). Only fires when gated work exists; a genuinely idle
+    /// pool never alerts.
+    #[serde(default = "default_pool_starvation_ticks")]
+    pub pool_starvation_ticks: u32,
 }
 
 impl Default for AlertingConfig {
@@ -170,6 +181,7 @@ impl Default for AlertingConfig {
             shutdown_flush_secs: default_shutdown_flush_secs(),
             channels: Vec::new(),
             heartbeat: AlertingHeartbeatConfig::default(),
+            pool_starvation_ticks: default_pool_starvation_ticks(),
         }
     }
 }
@@ -186,6 +198,9 @@ impl AlertingConfig {
         }
         if self.queue_capacity == 0 {
             anyhow::bail!("alerting.queue_capacity must be >= 1");
+        }
+        if self.pool_starvation_ticks == 0 {
+            anyhow::bail!("alerting.pool_starvation_ticks must be >= 1");
         }
         let mut names = HashSet::new();
         for channel in &self.channels {
@@ -257,6 +272,7 @@ mod tests {
         assert!(config.event_classes.is_empty());
         assert!(config.channels.is_empty());
         assert!(!config.heartbeat.enabled);
+        assert_eq!(config.pool_starvation_ticks, 20);
         config.validate().expect("inert config validates");
     }
 

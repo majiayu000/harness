@@ -1,10 +1,12 @@
+use super::rest_contract::LegacyJson as Json;
 use super::AppState;
 use crate::{
+    http::api_error::ApiError,
     runtime_projection::RuntimeWorkflowProjection,
     services::execution::EnqueueTaskError,
     workflow_runtime_submission::{CreateTaskRequest, TaskId},
 };
-use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -45,17 +47,14 @@ pub(crate) struct TaskResponseDetails {
 pub(crate) async fn task_response_details(
     state: &AppState,
     task_id: &TaskId,
-) -> Result<TaskResponseDetails, EnqueueTaskError> {
-    let store =
-        state.core.workflow_runtime_store.as_ref().ok_or_else(|| {
-            EnqueueTaskError::Internal("workflow runtime store unavailable".into())
-        })?;
+) -> Result<TaskResponseDetails, ApiError> {
+    let store = state.workflow_runtime_store()?;
     let workflow = store
         .get_instance_by_submission_id(task_id.as_str())
         .await
-        .map_err(|error| EnqueueTaskError::Internal(error.to_string()))?
+        .map_err(|error| ApiError::internal(error.to_string()))?
         .ok_or_else(|| {
-            EnqueueTaskError::Internal(format!(
+            ApiError::internal(format!(
                 "workflow runtime submission not found for {}",
                 task_id.as_str()
             ))
@@ -63,7 +62,10 @@ pub(crate) async fn task_response_details(
     let submission_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
         .map(|task_id| task_id.0)
         .unwrap_or_else(|| task_id.as_str().to_string());
-    let projection = RuntimeWorkflowProjection::from_workflow(&workflow);
+    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(
+        store.definition_registry(),
+        &workflow,
+    );
     Ok(TaskResponseDetails {
         status: projection.task_status.as_ref().to_string(),
         workflow_state: workflow.state,
@@ -95,40 +97,8 @@ pub(super) async fn create_runtime_submission(
                 Json(task_submission_response(&task_id, details)),
             )
                 .into_response(),
-            Err(EnqueueTaskError::BadRequest(error)) => {
-                (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
-            }
-            Err(EnqueueTaskError::Internal(error)) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": error })),
-            )
-                .into_response(),
-            Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs }) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(
-                    axum::http::header::RETRY_AFTER,
-                    retry_after_secs.to_string(),
-                )],
-                Json(json!({ "error": "maintenance_window", "retry_after": retry_after_secs })),
-            )
-                .into_response(),
+            Err(error) => error.into_response(),
         },
-        Err(EnqueueTaskError::BadRequest(error)) => {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
-        }
-        Err(EnqueueTaskError::Internal(error)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error })),
-        )
-            .into_response(),
-        Err(EnqueueTaskError::MaintenanceWindow { retry_after_secs }) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(
-                axum::http::header::RETRY_AFTER,
-                retry_after_secs.to_string(),
-            )],
-            Json(json!({ "error": "maintenance_window", "retry_after": retry_after_secs })),
-        )
-            .into_response(),
+        Err(error) => ApiError::from(error).into_response(),
     }
 }

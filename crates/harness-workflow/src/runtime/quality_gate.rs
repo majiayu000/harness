@@ -1,7 +1,7 @@
 use super::model::{
     WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvidence, WorkflowInstance,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub const QUALITY_GATE_DEFINITION_ID: &str = "quality_gate";
 pub const QUALITY_GATE_ACTIVITY: &str = "run_quality_gate";
@@ -18,6 +18,9 @@ pub enum QualityGateWorkflowAction {
 pub struct QualityGateDecisionInput<'a> {
     pub reason: &'a str,
     pub validation_commands: &'a [String],
+    pub validation_commands_argv: &'a [Vec<String>],
+    pub eval: Option<&'a Value>,
+    pub expected_head_sha: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +37,17 @@ pub fn build_quality_gate_run_decision(
     instance: &WorkflowInstance,
     input: QualityGateDecisionInput<'_>,
 ) -> QualityGateDecisionOutput {
+    let mut command = json!({
+        "activity": QUALITY_GATE_ACTIVITY,
+        "validation_commands": input.validation_commands,
+        "validation_commands_argv": input.validation_commands_argv,
+    });
+    if let Some(eval) = input.eval {
+        command["eval"] = eval.clone();
+    }
+    if let Some(expected_head_sha) = input.expected_head_sha {
+        command["expected_head_sha"] = json!(expected_head_sha);
+    }
     let decision = WorkflowDecision::new(
         &instance.id,
         &instance.state,
@@ -44,10 +58,7 @@ pub fn build_quality_gate_run_decision(
     .with_command(WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
         format!("quality-gate:{}:run", instance.subject.subject_key),
-        json!({
-            "activity": QUALITY_GATE_ACTIVITY,
-            "validation_commands": input.validation_commands,
-        }),
+        command,
     ))
     .with_evidence(WorkflowEvidence::new(
         "quality_gate",

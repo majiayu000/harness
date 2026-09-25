@@ -46,6 +46,26 @@ async fn open_test_store(
     Ok((dir, store))
 }
 
+#[test]
+fn errored_auto_recovery_tick_records_failed_loop_health() {
+    let health = Arc::new(crate::http::background::BackgroundLoopHealth::new());
+    let handle = health.register_loop("auto_recovery");
+    let tick = AutoRecoveryTick {
+        errored: 2,
+        ..AutoRecoveryTick::default()
+    };
+
+    record_auto_recovery_tick(&handle, &tick);
+
+    let snapshot = health.snapshot(60);
+    assert_eq!(snapshot[0].tick_count, 0);
+    assert_eq!(snapshot[0].failure_count, 1);
+    assert_eq!(
+        snapshot[0].last_error.as_deref(),
+        Some("2 auto-recovery instance(s) failed")
+    );
+}
+
 /// Seed a stopped instance whose structured stop metadata points at a real
 /// runtime job + command, so `recover_stopped_instance` can replay it.
 async fn seed_stopped_instance(
@@ -54,15 +74,16 @@ async fn seed_stopped_instance(
     state: &str,
     data: Value,
 ) -> anyhow::Result<WorkflowInstance> {
+    let target_state = state.to_string();
     let mut workflow = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
-        state,
+        "implementing",
         WorkflowSubject::new("issue", format!("issue:{id}")),
     )
     .with_id(id.to_string())
-    .with_data(data);
-    store.upsert_instance(&workflow).await?;
+    .with_server_data(data);
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     let command = WorkflowCommand::new(
         WorkflowCommandType::EnqueueActivity,
         format!("{id}-source"),
@@ -77,8 +98,15 @@ async fn seed_stopped_instance(
             command.command,
         )
         .await?;
-    workflow.data["last_stop"]["runtime_job_id"] = json!(job.id);
-    store.upsert_instance(&workflow).await?;
+    let mut last_stop = workflow.data["last_stop"].clone();
+    last_stop["runtime_job_id"] = json!(job.id);
+    workflow.set_data_field(
+        "last_stop",
+        last_stop,
+        harness_workflow::runtime::DataProvenance::Server,
+    )?;
+    workflow.state = target_state;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
     Ok(workflow)
 }
 
@@ -187,13 +215,10 @@ async fn auto_recovery_selects_transient_and_skips_terminal_and_legacy() -> anyh
     let (_dir, store) = open_test_store("harness-test-ar-select-").await?;
     let github = test_github_config(3);
 
-    let transient = seed_stopped_instance(
-        &store,
-        "ar-select-transient",
-        "blocked",
-        transient_blocked_data("episode-1"),
-    )
-    .await?;
+    let mut transient_data = transient_blocked_data("episode-1");
+    transient_data["repo"] = json!("Owner/Auto");
+    let transient =
+        seed_stopped_instance(&store, "ar-select-transient", "blocked", transient_data).await?;
     let terminal = seed_stopped_instance(
         &store,
         "ar-select-terminal",
@@ -238,8 +263,9 @@ async fn auto_recovery_selects_transient_and_skips_terminal_and_legacy() -> anyh
             WorkflowSubject::new("issue", "issue:ar-select-legacy"),
         )
         .with_id("ar-select-legacy".to_string())
-        .with_data(json!({ "repo": TEST_REPO, "blocked_reason": "legacy free text" }));
-        store.upsert_instance(&workflow).await?;
+        .with_server_data(json!({ "repo": TEST_REPO, "blocked_reason": "legacy free text" }));
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
+            .await?;
         workflow
     };
 
@@ -660,8 +686,8 @@ async fn auto_recovery_terminal_recheck_outcome_stops_scheduling() -> anyhow::Re
         WorkflowSubject::new("issue", "issue:ar-recheck-1"),
     )
     .with_id("ar-recheck-1".to_string())
-    .with_data(data);
-    store.upsert_instance(&workflow).await?;
+    .with_server_data(data);
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow).await?;
 
     let now = Utc::now();
     let tick = run_auto_recovery_tick(
@@ -746,7 +772,7 @@ async fn auto_recovery_scan_is_not_starved_by_ineligible_backlog() -> anyhow::Re
             WorkflowSubject::new("issue", format!("issue:ar-starve-{index}")),
         )
         .with_id(format!("ar-starve-{index}"))
-        .with_data(json!({
+        .with_server_data(json!({
             "repo": TEST_REPO,
             "stop_reason_code": "maintainer_input_required",
             "reason_class": "terminal",
@@ -756,7 +782,8 @@ async fn auto_recovery_scan_is_not_starved_by_ineligible_backlog() -> anyhow::Re
                 "event_id": format!("episode-{index}"),
             },
         }));
-        store.upsert_instance(&workflow).await?;
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
+            .await?;
     }
     // The eligible instance arrives last (newest updated_at).
     let eligible = seed_stopped_instance(

@@ -5,6 +5,32 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+fn record_gc_tick(
+    handle: &crate::http::background::LoopHandle,
+    response: &harness_protocol::methods::RpcResponse,
+) {
+    if let Some(error) = &response.error {
+        tracing::error!(error = %error.message, "scheduler: periodic GC run failed");
+        handle.tick_failed(&error.message);
+    } else {
+        handle.tick_ok();
+    }
+}
+
+fn record_workspace_gc_tick(
+    handle: &crate::http::background::LoopHandle,
+    summary: &crate::workspace::DiskReconciliationSummary,
+) {
+    if summary.errors == 0 {
+        handle.tick_ok();
+    } else {
+        handle.tick_failed(&format!(
+            "workspace disk GC completed with {} error(s)",
+            summary.errors
+        ));
+    }
+}
+
 pub struct Scheduler {
     pub gc_interval: Duration,
     pub health_interval: Duration,
@@ -14,6 +40,28 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// GC cadence for a window that produced no quality verdict.
+    ///
+    /// A server starting with an empty event store used to be graded A and
+    /// given the 7-day cadence — a reward for having observed nothing. With no
+    /// verdict, fall back to the daily cadence and let the first real grade
+    /// take over.
+    pub const NO_VERDICT_GC_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+    /// Build a scheduler from an optional startup grade. `None` means the
+    /// startup window carried no evidence to grade.
+    pub fn from_initial_grade(grade: Option<Grade>) -> Self {
+        match grade {
+            Some(grade) => Self::from_grade(grade),
+            None => Self {
+                gc_interval: Self::NO_VERDICT_GC_INTERVAL,
+                health_interval: Duration::from_secs(24 * 3600),
+                self_evolution_interval: Duration::from_secs(24 * 3600),
+                workspace_gc_interval: Duration::from_secs(3600),
+            },
+        }
+    }
+
     pub fn from_grade(grade: Grade) -> Self {
         Self {
             gc_interval: grade.recommended_gc_interval(),
@@ -24,28 +72,42 @@ impl Scheduler {
     }
 
     pub fn start(self, state: Arc<AppState>) {
+        let handle = state
+            .background_loops
+            .register_loop_with_interval("scheduler_gc", self.gc_interval.as_secs());
         let gc_state = state.clone();
         let gc_interval = self.gc_interval;
         tokio::spawn(async move {
             loop {
                 sleep(gc_interval).await;
                 tracing::info!("scheduler: triggering periodic GC run");
-                crate::handlers::gc::gc_run(&gc_state, None, None).await;
+                let response = crate::handlers::gc::gc_run(&gc_state, None, None).await;
+                record_gc_tick(&handle, &response);
             }
         });
 
+        let health_handle = state
+            .background_loops
+            .register_loop_with_interval("scheduler_health", self.health_interval.as_secs());
         let health_state = state.clone();
         let health_interval = self.health_interval;
         tokio::spawn(async move {
             loop {
                 sleep(health_interval).await;
-                if let Err(err) = Self::run_health_tick(&health_state).await {
-                    tracing::error!("scheduler: periodic health tick failed: {err}");
+                match Self::run_health_tick(&health_state).await {
+                    Ok(()) => health_handle.tick_ok(),
+                    Err(err) => {
+                        tracing::error!("scheduler: periodic health tick failed: {err}");
+                        health_handle.tick_failed(&err.to_string());
+                    }
                 }
             }
         });
 
         // Periodic disk workspace GC: removes on-disk worktrees for closed issues/PRs.
+        let wgc_handle = state
+            .background_loops
+            .register_loop_with_interval("workspace_disk_gc", self.workspace_gc_interval.as_secs());
         let wgc_state = state.clone();
         let wgc_interval = self.workspace_gc_interval;
         tokio::spawn(async move {
@@ -72,8 +134,12 @@ impl Scheduler {
                         removed = summary.removed,
                         skipped_uuid = summary.skipped_uuid,
                         skipped_open = summary.skipped_open,
+                        errors = summary.errors,
                         "scheduler: workspace disk GC complete"
                     );
+                    record_workspace_gc_tick(&wgc_handle, &summary);
+                } else {
+                    wgc_handle.tick_ok();
                 }
                 sleep(wgc_interval).await;
             }
@@ -96,15 +162,15 @@ impl Scheduler {
             .await
             .map_err(|err| anyhow::anyhow!("failed to query events: {err}"))?;
         let project_root = state.core.project_root.clone();
-        let violations = {
-            let rules = state.engines.rules.read().await;
-            rules.scan(&project_root).await.map_err(|err| {
-                anyhow::anyhow!(
-                    "failed to scan rules for '{}': {err}",
-                    project_root.display()
-                )
-            })?
-        };
+        // Snapshot under the read lock; the scan spawns one bash script per
+        // guard and must not pin the lock while it runs.
+        let snapshot = state.engines.rules.read().await.snapshot();
+        let violations = snapshot.scan(&project_root).await.map_err(|err| {
+            anyhow::anyhow!(
+                "failed to scan rules for '{}': {err}",
+                project_root.display()
+            )
+        })?;
         state
             .observability
             .events
@@ -114,8 +180,8 @@ impl Scheduler {
         state.observability.events.log(&probe_report).await?;
         let report = generate_health_report(&events, &violations);
         tracing::info!(
-            grade = ?report.quality.grade,
-            score = report.quality.score,
+            grade = ?report.quality.as_ref().map(|quality| quality.grade),
+            score = report.quality.as_ref().map(|quality| quality.score),
             violations = report.violation_summary.len(),
             "scheduler: periodic health report"
         );
@@ -147,12 +213,63 @@ mod tests {
     }
 
     #[test]
+    fn gc_rpc_error_records_a_failed_health_tick() {
+        let health = Arc::new(crate::http::background::BackgroundLoopHealth::new());
+        let handle = health.register_loop("scheduler_gc");
+        let response = harness_protocol::methods::RpcResponse::error(
+            None,
+            harness_protocol::methods::INTERNAL_ERROR,
+            "gc failed",
+        );
+
+        record_gc_tick(&handle, &response);
+
+        let snapshot = health.snapshot(60);
+        assert_eq!(snapshot[0].tick_count, 0);
+        assert_eq!(snapshot[0].failure_count, 1);
+        assert_eq!(snapshot[0].last_error.as_deref(), Some("gc failed"));
+    }
+
+    #[test]
+    fn workspace_gc_summary_errors_record_a_failed_health_tick() {
+        let health = Arc::new(crate::http::background::BackgroundLoopHealth::new());
+        let handle = health.register_loop("workspace_disk_gc");
+        let summary = crate::workspace::DiskReconciliationSummary {
+            errors: 2,
+            ..crate::workspace::DiskReconciliationSummary::default()
+        };
+
+        record_workspace_gc_tick(&handle, &summary);
+
+        let snapshot = health.snapshot(60);
+        assert_eq!(snapshot[0].tick_count, 0);
+        assert_eq!(snapshot[0].failure_count, 1);
+        assert_eq!(
+            snapshot[0].last_error.as_deref(),
+            Some("workspace disk GC completed with 2 error(s)")
+        );
+    }
+
+    #[test]
     fn from_grade_d_returns_1h_gc_interval() {
         let s = Scheduler::from_grade(Grade::D);
         assert_eq!(s.gc_interval, Duration::from_secs(3600));
         assert_eq!(s.health_interval, Duration::from_secs(24 * 3600));
         assert_eq!(s.self_evolution_interval, Duration::from_secs(24 * 3600));
         assert_eq!(s.workspace_gc_interval, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn no_startup_verdict_uses_the_daily_cadence_not_the_grade_a_cadence() {
+        let s = Scheduler::from_initial_grade(None);
+        assert_eq!(s.gc_interval, Scheduler::NO_VERDICT_GC_INTERVAL);
+        assert_ne!(s.gc_interval, Grade::A.recommended_gc_interval());
+    }
+
+    #[test]
+    fn a_startup_verdict_still_drives_the_cadence() {
+        let s = Scheduler::from_initial_grade(Some(Grade::D));
+        assert_eq!(s.gc_interval, Grade::D.recommended_gc_interval());
     }
 
     #[test]

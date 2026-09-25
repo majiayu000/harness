@@ -9,7 +9,9 @@ use harness_core::types::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+mod guard_output;
 
 pub const BUILTIN_BASELINE_GUARD_ID: &str = "BUILTIN-BASELINE-SCAN";
 pub const WARN_NO_GUARDS_REGISTERED: &str = "rule scan warning: no guards registered";
@@ -357,11 +359,7 @@ impl RuleEngine {
         let (re, replacement) = Self::parse_fix_pattern(fix_pattern)
             .ok_or_else(|| anyhow::anyhow!("invalid fix_pattern syntax: {}", fix_pattern))?;
 
-        let file_path = if violation.file.is_absolute() {
-            violation.file.clone()
-        } else {
-            project_root.join(&violation.file)
-        };
+        let file_path = resolve_fix_path(project_root, &violation.file)?;
 
         let content = std::fs::read_to_string(&file_path)
             .with_context(|| format!("failed to read {}", file_path.display()))?;
@@ -643,7 +641,11 @@ impl RuleEngine {
                 .arg(project_root)
                 .output()
                 .await?;
-            violations.extend(self.parse_guard_output(&output, guard)?);
+            violations.extend(guard_output::parse_guard_output(
+                &self.rules,
+                &output,
+                guard.id.as_str(),
+            )?);
         }
         Ok(violations)
     }
@@ -663,42 +665,13 @@ impl RuleEngine {
                     .arg(file)
                     .output()
                     .await?;
-                violations.extend(self.parse_guard_output(&output, guard)?);
+                violations.extend(guard_output::parse_guard_output(
+                    &self.rules,
+                    &output,
+                    guard.id.as_str(),
+                )?);
             }
         }
-        Ok(violations)
-    }
-
-    fn parse_guard_output(
-        &self,
-        output: &std::process::Output,
-        _guard: &Guard,
-    ) -> anyhow::Result<Vec<Violation>> {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut violations = Vec::new();
-
-        for line in stdout.lines() {
-            // Expected format: FILE:LINE:RULE_ID:MESSAGE
-            let parts: Vec<&str> = line.splitn(4, ':').collect();
-            if parts.len() >= 4 {
-                let rule_id = RuleId::from_str(parts[2].trim());
-                let severity = self
-                    .rules
-                    .iter()
-                    .find(|r| r.id == rule_id)
-                    .map(|r| r.severity)
-                    .unwrap_or(Severity::Medium);
-
-                violations.push(Violation {
-                    rule_id,
-                    file: PathBuf::from(parts[0]),
-                    line: parts[1].parse().ok(),
-                    message: parts[3].to_string(),
-                    severity,
-                });
-            }
-        }
-
         Ok(violations)
     }
 
@@ -806,7 +779,11 @@ impl RuleScanSnapshot {
                 .arg(project_root)
                 .output()
                 .await?;
-            violations.extend(self.parse_guard_output(&output)?);
+            violations.extend(guard_output::parse_guard_output(
+                &self.rules,
+                &output,
+                guard.id.as_str(),
+            )?);
         }
         Ok(violations)
     }
@@ -826,39 +803,40 @@ impl RuleScanSnapshot {
                     .arg(file)
                     .output()
                     .await?;
-                violations.extend(self.parse_guard_output(&output)?);
+                violations.extend(guard_output::parse_guard_output(
+                    &self.rules,
+                    &output,
+                    guard.id.as_str(),
+                )?);
             }
         }
         Ok(violations)
     }
+}
 
-    fn parse_guard_output(&self, output: &std::process::Output) -> anyhow::Result<Vec<Violation>> {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut violations = Vec::new();
-
-        for line in stdout.lines() {
-            // Expected format: FILE:LINE:RULE_ID:MESSAGE
-            let parts: Vec<&str> = line.splitn(4, ':').collect();
-            if parts.len() >= 4 {
-                let rule_id = RuleId::from_str(parts[2].trim());
-                let severity = self
-                    .rules
-                    .iter()
-                    .find(|r| r.id == rule_id)
-                    .map(|r| r.severity)
-                    .unwrap_or(Severity::Medium);
-
-                violations.push(Violation {
-                    rule_id,
-                    file: PathBuf::from(parts[0]),
-                    line: parts[1].parse().ok(),
-                    message: parts[3].to_string(),
-                    severity,
-                });
-            }
-        }
-
-        Ok(violations)
+fn resolve_fix_path(project_root: &Path, file: &Path) -> anyhow::Result<PathBuf> {
+    if file
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!(
+            "violation path '{}' escapes the project root",
+            file.display()
+        );
+    }
+    let joined = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        project_root.join(file)
+    };
+    if joined.starts_with(project_root) {
+        Ok(joined)
+    } else {
+        anyhow::bail!(
+            "violation path '{}' is outside project root '{}'",
+            file.display(),
+            project_root.display()
+        );
     }
 }
 

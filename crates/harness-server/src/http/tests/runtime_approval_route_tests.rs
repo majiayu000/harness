@@ -1,5 +1,5 @@
 use super::*;
-use harness_core::agent::{AgentAdapter, AgentEvent, ApprovalDecision, TurnRequest};
+use harness_core::agent::{AgentAdapter, AgentEvent, AgentRequest, ApprovalDecision};
 use harness_core::types::AgentId;
 use std::sync::atomic::Ordering;
 
@@ -16,7 +16,7 @@ impl AgentAdapter for ApprovalTrackingAdapter {
 
     async fn start_turn(
         &self,
-        _request: TurnRequest,
+        _request: AgentRequest,
         _events: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> harness_core::error::Result<()> {
         Ok(())

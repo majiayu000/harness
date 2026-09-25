@@ -1,12 +1,15 @@
 use crate::http::AppState;
 use harness_core::config::misc::ReconciliationConfig;
+pub use harness_protocol::rest::{
+    ReconciliationReport, ReconciliationTransition, WorkflowReconciliationAlert,
+    WorkflowReconciliationTransition,
+};
 use harness_workflow::issue_lifecycle::IssueWorkflowStore;
 use harness_workflow::runtime::{
     DecisionValidator, ValidationContext, WorkflowCommand, WorkflowCommandStatus,
     WorkflowCommandType, WorkflowDecision, WorkflowDecisionTransition, WorkflowEvidence,
     WorkflowInstance, WorkflowRuntimeStore, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     path::PathBuf,
@@ -28,11 +31,13 @@ use self::reconciliation_apply::apply_runtime_workflow_transition;
 use self::reconciliation_github::fetch_pr_state_by_url;
 #[cfg(test)]
 use self::reconciliation_github::{
-    classify_issue_state, classify_pr_state, GitHubIssueState, GitHubPullState,
+    classify_issue_state, classify_pr_state, github_get_json_with_client_timeout, GitHubIssueState,
+    GitHubPullState,
 };
 pub(crate) use self::reconciliation_github::{
+    fetch_exact_issue_state_with_token, fetch_exact_pr_state_with_token,
     fetch_issue_state_with_token, fetch_pr_state_by_slug_with_token, github_api_base_url,
-    GitHubState,
+    try_fetch_issue_state_with_token, try_fetch_pr_state_by_slug_with_token, GitHubState,
 };
 #[cfg(test)]
 use self::reconciliation_runtime::runtime_candidate_from_instance;
@@ -64,53 +69,6 @@ impl RuntimeWorkflowReconciliationSettings {
             ready_to_merge_alert_ttl_secs: config.ready_to_merge_alert_ttl_secs,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReconciliationTransition {
-    pub task_id: String,
-    pub from: String,
-    pub to: String,
-    pub reason: String,
-    pub applied: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowReconciliationTransition {
-    pub workflow_id: String,
-    pub from: String,
-    pub to: String,
-    pub reason: String,
-    pub applied: bool,
-    pub repo: Option<String>,
-    pub issue_number: Option<u64>,
-    pub pr_number: Option<u64>,
-    pub pr_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowReconciliationAlert {
-    pub workflow_id: String,
-    pub state: String,
-    pub reason: String,
-    pub age_secs: u64,
-    pub ttl_secs: u64,
-    pub repo: Option<String>,
-    pub issue_number: Option<u64>,
-    pub pr_number: Option<u64>,
-    pub pr_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReconciliationReport {
-    pub candidates: usize,
-    pub skipped_terminal: usize,
-    #[serde(default)]
-    pub transitions: Vec<ReconciliationTransition>,
-    #[serde(default)]
-    pub workflow_transitions: Vec<WorkflowReconciliationTransition>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub workflow_alerts: Vec<WorkflowReconciliationAlert>,
 }
 
 struct RateLimiter {
@@ -170,47 +128,34 @@ pub async fn run_once_with_runtime_config(
     config: &ReconciliationConfig,
     dry_run: bool,
     github_token: Option<&str>,
-) -> ReconciliationReport {
+) -> anyhow::Result<ReconciliationReport> {
     let Some(runtime_store) = runtime_store else {
-        return ReconciliationReport {
+        return Ok(ReconciliationReport {
             candidates: 0,
             skipped_terminal: 0,
             transitions: Vec::new(),
             workflow_transitions: Vec::new(),
             workflow_alerts: Vec::new(),
-        };
+        });
     };
     let mut rate = RateLimiter::new(config.max_gh_calls_per_minute);
-    match run_runtime_workflow_reconciliation_once(
-        runtime_store,
-        issue_workflows,
-        &mut rate,
-        RuntimeWorkflowReconciliationSettings::from_config(config),
-        dry_run,
-        github_token,
-    )
-    .await
-    {
-        Ok((candidates, skipped_terminal, workflow_transitions, workflow_alerts)) => {
-            ReconciliationReport {
-                candidates: candidates + skipped_terminal,
-                skipped_terminal,
-                transitions: Vec::new(),
-                workflow_transitions,
-                workflow_alerts,
-            }
-        }
-        Err(error) => {
-            tracing::warn!("workflow runtime reconciliation failed: {error}");
-            ReconciliationReport {
-                candidates: 0,
-                skipped_terminal: 0,
-                transitions: Vec::new(),
-                workflow_transitions: Vec::new(),
-                workflow_alerts: Vec::new(),
-            }
-        }
-    }
+    let (candidates, skipped_terminal, workflow_transitions, workflow_alerts) =
+        run_runtime_workflow_reconciliation_once(
+            runtime_store,
+            issue_workflows,
+            &mut rate,
+            RuntimeWorkflowReconciliationSettings::from_config(config),
+            dry_run,
+            github_token,
+        )
+        .await?;
+    Ok(ReconciliationReport {
+        candidates: candidates + skipped_terminal,
+        skipped_terminal,
+        transitions: Vec::new(),
+        workflow_transitions,
+        workflow_alerts,
+    })
 }
 
 fn runtime_transition_for_github_state(
@@ -329,8 +274,52 @@ fn ready_to_merge_open_alert(
 }
 
 #[cfg(test)]
-#[path = "reconciliation_payload_tests.rs"]
-mod payload_tests;
+mod payload_tests {
+    use super::*;
+
+    #[test]
+    fn reconciliation_payload_has_no_workspace_paths() {
+        let report = ReconciliationReport {
+            candidates: 3,
+            skipped_terminal: 1,
+            transitions: vec![ReconciliationTransition {
+                task_id: "task-abc123".to_string(),
+                from: "implementing".to_string(),
+                to: "done".to_string(),
+                reason: "PR merged".to_string(),
+                applied: true,
+            }],
+            workflow_transitions: vec![WorkflowReconciliationTransition {
+                workflow_id: "project::repo:owner/repo::issue:42".to_string(),
+                from: "pr_open".to_string(),
+                to: "done".to_string(),
+                reason: "PR merged".to_string(),
+                applied: true,
+                repo: Some("owner/repo".to_string()),
+                issue_number: Some(42),
+                pr_number: Some(77),
+                pr_url: Some("https://github.com/owner/repo/pull/77".to_string()),
+            }],
+            workflow_alerts: vec![],
+        };
+        let json =
+            serde_json::to_string(&report).expect("ReconciliationReport must serialise to JSON");
+        assert!(
+            !json.contains("/workspaces/"),
+            "ReconciliationReport JSON must not contain a workspace path, got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_runtime_store_returns_empty_ok_report() {
+        let report =
+            run_once_with_runtime_config(None, None, &ReconciliationConfig::default(), false, None)
+                .await
+                .expect("missing store is not a tick failure");
+        assert_eq!(report.candidates, 0);
+        assert!(report.workflow_transitions.is_empty());
+    }
+}
 #[cfg(test)]
 #[path = "reconciliation_state_tests.rs"]
 mod state_tests;

@@ -2,10 +2,11 @@ use chrono::Utc;
 use harness_core::config::isolation::IsolationTrustClass;
 use harness_workflow::issue_lifecycle::{workflow_id, IssueLifecycleState, IssueWorkflowStore};
 use harness_workflow::runtime::{
-    RemoteFactSnapshot, WorkflowCommand, WorkflowCommandType, WorkflowCoverageRecoveryExpected,
-    WorkflowCoverageRecoveryOutcome, WorkflowCoverageRecoveryTransition, WorkflowDecision,
-    WorkflowDefinition, WorkflowEvidence, WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject,
-    GITHUB_ISSUE_PR_DEFINITION_ID, QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
+    DataProvenance, RemoteFactSnapshot, WorkflowCommand, WorkflowCommandType,
+    WorkflowCoverageRecoveryExpected, WorkflowCoverageRecoveryOutcome,
+    WorkflowCoverageRecoveryTransition, WorkflowDecision, WorkflowDefinition, WorkflowEvidence,
+    WorkflowInstance, WorkflowRuntimeStore, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    QUALITY_GATE_ACTIVITY, QUALITY_GATE_DEFINITION_ID,
 };
 use serde_json::json;
 use std::path::Path;
@@ -83,10 +84,11 @@ pub(crate) fn issue_remote_fact_snapshot(
     issue_number: u64,
     issue: &IncomingIssue,
 ) -> anyhow::Result<RemoteFactSnapshot> {
+    let repo = repo.to_ascii_lowercase();
     let subject_number = i64::try_from(issue_number)?;
     let facts = json!({
         "provider": "github",
-        "repo": repo,
+        "repo": &repo,
         "subject_type": "issue",
         "number": issue_number,
         "title": issue.title,
@@ -97,7 +99,7 @@ pub(crate) fn issue_remote_fact_snapshot(
     });
     let mut snapshot = RemoteFactSnapshot::new(
         "github",
-        repo,
+        &repo,
         "issue",
         subject_number,
         "open",
@@ -135,11 +137,18 @@ pub(crate) async fn check_github_issue_coverage(
     author_trust_class: IsolationTrustClass,
     github_token: Option<&str>,
 ) -> anyhow::Result<GitHubIssueCoverage> {
+    let requested_repo = repo;
+    let repo = repo.to_ascii_lowercase();
     if let Some(issue_store) = issue_store {
-        if let Some(workflow) = issue_store
-            .get_by_issue(project_id, Some(repo), issue_number)
-            .await?
-        {
+        let mut workflow = issue_store
+            .get_by_issue(project_id, Some(&repo), issue_number)
+            .await?;
+        if workflow.is_none() && requested_repo != repo {
+            workflow = issue_store
+                .get_by_issue(project_id, Some(requested_repo), issue_number)
+                .await?;
+        }
+        if let Some(workflow) = workflow {
             if issue_lifecycle_state_is_covered(workflow.state) {
                 return Ok(GitHubIssueCoverage::Covered {
                     source: "issue_workflow",
@@ -152,19 +161,29 @@ pub(crate) async fn check_github_issue_coverage(
         }
     }
 
-    if let Some(runtime_store) = runtime_store {
-        let id = workflow_id(project_id, Some(repo), issue_number);
-        if let Some(workflow) = runtime_store.get_instance(&id).await? {
+    let existing_runtime_workflow_id = if let Some(runtime_store) = runtime_store {
+        let workflow = runtime_store
+            .get_instance_by_issue(
+                GITHUB_ISSUE_PR_DEFINITION_ID,
+                project_id,
+                Some(&repo),
+                issue_number,
+            )
+            .await?;
+        if let Some(workflow) = workflow.as_ref() {
             if runtime_issue_state_is_covered(&workflow.state)
-                && !recovered_closed_pr_requires_lookup(&workflow)
+                && !recovered_closed_pr_requires_lookup(workflow)
             {
                 return Ok(GitHubIssueCoverage::Covered {
                     source: "workflow_runtime",
-                    state: workflow.state,
+                    state: workflow.state.clone(),
                 });
             }
         }
-    }
+        workflow.map(|workflow| workflow.id)
+    } else {
+        None
+    };
 
     let Some(runtime_store) = runtime_store else {
         return Ok(GitHubIssueCoverage::Uncovered);
@@ -173,10 +192,11 @@ pub(crate) async fn check_github_issue_coverage(
         runtime_store,
         project_root,
         project_id,
-        repo,
+        &repo,
         issue_number,
         author_trust_class,
         github_token,
+        existing_runtime_workflow_id.as_deref(),
     )
     .await
 }
@@ -199,6 +219,7 @@ async fn recover_github_pr_coverage(
     issue_number: u64,
     author_trust_class: IsolationTrustClass,
     github_token: Option<&str>,
+    existing_workflow_id: Option<&str>,
 ) -> anyhow::Result<GitHubIssueCoverage> {
     let client = reqwest::Client::new();
     recover_github_pr_coverage_with_client(
@@ -209,6 +230,7 @@ async fn recover_github_pr_coverage(
         issue_number,
         author_trust_class,
         github_token,
+        existing_workflow_id,
         &client,
         &github_graphql_url(),
     )
@@ -224,6 +246,7 @@ async fn recover_github_pr_coverage_with_client(
     issue_number: u64,
     author_trust_class: IsolationTrustClass,
     github_token: Option<&str>,
+    existing_workflow_id: Option<&str>,
     client: &reqwest::Client,
     graphql_url: &str,
 ) -> anyhow::Result<GitHubIssueCoverage> {
@@ -235,9 +258,15 @@ async fn recover_github_pr_coverage_with_client(
         graphql_url,
     )
     .await?;
-    let expected_base_ref =
-        recovery_expected_base_ref(runtime_store, project_root, project_id, repo, issue_number)
-            .await?;
+    let expected_base_ref = recovery_expected_base_ref(
+        runtime_store,
+        project_root,
+        project_id,
+        repo,
+        issue_number,
+        existing_workflow_id,
+    )
+    .await?;
     let mut snapshots = Vec::new();
 
     for candidate in issue_links.candidates {
@@ -293,6 +322,7 @@ async fn recover_github_pr_coverage_with_client(
         remote_fact,
         state,
         author_trust_class,
+        existing_workflow_id,
     )
     .await?;
     for (_, _, fact, _) in &snapshots {
@@ -335,8 +365,10 @@ async fn persist_recovered_workflow(
     remote_fact: &RemoteFactSnapshot,
     state: &str,
     author_trust_class: IsolationTrustClass,
+    existing_workflow_id: Option<&str>,
 ) -> anyhow::Result<RecoveredWorkflowPersistence> {
-    let id = workflow_id(project_id, Some(repo), issue_number);
+    let canonical_id = workflow_id(project_id, Some(repo), issue_number);
+    let id = existing_workflow_id.unwrap_or(&canonical_id).to_string();
     let mut data = recovered_workflow_data(
         project_root,
         project_id,
@@ -372,22 +404,38 @@ async fn persist_recovered_workflow(
         .with_id(id.clone())
     });
     final_instance.state = state.to_string();
-    final_instance.data = data;
+    final_instance.replace_data_with_field_provenance(data, |field| match field {
+        "author_trust_class"
+        | "last_remote_fact_hash"
+        | "project_id"
+        | "repo"
+        | "runtime_retry_policy"
+        | "source"
+        | "task_id" => DataProvenance::Server,
+        _ => DataProvenance::External,
+    })?;
     final_instance.version = existing
         .as_ref()
-        .map_or(0, |value| value.version.saturating_add(1));
+        .map_or(1, |value| value.version.saturating_add(1));
     let mut decision = WorkflowDecision::new(
         &id,
         existing
             .as_ref()
-            .map_or("missing", |value| value.state.as_str()),
+            .map_or("discovered", |value| value.state.as_str()),
         "recover_github_pr_coverage",
         state,
         "Recovered an authoritative closing pull request from GitHub.",
     )
-    .with_evidence(WorkflowEvidence::new(
+    .with_evidence(WorkflowEvidence::runtime_observed(
         "server_pr_snapshot",
         "GitHub reported an authoritative closing pull request.",
+        "github_coverage_gate",
+        Some(remote_fact.fact_hash.clone()),
+    ))
+    .with_command(WorkflowCommand::bind_pr(
+        candidate.number,
+        candidate.url.clone(),
+        format!("{}:bind-pr:{}", id, candidate.number),
     ))
     .high_confidence();
     if state == "quality_gate_pending" {
@@ -402,6 +450,28 @@ async fn persist_recovered_workflow(
                 "pr_number": candidate.number,
                 "pr_url": candidate.url,
                 "validation_commands": [],
+            }),
+        ));
+    } else if state == "done" {
+        decision = decision.with_command(WorkflowCommand::new(
+            WorkflowCommandType::MarkDone,
+            format!("{}:done:{}", id, candidate.number),
+            json!({
+                "reason": "GitHub reported the closing pull request as merged.",
+                "repo": repo,
+                "pr_number": candidate.number,
+                "pr_url": candidate.url,
+            }),
+        ));
+    } else if state == "cancelled" {
+        decision = decision.with_command(WorkflowCommand::new(
+            WorkflowCommandType::MarkCancelled,
+            format!("{}:cancelled:{}", id, candidate.number),
+            json!({
+                "reason": "GitHub reported the closing pull request as closed without merge.",
+                "repo": repo,
+                "pr_number": candidate.number,
+                "pr_url": candidate.url,
             }),
         ));
     }
@@ -439,11 +509,20 @@ async fn persist_recovered_workflow(
             .filter(|workflow| runtime_issue_state_is_covered(&workflow.state))
             .map(|workflow| RecoveredWorkflowPersistence::ExistingCoverage(workflow.state))
             .unwrap_or(RecoveredWorkflowPersistence::Rejected)),
+        WorkflowCoverageRecoveryOutcome::Rejected { reason } => {
+            tracing::warn!(
+                workflow_id = %id,
+                issue_number,
+                pr_number = candidate.number,
+                "GitHub coverage recovery rejected by workflow validator: {reason}"
+            );
+            Ok(RecoveredWorkflowPersistence::Rejected)
+        }
     }
 }
 
 #[cfg(test)]
-#[path = "github_coverage_recovery_tests.rs"]
+#[path = "github_coverage_recovery_tests/mod.rs"]
 mod recovery_tests;
 
 #[cfg(test)]
@@ -623,9 +702,11 @@ mod tests {
         };
 
         let left = issue_remote_fact_snapshot("owner/repo", 7, &issue).expect("snapshot");
-        let right = issue_remote_fact_snapshot("owner/repo", 7, &issue).expect("snapshot");
+        let right = issue_remote_fact_snapshot("Owner/Repo", 7, &issue).expect("snapshot");
 
         assert_eq!(left.fact_hash, right.fact_hash);
+        assert_eq!(right.repo, "owner/repo");
+        assert_eq!(right.facts["repo"], "owner/repo");
     }
 
     async fn store_stopped_replan_workflow(
@@ -639,22 +720,26 @@ mod tests {
         let mut workflow = WorkflowInstance::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
             1,
-            stopped_state,
+            "replanning",
             WorkflowSubject::new("issue", format!("issue:{issue_number}")),
         )
         .with_id(workflow_id)
-        .with_data(json!({
-            "project_id": project_id,
-            "repo": repo,
-            "issue_number": issue_number,
-            "error_kind": "timeout",
-            "last_stop": {
-                "state": stopped_state,
-                "activity": "replan_issue",
+        .with_classified_data(
+            json!({
+                "project_id": project_id,
+                "repo": repo,
+                "issue_number": issue_number,
                 "error_kind": "timeout",
-            },
-        }));
-        store.upsert_instance(&workflow).await?;
+                "last_stop": {
+                    "state": stopped_state,
+                    "activity": "replan_issue",
+                    "error_kind": "timeout",
+                },
+            }),
+            DataProvenance::Server,
+        );
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
 
         let command = WorkflowCommand::enqueue_activity(
             "replan_issue",
@@ -669,8 +754,12 @@ mod tests {
                 command.command,
             )
             .await?;
-        workflow.data["last_stop"]["runtime_job_id"] = json!(runtime_job.id);
-        store.upsert_instance(&workflow).await?;
+        let mut last_stop = workflow.data["last_stop"].clone();
+        last_stop["runtime_job_id"] = json!(runtime_job.id);
+        workflow.set_data_field("last_stop", last_stop, DataProvenance::Server)?;
+        workflow.state = stopped_state.to_string();
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow)
+            .await?;
         Ok(workflow)
     }
 }

@@ -15,9 +15,13 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 use tower::ServiceExt;
 
+use crate::http::github_webhook_routes::github_webhook;
+use crate::http::health_routes::{health_check, project_queue_stats};
+use crate::http::intake_status_routes::intake_status;
 use crate::http::test_fixtures::{
     make_read_only_route_test_state, make_read_only_route_test_state_with,
 };
+use crate::http::workflow_routes::get_workflow_runtime_tree;
 
 mod state_support;
 use state_support::*;
@@ -33,6 +37,7 @@ mod repo_memory_api_tests;
 mod runtime_approval_route_tests;
 mod runtime_deferred_tree_tests;
 mod runtime_dispatch_tests;
+mod runtime_pr_feedback_sweep_tests;
 mod runtime_task_route_tests;
 mod runtime_transcript_route_tests;
 mod runtime_tree_tests;

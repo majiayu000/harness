@@ -1,3 +1,4 @@
+schema_version = 1
 suite = "harness-core"
 default_timeout_secs = 7200
 
@@ -57,13 +58,13 @@ issue = 1455
 base_commit = "55354d1e105fd6d63ac40269289ba331e22580cf"
 verify_commands = ["cargo test -p harness-server task_queue"]
 
-# PR #1457 closed GH-1454.
+# PR #1457 closed GH-1454. The verifier is embedded in the evaluator binary,
+# runs outside the candidate workspace, and is omitted from the agent prompt.
 [[cases]]
 case_id = "gh1454-scoped-ci-jobs"
 repo = "majiayu000/harness"
 issue = 1454
 base_commit = "9c0099ad458e82fd377fd20a8e288a46722762ef"
-verify_commands = ["python3 checks/check_workflow.py --repo ."]
 
 # PR #1446 closed GH-1430.
 [[cases]]

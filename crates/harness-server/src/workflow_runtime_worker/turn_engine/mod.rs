@@ -5,6 +5,7 @@
 //! GH-1434 removes that path.
 
 pub(crate) mod helpers;
+pub(super) mod runtime_usage;
 pub(crate) mod turn_lifecycle;
 
 #[cfg(test)]
@@ -12,3 +13,6 @@ mod stall_tests;
 
 #[cfg(test)]
 mod terminal_error_tests;
+
+#[cfg(test)]
+mod turn_lifecycle_tests;

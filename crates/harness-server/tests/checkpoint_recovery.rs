@@ -7,9 +7,10 @@
 //! tasks with checkpoints are resumed while tasks without are failed.
 
 use harness_core::types::TaskId as CoreTaskId;
-use harness_server::event_replay::{TaskEvent, TaskEventLog};
-use harness_server::task_db::TaskDb;
-use harness_server::task_runner::{TaskKind, TaskPhase, TaskState, TaskStatus, TaskStore};
+use harness_server::server::test_support::{
+    SchedulerAuthorityState, TaskDb, TaskEvent, TaskEventLog, TaskKind, TaskPhase,
+    TaskSchedulerState, TaskState, TaskStatus, TaskStore,
+};
 
 fn make_task(id: &str, status: TaskStatus) -> TaskState {
     TaskState {
@@ -40,7 +41,7 @@ fn make_task(id: &str, status: TaskStatus) -> TaskState {
         plan_output: None,
         repo: None,
         request_settings: None,
-        scheduler: harness_server::task_runner::TaskSchedulerState::queued(),
+        scheduler: TaskSchedulerState::queued(),
         version: 0,
     }
 }
@@ -190,7 +191,7 @@ async fn recovery_no_limbo_restart_mid_review_states_resume_or_terminalize() -> 
     assert_eq!(review_with_pr.status, TaskStatus::Pending);
     assert!(matches!(
         review_with_pr.scheduler.authority_state,
-        harness_server::task_runner::SchedulerAuthorityState::Recovering
+        SchedulerAuthorityState::Recovering
     ));
 
     let review_with_plan = recovered_task(&store, "review-with-plan").await?;
@@ -198,7 +199,7 @@ async fn recovery_no_limbo_restart_mid_review_states_resume_or_terminalize() -> 
     assert_eq!(review_with_plan.status, TaskStatus::Pending);
     assert!(matches!(
         review_with_plan.scheduler.authority_state,
-        harness_server::task_runner::SchedulerAuthorityState::Recovering
+        SchedulerAuthorityState::Recovering
     ));
 
     for id in ["reviewing-no-checkpoint", "waiting-no-checkpoint"] {
@@ -242,7 +243,7 @@ async fn recovery_no_limbo_shutdown_drain_states_are_queued_or_terminal() -> any
     assert_eq!(pending.status, TaskStatus::Pending);
     assert!(matches!(
         pending.scheduler.authority_state,
-        harness_server::task_runner::SchedulerAuthorityState::Queued
+        SchedulerAuthorityState::Queued
     ));
 
     for id in ["drained-implementing", "drained-review-waiting"] {
@@ -575,7 +576,7 @@ async fn restart_marks_resumed_task_as_recovering_in_scheduler_state() -> anyhow
     assert!(matches!(recovered.status, TaskStatus::Pending));
     assert!(matches!(
         recovered.scheduler.authority_state,
-        harness_server::task_runner::SchedulerAuthorityState::Recovering
+        SchedulerAuthorityState::Recovering
     ));
     assert_eq!(recovered.scheduler.recovery_generation, 1);
     assert_eq!(

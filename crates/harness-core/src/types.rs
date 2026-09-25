@@ -291,7 +291,29 @@ pub enum Item {
     Error {
         code: i32,
         message: String,
+        /// Typed transport/provider classification carried from `HarnessError`.
+        /// Absent on historical transcripts and untyped stream warnings.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_kind: Option<TurnFailureKind>,
     },
+}
+
+impl Item {
+    pub fn error(message: impl Into<String>) -> Self {
+        Self::Error {
+            code: -1,
+            message: message.into(),
+            failure_kind: None,
+        }
+    }
+
+    pub fn typed_error(message: impl Into<String>, kind: TurnFailureKind) -> Self {
+        Self::Error {
+            code: -1,
+            message: message.into(),
+            failure_kind: Some(kind),
+        }
+    }
 }
 
 // === Signal ===

@@ -15,7 +15,7 @@ unverified and blocked.
 ## 2. Evidence
 
 Audit of 132 Codex implx sessions (2026-06-30 → 2026-07-04) driven by the harness
-runtime and SpecRail queue workflows. A runtime job for `issue_1415` reported
+runtime and agent queue workflows. A runtime job for `issue_1415` reported
 final `"status": "succeeded"` while its own report simultaneously said:
 
 > "PR is open with pending CI/review quota blockers"

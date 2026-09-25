@@ -130,7 +130,7 @@ fn runtime_workflow_active_counts_match_dashboard_buckets() {
         "implementing",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
     )
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/repo",
         "task_id": "runtime-1",
     }));
@@ -140,7 +140,7 @@ fn runtime_workflow_active_counts_match_dashboard_buckets() {
         "ready_to_merge",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:2"),
     )
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/repo",
         "task_id": "runtime-2",
     }));
@@ -150,7 +150,7 @@ fn runtime_workflow_active_counts_match_dashboard_buckets() {
         "done",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:3"),
     )
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/repo",
         "task_id": "runtime-3",
     }));
@@ -175,7 +175,7 @@ fn planning_runtime_workflow_counts_as_running_work() {
         "planning",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:1"),
     )
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": "/repo",
         "task_id": "runtime-1",
     }));
@@ -251,6 +251,25 @@ async fn overview_returns_expected_shape() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn overview_fails_when_alert_delivery_query_fails() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = test_helpers::tempdir_in_home("harness-test-overview-alert-failure-")?;
+    let state = test_helpers::make_test_state(dir.path()).await?;
+    // A directory at the signal log path makes opening or reading it fail,
+    // without relying on filesystem permissions or touching other fixtures.
+    std::fs::create_dir(dir.path().join("signals.jsonl"))?;
+
+    let (status, body) = overview(State(Arc::new(state))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body.0 .0["error"], "exhausted alert deliveries unavailable");
+    assert!(body.0 .0.get("alerts").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn status_stalled_terminal_overview_counts_budget_exhaustion() -> anyhow::Result<()> {
     let _lock = test_helpers::HOME_LOCK.lock().await;
     if !test_helpers::db_tests_enabled().await {
@@ -294,12 +313,12 @@ async fn status_stalled_terminal_overview_counts_budget_exhaustion() -> anyhow::
         "failed",
         harness_workflow::runtime::WorkflowSubject::new("issue", "issue:overview-stalled"),
     )
-    .with_data(serde_json::json!({
+    .with_server_data(serde_json::json!({
         "project_id": project_root,
         "task_id": "overview-stalled-task",
         "failure_reason": "{\"reason\":\"round_budget_exhausted\"}"
     }));
-    store.upsert_instance(&workflow).await?;
+    crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &workflow).await?;
 
     let app = Router::new()
         .route("/api/overview", get(overview))
@@ -359,7 +378,10 @@ async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()>
                 created_at: std::time::SystemTime::now(),
                 owner_session: format!("session-{i}"),
                 run_generation: 1,
+                acquisition_id: format!("test-acquisition-{i}"),
+                state: crate::workspace::ActiveWorkspaceState::Ready,
                 _pool_permit: None,
+                _repository_write_lease: None,
             },
         );
     }
@@ -385,5 +407,33 @@ async fn worktrees_used_includes_local_workspace_manager() -> anyhow::Result<()>
         "kpi.worktrees.used should count local workspace manager entries"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_counts_fail_when_runtime_query_fails() -> anyhow::Result<()> {
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = test_helpers::tempdir_in_home("harness-test-active-counts-")?;
+    let mut state = test_helpers::make_test_state(dir.path()).await?;
+    let store = harness_workflow::runtime::WorkflowRuntimeStore::open_with_database_url(
+        &dir.path().join("active-counts.db"),
+        Some(&test_helpers::test_database_url()?),
+    )
+    .await?;
+    // Closing this fixture's pool simulates a query outage without modifying schema or shared state.
+    store.pool().close().await;
+    state.core.workflow_runtime_store = Some(Arc::new(store));
+    assert!(active_task_overview_counts(&state).await.is_err());
+    assert!(
+        crate::handlers::dashboard_active_counts::dashboard_active_counts(&state, None)
+            .await
+            .is_err()
+    );
+    let (status, body) = overview(State(Arc::new(state))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body.0 .0["error"], "active workflow counts unavailable");
     Ok(())
 }

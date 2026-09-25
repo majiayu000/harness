@@ -62,4 +62,4 @@ Config: `merge_execution: "agent" | "server"` under the existing auto-merge/inta
 
 ## Rollback Plan
 
-`merge_execution = "agent"` plus a `verify_merge_completion = false` escape hatch restores today's exact behavior without code rollback. Both flags read at dispatch time, so no migration is needed to revert.
+`merge_execution = "agent"` remains available, but `verify_merge_completion = false` fails closed: unverified agent-reported merge state cannot complete the workflow. Both flags are read at dispatch time.

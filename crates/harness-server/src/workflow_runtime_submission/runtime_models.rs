@@ -246,6 +246,7 @@ impl TaskTerminalFailure {
         }
     }
 
+    #[cfg(test)]
     pub fn round_budget_exhausted(
         rounds_used: u32,
         last_status: TaskStatus,
@@ -319,10 +320,6 @@ impl TaskTerminalInfo {
             waiting_on: failure.and_then(|failure| failure.waiting_on),
         })
     }
-
-    pub fn is_stalled(&self) -> bool {
-        self.classification == TaskTerminalClassification::Stalled
-    }
 }
 
 pub fn parse_terminal_failure(error: &str) -> Option<TaskTerminalFailure> {
@@ -331,8 +328,11 @@ pub fn parse_terminal_failure(error: &str) -> Option<TaskTerminalFailure> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskTerminalOutcome {
+    // Retained for the terminal-transition API; current production callers only fail tasks.
+    #[allow(dead_code)]
     Completed,
     Failed(TaskTerminalFailure),
+    #[allow(dead_code)]
     Cancelled(Option<String>),
 }
 

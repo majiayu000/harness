@@ -293,6 +293,7 @@ mod tests {
             shutdown_flush_secs: 5,
             channels,
             heartbeat: Default::default(),
+            pool_starvation_ticks: 20,
         }
     }
 

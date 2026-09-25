@@ -97,6 +97,57 @@ pub(crate) async fn github_state_server(path: &'static str, body: &'static str) 
     format!("http://{addr}")
 }
 
+pub(crate) async fn github_redirect_state_server(
+    path: &'static str,
+    terminal_body: &'static str,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind GitHub redirect mock");
+    let addr = listener.local_addr().expect("GitHub redirect mock address");
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0_u8; 2048];
+        let Ok(n) = socket.read(&mut buf).await else {
+            return;
+        };
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let response = if request.starts_with(&format!("GET {path} ")) {
+            format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://{addr}/terminal\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+        } else {
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+        };
+        let _ = socket.write_all(response.as_bytes()).await;
+
+        let Ok(Ok((mut socket, _))) =
+            tokio::time::timeout(Duration::from_secs(1), listener.accept()).await
+        else {
+            return;
+        };
+        let Ok(n) = socket.read(&mut buf).await else {
+            return;
+        };
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let (status, response_body) = if request.starts_with("GET /terminal ") {
+            ("200 OK", terminal_body)
+        } else {
+            ("404 Not Found", "{}")
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+    });
+    format!("http://{addr}")
+}
+
 pub(crate) fn init_git_repo(dir: &Path) {
     let run = |args: &[&str]| {
         run_git(args);

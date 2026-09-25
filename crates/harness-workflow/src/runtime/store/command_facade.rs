@@ -1,6 +1,52 @@
 use super::*;
 
+/// Point-in-time dispatch pool state used by the starvation probe (GH-1895):
+/// distinguishes "no work exists" from "work exists but is gated".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatchPoolSnapshot {
+    pub pending_commands: u64,
+    pub deferred_commands: u64,
+    pub dispatched_commands: u64,
+    pub gated_workflows: u64,
+}
+
+impl DispatchPoolSnapshot {
+    /// True when undispatchable work is sitting in the pool: deferred
+    /// commands behind a dispatch barrier, or workflows parked in a gated
+    /// state. This is the starvation case; an all-zero snapshot is idle.
+    pub fn has_gated_work(&self) -> bool {
+        self.deferred_commands > 0 || self.gated_workflows > 0
+    }
+}
+
 impl WorkflowRuntimeStore {
+    /// Count commands by dispatch status plus workflows parked in gated
+    /// states (`blocked`, `awaiting_feedback`, `awaiting_dependencies` —
+    /// the last one is how the 08-01 mutual-dependency starvation presented
+    /// while nothing was dispatching, GH-1885).
+    pub async fn dispatch_pool_snapshot(&self) -> anyhow::Result<DispatchPoolSnapshot> {
+        let (pending, deferred, dispatched): (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE status = 'pending'),
+                    COUNT(*) FILTER (WHERE status = 'deferred'),
+                    COUNT(*) FILTER (WHERE status = 'dispatched')
+             FROM workflow_commands",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let (gated_workflows,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM workflow_instances
+             WHERE state IN ('blocked', 'awaiting_feedback', 'awaiting_dependencies')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(DispatchPoolSnapshot {
+            pending_commands: pending.max(0) as u64,
+            deferred_commands: deferred.max(0) as u64,
+            dispatched_commands: dispatched.max(0) as u64,
+            gated_workflows: gated_workflows.max(0) as u64,
+        })
+    }
+
     pub async fn enqueue_command(
         &self,
         workflow_id: &str,
@@ -23,7 +69,47 @@ impl WorkflowRuntimeStore {
         command: &WorkflowCommand,
         status: WorkflowCommandStatus,
     ) -> anyhow::Result<String> {
-        command_store::insert(&self.pool, workflow_id, decision_id, command, status).await
+        let mut tx = self.pool.begin().await?;
+        let instance = select_instance_for_update_tx(&mut tx, workflow_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("workflow instance not found: {workflow_id}"))?;
+        if definitions::terminal_state_for_instance_tx(
+            &mut tx,
+            &self.definition_registry,
+            &instance,
+        )
+        .await?
+        .is_some()
+        {
+            anyhow::bail!(
+                "cannot enqueue command for terminal workflow `{workflow_id}` in state `{}`",
+                instance.state
+            );
+        }
+        let id =
+            command_store::insert_tx(&mut tx, workflow_id, decision_id, command, status).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn enqueue_command_for_test_unchecked(
+        &self,
+        workflow_id: &str,
+        decision_id: Option<&str>,
+        command: &WorkflowCommand,
+    ) -> anyhow::Result<String> {
+        let mut tx = self.pool.begin().await?;
+        let id = command_store::insert_tx(
+            &mut tx,
+            workflow_id,
+            decision_id,
+            command,
+            WorkflowCommandStatus::Pending,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
     }
 
     pub async fn commands_for(
@@ -34,7 +120,8 @@ impl WorkflowRuntimeStore {
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
                     dispatch_lease_expires_at, dispatch_not_before,
                     dispatch_attempt_count, dispatch_claim_generation,
-                    dispatch_barrier::text, data::text, created_at, updated_at
+                    dispatch_barrier::text, data::text, created_at, updated_at,
+                    attempt_generation, superseded_by_command_id
                  FROM workflow_commands
                  WHERE workflow_id = $1
                  ORDER BY created_at ASC",
@@ -58,7 +145,8 @@ impl WorkflowRuntimeStore {
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
                     dispatch_lease_expires_at, dispatch_not_before,
                     dispatch_attempt_count, dispatch_claim_generation,
-                    dispatch_barrier::text, data::text, created_at, updated_at
+                    dispatch_barrier::text, data::text, created_at, updated_at,
+                    attempt_generation, superseded_by_command_id
              FROM workflow_commands
              WHERE workflow_id = ANY($1::text[])
              ORDER BY workflow_id ASC, created_at ASC",
@@ -92,14 +180,16 @@ impl WorkflowRuntimeStore {
                     command.dispatch_not_before, command.dispatch_attempt_count,
                     command.dispatch_claim_generation, command.dispatch_barrier,
                     command.data,
-                    command.created_at, command.updated_at
+                    command.created_at, command.updated_at,
+                    command.attempt_generation, command.superseded_by_command_id
              FROM unnest($1::text[]) AS selected(workflow_id)
              JOIN LATERAL (
                  SELECT id, workflow_id, decision_id, status, dispatch_owner,
                         dispatch_lease_expires_at, dispatch_not_before,
                         dispatch_attempt_count, dispatch_claim_generation,
                         dispatch_barrier::text AS dispatch_barrier,
-                        data::text AS data, created_at, updated_at
+                        data::text AS data, created_at, updated_at,
+                        attempt_generation, superseded_by_command_id
                  FROM workflow_commands
                  WHERE workflow_id = selected.workflow_id
                  ORDER BY created_at DESC
@@ -130,7 +220,8 @@ impl WorkflowRuntimeStore {
             "SELECT id, workflow_id, decision_id, status, dispatch_owner,
                     dispatch_lease_expires_at, dispatch_not_before,
                     dispatch_attempt_count, dispatch_claim_generation,
-                    dispatch_barrier::text, data::text, created_at, updated_at
+                    dispatch_barrier::text, data::text, created_at, updated_at,
+                    attempt_generation, superseded_by_command_id
              FROM workflow_commands
              WHERE id = $1",
         )
@@ -147,7 +238,8 @@ impl WorkflowRuntimeStore {
                     command.dispatch_owner, command.dispatch_lease_expires_at,
                     command.dispatch_not_before, command.dispatch_attempt_count,
                     command.dispatch_claim_generation, command.dispatch_barrier::text,
-                    command.data::text, command.created_at, command.updated_at
+                    command.data::text, command.created_at, command.updated_at,
+                    command.attempt_generation, command.superseded_by_command_id
              FROM workflow_commands AS command
              JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
              WHERE command.status = 'pending'
@@ -162,27 +254,21 @@ impl WorkflowRuntimeStore {
             .collect()
     }
 
-    pub async fn claim_pending_commands(
-        &self,
-        owner: &str,
-        expires_at: DateTime<Utc>,
-        limit: i64,
-    ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
-        let limit = limit.clamp(1, 500);
-        let mut tx = self.pool.begin().await?;
-        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(
-            "WITH candidates AS (
-                 SELECT command.id
-                 FROM workflow_commands AS command
-                 JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
-             WHERE command.status = $3
+    /// The single definition of "claimable now" (B-001): a pending command, a
+    /// dispatching command whose lease expired, or a deferred command whose
+    /// backoff elapsed with an intact barrier. `claim_pending_commands` and
+    /// `peek_claimable_commands` must not drift apart, so both render this
+    /// fragment with their own bind indices.
+    fn claimable_command_predicate(pending: u8, dispatching: u8, deferred: u8) -> String {
+        format!(
+            "command.status = ${pending}
                     OR (
-                        command.status = $4
+                        command.status = ${dispatching}
                         AND COALESCE(command.dispatch_lease_expires_at, '-infinity'::timestamptz)
                             <= CURRENT_TIMESTAMP
                     )
                     OR (
-                        command.status = $5
+                        command.status = ${deferred}
                         AND command.dispatch_not_before <= CURRENT_TIMESTAMP
                         AND command.dispatch_owner IS NULL
                         AND command.dispatch_lease_expires_at IS NULL
@@ -201,7 +287,56 @@ impl WorkflowRuntimeStore {
                             = command.dispatch_claim_generation
                         AND (command.dispatch_barrier->>'next_dispatch_at')::TIMESTAMPTZ
                             = command.dispatch_not_before
-                    )
+                    )"
+        )
+    }
+
+    /// Claimable commands without claiming them — the throttle band needs to
+    /// know whether other work could run instead (GH-1770 §4.1).
+    pub async fn peek_claimable_commands(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(&format!(
+            "SELECT command.id, command.workflow_id, command.decision_id, command.status,
+                    command.dispatch_owner, command.dispatch_lease_expires_at,
+                    command.dispatch_not_before, command.dispatch_attempt_count,
+                    command.dispatch_claim_generation, command.dispatch_barrier::text,
+                    command.data::text, command.created_at, command.updated_at,
+                    command.attempt_generation, command.superseded_by_command_id
+             FROM workflow_commands AS command
+             JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+             WHERE {}
+             ORDER BY command.created_at ASC
+             LIMIT $4",
+            Self::claimable_command_predicate(1, 2, 3)
+        ))
+        .bind(WorkflowCommandStatus::Pending.as_str())
+        .bind(WorkflowCommandStatus::Dispatching.as_str())
+        .bind(WorkflowCommandStatus::Deferred.as_str())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(workflow_command_record_from_row)
+            .collect()
+    }
+
+    pub async fn claim_pending_commands(
+        &self,
+        owner: &str,
+        expires_at: DateTime<Utc>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WorkflowCommandRecord>> {
+        let limit = limit.clamp(1, 500);
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<WorkflowCommandRecordRow> = sqlx::query_as(&format!(
+            "WITH candidates AS (
+                 SELECT command.id
+                 FROM workflow_commands AS command
+                 JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+                 WHERE {}
                  ORDER BY command.created_at ASC
                  LIMIT $6
                  FOR UPDATE OF command SKIP LOCKED
@@ -218,8 +353,10 @@ impl WorkflowRuntimeStore {
                        command.dispatch_owner, command.dispatch_lease_expires_at,
                        command.dispatch_not_before, command.dispatch_attempt_count,
                        command.dispatch_claim_generation, command.dispatch_barrier::text,
-                       command.data::text, command.created_at, command.updated_at",
-        )
+                       command.data::text, command.created_at, command.updated_at,
+                       command.attempt_generation, command.superseded_by_command_id",
+            Self::claimable_command_predicate(3, 4, 5)
+        ))
         .bind(owner)
         .bind(expires_at)
         .bind(WorkflowCommandStatus::Pending.as_str())
@@ -244,12 +381,17 @@ impl WorkflowRuntimeStore {
         Ok(records)
     }
 
+    /// Move a command's dispatch status.
+    ///
+    /// A superseded attempt is history and cannot be moved: reviving it would
+    /// put two live rows on one dedupe key and let a replaced attempt dispatch
+    /// (GH-1865).
     pub async fn mark_command_status(
         &self,
         command_id: &str,
         status: WorkflowCommandStatus,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE workflow_commands
              SET status = $1,
                  dispatch_owner = NULL,
@@ -257,13 +399,31 @@ impl WorkflowRuntimeStore {
                  dispatch_not_before = NULL,
                  dispatch_barrier = NULL,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = $2",
+             WHERE id = $2 AND status <> $3",
         )
         .bind(status.as_str())
         .bind(command_id)
+        .bind(WorkflowCommandStatus::Superseded.as_str())
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected()
+            == 1;
+        if updated {
+            return Ok(());
+        }
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM workflow_commands WHERE id = $1")
+                .bind(command_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        match existing {
+            Some((current,)) if current == WorkflowCommandStatus::Superseded.as_str() => {
+                anyhow::bail!(
+                    "workflow command `{command_id}` was superseded by a newer attempt and cannot be moved to `{status}`"
+                )
+            }
+            _ => Ok(()),
+        }
     }
 
     pub async fn mark_pending_command_status(

@@ -1,5 +1,6 @@
 use super::*;
 use harness_workflow::issue_lifecycle::IssueLifecycleState;
+use harness_workflow::runtime::{DataProvenance, WorkflowDataWrite};
 
 pub(super) async fn apply_runtime_workflow_transition(
     runtime_store: &WorkflowRuntimeStore,
@@ -8,13 +9,33 @@ pub(super) async fn apply_runtime_workflow_transition(
     target_state: &str,
     reason: &str,
 ) -> anyhow::Result<bool> {
-    let Some(mut instance) = runtime_store.get_instance(&candidate.workflow_id).await? else {
+    let Some(instance) = runtime_store.get_instance(&candidate.workflow_id).await? else {
         return Ok(false);
     };
-    if instance.is_terminal() || instance.state != candidate.state {
+    if instance.is_terminal_with_registry(runtime_store.definition_registry())
+        || instance.state != candidate.state
+    {
         return Ok(false);
     }
+    apply_loaded_runtime_workflow_transition(
+        runtime_store,
+        issue_workflows,
+        candidate,
+        instance,
+        target_state,
+        reason,
+    )
+    .await
+}
 
+pub(super) async fn apply_loaded_runtime_workflow_transition(
+    runtime_store: &WorkflowRuntimeStore,
+    issue_workflows: Option<&IssueWorkflowStore>,
+    candidate: &RuntimeWorkflowCandidate,
+    mut instance: WorkflowInstance,
+    target_state: &str,
+    reason: &str,
+) -> anyhow::Result<bool> {
     let is_pr_target = candidate.pr_number.is_some();
     let event_type = match (target_state, is_pr_target) {
         ("done", true) => "PrMerged",
@@ -62,7 +83,21 @@ pub(super) async fn apply_runtime_workflow_transition(
             "github_issue"
         },
         runtime_remote_evidence_summary(candidate),
-    ))
+    ));
+    // Reconciliation reaches `done` from the server's own GitHub observation
+    // — a merged PR or a completed issue — never from an agent claim. That
+    // observation is exactly the server-recognized terminal proof the
+    // transition contract requires (GH-1766).
+    let decision = if target_state == "done" {
+        decision.with_evidence(WorkflowEvidence::runtime_observed(
+            harness_workflow::runtime::completion_evidence::EVIDENCE_GITHUB_TERMINAL,
+            runtime_remote_evidence_summary(candidate),
+            "runtime_reconciliation_remote_fact",
+            Some(runtime_remote_key(candidate)),
+        ))
+    } else {
+        decision
+    }
     .high_confidence();
     let validator = DecisionValidator::github_issue_pr();
     if let Err(error) = validator.validate(
@@ -83,29 +118,39 @@ pub(super) async fn apply_runtime_workflow_transition(
 
     instance.state = decision.next_state.clone();
     instance.version = instance.version.saturating_add(1);
-    instance.data = merge_runtime_reconciliation_data(
-        instance.data,
+    apply_runtime_reconciliation_data(
+        &mut instance,
         decision_name,
         target_state,
         reason,
         candidate,
-    );
-    let Some(_record) = runtime_store
-        .apply_decision_transition(WorkflowDecisionTransition {
-            expected_state: candidate.state.as_str(),
-            create_if_missing: None,
-            event_type,
-            source: "reconciliation",
-            payload: event_payload,
-            decision: &decision,
-            final_instance: &instance,
-            command_status: WorkflowCommandStatus::Completed,
-        })
-        .await?
-    else {
+    )?;
+    let record = runtime_store
+        .apply_decision_transition(
+            WorkflowDecisionTransition {
+                expected_state: candidate.state.as_str(),
+                create_if_missing: None,
+                event_type,
+                source: "reconciliation",
+                payload: event_payload,
+                decision: &decision,
+                final_instance: &instance,
+                command_status: WorkflowCommandStatus::Completed,
+            },
+            "reconciliation",
+        )
+        .await?;
+    if !complete_runtime_workflow_transition(
+        record,
+        issue_workflows,
+        candidate,
+        target_state,
+        reason,
+    )
+    .await
+    {
         return Ok(false);
-    };
-    record_runtime_issue_side_effects(issue_workflows, candidate, target_state, reason).await;
+    }
     tracing::info!(
         workflow_id = %candidate.workflow_id,
         from = %candidate.state,
@@ -116,6 +161,28 @@ pub(super) async fn apply_runtime_workflow_transition(
         "workflow runtime reconciliation: applying transition"
     );
     Ok(true)
+}
+
+pub(super) async fn complete_runtime_workflow_transition(
+    record: Option<harness_workflow::runtime::WorkflowDecisionRecord>,
+    issue_workflows: Option<&IssueWorkflowStore>,
+    candidate: &RuntimeWorkflowCandidate,
+    target_state: &str,
+    reason: &str,
+) -> bool {
+    let Some(record) = record else {
+        return false;
+    };
+    if !record.accepted {
+        tracing::warn!(
+            workflow_id = %candidate.workflow_id,
+            reason = record.rejection_reason.as_deref().unwrap_or("unspecified validator rejection"),
+            "workflow runtime reconciliation transition rejected during atomic validation"
+        );
+        return false;
+    }
+    record_runtime_issue_side_effects(issue_workflows, candidate, target_state, reason).await;
+    true
 }
 
 fn remote_payload(
@@ -160,37 +227,65 @@ fn runtime_remote_evidence_summary(candidate: &RuntimeWorkflowCandidate) -> Stri
     }
 }
 
-fn merge_runtime_reconciliation_data(
-    mut data: serde_json::Value,
+fn apply_runtime_reconciliation_data(
+    instance: &mut WorkflowInstance,
     decision: &str,
     target_state: &str,
     reason: &str,
     candidate: &RuntimeWorkflowCandidate,
-) -> serde_json::Value {
-    if let Some(object) = data.as_object_mut() {
-        object.insert("last_decision".to_string(), json!(decision));
-        object.insert("reconciled_at".to_string(), json!(chrono::Utc::now()));
-        object.insert("reconciliation_reason".to_string(), json!(reason));
-        let external_state_field = if candidate.pr_number.is_some() {
-            "external_pr_state"
-        } else {
-            "external_issue_state"
-        };
-        object.insert(external_state_field.to_string(), json!(target_state));
-        if let Some(pr_number) = candidate.pr_number {
-            object.insert("pr_number".to_string(), json!(pr_number));
-        }
-        if let Some(pr_url) = candidate.pr_url.as_deref() {
-            object.insert("pr_url".to_string(), json!(pr_url));
-        }
-        if let Some(repo) = candidate.repo.as_deref() {
-            object.insert("repo".to_string(), json!(repo));
-        }
-        if let Some(issue_number) = candidate.issue_number {
-            object.insert("issue_number".to_string(), json!(issue_number));
-        }
+) -> anyhow::Result<()> {
+    let external_state_field = if candidate.pr_number.is_some() {
+        "external_pr_state"
+    } else {
+        "external_issue_state"
+    };
+    let mut writes = vec![
+        WorkflowDataWrite::set("last_decision", json!(decision), DataProvenance::Server),
+        WorkflowDataWrite::set(
+            "reconciled_at",
+            json!(chrono::Utc::now()),
+            DataProvenance::Server,
+        ),
+        WorkflowDataWrite::set(
+            "reconciliation_reason",
+            json!(reason),
+            DataProvenance::External,
+        ),
+        WorkflowDataWrite::set(
+            external_state_field,
+            json!(target_state),
+            DataProvenance::External,
+        ),
+    ];
+    if let Some(pr_number) = candidate.pr_number {
+        writes.push(WorkflowDataWrite::set(
+            "pr_number",
+            json!(pr_number),
+            DataProvenance::External,
+        ));
     }
-    data
+    if let Some(pr_url) = candidate.pr_url.as_deref() {
+        writes.push(WorkflowDataWrite::set(
+            "pr_url",
+            json!(pr_url),
+            DataProvenance::External,
+        ));
+    }
+    if let Some(repo) = candidate.repo.as_deref() {
+        writes.push(WorkflowDataWrite::set(
+            "repo",
+            json!(repo),
+            DataProvenance::Server,
+        ));
+    }
+    if let Some(issue_number) = candidate.issue_number {
+        writes.push(WorkflowDataWrite::set(
+            "issue_number",
+            json!(issue_number),
+            DataProvenance::Server,
+        ));
+    }
+    instance.apply_data_writes(writes)
 }
 
 async fn record_runtime_issue_side_effects(
@@ -287,5 +382,85 @@ pub(super) fn issue_terminal_state(target_state: &str) -> Option<IssueLifecycleS
         "done" => Some(IssueLifecycleState::Done),
         "cancelled" => Some(IssueLifecycleState::Cancelled),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_workflow::runtime::WorkflowSubject;
+
+    #[test]
+    fn reconciliation_preserves_untouched_field_provenance() {
+        let mut instance = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("issue", "issue:42"),
+        )
+        .with_data_field_provenance(
+            json!({
+                "agent_note": "agent-authored",
+                "external_note": "remote-authored",
+                "legacy_note": "pre-migration",
+                "server_note": "server-authored",
+            }),
+            |field| match field {
+                "agent_note" => DataProvenance::Agent,
+                "external_note" => DataProvenance::External,
+                _ => DataProvenance::Server,
+            },
+        );
+        let provenance = instance
+            .data_provenance
+            .as_mut()
+            .expect("classified instance has provenance");
+        provenance.entries.remove("/legacy_note");
+        provenance.legacy_entries.insert("/legacy_note".to_string());
+        let candidate = RuntimeWorkflowCandidate {
+            workflow_id: instance.id.clone(),
+            state: instance.state.clone(),
+            row_updated_at: chrono::Utc::now(),
+            repo: Some("owner/repo".to_string()),
+            project_root: None,
+            issue_number: Some(42),
+            pr_number: None,
+            pr_url: None,
+        };
+
+        apply_runtime_reconciliation_data(
+            &mut instance,
+            "reconcile_issue_completed",
+            "done",
+            "remote issue is closed",
+            &candidate,
+        )
+        .expect("reconciliation write");
+
+        let provenance = instance
+            .data_provenance
+            .as_ref()
+            .expect("reconciliation preserves provenance");
+        assert_eq!(
+            provenance.provenance_for("/agent_note"),
+            Some(DataProvenance::Agent)
+        );
+        assert_eq!(
+            provenance.provenance_for("/external_note"),
+            Some(DataProvenance::External)
+        );
+        assert!(provenance.is_legacy("/legacy_note"));
+        assert_eq!(
+            provenance.provenance_for("/server_note"),
+            Some(DataProvenance::Server)
+        );
+        assert_eq!(
+            provenance.provenance_for("/external_issue_state"),
+            Some(DataProvenance::External)
+        );
+        assert_eq!(
+            provenance.provenance_for("/last_decision"),
+            Some(DataProvenance::Server)
+        );
     }
 }

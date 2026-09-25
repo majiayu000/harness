@@ -17,14 +17,20 @@ Options:
   --bin PATH            Harness binary. Default: ./target/release/harness, then ./target/debug/harness
   --log-dir PATH        Log/PID directory. Default: .harness/local
   --wait-secs N         Seconds to wait for /health in background mode. Default: 60
+  --require-github-token
+                        Refuse startup unless GITHUB_TOKEN/GH_TOKEN is set or gh auth can supply one
   --foreground          Run in the foreground instead of backgrounding
   --stop                Stop the PID recorded for this port
   --status              Print recorded PID and health status
   -h, --help            Show this help
 
 This wrapper is safe to run from Codex sessions. It preserves normal shell
-environment such as PATH, HOME, GITHUB_TOKEN, and API keys, but removes local
-Codex/Claude wrapper variables that can confuse spawned agent subprocesses.
+environment such as PATH, HOME, GITHUB_TOKEN, and unrelated API keys, but
+removes the Anthropic API key plus local Codex/Claude wrapper variables.
+With --require-github-token, the wrapper imports the current `gh auth token`
+into GITHUB_TOKEN when needed without printing it. Strict GitHub-authenticated
+starts use the direct background launcher instead of tmux so the credential is
+not copied into tmux's persistent environment.
 When available, background mode runs the server in a detached tmux session so it
 does not depend on the calling tool process lifetime.
 
@@ -64,6 +70,7 @@ POLL_INTERVAL_SECS="${HARNESS_STARTER_POLL_INTERVAL_SECS:-1}"
 FOREGROUND=0
 STOP=0
 STATUS=0
+REQUIRE_GITHUB_TOKEN=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -98,6 +105,10 @@ while [[ $# -gt 0 ]]; do
       require_value "$1" "${2:-}"
       WAIT_SECS="$2"
       shift 2
+      ;;
+    --require-github-token)
+      REQUIRE_GITHUB_TOKEN=1
+      shift
       ;;
     --foreground)
       FOREGROUND=1
@@ -338,6 +349,11 @@ require_listener_check_for_start
 
 pid="$(recorded_pid)"
 if pid_alive "$pid"; then
+  if [[ "$REQUIRE_GITHUB_TOKEN" -eq 1 ]]; then
+    echo "refusing GitHub token preflight for an already-running harness server pid=$pid port=$PORT" >&2
+    echo "stop it and restart with --require-github-token so authentication can be verified at launch" >&2
+    exit 5
+  fi
   echo "harness server already recorded as running pid=$pid port=$PORT"
   report_binary_freshness "$pid"
   exit 0
@@ -365,6 +381,27 @@ if [[ ! -x "$BIN" ]]; then
   exit 3
 fi
 
+if [[ "$REQUIRE_GITHUB_TOKEN" -eq 1 ]]; then
+  github_token_source=""
+  github_token_env="${GITHUB_TOKEN:-}"
+  gh_token_env="${GH_TOKEN:-}"
+  if [[ -n "${github_token_env//[[:space:]]/}" || -n "${gh_token_env//[[:space:]]/}" ]]; then
+    github_token_source="environment"
+  elif command -v gh >/dev/null 2>&1; then
+    github_token="$(env -u GITHUB_TOKEN -u GH_TOKEN gh auth token 2>/dev/null || true)"
+    if [[ -n "${github_token//[[:space:]]/}" ]]; then
+      export GITHUB_TOKEN="$github_token"
+      github_token_source="gh_auth"
+    fi
+  fi
+  if [[ -z "$github_token_source" ]]; then
+    echo "refusing to start harness server: GitHub token preflight failed" >&2
+    echo "set GITHUB_TOKEN/GH_TOKEN or run gh auth login before GitHub issue/PR automation" >&2
+    exit 5
+  fi
+  echo "GitHub token preflight: available source=$github_token_source"
+fi
+
 harness_binary_freshness "$BIN" "$PWD" > /dev/null
 binary_freshness_state="$HARNESS_BINARY_FRESHNESS_STATE"
 if [[ "$binary_freshness_state" != "fresh" ]]; then
@@ -380,9 +417,11 @@ if [[ "$binary_freshness_state" != "fresh" ]]; then
   echo "warning: freshness is not enforced for explicit --bin/HARNESS_BIN selections" >&2
 fi
 
-unset_args=()
+unset_args=("-u" "ANTHROPIC_API_KEY")
 while IFS='=' read -r name _; do
   case "$name" in
+    ANTHROPIC_API_KEY)
+      ;;
     CODEX*|Codex*)
       unset_args+=("-u" "$name")
       ;;
@@ -416,7 +455,9 @@ if [[ "$FOREGROUND" -eq 1 ]]; then
   exec env "${unset_args[@]}" "${cmd[@]}"
 fi
 
-if command -v tmux >/dev/null 2>&1 && [[ -z "${HARNESS_STARTER_NO_TMUX:-}" ]]; then
+if command -v tmux >/dev/null 2>&1 \
+  && [[ -z "${HARNESS_STARTER_NO_TMUX:-}" ]] \
+  && [[ "$REQUIRE_GITHUB_TOKEN" -eq 0 ]]; then
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     echo "tmux session already exists: $TMUX_SESSION"
   else

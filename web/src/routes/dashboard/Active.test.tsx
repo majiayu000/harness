@@ -6,7 +6,7 @@ import { Active } from "./Active";
 import type { Task } from "@/types";
 
 vi.mock("@/lib/queries", () => ({
-  useTasks: vi.fn(),
+  useAllTasks: vi.fn(),
   useDashboard: vi.fn(),
   useWorkflowRuntimeTree: vi.fn(),
 }));
@@ -33,10 +33,10 @@ vi.mock("@/lib/api", () => ({
   apiFetch: vi.fn(() => Promise.resolve(undefined)),
 }));
 
-import { useTasks, useDashboard, useWorkflowRuntimeTree } from "@/lib/queries";
+import { useAllTasks, useDashboard, useWorkflowRuntimeTree } from "@/lib/queries";
 import { apiFetch } from "@/lib/api";
 
-const mockUseTasks = useTasks as ReturnType<typeof vi.fn>;
+const mockUseAllTasks = useAllTasks as ReturnType<typeof vi.fn>;
 const mockUseDashboard = useDashboard as ReturnType<typeof vi.fn>;
 const mockUseWorkflowRuntimeTree = useWorkflowRuntimeTree as ReturnType<typeof vi.fn>;
 const mockApiFetch = apiFetch as ReturnType<typeof vi.fn>;
@@ -120,14 +120,76 @@ describe("<Active>", () => {
     });
   });
 
+  it("places runtime planning, local review and validation in their own columns", () => {
+    const rows = [
+      { ...makeTask("plan-runtime", null, "planning"), workflow: { state: "planning" } },
+      { ...makeTask("replan-runtime", null, "implementing"), workflow: { state: "replanning" } },
+      { ...makeTask("review-runtime", null, "waiting"), workflow: { state: "local_review_gate" } },
+      { ...makeTask("validate-runtime", null, "waiting"), workflow: { state: "quality_gate_pending" } },
+    ];
+    mockUseAllTasks.mockReturnValue({ data: taskList(rows), isLoading: false, isError: false });
+    wrap(<Active />);
+    expect(columnCount("Planning")).toBe("2");
+    expect(columnCount("Review")).toBe("1");
+    expect(columnCount("Validation")).toBe("1");
+    expect(columnCount("Implementing")).toBe("0");
+    expect(columnCount("Feedback")).toBe("0");
+  });
+
+  it("separates scheduled reviews, names the repository and filters by work type", () => {
+    const periodic = {
+      ...makeTask("scan", "/repos/remem", "implementing", "review"),
+      source: "periodic_review", description: "prompt task", workflow: { id: "scan-wf", state: "implementing" },
+    };
+    const issue = makeTask("issue-fix", "/repos/harness");
+    mockUseAllTasks.mockReturnValue({ data: taskList([periodic, issue] as Task[]), isLoading: false, isError: false });
+    wrap(<Active />);
+    expect(columnCount("Review")).toBe("1");
+    expect(columnCount("Implementing")).toBe("1");
+    expect(screen.getByText("remem")).toBeInTheDocument();
+    expect(screen.queryByText("prompt task")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Scheduled reviews/ }));
+    expect(screen.queryByText("issue-fix")).not.toBeInTheDocument();
+    expect(screen.getByText("Scheduled repository review")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter tasks" }), { target: { value: "harness" } });
+    expect(screen.getByText("No unfinished tasks match this view.")).toBeInTheDocument();
+  });
+
+  it("does not turn scheduler running into a claim of live model activity", () => {
+    mockUseAllTasks.mockReturnValue({ data: taskList([makeTask("unobserved", "/repos/harness")]), isLoading: false, isError: false });
+    wrap(<Active />);
+    expect(screen.getByText("Execution unconfirmed · open details")).toBeInTheDocument();
+    expect(screen.queryByText("Model active · reported by runtime")).not.toBeInTheDocument();
+    expect(screen.getByText(/Scheduler diagnostics/).closest("details")).not.toHaveAttribute("open");
+  });
+
+  it("distinguishes a queued job, an assigned worker and a reported model turn", () => {
+    const rows = ["queued", "assigned", "model"].map((id) => ({
+      ...makeTask(id, "/repos/harness"), workflow: { id, state: "implementing" },
+    }));
+    mockUseAllTasks.mockReturnValue({ data: taskList(rows as Task[]), isLoading: false, isError: false });
+    mockUseWorkflowRuntimeTree.mockReturnValue({ data: { total_workflows: 3, workflows: rows.map((row) => ({
+      workflow: { id: row.id, state: "implementing", subject: { subject_key: row.id }, updated_at: "2026-09-09T13:00:00Z" },
+      children: [], events: [], decisions: [], commands: [{ id: row.id, command: { command_type: "activity" }, runtime_jobs: [{
+        id: row.id, status: row.id === "queued" ? "pending" : "running",
+        lease_state: row.id === "queued" ? null : "active_leased",
+        in_flight_model_turn: row.id === "model", created_at: "2026-09-09T13:00:00Z",
+      }] }],
+    })) }, isLoading: false, isError: false });
+    wrap(<Active />);
+    expect(screen.getByText("Queued · waiting for a worker")).toBeInTheDocument();
+    expect(screen.getByText("Worker assigned · model activity unconfirmed")).toBeInTheDocument();
+    expect(screen.getByText("Model active · reported by runtime")).toBeInTheDocument();
+  });
+
   it("requests project-scoped active tasks when projectFilter is set", () => {
-    mockUseTasks.mockReturnValue({
+    mockUseAllTasks.mockReturnValue({
       data: taskList([tasks[0], tasks[2]]),
       isLoading: false,
       isError: false,
     });
     wrap(<Active projectFilter="harness" />);
-    expect(mockUseTasks).toHaveBeenCalledWith({
+    expect(mockUseAllTasks).toHaveBeenCalledWith({
       active: true,
       limit: 200,
       project_id: "harness",
@@ -139,7 +201,7 @@ describe("<Active>", () => {
   });
 
   it("shows all non-terminal tasks when no projectFilter", () => {
-    mockUseTasks.mockReturnValue({ data: taskList(tasks), isLoading: false, isError: false });
+    mockUseAllTasks.mockReturnValue({ data: taskList(tasks), isLoading: false, isError: false });
     wrap(<Active />);
     expect(screen.getByText("t1")).toBeInTheDocument();
     expect(screen.getByText("t2")).toBeInTheDocument();
@@ -148,9 +210,9 @@ describe("<Active>", () => {
   });
 
   it("shows empty columns when projectFilter matches no tasks", () => {
-    mockUseTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
+    mockUseAllTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
     wrap(<Active projectFilter="nonexistent" />);
-    expect(mockUseTasks).toHaveBeenCalledWith({
+    expect(mockUseAllTasks).toHaveBeenCalledWith({
       active: true,
       limit: 200,
       project_id: "nonexistent",
@@ -170,7 +232,7 @@ describe("<Active>", () => {
       ...makeTask("feedback-task", "harness", "pending"),
       workflow: { state: "addressing_feedback", pr_number: 124 },
     };
-    mockUseTasks.mockReturnValue({
+    mockUseAllTasks.mockReturnValue({
       data: taskList([ready, feedback]),
       isLoading: false,
       isError: false,
@@ -192,16 +254,13 @@ describe("<Active>", () => {
       workflow: {
         state: "ready_to_merge",
         pr_number: 123,
-        review_fallback: { tier: "c", trigger: "silence", active_bot: "codex", activated_at: "2026-04-30T00:00:00Z" },
       },
     };
-    mockUseTasks.mockReturnValue({ data: taskList([ready]), isLoading: false, isError: false });
+    mockUseAllTasks.mockReturnValue({ data: taskList([ready]), isLoading: false, isError: false });
 
     wrap(<Active projectFilter="harness" />);
 
     expect(screen.getByText("wf Ready To Merge")).toBeInTheDocument();
-    expect(screen.getByText("tier C")).toBeInTheDocument();
-    expect(screen.getByText("fallback: silence")).toBeInTheDocument();
     expect(columnCount("Ready")).toBe("1");
 
     expect(screen.queryByRole("button", { name: "Merge" })).not.toBeInTheDocument();
@@ -220,7 +279,7 @@ describe("<Active>", () => {
         pr_number: 124,
       },
     };
-    mockUseTasks.mockReturnValue({ data: taskList([ready]), isLoading: false, isError: false });
+    mockUseAllTasks.mockReturnValue({ data: taskList([ready]), isLoading: false, isError: false });
 
     wrap(<Active projectFilter="harness" />);
     fireEvent.click(screen.getByRole("button", { name: "Merge" }));
@@ -246,7 +305,7 @@ describe("<Active>", () => {
     };
     const mergeError = new Error("workflow already terminal");
     mockApiFetch.mockRejectedValueOnce(mergeError);
-    mockUseTasks.mockReturnValue({ data: taskList([ready]), isLoading: false, isError: false });
+    mockUseAllTasks.mockReturnValue({ data: taskList([ready]), isLoading: false, isError: false });
 
     wrap(<Active projectFilter="harness" />);
     fireEvent.click(screen.getByRole("button", { name: "Merge" }));
@@ -269,7 +328,7 @@ describe("<Active>", () => {
         state: "implementing",
       },
     };
-    mockUseTasks.mockReturnValue({
+    mockUseAllTasks.mockReturnValue({
       data: taskList([runtimeTask]),
       isLoading: false,
       isError: false,
@@ -285,7 +344,7 @@ describe("<Active>", () => {
   });
 
   it("groups planner and review lifecycle statuses outside implementing", () => {
-    mockUseTasks.mockReturnValue({
+    mockUseAllTasks.mockReturnValue({
       data: taskList([
         makeTask("planner-task", "harness", "planner_waiting", "planner"),
         makeTask("review-task", "harness", "review_generating", "review"),
@@ -303,7 +362,7 @@ describe("<Active>", () => {
   });
 
   it("renders workflow runtime tree with jobs and rejected decisions", () => {
-    mockUseTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
+    mockUseAllTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
     mockUseWorkflowRuntimeTree.mockReturnValue({
       data: {
         total_workflows: 2,
@@ -461,7 +520,7 @@ describe("<Active>", () => {
   });
 
   it("cancels a non-terminal runtime issue workflow from the runtime panel", async () => {
-    mockUseTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
+    mockUseAllTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
     mockUseWorkflowRuntimeTree.mockReturnValue({
       data: {
         total_workflows: 1,
@@ -490,6 +549,7 @@ describe("<Active>", () => {
     });
 
     wrap(<Active projectFilter="harness" />);
+    fireEvent.click(screen.getByText(/Scheduler diagnostics/));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     await waitFor(() => {
@@ -503,10 +563,9 @@ describe("<Active>", () => {
 
   it("refreshes runtime data when workflow cancellation returns a conflict", async () => {
     mockApiFetch.mockRejectedValueOnce(new Error("workflow already terminal"));
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const qc = makeQueryClient();
     const invalidateQueries = vi.spyOn(qc, "invalidateQueries");
-    mockUseTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
+    mockUseAllTasks.mockReturnValue({ data: taskList([]), isLoading: false, isError: false });
     mockUseWorkflowRuntimeTree.mockReturnValue({
       data: {
         total_workflows: 1,
@@ -535,6 +594,7 @@ describe("<Active>", () => {
     });
 
     wrap(<Active projectFilter="harness" />, qc);
+    fireEvent.click(screen.getByText(/Scheduler diagnostics/));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     await waitFor(() => {
@@ -548,15 +608,11 @@ describe("<Active>", () => {
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["tasks"] });
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["workflow-runtime-tree"] });
     });
-    expect(consoleError).toHaveBeenCalledWith(
-      "Failed to cancel runtime workflow",
-      expect.any(Error),
-    );
-    consoleError.mockRestore();
+    expect(screen.getByRole("alert")).toHaveTextContent("workflow already terminal");
   });
 
   it("clicking a standard task card opens the slide-over with that task's id", () => {
-    mockUseTasks.mockReturnValue({
+    mockUseAllTasks.mockReturnValue({
       data: taskList([makeTask("t1", "proj")]),
       isLoading: false,
       isError: false,
@@ -568,14 +624,14 @@ describe("<Active>", () => {
 
   it("clicking a prompt task card opens the shared slide-over", () => {
     const promptTask = makeTask("prompt-task", "proj", "planning", "prompt");
-    mockUseTasks.mockReturnValue({ data: taskList([promptTask]), isLoading: false, isError: false });
+    mockUseAllTasks.mockReturnValue({ data: taskList([promptTask]), isLoading: false, isError: false });
     wrap(<Active />);
     fireEvent.click(screen.getByText("prompt-task"));
     expect(screen.getByTestId("task-slideover")).toHaveAttribute("data-task-id", "prompt-task");
   });
 
   it("calling onClose from the slide-over hides it", () => {
-    mockUseTasks.mockReturnValue({
+    mockUseAllTasks.mockReturnValue({
       data: taskList([makeTask("t1", "proj")]),
       isLoading: false,
       isError: false,
@@ -588,7 +644,7 @@ describe("<Active>", () => {
   });
 
   it("clicking the scrim overlay closes the slide-over", () => {
-    mockUseTasks.mockReturnValue({
+    mockUseAllTasks.mockReturnValue({
       data: taskList([makeTask("t1", "proj")]),
       isLoading: false,
       isError: false,

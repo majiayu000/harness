@@ -1,53 +1,15 @@
+use super::super::rest_contract::{ContractJson, LegacyJson as Json};
 use super::*;
 use crate::runtime_projection::{runtime_string_field, RuntimeWorkflowProjection};
-
-#[derive(Serialize)]
-struct RuntimeTaskResponse {
-    id: String,
-    task_id: String,
-    submission_id: String,
-    task_kind: TaskKind,
-    status: TaskStatus,
-    workflow_state: String,
-    failure_kind: Option<crate::workflow_runtime_submission::runtime_models::TaskFailureKind>,
-    phase: crate::workflow_runtime_submission::runtime_models::TaskPhase,
-    scheduler: crate::workflow_runtime_submission::runtime_state::TaskSchedulerState,
-    turn: u32,
-    pr_url: Option<String>,
-    description: Option<String>,
-    created_at: String,
-    updated_at: String,
-    execution_path: &'static str,
-    workflow_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    external_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tracker_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tracker_external_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repo: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    project: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    issue: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token_usage: Option<harness_core::types::TokenUsage>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pending_approvals: Vec<harness_core::types::Item>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    terminal: Option<TaskTerminalInfo>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    depends_on: Vec<TaskId>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    subtask_ids: Vec<TaskId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workflow: Option<TaskWorkflowSummary>,
-}
+use crate::workflow_runtime_submission::{
+    runtime_models::{TaskPhase, TaskTerminalClassification},
+    runtime_state::{SchedulerOwnerKind, TaskSchedulerState},
+};
+use harness_protocol::rest::{
+    RuntimeTaskDetailErrorResponse, RuntimeTaskDetailResponse, RuntimeTaskSchedulerOwnerResponse,
+    RuntimeTaskSchedulerResponse, RuntimeTaskTerminalResponse, RuntimeTaskTokenUsageResponse,
+    RuntimeTaskWorkflowResponse,
+};
 
 enum RuntimeProofLookup {
     Missing,
@@ -59,15 +21,17 @@ pub(crate) async fn get_runtime_submission(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if state.core.workflow_runtime_store.is_none() {
-        return workflow_runtime_store_unavailable_response();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
     let task_id = harness_core::types::TaskId(id);
     match runtime_task_response_by_handle(&state, &task_id).await {
-        Ok(Some(runtime_task)) => Json(runtime_task).into_response(),
+        Ok(Some(runtime_task)) => ContractJson(runtime_task).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "runtime submission not found"})),
+            ContractJson(RuntimeTaskDetailErrorResponse {
+                error: "runtime submission not found".to_string(),
+            }),
         )
             .into_response(),
         Err(error) => {
@@ -80,7 +44,7 @@ pub(crate) async fn get_runtime_submission(
 async fn runtime_task_response_by_handle(
     state: &AppState,
     task_id: &harness_core::types::TaskId,
-) -> anyhow::Result<Option<RuntimeTaskResponse>> {
+) -> anyhow::Result<Option<RuntimeTaskDetailResponse>> {
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return Ok(None);
     };
@@ -116,22 +80,32 @@ async fn runtime_task_response_by_handle(
         project_id,
         submission_handle,
         ..
-    } = RuntimeWorkflowProjection::from_workflow(&workflow);
+    } = RuntimeWorkflowProjection::from_workflow_with_registry(
+        store.definition_registry(),
+        &workflow,
+    );
     let external_id = runtime_external_id(task_kind, &workflow.data, issue);
     let submission_id = submission_handle
         .map(|handle| handle.0)
         .unwrap_or_else(|| task_id.0.clone());
-    let error = runtime_string_field(&workflow.data, "failure_reason");
+    let error = match runtime_string_field(&workflow.data, "failure_reason") {
+        Some(reason) => Some(reason),
+        None => store
+            .latest_unresolved_rejection_for_workflow(&workflow.id)
+            .await?
+            .and_then(|record| record.rejection_reason),
+    };
     let terminal = TaskTerminalInfo::from_status_error(&task_status, error.as_deref());
-    let token_usage = store
-        .runtime_usage_for_workflow(&workflow.id)
-        .await?
-        .map(|usage| harness_core::types::TokenUsage {
-            input_tokens: usage.metrics.input_tokens,
-            output_tokens: usage.metrics.output_tokens,
-            total_tokens: usage.metrics.total_tokens(),
-            cost_usd: harness_workflow::runtime::cost_usd_from_micros(usage.cost_usd_micros),
-        });
+    let runtime_usage = store.runtime_usage_for_workflow(&workflow.id).await?;
+    let cost_usd_observed = runtime_usage.as_ref().map(|usage| usage.cost_usd_observed);
+    let token_usage = runtime_usage.map(|usage| RuntimeTaskTokenUsageResponse {
+        input_tokens: usage.metrics.input_tokens,
+        output_tokens: usage.metrics.output_tokens,
+        cache_read_input_tokens: usage.metrics.cache_read_input_tokens,
+        cache_creation_input_tokens: usage.metrics.cache_creation_input_tokens,
+        total_tokens: usage.metrics.total_tokens(),
+        cost_usd: harness_workflow::runtime::cost_usd_from_micros(usage.cost_usd_micros),
+    });
     let pending_approvals = state
         .core
         .server
@@ -140,16 +114,16 @@ async fn runtime_task_response_by_handle(
     let description = Some(super::runtime_submissions::runtime_submission_description(
         &workflow, task_kind, issue,
     ));
-    Ok(Some(RuntimeTaskResponse {
+    Ok(Some(RuntimeTaskDetailResponse {
         id: submission_id.clone(),
         task_id: submission_id.clone(),
         submission_id,
-        task_kind,
-        status: task_status,
+        task_kind: task_kind.as_ref().to_string(),
+        status: task_status.as_str().to_string(),
         workflow_state: workflow.state.clone(),
-        failure_kind,
-        phase,
-        scheduler,
+        failure_kind: failure_kind.map(|kind| kind.as_ref().to_string()),
+        phase: task_phase_name(phase).to_string(),
+        scheduler: runtime_task_scheduler_response(scheduler),
         turn: 0,
         pr_url: runtime_string_field(&workflow.data, "pr_url"),
         description,
@@ -166,32 +140,86 @@ async fn runtime_task_response_by_handle(
         issue,
         error,
         token_usage,
+        cost_usd_observed,
         pending_approvals,
-        terminal,
+        terminal: terminal.map(runtime_task_terminal_response),
         depends_on: runtime_task_id_array(&workflow.data, "depends_on"),
         subtask_ids: Vec::new(),
-        workflow: Some(TaskWorkflowSummary::from_runtime(&workflow)),
+        workflow: Some(runtime_task_workflow_response(
+            TaskWorkflowSummary::from_runtime(&workflow),
+        )),
     }))
 }
 
-fn workflow_runtime_store_unavailable_response() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": "workflow runtime store unavailable",
-            "message": "workflow runtime store is unavailable",
-        })),
-    )
-        .into_response()
+fn task_phase_name(phase: TaskPhase) -> &'static str {
+    match phase {
+        TaskPhase::Triage => "triage",
+        TaskPhase::Plan => "plan",
+        TaskPhase::Implement => "implement",
+        TaskPhase::Review => "review",
+        TaskPhase::Terminal => "terminal",
+    }
+}
+
+fn runtime_task_scheduler_response(scheduler: TaskSchedulerState) -> RuntimeTaskSchedulerResponse {
+    RuntimeTaskSchedulerResponse {
+        authority_state: scheduler.authority_state.as_str().to_string(),
+        owner: scheduler
+            .owner
+            .map(|owner| RuntimeTaskSchedulerOwnerResponse {
+                kind: match owner.kind {
+                    SchedulerOwnerKind::Scheduler => "scheduler",
+                    SchedulerOwnerKind::RuntimeHost => "runtime_host",
+                }
+                .to_string(),
+                id: owner.id,
+            }),
+        run_generation: scheduler.run_generation,
+        recovery_generation: scheduler.recovery_generation,
+        lease_expires_at: scheduler.lease_expires_at,
+    }
+}
+
+fn runtime_task_terminal_response(terminal: TaskTerminalInfo) -> RuntimeTaskTerminalResponse {
+    RuntimeTaskTerminalResponse {
+        status: terminal.status.as_str().to_string(),
+        classification: match terminal.classification {
+            TaskTerminalClassification::Done => "done",
+            TaskTerminalClassification::Failed => "failed",
+            TaskTerminalClassification::Stalled => "stalled",
+            TaskTerminalClassification::Cancelled => "cancelled",
+        }
+        .to_string(),
+        reason: terminal.reason,
+        rounds_used: terminal.rounds_used,
+        last_status: terminal
+            .last_status
+            .map(|status| status.as_str().to_string()),
+        waiting_on: terminal.waiting_on,
+    }
+}
+
+fn runtime_task_workflow_response(workflow: TaskWorkflowSummary) -> RuntimeTaskWorkflowResponse {
+    RuntimeTaskWorkflowResponse {
+        id: workflow.id,
+        definition_id: workflow.definition_id,
+        state: workflow.state,
+        project_id: workflow.project_id,
+        issue_number: workflow.issue_number,
+        pr_number: workflow.pr_number,
+        force_execute: workflow.force_execute,
+        plan_concern: workflow.plan_concern,
+    }
 }
 
 pub(crate) fn proof_from_runtime_workflow(
+    registry: &harness_workflow::runtime::WorkflowDefinitionRegistry,
     task_id: &harness_core::types::TaskId,
     workflow: &harness_workflow::runtime::WorkflowInstance,
     events: &[harness_workflow::runtime::WorkflowEvent],
     decisions: &[harness_workflow::runtime::WorkflowDecisionRecord],
 ) -> ProofOfWork {
-    let projection = RuntimeWorkflowProjection::from_workflow(workflow);
+    let projection = RuntimeWorkflowProjection::from_workflow_with_registry(registry, workflow);
     let status = projection.task_status;
     let pr_url = runtime_string_field(&workflow.data, "pr_url")
         .or_else(|| runtime_string_field(&workflow.data, "last_pr_url"));
@@ -300,7 +328,11 @@ async fn runtime_proof_by_handle(
     else {
         return Ok(RuntimeProofLookup::Missing);
     };
-    let status = RuntimeWorkflowProjection::from_workflow(&workflow).task_status;
+    let status = RuntimeWorkflowProjection::from_workflow_with_registry(
+        store.definition_registry(),
+        &workflow,
+    )
+    .task_status;
     if !status.is_terminal() {
         return Ok(RuntimeProofLookup::InFlight(status.as_ref().to_string()));
     }
@@ -309,6 +341,7 @@ async fn runtime_proof_by_handle(
     let proof_task_id = crate::workflow_runtime_submission::runtime_issue_task_handle(&workflow)
         .unwrap_or_else(|| task_id.clone());
     Ok(RuntimeProofLookup::Terminal(proof_from_runtime_workflow(
+        store.definition_registry(),
         &proof_task_id,
         &workflow,
         &events,
@@ -320,8 +353,8 @@ pub(crate) async fn get_runtime_submission_proof(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if state.core.workflow_runtime_store.is_none() {
-        return workflow_runtime_store_unavailable_response();
+    if let Err(error) = state.workflow_runtime_store() {
+        return error.into_response();
     }
     let task_id = harness_core::types::TaskId(id);
     match runtime_proof_by_handle(&state, &task_id).await {

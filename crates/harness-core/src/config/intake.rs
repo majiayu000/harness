@@ -292,7 +292,9 @@ impl GitHubIntakeConfig {
     pub fn effective_repos(&self) -> Vec<GitHubRepoConfig> {
         let mut result: Vec<GitHubRepoConfig> = self.repos.clone();
         if !self.repo.is_empty() {
-            let already = result.iter().any(|r| r.repo == self.repo);
+            let already = result
+                .iter()
+                .any(|r| r.repo.eq_ignore_ascii_case(&self.repo));
             if !already {
                 result.push(GitHubRepoConfig {
                     repo: self.repo.clone(),
@@ -313,20 +315,22 @@ impl GitHubIntakeConfig {
     pub fn find_repo_config(&self, repo: &str) -> Option<GitHubRepoConfig> {
         self.repos
             .iter()
-            .find(|config| config.repo == repo)
+            .find(|config| config.repo.eq_ignore_ascii_case(repo))
             .cloned()
             .or_else(|| {
-                (self.repo == repo).then(|| GitHubRepoConfig {
-                    repo: self.repo.clone(),
-                    label: self.label.clone(),
-                    project_root: None,
-                    auto_merge: None,
-                    auto_recovery: None,
-                    merge_method: None,
-                    delete_branch: None,
-                    require_review_threads_resolved: None,
-                    require_clean_merge_state: None,
-                })
+                self.repo
+                    .eq_ignore_ascii_case(repo)
+                    .then(|| GitHubRepoConfig {
+                        repo: self.repo.clone(),
+                        label: self.label.clone(),
+                        project_root: None,
+                        auto_merge: None,
+                        auto_recovery: None,
+                        merge_method: None,
+                        delete_branch: None,
+                        require_review_threads_resolved: None,
+                        require_clean_merge_state: None,
+                    })
             })
     }
 

@@ -1,9 +1,17 @@
+use super::attestation::EvalAttestationSummary;
+#[cfg(test)]
+use super::evidence_usage::usage_snapshot_from_event;
+use super::evidence_usage::usage_snapshots;
+#[cfg(test)]
+use super::model::Confidence;
 use super::model::{
-    Confidence, RuntimeErrorKind, RuntimeJobSnapshot, RuntimeSnapshot, UsageSnapshot,
+    QualitySnapshot, RuntimeArtifactSnapshot, RuntimeErrorKind, RuntimeJobSnapshot,
+    RuntimeSnapshot, UsageSnapshot,
 };
+use super::verification_evidence::{validation_command_evidence, EvalValidationCommandEvidence};
 use crate::runtime::{
     ActivityErrorKind, ActivityResult, RuntimeEvent, RuntimeJob, RuntimeJobStatus,
-    WorkflowCommandRecord, WorkflowInstance, WorkflowRuntimeStore, QUALITY_GATE_ACTIVITY,
+    WorkflowCommandRecord, WorkflowInstance, QUALITY_GATE_ACTIVITY,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -15,6 +23,11 @@ use std::collections::BTreeMap;
 pub enum EvalEvidenceStatus {
     Passed,
     Failed,
+    Skipped,
+    TimedOut,
+    DispatchFailed,
+    EvidenceIncomplete,
+    BudgetExhausted,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -23,10 +36,16 @@ pub struct EvalCaseEvidence {
     pub case_id: String,
     pub workflow_id: Option<String>,
     pub status: EvalEvidenceStatus,
+    #[serde(default)]
+    pub attestation: EvalAttestationSummary,
     pub runtime: Option<RuntimeSnapshot>,
     pub usage: Vec<UsageSnapshot>,
     pub submission: Option<EvalSubmissionEvidence>,
     pub quality_gate: Option<EvalQualityGateEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<QualitySnapshot>,
+    #[serde(default)]
+    pub isolation: Option<EvalIsolationEvidence>,
     pub missing_evidence: Vec<String>,
 }
 
@@ -46,41 +65,22 @@ pub struct EvalQualityGateEvidence {
     pub status: String,
     pub validation_passed: bool,
     pub validation_commands: Vec<String>,
+    #[serde(default)]
+    pub validation_evidence: Vec<EvalValidationCommandEvidence>,
 }
 
-pub async fn collect_eval_case_evidence(
-    store: &WorkflowRuntimeStore,
-    eval_run_id: &str,
-    case_id: &str,
-    workflow_id: &str,
-) -> anyhow::Result<EvalCaseEvidence> {
-    let workflow = store.get_instance(workflow_id).await?;
-    let commands = store.commands_for(workflow_id).await?;
-    let command_ids = commands
-        .iter()
-        .map(|command| command.id.clone())
-        .collect::<Vec<_>>();
-    let jobs_by_command = store.runtime_jobs_for_commands(&command_ids).await?;
-    let runtime_jobs = command_ids
-        .iter()
-        .filter_map(|command_id| jobs_by_command.get(command_id))
-        .flatten()
-        .cloned()
-        .collect::<Vec<_>>();
-    let runtime_job_ids = runtime_jobs
-        .iter()
-        .map(|job| job.id.clone())
-        .collect::<Vec<_>>();
-    let events_by_job = store.runtime_events_for_jobs(&runtime_job_ids).await?;
-
-    Ok(collect_eval_case_evidence_from_records(
-        eval_run_id,
-        case_id,
-        workflow.as_ref(),
-        &commands,
-        &runtime_jobs,
-        &events_by_job,
-    ))
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalIsolationEvidence {
+    pub required_tier: Option<String>,
+    pub selected_tier: Option<String>,
+    pub runtime_kind: Option<String>,
+    pub runtime_profile: Option<String>,
+    pub sandbox: Option<String>,
+    pub backend: Option<String>,
+    pub image: Option<String>,
+    pub lifecycle: Option<String>,
+    pub cleanup_required: bool,
+    pub cleanup_status: Option<String>,
 }
 
 pub fn collect_eval_case_evidence_from_records(
@@ -115,6 +115,11 @@ pub fn collect_eval_case_evidence_from_records(
     {
         missing_evidence.push("quality_gate_pass".to_string());
     }
+    let isolation = isolation_evidence(workflow, commands, runtime_jobs);
+    match isolation.as_ref() {
+        Some(isolation) => missing_evidence.extend(validate_isolation_evidence(isolation)),
+        None => missing_evidence.push("isolation_policy".to_string()),
+    }
 
     let runtime = workflow.map(|workflow| runtime_snapshot(workflow, runtime_jobs));
     if runtime.as_ref().is_none_or(|snapshot| {
@@ -126,7 +131,7 @@ pub fn collect_eval_case_evidence_from_records(
     }) {
         missing_evidence.push("terminal_runtime_state".to_string());
     }
-    let usage = usage_snapshots(workflow_id.as_deref(), runtime_events);
+    let usage = usage_snapshots(workflow_id.as_deref(), runtime_events, runtime_jobs);
     if usage.is_empty() {
         missing_evidence.push("usage".to_string());
     }
@@ -142,10 +147,13 @@ pub fn collect_eval_case_evidence_from_records(
         case_id: case_id.to_string(),
         workflow_id,
         status,
+        attestation: EvalAttestationSummary::unsigned(),
         runtime,
         usage,
         submission,
         quality_gate,
+        quality: None,
+        isolation,
         missing_evidence,
     }
 }
@@ -231,7 +239,135 @@ fn quality_gate_evidence(
         status: eval_runtime_job_status(job.status).to_string(),
         validation_passed,
         validation_commands,
+        validation_evidence: validation_command_evidence(result.as_ref()),
     })
+}
+
+fn isolation_evidence(
+    workflow: Option<&WorkflowInstance>,
+    commands: &[WorkflowCommandRecord],
+    runtime_jobs: &[RuntimeJob],
+) -> Option<EvalIsolationEvidence> {
+    let required = required_eval_isolation(workflow, commands)?;
+    let implementation_job = implementation_runtime_job(commands, runtime_jobs);
+    Some(EvalIsolationEvidence {
+        required_tier: string_field(required, "tier"),
+        selected_tier: implementation_job
+            .and_then(|job| job.input.pointer("/isolation/tier"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        runtime_kind: implementation_job.map(|job| job.runtime_kind.as_str().to_string()),
+        runtime_profile: implementation_job.map(|job| job.runtime_profile.clone()),
+        sandbox: implementation_job
+            .and_then(|job| job.input.pointer("/runtime_profile/sandbox"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| string_field(required, "sandbox")),
+        backend: string_field(required, "backend"),
+        image: string_field(required, "image"),
+        lifecycle: string_field(required, "lifecycle"),
+        cleanup_required: required
+            .get("cleanup_required")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        cleanup_status: implementation_job
+            .and_then(activity_result_from_job)
+            .and_then(|result| {
+                result.artifacts.into_iter().find(|artifact| {
+                    artifact.artifact_type
+                        == crate::runtime::completion_evidence::ARTIFACT_EVAL_ISOLATION_CLEANUP
+                })
+            })
+            .and_then(|artifact| {
+                artifact
+                    .artifact
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                workflow
+                    .and_then(|workflow| workflow.data.pointer("/eval/cleanup/status"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            }),
+    })
+}
+
+fn required_eval_isolation<'a>(
+    workflow: Option<&'a WorkflowInstance>,
+    commands: &'a [WorkflowCommandRecord],
+) -> Option<&'a Value> {
+    commands
+        .iter()
+        .find_map(|command| command.command.command.pointer("/eval/isolation"))
+        .or_else(|| workflow.and_then(|workflow| workflow.data.pointer("/eval/isolation")))
+}
+
+fn implementation_runtime_job<'a>(
+    commands: &[WorkflowCommandRecord],
+    runtime_jobs: &'a [RuntimeJob],
+) -> Option<&'a RuntimeJob> {
+    let implementation_command_id = commands
+        .iter()
+        .find(|command| command.command.runtime_activity_key() == "implement_issue")
+        .map(|command| command.id.as_str());
+    implementation_command_id
+        .and_then(|command_id| runtime_jobs.iter().find(|job| job.command_id == command_id))
+        .or_else(|| {
+            runtime_jobs.iter().find(|job| {
+                job.input
+                    .get("activity")
+                    .and_then(Value::as_str)
+                    .is_some_and(|activity| activity == "implement_issue")
+                    || activity_result_from_job(job)
+                        .as_ref()
+                        .is_some_and(|result| result.activity == "implement_issue")
+            })
+        })
+}
+
+fn validate_isolation_evidence(isolation: &EvalIsolationEvidence) -> Vec<String> {
+    let mut missing = Vec::new();
+    if isolation.required_tier.as_deref() != Some("container") {
+        missing.push("isolation_required_tier".to_string());
+    }
+    if isolation.selected_tier.as_deref() != isolation.required_tier.as_deref() {
+        missing.push("isolation_selected_tier".to_string());
+    }
+    if isolation.runtime_kind.as_deref() != Some("remote_host") {
+        missing.push("runtime_host".to_string());
+    }
+    if isolation
+        .runtime_profile
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        missing.push("runtime_profile".to_string());
+    }
+    if isolation.sandbox.as_deref() != Some("workspace-write") {
+        missing.push("isolation_sandbox".to_string());
+    }
+    if isolation.backend.as_deref().is_none_or(str::is_empty) {
+        missing.push("isolation_backend".to_string());
+    }
+    if isolation.image.as_deref().is_none_or(str::is_empty) {
+        missing.push("isolation_image".to_string());
+    }
+    if isolation.lifecycle.as_deref() != Some("ephemeral") {
+        missing.push("isolation_lifecycle".to_string());
+    }
+    if isolation.cleanup_required && isolation.cleanup_status.as_deref() != Some("cleaned") {
+        missing.push("isolation_cleanup".to_string());
+    }
+    missing
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn runtime_snapshot(workflow: &WorkflowInstance, runtime_jobs: &[RuntimeJob]) -> RuntimeSnapshot {
@@ -269,24 +405,51 @@ fn runtime_job_snapshot(job: &RuntimeJob) -> RuntimeJobSnapshot {
             .as_ref()
             .map(|result| result.artifacts.len() as u64)
             .unwrap_or(0),
-        terminal_state: runtime_job_terminal_state(job),
+        artifacts: result
+            .as_ref()
+            .map(|result| {
+                result
+                    .artifacts
+                    .iter()
+                    .map(|artifact| RuntimeArtifactSnapshot {
+                        artifact_type: artifact.artifact_type.clone(),
+                        artifact: artifact.artifact.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        terminal_state: runtime_job_terminal_state(job).map(ToOwned::to_owned),
         error_kind: result
             .as_ref()
             .and_then(|result| result.error_kind.map(runtime_error_kind)),
     }
 }
 
-fn activity_result_from_job(job: &RuntimeJob) -> Option<ActivityResult> {
-    job.output
-        .as_ref()
-        .and_then(|output| serde_json::from_value(output.clone()).ok())
+pub(super) fn activity_result_from_job(job: &RuntimeJob) -> Option<ActivityResult> {
+    let output = job.output.as_ref()?;
+    match serde_json::from_value(output.clone()) {
+        Ok(result) => Some(result),
+        Err(error) => {
+            // A malformed payload must not be silently treated as absent:
+            // downstream evidence would look identical to a legitimately
+            // skipped step, hiding producer bugs from operators.
+            let tagged_activity = job.input.get("activity").and_then(Value::as_str);
+            tracing::warn!(
+                job_id = %job.id,
+                activity = tagged_activity.unwrap_or("untagged"),
+                %error,
+                "eval evidence: runtime job output failed to deserialize into ActivityResult"
+            );
+            None
+        }
+    }
 }
 
-fn runtime_job_terminal_state(job: &RuntimeJob) -> Option<String> {
+fn runtime_job_terminal_state(job: &RuntimeJob) -> Option<&'static str> {
     match job.status {
-        RuntimeJobStatus::Succeeded | RuntimeJobStatus::Failed | RuntimeJobStatus::Cancelled => {
-            Some(eval_runtime_job_status(job.status).to_string())
-        }
+        RuntimeJobStatus::Succeeded => Some("succeeded"),
+        RuntimeJobStatus::Failed => Some("failed"),
+        RuntimeJobStatus::Cancelled => Some("cancelled"),
         RuntimeJobStatus::Pending | RuntimeJobStatus::Running => None,
     }
 }
@@ -312,299 +475,6 @@ fn runtime_error_kind(kind: ActivityErrorKind) -> RuntimeErrorKind {
     }
 }
 
-fn usage_snapshots(
-    workflow_id: Option<&str>,
-    runtime_events: &BTreeMap<String, Vec<RuntimeEvent>>,
-) -> Vec<UsageSnapshot> {
-    let mut usage = Vec::new();
-    for (runtime_job_id, events) in runtime_events {
-        for event in events {
-            if !matches!(
-                event.event_type.as_str(),
-                "UsageRecorded" | "TokenUsageRecorded"
-            ) {
-                continue;
-            }
-            let snapshot = usage_snapshot_from_event(workflow_id, runtime_job_id, &event.event);
-            if usage_snapshot_has_measurement(&snapshot) {
-                usage.push(snapshot);
-            }
-        }
-    }
-    usage
-}
-
-fn usage_snapshot_from_event(
-    workflow_id: Option<&str>,
-    runtime_job_id: &str,
-    event: &Value,
-) -> UsageSnapshot {
-    let payload = event.get("usage").unwrap_or(event);
-    let input_tokens = first_u64_field(payload, &["input_tokens", "input"]);
-    let output_tokens = first_u64_field(payload, &["output_tokens", "output"]);
-    let cached_input_tokens = first_u64_field(
-        payload,
-        &[
-            "cached_input_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-        ],
-    );
-    let total_tokens = first_u64_field(payload, &["total_tokens"]).or_else(|| {
-        (input_tokens.is_some() || output_tokens.is_some()).then(|| {
-            input_tokens
-                .unwrap_or(0)
-                .saturating_add(output_tokens.unwrap_or(0))
-        })
-    });
-    let cost_usd_micros = first_u64_field(payload, &["cost_usd_micros"]);
-    UsageSnapshot {
-        agent_invocation_id: payload
-            .get("agent_invocation_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        runtime_job_id: Some(runtime_job_id.to_string()),
-        workflow_id: workflow_id.map(ToOwned::to_owned),
-        model: payload
-            .get("model")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        reasoning_effort: payload
-            .get("reasoning_effort")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        total_tokens,
-        cost_usd_micros,
-        token_confidence: Confidence::Observed,
-        cost_confidence: if cost_usd_micros.is_some() {
-            Confidence::Estimated
-        } else {
-            Confidence::Unknown
-        },
-    }
-}
-
-fn first_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
-    keys.iter().find_map(|key| value.get(*key)?.as_u64())
-}
-
-fn usage_snapshot_has_measurement(snapshot: &UsageSnapshot) -> bool {
-    snapshot.input_tokens.is_some()
-        || snapshot.output_tokens.is_some()
-        || snapshot.cached_input_tokens.is_some()
-        || snapshot.total_tokens.is_some()
-        || snapshot.cost_usd_micros.is_some()
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::runtime::{
-        ActivityResult, RuntimeKind, RuntimeProfile, ValidationRecord, WorkflowCommand,
-        WorkflowCommandStatus, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
-    };
-    use serde_json::json;
-
-    #[test]
-    fn eval_evidence_missing_quality_gate_and_usage_fails_case() {
-        let workflow = WorkflowInstance::new(
-            GITHUB_ISSUE_PR_DEFINITION_ID,
-            1,
-            "pr_open",
-            WorkflowSubject::new("issue", "issue:42"),
-        )
-        .with_id("workflow-1")
-        .with_data(json!({
-            "repo": "owner/repo",
-            "issue_number": 42,
-            "task_id": "eval-task-1",
-            "eval": {"eval_run_id": "run-1", "case_id": "owner/repo#42"}
-        }));
-        let command = command_record(
-            "cmd-1",
-            "workflow-1",
-            WorkflowCommand::enqueue_activity("implement_issue", "impl-1"),
-            WorkflowCommandStatus::Completed,
-        );
-        let mut job = RuntimeJob::pending(
-            "cmd-1",
-            RuntimeKind::CodexExec,
-            RuntimeProfile::new("codex", RuntimeKind::CodexExec).name,
-            json!({"activity": "implement_issue"}),
-        );
-        job.id = "job-1".to_string();
-        job.complete(
-            &ActivityResult::succeeded("implement_issue", "opened PR").with_artifact(
-                crate::runtime::ActivityArtifact::new(
-                    "pull_request",
-                    json!({"pr_number": 5, "pr_url": "https://github.com/owner/repo/pull/5"}),
-                ),
-            ),
-        )
-        .expect("complete job");
-
-        let evidence = collect_eval_case_evidence_from_records(
-            "run-1",
-            "owner/repo#42",
-            Some(&workflow),
-            &[command],
-            &[job],
-            &BTreeMap::new(),
-        );
-
-        assert_eq!(evidence.status, EvalEvidenceStatus::Failed);
-        assert!(evidence
-            .missing_evidence
-            .contains(&"quality_gate".to_string()));
-        assert!(evidence.missing_evidence.contains(&"usage".to_string()));
-        assert_eq!(
-            evidence.submission.as_ref().unwrap().runtime_job_ids,
-            vec!["job-1".to_string()]
-        );
-    }
-
-    #[test]
-    fn eval_evidence_maps_quality_gate_and_usage_records() {
-        let workflow = WorkflowInstance::new(
-            GITHUB_ISSUE_PR_DEFINITION_ID,
-            1,
-            "done",
-            WorkflowSubject::new("issue", "issue:42"),
-        )
-        .with_id("workflow-1")
-        .with_data(json!({
-            "repo": "owner/repo",
-            "issue_number": 42,
-            "task_id": "eval-task-1",
-            "eval": {"eval_run_id": "run-1", "case_id": "owner/repo#42"}
-        }));
-        let implementation = command_record(
-            "cmd-impl",
-            "workflow-1",
-            WorkflowCommand::enqueue_activity("implement_issue", "impl-1"),
-            WorkflowCommandStatus::Completed,
-        );
-        let quality = command_record(
-            "cmd-quality",
-            "workflow-1",
-            WorkflowCommand::enqueue_activity(QUALITY_GATE_ACTIVITY, "quality-1"),
-            WorkflowCommandStatus::Completed,
-        );
-        let mut implementation_job = RuntimeJob::pending(
-            "cmd-impl",
-            RuntimeKind::CodexExec,
-            "codex",
-            json!({"activity": "implement_issue"}),
-        );
-        implementation_job.id = "job-impl".to_string();
-        implementation_job
-            .complete(
-                &ActivityResult::succeeded("implement_issue", "opened PR").with_artifact(
-                    crate::runtime::ActivityArtifact::new(
-                        "pull_request",
-                        json!({"pr_number": 5, "pr_url": "https://github.com/owner/repo/pull/5"}),
-                    ),
-                ),
-            )
-            .expect("complete implementation job");
-        let mut quality_job = RuntimeJob::pending(
-            "cmd-quality",
-            RuntimeKind::CodexExec,
-            "codex",
-            json!({"activity": QUALITY_GATE_ACTIVITY}),
-        );
-        quality_job.id = "job-quality".to_string();
-        quality_job
-            .complete(
-                &ActivityResult::succeeded(QUALITY_GATE_ACTIVITY, "validation passed")
-                    .with_validation(ValidationRecord::new(
-                        "cargo test -p harness-workflow eval_evidence",
-                        "passed",
-                    )),
-            )
-            .expect("complete quality job");
-        let mut events = BTreeMap::new();
-        events.insert(
-            "job-impl".to_string(),
-            vec![RuntimeEvent::new(
-                "job-impl",
-                1,
-                "UsageRecorded",
-                json!({
-                    "usage": {
-                        "agent_invocation_id": "agent-1",
-                        "model": "codex-test",
-                        "input_tokens": 100,
-                        "output_tokens": 20,
-                        "total_tokens": 120,
-                        "cost_usd_micros": 50
-                    }
-                }),
-            )],
-        );
-
-        let evidence = collect_eval_case_evidence_from_records(
-            "run-1",
-            "owner/repo#42",
-            Some(&workflow),
-            &[implementation, quality],
-            &[implementation_job, quality_job],
-            &events,
-        );
-
-        assert_eq!(evidence.status, EvalEvidenceStatus::Passed);
-        assert!(evidence.missing_evidence.is_empty());
-        assert_eq!(
-            evidence.quality_gate.as_ref().unwrap().validation_commands,
-            vec!["cargo test -p harness-workflow eval_evidence".to_string()]
-        );
-        assert_eq!(evidence.usage[0].total_tokens, Some(120));
-        assert_eq!(
-            evidence.runtime.as_ref().unwrap().terminal_state,
-            Some("done".to_string())
-        );
-    }
-
-    #[test]
-    fn eval_usage_invalid_cost_keeps_cost_confidence_unknown() {
-        let snapshot = usage_snapshot_from_event(
-            Some("workflow-1"),
-            "job-1",
-            &json!({
-                "usage": {
-                    "input_tokens": 10,
-                    "cost_usd_micros": "not-a-number"
-                }
-            }),
-        );
-
-        assert_eq!(snapshot.cost_usd_micros, None);
-        assert_eq!(snapshot.cost_confidence, Confidence::Unknown);
-    }
-
-    fn command_record(
-        id: &str,
-        workflow_id: &str,
-        command: WorkflowCommand,
-        status: WorkflowCommandStatus,
-    ) -> WorkflowCommandRecord {
-        WorkflowCommandRecord {
-            id: id.to_string(),
-            workflow_id: workflow_id.to_string(),
-            decision_id: None,
-            status,
-            dispatch_owner: None,
-            dispatch_lease_expires_at: None,
-            dispatch_not_before: None,
-            dispatch_attempt_count: 0,
-            dispatch_claim_generation: 0,
-            dispatch_barrier: None,
-            command,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-}
+#[path = "evidence_tests.rs"]
+mod tests;

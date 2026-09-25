@@ -85,7 +85,7 @@ pub(super) async fn emit_runtime_job_trajectory_completion(
         }
     }
 
-    if workflow.is_terminal() {
+    if workflow.is_terminal_with_registry(store.definition_registry()) {
         state
             .observability
             .events
@@ -146,6 +146,7 @@ fn retry_attempt(job: &RuntimeJob) -> Option<u64> {
 fn activity_status_label(status: ActivityStatus) -> &'static str {
     match status {
         ActivityStatus::Succeeded => "succeeded",
+        ActivityStatus::SucceededWithBlockers => "succeeded_with_blockers",
         ActivityStatus::Failed => "failed",
         ActivityStatus::Blocked => "blocked",
         ActivityStatus::Cancelled => "cancelled",

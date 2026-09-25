@@ -15,7 +15,7 @@ See `specs/GH1471/product.md`.
 | Prompt model | `crates/harness-core/src/prompts/mod.rs` | `PromptParts` stores static/context/dynamic layers, but callers usually call `to_prompt_string()`. | The layer data exists but is discarded before execution. |
 | Issue prompts | `crates/harness-core/src/prompts/issue.rs`, `contract.rs` | Issue triage, plan, implementation, and contract prompts return `PromptParts`. | These are the first practical candidates for layered execution. |
 | Agent boundary | `crates/harness-core/src/agent.rs` | `AgentRequest` contains only `prompt: String`. | Agents cannot receive separate static/context/dynamic layers today. |
-| Claude CLI adapter | `crates/harness-agents/src/claude.rs`, `claude_adapter.rs` | The prompt must immediately follow `-p`; no append-system-prompt args are used. | Claude CLI supports the first cache-friendly implementation path. |
+| Claude CLI CodeAgent | `crates/harness-agents/src/claude.rs` | The prompt must immediately follow `-p`; no append-system-prompt args are used. There is no `claude_adapter.rs` (removed in GH-1786). | Claude CLI supports the first cache-friendly implementation path. |
 | Codex adapters | `crates/harness-agents/src/codex.rs`, `codex_adapter.rs` | Prompt is sent as a positional `codex exec` prompt or JSON-RPC text input. | Local help did not expose an equivalent system-prompt cache channel, so this remains flattened. |
 | Skills listing | `crates/harness-core/src/prompts/context.rs`, `crates/harness-server/src/task_executor/helpers.rs` | `build_available_skills_listing` formats every active skill description. | Prompt size grows with total skill count. |
 | Prompt persistence | `crates/harness-server/src/task_executor/helpers/streaming.rs` | The redacted `req.prompt` is persisted/audited. | Layering must preserve an auditable effective prompt. |
@@ -41,8 +41,8 @@ See `specs/GH1471/product.md`.
    - Add `--exclude-dynamic-system-prompt-sections` when the layered path is
      active so Claude's dynamic default system sections do not reduce cache
      reuse.
-   - Apply the same argument construction rule in both `claude.rs` and
-     `claude_adapter.rs`.
+   - Apply the argument construction rule in `claude.rs`. There is no Claude
+     turn adapter; do not reintroduce `claude_adapter.rs`.
 4. Keep fallback behavior.
    - Codex, Anthropic API, test agents, and any request without layers should
      continue using `req.prompt`.
@@ -63,9 +63,9 @@ A prompt builder returns `PromptParts`. The task executor creates an
 layer payload carries the original static/context/dynamic strings. Shared
 helpers and non-layer-aware agents continue reading `req.prompt`.
 
-Claude Code adapters inspect the optional layer payload. If present, they send
-the selected static layer via the system-prompt append argument and send the
-dynamic effective prompt through `-p`. If absent, they use the current flattened
+The Claude CodeAgent inspects the optional layer payload. If present, it sends
+the selected static layer via the system-prompt append argument and sends the
+dynamic effective prompt through `-p`. If absent, it uses the current flattened
 argument list.
 
 Skill injection remains a pre-agent prompt augmentation step. The broad
@@ -87,8 +87,7 @@ remain full content and keep `skill_used` telemetry.
 ## Risks
 
 - Misordered Claude CLI arguments can break execution. Mitigate with tests that
-  assert `-p` is immediately followed by the dynamic prompt in both Claude
-  adapter paths.
+  assert `-p` is immediately followed by the dynamic prompt in `claude.rs`.
 - Moving too much context into the system prompt could change model behavior.
   Mitigate by starting with static instructions only and keeping the flattened
   fallback available.
@@ -101,7 +100,6 @@ remain full content and keep `skill_used` telemetry.
 
 - [ ] `cargo test -p harness-core prompts`
 - [ ] `cargo test -p harness-agents claude`
-- [ ] `cargo test -p harness-agents claude_adapter`
 - [ ] Focused task-executor helper tests covering skills-list cap and matched
       skill usage recording.
 - [ ] `cargo check -p harness-server --all-targets`

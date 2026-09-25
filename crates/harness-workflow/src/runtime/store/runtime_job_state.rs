@@ -1,6 +1,111 @@
 use super::*;
+use crate::runtime::DataProvenance;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowCancellationCleanupOutcome {
+    Cleaned(Box<WorkflowInstance>),
+    NoCancellationCommand,
+    StaleInstance,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuntimeJobClaimDeferOutcome {
+    Deferred(RuntimeJob),
+    CancellationRequested(RuntimeJob),
+    StaleLease,
+}
 
 impl WorkflowRuntimeStore {
+    /// Persist claim evidence only while the claimed lease still owns
+    /// delivery. Lock the parent first, matching terminal-transition lock order.
+    pub async fn record_remote_host_claim_delivery(
+        &self,
+        claimed_job: &RuntimeJob,
+        prepared_prompt_event: Option<Value>,
+        credential_policy_event: Option<Value>,
+        resource_limits_event: Option<Value>,
+        network_policy_event: Option<Value>,
+    ) -> anyhow::Result<bool> {
+        let Some(claimed_lease) = claimed_job.lease.as_ref() else {
+            return Ok(false);
+        };
+        let mut tx = self.pool.begin().await?;
+        if !runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(
+            &mut tx,
+            &self.definition_registry,
+            &claimed_job.id,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
+                .bind(&claimed_job.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((data,)) = row else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let current: RuntimeJob = serde_json::from_str(&data)?;
+        if current.status != RuntimeJobStatus::Running
+            || current.runtime_kind != RuntimeKind::RemoteHost
+            || current.lease_generation != claimed_job.lease_generation
+            || current.lease.as_ref().is_none_or(|lease| {
+                lease.owner != claimed_lease.owner
+                    || lease.expires_at != claimed_lease.expires_at
+                    || lease.expires_at <= Utc::now()
+            })
+            || current.input.get("cancellation_requested").is_some()
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        if let Some(mut payload) = prepared_prompt_event {
+            payload["lease_generation"] = json!(current.lease_generation);
+            runtime_job_leases::append_runtime_event_tx(
+                &mut tx,
+                &current.id,
+                "RuntimePromptPrepared",
+                payload,
+            )
+            .await?;
+        }
+        if let Some(payload) = credential_policy_event {
+            let (workflow_id,): (String,) =
+                sqlx::query_as("SELECT workflow_id FROM workflow_commands WHERE id = $1")
+                    .bind(&current.command_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            insert_event_tx(
+                &mut tx,
+                &workflow_id,
+                "RuntimeHostEvalCredentialPolicyIssued",
+                "runtime_host_claim",
+                payload,
+            )
+            .await?;
+        }
+        for (event_type, payload) in [
+            ("EvalResourceLimitsApplied", resource_limits_event),
+            ("EvalNetworkPolicyApplied", network_policy_event),
+        ] {
+            if let Some(payload) = payload {
+                runtime_job_leases::append_runtime_event_tx(
+                    &mut tx,
+                    &current.id,
+                    event_type,
+                    payload,
+                )
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn extend_runtime_job_lease_if_owned(
         &self,
         runtime_job_id: &str,
@@ -9,6 +114,16 @@ impl WorkflowRuntimeStore {
         next_lease_expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
         let mut tx = self.pool.begin().await?;
+        if !super::runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(
+            &mut tx,
+            &self.definition_registry,
+            runtime_job_id,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+        }
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
                 .bind(runtime_job_id)
@@ -18,6 +133,10 @@ impl WorkflowRuntimeStore {
             return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        if job.input.get("cancellation_requested").is_some() {
+            tx.commit().await?;
+            return Ok(None);
+        }
         let is_current_lease = job.status == RuntimeJobStatus::Running
             && job.lease.as_ref().is_some_and(|lease| {
                 lease.owner == owner && lease.expires_at == current_lease_expires_at
@@ -51,8 +170,18 @@ impl WorkflowRuntimeStore {
         owner: &str,
         lease_expires_at: DateTime<Utc>,
         not_before: DateTime<Utc>,
-    ) -> anyhow::Result<Option<RuntimeJob>> {
+    ) -> anyhow::Result<RuntimeJobClaimDeferOutcome> {
         let mut tx = self.pool.begin().await?;
+        if !super::runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(
+            &mut tx,
+            &self.definition_registry,
+            runtime_job_id,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
+        }
         let row: Option<(String,)> =
             sqlx::query_as("SELECT data::text FROM runtime_jobs WHERE id = $1 FOR UPDATE")
                 .bind(runtime_job_id)
@@ -62,6 +191,11 @@ impl WorkflowRuntimeStore {
             return Err(RuntimeJobNotFoundError::new(runtime_job_id).into());
         };
         let mut job: RuntimeJob = serde_json::from_str(&data)?;
+        let lease_expires_at = if job.runtime_kind == RuntimeKind::RemoteHost {
+            runtime_job_leases::postgres_timestamp_floor(lease_expires_at)
+        } else {
+            lease_expires_at
+        };
         let is_current_lease = job.status == RuntimeJobStatus::Running
             && job
                 .lease
@@ -69,7 +203,11 @@ impl WorkflowRuntimeStore {
                 .is_some_and(|lease| lease.owner == owner && lease.expires_at == lease_expires_at);
         if !is_current_lease {
             tx.commit().await?;
-            return Ok(None);
+            return Ok(RuntimeJobClaimDeferOutcome::StaleLease);
+        }
+        if job.input.get("cancellation_requested").is_some() {
+            tx.commit().await?;
+            return Ok(RuntimeJobClaimDeferOutcome::CancellationRequested(job));
         }
 
         job.status = RuntimeJobStatus::Pending;
@@ -78,6 +216,9 @@ impl WorkflowRuntimeStore {
         job.updated_at = Utc::now();
         let updated = to_jsonb_string(&job)?;
         let status = enum_str(&job.status)?;
+        if job.runtime_kind == RuntimeKind::RemoteHost {
+            runtime_job_leases::mark_remote_lease_proof_v1_tx(&mut tx).await?;
+        }
         sqlx::query(
             "UPDATE runtime_jobs
              SET status = $1, not_before = $2, data = $3::jsonb, updated_at = CURRENT_TIMESTAMP
@@ -96,7 +237,7 @@ impl WorkflowRuntimeStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(Some(job))
+        Ok(RuntimeJobClaimDeferOutcome::Deferred(job))
     }
 
     pub async fn record_runtime_job_failure_class(
@@ -187,6 +328,18 @@ impl WorkflowRuntimeStore {
             .map_err(Into::into)
     }
 
+    pub async fn persist_runtime_job_data(&self, job: &RuntimeJob) -> anyhow::Result<()> {
+        let data = to_jsonb_string(job)?;
+        sqlx::query(
+            "UPDATE runtime_jobs SET data = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        )
+        .bind(&data)
+        .bind(&job.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn runtime_job_matches_running_lease(
         &self,
         expected: &RuntimeJob,
@@ -259,6 +412,188 @@ impl WorkflowRuntimeStore {
         tx.commit().await?;
         Ok(cancelled)
     }
+
+    pub async fn finish_cancellation_cleanup_if_current(
+        &self,
+        expected: &WorkflowInstance,
+        activity: &str,
+        summary: &str,
+    ) -> anyhow::Result<WorkflowCancellationCleanupOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let Some(mut current) = select_instance_for_update_tx(&mut tx, &expected.id).await? else {
+            tx.rollback().await?;
+            return Ok(WorkflowCancellationCleanupOutcome::StaleInstance);
+        };
+        if current.state != expected.state || current.version != expected.version {
+            tx.rollback().await?;
+            return Ok(WorkflowCancellationCleanupOutcome::StaleInstance);
+        }
+        let original = current.clone();
+
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT id, status, data::text FROM workflow_commands
+             WHERE workflow_id = $1
+             ORDER BY id
+             FOR UPDATE",
+        )
+        .bind(&expected.id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let commands = rows
+            .into_iter()
+            .map(|(id, status, data)| {
+                Ok((id, status, serde_json::from_str::<WorkflowCommand>(&data)?))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // The marker authorizing cleanup must belong to the exact accepted
+        // decision that placed the instance in its current state (GH-1865).
+        // Accepting any historical MarkCancelled row lets a stale generation's
+        // cancellation — or a detached marker with no decision behind it, or a
+        // superseded attempt — authorize cancelling the current generation's
+        // live commands.
+        if !self
+            .cancellation_marker_is_current_tx(&mut tx, &current)
+            .await?
+        {
+            tx.rollback().await?;
+            return Ok(WorkflowCancellationCleanupOutcome::NoCancellationCommand);
+        }
+
+        let cancellations = commands
+            .iter()
+            .filter(|(_, status, _)| {
+                WorkflowCommandStatus::try_from(status.as_str())
+                    .is_ok_and(WorkflowCommandStatus::is_active)
+            })
+            .map(|(command_id, _, _)| RuntimeJobCancellation::new(command_id, activity, summary))
+            .collect::<Vec<_>>();
+        if !cancellations.is_empty() {
+            cancel_unfinished_runtime_jobs_for_commands_tx(&mut tx, &cancellations).await?;
+            let command_ids = cancellations
+                .iter()
+                .map(|cancellation| cancellation.command_id.clone())
+                .collect::<Vec<_>>();
+            sqlx::query(
+                "UPDATE workflow_commands
+                 SET status = $2,
+                     dispatch_owner = NULL,
+                     dispatch_lease_expires_at = NULL,
+                     dispatch_not_before = NULL,
+                     dispatch_barrier = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ANY($1::text[])",
+            )
+            .bind(&command_ids)
+            .bind(WorkflowCommandStatus::Cancelled.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        let data_already_cancelled =
+            current.data.get("cancelled").and_then(Value::as_bool) == Some(true);
+        if cancellations.is_empty() && data_already_cancelled {
+            tx.commit().await?;
+            return Ok(WorkflowCancellationCleanupOutcome::Cleaned(Box::new(
+                current,
+            )));
+        }
+        if !current.data.is_object() {
+            current.replace_classified_data(json!({}), DataProvenance::Server);
+        }
+        // Cancellation is a server decision about the workflow, never agent or
+        // remote input, so the marker is server-classified.
+        current.set_data_field("cancelled", Value::Bool(true), DataProvenance::Server)?;
+        if current.data != original.data {
+            current.version = current.version.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workflow instance `{}` version cannot advance during cancellation cleanup",
+                    current.id
+                )
+            })?;
+            commit_same_state_instance_tx(&mut tx, &original, &current).await?;
+        }
+        tx.commit().await?;
+        Ok(WorkflowCancellationCleanupOutcome::Cleaned(Box::new(
+            current,
+        )))
+    }
+
+    /// Prove that the workflow's live cancellation marker was minted by the
+    /// exact accepted decision that placed the instance in its current state.
+    ///
+    /// The latest accepted decision must target the instance's current state
+    /// and carry a `MarkCancelled` command, and a live (non-superseded)
+    /// command row linking that decision to the marker's dedupe key must
+    /// exist. Anything weaker lets an older generation's marker — replayed,
+    /// detached, or superseded — speak for the current generation.
+    async fn cancellation_marker_is_current_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        current: &WorkflowInstance,
+    ) -> anyhow::Result<bool> {
+        let latest: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, data::text FROM workflow_decisions
+             WHERE workflow_id = $1 AND accepted
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(&current.id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some((decision_id, data)) = latest else {
+            return Ok(false);
+        };
+        let record: WorkflowDecisionRecord = serde_json::from_str(&data)?;
+        let decision = record.decision;
+        if decision.next_state != current.state {
+            return Ok(false);
+        }
+        let marker_keys: Vec<String> = decision
+            .commands
+            .iter()
+            .filter(|command| command.command_type == WorkflowCommandType::MarkCancelled)
+            .map(|command| command.dedupe_key.clone())
+            .collect();
+        if marker_keys.is_empty() {
+            return Ok(false);
+        }
+        let bound: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM workflow_commands
+             WHERE workflow_id = $1
+               AND decision_id = $2
+               AND command_type = $3
+               AND dedupe_key = ANY($4::text[])
+               AND status <> $5
+             LIMIT 1",
+        )
+        .bind(&current.id)
+        .bind(&decision_id)
+        .bind(WorkflowCommandType::MarkCancelled.as_str())
+        .bind(&marker_keys)
+        .bind(WorkflowCommandStatus::Superseded.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(bound.is_some())
+    }
+}
+
+pub(super) struct RuntimeJobCancellation {
+    command_id: String,
+    activity: String,
+    summary: String,
+}
+
+impl RuntimeJobCancellation {
+    pub(super) fn new(
+        command_id: impl Into<String>,
+        activity: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            command_id: command_id.into(),
+            activity: activity.into(),
+            summary: summary.into(),
+        }
+    }
 }
 
 pub(super) async fn cancel_unfinished_runtime_jobs_tx(
@@ -267,16 +602,77 @@ pub(super) async fn cancel_unfinished_runtime_jobs_tx(
     activity: &str,
     summary: &str,
 ) -> anyhow::Result<usize> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, data::text FROM runtime_jobs
-         WHERE command_id = $1 AND status IN ('pending', 'running') FOR UPDATE",
+    cancel_unfinished_runtime_jobs_for_commands_tx(
+        tx,
+        &[RuntimeJobCancellation::new(command_id, activity, summary)],
     )
-    .bind(command_id)
+    .await
+}
+
+pub(super) async fn cancel_unfinished_runtime_jobs_for_commands_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cancellations: &[RuntimeJobCancellation],
+) -> anyhow::Result<usize> {
+    if cancellations.is_empty() {
+        return Ok(0);
+    }
+    let command_ids = cancellations
+        .iter()
+        .map(|cancellation| cancellation.command_id.clone())
+        .collect::<Vec<_>>();
+    let rows: Vec<(String, String, String, i64, i32)> = sqlx::query_as(
+        "SELECT job.id, job.command_id, job.data::text, workflow.version,
+                command.attempt_generation
+         FROM runtime_jobs AS job
+         JOIN workflow_commands AS command ON command.id = job.command_id
+         JOIN workflow_instances AS workflow ON workflow.id = command.workflow_id
+         WHERE job.command_id = ANY($1::text[])
+           AND job.status IN ('pending', 'running')
+         ORDER BY job.id
+         FOR UPDATE OF job",
+    )
+    .bind(&command_ids)
     .fetch_all(&mut **tx)
     .await?;
-    for (id, data) in &rows {
+    for (id, command_id, data, workflow_version, command_attempt_generation) in &rows {
+        let cancellation = cancellations
+            .iter()
+            .find(|cancellation| cancellation.command_id == *command_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime job `{id}` was locked without a cancellation for command \
+                     `{command_id}`"
+                )
+            })?;
         let mut job: RuntimeJob = serde_json::from_str(data)?;
-        job.complete(&ActivityResult::cancelled(activity, summary))?;
+        let remote_eval_cancellation = job.status == RuntimeJobStatus::Running
+            && job.runtime_kind == RuntimeKind::RemoteHost
+            && job.is_eval_job();
+        if remote_eval_cancellation {
+            job.input["cancellation_requested"] = serde_json::json!({
+                "reason": cancellation.summary,
+                "activity": cancellation.activity,
+                "requested_at": Utc::now(),
+                "workflow_version": workflow_version,
+                "command_attempt_generation": command_attempt_generation,
+            });
+            job.updated_at = Utc::now();
+            sqlx::query(
+                "UPDATE runtime_jobs SET data = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+            )
+            .bind(to_jsonb_string(&job)?)
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+            continue;
+        }
+        job.complete(&ActivityResult::cancelled(
+            &cancellation.activity,
+            &cancellation.summary,
+        ))?;
+        if job.runtime_kind == RuntimeKind::RemoteHost {
+            runtime_job_leases::mark_remote_lease_proof_v1_tx(tx).await?;
+        }
         sqlx::query(
             "UPDATE runtime_jobs SET status = $1, not_before = $2, data = $3::jsonb,
                 updated_at = CURRENT_TIMESTAMP WHERE id = $4",

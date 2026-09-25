@@ -163,14 +163,14 @@ mod declarative_pinning {
             "done",
             WorkflowSubject::new("document", "one"),
         )
-        .with_data(json!({ "definition_hash": v1.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": v1.definition_hash() }));
         let v2_instance = WorkflowInstance::new(
             "docs_review",
             v2.definition_version(),
             "done",
             WorkflowSubject::new("document", "two"),
         )
-        .with_data(json!({ "definition_hash": v2.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": v2.definition_hash() }));
         assert_eq!(
             registry
                 .state_definition_for_instance(&v1_instance, "done")
@@ -186,7 +186,7 @@ mod declarative_pinning {
             "done",
             WorkflowSubject::new("document", "mismatch"),
         )
-        .with_data(json!({ "definition_hash": v2.definition_hash() }));
+        .with_server_data(json!({ "definition_hash": v2.definition_hash() }));
         assert!(registry
             .state_definition_for_instance(&mismatched_hash, "done")
             .is_none());
@@ -215,16 +215,19 @@ mod declarative_pinning {
         assert!(registry
             .state_definition_for_instance(&missing_unmarked_version, "completed")
             .is_none());
-        assert!(workflow_definition_for_version(GITHUB_ISSUE_PR_DEFINITION_ID, u32::MAX).is_some());
+        assert!(WorkflowDefinitionRegistry::with_builtins()
+            .definition_for_version(GITHUB_ISSUE_PR_DEFINITION_ID, u32::MAX)
+            .is_some());
         let builtin_with_unrelated_hash = WorkflowInstance::new(
             GITHUB_ISSUE_PR_DEFINITION_ID,
             u32::MAX,
             "done",
             WorkflowSubject::new("issue", "1609"),
         )
-        .with_data(json!({ "definition_hash": "unrelated-business-metadata" }));
+        .with_server_data(json!({ "definition_hash": "unrelated-business-metadata" }));
         assert_eq!(
-            workflow_state_definition_for_instance(&builtin_with_unrelated_hash, "done")
+            WorkflowDefinitionRegistry::with_builtins()
+                .state_definition_for_instance(&builtin_with_unrelated_hash, "done")
                 .and_then(|state| state.terminal_state),
             Some(WorkflowTerminalState::Succeeded),
         );
@@ -248,7 +251,7 @@ mod declarative_pinning {
             .is_some());
         let raw_with_unrelated_hash = raw_instance
             .clone()
-            .with_data(json!({ "definition_hash": v1.definition_hash() }));
+            .with_server_data(json!({ "definition_hash": v1.definition_hash() }));
         assert!(matches!(
             raw_registry.resolve_declarative_definition(&raw_with_unrelated_hash),
             DeclarativeDefinitionResolution::NotDeclarative
@@ -256,6 +259,96 @@ mod declarative_pinning {
         assert!(raw_registry
             .state_definition_for_instance(&raw_with_unrelated_hash, "done")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn driverless_progress_uses_exact_declarative_progress_pin() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let v1 = compiled(&policy_v1());
+        let v2 = compiled(&policy_v2());
+        let mut registry = WorkflowDefinitionRegistry::new_for_tests();
+        registry.register_declarative_current(v2.clone())?;
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db"))
+            .await?
+            .with_definition_registry(registry.into_shared());
+        store
+            .persist_definition_version(&persisted_declarative_definition(&v1, None))
+            .await?;
+        let historical = WorkflowInstance::new(
+            "docs_review",
+            v1.definition_version(),
+            "reviewing",
+            WorkflowSubject::new("document", "historical-driverless"),
+        )
+        .with_id("historical-driverless")
+        .with_server_data(json!({ "definition_hash": v1.definition_hash() }));
+        let current = WorkflowInstance::new(
+            "docs_review",
+            v2.definition_version(),
+            "reviewing",
+            WorkflowSubject::new("document", "current-external-wait"),
+        )
+        .with_id("current-external-wait")
+        .with_server_data(json!({ "definition_hash": v2.definition_hash() }));
+        store.force_upsert_lifecycle_state_for_test(&historical).await?;
+        store.force_upsert_lifecycle_state_for_test(&current).await?;
+
+        let rows = store.list_driverless_progress_instances(500).await?;
+        assert!(rows.iter().any(|row| row.workflow_id == historical.id));
+        assert!(!rows.iter().any(|row| row.workflow_id == current.id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_enqueue_rejects_persisted_only_terminal_pin() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let mut historical_policy = policy_v1();
+        historical_policy.terminal.remove("cancelled");
+        historical_policy
+            .terminal
+            .insert("withdrawn".to_string(), "cancelled".to_string());
+        historical_policy
+            .states
+            .get_mut("reviewing")
+            .expect("fixture reviewing state should exist")
+            .on_signal
+            .insert("cancel".to_string(), "withdrawn".to_string());
+        let historical = compiled(&historical_policy);
+        let current = compiled(&policy_v2());
+        let mut registry = WorkflowDefinitionRegistry::new_for_tests();
+        registry.register_declarative_current(current)?;
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db"))
+            .await?
+            .with_definition_registry(registry.into_shared());
+        store
+            .persist_definition_version(&persisted_declarative_definition(&historical, None))
+            .await?;
+        let workflow = WorkflowInstance::new(
+            "docs_review",
+            historical.definition_version(),
+            "withdrawn",
+            WorkflowSubject::new("document", "persisted-terminal-dispatch"),
+        )
+        .with_id("persisted-terminal-dispatch")
+        .with_server_data(json!({ "definition_hash": historical.definition_hash() }));
+        store.force_upsert_lifecycle_state_for_test(&workflow).await?;
+        let command = WorkflowCommand::enqueue_activity("review", "persisted-terminal-command");
+        let error = store
+            .enqueue_command(&workflow.id, None, &command)
+            .await
+            .expect_err("persisted-only terminal workflow must reject new commands");
+        assert!(
+            error.to_string().contains("terminal workflow"),
+            "unexpected error: {error}"
+        );
+        assert!(store.commands_for(&workflow.id).await?.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -402,11 +495,11 @@ mod declarative_pinning {
             WorkflowSubject::new("prompt", "persisted-declarative-terminal"),
         )
         .with_id("persisted-declarative-terminal")
-        .with_data(json!({
+        .with_server_data(json!({
             "submission_id": "persisted-declarative-terminal",
             "definition_hash": definition.definition_hash(),
         }));
-        store.upsert_instance(&submission).await?;
+        store.force_upsert_lifecycle_state_for_test(&submission).await?;
 
         let active = store
             .list_submission_instances_page(
@@ -421,6 +514,8 @@ mod declarative_pinning {
                     include_prompt: true,
                     active_only: true,
                     task_statuses: Vec::new(),
+                    prompt_task_kinds: Vec::new(),
+                    recognized_task_kinds: Vec::new(),
                 },
                 10,
             )
@@ -440,11 +535,226 @@ mod declarative_pinning {
                     include_prompt: true,
                     active_only: false,
                     task_statuses: vec!["done".to_string()],
+                    prompt_task_kinds: Vec::new(),
+                    recognized_task_kinds: Vec::new(),
                 },
                 10,
             )
             .await?;
         assert_eq!(done, vec![submission]);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_filter_discriminates_prompt_family_kinds_in_sql() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("prompt-kinds.db")).await?;
+
+        let policy = |task_kind: &str| {
+            json!({
+                "submission_id": format!("kind-{task_kind}"),
+                "execution_policy": {
+                    "task_kind": task_kind,
+                    "queue_domain": "primary",
+                    "priority": 0
+                }
+            })
+        };
+        for (id, payload) in [
+            ("kind-planner", policy("planner")),
+            ("kind-review", policy("review")),
+            ("kind-prompt", json!({ "submission_id": "kind-prompt" })),
+        ] {
+            let instance = WorkflowInstance::new(
+                "prompt_task",
+                1,
+                "implementing",
+                WorkflowSubject::new("prompt", id),
+            )
+            .with_id(id)
+            .with_server_data(payload);
+            store.force_upsert_lifecycle_state_for_test(&instance).await?;
+        }
+
+        let planner_only = store
+            .list_submission_instances_page(
+                None,
+                None,
+                &WorkflowSubmissionFilter {
+                    project_id: None,
+                    source: None,
+                    repo: None,
+                    include_issue: false,
+                    include_pr: false,
+                    include_prompt: true,
+                    active_only: false,
+                    task_statuses: Vec::new(),
+                    prompt_task_kinds: vec!["planner".to_string()],
+                    recognized_task_kinds: Vec::new(),
+                },
+                10,
+            )
+            .await?;
+        assert_eq!(
+            planner_only
+                .iter()
+                .map(|instance| instance.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kind-planner"],
+            "SQL must return only the planner row when prompt_task_kinds=[planner]"
+        );
+
+        let all_prompt_family = store
+            .list_submission_instances_page(
+                None,
+                None,
+                &WorkflowSubmissionFilter {
+                    project_id: None,
+                    source: None,
+                    repo: None,
+                    include_issue: false,
+                    include_pr: false,
+                    include_prompt: true,
+                    active_only: false,
+                    task_statuses: Vec::new(),
+                    prompt_task_kinds: Vec::new(),
+                    recognized_task_kinds: Vec::new(),
+                },
+                10,
+            )
+            .await?;
+        assert_eq!(
+            all_prompt_family.len(),
+            3,
+            "empty prompt_task_kinds keeps the whole prompt family visible"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_listing_keeps_github_rows_and_corrupt_policies_visible(
+    ) -> anyhow::Result<()> {
+        // Regression guards for the SQL kind predicate:
+        // 1. GitHub rows carry no execution_policy; a mixed query that also
+        //    requests prompt-family kinds must not coalesce them to `prompt`
+        //    and drop them.
+        // 2. A persisted policy with an unrecognized task_kind must stay
+        //    fetchable so the handler's Rust validation rejects it (fail
+        //    closed) instead of the listing silently hiding it.
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let store =
+            WorkflowRuntimeStore::open(&dir.path().join("submission-kind-escapes.db")).await?;
+        let recognized_task_kinds = ["issue", "pr", "prompt", "review", "planner"]
+            .iter()
+            .map(|kind| (*kind).to_string())
+            .collect::<Vec<_>>();
+
+        for (id, payload) in [
+            (
+                "kind-github-issue",
+                json!({
+                    "submission_id": "kind-github-issue",
+                    "issue_number": 7,
+                }),
+            ),
+            ("kind-review", policy_payload("review")),
+            ("kind-prompt", json!({ "submission_id": "kind-prompt" })),
+            ("kind-corrupt", policy_payload("bogus")),
+        ] {
+            let instance = WorkflowInstance::new(
+                if id == "kind-github-issue" {
+                    GITHUB_ISSUE_PR_DEFINITION_ID
+                } else {
+                    "prompt_task"
+                },
+                1,
+                "implementing",
+                WorkflowSubject::new("prompt", id),
+            )
+            .with_id(id)
+            .with_server_data(payload);
+            store.force_upsert_lifecycle_state_for_test(&instance).await?;
+        }
+
+        let mixed_issue_review = store
+            .list_submission_instances_page(
+                None,
+                None,
+                &WorkflowSubmissionFilter {
+                    project_id: None,
+                    source: None,
+                    repo: None,
+                    include_issue: true,
+                    include_pr: false,
+                    include_prompt: true,
+                    active_only: false,
+                    task_statuses: Vec::new(),
+                    prompt_task_kinds: vec!["review".to_string()],
+                    recognized_task_kinds: recognized_task_kinds.clone(),
+                },
+                10,
+            )
+            .await?;
+        let mut mixed_ids: Vec<_> = mixed_issue_review
+            .iter()
+            .map(|instance| instance.id.as_str())
+            .collect();
+        mixed_ids.sort_unstable();
+        assert_eq!(
+            mixed_ids,
+            vec!["kind-corrupt", "kind-github-issue", "kind-review"],
+            "mixed Issue+Review query must keep GitHub rows and still surface \
+             corrupt policies for fail-closed validation"
+        );
+
+        let prompt_only = store
+            .list_submission_instances_page(
+                None,
+                None,
+                &WorkflowSubmissionFilter {
+                    project_id: None,
+                    source: None,
+                    repo: None,
+                    include_issue: false,
+                    include_pr: false,
+                    include_prompt: true,
+                    active_only: false,
+                    task_statuses: Vec::new(),
+                    prompt_task_kinds: vec!["prompt".to_string()],
+                    recognized_task_kinds,
+                },
+                10,
+            )
+            .await?;
+        let mut prompt_ids: Vec<_> = prompt_only
+            .iter()
+            .map(|instance| instance.id.as_str())
+            .collect();
+        prompt_ids.sort_unstable();
+        assert_eq!(
+            prompt_ids,
+            vec!["kind-corrupt", "kind-prompt"],
+            "corrupt policies stay visible even under a strict prompt filter; \
+             plain GitHub and review/planner rows do not match kind=prompt"
+        );
+        Ok(())
+    }
+
+    fn policy_payload(task_kind: &str) -> serde_json::Value {
+        json!({
+            "submission_id": format!("kind-{task_kind}"),
+            "execution_policy": {
+                "task_kind": task_kind,
+                "queue_domain": "primary",
+                "priority": 0
+            }
+        })
     }
 }

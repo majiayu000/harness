@@ -16,24 +16,33 @@ use axum::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
+pub(crate) mod api_error;
 pub(crate) mod auth;
+pub(crate) mod auth_routes;
 pub(crate) mod auto_merge;
 pub(crate) mod background;
 pub(crate) mod builders;
 pub(crate) mod github_intake_status;
+pub(crate) mod github_webhook_routes;
+pub(crate) mod health_routes;
 pub(crate) mod http_router;
 pub(crate) mod init;
-pub(crate) mod misc_routes;
+pub(crate) mod intake_status_routes;
 mod orphan_reaper;
 pub(crate) mod pr_hygiene_background;
 pub(crate) mod rate_limit;
+pub mod rest_contract;
+pub(crate) mod rpc_routes;
 mod runtime_retention;
 pub(crate) mod runtime_submission_routes;
+pub(crate) mod signal_routes;
 pub(crate) mod sse_routes;
 pub(crate) mod state;
 pub(crate) mod task_mutation_routes;
 pub(crate) mod task_query_routes;
+mod task_retention;
 pub(crate) mod task_routes;
+pub(crate) mod workflow_routes;
 mod workflow_watchdog;
 
 #[cfg(test)]
@@ -42,6 +51,8 @@ mod shutdown_test;
 mod startup_tests;
 #[cfg(test)]
 mod test_fixtures;
+// Nested route-contract tests. New tests must not grow this tree; see
+// CONTRIBUTING.md and crates/harness-server/tests/test_placement.rs (#1956).
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -49,17 +60,11 @@ mod tests_password_reset;
 
 // Re-export all public symbols so callers using `crate::http::*` paths continue to work.
 pub use init::build_app_state;
+pub use state::{AppState, GitHubTokenDispatchCounterSnapshot, GitHubTokenDispatchMetric};
+#[cfg(test)]
 pub use state::{
-    AppState, ConcurrencyServices, CoreServices, EngineServices,
-    GitHubTokenDispatchCounterSnapshot, GitHubTokenDispatchMetric, IntakeServices,
-    NotificationServices, ObservabilityServices,
-};
-
-// Handler re-exports — moved to focused submodules, kept accessible via `crate::http::`.
-pub(crate) use misc_routes::{
-    get_issue_workflow_by_issue, get_issue_workflow_by_pr, get_project_workflow_by_project,
-    get_workflow_runtime_tree, github_webhook, handle_rpc, health_check, ingest_signal,
-    intake_status, password_reset, project_queue_stats, reset_runtime_circuit_breaker,
+    ConcurrencyServices, CoreServices, EngineServices, IntakeServices, NotificationServices,
+    ObservabilityServices,
 };
 
 /// Extract the PR number from a GitHub PR URL.
@@ -87,7 +92,6 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     crate::handlers::dashboard::SERVER_START.get_or_init(std::time::Instant::now);
 
     let state = Arc::new(build_app_state(server.clone()).await?);
-    harness_workflow::runtime::freeze_workflow_definition_registry();
     let app = http_router::build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -152,7 +156,12 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     {
         let guard_count = state.engines.rules.read().await.guards().len();
         let skill_count = state.engines.skills.read().await.list().len();
-        let task_count = state.core.tasks.list_all().len();
+        let task_count = state
+            .core
+            .tasks
+            .as_ref()
+            .map(|tasks| tasks.list_all().len())
+            .unwrap_or(0);
         tracing::info!(
             project = %state.core.project_root.display(),
             guards = guard_count,
@@ -173,14 +182,17 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Run one reconciliation tick against GitHub before any recovery so that
     // recovery decisions are made on fresh GitHub truth.
     if state.core.server.config.reconciliation.enabled {
-        crate::reconciliation::run_once_with_runtime_config(
+        if let Err(error) = crate::reconciliation::run_once_with_runtime_config(
             state.core.workflow_runtime_store.as_deref(),
             state.core.issue_workflow_store.as_deref(),
             &state.core.server.config.reconciliation,
             false,
             state.core.server.config.server.github_token.as_deref(),
         )
-        .await;
+        .await
+        {
+            tracing::warn!("startup reconciliation failed: {error}");
+        }
     } else {
         tracing::info!("startup reconciliation disabled by config");
     }
@@ -192,6 +204,10 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Periodically sweep runtime issue workflows with attached PRs and emit
     // workflow command outbox rows.
     background::spawn_runtime_pr_feedback_sweeper(&state);
+
+    // Retry durable workspace cleanup obligations, including targets backfilled
+    // for workflows that were already terminal before this server started.
+    background::spawn_runtime_workspace_cleanup_sweeper(&state);
 
     // Periodically inspect managed open PRs for stale DIRTY/BEHIND mergeability
     // and route repair through workflow-owned PR feedback activities.
@@ -207,6 +223,9 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
     // Periodically prune terminal workflow-runtime history when explicitly
     // enabled by workflow storage policy.
     runtime_retention::spawn_runtime_retention(&state);
+
+    // Periodically prune terminal task rows and task-owned child rows.
+    task_retention::spawn_task_retention(&state);
 
     // Convert workflow command outbox rows into runtime jobs when the workflow
     // policy keeps the dispatcher enabled.
@@ -236,9 +255,9 @@ pub async fn serve(server: Arc<HarnessServer>, addr: SocketAddr) -> anyhow::Resu
                     .count()
             })
             .unwrap_or(0);
-        harness_observe::quality::QualityGrader::grade(&events, violation_count).grade
+        harness_observe::quality::QualityGrader::grade(&events, violation_count).map(|r| r.grade)
     };
-    crate::scheduler::Scheduler::from_grade(initial_grade).start(state.clone());
+    crate::scheduler::Scheduler::from_initial_grade(initial_grade).start(state.clone());
     // Pass the pre-built GitHub pollers from AppState to the orchestrator so
     // both share the same Arc instances and on_task_complete operates on the
     // live poller's dispatched map.

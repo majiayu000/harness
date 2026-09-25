@@ -90,8 +90,8 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_is_full() {
-        assert_eq!(CapabilityProfile::default(), CapabilityProfile::Full);
+    fn default_profile_is_standard() {
+        assert_eq!(CapabilityProfile::default(), CapabilityProfile::Standard);
     }
 
     #[test]
@@ -147,10 +147,40 @@ mod tests {
     }
 
     #[test]
-    fn full_profile_no_explicit_tools_returns_none() {
+    fn default_profile_resolves_to_standard_tools() {
         use crate::config::agents::AgentsConfig;
-        let cfg = AgentsConfig::default(); // Full profile, no allowed_tools
+        let cfg = AgentsConfig::default();
+        assert_eq!(
+            cfg.resolve_allowed_tools(),
+            CapabilityProfile::Standard.tools()
+        );
+        assert_eq!(
+            cfg.resolve_permission_mode(),
+            crate::config::agents::AgentPermissionMode::Scoped
+        );
+    }
+
+    #[test]
+    fn full_profile_requires_explicit_opt_up() {
+        use crate::config::agents::{AgentPermissionMode, AgentsConfig};
+        let cfg = AgentsConfig {
+            capability_profile: CapabilityProfile::Full,
+            ..Default::default()
+        };
         assert!(cfg.resolve_allowed_tools().is_none());
+        assert_eq!(cfg.resolve_permission_mode(), AgentPermissionMode::Full);
+    }
+
+    #[test]
+    fn explicit_allowlist_keeps_full_profile_scoped() {
+        use crate::config::agents::{AgentPermissionMode, AgentsConfig};
+        let cfg = AgentsConfig {
+            capability_profile: CapabilityProfile::Full,
+            allowed_tools: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_allowed_tools(), Some(Vec::new()));
+        assert_eq!(cfg.resolve_permission_mode(), AgentPermissionMode::Scoped);
     }
 
     // --- validate_tool_usage tests ---

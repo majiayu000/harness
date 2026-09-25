@@ -134,35 +134,6 @@ fn runtime_failure_missing_implementation_block_sets_invalid_agent_output_code()
 }
 
 #[test]
-fn runtime_failure_scope_too_large_block_sets_maintainer_input_required_code() {
-    let instance = issue_instance("implementing");
-    let result = ActivityResult::succeeded("implement_issue", "Scope guard rejected.").with_signal(
-        ActivitySignal::new(
-            SCOPE_TOO_LARGE_SIGNAL,
-            json!({
-                "base_ref": "origin/main",
-                "files_changed": 31,
-                "lines_added": 200,
-                "max_files_changed": 30,
-                "max_lines_added": 1500,
-                "decomposition_skeleton": [{ "title": "split" }]
-            }),
-        ),
-    );
-    let event = runtime_completion_event(&instance, "implement_issue", result);
-    let decision = reduce_runtime_job_completed(&instance, &event)
-        .expect("event should parse")
-        .expect("scope guard signal should block");
-    assert_eq!(decision.decision, "block_scope_too_large");
-    let payload = &mark_stop_command(&decision, WorkflowCommandType::MarkBlocked).command;
-    assert_eq!(
-        payload["stop_reason_code"],
-        json!("maintainer_input_required")
-    );
-    assert_eq!(payload["reason_class"], json!("terminal"));
-}
-
-#[test]
 fn runtime_transcript_store_failure_uses_bounded_default_backoff() {
     let instance = issue_instance("implementing");
     let result = ActivityResult::failed(

@@ -95,7 +95,6 @@ impl PostgresCatalogMonitor {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn unavailable(
         thresholds: PostgresCatalogThresholds,
         reason: &'static str,
@@ -287,7 +286,7 @@ fn log_catalog_breach(census: &PostgresCatalogCensus) {
 }
 
 fn parse_u64_env(name: &'static str, default: u64) -> u64 {
-    let Ok(raw) = std::env::var(name) else {
+    let Ok(raw) = harness_core::config::process_env::var(name) else {
         return default;
     };
     let raw = raw.trim();
@@ -304,7 +303,7 @@ fn parse_u64_env(name: &'static str, default: u64) -> u64 {
 }
 
 fn parse_f64_env(name: &'static str, default: f64) -> f64 {
-    let Ok(raw) = std::env::var(name) else {
+    let Ok(raw) = harness_core::config::process_env::var(name) else {
         return default;
     };
     let raw = raw.trim();

@@ -1,3 +1,4 @@
+use super::rest_contract::LegacyJson as Json;
 use super::AppState;
 use crate::workflow_runtime_submission::{
     RuntimeSubmissionCancelError, RuntimeSubmissionCancelOutcome,
@@ -7,7 +8,6 @@ use axum::{
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use harness_workflow::runtime::{
     WorkflowEvidence, WorkflowRuntimeRecoveryAction, WorkflowRuntimeRecoveryOutcome,
@@ -77,11 +77,9 @@ pub(super) async fn merge_workflow_runtime(
     State(state): State<Arc<AppState>>,
     Json(request): Json<WorkflowRuntimeMergeRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "workflow runtime store unavailable" })),
-        );
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_status_json(),
     };
     match crate::workflow_runtime_pr_feedback::approve_runtime_merge_by_workflow_id(
         store,
@@ -104,11 +102,9 @@ pub(super) async fn cancel_workflow_runtime(
     State(state): State<Arc<AppState>>,
     Json(request): Json<WorkflowRuntimeCancelRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "workflow runtime store unavailable" })),
-        );
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_status_json(),
     };
 
     match crate::workflow_runtime_submission::cancel_submission_by_workflow_id(
@@ -207,11 +203,9 @@ pub(super) async fn reconstruct_runtime_transcript(
             "re-exported transcript checksum does not match expected_checksum",
         );
     }
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return runtime_recovery_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "workflow runtime store unavailable",
-        );
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_status_json(),
     };
     let sources = match store
         .command_sources_for_runtime_jobs(&[runtime_job_id.to_string()])
@@ -287,11 +281,9 @@ async fn recover_workflow_runtime(
     if reason.is_empty() {
         return runtime_recovery_error(StatusCode::BAD_REQUEST, "reason is required");
     }
-    let Some(store) = state.core.workflow_runtime_store.as_ref() else {
-        return runtime_recovery_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "workflow runtime store unavailable",
-        );
+    let store = match state.workflow_runtime_store() {
+        Ok(store) => store,
+        Err(error) => return error.into_status_json(),
     };
 
     match store

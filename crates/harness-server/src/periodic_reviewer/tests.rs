@@ -352,7 +352,7 @@ fn test_git_guard_removed() {
     // The forbidden pattern is split across two literals so that this very
     // test does not trigger the assertion it is enforcing.
     let forbidden = ["Command::new(", "\"git\")"].concat();
-    let source = include_str!("../periodic_reviewer.rs");
+    let source = include_str!("mod.rs");
     assert!(
         !source.contains(&forbidden),
         "periodic_reviewer.rs must not spawn git directly"
