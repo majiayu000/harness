@@ -500,6 +500,22 @@ impl ThreadManager {
             .collect()
     }
 
+    pub(crate) fn pending_runtime_approvals(&self) -> Vec<(String, Vec<Item>)> {
+        let mut handles = self
+            .runtime_turn_aliases
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        handles.sort();
+        handles
+            .into_iter()
+            .filter_map(|handle| {
+                let items = self.pending_approval_items_for_runtime_handle(&handle);
+                (!items.is_empty()).then_some((handle, items))
+            })
+            .collect()
+    }
+
     fn has_pending_approval_request(&self, turn_id: &TurnId, request_id: &str) -> bool {
         self.find_thread_and_turn(turn_id).is_some_and(|(_, turn)| {
             matches!(turn.status, TurnStatus::Running)

@@ -17,6 +17,7 @@ export default defineConfig({
       "/api": "http://localhost:9800",
       "/projects": "http://localhost:9800",
       "/rpc": "http://localhost:9800",
+      "/reconcile": "http://localhost:9800",
       "/health": "http://localhost:9800",
       "/signals": "http://localhost:9800",
       "/webhook": "http://localhost:9800",

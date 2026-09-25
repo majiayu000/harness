@@ -1444,6 +1444,29 @@ async fn runtime_submission_routes_do_not_consult_legacy_task_store() -> anyhow:
     assert!(listed_ids.contains(&submission_id.as_str()));
     assert!(listed_ids.contains(&declarative_submission_id));
 
+    let approvals_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/workflows/runtime/approvals")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(approvals_response.status(), StatusCode::OK);
+    let approvals = response_json(approvals_response).await?;
+    assert_eq!(
+        approvals["data"],
+        serde_json::json!([{
+            "submission_id": submission_id,
+            "pending_approvals": [{
+                "type": "approval_request",
+                "id": "request-1",
+                "action": "run cargo test",
+                "approved": null
+            }]
+        }])
+    );
+
     let declarative_detail_response = app
         .clone()
         .oneshot(

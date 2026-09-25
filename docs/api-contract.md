@@ -26,6 +26,7 @@ observes results. The following capabilities are **only available over HTTP**:
 | `GET  /api/intake` | intake | Intake source status |
 | `POST /api/workflows/runtime/submissions` | submit | Create a durable workflow-runtime submission |
 | `GET  /api/workflows/runtime/submissions` | list | List runtime submissions |
+| `GET  /api/workflows/runtime/approvals` | approvals | List pending agent approvals for live runtime submission handles |
 | `GET  /api/workflows/runtime/submissions/{id}` | get | Read runtime submission status |
 | `GET  /api/workflows/runtime/submissions/{id}/artifacts` | artifacts | Read runtime output artifacts |
 | `POST /api/workflows/runtime/transcripts/reconstruct` | transcript reconstruction | Restore a missing or corrupt runtime transcript from an upstream provider re-export |
@@ -226,6 +227,11 @@ array:
   }
 }
 ```
+
+`GET /api/workflows/runtime/approvals` returns `{ "data": [{ "submission_id":
+"...", "pending_approvals": [...] }] }`. It includes only currently actionable
+in-memory approval requests. Each item has the same `approval_request` shape
+as the submission detail response.
 
 Supported query parameters are `status`, `scheduler_state`, `active`, `kind`,
 `source`, `repo`, `project_id`, `limit`, and `cursor`. `status` is the task

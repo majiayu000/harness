@@ -1,60 +1,61 @@
 import { useEffect } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Route, Routes, useLocation } from "react-router-dom";
-import { Dashboard } from "./routes/Dashboard";
-import { Overview } from "./routes/Overview";
-import { UsageMonitor } from "./routes/UsageMonitor";
-import { Worktrees } from "./routes/Worktrees";
-import { PaletteProvider } from "./lib/palette";
 import { TokenPrompt } from "./components/TokenPrompt";
+import { unauthorizedEvents } from "./lib/api";
 
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      refetchInterval: 5000,
-      refetchIntervalInBackground: true,
-      retry: 3,
-      staleTime: 0,
-    },
-  },
-});
+type ConsoleScreen =
+  | "home"
+  | "fleet"
+  | "projects"
+  | "history"
+  | "worktrees"
+  | "usage"
+  | "library"
+  | "system";
 
-/**
- * Scroll to a fragment target when the URL hash changes. React Router v6
- * updates the URL for hash links but does NOT scroll — so sidebar items
- * like /overview#projects would otherwise update the bar with no visible
- * effect. Runs after the route commits so the panel being targeted has
- * already mounted.
- */
-function ScrollToHash() {
-  const { hash, pathname } = useLocation();
+const queryClient = new QueryClient();
+
+function Console({ screen }: { screen: ConsoleScreen }) {
+  const { search } = useLocation();
+  const params = new URLSearchParams(search);
+  const view = params.get("view");
+  const selected: ConsoleScreen =
+    view === "home" || view === "fleet" || view === "projects" ||
+    view === "history" || view === "worktrees" || view === "usage" ||
+    view === "library" || view === "system" ? view : screen;
+  params.set("screen", selected);
   useEffect(() => {
-    if (!hash) return;
-    const id = hash.slice(1);
-    // Defer to after paint so newly-mounted panels exist in the DOM.
-    const t = setTimeout(() => {
-      const el = document.getElementById(id);
-      if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 0);
-    return () => clearTimeout(t);
-  }, [hash, pathname]);
-  return null;
+    const onMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      if (event.data?.type === "harness:unauthorized") {
+        unauthorizedEvents.dispatchEvent(new Event("unauthorized"));
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  return (
+    <iframe
+      title="Harness Console"
+      src={`/console-v2/index.html?${params}`}
+      style={{ display: "block", width: "100vw", height: "100vh", border: 0 }}
+    />
+  );
 }
 
 export function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <PaletteProvider>
-        <ScrollToHash />
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/dashboard" element={<Dashboard />} />
-          <Route path="/overview" element={<Overview />} />
-          <Route path="/usage" element={<UsageMonitor />} />
-          <Route path="/worktrees" element={<Worktrees />} />
-        </Routes>
-        <TokenPrompt />
-      </PaletteProvider>
+      <Routes>
+        <Route path="/" element={<Console screen="home" />} />
+        <Route path="/dashboard" element={<Console screen="home" />} />
+        <Route path="/overview" element={<Console screen="home" />} />
+        <Route path="/worktrees" element={<Console screen="worktrees" />} />
+        <Route path="/usage" element={<Console screen="usage" />} />
+      </Routes>
+      <TokenPrompt />
     </QueryClientProvider>
   );
 }
