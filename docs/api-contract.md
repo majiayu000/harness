@@ -182,6 +182,10 @@ array:
 }
 ```
 
+Rows with actionable agent approval requests include `pending_approvals`.
+The field is omitted when no approval is pending; each item uses the same
+`approval_request` shape as the submission detail response.
+
 Supported query parameters are `status`, `scheduler_state`, `active`, `kind`,
 `source`, `repo`, `project_id`, `limit`, and `cursor`. `status` is the task
 lifecycle status; `scheduler_state` is the ownership/execution state. For

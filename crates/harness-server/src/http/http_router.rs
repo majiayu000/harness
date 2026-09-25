@@ -27,6 +27,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/assets/{filename}",
             axum::routing::get(crate::assets::serve),
         )
+        .route(
+            "/console-v2/{filename}",
+            axum::routing::get(crate::assets::serve_console),
+        )
         .route("/favicon.ico", get(crate::dashboard::favicon))
         .route("/health", get(health_check))
         .route("/rpc", post(handle_rpc))

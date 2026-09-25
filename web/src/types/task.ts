@@ -17,6 +17,12 @@ export interface Task {
   pr_url: string | null;
   error: string | null;
   terminal?: TaskTerminalInfo | null;
+  pending_approvals?: Array<{
+    type: "approval_request";
+    id: string;
+    action: string;
+    approved: boolean | null;
+  }>;
   source: string | null;
   parent_id: string | null;
   external_id: string | null;
