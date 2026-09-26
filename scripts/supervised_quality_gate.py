@@ -105,11 +105,11 @@ def _positive(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def reject_unsupported_eval(command: dict) -> None:
+def reject_unsupported_eval(command: dict, *, native_quality_gate: bool = False) -> None:
     required = command.get("eval", {}).get("required_runtime_host_capabilities", [])
     if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
         raise RuntimeError("eval required capabilities are malformed")
-    if "trusted_eval_verifier_v1" in required:
+    if "trusted_eval_verifier_v1" in required and not native_quality_gate:
         raise RuntimeError("this supervised client does not implement trusted_eval_verifier_v1")
 
 
@@ -195,7 +195,7 @@ def network_policy_from_claim(claim: dict) -> dict:
     return policy
 
 
-def network_report(job_id: str, policy: dict) -> dict:
+def network_report(job_id: str, policy: dict, *, offline: bool = False) -> dict:
     return {
         "runtime_job_id": job_id,
         "enforced": True,
@@ -206,7 +206,8 @@ def network_report(job_id: str, policy: dict) -> dict:
         ],
         "connections": [],
         "payloads_recorded": False,
-        "reason": "container egress follows the claimed eval network policy",
+        "reason": ("offline verifier denies all network egress" if offline else
+                   "container egress follows the claimed eval network policy"),
     }
 
 
@@ -252,7 +253,10 @@ def bind_eval_contract(claim: dict, job_input: dict) -> dict[str, str] | None:
         eval_contract = job_input.get("eval")
     if not isinstance(eval_contract, dict):
         return None
-    reject_unsupported_eval({"eval": eval_contract})
+    reject_unsupported_eval(
+        {"eval": eval_contract},
+        native_quality_gate=job_input.get("activity") == QUALITY_GATE_ACTIVITY,
+    )
     limits = trusted_resource_limits(claim)
     network_policy_from_claim(claim)
     mount_budget(limits["effective"]["disk_bytes"])
@@ -403,10 +407,11 @@ print(json.dumps({'cpu_time_micros': cpu['usage_usec'], 'current_pids_before': p
                   'current_pids': int((root / 'pids.current').read_text())}))
 """
 
-DISK_METRICS_SCRIPT = """import json, os
+DISK_METRICS_SCRIPT = """import json, os, sys
 from datetime import datetime, timezone
 from pathlib import Path
-ROOTS = ('/workspace', '/home/harness', '/tmp', '/dev/shm')
+ROOTS = tuple(sys.argv[1].split(',')) if len(sys.argv)>1 else ('/workspace', '/home/harness', '/tmp', '/dev/shm')
+SCOPE = sys.argv[2] if len(sys.argv)>2 else 'candidate agent-writable tmpfs roots under trial policy'
 mounts = {}
 for line in Path('/proc/self/mountinfo').read_text().splitlines():
     parts = line.split()
@@ -439,7 +444,7 @@ for sample in samples:
 print(json.dumps({
     'sample_kind': 'terminal',
     'observed_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-    'scope': 'candidate agent-writable tmpfs roots under trial policy',
+    'scope': SCOPE,
     'mounts': samples,
     'aggregate_used_bytes': sum(item['used_bytes'] for item in by_device.values()),
     'aggregate_capacity_bytes': sum(item['capacity_bytes'] for item in by_device.values()),
@@ -448,7 +453,11 @@ print(json.dumps({
 """
 
 
-def disk_evidence_errors(disk: object) -> list[str]:
+def disk_evidence_errors(
+    disk: object,
+    roots: tuple[str, ...] = ("/workspace", "/home/harness", "/tmp", "/dev/shm"),
+    scope: str = "candidate agent-writable tmpfs roots under trial policy",
+) -> list[str]:
     """Return problems that must block successful completion; never zero-fill."""
     if not isinstance(disk, dict):
         return ["disk evidence is not an object"]
@@ -457,10 +466,10 @@ def disk_evidence_errors(disk: object) -> list[str]:
         errors.append("disk sample_kind must be terminal (not peak)")
     if not isinstance(disk.get("observed_at"), str) or not disk["observed_at"]:
         errors.append("disk observed_at is missing")
-    if disk.get("scope") != "candidate agent-writable tmpfs roots under trial policy":
+    if disk.get("scope") != scope:
         errors.append("disk scope is missing or unexpected")
     mounts = disk.get("mounts")
-    expected = ("/workspace", "/home/harness", "/tmp", "/dev/shm")
+    expected = roots
     if not isinstance(mounts, list) or [item.get("root") for item in mounts] != list(expected):
         errors.append("disk mounts must cover the four agent-writable tmpfs roots")
         return errors

@@ -37,6 +37,7 @@ HOST_OWNED_ARTIFACTS = {
     "runtime_host_usage",
     "supervised_input_snapshot",
     "supervised_candidate_resources",
+    "supervised_verifier_resources",
     "supervised_docker_verification",
     "supervised_git_handoff",
     "resource_limit_report",
@@ -259,13 +260,13 @@ class Host:
                    'set -eu; mkdir -p /home/harness/.codex; '
                    'cp /run/codex-auth.json /home/harness/.codex/auth.json')
 
-    def start_observer(self, retention_secs: int) -> None:
+    def start_observer(self, retention_secs: int, target: str | None = None) -> None:
         engine = json.loads(docker("info", "--format", "{{json .}}"))
         if engine["CgroupVersion"] != "2" or engine["CgroupDriver"] != "cgroupfs":
             raise RuntimeError("resource observer requires Docker cgroup v2 with cgroupfs")
         if os.getuid() == 0:
             raise RuntimeError("resource observer requires a non-root host UID")
-        candidate_id = docker("inspect", self.name, "--format", "{{.Id}}")
+        candidate_id = docker("inspect", target or self.name, "--format", "{{.Id}}")
         if len(candidate_id) != 64 or any(c not in "0123456789abcdef" for c in candidate_id):
             raise RuntimeError("Docker returned an invalid candidate container ID")
         self.state["candidate_id"] = candidate_id
@@ -280,18 +281,24 @@ class Host:
     def collect_resources(self, stop_agents: bool) -> None:
         if not self.state.get("container_started") or "resource_evidence" in self.state:
             return
+        container = self.state.get("resource_container", self.name)
+        verifier = container != self.name
+        roots = ("/candidate", "/home/harness", "/tmp", "/dev/shm") if verifier else (
+            "/workspace", "/home/harness", "/tmp", "/dev/shm")
+        scope = ("offline verifier writable tmpfs roots under claimed eval limits" if verifier else
+                 "candidate agent-writable tmpfs roots under trial policy")
         evidence = {"status": "incomplete", "candidate_id": self.state.get("candidate_id"),
-                    "scope": ("candidate cgroup and agent-writable tmpfs through "
-                              "quiesced export; excludes verifier and proxy")}
+                    "scope": ("offline verifier cgroup and writable tmpfs through quiescence" if verifier else
+                              "candidate cgroup and agent-writable tmpfs through quiesced export; excludes verifier and proxy")}
         errors = []
         limit_exceeded = False
         try:
-            state = json.loads(docker("inspect", self.name, "--format", "{{json .State}}"))
+            state = json.loads(docker("inspect", container, "--format", "{{json .State}}"))
             evidence["container_state"] = state
             if not state["Running"]:
                 raise RuntimeError("candidate PID 1 exited before final resource collection")
             if stop_agents:
-                docker("exec", self.name, "python3", "-I", "-c",
+                docker("exec", container, "python3", "-I", "-c",
                        "import os,signal\ntry: os.kill(-1,signal.SIGKILL)\nexcept ProcessLookupError: pass")
         except Exception as error:
             errors.append(str(error))
@@ -311,13 +318,14 @@ class Host:
         # Disk accounting needs the live candidate mount namespace; measure after
         # quiescence checks so the sample is terminal, not a forged peak.
         try:
-            disk = json.loads(docker("exec", self.name, "python3", "-I", "-c", DISK_METRICS_SCRIPT))
+            disk = json.loads(docker("exec", container, "python3", "-I", "-c", DISK_METRICS_SCRIPT,
+                                     ",".join(roots), scope))
             evidence["disk"] = disk
-            errors.extend(disk_evidence_errors(disk))
+            errors.extend(disk_evidence_errors(disk, roots, scope))
         except Exception as error:
             errors.append(str(error))
         try:
-            state = json.loads(docker("inspect", self.name, "--format", "{{json .State}}"))
+            state = json.loads(docker("inspect", container, "--format", "{{json .State}}"))
             evidence["container_state"] = state
             if not state["Running"]:
                 errors.append("candidate PID 1 exited before final resource collection")
@@ -332,7 +340,7 @@ class Host:
         else:
             evidence["status"] = "complete"
         self.state["resource_evidence"] = evidence
-        save(self.root / "candidate-resources.json", evidence)
+        save(self.root / ("verifier-resources.json" if verifier else "candidate-resources.json"), evidence)
         self.persist()
         if evidence["status"] == "limit_exceeded":
             raise RuntimeError(evidence["error"])
@@ -477,9 +485,10 @@ class Host:
         for key in ("job", "lease", "result", "agent_result", "prepared_prompt",
                     "cleanup_errors", "resource_evidence", "execution_evidence",
                     "enforced_limits", "enforced_network_policy", "network_enforced",
-                    "output_bytes", "wall_time_millis"):
+                    "resource_container", "output_bytes", "wall_time_millis"):
             self.state.pop(key, None)
-        for name in ("agent.jsonl", "agent.stderr", "verifier.stdout", "candidate-resources.json"):
+        for name in ("agent.jsonl", "agent.stderr", "verifier.stdout", "candidate-resources.json",
+                     "verifier-resources.json"):
             path = self.root / name
             if path.exists():
                 path.unlink()
@@ -487,10 +496,21 @@ class Host:
         self.persist()
 
     def offline_verify_args(self, *extra_mounts: str) -> list[str]:
+        limits = self.state.get("enforced_limits")
+        if limits is None:
+            isolation = self.base_args()
+            candidate_bytes = "512m"
+        else:
+            effective = limits["effective"]
+            isolation = quality_gate.docker_isolation_args(
+                effective["disk_bytes"], os.getuid(), os.getgid(),
+                memory_bytes=effective["memory_bytes"], pids=effective["pids"],
+            )
+            candidate_bytes = str(quality_gate.mount_budget(effective["disk_bytes"])["workspace"])
         return [
             "run", "-d", "--name", self.name + "-verify", "--network", "none",
-            *self.base_args(),
-            "--tmpfs", f"/candidate:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
+            *isolation,
+            "--tmpfs", f"/candidate:rw,nosuid,nodev,size={candidate_bytes},uid={os.getuid()},gid={os.getgid()},mode=700",
             "--mount", f"type=bind,src={self.root / 'candidate'},dst=/handoff,readonly",
             "--mount", f"type=bind,src={GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly",
             "--mount", f"type=bind,src={self.root / 'verifier.py'},dst=/verify.py,readonly",
@@ -530,21 +550,83 @@ class Host:
         if handoff is None:
             raise RuntimeError("native quality gate requires a retained candidate Git bundle")
         quality_gate.bind_retained_candidate(handoff, expected_head_sha)
-        payload = quality_gate.validation_spec(handoff, expected_head_sha, validation_commands)
-        out_dir = self.root / "quality-gate-out"
-        if out_dir.exists():
-            for path in out_dir.iterdir():
-                path.unlink()
-        else:
-            out_dir.mkdir(mode=0o700)
-        docker(*self.offline_verify_args(
+        limits = self.state.get("enforced_limits")
+        if limits is None:
+            payload = quality_gate.validation_spec(handoff, expected_head_sha, validation_commands)
+            out_dir = self.root / "quality-gate-out"
+            if out_dir.exists():
+                for path in out_dir.iterdir():
+                    path.unlink()
+            else:
+                out_dir.mkdir(mode=0o700)
+            verify_args = self.offline_verify_args(
+                f"--mount=type=bind,src={self.root / 'verifier.py'},dst=/trusted/verify.py,readonly",
+                f"--mount=type=bind,src={out_dir},dst=/out",
+            )
+            docker(*verify_args, quality_gate.OFFLINE_VALIDATION_SCRIPT, payload)
+            self.wait_verify_container()
+            return quality_gate.read_validation_evidence(
+                out_dir / "validation.json", len(validation_commands)
+            )
+
+        effective = limits["effective"]
+        retention_secs = effective["wall_time_secs"] + 300
+        verify_args = self.offline_verify_args(
             f"--mount=type=bind,src={self.root / 'verifier.py'},dst=/trusted/verify.py,readonly",
-            f"--mount=type=bind,src={out_dir},dst=/out",
-        ), quality_gate.OFFLINE_VALIDATION_SCRIPT, payload)
-        self.wait_verify_container()
-        return quality_gate.read_validation_evidence(
-            out_dir / "validation.json", len(validation_commands)
         )
+        docker(*verify_args[:-2], "-I", "-c", CANDIDATE_REAPER_SCRIPT, str(retention_secs))
+        self.state["resource_container"] = self.name + "-verify"
+        self.state["container_started"] = True
+        self.state["network_enforced"] = True
+        self.state["output_bytes"] = 0
+        self.persist()
+        self.start_observer(retention_secs, self.name + "-verify")
+        reconstruction = [
+            "python3", "-I", "/git-handoff.py", "verify", "/handoff/candidate.bundle",
+            handoff["base_commit"], expected_head_sha, handoff["bundle_sha256"],
+            "/handoff/workspace", "/candidate",
+        ]
+        validation = []
+        started = time.monotonic()
+        try:
+            for index, argv in enumerate([reconstruction, *validation_commands]):
+                remaining_wall = effective["wall_time_secs"] - (time.monotonic() - started)
+                if remaining_wall <= 0:
+                    raise RuntimeError("verifier exceeded claimed wall deadline")
+                remaining_output = effective["output_bytes"] - self.state["output_bytes"]
+                account = {}
+                command_started = time.monotonic()
+                try:
+                    exit_code = stream_agent_output(
+                        ["docker", "exec", "--workdir", "/candidate", self.name + "-verify", *argv],
+                        self.root, remaining_wall, self.renew,
+                        output_limit=remaining_output, account=account,
+                        check=lambda: self.check_verifier_cpu(effective["cpu_time_secs"]),
+                    )
+                finally:
+                    self.state["output_bytes"] += account.get("output_bytes", 0)
+                    self.persist()
+                if index == 0:
+                    if exit_code:
+                        raise RuntimeError(f"independent verifier could not reconstruct candidate: exit {exit_code}")
+                    continue
+                output = (self.root / "agent.jsonl").read_bytes() + (self.root / "agent.stderr").read_bytes()
+                validation.append({
+                    "argv": argv, "exit_code": exit_code,
+                    "output_sha256": hashlib.sha256(output).hexdigest(),
+                    "duration_ms": max(0, int((time.monotonic() - command_started) * 1000)),
+                })
+        finally:
+            self.state["wall_time_millis"] = max(0, int((time.monotonic() - started) * 1000))
+            self.persist()
+        self.collect_resources(stop_agents=True)
+        return validation
+
+    def check_verifier_cpu(self, cpu_time_secs: int) -> None:
+        metrics = json.loads(docker("exec", self.name + "-observer", "python3", "-I", "-c",
+                                    CGROUP_METRICS_SCRIPT))
+        if quality_gate.cpu_time_exceeded(metrics["cpu_time_micros"], cpu_time_secs):
+            raise RuntimeError("verifier exceeded cumulative CPU time limit")
 
     def result(self, status: str, reason: str, artifacts: list | None = None,
                native: dict | None = None) -> dict:
@@ -557,7 +639,9 @@ class Host:
                               "artifact": self.state["git_handoff"]})
         if self.state.get("container_started"):
             evidence = self.state.get("resource_evidence", {"status": "incomplete", "error": "not collected"})
-            artifacts.append({"artifact_type": "supervised_candidate_resources", "artifact": evidence})
+            artifact_type = ("supervised_verifier_resources" if self.state.get("resource_container") else
+                             "supervised_candidate_resources")
+            artifacts.append({"artifact_type": artifact_type, "artifact": evidence})
             if status in {"succeeded", "succeeded_with_blockers"} and evidence["status"] != "complete":
                 status, reason = "failed", reason + "; " + evidence.get("error", "final resource evidence is incomplete")
         limits = self.state.get("enforced_limits")
@@ -588,7 +672,8 @@ class Host:
                         })
         if self.state.get("network_enforced"):
             artifacts.append({"artifact_type": "network_policy_report", "artifact": quality_gate.network_report(
-                self.state["job"]["id"], self.state["enforced_network_policy"])})
+                self.state["job"]["id"], self.state["enforced_network_policy"],
+                offline=bool(self.state.get("resource_container")))})
         return {**(native or {}), "activity": self.state["job"]["input"]["activity"], "status": status,
                 "summary": reason, "artifacts": artifacts or [],
                 "signals": (native or {}).get("signals", []) if native and status == native["status"] else [],
@@ -623,7 +708,8 @@ class Host:
         self.persist()
         validation = self.verify_expected_head(expected, commands)
         self.state["git_handoff"]["verified"] = all(item["exit_code"] == 0 for item in validation)
-        self.state["execution_evidence"] = quality_gate.execution_evidence(expected, validation)
+        if self.state.get("enforced_limits") is None:
+            self.state["execution_evidence"] = quality_gate.execution_evidence(expected, validation)
         self.persist()
         native = quality_gate.activity_result(
             expected, self.state["git_handoff"]["candidate_commit"], validation
@@ -641,6 +727,15 @@ class Host:
                 "full_eval_capabilities": False,
             }},
         ], native)
+        if self.state.get("enforced_limits") is not None:
+            report = next(
+                artifact["artifact"] for artifact in self.state["result"]["artifacts"]
+                if artifact["artifact_type"] == "resource_limit_report"
+            )
+            self.state["execution_evidence"] = quality_gate.execution_evidence(
+                expected, validation, report
+            )
+            self.persist()
 
     def run(self) -> None:
         phase = self.state["phase"]
@@ -688,7 +783,8 @@ class Host:
                 self.persist()
         self.api("/api/runtime-hosts/register", {
             "host_id": self.name, "capabilities": [
-                "runtime_job_lease_proof_v1", "eval_resource_limits", "eval_network_policy"]})
+                "runtime_job_lease_proof_v1", "eval_resource_limits", "eval_network_policy",
+                "trusted_eval_verifier_v1"]})
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             claim = self.api(self.endpoint + "/runtime-jobs/claim", {"lease_secs": LEASE_SECONDS, "execution_workspace": "/workspace"})
@@ -715,14 +811,13 @@ class Host:
             activity = job["input"].get("activity")
             bound = quality_gate.bind_eval_contract(claim, job["input"])
             if bound is not None:
+                eval_contract = command.get("eval") if isinstance(command.get("eval"), dict) else job["input"].get("eval", {})
+                if eval_contract.get("base_commit") != self.args.base_commit:
+                    raise RuntimeError("claimed eval base_commit does not match --base-commit")
                 self.credential_variables = bound
                 self.state["enforced_limits"] = claim["resource_limits"]
                 self.state["enforced_network_policy"] = claim["network_policy"]
-                if activity == quality_gate.QUALITY_GATE_ACTIVITY:
-                    raise RuntimeError(
-                        "eval quality gate stays offline; this client does not implement trusted_eval_verifier_v1"
-                    )
-            if activity != quality_gate.QUALITY_GATE_ACTIVITY:
+            if activity != quality_gate.QUALITY_GATE_ACTIVITY and bound is None:
                 request = self.state["request"]
                 submission = self.state["submission"]
                 digest = hashlib.sha256(b"\0".join(value.encode() for value in [
