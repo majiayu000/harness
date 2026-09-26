@@ -342,13 +342,15 @@
   H.memoryRepos = {};
   H.evalError = null;
   H.evalProject = null;
+  H.evalRequestSeq = 0;
   H.loadEvalRuns = async projectRoot => {
     if (!projectRoot) return;
-    if (H.evalProject !== projectRoot) H.X.evals = [];
+    if (H.evalProject !== projectRoot) { H.X.evals = []; H.evalError = null; }
     H.evalProject = projectRoot;
+    const sequence = ++H.evalRequestSeq;
     try {
       const payload = await request('/api/eval-runs?' + new URLSearchParams({ project_root: projectRoot }));
-      if (H.evalProject !== projectRoot) return;
+      if (H.evalProject !== projectRoot || sequence !== H.evalRequestSeq) return;
       H.X.evals = (payload.runs || []).map(({ report, reported_at }) => ({
         v: report.run_id, at: report.outcome ? report.outcome + ' · ' + age(reported_at) : age(reported_at), suite: report.suite,
         pass: report.metrics.passed_cases || 0,
@@ -357,8 +359,8 @@
         score: report.metrics.scored_cases > 0 && typeof report.metrics.pass_at_1 === 'number' ? Math.round(report.metrics.pass_at_1 * 100) + '%' : '—',
         delta: '—', outcome: report.outcome || 'completed',
       }));
-      H.evalError = null;
-    } catch (error) { if (H.evalProject === projectRoot) H.evalError = error.message || String(error); }
+      H.evalError = payload.errors?.length ? payload.errors.length + ' report(s) unavailable: ' + payload.errors.slice(0, 2).join(' · ') : null;
+    } catch (error) { if (H.evalProject === projectRoot && sequence === H.evalRequestSeq) H.evalError = error.message || String(error); }
     refreshView();
   };
   H.loadMemory = async projectId => {

@@ -1,4 +1,4 @@
-use crate::handlers::{validate_file_in_root, validate_project_root};
+use crate::handlers::validate_file_in_root;
 use crate::http::api_error::ApiError;
 use crate::http::rest_contract::{ContractJson, ContractQuery};
 use crate::http::AppState;
@@ -20,10 +20,13 @@ pub(crate) async fn list_eval_runs(
     State(state): State<Arc<AppState>>,
     ContractQuery(query): ContractQuery<EvalRunListQuery>,
 ) -> Result<ContractJson<EvalRunListResponse>, ApiError> {
-    let root = project_root(&state, &query.project_root)?;
+    let root = project_root(&state, &query.project_root).await?;
     let directory = root.join("artifacts/eval");
     if !directory.exists() {
-        return Ok(ContractJson(EvalRunListResponse { runs: Vec::new() }));
+        return Ok(ContractJson(EvalRunListResponse {
+            runs: Vec::new(),
+            errors: Vec::new(),
+        }));
     }
     let directory = validate_file_in_root(&directory, &root).map_err(ApiError::BadRequest)?;
     if !directory.is_dir() {
@@ -32,36 +35,51 @@ pub(crate) async fn list_eval_runs(
         ));
     }
     let mut reports = Vec::new();
+    let mut errors = Vec::new();
     for entry in fs::read_dir(&directory).map_err(internal)? {
         let entry = entry.map_err(internal)?;
         let path = entry.path().join("report.json");
         if !path.is_file() {
             continue;
         }
-        let path = validate_file_in_root(&path, &directory).map_err(ApiError::BadRequest)?;
-        let modified = fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .map_err(internal)?;
+        let path = match validate_file_in_root(&path, &directory) {
+            Ok(path) => path,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        let modified = match fs::metadata(&path).and_then(|metadata| metadata.modified()) {
+            Ok(modified) => modified,
+            Err(error) => {
+                errors.push(format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
         reports.push((modified, path));
     }
     reports.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    let runs = reports
-        .into_iter()
-        .take(20)
-        .map(|(modified, path)| {
-            let report: EvalRunReport =
-                serde_json::from_slice(&fs::read(path).map_err(internal)?).map_err(internal)?;
-            entry(&report, DateTime::<Utc>::from(modified))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ContractJson(EvalRunListResponse { runs }))
+    let mut runs = Vec::new();
+    for (modified, path) in reports {
+        if runs.len() == 20 {
+            break;
+        }
+        match read_report_entry(&path, modified) {
+            Ok(run) => runs.push(run),
+            Err(error) => errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+    for error in &errors {
+        tracing::error!(%error, "console eval report unavailable");
+    }
+    Ok(ContractJson(EvalRunListResponse { runs, errors }))
 }
 
 pub(crate) async fn run_eval(
     State(state): State<Arc<AppState>>,
     ContractJson(request): ContractJson<EvalRunRequest>,
 ) -> Result<ContractJson<EvalRunResponse>, ApiError> {
-    let root = project_root(&state, &request.project_root)?;
+    let root = project_root(&state, &request.project_root).await?;
     let requested_path = Path::new(&request.manifest_path);
     let manifest_path = if requested_path.is_absolute() {
         requested_path.to_path_buf()
@@ -117,24 +135,59 @@ pub(crate) async fn run_eval(
         .map_err(|error| ApiError::Internal(format!("eval task failed: {error}")))?
 }
 
-fn project_root(state: &AppState, requested: &str) -> Result<PathBuf, ApiError> {
-    validate_project_root(Path::new(requested), &state.core.home_dir).map_err(ApiError::BadRequest)
+async fn project_root(state: &AppState, requested: &str) -> Result<PathBuf, ApiError> {
+    if requested.trim().is_empty() {
+        return Err(ApiError::BadRequest("project root is empty".to_string()));
+    }
+    let root = Path::new(requested)
+        .canonicalize()
+        .map_err(|error| ApiError::BadRequest(format!("invalid project root: {error}")))?;
+    if !root.is_dir() {
+        return Err(ApiError::BadRequest(
+            "project root is not a directory".to_string(),
+        ));
+    }
+    if state
+        .project_svc
+        .default_root()
+        .canonicalize()
+        .ok()
+        .as_ref()
+        == Some(&root)
+    {
+        return Ok(root);
+    }
+    let projects = state.project_svc.list().await.map_err(internal)?;
+    if projects
+        .iter()
+        .any(|project| project.active && project.root.canonicalize().ok().as_ref() == Some(&root))
+    {
+        return Ok(root);
+    }
+    Err(ApiError::BadRequest(
+        "project root is not registered".to_string(),
+    ))
 }
 
 fn create_eval_directory(root: &Path, run_id: &str) -> Result<PathBuf, ApiError> {
     let artifacts = root.join("artifacts");
-    if !artifacts.exists() {
-        fs::create_dir(&artifacts).map_err(internal)?;
-    }
+    fs::create_dir_all(&artifacts).map_err(internal)?;
     let artifacts = validate_file_in_root(&artifacts, root).map_err(ApiError::BadRequest)?;
     let evals = artifacts.join("eval");
-    if !evals.exists() {
-        fs::create_dir(&evals).map_err(internal)?;
-    }
+    fs::create_dir_all(&evals).map_err(internal)?;
     let evals = validate_file_in_root(&evals, root).map_err(ApiError::BadRequest)?;
     let directory = evals.join(run_id);
     fs::create_dir(&directory).map_err(internal)?;
     Ok(directory)
+}
+
+fn read_report_entry(
+    path: &Path,
+    modified: std::time::SystemTime,
+) -> Result<EvalRunEntry, ApiError> {
+    let report: EvalRunReport =
+        serde_json::from_slice(&fs::read(path).map_err(internal)?).map_err(internal)?;
+    entry(&report, DateTime::<Utc>::from(modified))
 }
 
 fn write_report(path: &Path, report: &EvalRunReport) -> Result<(), ApiError> {
@@ -229,6 +282,49 @@ mod tests {
         let listed = list_eval_runs(State(state.clone()), ContractQuery(query)).await?;
         assert_eq!(listed.0.runs.len(), 1);
         assert_eq!(listed.0.runs[0].report["suite"], "eval-isolation-fixture");
+        let incomplete_directory = dir.path().join("artifacts/eval/run-2");
+        fs::create_dir_all(&incomplete_directory)?;
+        fs::write(incomplete_directory.join("report.json"), b"")?;
+        let partial = list_eval_runs(
+            State(state.clone()),
+            ContractQuery(EvalRunListQuery {
+                project_root: request.project_root.clone(),
+            }),
+        )
+        .await?;
+        assert_eq!(partial.0.runs.len(), 1);
+        assert_eq!(partial.0.errors.len(), 1);
+
+        let outside_home = tempfile::tempdir()?;
+        let external_root = outside_home.path().canonicalize()?;
+        assert!(!external_root.starts_with(&state.core.home_dir));
+        fs::create_dir(external_root.join(".git"))?;
+        fs::write(
+            external_root.join("manifest.toml"),
+            include_str!("../../../../evals/benchmarks/eval-isolation-fixture.toml"),
+        )?;
+        state
+            .project_svc
+            .register(crate::project_registry::Project {
+                id: "external-eval-project".to_string(),
+                root: external_root.clone(),
+                name: None,
+                max_concurrent: None,
+                default_agent: None,
+                active: true,
+                created_at: Utc::now().to_rfc3339(),
+            })
+            .await?;
+        let external_response = run_eval(
+            State(state.clone()),
+            ContractJson(EvalRunRequest {
+                project_root: external_root.to_string_lossy().into_owned(),
+                manifest_path: "manifest.toml".to_string(),
+                dry_run: true,
+            }),
+        )
+        .await?;
+        assert_eq!(external_response.0.run.report["metrics"]["total_cases"], 1);
 
         let escaped = EvalRunRequest {
             manifest_path: "../outside.toml".to_string(),

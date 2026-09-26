@@ -134,9 +134,36 @@ it("shows local official quotas without inventing a Claude percentage", async ()
 
 it("maps saved eval reports without a fabricated diff", async () => {
   const { context, responses } = await setup();
-  responses["/api/eval-runs?project_root=%2Ftmp%2Frepo"] = { runs: [{ reported_at: "2026-09-26T17:00:00Z", report: { run_id: "run-1", suite: "core", metrics: { total_cases: 3, scored_cases: 2, passed_cases: 1, failed_cases: 1, pending_cases: 1, skipped_cases: 0, infra_failed_cases: 0, pass_at_1: 0.5 } } }] };
+  responses["/api/eval-runs?project_root=%2Ftmp%2Frepo"] = { runs: [{ reported_at: "2026-09-26T17:00:00Z", report: { run_id: "run-1", suite: "core", metrics: { total_cases: 3, scored_cases: 2, passed_cases: 1, failed_cases: 1, pending_cases: 1, skipped_cases: 0, infra_failed_cases: 0, pass_at_1: 0.5 } } }], errors: ["run-2/report.json: incomplete JSON"] };
   await context.HC.loadEvalRuns("/tmp/repo");
   expect(context.HC.X.evals[0]).toMatchObject({ v: "run-1", suite: "core", pass: 1, fail: 1, partial: 1, score: "50%", delta: "—" });
+  expect(context.HC.evalError).toContain("incomplete JSON");
+});
+
+it("ignores older eval responses for the same project", async () => {
+  let calls = 0;
+  const pending = [];
+  const { context } = await setup(path => {
+    if (path !== "/api/eval-runs?project_root=%2Ftmp%2Frepo") return null;
+    if (++calls === 1) return null;
+    return new Promise(resolve => pending.push(resolve));
+  });
+  const first = context.HC.loadEvalRuns("/tmp/repo");
+  const second = context.HC.loadEvalRuns("/tmp/repo");
+  const response = run_id => ({ ok: true, status: 200, json: async () => ({ runs: [{ reported_at: "2026-09-26T17:00:00Z", report: { run_id, suite: "core", metrics: { scored_cases: 1, passed_cases: 1, pass_at_1: 1 } } }], errors: [] }) });
+  pending[1](response("new"));
+  await second;
+  pending[0](response("old"));
+  await first;
+  expect(context.HC.X.evals[0].v).toBe("new");
+});
+
+it("surfaces an invalid eval response without inventing metrics", async () => {
+  const { context, responses } = await setup();
+  responses["/api/eval-runs?project_root=%2Ftmp%2Frepo"] = { runs: [{ reported_at: "2026-09-26T17:00:00Z", report: { run_id: "broken" } }] };
+  await context.HC.loadEvalRuns("/tmp/repo");
+  expect(context.HC.evalError).toBeTruthy();
+  expect(context.HC.X.evals).toHaveLength(0);
 });
 
 it("keeps live polling independent of slow history and surfaces history failures", async () => {

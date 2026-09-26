@@ -23,7 +23,7 @@ cannot reset shared state while the dashboard is rendering.
 | Worktree cleanup | Copies a shell-quoted `git worktree remove` command for a server-classified orphan. Does not execute deletion or add `--force`. |
 | Provider quotas | `/api/local-quotas` reads local `ccstats limits` records offline for Codex and Claude. Official percentage snapshots are shown when present; estimated windows without a percentage remain unquantified. Missing, stale, and unreadable records are labeled. |
 | Rule repair / exec policy | Rule check and auto-fix target the selected project; auto-fix confirms before changing files and reports edits plus residual violations. The command tester checks the server's configured policy on demand and distinguishes no match from allow. |
-| Eval runs | The selected project's `artifacts/eval/*/report.json` files populate the run list. `Run benchmark` accepts a TOML manifest path within that project, dispatches through the existing evaluator, and saves its report there. The request stays open while cases run; a disconnected browser can reload the report after the run finishes. |
+| Eval runs | The selected registered or default project's `artifacts/eval/*/report.json` files populate the run list. Unreadable or incomplete reports are shown as errors beside valid runs. `Run benchmark` accepts a TOML manifest path within that project, dispatches through the existing evaluator, and saves its report there. The request stays open while cases run; a disconnected browser can reload the report after the run finishes. |
 
 Requests retain session-token Bearer authentication, unauthorized notification,
 read timeouts, and stale-state/error reporting. Mutations do not inherit the short polling deadline. Failed detail requests retry at most

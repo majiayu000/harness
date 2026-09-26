@@ -58,6 +58,7 @@ pub struct EvalRunResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct EvalRunListResponse {
     pub runs: Vec<EvalRunEntry>,
+    pub errors: Vec<String>,
 }
 
 /// Runtime-host capability required before the server issues proof-bearing leases.
