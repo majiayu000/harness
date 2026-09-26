@@ -167,6 +167,10 @@ baseline remain unsupported. Pinned-contract jobs and eval jobs that require
 `trusted_eval_verifier_v1` are rejected. Other eval jobs enforce the claimed
 cumulative CPU budget, network policy, and credential environment. There
 is no source-directory-only mode or old-state migration.
+For eval jobs, credential values pass to the candidate process over Docker
+exec standard input; they are not stored in host state or Docker container
+configuration. A failed container launch can report missing measurements as
+incomplete evidence, while successful eval completion still requires them.
 
 ## Native quality-gate consumption
 

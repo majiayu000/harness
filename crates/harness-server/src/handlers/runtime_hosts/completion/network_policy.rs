@@ -46,6 +46,9 @@ pub(in crate::handlers::runtime_hosts) fn validate_eval_network_policy_report(
         .iter()
         .filter(|artifact| artifact.artifact_type == "network_policy_report");
     let Some(first_artifact) = report_artifacts.next() else {
+        if result.status == harness_workflow::runtime::ActivityStatus::Failed {
+            return Ok(());
+        }
         return Err((
             StatusCode::BAD_REQUEST,
             json!({
@@ -142,6 +145,15 @@ mod tests {
             err.1["error"],
             "eval runtime job completion requires network_policy_report artifact"
         );
+    }
+
+    #[test]
+    fn failed_eval_before_container_launch_can_omit_network_report() {
+        let job = eval_job_with_applied_policy("launch-failed");
+        let result = ActivityResult::failed("implement_issue", "container failed", "launch failed")
+            .with_error_kind(harness_workflow::runtime::ActivityErrorKind::SpawnFailure);
+        validate_eval_network_policy_report(&job, &result)
+            .expect("no network policy was applied before the container launched");
     }
 
     #[test]

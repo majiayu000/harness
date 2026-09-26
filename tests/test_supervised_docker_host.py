@@ -367,7 +367,6 @@ def test_stuck_client_cleanup_preserves_primary_failure_and_closes_streams(tmp_p
 
 def resource_runner(tmp_path, monkeypatch, *, running=True, oom=0, pids_max=0, stop_error=False,
                     disk=None, disk_error=None):
-    module = load()
     runner = host(tmp_path, 'executing')
     runner.name = 'owned'
     runner.state['container_started'] = True
@@ -943,10 +942,73 @@ def test_cumulative_cpu_budget_is_cgroup_usage_not_a_rate_or_wall_timeout():
             "network_policy": {"inbound": "deny", "outbound": "allowlist", "network_allowlist": ["chatgpt.com"]},
             "credential_environment_variables": {"MODEL_TOKEN": "secret"},
         },
-        {"eval": {}},
+        {"command": {"eval": {}}},
     )
     assert variables == {"MODEL_TOKEN": "secret"}
     assert "secret" not in json.dumps({key: value for key, value in limits.items()})
+
+
+def test_root_eval_contract_is_enforced():
+    module = load()
+    claim = {
+        "resource_limits": {"requested": {}, "effective": {
+            "cpu_time_secs": 1, "memory_bytes": 8, "pids": 16,
+            "disk_bytes": 512 * 1024 * 1024, "output_bytes": 1024,
+            "wall_time_secs": 30,
+        }},
+        "network_policy": {"inbound": "deny", "outbound": "deny", "network_allowlist": []},
+        "credential_environment_variables": {"MODEL_TOKEN": "private-value"},
+    }
+    assert module.quality_gate.bind_eval_contract(claim, {"eval": {}, "command": {}}) == {
+        "MODEL_TOKEN": "private-value"
+    }
+    with pytest.raises(RuntimeError, match="trusted_eval_verifier_v1"):
+        module.quality_gate.bind_eval_contract(
+            claim, {"eval": {"required_runtime_host_capabilities": ["trusted_eval_verifier_v1"]}}
+        )
+
+
+def test_eval_credentials_enter_container_over_stdin_only(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = load()
+    runner = host(tmp_path, 'executing')
+    runner.args = SimpleNamespace(timeout=30, model='model')
+    runner.name = 'candidate'
+    runner.credential_variables = {"MODEL_TOKEN": "private-value"}
+    runner.state.update(
+        enforced_limits={"effective": {
+            "wall_time_secs": 30, "cpu_time_secs": 10, "output_bytes": 1024,
+        }},
+        prepared_prompt={"prompt": "task"},
+    )
+    runner.persist = Mock()
+    runner.renew = Mock()
+    observed = {}
+
+    def stream(command, root, timeout, renew, **kwargs):
+        observed.update(command=command, kwargs=kwargs)
+        return 0
+
+    monkeypatch.setitem(runner.wait.__globals__, 'stream_agent_output', stream)
+    assert runner.wait() == 0
+    assert 'private-value' not in ' '.join(observed['command'])
+    assert observed['command'][:3] == ['docker', 'exec', '-i']
+    assert json.loads(observed['kwargs']['stdin_data']) == runner.credential_variables
+    assert runner.state['wall_time_millis'] >= 0
+
+
+def test_failed_eval_without_measurements_does_not_invent_evidence(tmp_path):
+    runner = host(tmp_path, 'executing')
+    runner.state.update(
+        enforced_limits={"effective": {}},
+        enforced_network_policy={"inbound": "deny", "outbound": "deny", "network_allowlist": []},
+        input_snapshot={"base_commit": "a" * 40},
+    )
+    failed = runner.result('failed', 'container launch failed')
+    assert failed['error_kind'] == 'unknown'
+    assert 'execution_evidence' not in runner.state
+    assert not any(item['artifact_type'] in {'resource_limit_report', 'network_policy_report'}
+                   for item in failed['artifacts'])
 
 
 def test_rendered_claim_and_native_result_survive_completion_and_restart(tmp_path):

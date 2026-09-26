@@ -238,7 +238,6 @@ class Host:
                 "--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080",
             ]
         else:
-            run_args += quality_gate.credential_env_args(self.credential_variables)
             if allowlist is not None:
                 run_args += ["--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080"]
         run_args += [args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT]
@@ -345,14 +344,27 @@ class Host:
                 raise RuntimeError("candidate exceeded cumulative CPU time limit")
 
         try:
-            return stream_agent_output([
-                "docker", "exec", "--workdir", "/workspace", self.name,
-                "timeout", "--signal=KILL", str(timeout),
-                "codex", "exec", "--skip-git-repo-check", "--json", "--sandbox", "danger-full-access",
+            command = ["docker", "exec"]
+            if limits is not None:
+                command.append("-i")
+            command += ["--workdir", "/workspace", self.name]
+            if limits is not None:
+                command += [
+                    "python3", "-I", "-c",
+                    "import json,os,sys\n"
+                    "environment=os.environ.copy()\n"
+                    "environment.update(json.load(sys.stdin))\n"
+                    "os.execvpe(sys.argv[1],sys.argv[1:],environment)",
+                ]
+            command += [
+                "timeout", "--signal=KILL", str(timeout), "codex", "exec",
+                "--skip-git-repo-check", "--json", "--sandbox", "danger-full-access",
                 "-m", self.args.model, self.state["prepared_prompt"]["prompt"],
-            ], self.root, timeout, self.renew,
+            ]
+            return stream_agent_output(command, self.root, timeout, self.renew,
                output_limit=None if limits is None else limits["output_bytes"],
-               check=None if limits is None else check, account=None if limits is None else account)
+               check=None if limits is None else check, account=None if limits is None else account,
+               stdin_data=None if limits is None else json.dumps(self.credential_variables).encode())
         finally:
             if limits is not None:
                 self.state["output_bytes"] = account.get("output_bytes", 0)
@@ -568,7 +580,9 @@ class Host:
                 "summary": reason, "artifacts": artifacts or [],
                 "signals": (native or {}).get("signals", []) if native and status == native["status"] else [],
                 "error": (native or {}).get("error") if native and status == native["status"]
-                else reason if status != "succeeded" else None}
+                else reason if status != "succeeded" else None,
+                "error_kind": (native or {}).get("error_kind") if native and status == native["status"]
+                else "unknown" if status == "failed" else None}
 
     def complete(self) -> None:
         payload_path = self.root / "completion.json"
@@ -679,7 +693,7 @@ class Host:
         if "agent_contract" in command or "exact_replay" in command:
             raise RuntimeError("this supervised client cannot execute pinned-contract jobs")
         activity = job["input"].get("activity")
-        bound = quality_gate.bind_eval_contract(claim, command)
+        bound = quality_gate.bind_eval_contract(claim, job["input"])
         if bound is not None:
             self.credential_variables = bound
             self.state["enforced_limits"] = claim["resource_limits"]

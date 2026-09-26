@@ -244,21 +244,18 @@ def report_from_evidence(limits: dict, evidence: dict, output_bytes: int, wall_t
     )
 
 
-def bind_eval_contract(claim: dict, command: dict) -> dict[str, str] | None:
-    if not isinstance(command.get("eval"), dict):
+def bind_eval_contract(claim: dict, job_input: dict) -> dict[str, str] | None:
+    command = job_input.get("command")
+    eval_contract = command.get("eval") if isinstance(command, dict) else None
+    if not isinstance(eval_contract, dict):
+        eval_contract = job_input.get("eval")
+    if not isinstance(eval_contract, dict):
         return None
-    reject_unsupported_eval(command)
+    reject_unsupported_eval({"eval": eval_contract})
     limits = trusted_resource_limits(claim)
     network_policy_from_claim(claim)
     mount_budget(limits["effective"]["disk_bytes"])
     return credential_variables(claim)
-
-
-def credential_env_args(variables: dict[str, str]) -> list[str]:
-    args: list[str] = []
-    for key, value in variables.items():
-        args.extend(["--env", f"{key}={value}"])
-    return args
 
 
 def build_resource_report(
@@ -499,6 +496,7 @@ def disk_evidence_errors(disk: object) -> list[str]:
 def stream_agent_output(
     command: list[str], root: Path, timeout: int, renew, *,
     output_limit: int | None = None, check=None, account: dict | None = None,
+    stdin_data: bytes | None = None,
 ) -> int:
     """Keep a shared bounded prefix of both attached streams outside the candidate."""
     if output_limit is None:
@@ -506,9 +504,13 @@ def stream_agent_output(
     deadline = time.monotonic() + timeout
     observed = 0
     process = subprocess.Popen(
-        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+        command, stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
     )
     try:
+        if stdin_data is not None:
+            process.stdin.write(stdin_data)
+            process.stdin.close()
         with selectors.DefaultSelector() as selector, \
                 (root / "agent.jsonl").open("wb") as stdout, \
                 (root / "agent.stderr").open("wb") as stderr:
