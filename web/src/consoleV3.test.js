@@ -243,4 +243,9 @@ it("does not dispatch another benchmark while an eval is active", async () => {
   expect(component.renderVals().evalRunning).toBe(true);
   await component.renderVals().runEval();
   expect(H.request).not.toHaveBeenCalled();
+  H.evalServerActive = false;
+  H.evalUnresolved = true;
+  expect(component.renderVals().evalButtonLabel).toBe("Cleanup required");
+  await component.renderVals().runEval();
+  expect(H.request).not.toHaveBeenCalled();
 });

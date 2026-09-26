@@ -346,9 +346,10 @@
   H.evalLoading = false;
   H.evalLoadFailed = false;
   H.evalServerActive = false;
+  H.evalUnresolved = false;
   H.loadEvalRuns = async projectRoot => {
     if (!projectRoot) return;
-    if (H.evalProject !== projectRoot) { H.X.evals = []; H.evalError = null; H.evalServerActive = false; }
+    if (H.evalProject !== projectRoot) { H.X.evals = []; H.evalError = null; H.evalServerActive = false; H.evalUnresolved = false; }
     H.evalProject = projectRoot;
     const sequence = ++H.evalRequestSeq;
     H.evalLoading = true;
@@ -367,9 +368,10 @@
           delta: '—', outcome: error || report.outcome || status || 'completed',
         };
       });
-      const errors = [...(payload.errors || []), ...H.X.evals.filter(run => run.status === 'failed' && run.outcome !== 'failed').map(run => run.v + ': ' + run.outcome)];
+      const errors = [...(payload.unresolved && !payload.active ? ['Previous eval needs workflow cleanup before another run.'] : []), ...(payload.errors || []), ...H.X.evals.filter(run => run.status === 'failed' && run.outcome !== 'failed').map(run => run.v + ': ' + run.outcome)];
       H.evalError = errors.length ? errors.slice(0, 2).join(' · ') + (errors.length > 2 ? ' · +' + (errors.length - 2) + ' more' : '') : null;
       H.evalServerActive = !!payload.active;
+      H.evalUnresolved = !!payload.unresolved;
       H.evalLoadFailed = false;
     } catch (error) { if (H.evalProject === projectRoot && sequence === H.evalRequestSeq) { H.evalError = error.message || String(error); H.evalLoadFailed = true; } }
     finally { if (H.evalProject === projectRoot && sequence === H.evalRequestSeq) { H.evalLoading = false; refreshView(); } }
@@ -549,7 +551,7 @@
       if (results[14].status === 'rejected') H.X.usage.quotas = [{ name: 'Local quota records', used: null, note: results[14].reason?.message || String(results[14].reason), status: 'unavailable' }];
       applyTaskSnapshot();
       const evalRoot = H.projects.find(project => project.root === H.evalProject)?.root || H.projects[0]?.root;
-      if (H.evalProject && H.evalProject !== evalRoot) { H.evalProject = null; H.evalRequestSeq++; H.X.evals = []; H.evalError = null; H.evalLoading = false; H.evalLoadFailed = false; H.evalServerActive = false; }
+      if (H.evalProject && H.evalProject !== evalRoot) { H.evalProject = null; H.evalRequestSeq++; H.X.evals = []; H.evalError = null; H.evalLoading = false; H.evalLoadFailed = false; H.evalServerActive = false; H.evalUnresolved = false; }
       if (secondaryDue || finished) void refreshHistory();
       if (secondaryDue) void H.loadEvents();
       if (secondaryDue) await Promise.all(H.projects.map(project => H.loadMemory(project.id)));
