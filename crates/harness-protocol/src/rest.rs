@@ -46,8 +46,12 @@ pub struct EvalRunListQuery {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EvalRunEntry {
+    pub run_id: String,
+    pub suite: String,
+    pub status: String,
     pub report: serde_json::Value,
     pub reported_at: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

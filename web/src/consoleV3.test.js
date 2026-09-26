@@ -221,3 +221,21 @@ it("does not replace the selected project's eval reports when another run finish
   expect(H.loadEvalRuns).toHaveBeenCalledTimes(1);
   expect(H.loadEvalRuns).toHaveBeenCalledWith("/tmp/other");
 });
+
+it("keeps the eval selector aligned when the project list is reordered", () => {
+  const { component, H } = setup();
+  H.evalProject = "/tmp/project";
+  H.projects.unshift({ id: "new", root: "/tmp/new", trend: [], dispatch: [] });
+  expect(component.renderVals().ruleProject).toBe("/tmp/project");
+});
+
+it("does not dispatch another benchmark while an eval is active", async () => {
+  const { component, H, context } = setup();
+  context.confirm = vi.fn(() => true);
+  component.state.evalManifest = "evals/benchmarks/core.toml";
+  H.X.evals = [{ v: "run-active", status: "running", pass: 0, partial: 0, fail: 0, delta: "—" }];
+  expect(component.renderVals().evalRunning).toBe(true);
+  await component.renderVals().runEval();
+  expect(context.confirm).not.toHaveBeenCalled();
+  expect(H.request).not.toHaveBeenCalled();
+});

@@ -343,25 +343,33 @@
   H.evalError = null;
   H.evalProject = null;
   H.evalRequestSeq = 0;
+  H.evalLoading = false;
+  H.evalLoadFailed = false;
   H.loadEvalRuns = async projectRoot => {
     if (!projectRoot) return;
     if (H.evalProject !== projectRoot) { H.X.evals = []; H.evalError = null; }
     H.evalProject = projectRoot;
     const sequence = ++H.evalRequestSeq;
+    H.evalLoading = true;
+    refreshView();
     try {
       const payload = await request('/api/eval-runs?' + new URLSearchParams({ project_root: projectRoot }));
       if (H.evalProject !== projectRoot || sequence !== H.evalRequestSeq) return;
-      H.X.evals = (payload.runs || []).map(({ report, reported_at }) => ({
-        v: report.run_id, at: report.outcome ? report.outcome + ' · ' + age(reported_at) : age(reported_at), suite: report.suite,
-        pass: report.metrics.passed_cases || 0,
-        partial: (report.metrics.pending_cases || 0) + (report.metrics.skipped_cases || 0) + (report.metrics.infra_failed_cases || 0),
-        fail: report.metrics.failed_cases || 0,
-        score: report.metrics.scored_cases > 0 && typeof report.metrics.pass_at_1 === 'number' ? Math.round(report.metrics.pass_at_1 * 100) + '%' : '—',
-        delta: '—', outcome: report.outcome || 'completed',
-      }));
+      H.X.evals = (payload.runs || []).map(({ run_id, suite, status, report, reported_at, error }) => {
+        if (!report) return { v: run_id, at: status + ' · ' + age(reported_at), suite, status, pass: 0, partial: 0, fail: 0, score: '—', delta: '—', outcome: error || status };
+        return {
+          v: report.run_id, at: report.outcome ? report.outcome + ' · ' + age(reported_at) : age(reported_at), suite: report.suite, status: status || 'completed',
+          pass: report.metrics.passed_cases || 0,
+          partial: (report.metrics.pending_cases || 0) + (report.metrics.skipped_cases || 0) + (report.metrics.infra_failed_cases || 0),
+          fail: report.metrics.failed_cases || 0,
+          score: report.metrics.scored_cases > 0 && typeof report.metrics.pass_at_1 === 'number' ? Math.round(report.metrics.pass_at_1 * 100) + '%' : '—',
+          delta: '—', outcome: report.outcome || status || 'completed',
+        };
+      });
       H.evalError = payload.errors?.length ? payload.errors.length + ' report(s) unavailable: ' + payload.errors.slice(0, 2).join(' · ') : null;
-    } catch (error) { if (H.evalProject === projectRoot && sequence === H.evalRequestSeq) H.evalError = error.message || String(error); }
-    refreshView();
+      H.evalLoadFailed = false;
+    } catch (error) { if (H.evalProject === projectRoot && sequence === H.evalRequestSeq) { H.evalError = error.message || String(error); H.evalLoadFailed = true; } }
+    finally { if (H.evalProject === projectRoot && sequence === H.evalRequestSeq) { H.evalLoading = false; refreshView(); } }
   };
   H.loadMemory = async projectId => {
     if (H.memoryLoading[projectId]) return;
@@ -538,7 +546,7 @@
       if (results[14].status === 'rejected') H.X.usage.quotas = [{ name: 'Local quota records', used: null, note: results[14].reason?.message || String(results[14].reason), status: 'unavailable' }];
       applyTaskSnapshot();
       const evalRoot = H.projects.find(project => project.root === H.evalProject)?.root || H.projects[0]?.root;
-      if (H.evalProject && H.evalProject !== evalRoot) { H.evalProject = null; H.evalRequestSeq++; H.X.evals = []; H.evalError = null; }
+      if (H.evalProject && H.evalProject !== evalRoot) { H.evalProject = null; H.evalRequestSeq++; H.X.evals = []; H.evalError = null; H.evalLoading = false; H.evalLoadFailed = false; }
       if (secondaryDue || finished) void refreshHistory();
       if (secondaryDue) void H.loadEvents();
       if (secondaryDue) await Promise.all(H.projects.map(project => H.loadMemory(project.id)));

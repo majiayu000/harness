@@ -17,6 +17,62 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::OnceLock;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EvalRunMarker {
+    run_id: String,
+    suite: String,
+    started_at: String,
+    pid: u32,
+    status: String,
+    error: Option<String>,
+}
+
+#[cfg(unix)]
+static ACTIVE_EVAL_PROJECTS: OnceLock<dashmap::DashMap<PathBuf, String>> = OnceLock::new();
+
+#[cfg(unix)]
+struct ActiveEvalProject {
+    root: PathBuf,
+    run_id: String,
+}
+
+#[cfg(unix)]
+impl ActiveEvalProject {
+    fn acquire(root: &Path, run_id: &str) -> Result<Self, ApiError> {
+        let active = ACTIVE_EVAL_PROJECTS.get_or_init(dashmap::DashMap::new);
+        match active.entry(root.to_path_buf()) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(run_id.to_string());
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(ApiError::BadRequest(
+                    "an eval is already running for this project".to_string(),
+                ));
+            }
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            run_id: run_id.to_string(),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ActiveEvalProject {
+    fn drop(&mut self) {
+        if let Some(active) = ACTIVE_EVAL_PROJECTS.get() {
+            if let dashmap::mapref::entry::Entry::Occupied(entry) = active.entry(self.root.clone())
+            {
+                if entry.get() == &self.run_id {
+                    entry.remove();
+                }
+            }
+        }
+    }
+}
 
 pub(crate) async fn list_eval_runs(
     State(state): State<Arc<AppState>>,
@@ -40,10 +96,15 @@ pub(crate) async fn list_eval_runs(
     let mut errors = Vec::new();
     for entry in fs::read_dir(&directory).map_err(internal)? {
         let entry = entry.map_err(internal)?;
-        let path = entry.path().join("report.json");
-        if !path.is_file() {
+        let report_path = entry.path().join("report.json");
+        let marker_path = entry.path().join("run-state.json");
+        let (path, is_marker) = if report_path.is_file() {
+            (report_path, false)
+        } else if marker_path.is_file() {
+            (marker_path, true)
+        } else {
             continue;
-        }
+        };
         let path = match validate_file_in_root(&path, &directory) {
             Ok(path) => path,
             Err(error) => {
@@ -58,15 +119,20 @@ pub(crate) async fn list_eval_runs(
                 continue;
             }
         };
-        reports.push((modified, path));
+        reports.push((modified, path, is_marker));
     }
-    reports.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    reports.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
     let mut runs = Vec::new();
-    for (modified, path) in reports {
+    for (modified, path, is_marker) in reports {
         if runs.len() == 20 {
             break;
         }
-        match read_report_entry(&path, modified) {
+        let result = if is_marker {
+            read_marker_entry(&path, &root)
+        } else {
+            read_report_entry(&path, modified)
+        };
+        match result {
             Ok(run) => runs.push(run),
             Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
@@ -103,7 +169,7 @@ pub(crate) async fn run_eval(
         let report = eval_report_dry_run(&manifest, run_id, 3)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
         return Ok(ContractJson(EvalRunResponse {
-            run: entry(&report, Utc::now())?,
+            run: entry(&report, Utc::now(), "dry_run")?,
         }));
     }
 
@@ -112,10 +178,20 @@ pub(crate) async fn run_eval(
         reject_during_maintenance(&state.core.server.config.maintenance_window, Utc::now())?;
         let store = state.workflow_runtime_store()?.clone();
         let events = state.observability.events.clone();
-        let directory = create_eval_directory(&root, &run_id)?;
-        let output = EvalReportOutput::open(directory)?;
+        let active = ActiveEvalProject::acquire(&root, &run_id)?;
+        let output = EvalReportOutput::create(&root, &run_id)?;
+        let marker = EvalRunMarker {
+            run_id: run_id.clone(),
+            suite: manifest.suite.clone(),
+            started_at: Utc::now().to_rfc3339(),
+            pid: std::process::id(),
+            status: "running".to_string(),
+            error: None,
+        };
+        output.write_marker(&marker)?;
         let project_id = root.to_string_lossy().into_owned();
         let task = tokio::spawn(async move {
+            let _active = active;
             let result: Result<ContractJson<EvalRunResponse>, ApiError> = async {
                 let config = EvalExecuteConfig::new(run_id.clone(), project_id.clone(), 3);
                 let report = match execute_manifest(&store, &events, &manifest, config).await {
@@ -128,10 +204,19 @@ pub(crate) async fn run_eval(
                     }
                 };
                 output.write(&report)?;
-                entry(&report, Utc::now()).map(|run| ContractJson(EvalRunResponse { run }))
+                entry(&report, Utc::now(), "completed")
+                    .map(|run| ContractJson(EvalRunResponse { run }))
             }
             .await;
             if let Err(error) = &result {
+                let failed = EvalRunMarker {
+                    status: "failed".to_string(),
+                    error: Some(error.to_string()),
+                    ..marker
+                };
+                if let Err(marker_error) = output.write_marker(&failed) {
+                    tracing::error!(run_id = %run_id, project = %project_id, %marker_error, "failed to record console eval failure");
+                }
                 tracing::error!(run_id = %run_id, project = %project_id, %error, "console eval run failed");
             }
             result
@@ -194,29 +279,80 @@ fn reject_during_maintenance(
     Ok(())
 }
 
-#[cfg(unix)]
-fn create_eval_directory(root: &Path, run_id: &str) -> Result<PathBuf, ApiError> {
-    let artifacts = root.join("artifacts");
-    fs::create_dir_all(&artifacts).map_err(internal)?;
-    let artifacts = validate_file_in_root(&artifacts, root).map_err(ApiError::BadRequest)?;
-    let evals = artifacts.join("eval");
-    fs::create_dir_all(&evals).map_err(internal)?;
-    let evals = validate_file_in_root(&evals, root).map_err(ApiError::BadRequest)?;
-    let directory = evals.join(run_id);
-    fs::create_dir(&directory).map_err(internal)?;
-    Ok(directory)
-}
-
 fn read_report_entry(
     path: &Path,
     modified: std::time::SystemTime,
 ) -> Result<EvalRunEntry, ApiError> {
     let report: EvalRunReport =
         serde_json::from_slice(&fs::read(path).map_err(internal)?).map_err(internal)?;
-    entry(&report, DateTime::<Utc>::from(modified))
+    entry(&report, DateTime::<Utc>::from(modified), "completed")
+}
+
+fn read_marker_entry(path: &Path, root: &Path) -> Result<EvalRunEntry, ApiError> {
+    let marker: EvalRunMarker =
+        serde_json::from_slice(&fs::read(path).map_err(internal)?).map_err(internal)?;
+    let status = match marker.status.as_str() {
+        "failed" => "failed",
+        "running"
+            if marker.pid == std::process::id() && active_eval_project(root, &marker.run_id) =>
+        {
+            "running"
+        }
+        "running" => "interrupted",
+        _ => return Err(ApiError::Internal("invalid eval run state".to_string())),
+    };
+    Ok(EvalRunEntry {
+        run_id: marker.run_id,
+        suite: marker.suite,
+        status: status.to_string(),
+        report: serde_json::Value::Null,
+        reported_at: marker.started_at,
+        error: marker.error,
+    })
+}
+
+fn active_eval_project(root: &Path, run_id: &str) -> bool {
+    #[cfg(unix)]
+    {
+        ACTIVE_EVAL_PROJECTS.get().is_some_and(|active| {
+            active
+                .get(root)
+                .is_some_and(|entry| entry.value() == run_id)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, run_id);
+        false
+    }
 }
 
 #[cfg(unix)]
+fn create_or_open_child(parent: &File, name: &str) -> Result<File, ApiError> {
+    match rustix::fs::mkdirat(parent, name, rustix::fs::Mode::RWXU) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => return Err(internal(error)),
+    }
+    open_child(parent, name)
+}
+
+#[cfg(unix)]
+fn open_child(parent: &File, name: &str) -> Result<File, ApiError> {
+    rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| ApiError::BadRequest(format!("unsafe eval report directory {name}: {error}")))
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
 struct EvalReportOutput {
     directory_path: PathBuf,
     directory: File,
@@ -224,10 +360,10 @@ struct EvalReportOutput {
 
 #[cfg(unix)]
 impl EvalReportOutput {
-    fn open(directory_path: PathBuf) -> Result<Self, ApiError> {
-        let directory = File::from(
+    fn create(root: &Path, run_id: &str) -> Result<Self, ApiError> {
+        let root_directory = File::from(
             rustix::fs::open(
-                &directory_path,
+                root,
                 rustix::fs::OFlags::RDONLY
                     | rustix::fs::OFlags::DIRECTORY
                     | rustix::fs::OFlags::NOFOLLOW
@@ -236,15 +372,28 @@ impl EvalReportOutput {
             )
             .map_err(internal)?,
         );
+        let artifacts = create_or_open_child(&root_directory, "artifacts")?;
+        let evals = create_or_open_child(&artifacts, "eval")?;
+        rustix::fs::mkdirat(&evals, run_id, rustix::fs::Mode::RWXU).map_err(internal)?;
+        let directory = open_child(&evals, run_id)?;
         Ok(Self {
-            directory_path,
+            directory_path: root.join("artifacts/eval").join(run_id),
             directory,
         })
     }
 
     fn write(&self, report: &EvalRunReport) -> Result<(), ApiError> {
         let bytes = serde_json::to_vec_pretty(report).map_err(internal)?;
-        let temporary = format!("report.{}.tmp", uuid::Uuid::new_v4());
+        self.publish("report.json", &bytes)
+    }
+
+    fn write_marker(&self, marker: &EvalRunMarker) -> Result<(), ApiError> {
+        let bytes = serde_json::to_vec(marker).map_err(internal)?;
+        self.publish("run-state.json", &bytes)
+    }
+
+    fn publish(&self, name: &str, bytes: &[u8]) -> Result<(), ApiError> {
+        let temporary = format!("{name}.{}.tmp", uuid::Uuid::new_v4());
 
         let result = (|| {
             let file = rustix::fs::openat(
@@ -259,15 +408,10 @@ impl EvalReportOutput {
             )
             .map_err(internal)?;
             let mut file = File::from(file);
-            file.write_all(&bytes).map_err(internal)?;
+            file.write_all(bytes).map_err(internal)?;
             file.sync_all().map_err(internal)?;
-            rustix::fs::renameat(
-                &self.directory,
-                temporary.as_str(),
-                &self.directory,
-                "report.json",
-            )
-            .map_err(internal)
+            rustix::fs::renameat(&self.directory, temporary.as_str(), &self.directory, name)
+                .map_err(internal)
         })();
 
         if result.is_err() {
@@ -287,10 +431,18 @@ impl EvalReportOutput {
     }
 }
 
-fn entry(report: &EvalRunReport, reported_at: DateTime<Utc>) -> Result<EvalRunEntry, ApiError> {
+fn entry(
+    report: &EvalRunReport,
+    reported_at: DateTime<Utc>,
+    status: &str,
+) -> Result<EvalRunEntry, ApiError> {
     Ok(EvalRunEntry {
+        run_id: report.run_id.clone(),
+        suite: report.suite.clone(),
+        status: status.to_string(),
         report: serde_json::to_value(report).map_err(internal)?,
         reported_at: reported_at.to_rfc3339(),
+        error: None,
     })
 }
 
@@ -333,7 +485,8 @@ mod tests {
         fs::create_dir(&project)?;
         fs::create_dir(&outside)?;
         symlink(&outside, project.join("artifacts"))?;
-        let error = create_eval_directory(&project, "run-1").expect_err("outside output rejected");
+        let error = EvalReportOutput::create(&project.canonicalize()?, "run-1")
+            .expect_err("outside output rejected");
         assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
         assert!(!outside.join("eval").exists());
         Ok(())
@@ -350,8 +503,8 @@ mod tests {
         fs::create_dir(&project)?;
         fs::create_dir(&outside)?;
         let project = project.canonicalize()?;
-        let run_directory = create_eval_directory(&project, "run-1")?;
-        let output = EvalReportOutput::open(run_directory.clone())?;
+        let output = EvalReportOutput::create(&project, "run-1")?;
+        let run_directory = project.join("artifacts/eval/run-1");
         let moved = project.join("artifacts/eval/moved-run");
         fs::rename(&run_directory, &moved)?;
         symlink(&outside, &run_directory)?;
@@ -363,6 +516,35 @@ mod tests {
         output.write(&report)?;
         assert!(!outside.join("report.json").exists());
         assert!(moved.join("report.json").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eval_child_creation_stays_in_pinned_parent_directory() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&project)?;
+        fs::create_dir(&outside)?;
+        let project = project.canonicalize()?;
+        let root = File::from(rustix::fs::open(
+            &project,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )?);
+        let artifacts = create_or_open_child(&root, "artifacts")?;
+        let evals = create_or_open_child(&artifacts, "eval")?;
+        let moved = project.join("artifacts/eval-moved");
+        fs::rename(project.join("artifacts/eval"), &moved)?;
+        symlink(&outside, project.join("artifacts/eval"))?;
+        rustix::fs::mkdirat(&evals, "run-1", rustix::fs::Mode::RWXU)?;
+        assert!(moved.join("run-1").is_dir());
+        assert!(!outside.join("run-1").exists());
         Ok(())
     }
 
@@ -389,7 +571,7 @@ mod tests {
             .as_str()
             .is_some_and(|id| id.starts_with("console-")));
         let report_directory = dir.path().join("artifacts/eval/run-1");
-        fs::create_dir_all(&report_directory)?;
+        let output = EvalReportOutput::create(&dir.path().canonicalize()?, "run-1")?;
         fs::write(report_directory.join("report.incomplete.tmp"), b"{")?;
         let query = EvalRunListQuery {
             project_root: request.project_root.clone(),
@@ -398,7 +580,7 @@ mod tests {
             list_eval_runs(State(state.clone()), ContractQuery(query.clone())).await?;
         assert!(before_publish.0.runs.is_empty());
         let report: EvalRunReport = serde_json::from_value(response.0.run.report)?;
-        EvalReportOutput::open(report_directory.clone())?.write(&report)?;
+        output.write(&report)?;
         let listed = list_eval_runs(State(state.clone()), ContractQuery(query)).await?;
         assert_eq!(listed.0.runs.len(), 1);
         assert_eq!(listed.0.runs[0].report["suite"], "eval-isolation-fixture");
@@ -414,6 +596,71 @@ mod tests {
         .await?;
         assert_eq!(partial.0.runs.len(), 1);
         assert_eq!(partial.0.errors.len(), 1);
+
+        let active_root = dir.path().canonicalize()?;
+        let active = ActiveEvalProject::acquire(&active_root, "run-3")?;
+        assert!(ActiveEvalProject::acquire(&active_root, "run-4").is_err());
+        let active_output = EvalReportOutput::create(&active_root, "run-3")?;
+        active_output.write_marker(&EvalRunMarker {
+            run_id: "run-3".to_string(),
+            suite: "eval-isolation-fixture".to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            pid: std::process::id(),
+            status: "running".to_string(),
+            error: None,
+        })?;
+        let active_list = list_eval_runs(
+            State(state.clone()),
+            ContractQuery(EvalRunListQuery {
+                project_root: request.project_root.clone(),
+            }),
+        )
+        .await?;
+        let active_row = active_list
+            .0
+            .runs
+            .iter()
+            .find(|run| run.run_id == "run-3")
+            .expect("running eval is listed");
+        assert_eq!(active_row.status, "running");
+        assert!(active_row.report.is_null());
+        drop(active);
+        let interrupted = list_eval_runs(
+            State(state.clone()),
+            ContractQuery(EvalRunListQuery {
+                project_root: request.project_root.clone(),
+            }),
+        )
+        .await?;
+        assert_eq!(
+            interrupted
+                .0
+                .runs
+                .iter()
+                .find(|run| run.run_id == "run-3")
+                .expect("interrupted eval is listed")
+                .status,
+            "interrupted"
+        );
+        let next_active = ActiveEvalProject::acquire(&active_root, "run-4")?;
+        let still_interrupted = list_eval_runs(
+            State(state.clone()),
+            ContractQuery(EvalRunListQuery {
+                project_root: request.project_root.clone(),
+            }),
+        )
+        .await?;
+        assert_eq!(
+            still_interrupted
+                .0
+                .runs
+                .iter()
+                .find(|run| run.run_id == "run-3")
+                .expect("older marker remains listed")
+                .status,
+            "interrupted"
+        );
+        drop(next_active);
 
         let outside_home = tempfile::tempdir()?;
         let external_root = outside_home.path().canonicalize()?;

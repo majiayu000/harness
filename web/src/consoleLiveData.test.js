@@ -177,6 +177,13 @@ it("drops eval data for a project removed from the live project list", async () 
   expect(calls).toContain("/api/eval-runs?project_root=%2Ftmp%2Fnew");
 });
 
+it("shows an active eval without inventing report metrics", async () => {
+  const { context, responses } = await setup();
+  responses["/api/eval-runs?project_root=%2Ftmp%2Frepo"] = { runs: [{ run_id: "run-active", suite: "core", status: "running", report: null, reported_at: "2026-09-26T17:00:00Z", error: null }], errors: [] };
+  await context.HC.loadEvalRuns("/tmp/repo");
+  expect(context.HC.X.evals[0]).toMatchObject({ v: "run-active", status: "running", score: "—" });
+});
+
 it("keeps live polling independent of slow history and surfaces history failures", async () => {
   let releaseHistory;
   const pending = new Promise(resolve => { releaseHistory = resolve; });
