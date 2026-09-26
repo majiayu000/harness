@@ -125,17 +125,17 @@ pub(crate) async fn list_eval_runs(
 ) -> Result<ContractJson<EvalRunListResponse>, ApiError> {
     let root = project_root(&state, &query.project_root).await?;
     let mut errors = Vec::new();
-    let active = match state.workflow_runtime_store() {
+    let (active, lock_confirmed) = match state.workflow_runtime_store() {
         Ok(store) => match eval_database_lock_held(store.pool(), &root).await {
-            Ok(active) => active,
+            Ok(active) => (active, true),
             Err(error) => {
                 errors.push(format!("eval activity unavailable: {error}"));
-                true
+                (true, false)
             }
         },
         Err(error) => {
             errors.push(format!("eval activity unavailable: {error}"));
-            true
+            (true, false)
         }
     };
     let directory = root.join("artifacts/eval");
@@ -191,7 +191,7 @@ pub(crate) async fn list_eval_runs(
         let result = if is_marker {
             read_marker_entry(
                 &path,
-                active,
+                active && lock_confirmed,
                 local_active_run.as_deref(),
                 &mut active_claimed,
             )
@@ -912,6 +912,19 @@ mod tests {
             .expect("only the test owns the state")
             .core
             .workflow_runtime_store = None;
+        let uncertain = list_eval_runs(
+            State(state.clone()),
+            ContractQuery(EvalRunListQuery {
+                project_root: request.project_root.clone(),
+            }),
+        )
+        .await?;
+        assert!(
+            uncertain.0.active,
+            "unknown activity must block another dispatch"
+        );
+        assert!(!uncertain.0.errors.is_empty());
+        assert!(uncertain.0.runs.iter().all(|run| run.status != "running"));
         let execute = EvalRunRequest {
             dry_run: false,
             ..request
