@@ -1,4 +1,5 @@
 use chrono::{DateTime, SecondsFormat, Utc};
+use harness_protocol::rest::{LocalQuotaSource, LocalQuotaWindow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::process::Output;
@@ -49,25 +50,6 @@ pub(super) struct LocalUsageSourceSummary {
     error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub(super) struct LocalQuotaSummary {
-    source: &'static str,
-    display_name: &'static str,
-    status: &'static str,
-    observed_at: Option<String>,
-    windows: Vec<LocalQuotaWindow>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct LocalQuotaWindow {
-    window: String,
-    source: String,
-    used_pct: Option<f64>,
-    resets_at: Option<String>,
-    stale: bool,
-}
-
 #[derive(Debug, Deserialize)]
 struct CcstatsLimits {
     windows: Vec<LocalQuotaWindow>,
@@ -79,14 +61,14 @@ struct CcstatsQuotaObservation {
     observed_at: Option<String>,
 }
 
-pub(super) async fn load_local_quota_summaries() -> Vec<LocalQuotaSummary> {
+pub(super) async fn load_local_quota_summaries() -> Vec<LocalQuotaSource> {
     let codex = load_local_quota_source(LOCAL_USAGE_SOURCES[0]);
     let claude = load_local_quota_source(LOCAL_USAGE_SOURCES[1]);
     let (codex, claude) = tokio::join!(codex, claude);
     vec![codex, claude]
 }
 
-async fn load_local_quota_source(source: LocalUsageSource) -> LocalQuotaSummary {
+async fn load_local_quota_source(source: LocalUsageSource) -> LocalQuotaSource {
     let result = async {
         let output = Command::new(CCSTATS_BIN)
             .args([
@@ -115,9 +97,9 @@ async fn load_local_quota_source(source: LocalUsageSource) -> LocalQuotaSummary 
 fn local_quota_summary_from_result(
     source: LocalUsageSource,
     result: Result<CcstatsLimits, String>,
-) -> LocalQuotaSummary {
+) -> LocalQuotaSource {
     match result {
-        Ok(limits) => LocalQuotaSummary {
+        Ok(limits) => LocalQuotaSource {
             source: source.source,
             display_name: source.display_name,
             status: if limits.windows.is_empty() {
@@ -129,7 +111,7 @@ fn local_quota_summary_from_result(
             windows: limits.windows,
             error: None,
         },
-        Err(error) => LocalQuotaSummary {
+        Err(error) => LocalQuotaSource {
             source: source.source,
             display_name: source.display_name,
             status: "unavailable",

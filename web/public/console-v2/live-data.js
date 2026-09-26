@@ -159,9 +159,17 @@
   function mapUsage(usage) {
     const summary = usage?.summary;
     if (!summary) return;
-    const { hourly, hourlySource } = H.X.usage;
+    const { hourly, hourlySource, quotas } = H.X.usage;
     const group = (rows) => (rows || []).map(row => [row.name, formatInt(row.total_tokens), formatCost(row.estimated_cost_usd), summary.total_tokens ? Math.round(100 * row.total_tokens / summary.total_tokens) : 0]);
-    const quotas = (usage.local_quotas || []).flatMap(provider => {
+    H.X.usage = {
+      tokens: formatInt(summary.total_tokens), cost: formatCost(summary.estimated_cost_usd), turns: summary.request_count,
+      cache: summary.total_tokens ? Math.round(100 * (summary.cache_read_input_tokens || 0) / summary.total_tokens) + '%' : '—',
+      hourly, hourlySource, quotas, byProject: group(usage.tokens_by_project), byAgent: group(usage.tokens_by_agent), byModel: group(usage.tokens_by_model),
+    };
+  }
+
+  function mapQuotas(payload) {
+    H.X.usage.quotas = (payload.sources || []).flatMap(provider => {
       if (!provider.windows?.length) return [{ name: provider.display_name, used: null, note: provider.error || 'No local quota record', status: provider.status }];
       return provider.windows.map(window => ({
         name: provider.display_name + ' · ' + window.window.replaceAll('_', ' '),
@@ -173,15 +181,10 @@
         status: window.stale ? 'stale' : provider.status,
       }));
     });
-    H.X.usage = {
-      tokens: formatInt(summary.total_tokens), cost: formatCost(summary.estimated_cost_usd), turns: summary.request_count,
-      cache: summary.total_tokens ? Math.round(100 * (summary.cache_read_input_tokens || 0) / summary.total_tokens) + '%' : '—',
-      hourly, hourlySource, quotas, byProject: group(usage.tokens_by_project), byAgent: group(usage.tokens_by_agent), byModel: group(usage.tokens_by_model),
-    };
   }
 
   function applyPayloads(payloads) {
-    const [tasks, monitor, overview, usage, dashboard, snapshot, worktrees, intake, registry, skills, drafts, tokenUsage, approvals, runtimeSummary] = payloads;
+    const [tasks, monitor, overview, usage, dashboard, snapshot, worktrees, intake, registry, skills, drafts, tokenUsage, approvals, runtimeSummary, localQuotas] = payloads;
     if (monitor) {
       H.health = {
         status: monitor.health.status, degraded: monitor.health.degraded_subsystems || [],
@@ -212,6 +215,7 @@
     }));
     if (overview) H.hosts = mapHosts(overview, dashboard);
     if (usage) { mapUsage(usage); H.costNote = usage.cost?.message || ''; if (usage.cost?.configured === false) H.X.usage.cost = 'not priced'; }
+    if (localQuotas) mapQuotas(localQuotas);
     if (tokenUsage?.by_hour) {
       H.X.usage.hourly = Object.keys(tokenUsage.by_hour).sort().slice(-24).map(key => {
         const bucket = tokenUsage.by_hour[key];
@@ -492,6 +496,7 @@
         secondaryDue ? request('/api/token-usage') : Promise.resolve(null),
         request('/api/workflows/runtime/approvals'),
         request('/api/workflows/runtime/tree?summary_only=true'),
+        secondaryDue ? request('/api/local-quotas') : Promise.resolve(null),
       ];
       const results = await Promise.allSettled(jobs);
       const failures = results.filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason));
@@ -507,6 +512,7 @@
       }
       payloads[0] = null;
       applyPayloads(payloads);
+      if (results[14].status === 'rejected') H.X.usage.quotas = [{ name: 'Local quota records', used: null, note: results[14].reason?.message || String(results[14].reason), status: 'unavailable' }];
       applyTaskSnapshot();
       if (secondaryDue || finished) void refreshHistory();
       if (secondaryDue) void H.loadEvents();

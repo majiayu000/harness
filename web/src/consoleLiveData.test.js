@@ -28,6 +28,7 @@ async function setup(beforeFetch = async () => {}) {
         { workflow_id: "wf-1", agent_runtime: "old-agent", lease_state: "released", activity: "plan_issue" },
       ],
     },
+    "/api/local-quotas": { sources: [] },
     "/api/workflows/runtime/tree?summary_only=true": { summary: { circuit_breakers: [] } },
     "/api/dashboard": { global: { max_concurrent: 2 }, runtime_hosts: [] },
     "/api/operator-snapshot": {},
@@ -121,11 +122,11 @@ it("keeps the current invocation, hourly series, and snake-case stream events", 
 
 it("shows local official quotas without inventing a Claude percentage", async () => {
   const { context, responses } = await setup();
-  responses["/api/usage-monitor"].local_quotas = [
+  responses["/api/local-quotas"].sources = [
     { source: "codex", display_name: "OpenAI Codex", status: "available", observed_at: "2026-09-26T17:06:05Z", windows: [{ window: "weekly", source: "official", used_pct: 70, resets_at: "2026-10-03T16:58:50Z", stale: false }] },
     { source: "claude", display_name: "Claude Code", status: "available", observed_at: null, windows: [{ window: "estimated_5h", source: "estimated", used_pct: null, resets_at: "53m remaining", stale: false }] },
   ];
-  await context.HC.refresh();
+  await context.HC.refresh(true);
   expect(context.HC.X.usage.quotas.map(row => row.used)).toEqual([70, null]);
   expect(context.HC.X.usage.quotas[1].note).toContain("quota % unavailable");
 });

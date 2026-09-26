@@ -36,8 +36,7 @@ use usage_monitor_candidate::{
     candidate_attribution_index, candidate_usage_groups, CandidateUsageGroup,
 };
 use usage_monitor_local_usage::{
-    load_local_quota_summaries, load_local_usage_summaries, LocalQuotaSummary,
-    LocalUsageSourceSummary,
+    load_local_quota_summaries, load_local_usage_summaries, LocalUsageSourceSummary,
 };
 use usage_monitor_process::{sample_agent_processes_for_monitor, AgentProcess};
 use usage_monitor_records::load_usage_records;
@@ -64,7 +63,6 @@ pub(crate) struct UsageMonitorResponse {
     agent_invocations: Vec<AgentInvocation>,
     external_agent_processes: Vec<AgentProcess>,
     local_usage_sources: Vec<LocalUsageSourceSummary>,
-    local_quotas: Vec<LocalQuotaSummary>,
     active_by_repo: Vec<ActiveCount>,
     active_by_activity: Vec<ActiveCount>,
     postgres_catalog: crate::postgres_catalog::PostgresCatalogCensus,
@@ -291,6 +289,13 @@ pub(crate) async fn usage_monitor(
     }
 }
 
+pub(crate) async fn local_quotas(
+) -> crate::http::rest_contract::ContractJson<harness_protocol::rest::LocalQuotaResponse> {
+    crate::http::rest_contract::ContractJson(harness_protocol::rest::LocalQuotaResponse {
+        sources: load_local_quota_summaries().await,
+    })
+}
+
 async fn build_usage_monitor_response(
     state: &AppState,
     query: UsageMonitorQuery,
@@ -311,10 +316,7 @@ async fn build_usage_monitor_response(
     let process_sample =
         sample_agent_processes_for_monitor(now, runtime_attribution_tokens(&runtime_rows)).await;
     let external_agent_processes = process_sample.processes;
-    let (local_usage_sources, local_quotas) = tokio::join!(
-        load_local_usage_summaries(window),
-        load_local_quota_summaries()
-    );
+    let local_usage_sources = load_local_usage_summaries(window).await;
     let postgres_catalog = state.postgres_catalog.snapshot().await;
 
     let tokens_by_agent =
@@ -412,7 +414,6 @@ async fn build_usage_monitor_response(
         agent_invocations,
         external_agent_processes,
         local_usage_sources,
-        local_quotas,
         diagnostics: UsageDiagnostics {
             runtime_store_available: state.core.workflow_runtime_store.is_some(),
             token_source: "workflow_runtime_usage_and_llm_usage_events",
