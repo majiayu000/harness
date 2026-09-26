@@ -56,6 +56,25 @@ it("renders all v3 views from real state without fixture data or missing templat
   expect(html).not.toContain("localStorage");
 });
 
+it("handles refresh ticks and selection changes without a previous-state argument", () => {
+  const { component, H, workflow } = setup();
+  component.state.vw = 920;
+  component.state.sel = workflow.id;
+  expect(() => component.componentDidUpdate({})).not.toThrow();
+  component.state.promptSel = 2;
+  component.state.memFor = "project-id";
+  for (let tick = 0; tick < 5; tick++) {
+    expect(() => component.componentDidUpdate({})).not.toThrow();
+  }
+  expect(component.state.promptSel).toBe(2);
+  expect(component.state.memFor).toBe("project-id");
+  H.workflows.push({ ...workflow, id: "wf-b", submissionId: "sub-b" });
+  component.state.sel = "wf-b";
+  expect(() => component.componentDidUpdate()).not.toThrow();
+  expect(component.state.promptSel).toBe(0);
+  expect(H.loadDetails).toHaveBeenLastCalledWith(expect.objectContaining({ id: "wf-b" }));
+});
+
 it("confirms and records the exact approval request rather than the first request", async () => {
   const { component, H, workflow } = setup();
   workflow.approvals = [{ id: "approval-1", action: "cargo test" }, { id: "approval-2", action: "git push" }];

@@ -15,14 +15,14 @@
   'https://unpkg.com/react@18.3.1/umd/react.production.min.js': './react.production.min.js',
   'https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js': './react-dom.production.min.js',
 };</script>
+<script src="./harness-console-data.js"></script>
+<script src="./harness-console-data-ext.js"></script>
+<script src="./live-data.js"></script>
 <script src="./support.js"></script>
 </head>
 <body>
 <x-dc>
 <helmet>
-<script src="harness-console-data.js"></script>
-<script src="harness-console-data-ext.js"></script>
-<script src="live-data.js"></script>
 <style>
 body{margin:0;background:oklch(0.155 0.005 275)}
 *{box-sizing:border-box}
@@ -38,9 +38,9 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 @keyframes caret{0%,49%{opacity:1}50%,100%{opacity:0}}
 </style>
 </helmet>
-<div data-theme="{{ themeName }}" data-density="{{ densityName }}" style="height:100vh;max-width:{{ rootMaxW }};margin:0 auto;display:grid;grid-template-rows:48px minmax(0,1fr);background:var(--bg);color:var(--ink);font-family:Geist,system-ui,sans-serif;font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased;font-feature-settings:'tnum'">
+<div data-theme="{{ themeName }}" data-density="{{ densityName }}" style="height:100vh;max-width:{{ rootMaxW }};margin:0 auto;display:grid;grid-template-rows:48px minmax(0,1fr);grid-template-columns:minmax(0,1fr);background:var(--bg);color:var(--ink);font-family:Geist,system-ui,sans-serif;font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased;font-feature-settings:'tnum'">
 
-<header style="display:flex;align-items:center;gap:16px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--panel)">
+<header style="display:flex;align-items:center;gap:16px;padding:0 16px;min-width:0;overflow:hidden;border-bottom:1px solid var(--line);background:var(--panel)">
   <div style="display:flex;align-items:center;gap:9px;width:180px;flex:none">
     <div style="width:22px;height:22px;border-radius:6px;background:var(--ink);color:var(--bg);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px">H</div>
     <span style="font-weight:600;font-size:14px;letter-spacing:-0.01em">Harness</span>
@@ -52,16 +52,16 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
     <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:var(--faint);border:1px solid var(--line);border-radius:4px;padding:0 5px">/</span><button onClick="{{ openPal }}" style="font-family:'Geist Mono',monospace;font-size:10.5px;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:0 5px;background:none;cursor:pointer" style-hover="color:var(--ink)">⌘K</button>
   </div>
   <button onClick="{{ openTask }}" style="display:flex;align-items:center;gap:8px;padding:5px 11px;border-radius:7px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12.5px;font-weight:600;flex:none" style-hover="filter:brightness(1.1)">New task<span style="font-family:'Geist Mono',monospace;font-size:10.5px;opacity:0.6">N</span></button>
-  <div style="margin-left:auto;display:{{ hdrDisplay }};align-items:center;gap:4px;flex:none;white-space:nowrap">
+  <div style="margin-left:auto;display:{{ hdrDisplay }};align-items:center;gap:4px;flex:0 1 auto;min-width:0;overflow:hidden;white-space:nowrap">
     <sc-for list="{{ chips }}" as="c" hint-placeholder-count="5">
       <button onClick="{{ c.go }}" style="display:flex;align-items:center;gap:6px;padding:4px 9px;border-radius:6px;border:none;background:transparent;cursor:pointer;font-size:12px;color:var(--muted)" style-hover="background:var(--hover);color:var(--ink)"><span style="width:6px;height:6px;border-radius:50%;background:{{ c.tone }}"></span>{{ c.label }}</button>
     </sc-for>
     <span style="width:1px;height:18px;background:var(--line);margin:0 6px"></span>
-    <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)"><span style="width:6px;height:6px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite"></span>{{ liveLabel }} · {{ now }}</span>
+    <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);min-width:0;flex:0 1 auto"><span style="width:6px;height:6px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite;flex:none"></span><span style="overflow:hidden;text-overflow:ellipsis">{{ liveLabel }} · {{ now }}</span></span>
   </div>
 </header>
 
-<div style="display:grid;grid-template-columns:{{ cols }};min-height:0">
+<div style="display:grid;grid-template-columns:{{ cols }};min-height:0;min-width:0">
   <nav style="border-right:1px solid var(--line);background:var(--panel);padding:12px 8px;display:{{ navDisplay }};flex-direction:column;gap:2px;overflow:auto">
     <sc-for list="{{ nav }}" as="n" hint-placeholder-count="6">
       <button onClick="{{ n.go }}" style="display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;border:none;background:{{ n.bg }};color:{{ n.fg }};cursor:pointer;text-align:left;font-weight:500" style-hover="background:var(--hover);color:var(--ink)">
@@ -870,7 +870,11 @@ class Component extends DCLogic {
   }
   componentWillUnmount() { clearInterval(this.iv); clearInterval(this.iv0); clearTimeout(this.tt); window.removeEventListener('keydown', this.onKey); window.removeEventListener('resize', this.onResize); }
   componentDidUpdate(pp) {
-    if (pp.startScreen !== this.props.startScreen && this.props.startScreen) this.setState({ screen: this.props.startScreen });
+    if (pp?.startScreen !== this.props.startScreen && this.props.startScreen) this.setState({ screen: this.props.startScreen });
+    if (this.lastSelectedWorkflow !== this.state.sel) {
+      this.lastSelectedWorkflow = this.state.sel;
+      if (this.state.promptSel !== 0) this.setState({ promptSel: 0 });
+    }
     if (this.state.modal && !this.state.submitting && !window.HC.workflows.some(w => (this.state.modal.ids || [this.state.modal.id]).includes(w.id) && this.eligible(this.state.modal.action, w, this.state.modal.requestId))) {
       this.setState({ modal: null, reason: '' });
       this.flash('Workflow changed', 'The pending action was closed.');

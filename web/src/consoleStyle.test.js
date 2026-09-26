@@ -14,6 +14,6 @@ it("retains the Console v3 theme CSS and every original inline style", () => {
     .map((match) => match[1]);
 
   expect(sha256(theme)).toBe("e9608a21b4006865b19b0477cdba174bca4377d5e26ee0e0fb90464e463d1462");
-  expect(inlineStyles).toHaveLength(826);
-  expect(sha256(inlineStyles.join("\n"))).toBe("bfa67613653235c1e42f546efad27ab9c2f947c47536c862d0e3f81e6e45833d");
+  expect(inlineStyles).toHaveLength(827);
+  expect(sha256(inlineStyles.join("\n"))).toBe("ba8d428361ab8bd99a313a44eef87bfffdd751ca72fc06874ace69cf43cb2a0e");
 });

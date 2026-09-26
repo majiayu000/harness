@@ -1,9 +1,11 @@
 # Console v3 integration
 
 The dashboard uses the `Harness Console v3.dc.html` design from the September 26
-export. Its theme and 826 inline styles are retained. The existing
+export. Its theme and 827 inline styles are retained. The existing
 `/console-v2/index.html` asset URL remains the dashboard entry point; it now
 renders v3. Production loads no example workflows, usage, events, or memories.
+The data scripts load once, in order, before the design runtime so cold loads
+cannot reset shared state while the dashboard is rendering.
 
 ## Data and actions
 
