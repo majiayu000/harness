@@ -99,6 +99,10 @@
     const leaseState = { active_leased: 'active', expired_lease: 'expired', missing_lease: 'missing' }[invocation?.lease_state] || invocation?.lease_state || '—';
     return {
       id, submissionId: task.submission_id || task.id, repo, projectId: project?.id || task.project || null, n: issue || pr || '—', pr,
+      repository: task.repo || null, issue, dependsOn: task.depends_on || [],
+      failureClass: task.failure_kind || invocation?.failure_kind || null,
+      approval: approval ? { command: approval.action, scope: 'Submission ' + (task.submission_id || task.id) } : null,
+      approvals: (task.pending_approvals || []).filter(item => item.type === 'approval_request' && item.id && item.approved == null),
       ref: issue ? repo + '#' + issue : pr ? repo + '#PR' + pr : repo + ' · ' + String(task.id).slice(0, 8),
       prLabel: pr ? 'PR #' + pr : '—', prUrl: task.pr_url || action?.url || null,
       title: label(task), state: current, from: task.phase || null,
@@ -165,7 +169,7 @@
   }
 
   function applyPayloads(payloads) {
-    const [tasks, monitor, overview, usage, dashboard, snapshot, worktrees, intake, registry, skills, drafts, tokenUsage, approvals] = payloads;
+    const [tasks, monitor, overview, usage, dashboard, snapshot, worktrees, intake, registry, skills, drafts, tokenUsage, approvals, runtimeSummary] = payloads;
     if (monitor) {
       H.health = {
         status: monitor.health.status, degraded: monitor.health.degraded_subsystems || [],
@@ -173,7 +177,6 @@
         logPath: monitor.health.runtime_log_path || '—', retention: snapshot?.runtime_logs?.retention_days ? snapshot.runtime_logs.retention_days + 'd' : '—',
       };
       H.failures = (monitor.failures || []).map(row => ({ family: row.family, sev: row.severity, msg: row.message, count: row.count, repo: row.repo || '—', last: age(row.last_seen), retryable: row.retryable }));
-      H.breakers = (monitor.health.degraded_subsystems || []).filter(value => value.startsWith('circuit_breaker:')).map(value => ({ profile: value.slice(16), state: 'open', failures: '—', window: '—', opened: '—', next: '—', open: true }));
     }
     if (snapshot) {
       const tick = snapshot.retry?.last_tick;
@@ -185,6 +188,9 @@
         resetLimit: snapshot.rate_limits?.password_reset?.limit_per_hour || 0,
       };
     }
+    if (runtimeSummary?.summary?.circuit_breakers) H.breakers = runtimeSummary.summary.circuit_breakers.map(b => ({
+      profile: b.profile, state: b.state, open: b.state === 'open', failures: b.consecutive ?? '—', window: b.class || '—', opened: '—', next: b.cooldown_until ? new Date(b.cooldown_until).toLocaleTimeString() : '—',
+    }));
     if (dashboard) H.maxSlots = dashboard.global?.max_concurrent || 0;
     if (overview) H.projects = mapProjects(overview, usage, monitor, registry);
     else if (registry) H.projects = registry.map(project => ({
@@ -193,7 +199,7 @@
       intake: '—', memory: 0, trend: [], dispatch: [],
     }));
     if (overview) H.hosts = mapHosts(overview, dashboard);
-    if (usage) mapUsage(usage);
+    if (usage) { mapUsage(usage); H.costNote = usage.cost?.message || ''; if (usage.cost?.configured === false) H.X.usage.cost = 'not priced'; }
     if (tokenUsage?.by_hour) {
       H.X.usage.hourly = Object.keys(tokenUsage.by_hour).sort().slice(-24).map(key => {
         const bucket = tokenUsage.by_hour[key];
@@ -202,10 +208,19 @@
       H.X.usage.hourlySource = 'Claude CLI session logs · last 24h';
     }
     if (worktrees) H.worktrees = worktrees;
-    if (intake) H.X.intake = (intake.channels || []).map(channel => ({
-      k: channel.name, ep: channel.name === 'github' ? 'POST /webhook' : channel.name === 'feishu' ? 'POST /webhook/feishu' : 'POST /api/workflows/runtime/submissions',
-      ok: channel.enabled, last: '—', n: channel.active, rej: '—', note: channel.enabled ? 'enabled' : 'disabled',
-    }));
+    if (intake) H.X.intake = (intake.channels || []).map(channel => {
+      const webhook = channel.drivers?.webhook, polling = channel.drivers?.polling;
+      const degraded = webhook?.degraded || polling?.degraded;
+      return {
+        k: channel.name, ep: channel.name === 'github' ? 'POST /webhook' : channel.name === 'feishu' ? 'POST /webhook/feishu' : 'POST /api/workflows/runtime/submissions',
+        ok: channel.enabled && !degraded, last: !channel.enabled ? 'off' : degraded ? 'degraded' : 'on', n: channel.active, rej: channel.repos?.length ?? '—',
+        note: channel.name === 'github' ? 'webhook ' + (webhook?.accepting ? 'accepting' : webhook?.reason || 'off') + ' · polling ' + (polling?.active ? polling.discovery_driver : 'off') : channel.enabled ? 'enabled' : 'disabled',
+      };
+    });
+    if (intake) {
+      H.intake = intake;
+      H.intakeRecent = (intake.recent_dispatches || []).map(row => ({ src: row.source, ref: row.external_id || row.task_id, kind: row.status, ago: '—' }));
+    }
     if (skills) H.X.skills = skills.map(skill => ({
       id: skill.id, name: skill.name, src: String(skill.location?.kind || skill.location || 'project'), uses: skill.usage_count,
       last: age(skill.last_used), gov: skill.governance_status, score: typeof skill.quality_score === 'number' ? (skill.quality_score * 10).toFixed(1) : '—',
@@ -230,6 +245,12 @@
       }
       const byWorktree = new Map((worktrees || []).filter(row => row.runtime_workflow_id).map(row => [row.runtime_workflow_id, row]));
       const rows = tasks.map(task => mapTask({ ...task, pending_approvals: approvals ? (bySubmission.get(task.id) || []) : (H.details.get(task.workflow_id || task.workflow?.id || task.id)?.task?.pending_approvals || []) }, byAction, byInvocation, byWorktree));
+      const previous = new Map([...H.workflows, ...H.history].map(row => [row.id, row]));
+      for (const row of rows) {
+        const old = previous.get(row.id);
+        row.changedAt = old && (old.state !== row.state || old.turn !== row.turn) ? Date.now() : old?.changedAt;
+        if (!row.inbox && (row.lease === 'expired' || row.lease === 'missing')) row.inbox = { kind: 'lease', reason: row.lease + ' lease', hint: 'Check the runtime host before taking action', actions: ['cancel'], ago: row.obs };
+      }
       const seen = new Set(rows.map(row => row.id));
       for (const action of byAction.values()) {
         if (seen.has(action.workflow_id)) continue;
@@ -251,6 +272,74 @@
   H.details = new Map();
   H.transcripts = new Map();
   H.transcriptFailed = new Set();
+  H.contexts = new Map();
+  H.events = [];
+  H.eventsLoading = true;
+  H.loadEvents = async () => {
+    H.eventsLoading = true;
+    refreshView();
+    try {
+      const dayAgo = Date.now() - 86400_000;
+      const since = H.events[0]?.ts || new Date(dayAgo).toISOString();
+      // event_query orders oldest first; limiting that query would hide new actions.
+      const incoming = await H.rpc('event_query', { filters: { since } });
+      H.events = [...new Map([...H.events, ...incoming].map(event => [event.id, event])).values()]
+        .filter(event => new Date(event.ts).getTime() >= dayAgo)
+        .sort((a, b) => new Date(b.ts) - new Date(a.ts)).slice(0, 200);
+      H.eventsError = null;
+    } catch (error) { H.eventsError = error.message || String(error); }
+    H.eventsLoading = false;
+    refreshView();
+  };
+  H.recordAction = async (action, workflow, reason, endpoint, status) => {
+    await H.rpc('event_log', { event: {
+      id: crypto.randomUUID(), ts: new Date().toISOString(), session_id: 'console', hook: 'console_action', tool: action,
+      decision: status === 'accepted' ? 'complete' : 'warn', reason: reason || null,
+      detail: JSON.stringify({ workflow_id: workflow?.id, ref: workflow?.ref, endpoint, status }),
+      metadata: workflow ? { task_id: workflow.submissionId } : null, duration_ms: null,
+    } });
+    await H.loadEvents();
+  };
+  H.loadContext = async workflow => {
+    const cached = H.contexts.get(workflow.id);
+    if (cached?.loading || cached?.at && Date.now() - cached.at < 30_000) return;
+    H.contexts.set(workflow.id, { loading: true });
+    refreshView();
+    try {
+      const root = H.projects.find(project => project.id === workflow.projectId)?.root;
+      if (!root) throw new Error('Project root unavailable for context preview');
+      const result = await H.rpc('context_preview', { request: { thread_id: workflow.submissionId, project: root, task_profile: { task_kind: workflow.taskKind, prompt: workflow.title }, budget_hint: 0 }, supplied_items: [] });
+      H.contexts.set(workflow.id, { ...result, at: Date.now(), loading: false });
+    } catch (error) { H.contexts.set(workflow.id, { error: error.message || String(error), at: Date.now(), loading: false }); }
+    refreshView();
+  };
+  H.memoryErrors = {};
+  H.memoryUnavailable = {};
+  H.memoryLoading = {};
+  H.memoryRepos = {};
+  H.loadMemory = async projectId => {
+    if (H.memoryLoading[projectId]) return;
+    const repos = [...new Set([...H.workflows, ...H.history].filter(w => w.projectId === projectId && w.repository).map(w => w.repository))];
+    if (repos.length !== 1) {
+      H.memoryUnavailable[projectId] = repos.length ? 'Multiple repositories recorded for this project; a unique repository is required.' : 'No repository identity recorded in this project’s submissions yet.';
+      refreshView();
+      return;
+    }
+    const repo = repos[0];
+    H.memoryRepos[projectId] = repo;
+    delete H.memoryUnavailable[projectId];
+    H.memoryLoading[projectId] = true;
+    refreshView();
+    try {
+      const response = await request('/api/projects/' + encodeURIComponent(repo) + '/memory');
+      H.X.memory[projectId] = (response.records || []).map(record => ({
+        id: record.id, kind: record.kind, text: typeof record.payload === 'string' ? record.payload : JSON.stringify(record.payload),
+        src: record.evidence_ref || '—', age: age(record.created_at), outcome: record.outcome || '—', uses: record.use_count ?? '—',
+      }));
+      delete H.memoryErrors[projectId];
+    } catch (error) { H.memoryErrors[projectId] = error.message || String(error); }
+    finally { H.memoryLoading[projectId] = false; refreshView(); }
+  };
   H.loadDetails = async (workflow) => {
     const cached = H.details.get(workflow.id);
     if (cached?.loading || cached?.loadedAt && Date.now() - cached.loadedAt < 30_000) return;
@@ -383,6 +472,7 @@
         secondaryDue ? H.rpc('gc_drafts', { project_id: null }, 15_000) : Promise.resolve(null),
         secondaryDue ? request('/api/token-usage') : Promise.resolve(null),
         request('/api/workflows/runtime/approvals'),
+        request('/api/workflows/runtime/tree?summary_only=true'),
       ];
       const results = await Promise.allSettled(jobs);
       const failures = results.filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason));
@@ -400,18 +490,8 @@
       applyPayloads(payloads);
       applyTaskSnapshot();
       if (secondaryDue || finished) void refreshHistory();
-      if (secondaryDue) {
-        const projects = H.projects;
-        const memories = await Promise.allSettled(projects.map(project => request('/api/projects/' + encodeURIComponent(project.id) + '/memory')));
-        memories.forEach((result, index) => {
-          if (result.status !== 'fulfilled') return;
-          const id = projects[index].id;
-          H.X.memory[id] = (result.value.records || []).map(record => ({
-            id: record.id, kind: record.kind, text: typeof record.payload === 'string' ? record.payload : JSON.stringify(record.payload),
-            src: record.evidence_ref || '—', age: age(record.created_at),
-          }));
-        });
-      }
+      if (secondaryDue) void H.loadEvents();
+      if (secondaryDue) await Promise.all(H.projects.map(project => H.loadMemory(project.id)));
       refreshView();
     } catch (error) {
       H.loadError = error.message || String(error);

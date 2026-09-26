@@ -157,6 +157,10 @@ secret and do not commit or share it. Shell environments are not shared between
 terminals or persisted across restarts; after restarting, use the newly printed
 export command.
 
+The Console v3 dashboard provides nine views with live submissions, approvals,
+events, usage, projects, and runtime state. See [Console v3](docs/console-v3.md)
+for supported actions, data sources, and backend limitations.
+
 Full server setup, configuration, and workflows are covered in
 [Quick Start](#quick-start) below.
 

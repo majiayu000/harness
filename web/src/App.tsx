@@ -9,6 +9,7 @@ type ConsoleScreen =
   | "fleet"
   | "projects"
   | "history"
+  | "events"
   | "worktrees"
   | "usage"
   | "library"
@@ -23,7 +24,7 @@ function Console({ screen }: { screen: ConsoleScreen }) {
   const selected: ConsoleScreen =
     view === "home" || view === "fleet" || view === "projects" ||
     view === "history" || view === "worktrees" || view === "usage" ||
-    view === "library" || view === "system" ? view : screen;
+    view === "events" || view === "library" || view === "system" ? view : screen;
   params.set("screen", selected);
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
