@@ -278,6 +278,7 @@ class Host:
                     "scope": ("candidate cgroup and agent-writable tmpfs through "
                               "quiesced export; excludes verifier and proxy")}
         errors = []
+        limit_exceeded = False
         try:
             state = json.loads(docker("inspect", self.name, "--format", "{{json .State}}"))
             evidence["container_state"] = state
@@ -298,7 +299,7 @@ class Host:
                 errors.append("candidate cgroup is not quiescent at final resource collection")
             if (metrics["memory_events"]["oom"] or metrics["memory_events"]["oom_kill"]
                     or metrics["pids_events"]["max"]):
-                errors.append("candidate hit an OOM or PID limit")
+                limit_exceeded = True
         except Exception as error:
             errors.append(str(error))
         # Disk accounting needs the live candidate mount namespace; measure after
@@ -312,17 +313,23 @@ class Host:
         try:
             state = json.loads(docker("inspect", self.name, "--format", "{{json .State}}"))
             evidence["container_state"] = state
-            if not state["Running"] or state["OOMKilled"]:
-                errors.append("candidate PID 1 exited or Docker reported OOM")
+            if not state["Running"]:
+                errors.append("candidate PID 1 exited before final resource collection")
+            limit_exceeded = limit_exceeded or state["OOMKilled"]
         except Exception as error:
             errors.append(str(error))
         if errors:
             evidence["error"] = "; ".join(errors)
+        elif limit_exceeded:
+            evidence["status"] = "limit_exceeded"
+            evidence["error"] = "candidate hit an OOM or PID limit"
         else:
             evidence["status"] = "complete"
         self.state["resource_evidence"] = evidence
         save(self.root / "candidate-resources.json", evidence)
         self.persist()
+        if evidence["status"] == "limit_exceeded":
+            raise RuntimeError(evidence["error"])
         if evidence["status"] != "complete":
             raise RuntimeError("candidate resource evidence incomplete: " + evidence["error"])
 
@@ -546,7 +553,7 @@ class Host:
             evidence = self.state.get("resource_evidence", {"status": "incomplete", "error": "not collected"})
             artifacts.append({"artifact_type": "supervised_candidate_resources", "artifact": evidence})
             if status in {"succeeded", "succeeded_with_blockers"} and evidence["status"] != "complete":
-                status, reason = "failed", reason + "; final resource evidence is incomplete"
+                status, reason = "failed", reason + "; " + evidence.get("error", "final resource evidence is incomplete")
         limits = self.state.get("enforced_limits")
         if limits is not None:
             try:

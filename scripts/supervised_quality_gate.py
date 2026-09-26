@@ -228,7 +228,7 @@ def credential_variables(claim: dict) -> dict[str, str]:
 
 
 def report_from_evidence(limits: dict, evidence: dict, output_bytes: int, wall_time_millis: int) -> dict:
-    if not isinstance(evidence, dict) or evidence.get("status") != "complete":
+    if not isinstance(evidence, dict) or evidence.get("status") not in {"complete", "limit_exceeded"}:
         raise RuntimeError("eval resource report requires complete measurements")
     metrics = evidence["metrics"]
     return build_resource_report(
@@ -239,7 +239,8 @@ def report_from_evidence(limits: dict, evidence: dict, output_bytes: int, wall_t
         disk_bytes=evidence["disk"]["aggregate_used_bytes"],
         output_bytes=output_bytes,
         wall_time_millis=wall_time_millis,
-        oom=bool(metrics["memory_events"]["oom"] or metrics["memory_events"]["oom_kill"]),
+        oom=bool(metrics["memory_events"]["oom"] or metrics["memory_events"]["oom_kill"]
+                 or evidence.get("container_state", {}).get("OOMKilled")),
         pid_exhausted=bool(metrics["pids_events"]["max"]),
     )
 

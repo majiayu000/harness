@@ -435,14 +435,51 @@ def test_resource_failures_cannot_be_success_or_fake_zero(tmp_path, monkeypatch,
     runner, calls, metrics, disk = resource_runner(
         tmp_path, monkeypatch, running=failure != 'dead', oom=int(failure == 'oom'),
         pids_max=int(failure in {'pids', 'pid-exec'}), stop_error=failure == 'pid-exec')
-    with pytest.raises(RuntimeError, match='resource evidence incomplete'):
+    with pytest.raises(RuntimeError, match='OOM or PID limit' if failure in {'oom', 'pids'}
+                       else 'resource evidence incomplete'):
         runner.collect_resources(stop_agents=True)
     evidence = json.loads((tmp_path / 'candidate-resources.json').read_text())
-    assert evidence['status'] == 'incomplete'
+    assert evidence['status'] == ('limit_exceeded' if failure in {'oom', 'pids'} else 'incomplete')
     assert evidence['metrics'] == metrics
     assert evidence['error']
     assert runner.result('succeeded', 'verifier accepted')['status'] == 'failed'
     assert runner.result('failed', 'original timeout')['error'] == 'original timeout'
+
+
+@pytest.mark.parametrize('resource', ['memory', 'pids'])
+@pytest.mark.parametrize('measurement_failure', [None, 'disk', 'quiescence', 'dead', 'pid-exec'])
+def test_eval_quota_failures_report_only_complete_measurements(
+        tmp_path, monkeypatch, resource, measurement_failure):
+    runner, _, metrics, _ = resource_runner(
+        tmp_path, monkeypatch, oom=int(resource == 'memory'), pids_max=int(resource == 'pids'),
+        running=measurement_failure != 'dead', stop_error=measurement_failure == 'pid-exec',
+        disk_error='disk measurement unavailable' if measurement_failure == 'disk' else None)
+    if measurement_failure == 'quiescence':
+        metrics['current_pids'] = 2
+    runner.state.update(
+        enforced_limits={'requested': {}, 'effective': {
+            'cpu_time_secs': 60, 'memory_bytes': 512 * 1024 * 1024, 'pids': 32,
+            'disk_bytes': 1024 * 1024 * 1024, 'output_bytes': 1024, 'wall_time_secs': 30,
+        }, 'caps': []},
+        output_bytes=100, wall_time_millis=1000,
+    )
+    with pytest.raises(RuntimeError):
+        runner.collect_resources(stop_agents=True)
+    for native_status in ('succeeded', 'succeeded_with_blockers', 'failed'):
+        result = runner.result(native_status, 'original result', native=native_result(native_status))
+        assert result['status'] == 'failed'
+        reports = [item['artifact'] for item in result['artifacts']
+                   if item['artifact_type'] == 'resource_limit_report']
+        if measurement_failure:
+            assert runner.state['resource_evidence']['status'] == 'incomplete'
+            assert reports == []
+        else:
+            assert runner.state['resource_evidence']['status'] == 'limit_exceeded'
+            assert reports[0]['termination']['resource'] == resource
+            assert reports[0]['usage']['peak_memory_bytes'] == metrics['peak_memory_bytes']
+            assert reports[0]['usage']['peak_pids'] == metrics['peak_pids']
+            if native_status != 'failed':
+                assert result['signals'] == []
 
 
 def test_missing_observer_keeps_missing_evidence_instead_of_zero(tmp_path, monkeypatch):
