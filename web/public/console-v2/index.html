@@ -15,14 +15,14 @@
   'https://unpkg.com/react@18.3.1/umd/react.production.min.js': './react.production.min.js',
   'https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js': './react-dom.production.min.js',
 };</script>
+<script src="./harness-console-data.js"></script>
+<script src="./harness-console-data-ext.js"></script>
+<script src="./live-data.js"></script>
 <script src="./support.js"></script>
 </head>
 <body>
 <x-dc>
 <helmet>
-<script src="harness-console-data.js"></script>
-<script src="harness-console-data-ext.js"></script>
-<script src="live-data.js"></script>
 <style>
 body{margin:0;background:oklch(0.155 0.005 275)}
 *{box-sizing:border-box}
@@ -30,44 +30,46 @@ button,input,textarea{font:inherit;color:inherit}
 input::placeholder,textarea::placeholder{color:var(--faint)}
 [data-theme]{--bg:oklch(0.155 0.005 275);--panel:oklch(0.175 0.005 275);--raised:oklch(0.205 0.006 275);--hover:oklch(0.215 0.006 275);--sel:oklch(0.235 0.018 275);--line:oklch(0.265 0.006 275);--line2:oklch(0.215 0.005 275);--ink:oklch(0.95 0.003 275);--muted:oklch(0.74 0.008 275);--faint:oklch(0.56 0.008 275);--accent:oklch(0.72 0.14 275);--run:oklch(0.75 0.12 240);--rev:oklch(0.74 0.13 305);--plan:oklch(0.76 0.09 200);--ok:oklch(0.77 0.14 155);--warn:oklch(0.81 0.14 75);--fail:oklch(0.71 0.18 25);--queue:oklch(0.6 0.008 275);--btn:oklch(0.94 0.003 275);--btnFg:oklch(0.17 0.005 275);--scrim:oklch(0.05 0 0 / 0.6);--code:oklch(0.13 0.005 275);--shadow:0 24px 64px -12px oklch(0 0 0 / 0.6)}
 [data-theme="light"]{--bg:oklch(0.985 0.002 275);--panel:oklch(0.97 0.003 275);--raised:oklch(1 0 0);--hover:oklch(0.955 0.004 275);--sel:oklch(0.94 0.02 275);--line:oklch(0.9 0.004 275);--line2:oklch(0.935 0.003 275);--ink:oklch(0.22 0.01 275);--muted:oklch(0.45 0.01 275);--faint:oklch(0.6 0.008 275);--accent:oklch(0.52 0.18 275);--run:oklch(0.55 0.15 245);--rev:oklch(0.54 0.16 305);--plan:oklch(0.55 0.1 205);--ok:oklch(0.55 0.14 155);--warn:oklch(0.62 0.15 65);--fail:oklch(0.56 0.2 25);--queue:oklch(0.62 0.008 275);--btn:oklch(0.22 0.01 275);--btnFg:oklch(0.98 0 0);--scrim:oklch(0.2 0.01 275 / 0.3);--code:oklch(0.2 0.01 275);--shadow:0 24px 64px -16px oklch(0.2 0.02 275 / 0.3)}
+[data-theme]{color-scheme:dark}[data-theme="light"]{color-scheme:light}
+[data-theme] *{scrollbar-width:thin;scrollbar-color:var(--line) transparent}
 [data-density="compact"]{--py:5px}[data-density="standard"]{--py:8px}[data-density="comfortable"]{--py:12px}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 @keyframes caret{0%,49%{opacity:1}50%,100%{opacity:0}}
 </style>
 </helmet>
-<div data-theme="{{ themeName }}" data-density="{{ densityName }}" style="height:100vh;display:grid;grid-template-rows:48px minmax(0,1fr);background:var(--bg);color:var(--ink);font-family:Geist,system-ui,sans-serif;font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased;font-feature-settings:'tnum'">
+<div data-theme="{{ themeName }}" data-density="{{ densityName }}" style="height:100vh;max-width:{{ rootMaxW }};margin:0 auto;display:grid;grid-template-rows:48px minmax(0,1fr);grid-template-columns:minmax(0,1fr);background:var(--bg);color:var(--ink);font-family:Geist,system-ui,sans-serif;font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased;font-feature-settings:'tnum'">
 
-<header style="display:flex;align-items:center;gap:16px;padding:0 16px;border-bottom:1px solid var(--line);background:var(--panel)">
+<header style="display:flex;align-items:center;gap:16px;padding:0 16px;min-width:0;overflow:hidden;border-bottom:1px solid var(--line);background:var(--panel)">
   <div style="display:flex;align-items:center;gap:9px;width:180px;flex:none">
     <div style="width:22px;height:22px;border-radius:6px;background:var(--ink);color:var(--bg);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px">H</div>
     <span style="font-weight:600;font-size:14px;letter-spacing:-0.01em">Harness</span>
-    <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">:9800</span>
+    <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">{{ serverPort }}</span>
   </div>
-  <div style="display:flex;align-items:center;gap:8px;flex:1;max-width:360px;min-width:160px;padding:5px 10px;border:1px solid var(--line);border-radius:7px;background:var(--bg)">
+  <div style="display:{{ hdrDisplay }};align-items:center;gap:8px;flex:1;max-width:360px;min-width:160px;padding:5px 10px;border:1px solid var(--line);border-radius:7px;background:var(--bg)">
     <span style="color:var(--faint)">⌕</span>
     <input value="{{ q }}" onChange="{{ onQuery }}" placeholder="Filter by title, repo#issue, agent, host" style="flex:1;border:none;outline:none;background:none;font-size:12.5px;min-width:0">
-    <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:var(--faint);border:1px solid var(--line);border-radius:4px;padding:0 5px">/</span>
+    <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:var(--faint);border:1px solid var(--line);border-radius:4px;padding:0 5px">/</span><button onClick="{{ openPal }}" style="font-family:'Geist Mono',monospace;font-size:10.5px;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:0 5px;background:none;cursor:pointer" style-hover="color:var(--ink)">⌘K</button>
   </div>
   <button onClick="{{ openTask }}" style="display:flex;align-items:center;gap:8px;padding:5px 11px;border-radius:7px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12.5px;font-weight:600;flex:none" style-hover="filter:brightness(1.1)">New task<span style="font-family:'Geist Mono',monospace;font-size:10.5px;opacity:0.6">N</span></button>
-  <div style="margin-left:auto;display:flex;align-items:center;gap:4px;flex:none;white-space:nowrap">
+  <div style="margin-left:auto;display:{{ hdrDisplay }};align-items:center;gap:4px;flex:0 1 auto;min-width:0;overflow:hidden;white-space:nowrap">
     <sc-for list="{{ chips }}" as="c" hint-placeholder-count="5">
       <button onClick="{{ c.go }}" style="display:flex;align-items:center;gap:6px;padding:4px 9px;border-radius:6px;border:none;background:transparent;cursor:pointer;font-size:12px;color:var(--muted)" style-hover="background:var(--hover);color:var(--ink)"><span style="width:6px;height:6px;border-radius:50%;background:{{ c.tone }}"></span>{{ c.label }}</button>
     </sc-for>
     <span style="width:1px;height:18px;background:var(--line);margin:0 6px"></span>
-    <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)"><span style="width:6px;height:6px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite"></span>{{ liveStatus }} · {{ now }}</span>
+    <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);min-width:0;flex:0 1 auto"><span style="width:6px;height:6px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite;flex:none"></span><span style="overflow:hidden;text-overflow:ellipsis">{{ liveLabel }} · {{ now }}</span></span>
   </div>
 </header>
 
-<div style="display:grid;grid-template-columns:{{ cols }};min-height:0">
-  <nav style="border-right:1px solid var(--line);background:var(--panel);padding:12px 8px;display:flex;flex-direction:column;gap:2px;overflow:auto">
+<div style="display:grid;grid-template-columns:{{ cols }};min-height:0;min-width:0">
+  <nav style="border-right:1px solid var(--line);background:var(--panel);padding:12px 8px;display:{{ navDisplay }};flex-direction:column;gap:2px;overflow:auto">
     <sc-for list="{{ nav }}" as="n" hint-placeholder-count="6">
-      <button onClick="{{ n.go }}" style="display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:6px;padding:6px 8px;border-radius:6px;border:none;background:{{ n.bg }};color:{{ n.fg }};cursor:pointer;text-align:left;font-weight:500" style-hover="background:var(--hover);color:var(--ink)">
+      <button onClick="{{ n.go }}" style="display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;border:none;background:{{ n.bg }};color:{{ n.fg }};cursor:pointer;text-align:left;font-weight:500" style-hover="background:var(--hover);color:var(--ink)">
         <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:var(--faint)">{{ n.key }}</span><span>{{ n.label }}</span>
         <span style="font-family:'Geist Mono',monospace;font-size:11px;padding:0 6px;border-radius:4px;background:{{ n.badgeBg }};color:{{ n.badgeFg }}">{{ n.count }}</span>
       </button>
     </sc-for>
-    <div style="margin:18px 8px 6px;font-size:11px;font-weight:600;color:var(--faint)">Projects</div>
+    <div style="margin:12px 8px 4px;font-size:11px;font-weight:600;color:var(--faint)">Projects</div>
     <sc-for list="{{ navProjects }}" as="p" hint-placeholder-count="4">
       <button onClick="{{ p.go }}" style="display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;border:none;background:{{ p.bg }};cursor:pointer;text-align:left;color:var(--muted)" style-hover="background:var(--hover);color:var(--ink)">
         <span style="width:8px;height:8px;border-radius:2px;background:{{ p.tone }};justify-self:center"></span><span>{{ p.id }}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">{{ p.live }}</span>
@@ -76,11 +78,18 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
     <div style="margin-top:auto;padding:10px 8px 0;display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--line2)">
       <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--faint)"><span>Slots</span><span style="font-family:'Geist Mono',monospace">{{ slotsUsed }}/{{ maxSlots }}</span></div>
       <div style="display:grid;grid-template-columns:repeat(16,1fr);gap:2px"><sc-for list="{{ slotCells }}" as="s" hint-placeholder-count="16"><div style="height:6px;border-radius:1px;background:{{ s.tone }}"></div></sc-for></div>
-      <div style="font-size:11px;color:var(--faint);line-height:1.5">j / k move · n new task · esc close · 1–8 views</div>
+      <div style="font-size:11px;color:var(--faint);line-height:1.5">⌘K commands · j / k move · n new task · 1–9 views</div>
+      <div style="font-family:'Geist Mono',monospace;font-size:10.5px;color:var(--faint)">{{ dataLabel }}</div>
     </div>
   </nav>
 
   <main style="overflow:auto;min-width:0">
+  <sc-if value="{{ hasBanner }}" hint-placeholder-val="{{ false }}">
+    <div style="display:flex;align-items:flex-start;gap:10px;padding:10px 22px;border-bottom:1px solid {{ banner.tone }};background:var(--panel)">
+      <span style="width:8px;height:8px;margin-top:5px;border-radius:50%;background:{{ banner.tone }};flex:none;animation:pulse 1.4s infinite"></span>
+      <span style="display:flex;flex-direction:column;gap:1px"><span style="font-weight:600">{{ banner.t }}</span><span style="font-size:12px;color:var(--muted)">{{ banner.sub }}</span></span>
+    </div>
+  </sc-if>
 
   <sc-if value="{{ isHome }}" hint-placeholder-val="{{ true }}">
   <div data-screen-label="Home" style="padding:18px 22px 48px;display:flex;flex-direction:column;gap:22px">
@@ -90,6 +99,33 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         <sc-for list="{{ stats }}" as="x" hint-placeholder-count="6"><div style="display:flex;flex-direction:column;padding:6px 14px;border-right:1px solid var(--line2);min-width:78px"><span style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--faint)"><span style="width:6px;height:6px;border-radius:50%;background:{{ x.tone }}"></span>{{ x.label }}</span><span style="font-size:17px;font-weight:600;font-family:'Geist Mono',monospace;letter-spacing:-0.02em">{{ x.v }}</span></div></sc-for>
       </div>
     </div>
+
+    <sc-if value="{{ hasOpenBreakers }}" hint-placeholder-val="{{ false }}">
+    <div style="display:flex;flex-direction:column;border:1px solid var(--warn);border-radius:10px;background:var(--panel);overflow:hidden">
+      <sc-for list="{{ openBreakers }}" as="b" hint-placeholder-count="1">
+        <div style="display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:center;padding:8px 16px;box-shadow:inset 0 1px 0 var(--line2)">
+          <span style="display:flex;align-items:center;gap:8px;font-weight:600;color:var(--warn);white-space:nowrap"><span style="width:8px;height:8px;border-radius:50%;background:var(--warn)"></span>Breaker open</span>
+          <span style="display:flex;gap:12px;min-width:0;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden"><span style="font-family:'Geist Mono',monospace;color:var(--ink)">{{ b.profile }}</span><span>{{ b.failures }} consecutive · {{ b.window }}</span><span>{{ b.next }}</span><span style="color:var(--faint)">{{ b.affected }}</span></span>
+          <button onClick="{{ b.reset }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:var(--raised);cursor:pointer;font-size:12px;font-weight:500" style-hover="border-color:var(--muted)">Reset breaker</button>
+        </div>
+      </sc-for>
+    </div>
+    </sc-if>
+
+    <sc-if value="{{ hasApprovals }}" hint-placeholder-val="{{ false }}">
+    <section style="border:1px solid var(--accent);border-radius:10px;overflow:hidden;background:var(--panel)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="display:flex;align-items:center;gap:8px;font-weight:600">Approvals<span style="font-family:'Geist Mono',monospace;font-size:11.5px;padding:0 6px;border-radius:4px;background:var(--accent);color:var(--btnFg)">{{ approvalCount }}</span></span><span style="font-size:12px;color:var(--faint)">agents paused mid-turn · turn/approval_request</span></div>
+      <sc-for list="{{ approvals }}" as="a" hint-placeholder-count="2">
+        <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:center;padding:10px 16px;border-top:1px solid var(--line2);background:{{ a.bg }};box-shadow:{{ a.edge }}">
+          <div onClick="{{ a.select }}" style="display:flex;flex-direction:column;gap:6px;min-width:0;cursor:pointer">
+            <span style="display:flex;gap:8px;align-items:baseline;min-width:0"><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);flex:none">{{ a.ref }}</span><span style="font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ a.title }}</span></span>
+            <span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span style="font-family:'Geist Mono',monospace;font-size:12px;padding:2px 8px;border-radius:5px;background:var(--code);color:oklch(0.9 0.005 275)">$ {{ a.command }}</span><span style="font-size:11.5px;padding:1px 7px;border-radius:4px;border:1px solid {{ a.polTone }};color:{{ a.polTone }}">policy · {{ a.policy }}</span><span style="font-size:11.5px;color:var(--muted)">{{ a.scope }} · {{ a.agent }} · {{ a.ago }}</span></span>
+          </div>
+          <div style="display:flex;gap:6px"><button onClick="{{ a.deny }}" style="padding:5px 12px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500" style-hover="border-color:var(--muted)">Deny…</button><button onClick="{{ a.approve }}" style="padding:5px 12px;border-radius:6px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12px;font-weight:600" style-hover="filter:brightness(1.1)">Approve</button></div>
+        </div>
+      </sc-for>
+    </section>
+    </sc-if>
 
     <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
       <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="display:flex;align-items:center;gap:8px;font-weight:600">Inbox<span style="font-family:'Geist Mono',monospace;font-size:11.5px;padding:0 6px;border-radius:4px;background:var(--warn);color:var(--btnFg)">{{ inboxCount }}</span></span><span style="font-size:12px;color:var(--faint)">operator_actions · stuck_workflows · approvals</span></div>
@@ -140,6 +176,17 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
       <div style="display:flex;flex-direction:column;gap:2px;flex:1 1 320px"><h1 style="margin:0;font-size:20px;font-weight:600;letter-spacing:-0.015em">Fleet</h1><span style="color:var(--muted)">{{ fleetCount }} active workflows · grouped by runtime state</span></div>
       <div style="display:flex;gap:4px;flex-wrap:wrap"><sc-for list="{{ fleetFilters }}" as="c" hint-placeholder-count="5"><button onClick="{{ c.go }}" style="padding:4px 10px;border-radius:6px;border:1px solid {{ c.bd }};background:{{ c.bg }};color:{{ c.fg }};cursor:pointer;font-size:12px;font-weight:500">{{ c.label }}</button></sc-for></div>
     </div>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;min-height:30px">
+      <div style="display:flex;padding:2px;border:1px solid var(--line);border-radius:7px;gap:2px"><sc-for list="{{ fleetViews }}" as="v" hint-placeholder-count="2"><button onClick="{{ v.go }}" style="padding:3px 10px;border-radius:5px;border:none;background:{{ v.bg }};color:{{ v.fg }};cursor:pointer;font-size:12px;font-weight:500">{{ v.label }}</button></sc-for></div>
+      <sc-if value="{{ hasPicked }}" hint-placeholder-val="{{ false }}">
+        <div style="display:flex;align-items:center;gap:6px;padding:3px 4px 3px 12px;border-radius:8px;background:var(--raised);border:1px solid var(--accent)">
+          <span style="font-size:12px;font-weight:600;margin-right:4px">{{ pickedCount }} selected</span>
+          <sc-for list="{{ bulkBtns }}" as="b" hint-placeholder-count="3"><button onClick="{{ b.go }}" style="padding:3px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;color:{{ b.fg }};opacity:{{ b.op }};cursor:pointer;font-size:12px;font-weight:500" style-hover="border-color:var(--muted)">{{ b.label }}</button></sc-for>
+          <button onClick="{{ clearPicked }}" style="padding:3px 8px;border-radius:6px;border:none;background:transparent;cursor:pointer;font-size:12px;color:var(--faint)">Clear</button>
+        </div>
+      </sc-if>
+    </div>
+    <sc-if value="{{ isStateView }}" hint-placeholder-val="{{ true }}">
     <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
       <div style="display:grid;grid-template-columns:{{ fleetCols }};gap:12px;padding:8px 16px;font-size:11px;color:var(--faint);font-weight:500;border-bottom:1px solid var(--line)"><span>Workflow</span><span>Agent</span><sc-if value="{{ wide }}" hint-placeholder-val="{{ true }}"><span>Host · lease</span></sc-if><span>Turn</span><sc-if value="{{ wide }}" hint-placeholder-val="{{ true }}"><span style="text-align:right">Tokens</span></sc-if><span style="text-align:right">Obs.</span><span style="text-align:right">Age</span></div>
       <sc-for list="{{ fleetGroups }}" as="g" hint-placeholder-count="8">
@@ -147,7 +194,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         <sc-for list="{{ g.rows }}" as="r" hint-placeholder-count="3">
           <div onClick="{{ r.select }}" style="display:grid;grid-template-columns:{{ fleetCols }};gap:12px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2);background:{{ r.bg }};box-shadow:{{ r.edge }};cursor:pointer" style-hover="background:var(--hover)">
             <div style="display:flex;flex-direction:column;gap:1px;min-width:0">
-              <span style="display:flex;gap:8px;align-items:baseline;min-width:0"><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);flex:none">{{ r.ref }}</span><span style="font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.title }}</span></span>
+              <span style="display:flex;gap:8px;align-items:baseline;min-width:0"><button onClick="{{ r.togglePick }}" style="width:14px;height:14px;flex:none;align-self:center;padding:0;border-radius:4px;border:1px solid {{ r.pickBd }};background:{{ r.pickBg }};color:var(--btnFg);font-size:10px;line-height:12px;cursor:pointer">{{ r.pickMark }}</button><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);flex:none">{{ r.ref }}</span><span style="font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.title }}</span></span>
               <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.activity }}</span>
             </div>
             <span style="display:flex;flex-direction:column;font-size:12px;line-height:1.3"><span>{{ r.agent }}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">{{ r.model }} · {{ r.effort }}</span></span>
@@ -160,6 +207,44 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         </sc-for>
       </sc-for>
     </section>
+    </sc-if>
+    <sc-if value="{{ isTreeView }}" hint-placeholder-val="{{ false }}">
+    <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
+      <div style="display:flex;justify-content:space-between;padding:8px 16px;font-size:11px;color:var(--faint);font-weight:500;border-bottom:1px solid var(--line)"><span>Workflow · depends_on</span><span>/api/workflows/runtime/tree</span></div>
+      <sc-for list="{{ treeRows }}" as="r" hint-placeholder-count="10">
+        <div onClick="{{ r.select }}" style="display:grid;grid-template-columns:minmax(0,1fr) 140px 110px;gap:12px;align-items:center;padding:var(--py) 16px var(--py) {{ r.pad }};border-top:1px solid var(--line2);background:{{ r.bg }};box-shadow:{{ r.edge }};cursor:pointer" style-hover="background:var(--hover)">
+          <span style="display:flex;gap:8px;align-items:baseline;min-width:0"><span style="color:var(--faint);font-family:'Geist Mono',monospace;flex:none">{{ r.branch }}</span><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);flex:none">{{ r.ref }}</span><span style="font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.title }}</span><span style="font-size:11.5px;color:var(--faint);flex:none">{{ r.nKids }}</span></span>
+          <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:{{ r.tone }};white-space:nowrap"><span style="width:7px;height:7px;border-radius:50%;background:{{ r.tone }}"></span>{{ r.stateLabel }}</span>
+          <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.waitsOn }}</span>
+        </div>
+      </sc-for>
+    </section>
+    </sc-if>
+    <sc-if value="{{ isFailView }}" hint-placeholder-val="{{ false }}">
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <sc-if value="{{ failEmpty }}" hint-placeholder-val="{{ false }}"><div style="padding:28px 16px;text-align:center;color:var(--muted);border:1px solid var(--line);border-radius:10px;background:var(--panel)">No failed or blocked workflows.</div></sc-if>
+      <sc-for list="{{ failGroups }}" as="g" hint-placeholder-count="4">
+        <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap">
+            <span style="display:flex;flex-direction:column;gap:2px;min-width:0"><span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="width:8px;height:8px;border-radius:2px;background:{{ g.tone }}"></span><span style="font-family:'Geist Mono',monospace;font-size:12.5px;font-weight:600">{{ g.cls }}</span><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint)">×{{ g.count }}</span><span style="font-size:11.5px;padding:0 6px;border-radius:4px;border:1px solid {{ g.rTone }};color:{{ g.rTone }}">{{ g.rLabel }}</span></span><span style="font-size:12px;color:var(--faint)">{{ g.desc }}</span></span>
+            <sc-if value="{{ g.canAct }}" hint-placeholder-val="{{ false }}"><button onClick="{{ g.act }}" style="padding:4px 12px;border-radius:6px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12px;font-weight:600" style-hover="filter:brightness(1.1)">{{ g.actLabel }}</button></sc-if>
+          </div>
+          <sc-for list="{{ g.rows }}" as="r" hint-placeholder-count="2">
+            <div onClick="{{ r.select }}" style="display:grid;grid-template-columns:minmax(0,1fr) 110px minmax(0,0.8fr) 48px;gap:12px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2);background:{{ r.bg }};box-shadow:{{ r.edge }};cursor:pointer" style-hover="background:var(--hover)">
+              <span style="display:flex;gap:8px;align-items:baseline;min-width:0"><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);flex:none">{{ r.ref }}</span><span style="font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.title }}</span></span>
+              <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:{{ r.tone }}"><span style="width:7px;height:7px;border-radius:50%;background:{{ r.tone }}"></span>{{ r.stateLabel }}</span>
+              <span style="font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.host }} · {{ r.agent }} · turn {{ r.turn }}/{{ r.max }}</span>
+              <span style="font-family:'Geist Mono',monospace;font-size:11.5px;text-align:right;color:var(--faint)">{{ r.obs }}</span>
+            </div>
+          </sc-for>
+        </section>
+      </sc-for>
+    </div>
+    </sc-if>
+    <div style="display:flex;justify-content:center;align-items:center;gap:12px;padding:2px 0">
+      <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint)">{{ pageLabel }}</span>
+      <sc-if value="{{ pageHasMore }}" hint-placeholder-val="{{ false }}"><button onClick="{{ loadMore }}" style="padding:4px 12px;border-radius:6px;border:1px solid var(--line);background:var(--raised);cursor:pointer;font-size:12px;font-weight:500" style-hover="border-color:var(--muted)">Load more</button></sc-if>
+    </div>
   </div>
   </sc-if>
 
@@ -202,7 +287,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
       <div style="display:flex;gap:4px"><sc-for list="{{ histFilters }}" as="c" hint-placeholder-count="4"><button onClick="{{ c.go }}" style="padding:4px 10px;border-radius:6px;border:1px solid {{ c.bd }};background:{{ c.bg }};color:{{ c.fg }};cursor:pointer;font-size:12px;font-weight:500;display:flex;gap:6px">{{ c.label }}<span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ c.count }}</span></button></sc-for></div>
     </div>
     <section style="border:1px solid var(--line);border-radius:10px;overflow-x:auto;overflow-y:hidden;background:var(--panel)"><div style="min-width:1040px">
-      <div style="display:grid;grid-template-columns:96px minmax(260px,1fr) 110px 76px 48px 72px 64px 44px 44px;gap:12px;padding:8px 16px;font-size:11px;color:var(--faint);font-weight:500;border-bottom:1px solid var(--line)"><span>Outcome</span><span>Workflow</span><span>Agent</span><span>PR</span><span style="text-align:right">Turns</span><span style="text-align:right">Duration</span><span style="text-align:right">Tokens</span><span style="text-align:right">Score</span><span style="text-align:right">Ago</span></div>
+      <div style="display:grid;grid-template-columns:96px minmax(260px,1fr) 110px 76px 48px 72px 64px 44px 44px;gap:12px;padding:8px 16px;font-size:11px;color:var(--faint);font-weight:500;border-bottom:1px solid var(--line)"><span>Outcome</span><span>Workflow</span><span>Agent</span><span>PR</span><span style="text-align:right">Turns</span><span style="text-align:right">Age</span><span style="text-align:right">Tokens</span><span style="text-align:right">Score</span><span style="text-align:right">Ago</span></div>
       <sc-for list="{{ hist }}" as="h" hint-placeholder-count="12">
         <div onClick="{{ h.select }}" style="display:grid;grid-template-columns:96px minmax(260px,1fr) 110px 76px 48px 72px 64px 44px 44px;gap:12px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2);background:{{ h.bg }};box-shadow:{{ h.edge }};cursor:pointer" style-hover="background:var(--hover)">
           <span style="display:flex;align-items:center;gap:6px;font-size:12px;font-weight:500;color:{{ h.tone }}"><span style="width:7px;height:7px;border-radius:50%;background:{{ h.tone }}"></span>{{ h.stateLabel }}</span>
@@ -224,7 +309,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
   <div data-screen-label="Worktrees" style="padding:18px 22px 48px;display:flex;flex-direction:column;gap:16px">
     <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap">
       <div style="display:flex;flex-direction:column;gap:2px"><h1 style="margin:0;font-size:20px;font-weight:600;letter-spacing:-0.015em">Worktrees</h1><span style="color:var(--muted)">.harness/worktrees · {{ wtUsed }} of {{ maxSlots }} in use{{ wtOrphanNote }}</span></div>
-      <div style="display:grid;grid-template-columns:repeat(16,14px);gap:3px"><sc-for list="{{ wtCells }}" as="s" hint-placeholder-count="16"><div style="height:22px;border-radius:3px;background:{{ s.tone }}"></div></sc-for></div>
+      <div style="display:flex;align-items:center;gap:12px"><div style="display:grid;grid-template-columns:repeat(16,14px);gap:3px"><sc-for list="{{ wtCells }}" as="s" hint-placeholder-count="16"><div style="height:22px;border-radius:3px;background:{{ s.tone }}"></div></sc-for></div><sc-if value="{{ wtHasOrphans }}" hint-placeholder-val="{{ false }}"><button onClick="{{ wtCopyAll }}" style="padding:5px 11px;border-radius:7px;border:1px solid var(--warn);background:transparent;color:var(--warn);cursor:pointer;font-size:12px;font-weight:500;white-space:nowrap">Copy cleanup · {{ wtOrphanCount }}</button></sc-if></div>
     </div>
     <section style="border:1px solid var(--line);border-radius:10px;overflow-x:auto;overflow-y:hidden;background:var(--panel)"><div style="min-width:760px">
       <div style="display:grid;grid-template-columns:80px minmax(0,1fr) minmax(0,0.9fr) 96px 104px 56px 76px;gap:12px;padding:8px 16px;font-size:11px;color:var(--faint);font-weight:500;border-bottom:1px solid var(--line)"><span>Status</span><span>Worktree</span><span>Branch</span><span>Phase</span><span>Host</span><span style="text-align:right">Age</span><span></span></div>
@@ -236,23 +321,80 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
           <span style="font-size:12px;color:var(--muted)">{{ w.phase }}</span>
           <span style="font-size:12px;color:var(--muted)">{{ w.host }}</span>
           <span style="font-family:'Geist Mono',monospace;font-size:11.5px;text-align:right;color:var(--faint)">{{ w.age }}</span>
-          <span style="text-align:right"><sc-if value="{{ w.orphan }}" hint-placeholder-val="{{ false }}"><button onClick="{{ w.reclaim }}" style="padding:3px 9px;border-radius:6px;border:1px solid var(--warn);background:transparent;color:var(--warn);cursor:pointer;font-size:12px;font-weight:500">Reclaim</button></sc-if></span>
+          <span style="text-align:right"><sc-if value="{{ w.orphan }}" hint-placeholder-val="{{ false }}"><button onClick="{{ w.reclaim }}" title="{{ w.cmd }}" style="padding:3px 9px;border-radius:6px;border:1px solid var(--warn);background:transparent;color:var(--warn);cursor:pointer;font-size:12px;font-weight:500">Cleanup</button></sc-if></span>
         </div>
       </sc-for>
     </div></section>
   </div>
   </sc-if>
 
+  <sc-if value="{{ isEvents }}" hint-placeholder-val="{{ false }}">
+  <div data-screen-label="Events" style="padding:18px 22px 48px;display:flex;flex-direction:column;gap:16px">
+    <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap">
+      <div style="display:flex;flex-direction:column;gap:2px"><h1 style="margin:0;font-size:20px;font-weight:600;letter-spacing:-0.015em">Events</h1><span style="color:var(--muted)">Latest 200 server events · last 24h · refreshes every minute</span></div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap"><sc-for list="{{ evFilters }}" as="c" hint-placeholder-count="6"><button onClick="{{ c.go }}" style="padding:4px 10px;border-radius:6px;border:1px solid {{ c.bd }};background:{{ c.bg }};color:{{ c.fg }};cursor:pointer;font-size:12px;font-weight:500;display:flex;gap:6px">{{ c.label }}<span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ c.count }}</span></button></sc-for></div>
+    </div>
+    <section style="border:1px solid var(--line);border-radius:10px;overflow-x:auto;overflow-y:hidden;background:var(--panel)"><div style="min-width:720px">
+      <div style="display:grid;grid-template-columns:48px 86px 110px minmax(0,1fr) minmax(0,1fr);gap:12px;padding:8px 16px;font-size:11px;color:var(--faint);font-weight:500;border-bottom:1px solid var(--line)"><span>Time</span><span>Kind</span><span>Workflow</span><span>Event</span><span>Detail</span></div>
+      <sc-if value="{{ evEmpty }}" hint-placeholder-val="{{ false }}"><div style="padding:24px 16px;text-align:center;color:var(--muted)">{{ eventsEmptyLabel }}</div></sc-if>
+      <sc-for list="{{ events }}" as="e" hint-placeholder-count="14">
+        <div onClick="{{ e.select }}" style="display:grid;grid-template-columns:48px 86px 110px minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2);background:{{ e.bg }};cursor:pointer" style-hover="background:var(--hover)">
+          <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint)">{{ e.ts }}</span>
+          <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:{{ e.tone }}"><span style="width:7px;height:7px;border-radius:2px;background:{{ e.tone }}"></span>{{ e.kindLabel }}</span>
+          <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--muted)">{{ e.ref }}</span>
+          <span style="font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ e.text }}</span>
+          <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ e.sub }}</span>
+        </div>
+      </sc-for>
+    </div></section>
+  </div>
+  </sc-if>
+
+  <sc-if value="{{ isOnboard }}" hint-placeholder-val="{{ false }}">
+  <div data-screen-label="Onboarding" style="padding:12vh 22px 48px;display:flex;justify-content:center">
+    <div style="max-width:460px;display:flex;flex-direction:column;gap:14px">
+      <h1 style="margin:0;font-size:20px;font-weight:600;letter-spacing:-0.015em">No projects registered</h1>
+      <span style="color:var(--muted);line-height:1.6">Harness is running, but it has nothing to work on. Register a repository and its issues become eligible for intake. You can also pass <span style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--ink)">--project name=path</span> to harness serve.</span>
+      <div style="display:flex;gap:8px"><button onClick="{{ newProject }}" style="padding:6px 14px;border-radius:7px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12.5px;font-weight:600">Register project</button><button onClick="{{ openTask }}" style="padding:6px 12px;border-radius:7px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12.5px">Run a one-off prompt</button></div>
+    </div>
+  </div>
+  </sc-if>
+
+  <sc-if value="{{ isMobile }}" hint-placeholder-val="{{ false }}">
+  <div data-screen-label="Mobile inbox" style="padding:14px 14px 40px;display:flex;flex-direction:column;gap:14px">
+    <div style="display:flex;align-items:baseline;justify-content:space-between"><h1 style="margin:0;font-size:19px;font-weight:600;letter-spacing:-0.015em">{{ homeTitle }}</h1><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">{{ now }}</span></div>
+    <sc-for list="{{ mInbox }}" as="r" hint-placeholder-count="4">
+      <div onClick="{{ r.select }}" style="border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:12px 14px;display:flex;flex-direction:column;gap:8px;cursor:pointer">
+        <span style="display:flex;justify-content:space-between;gap:8px;font-size:12px"><span style="font-weight:600;color:{{ r.kindTone }}">{{ r.kindLabel }}</span><span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ r.inbox.ago }}</span></span>
+        <span style="font-weight:500;font-size:14px;line-height:1.35">{{ r.title }}</span>
+        <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--muted)">{{ r.ref }} · {{ r.inbox.reason }}</span>
+        <div style="display:flex;gap:8px"><sc-for list="{{ r.btns }}" as="b" hint-placeholder-count="2"><button onClick="{{ b.go }}" style="flex:1;min-height:44px;border-radius:9px;border:1px solid {{ b.bd }};background:{{ b.bg }};color:{{ b.fg }};cursor:pointer;font-size:13.5px;font-weight:600">{{ b.label }}</button></sc-for></div>
+      </div>
+    </sc-for>
+    <div style="font-size:12px;font-weight:600;color:var(--faint);margin-top:6px">Running</div>
+    <div style="border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow:hidden">
+      <sc-for list="{{ mRunning }}" as="r" hint-placeholder-count="6">
+        <div onClick="{{ r.select }}" style="display:flex;flex-direction:column;gap:3px;padding:10px 14px;border-top:1px solid var(--line2);min-height:44px;cursor:pointer">
+          <span style="display:flex;justify-content:space-between;gap:8px;font-size:12px"><span style="display:flex;align-items:center;gap:6px;color:{{ r.tone }}"><span style="width:7px;height:7px;border-radius:50%;background:{{ r.tone }}"></span>{{ r.stateLabel }}</span><span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ r.turn }}/{{ r.max }}</span></span>
+          <span style="font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.title }}</span>
+          <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">{{ r.ref }} · {{ r.agent }}</span>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+  </sc-if>
+
   <sc-if value="{{ isUsage }}" hint-placeholder-val="{{ false }}">
   <div data-screen-label="Usage" style="padding:18px 22px 48px;display:flex;flex-direction:column;gap:16px">
     <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap">
-      <div style="display:flex;flex-direction:column;gap:2px;flex:1 1 320px"><h1 style="margin:0;font-size:20px;font-weight:600;letter-spacing:-0.015em">Usage</h1><span style="color:var(--muted)">Token spend and provider quotas · /api/token-usage · /api/usage-monitor</span></div>
+      <div style="display:flex;flex-direction:column;gap:2px;flex:1 1 320px"><h1 style="margin:0;font-size:20px;font-weight:600;letter-spacing:-0.015em">Usage</h1><span style="color:var(--muted)">{{ usageSrc }}</span></div>
       <div style="display:flex;flex-wrap:wrap;border:1px solid var(--line);border-radius:8px;overflow:hidden">
         <sc-for list="{{ usageStats }}" as="x" hint-placeholder-count="4"><div style="display:flex;flex-direction:column;padding:6px 14px;border-right:1px solid var(--line2);min-width:90px"><span style="font-size:11px;color:var(--faint)">{{ x.k }}</span><span style="font-size:17px;font-weight:600;font-family:'Geist Mono',monospace;letter-spacing:-0.02em">{{ x.v }}</span></div></sc-for>
       </div>
     </div>
     <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
-      <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Provider quotas</span><span style="font-size:12px;color:var(--faint)">{{ quotaNote }}</span></div>
+      <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Provider quotas · {{ quotaNote }}</span><span style="font-size:12px;color:var(--faint)">No provider quota source configured</span></div>
+      <sc-if value="{{ quotasEmpty }}" hint-placeholder-val="{{ false }}"><div style="padding:14px 16px;font-size:12.5px;color:var(--muted)">Provider quotas are not exposed by /api/usage-monitor. {{ costNote }}</div></sc-if>
       <sc-for list="{{ quotas }}" as="q" hint-placeholder-count="4">
         <div style="display:grid;grid-template-columns:minmax(160px,220px) minmax(120px,1fr) 44px minmax(0,260px);gap:14px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2)">
           <span style="font-weight:500">{{ q.name }}</span>
@@ -291,10 +433,10 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 
     <section style="border:1px solid var(--line);border-radius:10px;overflow-x:auto;overflow-y:hidden;background:var(--panel)"><div style="min-width:680px">
       <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Skills</span><div style="display:flex;gap:6px"><button onClick="{{ learnSkills }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500" style-hover="border-color:var(--muted)">Learn from history</button><button onClick="{{ newSkill }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12px;font-weight:500">Create skill</button></div></div>
-      <div style="display:grid;grid-template-columns:minmax(180px,1fr) 150px 90px 56px 56px 50px 130px;gap:12px;padding:6px 16px;font-size:11px;color:var(--faint);font-weight:500"><span>Skill</span><span>Source</span><span>Governance</span><span style="text-align:right">Uses</span><span style="text-align:right">Last</span><span style="text-align:right">Score</span><span></span></div>
+      <div style="display:grid;grid-template-columns:minmax(180px,1fr) 150px 90px 56px 56px 50px 130px;gap:12px;padding:6px 16px;font-size:11px;color:var(--faint);font-weight:500"><span>Skill</span><span>Source</span><span>Governance</span><span style="text-align:right">Uses 7d</span><span style="text-align:right">Last</span><span style="text-align:right">Score</span><span></span></div>
       <sc-for list="{{ skills }}" as="k" hint-placeholder-count="8">
         <div style="display:grid;grid-template-columns:minmax(180px,1fr) 150px 90px 56px 56px 50px 130px;gap:12px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2)">
-          <span style="font-family:'Geist Mono',monospace;font-size:12px">{{ k.name }}</span>
+          <span style="font-family:'Geist Mono',monospace;font-size:12px">{{ k.id }}</span>
           <span style="font-size:12px;color:var(--muted)">{{ k.src }}</span>
           <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:{{ k.tone }}"><span style="width:6px;height:6px;border-radius:50%;background:{{ k.tone }}"></span>{{ k.gov }}</span>
           <span style="font-family:'Geist Mono',monospace;font-size:11.5px;text-align:right">{{ k.uses }}</span>
@@ -307,7 +449,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:16px">
       <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Rules</span><div style="display:flex;gap:6px"><button onClick="{{ learnRules }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500">Learn</button><button onClick="{{ autoFix }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500">Auto-fix</button><button onClick="{{ runCheck }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12px;font-weight:500">Run check</button></div></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Rules · last check results</span><div style="display:flex;gap:6px"><button onClick="{{ learnRules }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500">Learn</button><button onClick="{{ autoFix }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500">Auto-fix</button><button onClick="{{ runCheck }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12px;font-weight:500">Run check</button></div></div>
         <sc-for list="{{ rules }}" as="r" hint-placeholder-count="6">
           <div style="display:grid;grid-template-columns:minmax(0,1fr) 44px 56px 36px;gap:10px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2)">
             <span style="display:flex;flex-direction:column;min-width:0"><span style="font-family:'Geist Mono',monospace;font-size:12px">{{ r.id }}</span><span style="font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.lang }} · {{ r.file }}</span></span>
@@ -319,7 +461,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
       </section>
       <div style="display:flex;flex-direction:column;gap:16px">
         <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
-          <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Exec policy preview</span><span style="font-size:12px;color:var(--faint)">local preview only</span></div>
+          <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Exec policy tester</span><span style="font-size:12px;color:var(--faint)">harness execpolicy check</span></div>
           <div style="padding:12px 16px;display:flex;flex-direction:column;gap:10px">
             <input value="{{ epCmd }}" onChange="{{ onEp }}" placeholder="command to evaluate" style="padding:7px 10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);outline:none;font-family:'Geist Mono',monospace;font-size:12.5px">
             <span style="display:flex;align-items:center;gap:10px"><span style="padding:2px 8px;border-radius:5px;border:1px solid {{ ep.tone }};color:{{ ep.tone }};font-family:'Geist Mono',monospace;font-size:12px;font-weight:500">{{ ep.d }}</span><span style="font-size:12px;color:var(--muted)">{{ ep.why }}</span></span>
@@ -390,7 +532,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:16px">
       <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
-        <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Intake sources</span><span style="font-size:12px;color:var(--faint)">Active submissions</span></div>
+        <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Intake</span><span style="font-size:12px;color:var(--faint)">/api/intake · active · repos · status</span></div>
         <sc-for list="{{ intake }}" as="i" hint-placeholder-count="4">
           <div style="display:grid;grid-template-columns:minmax(0,1fr) 44px 40px 36px;gap:10px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2)">
             <span style="display:flex;flex-direction:column;min-width:0"><span style="display:flex;align-items:center;gap:7px;font-weight:500"><span style="width:6px;height:6px;border-radius:50%;background:{{ i.tone }}"></span>{{ i.k }}<span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint);font-weight:400">{{ i.ep }}</span></span><span style="font-size:11.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ i.note }}</span></span>
@@ -399,6 +541,10 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
             <span style="font-family:'Geist Mono',monospace;font-size:11.5px;text-align:right;color:var(--faint)">{{ i.last }}</span>
           </div>
         </sc-for>
+        <sc-if value="{{ intakeDegraded }}" hint-placeholder-val="{{ false }}"><div style="padding:6px 16px;border-top:1px solid var(--line2);font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--warn)">{{ intakeDegradedLabel }}</div></sc-if>
+        <div style="padding:8px 16px 4px;font-size:11px;font-weight:500;color:var(--faint);border-top:1px solid var(--line2)">Recent dispatches</div>
+        <sc-for list="{{ intakeRecent }}" as="d" hint-placeholder-count="4"><div style="display:grid;grid-template-columns:72px minmax(0,1fr) auto 36px;gap:10px;padding:3px 16px;font-size:12px;align-items:baseline"><span style="color:var(--muted)">{{ d.src }}</span><span style="font-family:'Geist Mono',monospace;font-size:11.5px">{{ d.ref }}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">{{ d.kind }}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint);text-align:right">{{ d.ago }}</span></div></sc-for>
+        <div style="height:8px"></div>
       </section>
       <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel);display:flex;flex-direction:column">
         <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line)"><span style="display:flex;flex-direction:column"><span style="font-weight:600">Reconcile with GitHub</span><span style="font-size:11.5px;color:var(--faint)">last run {{ recLast }}</span></span><div style="display:flex;gap:6px"><button onClick="{{ recDry }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500">Dry run</button><button onClick="{{ recApply }}" disabled="{{ recEmpty }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12px;font-weight:500">Apply</button></div></div>
@@ -428,7 +574,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px">
       <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
-      <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">GC remediation drafts</span><span style="display:flex;align-items:center;gap:10px"><span style="font-size:12px;color:var(--faint)">last {{ gc.last }}</span><button onClick="{{ runGc }}" style="padding:3px 9px;border-radius:6px;border:1px solid var(--line);background:var(--raised);cursor:pointer;font-size:12px;font-weight:500" style-hover="border-color:var(--muted)">Run GC</button></span></div>
+        <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">GC remediation drafts</span><span style="display:flex;align-items:center;gap:10px"><span style="font-size:12px;color:var(--faint)">last {{ gc.last }} · cost unavailable</span><button onClick="{{ runGc }}" style="padding:3px 9px;border-radius:6px;border:1px solid var(--line);background:var(--raised);cursor:pointer;font-size:12px;font-weight:500" style-hover="border-color:var(--muted)">Run GC</button></span></div>
         <sc-for list="{{ drafts }}" as="d" hint-placeholder-count="3">
           <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2)">
             <span style="display:flex;flex-direction:column;min-width:0"><span style="font-weight:500">{{ d.title }}</span><span style="font-size:11.5px;color:var(--faint)">{{ d.signal }} · {{ d.budget }}</span></span>
@@ -451,7 +597,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
   <sc-if value="{{ hasSel }}" hint-placeholder-val="{{ true }}">
   <aside data-screen-label="Workflow inspector" style="border-left:1px solid var(--line);background:var(--panel);overflow:auto;display:flex;flex-direction:column;min-width:0;position:{{ inspPos }};top:{{ inspTop }};right:0;bottom:0;width:{{ inspW }};z-index:30;box-shadow:{{ inspShadow }}">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 16px;border-bottom:1px solid var(--line2);position:sticky;top:0;background:var(--panel);z-index:2">
-      <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ s.id }} · {{ s.definition }} · {{ s.version }}</span>
+      <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ s.id }} · github_issue_pr · v3</span>
       <div style="display:flex;gap:4px"><button onClick="{{ selPrev }}" style="width:24px;height:24px;border-radius:5px;border:1px solid var(--line);background:transparent;cursor:pointer;color:var(--muted)">↑</button><button onClick="{{ selNext }}" style="width:24px;height:24px;border-radius:5px;border:1px solid var(--line);background:transparent;cursor:pointer;color:var(--muted)">↓</button><button onClick="{{ closeSel }}" style="width:24px;height:24px;border-radius:5px;border:1px solid var(--line);background:transparent;cursor:pointer;color:var(--muted)">✕</button></div>
     </div>
     <div style="padding:14px 16px;display:flex;flex-direction:column;gap:14px">
@@ -478,11 +624,16 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         <sc-for list="{{ s.meta }}" as="m" hint-placeholder-count="8"><div style="padding:7px 10px;border-bottom:1px solid var(--line2);border-right:1px solid var(--line2);display:flex;flex-direction:column;min-width:0"><span style="font-size:10.5px;color:var(--faint)">{{ m.k }}</span><span style="font-family:'Geist Mono',monospace;font-size:12px;color:{{ m.fg }};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ m.v }}</span></div></sc-for>
       </div>
 
-      <div style="display:flex;gap:14px;border-bottom:1px solid var(--line)">
-        <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="5"><button onClick="{{ t.go }}" style="padding:6px 0;margin-bottom:-1px;border:none;border-bottom:2px solid {{ t.bd }};background:none;cursor:pointer;font-size:12.5px;font-weight:500;color:{{ t.fg }}">{{ t.label }}</button></sc-for>
+      <div style="display:flex;flex-direction:column;border:1px solid var(--line2);border-radius:8px;overflow:hidden">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg)"><span style="font-size:11.5px;font-weight:600">Runs for {{ s.ref }}</span><span style="display:flex;gap:4px"><button onClick="{{ openIssue }}" style="padding:2px 8px;border-radius:5px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:11.5px;color:var(--muted)" style-hover="color:var(--ink)">Issue ↗</button><sc-if value="{{ hasPr }}" hint-placeholder-val="{{ false }}"><button onClick="{{ openPr }}" style="padding:2px 8px;border-radius:5px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:11.5px;color:var(--muted)" style-hover="color:var(--ink)">PR ↗</button></sc-if></span></div>
+        <sc-for list="{{ runs }}" as="u" hint-placeholder-count="1"><div style="display:grid;grid-template-columns:44px 92px minmax(0,1fr) 44px;gap:8px;padding:6px 10px;border-top:1px solid var(--line2);font-size:11.5px;align-items:center"><span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ u.run }}</span><span style="display:flex;align-items:center;gap:5px;color:{{ u.tone }}"><span style="width:6px;height:6px;border-radius:50%;background:{{ u.tone }}"></span>{{ u.outcome }}</span><span style="color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ u.why }}</span><span style="font-family:'Geist Mono',monospace;color:var(--faint);text-align:right">{{ u.ago }}</span></div></sc-for>
       </div>
 
-      <sc-if value="{{ s.detailError }}" hint-placeholder-val="{{ false }}"><p role="status">Details may be incomplete · {{ s.detailError }}. Retrying in 30 seconds.</p></sc-if>
+      <div style="display:flex;gap:9px;border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:none">
+        <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="8"><button onClick="{{ t.go }}" style="flex:none;white-space:nowrap;padding:6px 0;margin-bottom:-1px;border:none;border-bottom:2px solid {{ t.bd }};background:none;cursor:pointer;font-size:12px;font-weight:500;color:{{ t.fg }}">{{ t.label }}</button></sc-for>
+      </div>
+      <sc-if value="{{ hasDetailNote }}" hint-placeholder-val="{{ false }}"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint);margin-top:-6px">{{ detailNote }}</span></sc-if>
+
       <sc-if value="{{ tabTimeline }}" hint-placeholder-val="{{ true }}">
         <div style="display:flex;flex-direction:column">
           <sc-for list="{{ s.timeline }}" as="e" hint-placeholder-count="8">
@@ -496,9 +647,10 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
       </sc-if>
       <sc-if value="{{ tabTranscript }}" hint-placeholder-val="{{ false }}">
         <div style="background:var(--code);border-radius:8px;padding:10px 12px;font-family:'Geist Mono',monospace;font-size:11.5px;line-height:1.65;color:oklch(0.86 0.005 275);display:flex;flex-direction:column;min-height:260px">
-          <span style="color:oklch(0.55 0.008 275);margin-bottom:4px">GET /submissions/{{ s.submissionId }}/stream · SSE</span>
+          <span style="color:oklch(0.55 0.008 275);margin-bottom:4px">GET /submissions/{{ s.id }}/stream · SSE</span>
           <sc-for list="{{ s.transcript }}" as="l" hint-placeholder-count="8"><span style="color:{{ l.c }};white-space:pre-wrap;word-break:break-word">{{ l.t }}</span></sc-for>
           <sc-if value="{{ s.streaming }}" hint-placeholder-val="{{ false }}"><span style="color:var(--accent);animation:caret 1s steps(1) infinite">▍</span></sc-if>
+          <sc-if value="{{ canReconstruct }}" hint-placeholder-val="{{ false }}"><button onClick="{{ reconstruct }}" style="align-self:flex-start;margin-top:10px;padding:4px 10px;border-radius:6px;border:1px solid oklch(0.4 0.01 275);background:transparent;color:oklch(0.9 0.005 275);cursor:pointer;font-family:Geist,system-ui,sans-serif;font-size:12px;font-weight:500">Retry transcript</button></sc-if>
         </div>
       </sc-if>
       <sc-if value="{{ tabCommands }}" hint-placeholder-val="{{ false }}">
@@ -519,17 +671,36 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
               <div style="display:flex;justify-content:space-between;padding:7px 10px;background:var(--bg);font-size:11.5px"><span style="font-weight:600">ExecPlan</span><span style="font-family:'Geist Mono',monospace;color:var(--faint)">exec-plan.md</span></div>
               <sc-for list="{{ planSteps }}" as="p" hint-placeholder-count="4"><div style="display:grid;grid-template-columns:16px minmax(0,1fr);gap:8px;padding:7px 10px;border-top:1px solid var(--line2);align-items:start"><span style="color:{{ p.tone }};font-size:11px;text-align:center;padding-top:1px">{{ p.mark }}</span><span style="display:flex;flex-direction:column;min-width:0"><span style="font-size:12.5px">{{ p.t }}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ p.sub }}</span></span></div></sc-for>
             </div>
-            <div style="display:flex;flex-direction:column;border:1px solid var(--line2);border-radius:8px;overflow:hidden">
-              <div style="display:flex;justify-content:space-between;padding:7px 10px;background:var(--bg);font-size:11.5px"><span style="font-weight:600">Prompt packets</span><span style="font-family:'Geist Mono',monospace;color:var(--faint)">/submissions/{id}/prompts</span></div>
-              <sc-for list="{{ prompts }}" as="p" hint-placeholder-count="3"><div style="display:grid;grid-template-columns:50px minmax(0,1fr) 60px 40px;gap:8px;padding:6px 10px;border-top:1px solid var(--line2);font-size:11.5px;align-items:center"><span style="font-family:'Geist Mono',monospace;color:var(--faint)">turn {{ p.turn }}</span><span style="font-family:'Geist Mono',monospace">{{ p.act }}</span><span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ p.digest }}</span><span style="font-family:'Geist Mono',monospace;color:var(--muted);text-align:right">{{ p.tokens }}</span></div></sc-for>
-              <div style="background:var(--code);padding:10px 12px;font-family:'Geist Mono',monospace;font-size:11.5px;line-height:1.6;color:oklch(0.8 0.005 275);display:flex;flex-direction:column"><sc-for list="{{ promptPreview }}" as="l" hint-placeholder-count="6"><span style="white-space:pre-wrap;word-break:break-word;min-height:1em">{{ l }}</span></sc-for></div>
-            </div>
           </div>
         </sc-if>
       </sc-if>
+      <sc-if value="{{ tabPrompts }}" hint-placeholder-val="{{ false }}">
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <sc-if value="{{ promptsEmpty }}" hint-placeholder-val="{{ false }}"><div style="font-size:12.5px;color:var(--muted);padding:8px 0">No prompt packets recorded for this workflow yet.</div></sc-if>
+          <div style="display:flex;flex-direction:column;border:1px solid var(--line2);border-radius:8px;overflow:hidden">
+            <sc-for list="{{ promptRows }}" as="p" hint-placeholder-count="3"><div onClick="{{ p.pick }}" style="display:grid;grid-template-columns:50px minmax(0,1fr) 60px 40px;gap:8px;padding:7px 10px;border-top:1px solid var(--line2);font-size:11.5px;align-items:center;cursor:pointer;background:{{ p.bg }}" style-hover="background:var(--hover)"><span style="font-family:'Geist Mono',monospace;color:var(--faint)">turn {{ p.turn }}</span><span style="font-family:'Geist Mono',monospace">{{ p.act }}</span><span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ p.digest }}</span><span style="font-family:'Geist Mono',monospace;color:var(--muted);text-align:right">{{ p.tokens }}</span></div></sc-for>
+          </div>
+          <div style="background:var(--code);border-radius:8px;padding:10px 12px;font-family:'Geist Mono',monospace;font-size:11.5px;line-height:1.6;color:oklch(0.8 0.005 275);display:flex;flex-direction:column;max-height:360px;overflow:auto"><sc-for list="{{ promptPreview }}" as="l" hint-placeholder-count="6"><span style="white-space:pre-wrap;word-break:break-word;min-height:1em">{{ l }}</span></sc-for></div>
+        </div>
+      </sc-if>
+      <sc-if value="{{ tabContext }}" hint-placeholder-val="{{ false }}">
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <div style="display:flex;flex-direction:column;gap:5px"><span style="display:flex;justify-content:space-between;font-size:11.5px"><span style="font-weight:600">Next-turn context · preview</span><span style="font-family:'Geist Mono',monospace;color:var(--muted)">{{ ctxTotal }} · {{ ctxPct }}</span></span><span style="height:6px;border-radius:3px;background:var(--line);overflow:hidden"><span style="display:block;height:100%;width:{{ ctxPct }};background:var(--accent)"></span></span></div>
+          <div style="display:flex;flex-direction:column;border:1px solid var(--line2);border-radius:8px;overflow:hidden">
+            <sc-for list="{{ ctxItems }}" as="c" hint-placeholder-count="9">
+              <div style="display:flex;flex-direction:column;gap:4px;padding:7px 10px;border-top:1px solid var(--line2)">
+                <span style="display:grid;grid-template-columns:56px minmax(0,1fr) 60px 44px;gap:8px;align-items:baseline;font-size:11.5px"><span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ c.cls }}</span><span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ c.name }}</span><span style="color:{{ c.tone }}">{{ c.pri }}</span><span style="font-family:'Geist Mono',monospace;text-align:right;color:var(--muted)">{{ c.kL }}</span></span>
+                <span style="height:3px;border-radius:2px;background:var(--line2);overflow:hidden;margin-left:64px"><span style="display:block;height:100%;width:{{ c.w }};background:{{ c.tone }}"></span></span>
+                <sc-if value="{{ c.hasDeg }}" hint-placeholder-val="{{ false }}"><span style="margin-left:64px;font-family:'Geist Mono',monospace;font-size:11px;color:var(--warn)">{{ c.deg }}</span></sc-if>
+              </div>
+            </sc-for>
+          </div>
+          <span style="font-size:11.5px;color:var(--faint)">context/preview · ordered by priority, low-priority items are summarized or truncated first</span>
+        </div>
+      </sc-if>
       <sc-if value="{{ tabArtifacts }}" hint-placeholder-val="{{ false }}">
         <div style="display:flex;flex-direction:column;border:1px solid var(--line2);border-radius:8px;overflow:hidden">
-          <sc-for list="{{ s.artifacts }}" as="a" hint-placeholder-count="5"><div style="display:grid;grid-template-columns:minmax(0,1fr) 50px 60px;gap:8px;padding:8px 10px;border-top:1px solid var(--line2);font-size:12px;align-items:center" style-hover="background:var(--hover)"><span style="display:flex;flex-direction:column;min-width:0"><span style="font-family:'Geist Mono',monospace;font-size:12px">{{ a.name }}</span><span style="font-size:11.5px;color:var(--faint)">{{ a.desc }}</span></span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">turn {{ a.turn }}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint);text-align:right">{{ a.size }}</span></div></sc-for>
+          <sc-for list="{{ s.artifacts }}" as="a" hint-placeholder-count="5"><div onClick="{{ a.toggle }}" style="display:grid;grid-template-columns:minmax(0,1fr) 50px 60px;gap:8px;padding:8px 10px;border-top:1px solid var(--line2);font-size:12px;align-items:center;cursor:pointer" style-hover="background:var(--hover)"><span style="display:flex;flex-direction:column;min-width:0"><span style="font-family:'Geist Mono',monospace;font-size:12px">{{ a.name }}</span><span style="font-size:11.5px;color:var(--faint)">{{ a.desc }}</span></span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">turn {{ a.turn }}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint);text-align:right">{{ a.size }}</span></div><sc-if value="{{ a.open }}" hint-placeholder-val="{{ false }}"><div style="background:var(--code);padding:10px 12px;font-family:'Geist Mono',monospace;font-size:11px;line-height:1.6;color:oklch(0.82 0.005 275);white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto">{{ a.content }}</div></sc-if></sc-for>
         </div>
       </sc-if>
       <sc-if value="{{ tabProof }}" hint-placeholder-val="{{ false }}">
@@ -538,8 +709,15 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         </div>
       </sc-if>
 
+      <sc-if value="{{ hasSelAudit }}" hint-placeholder-val="{{ false }}">
+        <div style="display:flex;flex-direction:column;border:1px solid var(--line2);border-radius:8px;overflow:hidden">
+          <div style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);font-size:11.5px"><span style="font-weight:600">Audit trail</span><span style="font-family:'Geist Mono',monospace;color:var(--faint)">operator actions</span></div>
+          <sc-for list="{{ selAudit }}" as="u" hint-placeholder-count="1"><div style="display:grid;grid-template-columns:40px 70px minmax(0,1fr) 30px;gap:8px;padding:6px 10px;border-top:1px solid var(--line2);font-size:11.5px;align-items:baseline"><span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ u.at }}</span><span style="font-weight:500">{{ u.action }}</span><span style="color:var(--muted);text-wrap:pretty">{{ u.reason }}</span><span style="font-family:'Geist Mono',monospace;color:{{ u.tone }};text-align:right">{{ u.status }}</span></div></sc-for>
+        </div>
+      </sc-if>
+
       <sc-if value="{{ s.canCancel }}" hint-placeholder-val="{{ false }}">
-        <div style="display:flex;justify-content:space-between;align-items:center;padding-top:10px;border-top:1px solid var(--line2)"><span style="font-size:11.5px;color:var(--faint)">All actions are recorded in the workflow audit trail.</span><button onClick="{{ s.cancel }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;color:var(--fail)" style-hover="border-color:var(--fail)">Cancel workflow</button></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding-top:10px;border-top:1px solid var(--line2)"><span style="font-size:11.5px;color:var(--faint)">Operator action results are recorded in server events.</span><button onClick="{{ s.cancel }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;color:var(--fail)" style-hover="border-color:var(--fail)">Cancel workflow</button></div>
       </sc-if>
     </div>
   </aside>
@@ -558,6 +736,9 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
       <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--muted)">{{ m.endpoint }}</span>
       <span style="font-family:'Geist Mono',monospace;font-size:12px"><span style="color:{{ m.fromTone }}">{{ m.from }}</span> <span style="color:var(--faint)">→</span> <span style="color:{{ m.toTone }}">{{ m.to }}</span></span>
     </div>
+    <sc-if value="{{ m.hasItems }}" hint-placeholder-val="{{ false }}"><div style="margin:8px 18px 0;display:flex;flex-wrap:wrap;gap:4px;max-height:84px;overflow:auto"><sc-for list="{{ m.items }}" as="x" hint-placeholder-count="3"><span style="font-family:'Geist Mono',monospace;font-size:11.5px;padding:1px 7px;border-radius:4px;background:var(--bg);border:1px solid var(--line2)">{{ x }}</span></sc-for></div></sc-if>
+    <sc-if value="{{ m.hasSkipped }}" hint-placeholder-val="{{ false }}"><div style="margin:6px 18px 0;font-size:11.5px;color:var(--faint)">{{ m.skipped }}</div></sc-if>
+    <sc-if value="{{ m.hasCmd }}" hint-placeholder-val="{{ false }}"><div style="margin:8px 18px 0;padding:8px 10px;border-radius:7px;background:var(--code);font-family:'Geist Mono',monospace;font-size:12px;color:oklch(0.9 0.005 275);word-break:break-word">$ {{ m.cmd }}</div></sc-if>
     <label style="padding:14px 18px 0;display:flex;flex-direction:column;gap:6px">
       <span style="font-size:12px;color:var(--muted)">{{ m.reasonLabel }}</span>
       <textarea rows="3" value="{{ reason }}" onChange="{{ onReason }}" placeholder="{{ m.placeholder }}" style="padding:8px 10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);outline:none;resize:vertical;font-size:13px"></textarea>
@@ -566,6 +747,26 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
       <span style="font-size:11.5px;color:var(--faint)">esc to cancel</span>
       <div style="display:flex;gap:8px"><button onClick="{{ closeModal }}" style="padding:6px 12px;border-radius:7px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12.5px">Back</button><button onClick="{{ confirm }}" disabled="{{ confirmDisabled }}" style="padding:6px 14px;border-radius:7px;border:1px solid {{ m.btnBg }};background:{{ m.btnBg }};color:{{ m.btnFg }};cursor:pointer;font-size:12.5px;font-weight:600;opacity:{{ confirmOpacity }}">{{ m.confirm }}</button></div>
     </div>
+  </div>
+</div>
+</sc-if>
+
+<sc-if value="{{ hasPal }}" hint-placeholder-val="{{ false }}">
+<div style="position:fixed;inset:0;z-index:55;display:flex;align-items:flex-start;justify-content:center;padding:14vh 24px 24px">
+  <div onClick="{{ closePal }}" style="position:absolute;inset:0;background:var(--scrim)"></div>
+  <div style="position:relative;width:min(560px,100%);background:var(--raised);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);display:flex;flex-direction:column;overflow:hidden">
+    <input autoFocus="{{ true }}" value="{{ palQ }}" onChange="{{ onPal }}" placeholder="Type a command, screen or repo#issue" style="padding:14px 16px;border:none;border-bottom:1px solid var(--line);background:transparent;outline:none;font-size:14px">
+    <sc-if value="{{ palEmpty }}" hint-placeholder-val="{{ false }}"><div style="padding:18px 16px;color:var(--muted);font-size:12.5px">No matches.</div></sc-if>
+    <div style="display:flex;flex-direction:column;padding:6px;max-height:50vh;overflow:auto">
+      <sc-for list="{{ palItems }}" as="i" hint-placeholder-count="8">
+        <div onClick="{{ i.run }}" onMouseEnter="{{ i.hover }}" style="display:grid;grid-template-columns:64px minmax(0,1fr) auto;gap:10px;align-items:center;padding:8px 10px;border-radius:7px;background:{{ i.bg }};cursor:pointer">
+          <span style="font-size:11px;color:var(--faint)">{{ i.group }}</span>
+          <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ i.t }}</span>
+          <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint)">{{ i.k }}</span>
+        </div>
+      </sc-for>
+    </div>
+    <div style="display:flex;gap:14px;padding:8px 16px;border-top:1px solid var(--line2);font-size:11px;color:var(--faint)"><span>↑↓ move</span><span>enter run</span><span>esc close</span></div>
   </div>
 </div>
 </sc-if>
@@ -583,7 +784,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         <sc-if value="{{ fNeedPrompt }}" hint-placeholder-val="{{ false }}"><label style="display:flex;flex-direction:column;gap:6px"><span style="font-size:12px;color:var(--muted)">Prompt</span><textarea rows="3" value="{{ f.prompt }}" onChange="{{ onFPrompt }}" placeholder="Describe the change" style="padding:8px 10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);outline:none;resize:vertical;font-size:13px"></textarea></label></sc-if>
         <div style="display:flex;gap:18px;flex-wrap:wrap">
           <div style="display:flex;flex-direction:column;gap:6px"><span style="font-size:12px;color:var(--muted)">Agent</span><div style="display:flex;gap:4px;flex-wrap:wrap"><sc-for list="{{ formAgents }}" as="c" hint-placeholder-count="4"><button onClick="{{ c.go }}" style="padding:4px 9px;border-radius:6px;border:1px solid {{ c.bd }};background:{{ c.bg }};color:{{ c.fg }};cursor:pointer;font-family:'Geist Mono',monospace;font-size:11.5px">{{ c.label }}</button></sc-for></div></div>
-          <div style="display:flex;flex-direction:column;gap:6px"><span style="font-size:12px;color:var(--muted)">Effort · server profile</span><div style="display:flex;gap:4px"><sc-for list="{{ formEfforts }}" as="c" hint-placeholder-count="3"><button onClick="{{ c.go }}" style="padding:4px 9px;border-radius:6px;border:1px solid {{ c.bd }};background:{{ c.bg }};color:{{ c.fg }};cursor:pointer;font-family:'Geist Mono',monospace;font-size:11.5px">{{ c.label }}</button></sc-for></div></div>
+          <div style="display:flex;flex-direction:column;gap:6px"><span style="font-size:12px;color:var(--muted)">Effort</span><div style="display:flex;gap:4px"><sc-for list="{{ formEfforts }}" as="c" hint-placeholder-count="3"><button onClick="{{ c.go }}" style="padding:4px 9px;border-radius:6px;border:1px solid {{ c.bd }};background:{{ c.bg }};color:{{ c.fg }};cursor:pointer;font-family:'Geist Mono',monospace;font-size:11.5px">{{ c.label }}</button></sc-for></div></div>
         </div>
         <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);padding:6px 10px;border-radius:6px;background:var(--bg);border:1px solid var(--line2)">$ {{ fCli }}</span>
       </div>
@@ -595,10 +796,11 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         <label style="display:flex;flex-direction:column;gap:6px"><span style="font-size:12px;color:var(--muted)">Max slots</span><input value="{{ f.max }}" onChange="{{ onFMax }}" style="padding:7px 10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);outline:none;font-family:'Geist Mono',monospace;font-size:12.5px;min-width:0"></label>
       </div>
     </sc-if>
+    <sc-if value="{{ fIsProject }}" hint-placeholder-val="{{ false }}"><div style="display:flex;flex-direction:column;gap:6px"><span style="font-size:12px;color:var(--muted)">Default agent</span><div style="display:flex;gap:4px;flex-wrap:wrap"><sc-for list="{{ formAgents }}" as="c" hint-placeholder-count="4"><button onClick="{{ c.go }}" style="padding:4px 9px;border-radius:6px;border:1px solid {{ c.bd }};background:{{ c.bg }};color:{{ c.fg }};cursor:pointer;font-family:'Geist Mono',monospace;font-size:11.5px">{{ c.label }}</button></sc-for></div></div></sc-if>
     <sc-if value="{{ fIsSkill }}" hint-placeholder-val="{{ false }}">
       <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:10px">
         <label style="display:flex;flex-direction:column;gap:6px"><span style="font-size:12px;color:var(--muted)">Name</span><input value="{{ f.name }}" onChange="{{ onFName }}" placeholder="migrate-sqlx" style="padding:7px 10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);outline:none;font-family:'Geist Mono',monospace;font-size:12px;min-width:0"></label>
-        <label style="display:flex;flex-direction:column;gap:6px"><span style="font-size:12px;color:var(--muted)">Skill content</span><input value="{{ f.file }}" onChange="{{ onFFile }}" placeholder="# Skill instructions" style="padding:7px 10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);outline:none;font-family:'Geist Mono',monospace;font-size:12px;min-width:0"></label>
+        <label style="display:flex;flex-direction:column;gap:6px"><span style="font-size:12px;color:var(--muted)">Skill file</span><input value="{{ f.file }}" onChange="{{ onFFile }}" placeholder="skills/migrate-sqlx.md" style="padding:7px 10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);outline:none;font-family:'Geist Mono',monospace;font-size:12px;min-width:0"></label>
       </div>
     </sc-if>
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
@@ -613,12 +815,13 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 <div style="position:fixed;inset:0;z-index:50;display:flex;align-items:flex-start;justify-content:center;padding:12vh 24px 24px">
   <div onClick="{{ closeMem }}" style="position:absolute;inset:0;background:var(--scrim)"></div>
   <div style="position:relative;width:min(560px,100%);background:var(--raised);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);display:flex;flex-direction:column;overflow:hidden">
-    <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px"><span style="display:flex;flex-direction:column;gap:2px"><span style="font-size:15px;font-weight:600">Repo memory · {{ memFor }}</span><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--muted)">GET /api/projects/{{ memFor }}/memory</span></span><button onClick="{{ closeMem }}" style="width:24px;height:24px;border-radius:5px;border:1px solid var(--line);background:transparent;cursor:pointer;color:var(--muted)">✕</button></div>
-    <sc-if value="{{ memEmpty }}" hint-placeholder-val="{{ false }}"><div style="padding:18px;border-top:1px solid var(--line2);color:var(--muted);font-size:12.5px">No memory records. Records are written by GC learn, review findings and failure families.</div></sc-if>
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px"><span style="display:flex;flex-direction:column;gap:2px"><span style="font-size:15px;font-weight:600">Repo memory · {{ memFor }}</span><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--muted)">{{ memorySource }}</span></span><button onClick="{{ closeMem }}" style="width:24px;height:24px;border-radius:5px;border:1px solid var(--line);background:transparent;cursor:pointer;color:var(--muted)">✕</button></div>
+    <div style="display:flex;gap:4px;padding:0 18px 12px;flex-wrap:wrap"><sc-for list="{{ memKinds }}" as="c" hint-placeholder-count="4"><button onClick="{{ c.go }}" style="padding:3px 9px;border-radius:6px;border:1px solid {{ c.bd }};background:{{ c.bg }};color:{{ c.fg }};cursor:pointer;font-size:11.5px;font-weight:500;display:flex;gap:5px">{{ c.label }}<span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ c.count }}</span></button></sc-for></div>
+    <sc-if value="{{ memEmpty }}" hint-placeholder-val="{{ false }}"><div style="padding:18px;border-top:1px solid var(--line2);color:var(--muted);font-size:12.5px">{{ memoryEmptyLabel }}</div></sc-if>
     <sc-for list="{{ memRows }}" as="m" hint-placeholder-count="3">
       <div style="display:grid;grid-template-columns:78px minmax(0,1fr) auto;gap:12px;align-items:start;padding:10px 18px;border-top:1px solid var(--line2)">
         <span style="font-family:'Geist Mono',monospace;font-size:11px;color:var(--faint);padding-top:2px">{{ m.kind }}</span>
-        <span style="display:flex;flex-direction:column;gap:2px;min-width:0"><span style="font-size:12.5px;text-wrap:pretty">{{ m.text }}</span><span style="font-size:11px;color:var(--faint)">{{ m.id }} · {{ m.src }} · {{ m.age }}</span></span>
+        <span style="display:flex;flex-direction:column;gap:2px;min-width:0"><span style="font-size:12.5px;text-wrap:pretty">{{ m.text }}</span><span style="font-size:11px;color:var(--faint)"><span style="color:{{ m.oTone }}">{{ m.outcome }}</span> · used {{ m.uses }}× · {{ m.id }} · {{ m.src }} · {{ m.age }}</span></span>
         <button onClick="{{ m.del }}" style="padding:2px 8px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:11.5px;color:var(--faint)" style-hover="color:var(--fail);border-color:var(--fail)">Delete</button>
       </div>
     </sc-for>
@@ -634,14 +837,22 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 </sc-if>
 </div>
 </x-dc>
-<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;dark&quot;,&quot;light&quot;],&quot;default&quot;:&quot;dark&quot;,&quot;tsType&quot;:&quot;'dark'|'light'&quot;},&quot;density&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;compact&quot;,&quot;standard&quot;,&quot;comfortable&quot;],&quot;default&quot;:&quot;standard&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;startScreen&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;home&quot;,&quot;fleet&quot;,&quot;projects&quot;,&quot;history&quot;,&quot;worktrees&quot;,&quot;usage&quot;,&quot;library&quot;,&quot;system&quot;],&quot;default&quot;:&quot;home&quot;,&quot;tsType&quot;:&quot;string&quot;}}">
+<script type="text/x-dc" data-dc-script>
+
 class Component extends DCLogic {
-  state = { vw: typeof window !== 'undefined' ? window.innerWidth : 1440, screen: new URLSearchParams(location.search).get('screen') || this.props.startScreen || 'home', theme: new URLSearchParams(location.search).get('theme') || this.props.theme || 'dark', density: new URLSearchParams(location.search).get('density') || this.props.density || 'standard', sel: null, tab: 'timeline', q: '', over: {}, modal: null, reason: '', toast: null, tick: 0, hf: 'all', ff: 'all', reclaimed: false, breakers: {}, drafts: {}, extraHist: [], proj: null, newWf: [], form: null, memFor: null, memDel: {}, skillsDel: {}, epCmd: '', reconciled: false, hostAct: {} };
+  state = { vw: typeof window !== 'undefined' ? window.innerWidth : 1440, screen: new URLSearchParams(location.search).get('screen') || this.props.startScreen || 'home', theme: new URLSearchParams(location.search).get('theme') || this.props.theme || 'dark', density: new URLSearchParams(location.search).get('density') || this.props.density || 'standard', sel: null, tab: 'timeline', q: '', over: {}, modal: null, reason: '', toast: null, tick: 0, hf: 'all', ff: 'all', reclaimed: false, breakers: {}, drafts: {}, extraHist: [], proj: null, newWf: [], form: null, memFor: null, memDel: {}, skillsDel: {}, epCmd: '', reconciled: false, hostAct: {}, picked: {}, fleetView: 'state', fleetLimit: 100, pal: null, palIdx: 0, evf: 'all', promptSel: 0, artOpen: {}, memKind: 'all', submitting: false };
 
   componentDidMount() {
     if (!(window.HC && window.HC.X)) this.iv0 = setInterval(() => { if (window.HC && window.HC.X) { clearInterval(this.iv0); this.forceUpdate(); } }, 60);
     this.iv = setInterval(() => this.setState(s => ({ tick: s.tick + 1 })), 1800);
     this.onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); this.setState({ pal: this.state.pal == null ? '' : null, palIdx: 0 }); return; }
+      if (this.state.pal != null) {
+        if (e.key === 'Escape') this.setState({ pal: null });
+        else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); this.setState({ palIdx: Math.max(0, Math.min((this.palItems || []).length - 1, this.state.palIdx + (e.key === 'ArrowDown' ? 1 : -1))) }); }
+        else if (e.key === 'Enter') { e.preventDefault(); this.palItems?.[this.state.palIdx]?.run(); }
+        return;
+      }
       const typing = e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA';
       if (e.key === 'Escape') { if (this.state.form || this.state.memFor) this.setState({ form: null, memFor: null }); else if (this.state.modal) this.setState({ modal: null }); else if (typing) e.target.blur(); else this.setState({ sel: null }); return; }
       if (typing) { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && this.state.modal) this.doConfirm(); return; }
@@ -650,7 +861,7 @@ class Component extends DCLogic {
       if (e.key === '/') { e.preventDefault(); const i = document.querySelector('header input'); i && i.focus(); return; }
       if (e.key === 'j' || e.key === 'ArrowDown') { e.preventDefault(); this.move(1); }
       if (e.key === 'k' || e.key === 'ArrowUp') { e.preventDefault(); this.move(-1); }
-      const scr = ['home', 'fleet', 'projects', 'history', 'worktrees', 'usage', 'library', 'system'][+e.key - 1];
+      const scr = ['home', 'fleet', 'projects', 'history', 'worktrees', 'events', 'usage', 'library', 'system'][+e.key - 1];
       if (scr) this.goScreen(scr);
     };
     window.addEventListener('keydown', this.onKey);
@@ -659,8 +870,12 @@ class Component extends DCLogic {
   }
   componentWillUnmount() { clearInterval(this.iv); clearInterval(this.iv0); clearTimeout(this.tt); window.removeEventListener('keydown', this.onKey); window.removeEventListener('resize', this.onResize); }
   componentDidUpdate(pp) {
-    if (pp.startScreen !== this.props.startScreen && this.props.startScreen) this.setState({ screen: this.props.startScreen });
-    if (this.state.modal && !window.HC.workflows.some(w => w.id === this.state.modal.id && (this.state.modal.action === 'cancel' || w.inbox?.actions?.includes(this.state.modal.action)))) {
+    if (pp?.startScreen !== this.props.startScreen && this.props.startScreen) this.setState({ screen: this.props.startScreen });
+    if (this.lastSelectedWorkflow !== this.state.sel) {
+      this.lastSelectedWorkflow = this.state.sel;
+      if (this.state.promptSel !== 0) this.setState({ promptSel: 0 });
+    }
+    if (this.state.modal && !this.state.submitting && !window.HC.workflows.some(w => (this.state.modal.ids || [this.state.modal.id]).includes(w.id) && this.eligible(this.state.modal.action, w, this.state.modal.requestId))) {
       this.setState({ modal: null, reason: '' });
       this.flash('Workflow changed', 'The pending action was closed.');
       return;
@@ -673,7 +888,7 @@ class Component extends DCLogic {
     }
     if (this.state.sel) {
       const selected = [...window.HC.workflows, ...window.HC.history].find(w => w.id === this.state.sel);
-      if (selected) window.HC.loadDetails?.(selected);
+      if (selected) { window.HC.loadDetails?.(selected); if (this.state.tab === 'context') window.HC.loadContext?.(selected); }
     }
   }
 
@@ -696,12 +911,8 @@ class Component extends DCLogic {
   }
   openTask() { this.setState({ form: { kind: 'task', tk: 'issue', repo: window.HC.projects[0]?.id || '', num: '', prompt: '', agent: 'auto', effort: 'medium' } }); }
   setF(k) { return (e) => { const v = e && e.target ? e.target.value : e; this.setState(s => ({ form: { ...s.form, [k]: v } })); }; }
-  policy(cmd) {
-    const c = (cmd || '').trim();
-    const R = [[/^(sudo|su)\b/, 'forbidden', 'privilege escalation'], [/^rm\s+-rf?\s+(\/|~)/, 'forbidden', 'destructive path outside workspace'], [/^git\s+push\b.*(--force|\s-f\b)/, 'forbidden', 'force push'], [/^git\s+push\b/, 'prompt', 'network write · operator approval'], [/^(curl|wget|cargo\s+fetch|npm\s+i)/, 'prompt', 'network access'], [/^cargo\s+(check|test|clippy|build|fmt)\b/, 'allow', 'workspace-safe toolchain'], [/^(rg|ls|cat|git\s+(status|diff|log))\b/, 'allow', 'read-only']];
-    const hit = R.find(([re]) => re.test(c));
-    const [d, why] = hit ? [hit[1], hit[2]] : ['prompt', 'no matching rule · default decision'];
-    return { d, why, tone: d === 'allow' ? 'var(--ok)' : d === 'forbidden' ? 'var(--fail)' : 'var(--warn)' };
+  policy() {
+    return { d: 'Not evaluated', why: 'No server policy-preview endpoint. Use harness execpolicy check for the configured policy.', tone: 'var(--faint)' };
   }
   async submitForm() {
     const f = this.state.form, H = window.HC;
@@ -727,6 +938,7 @@ class Component extends DCLogic {
         this.goScreen('library', { form: null });
         this.flash('Skill created', f.name.trim());
       }
+      try { await H.recordAction('create ' + f.kind, null, '', '', 'accepted'); } catch (error) { this.flash('Created ' + f.kind, 'Action log unavailable: ' + error.message); }
       await H.refresh(true);
     } catch (error) {
       this.flash('Request failed', error.message || String(error));
@@ -738,7 +950,9 @@ class Component extends DCLogic {
   async runAction(label, action) {
     try {
       const result = await action();
-      this.flash(label, typeof result === 'string' ? result : 'Completed');
+      let auditError = '';
+      try { await window.HC.recordAction(label, null, '', '', 'accepted'); } catch (error) { auditError = ' · action log unavailable: ' + error.message; }
+      this.flash(label, (typeof result === 'string' ? result : 'Completed') + auditError);
       await window.HC.refresh(true);
     } catch (error) {
       this.flash('Request failed', error.message || String(error));
@@ -763,33 +977,7 @@ class Component extends DCLogic {
       }
       return;
     }
-    this.setState({ modal: { action, id: w.id }, reason: '', sel: w.id });
-  }
-
-  async doConfirm() {
-    const md = this.state.modal; if (!md) return;
-    const w = this.all().find(x => x.id === md.id);
-    if (!w || (md.action !== 'cancel' && !w.inbox?.actions?.includes(md.action))) {
-      this.setState({ modal: null, reason: '' });
-      this.flash('Workflow changed', 'The pending action was closed.');
-      return;
-    }
-    const A = this.actionMeta(md.action, w);
-    if (A.required && !this.state.reason.trim()) return;
-    const body = { workflow_id: w.id };
-    if (md.action === 'unblock' || md.action === 'retry') body.reason = this.state.reason.trim();
-    if (md.action === 'unblock' && w.inbox?.target) body.target_state = w.inbox.target;
-    const isApproval = md.action === 'approve' || md.action === 'deny';
-    const path = isApproval ? '/api/workflows/runtime/turns/' + encodeURIComponent(w.submissionId) + '/approvals/' + encodeURIComponent(w.inbox.requestId) : A.endpoint.replace('POST ', '');
-    const payload = isApproval ? (md.action === 'approve' ? { decision: 'accept' } : { decision: 'reject', reason: this.state.reason.trim() }) : body;
-    try {
-      await window.HC.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      this.setState({ modal: null, reason: '' });
-      this.flash('Request accepted for ' + w.ref, 'Workflow state will refresh shortly.');
-      await window.HC.refresh();
-    } catch (error) {
-      this.flash('Request failed', error.message || String(error));
-    }
+    this.setState({ modal: { action, id: w.id, requestId: w.inbox?.requestId }, reason: '', sel: w.id });
   }
 
   actionMeta(a, w) {
@@ -826,10 +1014,12 @@ class Component extends DCLogic {
     const liveAct = live && w.file ? (w.state === 'local_review_gate' ? 'review ' + w.branch : 'edit ' + w.file) : '';
     return {
       ...w, stateLabel: label, tone, obsTone,
+      pickMark: this.state.picked[w.id] ? '✓' : '', pickBd: this.state.picked[w.id] ? 'var(--accent)' : 'var(--line)', pickBg: this.state.picked[w.id] ? 'var(--accent)' : 'transparent',
+      togglePick: e => { this.stop(e); this.setState({ picked: { ...this.state.picked, [w.id]: !this.state.picked[w.id] } }); },
       activity: w.state === 'pending' ? w.waiting : (w.activity || liveAct || act),
       turnPct: typeof w.max === 'number' && w.max > 0 ? Math.round((w.turn / w.max) * 100) + '%' : '0%',
-      leaseTone: w.lease === 'expired' ? 'var(--warn)' : w.lease === 'active' ? 'var(--muted)' : 'var(--faint)',
-      bg: sel ? 'var(--sel)' : 'transparent', edge: sel ? 'inset 2px 0 0 var(--accent)' : 'none',
+      leaseTone: w.lease === 'expired' || w.lease === 'missing' ? 'var(--fail)' : w.lease === 'active' ? 'var(--muted)' : 'var(--faint)',
+      bg: sel ? 'var(--sel)' : this.state.picked[w.id] ? 'oklch(0.72 0.14 275 / 0.08)' : Date.now() - w.changedAt < 3600 ? 'oklch(0.77 0.14 155 / 0.13)' : 'transparent', edge: sel ? 'inset 2px 0 0 var(--accent)' : w.inbox?.kind === 'lease' ? 'inset 3px 0 0 var(--fail)' : 'none',
       kindTone: w.inbox ? H.K[w.inbox.kind].tone : 'var(--muted)',
       select: () => { this.setState({ sel: w.id }); H.loadDetails?.(w); }, btns: this.btns(w),
     };
@@ -865,7 +1055,7 @@ class Component extends DCLogic {
       type: c.command?.command_type || 'Command', status: c.status, tone: c.status === 'succeeded' ? 'var(--ok)' : c.status === 'failed' ? 'var(--fail)' : 'var(--run)',
       jobs: (c.runtime_jobs || []).map(j => ({ id: j.id.slice(0, 8), profile: j.runtime_profile, host: j.lease?.owner || '—', lease: j.lease_state || j.status, tone: j.status === 'failed' ? 'var(--fail)' : 'var(--muted)' })),
     }));
-    const artifacts = (detail.artifacts || []).map(a => ({ name: a.artifact_type, desc: a.created_at ? new Date(a.created_at).toLocaleString() : '', turn: a.turn, size: a.content ? Math.ceil(a.content.length / 1024) + ' KB' : '0 KB' }));
+    const artifacts = (detail.artifacts || []).map((a, index) => ({ content: a.content, open: !!this.state.artOpen[w.id + ':' + index], toggle: () => this.setState({ artOpen: { ...this.state.artOpen, [w.id + ':' + index]: !this.state.artOpen[w.id + ':' + index] } }), name: a.artifact_type, desc: a.created_at ? new Date(a.created_at).toLocaleString() : '', turn: a.turn, size: a.content ? Math.ceil(a.content.length / 1024) + ' KB' : '0 KB' }));
     const P = (k, sub, v, ok) => ({ k, sub, v, tone: ok ? 'var(--ok)' : 'var(--faint)', mark: ok ? '✓' : '○' });
     const proof = detail.proof ? [
       P('Pull request', detail.proof.pr_url || '—', detail.proof.pr_url ? w.prLabel : '—', !!detail.proof.pr_url),
@@ -886,7 +1076,7 @@ class Component extends DCLogic {
   extra(H, all, hist) {
     const X = H.X, s = this.state, fl = (a, b) => this.flash(a, b);
     const pick = (list, cur, key) => list.map(([k, label]) => ({ label, go: () => this.setF(key)(k), bg: cur === k ? 'var(--sel)' : 'transparent', fg: cur === k ? 'var(--ink)' : 'var(--muted)', bd: cur === k ? 'var(--accent)' : 'var(--line)' }));
-    const U = X.usage, hmax = Math.max(...U.hourly);
+    const U = X.usage, hmax = Math.max(...U.hourly, 0.001);
     const usageStats = [['Tokens · 24h', U.tokens], ['Est. cost', U.cost], ['Turns', U.turns], ['Cache read', U.cache]].map(([k, v]) => ({ k, v }));
     const quotas = U.quotas.map(q => ({ ...q, w: q.used + '%', tone: q.used >= 75 ? 'var(--warn)' : 'var(--run)' }));
     const hourly = U.hourly.map(v => ({ h: Math.round(v / hmax * 100) + '%', tip: v.toFixed(1) + 'M' }));
@@ -927,7 +1117,7 @@ class Component extends DCLogic {
       openTask: () => this.openTask(),
       usageStats, quotas, quotaNote: quotas.length ? 'Provider limits' : 'Not exposed by /api/usage-monitor', hourly, hourlyNote: hourly.length ? U.hourlySource : 'Hourly series unavailable', usageTables,
       skills, rules, ep, epCmd: s.epCmd, onEp: (e) => this.setState({ epCmd: e.target.value }), evals,
-      runCheck: () => this.runAction('Rule check complete', async () => { const rows = await H.rpc('rule_check', { project_root: H.projects[0]?.root, files: null }); return (rows?.length || 0) + ' violations'; }),
+      runCheck: () => this.runAction('Rule check complete', async () => { const rows = await H.rpc('rule_check', { project_root: H.projects[0]?.root, files: null }); X.rules = (rows || []).map(row => ({ id: row.rule_id, name: row.message, lang: row.file || '—', sev: row.severity, hits: 1, fix: false })); H.rules.failing = X.rules.length; H.rules.lastCheck = new Date().toLocaleTimeString(); return X.rules.length + ' violations'; }),
       autoFix: () => fl('Auto-fix unavailable', 'The server does not expose an auto-fix endpoint.'),
       learnRules: () => this.runAction('Rule learning complete', () => H.rpc('learn_rules', { project_root: H.projects[0]?.root })),
       learnSkills: () => this.runAction('Skill learning complete', () => H.rpc('learn_skills', { project_root: H.projects[0]?.root })),
@@ -948,6 +1138,168 @@ class Component extends DCLogic {
     };
   }
 
+  eligible(action, w, requestId) {
+    if (requestId && ['approve', 'deny'].includes(action)) return !!w?.approvals?.some(item => item.id === requestId);
+    return !!w && !w.terminal && (action === 'cancel' || !!w.inbox?.actions?.includes(action));
+  }
+  openBulk(action, ids) {
+    const selected = this.all().filter(w => ids.includes(w.id));
+    const eligible = selected.filter(w => this.eligible(action, w));
+    if (!eligible.length) { this.flash('No eligible workflows', 'Refresh the workflow state and try again.'); return; }
+    this.setState({ modal: { action, ids: eligible.map(w => w.id), skipped: selected.length - eligible.length }, reason: '' });
+  }
+  bulk(action) { this.openBulk(action, Object.keys(this.state.picked).filter(id => this.state.picked[id])); }
+  async doConfirm() {
+    const md = this.state.modal;
+    if (!md || this.state.submitting) return;
+    const ids = md.ids || [md.id];
+    const workflows = this.all().filter(w => ids.includes(w.id) && this.eligible(md.action, w, md.requestId)).map(w => md.requestId ? { ...w, inbox: { ...w.inbox, requestId: md.requestId } } : w);
+    if (!workflows.length) { this.setState({ modal: null }); this.flash('Workflow changed', 'No selected workflow remains eligible.'); return; }
+    const reason = this.state.reason.trim();
+    if ((md.ids || this.actionMeta(md.action, workflows[0]).required) && !reason) return;
+    this.setState({ submitting: true });
+    const H = window.HC, errors = [], auditErrors = [];
+    let accepted = 0;
+    for (const w of workflows) {
+      const action = md.action;
+      const path = this.actionMeta(action, w).endpoint.replace('POST ', '');
+      const body = action === 'approve' ? { decision: 'accept' } : action === 'deny' ? { decision: 'reject', reason } : { workflow_id: w.id, ...(['unblock', 'retry'].includes(action) ? { reason } : {}), ...(action === 'unblock' && w.inbox?.target ? { target_state: w.inbox.target } : {}) };
+      let status = 'accepted';
+      try { await H.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); accepted++; }
+      catch (error) { status = 'failed'; errors.push(w.ref + ': ' + error.message); }
+      try { await H.recordAction(action, w, reason, path, status); }
+      catch (error) { auditErrors.push(error.message); }
+    }
+    this.setState({ submitting: false, modal: null, reason: '', picked: {} });
+    this.flash(accepted + '/' + workflows.length + ' requests accepted', [...errors, ...(auditErrors.length ? ['Action log unavailable: ' + auditErrors.join(' · ')] : [])].join(' · ') || 'Workflow state will refresh shortly.');
+    await H.refresh(true);
+  }
+  async copy(text, label) {
+    try { await navigator.clipboard.writeText(text); this.flash(label, 'Copied to clipboard; nothing was executed.'); }
+    catch (error) { this.flash('Copy failed', error.message || String(error)); }
+  }
+  cleanupCommand(w) {
+    const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'";
+    return w.source_repo && w.workspace_path ? 'git -C ' + quote(w.source_repo) + ' worktree remove ' + quote(w.workspace_path) : null;
+  }
+  openExternal(url) {
+    try {
+      const target = new URL(url);
+      if (target.protocol !== 'https:' || target.hostname !== 'github.com') throw new Error('No GitHub link available');
+      window.open(target.href, '_blank', 'noopener,noreferrer');
+    } catch (error) { this.flash('Cannot open link', error.message); }
+  }
+  extraV3(H, all, hist, base) {
+    const s = this.state, set = update => () => this.setState(update);
+    const active = all.filter(w => !w.terminal);
+    const shown = active.filter(w => this.match(w) && (s.ff === 'all' || s.ff === 'attn' && w.inbox || s.ff === w.projectId));
+    const selected = [...all, ...hist].find(w => w.id === s.sel);
+    const detail = H.details?.get(s.sel) || {};
+    const mobile = s.vw < 760;
+    const noProjects = !H.loading && !H.loadError && !H.partialError && H.projects.length === 0;
+    const dataError = H.loadError || H.partialError || H.historyError || H.eventsError || Object.values(H.memoryErrors || {}).join(' · ');
+    const banner = dataError ? { tone: 'var(--fail)', t: 'Some data could not be refreshed', sub: dataError + ' · retaining the last successful snapshot' }
+      : H.hosts.length && H.hosts.every(h => !h.online) ? { tone: 'var(--warn)', t: 'All runtime hosts offline', sub: 'Waiting for a runtime host to reconnect.' } : null;
+    const byId = new Map(shown.flatMap(w => [[w.id, w], [w.submissionId, w]]));
+    const children = new Map(), parents = new Map();
+    for (const w of shown) {
+      const p = (w.dependsOn || []).map(id => byId.get(id)).find(p => p && p.id !== w.id);
+      if (p) { parents.set(w.id, p); children.set(p.id, [...(children.get(p.id) || []), w]); }
+    }
+    const visited = new Set(), treeRows = [];
+    const walk = (w, depth) => {
+      if (visited.has(w.id)) return;
+      visited.add(w.id);
+      const deps = (w.dependsOn || []).map(id => byId.get(id)?.ref || id);
+      treeRows.push({ ...this.deco(w), pad: (16 + depth * 24) + 'px', branch: depth ? '└' : '', waitsOn: deps.length ? 'depends on ' + deps.join(', ') : '', nKids: children.get(w.id)?.length ? children.get(w.id).length + ' dependents' : '' });
+      (children.get(w.id) || []).forEach(child => walk(child, depth + 1));
+    };
+    shown.filter(w => !parents.has(w.id)).forEach(w => walk(w, 0));
+    shown.forEach(w => walk(w, 0));
+    const groups = new Map();
+    for (const w of shown.filter(w => ['failed', 'blocked'].includes(w.state))) {
+      const cls = w.failureClass || 'unclassified';
+      groups.set(cls, [...(groups.get(cls) || []), w]);
+    }
+    const failGroups = [...groups].map(([cls, rows]) => {
+      const action = rows.some(w => this.eligible('retry', w)) ? 'retry' : 'unblock';
+      const eligible = rows.filter(w => this.eligible(action, w));
+      return { cls, count: rows.length, desc: rows[0].inbox?.hint || 'No failure detail recorded', rLabel: eligible.length ? 'Action available' : 'No action offered', rTone: 'var(--warn)', tone: 'var(--fail)', canAct: eligible.length > 0, actLabel: (action === 'retry' ? 'Retry' : 'Unblock') + ' all · ' + eligible.length, act: () => this.openBulk(action, rows.map(w => w.id)), rows: rows.map(w => this.deco(w)) };
+    });
+    const picked = active.filter(w => s.picked[w.id]);
+    const bulkBtns = [['retry', 'Retry'], ['unblock', 'Unblock'], ['merge', 'Merge'], ['cancel', 'Cancel']].map(([action, label]) => {
+      const count = picked.filter(w => this.eligible(action, w)).length;
+      return { label: label + ' · ' + count, go: () => this.bulk(action), op: count && !s.submitting ? 1 : 0.4, fg: action === 'cancel' ? 'var(--fail)' : 'var(--ink)' };
+    });
+    const approvals = active.filter(w => this.match(w)).flatMap(w => (w.approvals || []).map(item => ({ ...w, approval: { command: item.action, scope: 'Submission ' + w.submissionId }, inbox: { ...w.inbox, kind: 'approval', requestId: item.id } }))).map(w => ({ ...this.deco(w), command: w.approval?.command || w.inbox.hint, scope: w.approval?.scope || 'Submission ' + w.submissionId, policy: 'Approval required', polTone: 'var(--warn)', ago: w.inbox.ago, approve: e => this.openModal('approve', w, e), deny: e => this.openModal('deny', w, e) }));
+    const kindFor = e => e.hook === 'console_action' ? 'audit' : e.decision === 'block' ? 'rejected' : e.decision === 'gate' || e.decision === 'escalate' ? 'stop' : 'decision';
+    const kinds = { decision: ['Decision', 'var(--ink)'], rejected: ['Rejected', 'var(--fail)'], stop: ['Stop', 'var(--warn)'], audit: ['Operator', 'var(--accent)'] };
+    const eventRows = (H.events || []).map(e => {
+      let action = {}; if (e.hook === 'console_action') { try { action = JSON.parse(e.detail || '{}') || {}; } catch {} }
+      const w = [...all, ...hist].find(w => w.id === action.workflow_id || w.submissionId === e.metadata?.task_id);
+      return { ...e, kind: kindFor(e), action, workflow: w };
+    });
+    const events = eventRows.filter(e => (s.evf === 'all' || e.kind === s.evf) && (!s.q || [e.tool, e.reason, e.detail, e.workflow?.ref].join(' ').toLowerCase().includes(s.q.toLowerCase()))).map(e => ({ ts: new Date(e.ts).toLocaleTimeString(), kindLabel: kinds[e.kind][0], tone: kinds[e.kind][1], ref: e.workflow?.ref || e.action.ref || e.metadata?.task_id || '—', text: e.tool + ' · ' + e.decision, sub: e.reason || e.detail || '', bg: e.workflow?.id === s.sel ? 'var(--sel)' : 'transparent', select: () => { if (e.workflow) { this.setState({ sel: e.workflow.id }); H.loadDetails(e.workflow); } } }));
+    const evFilters = [['all', 'All'], ...Object.entries(kinds).map(([k, v]) => [k, v[0]])].map(([k, label]) => ({ label, count: k === 'all' ? eventRows.length : eventRows.filter(e => e.kind === k).length, go: set({ evf: k }), bg: s.evf === k ? 'var(--sel)' : 'transparent', fg: s.evf === k ? 'var(--ink)' : 'var(--muted)', bd: s.evf === k ? 'var(--accent)' : 'var(--line)' }));
+    const selAudit = selected ? eventRows.filter(e => e.kind === 'audit' && e.action.workflow_id === selected.id).map(e => ({ at: new Date(e.ts).toLocaleTimeString(), action: e.tool, reason: e.reason || '—', status: e.action.status, tone: e.action.status === 'accepted' ? 'var(--ok)' : 'var(--fail)' })) : [];
+    const screens = [['home', 'Home'], ['fleet', 'Fleet'], ['projects', 'Projects'], ['history', 'History'], ['worktrees', 'Worktrees'], ['events', 'Events'], ['usage', 'Usage'], ['library', 'Skills & rules'], ['system', 'System']];
+    const actions = [['New task', base.openTask], ['Register project', base.newProject], ['Create skill', base.newSkill], ['Run GC', base.runGc], ['Reconcile · dry run', base.recDry], ['Run rule check', base.runCheck]];
+    const query = (s.pal || '').trim().toLowerCase();
+    const palette = [...actions.map(([t, fn]) => ({ t, fn, group: 'Action', k: '' })), ...screens.map(([id, t], i) => ({ t, fn: () => this.goScreen(id), group: 'Go to', k: String(i + 1) })), ...[...active, ...hist].map(w => ({ t: w.ref + ' · ' + w.title, fn: () => { this.setState({ sel: w.id }); H.loadDetails(w); }, group: 'Workflow', k: w.state }))].filter(i => query ? (i.group + ' ' + i.t).toLowerCase().includes(query) : i.group !== 'Workflow').slice(0, 10);
+    const palItems = palette.map((item, index) => ({ ...item, run: () => { this.setState({ pal: null }); item.fn(); }, bg: index === s.palIdx ? 'var(--sel)' : 'transparent', hover: set({ palIdx: index }) }));
+    this.palItems = palItems;
+    const rawPrompts = detail.prompts || [];
+    const promptIndex = Math.min(s.promptSel, Math.max(0, rawPrompts.length - 1));
+    const promptRows = rawPrompts.map((p, index) => ({ turn: p.turn, act: p.phase, digest: '#' + (index + 1), tokens: '—', bg: promptIndex === index ? 'var(--sel)' : 'transparent', pick: set({ promptSel: index }) }));
+    const context = H.contexts?.get(s.sel);
+    const manifest = context?.manifest;
+    const budget = manifest?.budget;
+    const ctxItems = (manifest?.items || []).map(i => ({ cls: i.class, name: i.id, pri: i.decision, kL: i.tokens + ' tokens', w: budget?.effective ? Math.min(100, i.tokens / budget.effective * 100) + '%' : '0%', tone: i.decision === 'excluded' ? 'var(--faint)' : 'var(--accent)', hasDeg: !!i.reason, deg: i.reason || '' }));
+    const ctxErrors = [...(manifest?.provider_errors || []).map(e => e.message || JSON.stringify(e)), ...(manifest?.warnings || [])];
+    let detailNote = detail.loading ? 'Loading workflow details…' : detail.error || '';
+    if (s.tab === 'context') detailNote = context?.loading ? 'Loading context preview…' : context?.error || ctxErrors.join(' · ') || 'Preview composed now; recorded prompt packets are available in Prompts.';
+    const mem = s.memFor ? H.X.memory[s.memFor] || [] : [];
+    const memKind = s.memKind;
+    const memKinds = ['all', ...new Set(mem.map(m => m.kind))].map(kind => ({ label: kind === 'all' ? 'All' : kind, count: kind === 'all' ? mem.length : mem.filter(m => m.kind === kind).length, go: set({ memKind: kind }), bg: memKind === kind ? 'var(--sel)' : 'transparent', fg: memKind === kind ? 'var(--ink)' : 'var(--muted)', bd: memKind === kind ? 'var(--accent)' : 'var(--line)' }));
+    const memRows = base.memRows.filter(m => memKind === 'all' || m.kind === memKind).map(m => ({ ...m, oTone: m.outcome === 'failure' ? 'var(--warn)' : 'var(--muted)' }));
+    const orphans = (H.worktrees || []).filter(w => w.status === 'orphaned');
+    const commands = orphans.map(w => this.cleanupCommand(w)).filter(Boolean);
+    const worktrees = base.worktrees.map((w, index) => { const cmd = this.cleanupCommand(H.worktrees[index]); return { ...w, cmd: cmd || 'Repository path unavailable', reclaim: () => cmd ? this.copy(cmd, 'Cleanup command copied') : this.flash('Cleanup unavailable', 'No source repository recorded') }; });
+    const sameIssue = selected ? [...all, ...hist].filter((w, i, rows) => rows.findIndex(x => x.id === w.id) === i && (w.id === selected.id || selected.issue && w.issue === selected.issue && w.repository === selected.repository)) : [];
+    const runs = sameIssue.map((w, i) => ({ run: 'run ' + (i + 1), outcome: (H.S[w.state] || [w.state])[0], tone: (H.S[w.state] || [null, 'var(--muted)'])[1], why: w.title + ' · ' + w.id, ago: w.ago }));
+    let modal = base.m;
+    if (s.modal?.ids) {
+      const rows = active.filter(w => s.modal.ids.includes(w.id) && this.eligible(s.modal.action, w));
+      if (rows.length) {
+        const A = this.actionMeta(s.modal.action, rows[0]);
+        modal = { title: A.title + ' · ' + rows.length, ref: rows.length + ' selected workflows', wfTitle: 'One request per eligible workflow', endpoint: A.endpoint, from: 'selected states', to: A.to, fromTone: 'var(--muted)', toTone: 'var(--warn)', confirm: A.confirm + ' · ' + rows.length, reasonLabel: 'Reason required · recorded in server events', placeholder: A.ph, btnBg: A.danger ? 'var(--fail)' : 'var(--btn)', btnFg: 'var(--btnFg)', items: rows.map(w => w.ref), hasItems: true, skipped: s.modal.skipped ? s.modal.skipped + ' ineligible selections skipped' : '', hasSkipped: !!s.modal.skipped };
+      }
+    }
+    const limit = s.fleetLimit;
+    const groupsVisible = base.fleetGroups.map(group => ({ ...group, rows: group.rows.filter(row => shown.slice(0, limit).some(w => w.id === row.id)) })).filter(group => group.rows.length);
+    return {
+      rootMaxW: 'none', serverPort: location.port ? ':' + location.port : '', hdrDisplay: mobile ? 'none' : 'flex', navDisplay: mobile ? 'none' : 'flex', isMobile: mobile,
+      ...(mobile ? { cols: 'minmax(0,1fr)', scrim: false, inspPos: 'fixed', inspTop: '48px', inspW: '100%', inspShadow: 'none', wide: false, isHome: false, isFleet: false, isProjects: false, isHistory: false, isWorktrees: false, isUsage: false, isLibrary: false, isSystem: false } : {}),
+      ...(noProjects && !mobile ? { isHome: false } : {}), isOnboard: noProjects && s.screen === 'home' && !mobile,
+      hasBanner: !!banner, banner: banner || {}, liveLabel: (H.eventsError ? 'Partial' : base.liveStatus) + ' · poll 5s', dataLabel: 'Harness API',
+      mInbox: active.filter(w => w.inbox && this.match(w)).map(w => ({ ...this.deco(w), kindLabel: H.K[w.inbox.kind].label })), mRunning: active.filter(w => !w.inbox && w.state !== 'pending' && this.match(w)).map(w => this.deco(w)), mInboxCount: active.filter(w => w.inbox).length,
+      isEvents: s.screen === 'events' && !mobile, events, evFilters, evEmpty: events.length === 0, eventsEmptyLabel: H.loading || H.eventsLoading ? 'Loading events…' : H.eventsError ? 'Events unavailable · ' + H.eventsError : 'No events match.',
+      fleetViews: [['state', 'By state'], ['tree', 'Dependency tree'], ['failure', 'By failure']].map(([key, label]) => ({ label, go: set({ fleetView: key }), bg: s.fleetView === key ? 'var(--sel)' : 'transparent', fg: s.fleetView === key ? 'var(--ink)' : 'var(--muted)' })),
+      isTreeView: s.fleetView === 'tree', isStateView: s.fleetView === 'state', isFailView: s.fleetView === 'failure', treeRows: treeRows.slice(0, limit), failGroups, failEmpty: !failGroups.length, fleetGroups: groupsVisible,
+      hasPicked: picked.length > 0, pickedCount: picked.length, bulkBtns, clearPicked: set({ picked: {} }),
+      pageHasMore: shown.length > limit, pageLabel: Math.min(shown.length, limit) + ' of ' + shown.length + ' workflows shown', loadMore: set({ fleetLimit: limit + 100 }),
+      approvals, hasApprovals: approvals.length > 0, approvalCount: approvals.length, openBreakers: base.breakers.filter(b => b.open), hasOpenBreakers: base.breakers.some(b => b.open),
+      detailNote, hasDetailNote: !!detailNote, promptRows, promptsEmpty: !rawPrompts.length, promptPreview: (rawPrompts[promptIndex]?.prompt || '').split('\n'), tabPrompts: s.tab === 'prompts',
+      tabContext: s.tab === 'context', ctxItems, ctxTotal: budget ? budget.used + ' / ' + budget.effective + ' tokens' : '—', ctxPct: budget?.effective ? Math.min(100, budget.used / budget.effective * 100).toFixed(1) + '%' : '0%',
+      selAudit, hasSelAudit: selAudit.length > 0, runs, hasPr: !!selected?.prUrl, openIssue: () => this.openExternal(selected?.repository && selected?.issue ? 'https://github.com/' + selected.repository + '/issues/' + selected.issue : null), openPr: () => this.openExternal(selected?.prUrl),
+      canReconstruct: !!selected && H.transcriptFailed?.has(selected.id), reconstruct: () => selected && H.loadTranscript(selected),
+      hasPal: s.pal != null, palQ: s.pal || '', onPal: e => this.setState({ pal: e.target.value, palIdx: 0 }), palItems, palEmpty: !palItems.length, closePal: set({ pal: null }), openPal: set({ pal: '', palIdx: 0 }),
+      memorySource: H.memoryErrors?.[s.memFor] || H.memoryUnavailable?.[s.memFor] || H.memoryRepos?.[s.memFor] || 'Repository identity unavailable', memoryEmptyLabel: H.memoryLoading?.[s.memFor] ? 'Loading repository memory…' : H.memoryErrors?.[s.memFor] || H.memoryUnavailable?.[s.memFor] || 'No matching memory records.', memKinds, memRows, memEmpty: !!s.memFor && !memRows.length, intakeRecent: H.intakeRecent || [], usageSrc: 'Recorded usage · last 24h', quotasEmpty: !base.quotas.length, costNote: H.costNote || '', intakeDegraded: !!H.intake?.degraded, intakeDegradedLabel: H.intake?.degraded?.reason || '',
+      worktrees, wtHasOrphans: commands.length > 0, wtOrphanCount: commands.length, wtCopyAll: () => this.copy(commands.join('\n'), 'Cleanup commands copied'),
+      hasModal: !!modal?.title, m: modal, confirmDisabled: s.submitting || (s.modal?.ids ? !s.reason.trim() : base.confirmDisabled), confirmOpacity: s.submitting || s.modal?.ids && !s.reason.trim() ? 0.4 : base.confirmOpacity,
+    };
+  }
+
   renderVals() {
     const H = window.HC, s = this.state;
     if (!H || !H.X) return { wide: true, isHome: s.screen === 'home', hasSel: false, themeName: s.theme, densityName: s.density, cols: '212px minmax(0,1fr)' };
@@ -956,7 +1308,7 @@ class Component extends DCLogic {
     const active = all.filter(w => !w.terminal && w.state !== 'done' && w.state !== 'cancelled');
     const shown = active.filter(w => this.match(w));
     const inboxAll = active.filter(w => w.inbox);
-    const inbox = shown.filter(w => w.inbox);
+    const inbox = shown.filter(w => w.inbox && w.inbox.kind !== 'approval');
     const inboxGroups = H.KIND_ORDER.map(k => ({ k, ...H.K[k], rows: inbox.filter(w => w.inbox.kind === k).map(w => this.deco(w)) })).filter(g => g.rows.length).map(g => ({ ...g, count: g.rows.length }));
     const byState = (list) => [...H.FLEET_ORDER, ...new Set(list.map(w => w.state).filter(k => !H.FLEET_ORDER.includes(k)))].map(k => ({ key: k, label: (H.S[k] || [k])[0], tone: (H.S[k] || [null, 'var(--queue)'])[1], rows: list.filter(w => w.state === k).map(w => this.deco(w)) })).filter(g => g.rows.length).map(g => ({ ...g, count: g.rows.length }));
     const ffList = shown.filter(w => s.ff === 'all' || (s.ff === 'attn' && w.inbox) || w.projectId === s.ff);
@@ -1000,7 +1352,7 @@ class Component extends DCLogic {
     ];
     const chips = s.vw < 1100 ? chips0.slice(0, 2) : chips0;
 
-    const navDef = [['home', 'Home', inboxAll.length, true], ['fleet', 'Fleet', active.length], ['projects', 'Projects', H.projects.length], ['history', 'History', hist.length], ['worktrees', 'Worktrees', slotsUsed + '/' + H.maxSlots], ['usage', 'Usage', H.X.usage.quotas.filter(q => q.used >= 75).length, true], ['library', 'Skills & rules', H.X.skills.length], ['system', 'System', sysIssues, true]];
+    const navDef = [['home', 'Home', inboxAll.length, true], ['fleet', 'Fleet', active.length], ['projects', 'Projects', H.projects.length], ['history', 'History', hist.length], ['worktrees', 'Worktrees', slotsUsed + '/' + H.maxSlots], ['events', 'Events', (H.events || []).length], ['usage', 'Usage', H.X.usage.quotas.filter(q => q.used >= 75).length, true], ['library', 'Skills & rules', H.X.skills.length], ['system', 'System', sysIssues, true]];
     const nav = navDef.map(([key, label, count, hot], i) => {
       const on = s.screen === key, alert = hot && count > 0;
       return { key: i + 1, label, count, go: set({ screen: key }), bg: on ? 'var(--sel)' : 'transparent', fg: on ? 'var(--ink)' : 'var(--muted)', badgeBg: alert ? (key === 'system' ? 'var(--warn)' : 'var(--accent)') : 'transparent', badgeFg: alert ? 'var(--btnFg)' : 'var(--faint)' };
@@ -1013,7 +1365,7 @@ class Component extends DCLogic {
     const slotCells = Array.from({ length: H.maxSlots }, (_, i) => ({ tone: i < slotsUsed ? 'var(--run)' : 'var(--line)' }));
 
     const fleetFilters = [['all', 'All'], ['attn', 'Needs action'], ...H.projects.map(p => [p.id, p.id])].map(([k, label]) => ({ label, go: set({ ff: k }), bg: s.ff === k ? 'var(--sel)' : 'transparent', fg: s.ff === k ? 'var(--ink)' : 'var(--muted)', bd: s.ff === k ? 'var(--accent)' : 'var(--line)' }));
-    const histFilters = [['all', 'All'], ['done', 'Merged'], ['failed', 'Failed'], ['cancelled', 'Cancelled']].map(([k, label]) => ({ label, count: k === 'all' ? hist.length : hist.filter(h => h.state === k).length, go: set({ hf: k }), bg: s.hf === k ? 'var(--sel)' : 'transparent', fg: s.hf === k ? 'var(--ink)' : 'var(--muted)', bd: s.hf === k ? 'var(--accent)' : 'var(--line)' }));
+    const histFilters = [['all', 'All'], ['done', 'Done'], ['failed', 'Failed'], ['cancelled', 'Cancelled']].map(([k, label]) => ({ label, count: k === 'all' ? hist.length : hist.filter(h => h.state === k).length, go: set({ hf: k }), bg: s.hf === k ? 'var(--sel)' : 'transparent', fg: s.hf === k ? 'var(--ink)' : 'var(--muted)', bd: s.hf === k ? 'var(--accent)' : 'var(--line)' }));
 
     const spark = (vals) => { const m = Math.max(...vals, 1), st = 100 / (vals.length - 1); return 'M' + vals.map((v, i) => (i * st).toFixed(1) + ' ' + (26 - (v / m) * 22).toFixed(1)).join(' L'); };
     const projectCards = H.projects.map(p => {
@@ -1026,7 +1378,7 @@ class Component extends DCLogic {
         slots: Array.from({ length: typeof p.max === 'number' ? p.max : 0 }, (_, i) => ({ tone: i < run ? 'var(--run)' : 'var(--line)' })),
         metrics: [['Merged', p.merged, 'var(--ink)'], ['Review', p.score, 'var(--ink)'], ['Rule fail', p.ruleFail, parseFloat(p.ruleFail) > 5 ? 'var(--warn)' : 'var(--ink)'], ['Cost', p.cost, 'var(--ink)']].map(([k, v, fg]) => ({ k, v, fg })),
         dispatch: p.dispatch.map(([k, v]) => ({ k, v })),
-        memCount: (H.X.memory[p.id] || []).filter(m => !s.memDel[m.id]).length, openMem: set({ memFor: p.id }),
+        memCount: (H.X.memory[p.id] || []).filter(m => !s.memDel[m.id]).length, openMem: () => { this.setState({ memFor: p.id, memKind: 'all' }); H.loadMemory?.(p.id); },
         remove: () => { if (ws.length) { this.flash('Cannot remove ' + p.id, ws.length + ' active workflows · cancel them first'); return; } if (window.confirm('Remove project ' + p.id + ' from Harness?')) this.runAction('Project removed', () => H.request('/projects/' + encodeURIComponent(p.id), { method: 'DELETE' })); },
       };
     });
@@ -1069,21 +1421,21 @@ class Component extends DCLogic {
     ].map(([k, v, fg]) => ({ k, v, fg }));
     const healthy = H.health.status === 'ok' && degraded.length === 0;
 
-    const tabs = [['timeline', 'Timeline'], ['transcript', 'Transcript'], ['commands', 'Commands'], ['plan', 'Plan'], ['artifacts', 'Artifacts'], ['proof', 'Proof']].map(([k, label]) => ({ label, go: () => { this.setState({ tab: k }); if (k === 'transcript' && selW) H.loadTranscript?.(selW); }, bd: s.tab === k ? 'var(--accent)' : 'transparent', fg: s.tab === k ? 'var(--ink)' : 'var(--muted)' }));
+    const tabs = [['timeline', 'Timeline'], ['transcript', 'Transcript'], ['commands', 'Commands'], ['plan', 'Plan'], ['prompts', 'Prompts'], ['context', 'Context'], ['artifacts', 'Artifacts'], ['proof', 'Proof']].map(([k, label]) => ({ label, go: () => { this.setState({ tab: k }); if (k === 'transcript' && selW) H.loadTranscript?.(selW); if (k === 'context' && selW) H.loadContext?.(selW); }, bd: s.tab === k ? 'var(--accent)' : 'transparent', fg: s.tab === k ? 'var(--ink)' : 'var(--muted)' }));
 
     let m = {}, confirmDisabled = false;
     if (s.modal) {
       const w = all.find(x => x.id === s.modal.id);
       if (w && (s.modal.action === 'cancel' || w.inbox?.actions?.includes(s.modal.action))) {
-        const A = this.actionMeta(s.modal.action, w);
+        const A = this.actionMeta(s.modal.action, s.modal.requestId ? { ...w, inbox: { ...w.inbox, requestId: s.modal.requestId } } : w);
         const toneOf = (st) => (H.S[st] || [0, 'var(--muted)'])[1];
-        m = { title: A.title, ref: w.ref, wfTitle: w.title, endpoint: A.endpoint, from: A.from, to: A.to, fromTone: toneOf(A.from), toTone: A.danger ? 'var(--fail)' : toneOf(A.to === 'replanning' ? 'planning' : A.to), confirm: A.confirm, reasonLabel: A.required ? 'Reason · required, written to the audit trail' : 'Note · not sent by this endpoint', placeholder: A.ph, btnBg: A.danger ? 'var(--fail)' : 'var(--btn)', btnFg: A.danger ? 'oklch(0.99 0 0)' : 'var(--btnFg)' };
+        m = { title: A.title, ref: w.ref, wfTitle: w.title, endpoint: A.endpoint, from: A.from, to: A.to, fromTone: toneOf(A.from), toTone: A.danger ? 'var(--fail)' : toneOf(A.to === 'replanning' ? 'planning' : A.to), confirm: A.confirm, reasonLabel: A.required ? 'Reason · required, recorded in server events' : 'Note · recorded in server events', placeholder: A.ph, btnBg: A.danger ? 'var(--fail)' : 'var(--btn)', btnFg: A.danger ? 'oklch(0.99 0 0)' : 'var(--btnFg)' };
         confirmDisabled = A.required && !s.reason.trim();
       }
     }
 
     const titles = { 0: 'Nothing needs you', 1: '1 thing needs you' };
-    return {
+    const base = {
       themeName: s.theme, densityName: s.density,
       cols: insp && wide ? '212px minmax(0,1fr) minmax(380px,440px)' : '212px minmax(0,1fr)',
       wide, fleetCols: wide ? 'minmax(220px,1fr) 128px 104px 92px 64px 52px 52px' : 'minmax(200px,1fr) 128px 92px 52px 52px',
@@ -1102,8 +1454,10 @@ class Component extends DCLogic {
       hasToast: !!s.toast, toast: s.toast || {},
       ...this.extra(H, all, hist),
     };
+    return { ...base, ...this.extraV3(H, all, hist, base) };
   }
 }
+
 </script>
 </body>
 </html>

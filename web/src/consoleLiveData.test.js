@@ -9,6 +9,7 @@ async function setup(beforeFetch = async () => {}) {
   const flags = { readerCancelled: false, approvalsFail: false, streamFail: false, streamEOF: false, monitorFail: false };
   const calls = [];
   const rpcMethods = [];
+  const rpcCalls = [];
   const task = {
     id: "sub-1", workflow: { id: "wf-1", state: "implementing" }, repo: "owner/repo",
     external_id: "42", description: "Fix issue 42", status: "implementing", turn: 2, project: "/tmp/repo",
@@ -27,12 +28,13 @@ async function setup(beforeFetch = async () => {}) {
         { workflow_id: "wf-1", agent_runtime: "old-agent", lease_state: "released", activity: "plan_issue" },
       ],
     },
+    "/api/workflows/runtime/tree?summary_only=true": { summary: { circuit_breakers: [] } },
     "/api/dashboard": { global: { max_concurrent: 2 }, runtime_hosts: [] },
     "/api/operator-snapshot": {},
     "/api/worktrees": [],
     "/api/intake": { channels: [] },
     "/projects": [],
-    "/api/projects/%2Ftmp%2Frepo/memory": { records: [] },
+    "/api/projects/owner%2Frepo/memory": { records: [] },
     "/api/token-usage": { by_hour: { "2026-09-25T12": { input_tokens: 100 } } },
   };
   const context = {
@@ -56,6 +58,7 @@ async function setup(beforeFetch = async () => {}) {
       }
       if (path === "/rpc") {
         rpcMethods.push(JSON.parse(init.body).method);
+        rpcCalls.push(JSON.parse(init.body));
         return { ok: true, status: 200, json: async () => ({ result: [] }) };
       }
       if (flags.approvalsFail && path === "/api/workflows/runtime/approvals") return { ok: false, status: 503, json: async () => ({ error: "approvals unavailable" }) };
@@ -75,7 +78,7 @@ async function setup(beforeFetch = async () => {}) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 
-  return { context, task, responses, flags, calls, rpcMethods };
+  return { context, task, responses, flags, calls, rpcMethods, rpcCalls };
 }
 
 it("keeps the current invocation, hourly series, and snake-case stream events", async () => {
@@ -265,6 +268,73 @@ it("bounds polling reads without timing out long-running RPC mutations", async (
   expect([...alarms].map(alarm => alarm.delay)).toEqual([15_000]);
   [...alarms].forEach(alarm => alarm.callback());
   await rpcFailure;
+});
+
+it("uses repository identity for memory and the canonical root for context previews", async () => {
+  const { context, responses, calls, rpcCalls } = await setup();
+  const H = context.HC;
+  responses["/api/overview"].projects = [{ id: "alias", root: "/tmp/repo", merged_24h: 0 }];
+  responses["/api/projects/owner%2Frepo/memory"] = { records: [{ id: "memory-1", kind: "lesson", payload: "Actual memory", outcome: "success", use_count: 3 }] };
+  await H.refresh(true);
+  expect(H.workflows[0].projectId).toBe("alias");
+  expect(H.X.memory.alias[0]).toMatchObject({ text: "Actual memory", uses: 3, outcome: "success" });
+  expect(calls).not.toContain("/api/projects/alias/memory");
+  await H.loadContext(H.workflows[0]);
+  expect(rpcCalls.find(call => call.method === "context_preview").params.request.project).toBe("/tmp/repo");
+  expect(rpcCalls.find(call => call.method === "context_preview").params.request.task_profile.task_kind).toBeNull();
+  H.workflows = [];
+  H.history = [];
+  await H.loadMemory("alias");
+  expect(H.memoryUnavailable.alias).toContain("No repository identity");
+});
+
+it("shows newest events even though event_query returns oldest first", async () => {
+  const { context } = await setup();
+  const H = context.HC;
+  const incoming = Array.from({ length: 251 }, (_, index) => ({ id: "event-" + index, ts: new Date(Date.now() - 300_000 + index * 1000).toISOString() }));
+  const queries = [];
+  H.rpc = async (method, params) => { queries.push({ method, params }); return incoming; };
+  await H.loadEvents();
+  expect(H.events).toHaveLength(200);
+  expect(H.events[0].id).toBe("event-250");
+  expect(queries[0].params.filters.limit).toBeUndefined();
+  const lastSeen = H.events[0].ts;
+  const late = { id: "late-commit", ts: new Date(new Date(lastSeen).getTime() - 1000).toISOString() };
+  incoming.push(late);
+  await H.loadEvents();
+  expect(new Date(queries[1].params.filters.since).getTime()).toBeLessThan(new Date(late.ts).getTime());
+  expect(H.events.map(event => event.id)).toContain("late-commit");
+  expect(H.events).toHaveLength(200);
+});
+
+
+it("records operator events without secure-context-only randomUUID", async () => {
+  const { context, rpcCalls } = await setup();
+  const H = context.HC;
+  await expect.poll(() => H.eventsLoading).toBe(false);
+  context.crypto = { getRandomValues: bytes => { for (let i = 0; i < bytes.length; i++) bytes[i] = i; return bytes; } };
+  await H.recordAction("retry", H.workflows[0], "Host recovered", "/api/workflows/runtime/retry", "accepted");
+  const event = rpcCalls.find(call => call.method === "event_log").params.event;
+  expect(event.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  expect(event.metadata.task_id).toBe("sub-1");
+  expect(event.reason).toBe("Host recovered");
+});
+
+it("retains cached events and memory when the server returns an invalid null payload", async () => {
+  const { context, responses } = await setup();
+  const H = context.HC;
+  await expect.poll(() => H.eventsLoading).toBe(false);
+  const event = { id: "keep-event", ts: new Date().toISOString() };
+  H.events = [event];
+  H.rpc = async () => null;
+  await H.loadEvents();
+  expect(H.events).toEqual([event]);
+  expect(H.eventsError).toBeTruthy();
+  H.X.memory["/tmp/repo"] = [{ id: "keep-memory" }];
+  responses["/api/projects/owner%2Frepo/memory"] = null;
+  await H.loadMemory("/tmp/repo");
+  expect(H.X.memory["/tmp/repo"]).toEqual([{ id: "keep-memory" }]);
+  expect(H.memoryErrors["/tmp/repo"]).toBeTruthy();
 });
 
 it("closes a pending action when its workflow disappears", () => {
