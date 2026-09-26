@@ -10,6 +10,8 @@ use harness_protocol::rest::{
 use harness_workflow::runtime::{eval_report_dry_run, parse_benchmark_manifest_str, EvalRunReport};
 #[cfg(unix)]
 use harness_workflow::runtime::{execute_manifest, EvalEventPersistenceError, EvalExecuteConfig};
+#[cfg(unix)]
+use sqlx::Connection;
 use std::fs;
 #[cfg(unix)]
 use std::fs::File;
@@ -74,16 +76,74 @@ impl Drop for ActiveEvalProject {
     }
 }
 
+fn eval_lock_key(root: &Path) -> String {
+    format!("harness-console-eval:{}", root.display())
+}
+
+async fn eval_database_lock_held(pool: &sqlx::PgPool, root: &Path) -> Result<bool, ApiError> {
+    if local_active_run_id(root).is_some() {
+        return Ok(true);
+    }
+    let mut connection = pool.acquire().await.map_err(internal)?;
+    connection.close_on_drop();
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+        .bind(eval_lock_key(root))
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(internal)?;
+    Ok(!acquired)
+}
+
+#[cfg(unix)]
+async fn acquire_eval_database_lock(
+    pool: &sqlx::PgPool,
+    root: &Path,
+) -> Result<sqlx::PgConnection, ApiError> {
+    let options = pool.connect_options();
+    let mut connection = sqlx::PgConnection::connect_with(options.as_ref())
+        .await
+        .map_err(internal)?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+        .bind(eval_lock_key(root))
+        .fetch_one(&mut connection)
+        .await
+        .map_err(internal)?;
+    if !acquired {
+        if let Err(error) = connection.close().await {
+            tracing::error!(%error, "failed to close rejected eval lock connection");
+        }
+        return Err(ApiError::BadRequest(
+            "an eval is already running for this project".to_string(),
+        ));
+    }
+    Ok(connection)
+}
+
 pub(crate) async fn list_eval_runs(
     State(state): State<Arc<AppState>>,
     ContractQuery(query): ContractQuery<EvalRunListQuery>,
 ) -> Result<ContractJson<EvalRunListResponse>, ApiError> {
     let root = project_root(&state, &query.project_root).await?;
+    let mut errors = Vec::new();
+    let active = match state.workflow_runtime_store() {
+        Ok(store) => match eval_database_lock_held(store.pool(), &root).await {
+            Ok(active) => active,
+            Err(error) => {
+                errors.push(format!("eval activity unavailable: {error}"));
+                true
+            }
+        },
+        Err(error) => {
+            errors.push(format!("eval activity unavailable: {error}"));
+            true
+        }
+    };
     let directory = root.join("artifacts/eval");
     if !directory.exists() {
         return Ok(ContractJson(EvalRunListResponse {
             runs: Vec::new(),
-            errors: Vec::new(),
+            errors,
+            active,
         }));
     }
     let directory = validate_file_in_root(&directory, &root).map_err(ApiError::BadRequest)?;
@@ -93,7 +153,6 @@ pub(crate) async fn list_eval_runs(
         ));
     }
     let mut reports = Vec::new();
-    let mut errors = Vec::new();
     for entry in fs::read_dir(&directory).map_err(internal)? {
         let entry = entry.map_err(internal)?;
         let report_path = entry.path().join("report.json");
@@ -122,25 +181,58 @@ pub(crate) async fn list_eval_runs(
         reports.push((modified, path, is_marker));
     }
     reports.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
+    let local_active_run = local_active_run_id(&root);
+    let mut active_claimed = false;
     let mut runs = Vec::new();
     for (modified, path, is_marker) in reports {
         if runs.len() == 20 {
             break;
         }
         let result = if is_marker {
-            read_marker_entry(&path, &root)
+            read_marker_entry(
+                &path,
+                active,
+                local_active_run.as_deref(),
+                &mut active_claimed,
+            )
         } else {
             read_report_entry(&path, modified)
         };
         match result {
-            Ok(run) => runs.push(run),
+            Ok(mut run) => {
+                if !is_marker {
+                    let marker_path = path.with_file_name("run-state.json");
+                    if marker_path.is_file() {
+                        match validate_file_in_root(&marker_path, &directory) {
+                            Ok(marker_path) => match read_marker(&marker_path) {
+                                Ok(marker)
+                                    if marker.status == "failed" && marker.run_id == run.run_id =>
+                                {
+                                    run.status = "failed".to_string();
+                                    run.error = marker.error;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    errors.push(format!("{}: {error}", marker_path.display()));
+                                }
+                            },
+                            Err(error) => errors.push(error),
+                        }
+                    }
+                }
+                runs.push(run);
+            }
             Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
     }
     for error in &errors {
         tracing::error!(%error, "console eval report unavailable");
     }
-    Ok(ContractJson(EvalRunListResponse { runs, errors }))
+    Ok(ContractJson(EvalRunListResponse {
+        runs,
+        errors,
+        active,
+    }))
 }
 
 pub(crate) async fn run_eval(
@@ -176,9 +268,15 @@ pub(crate) async fn run_eval(
     #[cfg(unix)]
     {
         reject_during_maintenance(&state.core.server.config.maintenance_window, Utc::now())?;
+        if !crate::services::execution::workflow_runtime_loops_enabled(&root)? {
+            return Err(ApiError::Internal(
+                "workflow runtime dispatch and worker must be enabled for evals".to_string(),
+            ));
+        }
         let store = state.workflow_runtime_store()?.clone();
         let events = state.observability.events.clone();
         let active = ActiveEvalProject::acquire(&root, &run_id)?;
+        let database_lock = acquire_eval_database_lock(store.pool(), &root).await?;
         let output = EvalReportOutput::create(&root, &run_id)?;
         let marker = EvalRunMarker {
             run_id: run_id.clone(),
@@ -218,6 +316,9 @@ pub(crate) async fn run_eval(
                     tracing::error!(run_id = %run_id, project = %project_id, %marker_error, "failed to record console eval failure");
                 }
                 tracing::error!(run_id = %run_id, project = %project_id, %error, "console eval run failed");
+            }
+            if let Err(error) = database_lock.close().await {
+                tracing::error!(run_id = %run_id, project = %project_id, %error, "failed to close console eval database lock");
             }
             result
         });
@@ -288,14 +389,21 @@ fn read_report_entry(
     entry(&report, DateTime::<Utc>::from(modified), "completed")
 }
 
-fn read_marker_entry(path: &Path, root: &Path) -> Result<EvalRunEntry, ApiError> {
-    let marker: EvalRunMarker =
-        serde_json::from_slice(&fs::read(path).map_err(internal)?).map_err(internal)?;
+fn read_marker_entry(
+    path: &Path,
+    active: bool,
+    local_active_run: Option<&str>,
+    active_claimed: &mut bool,
+) -> Result<EvalRunEntry, ApiError> {
+    let marker = read_marker(path)?;
     let status = match marker.status.as_str() {
         "failed" => "failed",
         "running"
-            if marker.pid == std::process::id() && active_eval_project(root, &marker.run_id) =>
+            if active
+                && !*active_claimed
+                && local_active_run.is_none_or(|run_id| run_id == marker.run_id) =>
         {
+            *active_claimed = true;
             "running"
         }
         "running" => "interrupted",
@@ -311,19 +419,21 @@ fn read_marker_entry(path: &Path, root: &Path) -> Result<EvalRunEntry, ApiError>
     })
 }
 
-fn active_eval_project(root: &Path, run_id: &str) -> bool {
+fn read_marker(path: &Path) -> Result<EvalRunMarker, ApiError> {
+    serde_json::from_slice(&fs::read(path).map_err(internal)?).map_err(internal)
+}
+
+fn local_active_run_id(root: &Path) -> Option<String> {
     #[cfg(unix)]
     {
-        ACTIVE_EVAL_PROJECTS.get().is_some_and(|active| {
-            active
-                .get(root)
-                .is_some_and(|entry| entry.value() == run_id)
-        })
+        ACTIVE_EVAL_PROJECTS
+            .get()
+            .and_then(|active| active.get(root).map(|entry| entry.value().clone()))
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, run_id);
-        false
+        let _ = root;
+        None
     }
 }
 
@@ -584,6 +694,30 @@ mod tests {
         let listed = list_eval_runs(State(state.clone()), ContractQuery(query)).await?;
         assert_eq!(listed.0.runs.len(), 1);
         assert_eq!(listed.0.runs[0].report["suite"], "eval-isolation-fixture");
+        output.write_marker(&EvalRunMarker {
+            run_id: report.run_id.clone(),
+            suite: report.suite.clone(),
+            started_at: Utc::now().to_rfc3339(),
+            pid: std::process::id(),
+            status: "failed".to_string(),
+            error: Some("event persistence failed".to_string()),
+        })?;
+        let failed_with_report = list_eval_runs(
+            State(state.clone()),
+            ContractQuery(EvalRunListQuery {
+                project_root: request.project_root.clone(),
+            }),
+        )
+        .await?;
+        assert_eq!(failed_with_report.0.runs[0].status, "failed");
+        assert_eq!(
+            failed_with_report.0.runs[0].error.as_deref(),
+            Some("event persistence failed")
+        );
+        assert_eq!(
+            failed_with_report.0.runs[0].report["suite"],
+            "eval-isolation-fixture"
+        );
         let incomplete_directory = dir.path().join("artifacts/eval/run-2");
         fs::create_dir_all(&incomplete_directory)?;
         fs::write(incomplete_directory.join("report.json"), b"")?;
@@ -598,8 +732,40 @@ mod tests {
         assert_eq!(partial.0.errors.len(), 1);
 
         let active_root = dir.path().canonicalize()?;
+        let store = state.workflow_runtime_store()?;
         let active = ActiveEvalProject::acquire(&active_root, "run-3")?;
         assert!(ActiveEvalProject::acquire(&active_root, "run-4").is_err());
+        let database_lock = acquire_eval_database_lock(store.pool(), &active_root).await?;
+        let other_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&crate::test_helpers::test_database_url()?)
+            .await?;
+        let other_acquired: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+                .bind(eval_lock_key(&active_root))
+                .fetch_one(&other_pool)
+                .await?;
+        assert!(
+            !other_acquired,
+            "another server connection must not acquire the eval lock"
+        );
+        other_pool.close().await;
+        let single_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&crate::test_helpers::test_database_url()?)
+            .await?;
+        let single_pool_lock =
+            acquire_eval_database_lock(&single_pool, &active_root.join("single-pool-proof"))
+                .await?;
+        let can_query: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&single_pool)
+            .await?;
+        assert_eq!(
+            can_query, 1,
+            "the runtime pool must remain usable while eval holds its lock"
+        );
+        single_pool_lock.close().await?;
+        single_pool.close().await;
         let active_output = EvalReportOutput::create(&active_root, "run-3")?;
         active_output.write_marker(&EvalRunMarker {
             run_id: "run-3".to_string(),
@@ -624,7 +790,9 @@ mod tests {
             .expect("running eval is listed");
         assert_eq!(active_row.status, "running");
         assert!(active_row.report.is_null());
+        assert!(active_list.0.active);
         drop(active);
+        database_lock.close().await?;
         let interrupted = list_eval_runs(
             State(state.clone()),
             ContractQuery(EvalRunListQuery {
@@ -642,7 +810,18 @@ mod tests {
                 .status,
             "interrupted"
         );
+        assert!(!interrupted.0.active);
         let next_active = ActiveEvalProject::acquire(&active_root, "run-4")?;
+        let next_database_lock = acquire_eval_database_lock(store.pool(), &active_root).await?;
+        let next_output = EvalReportOutput::create(&active_root, "run-4")?;
+        next_output.write_marker(&EvalRunMarker {
+            run_id: "run-4".to_string(),
+            suite: "eval-isolation-fixture".to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            pid: std::process::id(),
+            status: "running".to_string(),
+            error: None,
+        })?;
         let still_interrupted = list_eval_runs(
             State(state.clone()),
             ContractQuery(EvalRunListQuery {
@@ -660,7 +839,18 @@ mod tests {
                 .status,
             "interrupted"
         );
+        assert_eq!(
+            still_interrupted
+                .0
+                .runs
+                .iter()
+                .find(|run| run.run_id == "run-4")
+                .expect("new active marker remains listed")
+                .status,
+            "running"
+        );
         drop(next_active);
+        next_database_lock.close().await?;
 
         let outside_home = tempfile::tempdir()?;
         let external_root = outside_home.path().canonicalize()?;
@@ -701,6 +891,22 @@ mod tests {
             .await
             .expect_err("outside manifest should be rejected");
         assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        fs::write(
+            dir.path().join("WORKFLOW.md"),
+            "---\nruntime_dispatch:\n  enabled: false\nruntime_worker:\n  enabled: true\n---\n",
+        )?;
+        let execute = EvalRunRequest {
+            dry_run: false,
+            ..request.clone()
+        };
+        let error = run_eval(State(state.clone()), ContractJson(execute))
+            .await
+            .expect_err("disabled workflow loops must reject eval execution");
+        assert!(error
+            .to_string()
+            .contains("dispatch and worker must be enabled"));
+        fs::remove_file(dir.path().join("WORKFLOW.md"))?;
 
         Arc::get_mut(&mut state)
             .expect("only the test owns the state")
