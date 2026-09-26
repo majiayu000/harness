@@ -323,6 +323,11 @@ async fn project_root(state: &AppState, requested: &str) -> Result<PathBuf, ApiE
             "project root is not a directory".to_string(),
         ));
     }
+    crate::project_registry::check_allowed_roots(
+        &root,
+        &state.core.server.config.server.allowed_project_roots,
+    )
+    .map_err(ApiError::BadRequest)?;
     if state
         .project_svc
         .default_root()
@@ -954,6 +959,43 @@ mod tests {
         assert!(unresolved_error
             .to_string()
             .contains("previous Console eval is unresolved"));
+
+        let restricted_base = tempfile::tempdir()?;
+        Arc::get_mut(
+            &mut Arc::get_mut(&mut state)
+                .expect("only the test owns the state")
+                .core
+                .server,
+        )
+        .expect("test server is uniquely owned")
+        .config
+        .server
+        .allowed_project_roots = vec![restricted_base.path().to_path_buf()];
+        let denied = run_eval(State(state.clone()), ContractJson(request.clone()))
+            .await
+            .expect_err("stale registration must not bypass current allowed roots");
+        assert_eq!(denied.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(denied.to_string().contains("allowed base directory"));
+        let denied_list = list_eval_runs(
+            State(state.clone()),
+            ContractQuery(EvalRunListQuery {
+                project_root: request.project_root.clone(),
+            }),
+        )
+        .await
+        .expect_err("report listing must obey current allowed roots");
+        assert_eq!(denied_list.status(), axum::http::StatusCode::BAD_REQUEST);
+        Arc::get_mut(
+            &mut Arc::get_mut(&mut state)
+                .expect("only the test owns the state")
+                .core
+                .server,
+        )
+        .expect("test server is uniquely owned")
+        .config
+        .server
+        .allowed_project_roots
+        .clear();
 
         Arc::get_mut(&mut state)
             .expect("only the test owns the state")
