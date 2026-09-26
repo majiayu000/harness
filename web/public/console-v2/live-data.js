@@ -15,7 +15,7 @@
     return Math.floor(seconds / 86400) + 'd';
   };
   const secondsAge = (seconds) => seconds < 60 ? seconds + 's' : seconds < 3600 ? Math.floor(seconds / 60) + 'm' : Math.floor(seconds / 3600) + 'h';
-  const state = (value) => stateAliases[value] || (H.S[value] ? value : 'pending');
+  const state = (value) => stateAliases[value] || value || 'pending';
   const numberFrom = (value) => {
     if (typeof value === 'number') return value;
     const match = String(value || '').match(/(?:#|\/issues\/|\/pull\/)(\d+)(?:\b|$)/) || String(value || '').match(/^(\d+)$/);
@@ -24,33 +24,41 @@
   const prFrom = (url) => numberFrom(url && url.includes('/pull/') ? url : null);
   const label = (row) => row?.description?.trim() || row?.external_id || row?.task_kind || row?.workflow?.definition_id || row?.id || 'Workflow';
 
-  async function request(path, init) {
+  async function request(path, init, timeoutMs = ['GET', 'HEAD'].includes((init?.method || 'GET').toUpperCase()) ? 15_000 : null) {
     const token = sessionStorage.getItem('harness_token')?.trim();
-    const response = await fetch(path, {
-      ...init,
-      headers: { Accept: 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}), ...(init?.headers || {}) },
-    });
-    if (response.status === 401) {
-      window.parent.postMessage({ type: 'harness:unauthorized' }, location.origin);
-      throw new Error('Authentication required');
+    const controller = timeoutMs == null ? null : new AbortController();
+    const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+      const response = await fetch(path, {
+        ...init, ...(controller ? { signal: controller.signal } : {}),
+        headers: { Accept: 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}), ...(init?.headers || {}) },
+      });
+      if (response.status === 401) {
+        window.parent.postMessage({ type: 'harness:unauthorized' }, location.origin);
+        throw new Error('Authentication required');
+      }
+      if (!response.ok) {
+        let detail = path + ' → HTTP ' + response.status;
+        try {
+          const payload = await response.json();
+          if (typeof payload.error === 'string') detail = payload.error;
+        } catch { /* Keep the HTTP status when the error is not JSON. */ }
+        throw new Error(detail);
+      }
+      return response.status === 204 ? null : await response.json();
+    } finally {
+      if (timeout != null) clearTimeout(timeout);
     }
-    if (!response.ok) {
-      let detail = path + ' → HTTP ' + response.status;
-      try {
-        const payload = await response.json();
-        if (typeof payload.error === 'string') detail = payload.error;
-      } catch { /* Keep the HTTP status when the error is not JSON. */ }
-      throw new Error(detail);
-    }
-    return response.status === 204 ? null : response.json();
   }
 
-  async function allTasks() {
+  async function allTasks(active = false, status = null) {
     const rows = [];
     let cursor = null;
     const seen = new Set();
     do {
       const params = new URLSearchParams({ limit: '200' });
+      if (active) params.set('active', 'true');
+      if (status) params.set('status', status);
       if (cursor) params.set('cursor', cursor);
       const page = await request('/api/workflows/runtime/submissions?' + params);
       rows.push(...(page.data || []));
@@ -90,7 +98,7 @@
     const tokenUsage = H.details?.get(id)?.task?.token_usage;
     const leaseState = { active_leased: 'active', expired_lease: 'expired', missing_lease: 'missing' }[invocation?.lease_state] || invocation?.lease_state || '—';
     return {
-      id, submissionId: task.submission_id || task.id, repo, n: issue || pr || '—', pr,
+      id, submissionId: task.submission_id || task.id, repo, projectId: project?.id || task.project || null, n: issue || pr || '—', pr,
       ref: issue ? repo + '#' + issue : pr ? repo + '#PR' + pr : repo + ' · ' + String(task.id).slice(0, 8),
       prLabel: pr ? 'PR #' + pr : '—', prUrl: task.pr_url || action?.url || null,
       title: label(task), state: current, from: task.phase || null,
@@ -135,7 +143,7 @@
       const entry = dashboardHosts.get(host.id);
       return {
         id: host.id, name: host.display_name, online: host.online,
-        hb: age(host.last_heartbeat_at), leases: host.active_leases, cap: host.active_leases,
+        hb: age(host.last_heartbeat_at), leases: host.active_leases, cap: null,
         cpu: host.cpu_pct, ram: host.ram_pct, caps: (host.capabilities || []).join(' · '),
         projects: host.watched_projects, tokens: formatInt(host.tokens_24h),
         projectRoots: entry?.watched_project_roots || [],
@@ -221,7 +229,7 @@
         if (!byInvocation.has(invocation.workflow_id)) byInvocation.set(invocation.workflow_id, invocation);
       }
       const byWorktree = new Map((worktrees || []).filter(row => row.runtime_workflow_id).map(row => [row.runtime_workflow_id, row]));
-      const rows = tasks.map(task => mapTask({ ...task, pending_approvals: bySubmission.get(task.id) || [] }, byAction, byInvocation, byWorktree));
+      const rows = tasks.map(task => mapTask({ ...task, pending_approvals: approvals ? (bySubmission.get(task.id) || []) : (H.details.get(task.workflow_id || task.workflow?.id || task.id)?.task?.pending_approvals || []) }, byAction, byInvocation, byWorktree));
       const seen = new Set(rows.map(row => row.id));
       for (const action of byAction.values()) {
         if (seen.has(action.workflow_id)) continue;
@@ -236,8 +244,13 @@
 
   let polling = false;
   let lastSecondaryRefresh = 0;
+  let historicalTasks = [];
+  let taskSnapshot = null;
+  let rpcReady = false;
+  let rpcHandshake = null;
   H.details = new Map();
   H.transcripts = new Map();
+  H.transcriptFailed = new Set();
   H.loadDetails = async (workflow) => {
     const cached = H.details.get(workflow.id);
     if (cached?.loading || cached?.loadedAt && Date.now() - cached.loadedAt < 30_000) return;
@@ -247,9 +260,13 @@
     if (workflow.terminal) requests.push(request(path + '/proof'));
     const results = await Promise.allSettled(requests);
     let node = null;
+    let treeError = null;
     try {
-      for (let offset = 0; offset < 2000; offset += 100) {
-        const page = await request('/api/workflows/runtime/tree?detail=full&limit=100&offset=' + offset);
+      const projectRoot = H.projects.find(project => project.id === workflow.projectId)?.root;
+      for (let offset = 0; ; offset += 100) {
+        const params = new URLSearchParams({ detail: 'full', limit: '100', offset: String(offset) });
+        if (projectRoot) params.set('project_id', projectRoot);
+        const page = await request('/api/workflows/runtime/tree?' + params);
         const walk = (nodes) => {
           for (const entry of nodes || []) {
             if (entry.workflow?.id === workflow.id) return entry;
@@ -261,9 +278,12 @@
         node = walk(page.workflows);
         if (node || !page.pagination?.has_more) break;
       }
-    } catch { /* Detail resources remain available when the runtime tree is unavailable. */ }
+      if (!node) treeError = 'Workflow timeline and commands are unavailable';
+    } catch (error) { treeError = error.message || String(error); }
     const value = (index) => results[index]?.status === 'fulfilled' ? results[index].value : null;
-    const detail = { task: value(0), artifacts: value(1) || [], prompts: value(2) || [], proof: value(3), node, loading: false, loadedAt: Date.now() };
+    const errors = results.filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason));
+    if (treeError) errors.push(treeError);
+    const detail = { task: value(0), artifacts: value(1) || [], prompts: value(2) || [], proof: value(3), node, error: errors.join(' · '), loading: false, loadedAt: Date.now() };
     H.details.set(workflow.id, detail);
     const approval = detail.task?.pending_approvals?.find(item => item.type === 'approval_request' && item.id && item.approved == null);
     if (approval) workflow.inbox = actionInbox({ kind: 'approval', requestId: approval.id, blocked_reason: 'approval_request', unblock_hint: approval.action, next_action: 'Approve or deny request' });
@@ -276,13 +296,18 @@
   };
 
   H.loadTranscript = async (workflow) => {
-    if (H.transcripts.has(workflow.id)) return;
+    if (H.transcripts.has(workflow.id) && !H.transcriptFailed.has(workflow.id)) return;
+    H.transcriptFailed.delete(workflow.id);
     H.transcripts.set(workflow.id, []);
     const token = sessionStorage.getItem('harness_token')?.trim();
     try {
       const response = await fetch('/api/workflows/runtime/submissions/' + encodeURIComponent(workflow.submissionId) + '/stream', {
         headers: { Accept: 'text/event-stream', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
       });
+      if (response.status === 401) {
+        window.parent.postMessage({ type: 'harness:unauthorized' }, location.origin);
+        throw new Error('Authentication required');
+      }
       if (!response.ok || !response.body) throw new Error('Transcript stream unavailable');
       const reader = response.body.getReader();
       try {
@@ -290,7 +315,7 @@
         let buffer = '';
         while (true) {
           const result = await reader.read();
-          if (result.done) break;
+          if (result.done) throw new Error('Transcript ended before a terminal event; retry to reconnect');
           buffer += decoder.decode(result.value, { stream: true });
           const events = buffer.split('\n\n');
           buffer = events.pop() || '';
@@ -300,7 +325,10 @@
             try {
               const item = JSON.parse(data.slice(6));
               if (item.type === 'message_delta') H.transcripts.get(workflow.id).push({ t: item.text, c: 'oklch(0.86 0.005 275)' });
-              if (item.type === 'error') H.transcripts.get(workflow.id).push({ t: item.message, c: 'var(--fail)' });
+              if (item.type === 'error') {
+                H.transcripts.get(workflow.id).push({ t: item.message, c: 'var(--fail)' });
+                H.transcriptFailed.add(workflow.id);
+              }
               refreshView();
               if (item.type === 'done' || item.type === 'error') return;
             } catch { /* Ignore malformed stream events. */ }
@@ -311,9 +339,36 @@
       }
     } catch (error) {
       H.transcripts.get(workflow.id).push({ t: error.message || String(error), c: 'var(--fail)' });
+      H.transcriptFailed.add(workflow.id);
       refreshView();
     }
   };
+
+  function applyTaskSnapshot() {
+    if (!taskSnapshot || H.loadError) return;
+    const payloads = [...taskSnapshot];
+    const activeIds = new Set(payloads[0].map(task => task.id));
+    payloads[0] = [...payloads[0], ...historicalTasks.filter(task => !activeIds.has(task.id))];
+    applyPayloads(payloads);
+  }
+
+  let historyRefreshPending = false;
+  async function refreshHistory() {
+    if (H.historyLoading) { historyRefreshPending = true; return; }
+    H.historyLoading = true;
+    H.historyError = null;
+    refreshView();
+    try {
+      historicalTasks = await allTasks(false, 'done,failed,cancelled');
+      applyTaskSnapshot();
+    } catch (error) {
+      H.historyError = error.message || String(error);
+    } finally {
+      H.historyLoading = false;
+      refreshView();
+      if (historyRefreshPending) { historyRefreshPending = false; void refreshHistory(); }
+    }
+  }
 
   async function refresh(forceSecondary = false) {
     if (polling) return;
@@ -322,19 +377,29 @@
       const secondaryDue = forceSecondary || Date.now() - lastSecondaryRefresh >= 60_000;
       if (secondaryDue) lastSecondaryRefresh = Date.now();
       const jobs = [
-        allTasks(), request('/api/operator-monitor'), request('/api/overview'), request('/api/usage-monitor'),
+        allTasks(true), request('/api/operator-monitor'), request('/api/overview'), request('/api/usage-monitor'),
         request('/api/dashboard'), request('/api/operator-snapshot'), request('/api/worktrees'), request('/api/intake'),
-        request('/projects'), secondaryDue ? H.rpc('skill_list', { query: null }) : Promise.resolve(null),
-        secondaryDue ? H.rpc('gc_drafts', { project_id: null }) : Promise.resolve(null),
+        request('/projects'), secondaryDue ? H.rpc('skill_list', { query: null }, 15_000) : Promise.resolve(null),
+        secondaryDue ? H.rpc('gc_drafts', { project_id: null }, 15_000) : Promise.resolve(null),
         secondaryDue ? request('/api/token-usage') : Promise.resolve(null),
         request('/api/workflows/runtime/approvals'),
       ];
       const results = await Promise.allSettled(jobs);
       const failures = results.filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason));
-      const critical = results.slice(0, 2).filter(result => result.status === 'rejected').map(result => result.reason?.message || String(result.reason));
+      const critical = [0, 1, 12].filter(index => results[index].status === 'rejected').map(index => results[index].reason?.message || String(results[index].reason));
       H.loadError = critical.length ? critical.join(' · ') : null;
       H.partialError = failures.length ? failures.join(' · ') : null;
-      applyPayloads(results.map(result => result.status === 'fulfilled' ? result.value : null));
+      const payloads = results.map(result => result.status === 'fulfilled' ? result.value : null);
+      const activeIds = new Set((payloads[0] || []).map(task => task.id));
+      const finished = !critical.length && taskSnapshot?.[0].some(task => !activeIds.has(task.id));
+      if (!critical.length) {
+        // Retain only the inputs needed to remap tasks when history arrives.
+        taskSnapshot = [payloads[0], payloads[1], null, payloads[3], null, null, payloads[6], null, null, null, null, null, payloads[12]];
+      }
+      payloads[0] = null;
+      applyPayloads(payloads);
+      applyTaskSnapshot();
+      if (secondaryDue || finished) void refreshHistory();
       if (secondaryDue) {
         const projects = H.projects;
         const memories = await Promise.allSettled(projects.map(project => request('/api/projects/' + encodeURIComponent(project.id) + '/memory')));
@@ -359,10 +424,26 @@
   }
 
   H.request = request;
-  H.rpc = async (method, params = {}) => {
-    const result = await request('/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }) });
+  H.age = age;
+  const rpcRequest = async (method, params = {}, timeoutMs = null) => {
+    const result = await request('/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }) }, timeoutMs);
     if (result.error) throw new Error(result.error.message || 'RPC request failed');
     return result.result;
+  };
+  H.rpc = async (method, params = {}, timeoutMs = null) => {
+    if (!rpcReady) {
+      rpcHandshake ||= (async () => {
+        try {
+          await rpcRequest('initialize', {}, timeoutMs);
+          await rpcRequest('initialized', {}, timeoutMs);
+        } catch (error) {
+          if (error.message !== 'Server already initialized.') throw error;
+        }
+        rpcReady = true;
+      })().finally(() => { rpcHandshake = null; });
+      await rpcHandshake;
+    }
+    return rpcRequest(method, params, timeoutMs);
   };
   H.refresh = refresh;
   window.addEventListener('storage', event => { if (event.key === 'harness_token') { lastSecondaryRefresh = 0; refresh(); } });
