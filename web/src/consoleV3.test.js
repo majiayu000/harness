@@ -158,3 +158,33 @@ it("shows partial errors and empty onboarding without inventing history or usage
   expect(mobile.isHome).toBe(false);
   expect(mobile.cols).toBe("minmax(0,1fr)");
 });
+
+it("checks the loaded command policy and fixes only the selected project", async () => {
+  const { component, H, context } = setup();
+  H.rpc = vi.fn()
+    .mockResolvedValueOnce({ decision: "forbidden", matchedRules: [{ decision: "forbidden" }] })
+    .mockResolvedValueOnce({ fixed_count: 1, residual_violations: [] });
+  context.confirm = vi.fn(() => true);
+  component.state.epCmd = "rm -rf .";
+  await component.renderVals().checkEp();
+  expect(H.rpc).toHaveBeenCalledWith("exec_policy_check", { command: "rm -rf ." });
+  expect(component.renderVals().ep.d).toBe("forbidden");
+
+  component.state.ruleProject = "/tmp/project";
+  await component.renderVals().autoFix();
+  expect(context.confirm).toHaveBeenCalledWith(expect.stringContaining("/tmp/project"));
+  expect(H.rpc).toHaveBeenCalledWith("rule_fix", { project_root: "/tmp/project" });
+  expect(H.rules.failing).toBe(0);
+});
+
+it("discards policy results for an edited command", async () => {
+  const { component, H } = setup();
+  let resolveCheck;
+  H.rpc = vi.fn(() => new Promise(resolve => { resolveCheck = resolve; }));
+  component.state.epCmd = "git status";
+  const pending = component.renderVals().checkEp();
+  component.renderVals().onEp({ target: { value: "rm -rf ." } });
+  resolveCheck({ decision: "allow", matchedRules: [{}] });
+  await pending;
+  expect(component.renderVals().ep.d).toBe("Not evaluated");
+});

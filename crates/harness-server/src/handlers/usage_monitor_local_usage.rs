@@ -1,4 +1,5 @@
 use chrono::{DateTime, SecondsFormat, Utc};
+use harness_protocol::rest::{LocalQuotaSource, LocalQuotaWindow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::process::Output;
@@ -47,6 +48,78 @@ pub(super) struct LocalUsageSourceSummary {
     cost_confidence: &'static str,
     elapsed_ms: f64,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CcstatsLimits {
+    windows: Vec<LocalQuotaWindow>,
+    codex: Option<CcstatsQuotaObservation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CcstatsQuotaObservation {
+    observed_at: Option<String>,
+}
+
+pub(super) async fn load_local_quota_summaries() -> Vec<LocalQuotaSource> {
+    let codex = load_local_quota_source(LOCAL_USAGE_SOURCES[0]);
+    let claude = load_local_quota_source(LOCAL_USAGE_SOURCES[1]);
+    let (codex, claude) = tokio::join!(codex, claude);
+    vec![codex, claude]
+}
+
+async fn load_local_quota_source(source: LocalUsageSource) -> LocalQuotaSource {
+    let result = async {
+        let output = Command::new(CCSTATS_BIN)
+            .args([
+                "limits",
+                "--source",
+                source.source,
+                "--json",
+                "--no-cost",
+                "--offline",
+            ])
+            .output()
+            .await
+            .map_err(|error| format!("failed to run `{CCSTATS_BIN}`: {error}"))?;
+        if !output.status.success() {
+            return Err(ccstats_failure_message(&output));
+        }
+        let stdout = std::str::from_utf8(&output.stdout)
+            .map_err(|error| format!("ccstats stdout was not UTF-8: {error}"))?;
+        serde_json::from_str::<CcstatsLimits>(stdout)
+            .map_err(|error| format!("ccstats limits JSON output was invalid: {error}"))
+    }
+    .await;
+    local_quota_summary_from_result(source, result)
+}
+
+fn local_quota_summary_from_result(
+    source: LocalUsageSource,
+    result: Result<CcstatsLimits, String>,
+) -> LocalQuotaSource {
+    match result {
+        Ok(limits) => LocalQuotaSource {
+            source: source.source,
+            display_name: source.display_name,
+            status: if limits.windows.is_empty() {
+                "missing"
+            } else {
+                "available"
+            },
+            observed_at: limits.codex.and_then(|quota| quota.observed_at),
+            windows: limits.windows,
+            error: None,
+        },
+        Err(error) => LocalQuotaSource {
+            source: source.source,
+            display_name: source.display_name,
+            status: "unavailable",
+            observed_at: None,
+            windows: Vec::new(),
+            error: Some(error),
+        },
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -396,6 +469,29 @@ fn nonnegative_tokens(value: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_quota_summary_preserves_official_and_estimated_boundaries() {
+        let codex: CcstatsLimits = serde_json::from_str(r#"{"codex":{"observed_at":"2026-09-26T17:06:05Z"},"windows":[{"window":"weekly","source":"official","used_pct":70.0,"resets_at":"2026-10-03T16:58:50Z","stale":false}]}"#).expect("codex limits");
+        let codex = local_quota_summary_from_result(LOCAL_USAGE_SOURCES[0], Ok(codex));
+        assert_eq!(codex.status, "available");
+        assert_eq!(codex.observed_at.as_deref(), Some("2026-09-26T17:06:05Z"));
+        assert_eq!(codex.windows[0].used_pct, Some(70.0));
+
+        let claude: CcstatsLimits = serde_json::from_str(r#"{"claude_blocks":{},"windows":[{"window":"estimated_5h","source":"estimated","used_pct":null,"resets_at":"53m remaining","stale":false}]}"#).expect("claude limits");
+        let claude = local_quota_summary_from_result(LOCAL_USAGE_SOURCES[1], Ok(claude));
+        assert_eq!(claude.status, "available");
+        assert_eq!(claude.observed_at, None);
+        assert_eq!(claude.windows[0].used_pct, None);
+
+        let missing = local_quota_summary_from_result(
+            LOCAL_USAGE_SOURCES[1],
+            Ok(CcstatsLimits {
+                windows: Vec::new(),
+                codex: None,
+            }),
+        );
+        assert_eq!(missing.status, "missing");
+    }
     use super::*;
 
     #[test]

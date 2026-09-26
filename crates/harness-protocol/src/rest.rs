@@ -7,6 +7,30 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 
+#[derive(Debug, Clone, serde::Deserialize, Serialize)]
+pub struct LocalQuotaWindow {
+    pub window: String,
+    pub source: String,
+    pub used_pct: Option<f64>,
+    pub resets_at: Option<String>,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalQuotaSource {
+    pub source: &'static str,
+    pub display_name: &'static str,
+    pub status: &'static str,
+    pub observed_at: Option<String>,
+    pub windows: Vec<LocalQuotaWindow>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalQuotaResponse {
+    pub sources: Vec<LocalQuotaSource>,
+}
+
 /// Runtime-host capability required before the server issues proof-bearing leases.
 pub const RUNTIME_JOB_LEASE_PROOF_V1_CAPABILITY: &str = "runtime_job_lease_proof_v1";
 
@@ -514,3 +538,6 @@ impl RestDto for ProjectQueueStatsResponse {}
 
 impl private::Sealed for IntakeStatusResponse {}
 impl RestDto for IntakeStatusResponse {}
+
+impl private::Sealed for LocalQuotaResponse {}
+impl RestDto for LocalQuotaResponse {}

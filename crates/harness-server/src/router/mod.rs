@@ -109,6 +109,12 @@ pub async fn handle_request(state: &AppState, req: RpcRequest) -> Option<RpcResp
             project_root,
             files,
         } => Some(handlers::rules::rule_check(state, id, project_root, files).await),
+        Method::RuleFix { project_root } => {
+            Some(handlers::rules::rule_fix(state, id, project_root).await)
+        }
+        Method::ExecPolicyCheck { command } => {
+            Some(handlers::rules::exec_policy_check(state, id, command).await)
+        }
 
         // === GC ===
         Method::GcRun { project_id } => Some(handlers::gc::gc_run(state, id, project_id).await),

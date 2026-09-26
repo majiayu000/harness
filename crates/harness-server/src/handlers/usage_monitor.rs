@@ -35,7 +35,9 @@ use usage_monitor_aggregate::{aggregate_usage, total_usage_aggregate, UsageGroup
 use usage_monitor_candidate::{
     candidate_attribution_index, candidate_usage_groups, CandidateUsageGroup,
 };
-use usage_monitor_local_usage::{load_local_usage_summaries, LocalUsageSourceSummary};
+use usage_monitor_local_usage::{
+    load_local_quota_summaries, load_local_usage_summaries, LocalUsageSourceSummary,
+};
 use usage_monitor_process::{sample_agent_processes_for_monitor, AgentProcess};
 use usage_monitor_records::load_usage_records;
 
@@ -285,6 +287,13 @@ pub(crate) async fn usage_monitor(
         )
             .into_response(),
     }
+}
+
+pub(crate) async fn local_quotas(
+) -> crate::http::rest_contract::ContractJson<harness_protocol::rest::LocalQuotaResponse> {
+    crate::http::rest_contract::ContractJson(harness_protocol::rest::LocalQuotaResponse {
+        sources: load_local_quota_summaries().await,
+    })
 }
 
 async fn build_usage_monitor_response(
