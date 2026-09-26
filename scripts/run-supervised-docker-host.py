@@ -550,59 +550,77 @@ class Host:
         if handoff is None:
             raise RuntimeError("native quality gate requires a retained candidate Git bundle")
         quality_gate.bind_retained_candidate(handoff, expected_head_sha)
-        payload = quality_gate.validation_spec(handoff, expected_head_sha, validation_commands)
-        out_dir = self.root / "quality-gate-out"
-        if out_dir.exists():
-            for path in out_dir.iterdir():
-                path.unlink()
-        else:
-            out_dir.mkdir(mode=0o700)
-        verify_args = self.offline_verify_args(
-            f"--mount=type=bind,src={self.root / 'verifier.py'},dst=/trusted/verify.py,readonly",
-            f"--mount=type=bind,src={out_dir},dst=/out",
-        )
         limits = self.state.get("enforced_limits")
         if limits is None:
+            payload = quality_gate.validation_spec(handoff, expected_head_sha, validation_commands)
+            out_dir = self.root / "quality-gate-out"
+            if out_dir.exists():
+                for path in out_dir.iterdir():
+                    path.unlink()
+            else:
+                out_dir.mkdir(mode=0o700)
+            verify_args = self.offline_verify_args(
+                f"--mount=type=bind,src={self.root / 'verifier.py'},dst=/trusted/verify.py,readonly",
+                f"--mount=type=bind,src={out_dir},dst=/out",
+            )
             docker(*verify_args, quality_gate.OFFLINE_VALIDATION_SCRIPT, payload)
             self.wait_verify_container()
-        else:
-            effective = limits["effective"]
-            retention_secs = effective["wall_time_secs"] + 300
-            docker(*verify_args[:-2], "-I", "-c", CANDIDATE_REAPER_SCRIPT, str(retention_secs))
-            self.state["resource_container"] = self.name + "-verify"
-            self.state["container_started"] = True
-            self.state["network_enforced"] = True
-            self.state["output_bytes"] = 0
-            self.persist()
-            self.start_observer(retention_secs, self.name + "-verify")
-            spec = json.loads(payload)
-            spec["output_limit"] = effective["output_bytes"]
-            started = time.monotonic()
-            try:
-                stream_agent_output(
-                    ["docker", "exec", "--workdir", "/candidate", self.name + "-verify",
-                     "python3", "-I", "-c", quality_gate.OFFLINE_VALIDATION_SCRIPT, json.dumps(spec)],
-                    self.root, effective["wall_time_secs"], self.renew,
-                    output_limit=effective["output_bytes"],
-                    check=lambda: self.check_verifier_cpu(effective["cpu_time_secs"]),
-                )
-            finally:
-                self.state["output_bytes"] = sum(
-                    (self.root / name).stat().st_size for name in ("agent.jsonl", "agent.stderr")
-                    if (self.root / name).is_file()
-                )
-                self.state["wall_time_millis"] = max(0, int((time.monotonic() - started) * 1000))
-                self.persist()
-            validation_path = out_dir / "validation.json"
-            if validation_path.is_file():
-                self.state["output_bytes"] += sum(
-                    item["output_bytes"] for item in json.loads(validation_path.read_text())
-                )
-                self.persist()
-            self.collect_resources(stop_agents=True)
-        return quality_gate.read_validation_evidence(
-            out_dir / "validation.json", len(validation_commands)
+            return quality_gate.read_validation_evidence(
+                out_dir / "validation.json", len(validation_commands)
+            )
+
+        effective = limits["effective"]
+        retention_secs = effective["wall_time_secs"] + 300
+        verify_args = self.offline_verify_args(
+            f"--mount=type=bind,src={self.root / 'verifier.py'},dst=/trusted/verify.py,readonly",
         )
+        docker(*verify_args[:-2], "-I", "-c", CANDIDATE_REAPER_SCRIPT, str(retention_secs))
+        self.state["resource_container"] = self.name + "-verify"
+        self.state["container_started"] = True
+        self.state["network_enforced"] = True
+        self.state["output_bytes"] = 0
+        self.persist()
+        self.start_observer(retention_secs, self.name + "-verify")
+        reconstruction = [
+            "python3", "-I", "/git-handoff.py", "verify", "/handoff/candidate.bundle",
+            handoff["base_commit"], expected_head_sha, handoff["bundle_sha256"],
+            "/handoff/workspace", "/candidate",
+        ]
+        validation = []
+        started = time.monotonic()
+        try:
+            for index, argv in enumerate([reconstruction, *validation_commands]):
+                remaining_wall = effective["wall_time_secs"] - (time.monotonic() - started)
+                if remaining_wall <= 0:
+                    raise RuntimeError("verifier exceeded claimed wall deadline")
+                remaining_output = effective["output_bytes"] - self.state["output_bytes"]
+                account = {}
+                command_started = time.monotonic()
+                try:
+                    exit_code = stream_agent_output(
+                        ["docker", "exec", "--workdir", "/candidate", self.name + "-verify", *argv],
+                        self.root, remaining_wall, self.renew,
+                        output_limit=remaining_output, account=account,
+                        check=lambda: self.check_verifier_cpu(effective["cpu_time_secs"]),
+                    )
+                finally:
+                    self.state["output_bytes"] += account.get("output_bytes", 0)
+                    self.persist()
+                if index == 0:
+                    if exit_code:
+                        raise RuntimeError(f"independent verifier could not reconstruct candidate: exit {exit_code}")
+                    continue
+                output = (self.root / "agent.jsonl").read_bytes() + (self.root / "agent.stderr").read_bytes()
+                validation.append({
+                    "argv": argv, "exit_code": exit_code,
+                    "output_sha256": hashlib.sha256(output).hexdigest(),
+                    "duration_ms": max(0, int((time.monotonic() - command_started) * 1000)),
+                })
+        finally:
+            self.state["wall_time_millis"] = max(0, int((time.monotonic() - started) * 1000))
+            self.persist()
+        self.collect_resources(stop_agents=True)
+        return validation
 
     def check_verifier_cpu(self, cpu_time_secs: int) -> None:
         metrics = json.loads(docker("exec", self.name + "-observer", "python3", "-I", "-c",
