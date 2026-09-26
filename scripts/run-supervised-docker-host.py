@@ -685,6 +685,11 @@ class Host:
     def complete(self) -> None:
         payload_path = self.root / "completion.json"
         if not payload_path.exists():
+            if self.state.get("enforced_limits") is not None and "execution_evidence" not in self.state:
+                # The server uses only this cleanup acknowledgement for a failed
+                # eval result; missing model usage and measurements stay unknown.
+                self.state["execution_evidence"] = quality_gate.execution_evidence("", [], {})
+                self.persist()
             payload = {**self.state["lease"], "result": self.state["result"]}
             evidence = self.state.get("execution_evidence")
             if evidence is not None:

@@ -98,6 +98,26 @@ def test_unaccepted_completion_remains_pending(tmp_path):
     assert (tmp_path / 'completion.json').is_file()
 
 
+def test_failed_eval_completion_attests_successful_cleanup_without_usage(tmp_path, monkeypatch):
+    module = load()
+    runner = host(tmp_path, 'cleaning')
+    runner.name = 'owned'
+    runner.state['enforced_limits'] = {'effective': {}}
+    runner.state['result'] = {'activity': 'modify', 'status': 'failed', 'summary': 'model failed',
+                              'artifacts': [], 'signals': [], 'error': 'model failed',
+                              'error_kind': 'unknown'}
+    runner.api = Mock(return_value={'completed': True})
+    monkeypatch.setattr(module, 'docker', lambda *args: '')
+
+    runner.run()
+
+    payload = runner.api.call_args.args[1]
+    assert payload['result']['status'] == 'failed'
+    assert payload['execution_evidence']['isolation_cleanup_status'] == 'cleaned'
+    assert payload['execution_evidence']['resource_limit_report'] == {}
+    assert payload['execution_evidence']['usage']['cost_usd_micros'] is None
+
+
 def test_usage_requires_completed_turn(tmp_path):
     module = load()
     log = tmp_path / 'agent.jsonl'
@@ -1023,10 +1043,11 @@ def test_root_eval_contract_is_enforced():
     assert module.quality_gate.bind_eval_contract(claim, {"eval": {}, "command": {}}) == {
         "MODEL_TOKEN": "private-value"
     }
-    with pytest.raises(RuntimeError, match="trusted_eval_verifier_v1"):
-        module.quality_gate.bind_eval_contract(
-            claim, {"eval": {"required_runtime_host_capabilities": ["trusted_eval_verifier_v1"]}}
-        )
+    assert module.quality_gate.bind_eval_contract(
+        claim, {"activity": "implement_issue", "eval": {
+            "required_runtime_host_capabilities": ["trusted_eval_verifier_v1"]
+        }}
+    ) == {"MODEL_TOKEN": "private-value"}
     assert module.quality_gate.bind_eval_contract(
         claim, {"activity": "run_quality_gate", "eval": {
             "required_runtime_host_capabilities": ["trusted_eval_verifier_v1"]

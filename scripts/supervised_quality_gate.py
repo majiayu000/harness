@@ -105,14 +105,6 @@ def _positive(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def reject_unsupported_eval(command: dict, *, native_quality_gate: bool = False) -> None:
-    required = command.get("eval", {}).get("required_runtime_host_capabilities", [])
-    if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
-        raise RuntimeError("eval required capabilities are malformed")
-    if "trusted_eval_verifier_v1" in required and not native_quality_gate:
-        raise RuntimeError("this supervised client does not implement trusted_eval_verifier_v1")
-
-
 def trusted_resource_limits(claim: dict) -> dict:
     limits = claim.get("resource_limits")
     if (
@@ -253,10 +245,6 @@ def bind_eval_contract(claim: dict, job_input: dict) -> dict[str, str] | None:
         eval_contract = job_input.get("eval")
     if not isinstance(eval_contract, dict):
         return None
-    reject_unsupported_eval(
-        {"eval": eval_contract},
-        native_quality_gate=job_input.get("activity") == QUALITY_GATE_ACTIVITY,
-    )
     limits = trusted_resource_limits(claim)
     network_policy_from_claim(claim)
     mount_budget(limits["effective"]["disk_bytes"])

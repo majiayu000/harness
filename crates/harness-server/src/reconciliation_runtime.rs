@@ -32,7 +32,14 @@ pub(super) fn runtime_candidate_from_instance(
     instance: &WorkflowInstance,
     row_updated_at: chrono::DateTime<chrono::Utc>,
 ) -> Option<RuntimeWorkflowCandidate> {
-    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID || instance.is_terminal() {
+    if instance.definition_id != GITHUB_ISSUE_PR_DEFINITION_ID
+        || instance.is_terminal()
+        || instance
+            .data
+            .pointer("/eval/eval_run_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    {
         return None;
     }
     let pr_number = instance

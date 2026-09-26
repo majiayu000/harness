@@ -86,6 +86,56 @@ pub(super) fn attach_eval_checkout_evidence(
     result: ActivityResult,
     execution_evidence: Option<RuntimeHostExecutionEvidence>,
 ) -> Result<ActivityResult, serde_json::Value> {
+    if job.is_eval_job()
+        && result.status == harness_workflow::runtime::ActivityStatus::Failed
+        && execution_evidence
+            .as_ref()
+            .is_none_or(|evidence| evidence.checked_out_commit.trim().is_empty())
+    {
+        let Some(execution_evidence) = execution_evidence else {
+            return Ok(result);
+        };
+        if execution_evidence.isolation_cleanup_status.trim() != "cleaned" {
+            return Err(json!({"error": "eval failure cleanup is not confirmed"}));
+        }
+        if !execution_evidence.usage.model.trim().is_empty()
+            || execution_evidence.usage.total_tokens != 0
+            || execution_evidence.usage.input_tokens != 0
+            || execution_evidence.usage.output_tokens != 0
+            || execution_evidence.usage.cached_input_tokens != 0
+            || execution_evidence
+                .usage
+                .cost_usd_micros
+                .is_some_and(|cost| cost != 0)
+            || !execution_evidence.validation.is_empty()
+        {
+            return Err(
+                json!({"error": "failed eval execution evidence has measurements without a checked-out commit"}),
+            );
+        }
+        let mut result = result.with_artifact(ActivityArtifact::new(
+            harness_workflow::runtime::completion_evidence::ARTIFACT_EVAL_ISOLATION_CLEANUP,
+            json!({
+                "status": "cleaned",
+                "evidence_source": "runtime_host_completion_request",
+            }),
+        ));
+        if !execution_evidence.resource_limit_report.is_null()
+            && execution_evidence.resource_limit_report != json!({})
+        {
+            let report: ResourceLimitReport = serde_json::from_value(
+                execution_evidence.resource_limit_report,
+            )
+            .map_err(
+                |error| json!({ "error": format!("invalid host resource_limit_report: {error}") }),
+            )?;
+            result = result.with_artifact(ActivityArtifact::new(
+                harness_workflow::runtime::completion_evidence::ARTIFACT_RESOURCE_LIMIT_REPORT,
+                json!(report),
+            ));
+        }
+        return Ok(result);
+    }
     let Some((expected, exact_match)) = expected_eval_checkout_commit(job) else {
         return Ok(result);
     };
@@ -323,10 +373,8 @@ pub(in crate::handlers::runtime_hosts) fn validate_eval_resource_limit_report(
 pub(super) fn failed_eval_resource_report_without_usage(
     job: &RuntimeJob,
     result: &ActivityResult,
-    has_execution_evidence: bool,
 ) -> Result<Option<ActivityArtifact>, (StatusCode, serde_json::Value)> {
-    if has_execution_evidence
-        || result.status != harness_workflow::runtime::ActivityStatus::Failed
+    if result.status != harness_workflow::runtime::ActivityStatus::Failed
         || eval_metadata(&job.input).is_none()
     {
         return Ok(None);
@@ -520,24 +568,33 @@ mod tests {
         );
         let raw = ActivityResult::failed("implement_issue", "quota stopped", "memory limit")
             .with_artifact(report.clone());
-        let retained = failed_eval_resource_report_without_usage(&job, &raw, false)
+        let retained = failed_eval_resource_report_without_usage(&job, &raw)
             .expect("single measured host report should be accepted")
             .expect("measured report should be retained");
         let stripped =
             harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(raw);
         assert!(stripped.artifacts.is_empty());
-        let attached = stripped.with_artifact(retained);
+        let mut evidence = host_execution_evidence("");
+        evidence.resource_limit_report = json!({});
+        evidence.usage.model.clear();
+        evidence.usage.input_tokens = 0;
+        evidence.usage.output_tokens = 0;
+        evidence.usage.total_tokens = 0;
+        evidence.usage.cost_usd_micros = None;
+        evidence.validation.clear();
+        let attached = attach_eval_checkout_evidence(&job, stripped, Some(evidence))
+            .expect("failed eval cleanup acknowledgement should be accepted")
+            .with_artifact(retained);
         validate_eval_resource_limit_report(&job, &attached)
             .expect("claimed limits and complete measurements should match");
-        assert_eq!(attached.artifacts[0].artifact, report.artifact);
-        assert!(
-            failed_eval_resource_report_without_usage(&job, &attached, true)
-                .expect("execution evidence owns the report")
-                .is_none()
+        assert_eq!(attached.artifacts[1].artifact, report.artifact);
+        assert_eq!(
+            attached.artifacts[0].artifact_type,
+            harness_workflow::runtime::completion_evidence::ARTIFACT_EVAL_ISOLATION_CLEANUP
         );
         let duplicate = attached.with_artifact(report);
         assert_eq!(
-            failed_eval_resource_report_without_usage(&job, &duplicate, false)
+            failed_eval_resource_report_without_usage(&job, &duplicate)
                 .expect_err("duplicate reports are ambiguous")
                 .0,
             StatusCode::BAD_REQUEST
@@ -624,6 +681,98 @@ mod tests {
             error["error"],
             "eval completion requires host execution_evidence"
         );
+    }
+
+    #[test]
+    fn failed_eval_accepts_host_cleanup_without_inventing_usage_or_checkout() {
+        let job = eval_implementation_job("abcdef1");
+        let mut evidence = host_execution_evidence("");
+        evidence.resource_limit_report = json!({});
+        evidence.usage.model.clear();
+        evidence.usage.input_tokens = 0;
+        evidence.usage.output_tokens = 0;
+        evidence.usage.total_tokens = 0;
+        evidence.usage.cost_usd_micros = None;
+        evidence.validation.clear();
+        let result = attach_eval_checkout_evidence(
+            &job,
+            ActivityResult::failed("implement_issue", "model failed", "unauthorized"),
+            Some(evidence.clone()),
+        )
+        .expect("a cleaned failed eval can retain cleanup proof");
+        assert_eq!(result.artifacts.len(), 1);
+        assert_eq!(
+            result.artifacts[0].artifact_type,
+            harness_workflow::runtime::completion_evidence::ARTIFACT_EVAL_ISOLATION_CLEANUP
+        );
+        assert_eq!(result.artifacts[0].artifact["status"], "cleaned");
+
+        evidence.isolation_cleanup_status = "incomplete".to_string();
+        let error = attach_eval_checkout_evidence(
+            &job,
+            ActivityResult::failed("implement_issue", "model failed", "unauthorized"),
+            Some(evidence),
+        )
+        .expect_err("incomplete cleanup must be rejected");
+        assert_eq!(error["error"], "eval failure cleanup is not confirmed");
+    }
+
+    #[test]
+    fn failed_eval_retains_valid_host_usage_and_checkout() {
+        let job = eval_implementation_job("abcdef1");
+        let result = attach_eval_checkout_evidence(
+            &job,
+            ActivityResult::failed("implement_issue", "model failed", "agent exited"),
+            Some(host_execution_evidence(
+                "abcdef1234567890abcdef1234567890abcdef12",
+            )),
+        )
+        .expect("measured evidence from a failed turn should be retained");
+
+        for kind in [
+            harness_workflow::runtime::completion_evidence::ARTIFACT_EVAL_BASE_CHECKOUT,
+            harness_workflow::runtime::completion_evidence::ARTIFACT_RUNTIME_HOST_USAGE,
+            harness_workflow::runtime::completion_evidence::ARTIFACT_RESOURCE_LIMIT_REPORT,
+            harness_workflow::runtime::completion_evidence::ARTIFACT_EVAL_ISOLATION_CLEANUP,
+        ] {
+            assert!(result
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.artifact_type == kind));
+        }
+        assert_eq!(
+            result.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+    }
+
+    #[test]
+    fn failed_eval_accepts_resource_measurements_without_checkout() {
+        let job = eval_implementation_job("abcdef1");
+        let mut evidence = host_execution_evidence("");
+        evidence.usage.model.clear();
+        evidence.usage.input_tokens = 0;
+        evidence.usage.output_tokens = 0;
+        evidence.usage.total_tokens = 0;
+        evidence.usage.cost_usd_micros = None;
+        evidence.validation.clear();
+        let result = attach_eval_checkout_evidence(
+            &job,
+            ActivityResult::failed("implement_issue", "container failed", "quota stopped"),
+            Some(evidence),
+        )
+        .expect("resource measurements do not require a completed checkout");
+
+        validate_eval_resource_limit_report(&job, &result)
+            .expect("host measurements should match the claimed limits");
+        assert!(result.artifacts.iter().any(|artifact| {
+            artifact.artifact_type
+                == harness_workflow::runtime::completion_evidence::ARTIFACT_RESOURCE_LIMIT_REPORT
+        }));
+        assert!(!result.artifacts.iter().any(|artifact| {
+            artifact.artifact_type
+                == harness_workflow::runtime::completion_evidence::ARTIFACT_RUNTIME_HOST_USAGE
+        }));
     }
 
     #[test]
