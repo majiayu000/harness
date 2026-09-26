@@ -1,0 +1,59 @@
+{
+  "probe_kind": "offline_container_replay",
+  "formal_eval_claim": false,
+  "historical_gold": {
+    "gold": "e8de36b98b0afc1c8213486b3ff89ec7af5e4d2d",
+    "validation": [
+      {
+        "argv": [
+          "harness",
+          "eval",
+          "verify-trusted",
+          "gh1454_ci_contract_v1",
+          "--workspace",
+          ".",
+          "--verifier-sha256",
+          "5e72f1bd2d1ce30f10510e17890b3c77e863da3ab44be63aaa3d16c09d46a0f1"
+        ],
+        "exit_code": 0,
+        "output_sha256": "d30f90aa8f3d46edd1f0d2295babd40304e59943f3b71c4b7de759f9d0f5ada8",
+        "output_bytes": 963,
+        "duration_ms": 13
+      }
+    ],
+    "resource_status": "complete",
+    "resource_report": {
+      "limits": {
+        "requested": {},
+        "effective": {
+          "cpu_time_secs": 60,
+          "memory_bytes": 2147483648,
+          "pids": 128,
+          "disk_bytes": 2147483648,
+          "output_bytes": 1048576,
+          "wall_time_secs": 120
+        },
+        "caps": []
+      },
+      "usage": {
+        "cpu_time_millis": 2545,
+        "peak_memory_bytes": 122425344,
+        "peak_pids": 9,
+        "disk_bytes": 13029376,
+        "output_bytes": 963,
+        "wall_time_millis": 4688
+      },
+      "reason": "completed within trusted resource limits"
+    },
+    "verifier_image": "sha256:9c44a5e27d19ab2ea860b8f06ff5e59dddbeb7519a4925424f9cc68fd5bf905c"
+  },
+  "one_second_cpu_limit": {
+    "error": "verifier exceeded cumulative CPU time limit",
+    "resource_status": "complete",
+    "cpu_time_millis": 1168,
+    "termination": {
+      "resource": "cpu_time",
+      "reason": "cumulative CPU time limit exceeded"
+    }
+  }
+}
