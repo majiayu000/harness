@@ -1614,7 +1614,8 @@ def test_verify_expected_head_uses_helper_verify_and_server_argv(tmp_path, monke
     assert payload['commands'] == commands
 
 
-def test_eval_verifier_reaps_stopped_children_before_resource_collection(tmp_path, monkeypatch):
+@pytest.mark.parametrize('validator_exit', [0, 1])
+def test_eval_verifier_reaps_and_uses_host_captured_validation(tmp_path, monkeypatch, validator_exit):
     from types import SimpleNamespace
     module = load()
     runner = host(tmp_path, 'executing')
@@ -1633,24 +1634,37 @@ def test_eval_verifier_reaps_stopped_children_before_resource_collection(tmp_pat
     }}
     (tmp_path / 'verifier.py').write_text('pass\n')
     commands = [['python3', '-c', 'pass']]
+    forged = tmp_path / 'quality-gate-out'
+    forged.mkdir()
+    (forged / 'validation.json').write_text(json.dumps([{
+        'argv': commands[0], 'exit_code': 0, 'output_sha256': 'a' * 64,
+        'duration_ms': 1,
+    }]))
     calls = []
+    executions = []
 
     def docker(*args):
         calls.append(args)
-        if args[0] == 'run':
-            (tmp_path / 'quality-gate-out/validation.json').write_text(json.dumps([{
-                'argv': commands[0], 'exit_code': 0, 'output_sha256': 'a' * 64,
-                'output_bytes': 5, 'duration_ms': 1,
-            }]))
         return 'ok'
 
+    def stream(command, root, timeout, renew, **kwargs):
+        executions.append(command)
+        output = b'xxxxx' if len(executions) == 2 else b''
+        (root / 'agent.jsonl').write_bytes(output)
+        (root / 'agent.stderr').write_bytes(b'')
+        kwargs['account']['output_bytes'] = len(output)
+        return validator_exit if len(executions) == 2 else 0
+
     monkeypatch.setitem(runner.verify_expected_head.__globals__, 'docker', docker)
-    monkeypatch.setitem(runner.verify_expected_head.__globals__, 'stream_agent_output', Mock(return_value=0))
+    monkeypatch.setitem(runner.verify_expected_head.__globals__, 'stream_agent_output', stream)
     result = runner.verify_expected_head(handoff['candidate_commit'], commands)
-    assert result[0]['exit_code'] == 0
+    assert result[0]['exit_code'] == validator_exit
+    assert result[0]['output_sha256'] == __import__('hashlib').sha256(b'xxxxx').hexdigest()
     launch = next(call for call in calls if call[0] == 'run')
     assert module.CANDIDATE_REAPER_SCRIPT in launch
     assert launch[-1] == '330'
+    assert not any('dst=/out' in arg for arg in launch)
+    assert executions[1][-3:] == ['python3', '-c', 'pass']
     assert runner.state['resource_container'] == 'owned-verify'
     assert runner.state['network_enforced'] is True
     assert runner.state['output_bytes'] == 5

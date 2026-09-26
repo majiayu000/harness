@@ -206,8 +206,9 @@ and PID peaks plus terminal writable tmpfs use under the claimed resource
 limits. Their completion includes `resource_limit_report` and
 `network_policy_report`; the verifier runs with `--network none` and without
 model credentials. `verifier-resources.json` and `supervised_verifier_resources`
-retain the raw host measurement. Lease-only quality gates still omit eval
-resource measurements. Prior-job
+retain the raw host measurement. The host captures formal eval validation exit
+codes and output digests; the verifier has no writable host result mount.
+Lease-only quality gates still omit eval resource measurements. Prior-job
 `execution_evidence` is cleared before the new claim so stale evidence cannot
 attach to the current lease. Agent-contract and exact-replay jobs remain
 rejected. Completed restarts of the original state directory still no-op and do

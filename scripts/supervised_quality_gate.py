@@ -20,34 +20,20 @@ QUALITY_GATE_ACTIVITY = "run_quality_gate"
 QUALITY_PASSED_SIGNAL = "QualityPassed"
 QUALITY_FAILED_SIGNAL = "QualityFailed"
 
-OFFLINE_VALIDATION_SCRIPT = """import hashlib,json,resource,subprocess,sys,time
+OFFLINE_VALIDATION_SCRIPT = """import hashlib,json,subprocess,sys,time
 from pathlib import Path
 spec=json.loads(sys.argv[1])
 subprocess.run(['python3','-I','/git-handoff.py','verify',
 '/handoff/candidate.bundle',spec['base'],spec['candidate'],spec['digest'],
 '/handoff/workspace','/candidate'],check=True)
 results=[]
-remaining=spec.get('output_limit')
 for argv in spec['commands']:
   started=time.monotonic()
-  path=Path('/tmp/validation-output')
-  with path.open('wb') as output:
-    cap=remaining
-    def limit_output():
-      if cap is not None:
-        resource.setrlimit(resource.RLIMIT_FSIZE,(max(1,cap),max(1,cap)))
-    proc=subprocess.run(argv,cwd='/candidate',stdout=output,stderr=subprocess.STDOUT,
-                        preexec_fn=limit_output if cap is not None else None)
-  output=path.read_bytes()
-  if remaining is not None:
-    remaining-=len(output)
-  output_exceeded=remaining is not None and remaining<=0
-  results.append({'argv':argv,'exit_code':-25 if output_exceeded else proc.returncode,
+  proc=subprocess.run(argv,cwd='/candidate',capture_output=True)
+  output=proc.stdout+proc.stderr
+  results.append({'argv':argv,'exit_code':proc.returncode,
  'output_sha256':hashlib.sha256(output).hexdigest(),
- 'output_bytes':len(output),
  'duration_ms':int((time.monotonic()-started)*1000)})
-  if output_exceeded:
-    break
 Path('/out/validation.json').write_text(json.dumps(results))
 sys.exit(0 if all(item['exit_code']==0 for item in results) else 1)
 """
