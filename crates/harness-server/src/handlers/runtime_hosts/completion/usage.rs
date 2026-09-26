@@ -6,17 +6,17 @@ pub(super) fn validate_eval_usage(
     job: &RuntimeJob,
     usage: &RuntimeHostUsageEvidence,
 ) -> Result<(), Value> {
-    // A native verifier executes without a model. Keep unknown cost unknown and
-    // accept zero usage only for the exact evaluator-owned validation command.
-    let native_verifier_usage = usage.model.is_empty()
+    // Revision-bound native quality gates execute without a model. Keep unknown
+    // cost unknown; trusted verifier commands must still match their embedded contract.
+    let native_gate_usage = usage.model.is_empty()
         && usage.input_tokens == 0
         && usage.output_tokens == 0
         && usage.cached_input_tokens == 0
         && usage.total_tokens == 0
         && usage.cost_usd_micros.is_none_or(|cost| cost == 0)
-        && is_native_verifier_job(job);
+        && is_native_quality_gate_job(job);
     let measured_total = usage.input_tokens.saturating_add(usage.output_tokens);
-    if !native_verifier_usage
+    if !native_gate_usage
         && (usage.model.trim().is_empty()
             || usage.cached_input_tokens > usage.input_tokens
             || usage.total_tokens < measured_total
@@ -31,8 +31,16 @@ pub(super) fn validate_eval_usage(
     Ok(())
 }
 
-fn is_native_verifier_job(job: &RuntimeJob) -> bool {
+fn is_native_quality_gate_job(job: &RuntimeJob) -> bool {
     if super::evidence::runtime_job_activity(job) != QUALITY_GATE_ACTIVITY {
+        return false;
+    }
+    if job
+        .input
+        .pointer("/command/expected_head_sha")
+        .and_then(Value::as_str)
+        .is_none_or(|head| head.len() != 40 || !head.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
         return false;
     }
     let Some(commands) = job.input.pointer("/command/validation_commands_argv") else {
@@ -41,11 +49,20 @@ fn is_native_verifier_job(job: &RuntimeJob) -> bool {
     let Ok(commands) = serde_json::from_value::<Vec<Vec<String>>>(commands.clone()) else {
         return false;
     };
+    let trusted = commands.iter().any(|argv| {
+        argv.first().map(String::as_str) == Some("harness")
+            && argv.get(1).map(String::as_str) == Some("eval")
+            && argv.get(2).map(String::as_str) == Some("verify-trusted")
+    });
     !commands.is_empty()
         && commands.iter().all(|argv| {
-            argv.get(3)
-                .and_then(|id| id.parse::<EvalTrustedVerifier>().ok())
-                .is_some_and(|verifier| *argv == verifier.validation_argv())
+            !argv.is_empty()
+                && argv.iter().all(|part| !part.is_empty())
+                && (!trusted
+                    || argv
+                        .get(3)
+                        .and_then(|id| id.parse::<EvalTrustedVerifier>().ok())
+                        .is_some_and(|verifier| *argv == verifier.validation_argv()))
         })
 }
 
@@ -147,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn native_verifier_zero_usage_requires_exact_server_command() {
+    fn native_quality_gate_zero_usage_requires_revision_and_exact_trusted_command() {
         let original = native_job();
         let argv = EvalTrustedVerifier::Gh1454CiContractV1.validation_argv();
         let mut wrong_digest = argv.clone();
@@ -159,7 +176,6 @@ mod tests {
         for commands in [
             Value::Null,
             json!([]),
-            json!([["cargo", "check"]]),
             json!([argv, ["cargo", "check"]]),
             json!([wrong_digest]),
             json!([extra_arg]),
@@ -172,6 +188,12 @@ mod tests {
         let mut implementation = original;
         implementation.input["activity"] = json!("implement_issue");
         assert!(validate_eval_usage(&implementation, &native_usage()).is_err());
+
+        let mut ordinary_gate = native_job();
+        ordinary_gate.input["command"]["validation_commands_argv"] = json!([["cargo", "check"]]);
+        assert!(validate_eval_usage(&ordinary_gate, &native_usage()).is_ok());
+        ordinary_gate.input["command"]["expected_head_sha"] = Value::Null;
+        assert!(validate_eval_usage(&ordinary_gate, &native_usage()).is_err());
     }
 
     #[test]

@@ -1027,6 +1027,11 @@ def test_root_eval_contract_is_enforced():
         module.quality_gate.bind_eval_contract(
             claim, {"eval": {"required_runtime_host_capabilities": ["trusted_eval_verifier_v1"]}}
         )
+    assert module.quality_gate.bind_eval_contract(
+        claim, {"activity": "run_quality_gate", "eval": {
+            "required_runtime_host_capabilities": ["trusted_eval_verifier_v1"]
+        }}
+    ) == {"MODEL_TOKEN": "private-value"}
 
 
 def test_eval_credentials_enter_container_over_stdin_only(tmp_path, monkeypatch):
@@ -1097,6 +1102,7 @@ def test_rendered_claim_and_native_result_survive_completion_and_restart(tmp_pat
     assert runner.api.call_args_list[1].args[1]['execution_workspace'] == '/workspace'
     assert runner.api.call_args_list[0].args[1]['capabilities'] == [
         'runtime_job_lease_proof_v1', 'eval_resource_limits', 'eval_network_policy',
+        'trusted_eval_verifier_v1',
     ]
     saved = json.loads((tmp_path / 'state.json').read_text())
     assert saved['prepared_prompt'] == claim['prepared_prompt']
@@ -1462,6 +1468,75 @@ def test_native_quality_gate_claim_binds_expected_head_and_submits_evidence(tmp_
     assert 'eval_resource_limits not advertised' in evidence['resource_limit_report']['reason']
 
 
+def test_eval_quality_gate_claim_reports_measured_verifier_resources(tmp_path):
+    import hashlib
+    runner, _ = claimed_runner(tmp_path)
+    handoff, _ = seed_retained_candidate(tmp_path)
+    runner.args.base_commit = handoff['base_commit']
+    runner.state.update(phase='claiming', git_handoff=handoff)
+    contract = Path(__file__).resolve().parents[1] / 'evals/verifiers/gh1454_ci_contract_v1.json'
+    command = {
+        'expected_head_sha': handoff['candidate_commit'],
+        'validation_commands_argv': [[
+            'harness', 'eval', 'verify-trusted', 'gh1454_ci_contract_v1',
+            '--workspace', '.', '--verifier-sha256',
+            hashlib.sha256(contract.read_bytes()).hexdigest(),
+        ]],
+        'eval': {'base_commit': handoff['base_commit'],
+                 'required_runtime_host_capabilities': ['trusted_eval_verifier_v1']},
+    }
+    limits = {'requested': {}, 'effective': {
+        'cpu_time_secs': 60, 'memory_bytes': 512 * 1024 * 1024, 'pids': 32,
+        'disk_bytes': 1024 * 1024 * 1024, 'output_bytes': 1024,
+        'wall_time_secs': 30,
+    }, 'caps': []}
+    policy = {'inbound': 'deny', 'outbound': 'deny', 'network_allowlist': []}
+    claim = {
+        'claimed': True, **runner.state['lease'],
+        'resource_limits': limits, 'network_policy': policy,
+        'credential_environment_variables': {},
+        'runtime_job': {'id': 'quality-job', 'input': {
+            'activity': 'run_quality_gate', 'workflow_id': 'workflow-id',
+            'command': command,
+        }},
+    }
+    runner.api = Mock(side_effect=[{}, claim])
+    runner.persist = Mock()
+    runner.complete = Mock()
+    runner.cleanup = Mock()
+    runner.launch = Mock(side_effect=AssertionError('model must not launch'))
+    validation = [{'argv': command['validation_commands_argv'][0], 'exit_code': 0,
+                   'output_sha256': 'a' * 64, 'duration_ms': 10}]
+
+    def verified(expected, commands):
+        assert expected == handoff['candidate_commit']
+        assert commands == command['validation_commands_argv']
+        runner.state.update(container_started=True, resource_container='test-verify',
+                            network_enforced=True,
+                            output_bytes=12, wall_time_millis=100,
+                            resource_evidence={
+                                'status': 'complete',
+                                'metrics': {'cpu_time_micros': 100000, 'peak_memory_bytes': 1024,
+                                            'peak_pids': 2, 'memory_events': {'oom': 0, 'oom_kill': 0},
+                                            'pids_events': {'max': 0}},
+                                'disk': {'aggregate_used_bytes': 4096},
+                            })
+        return validation
+
+    runner.verify_expected_head = Mock(side_effect=verified)
+    runner.run()
+    assert runner.state['result']['status'] == 'succeeded'
+    assert runner.state['execution_evidence']['checked_out_commit'] == handoff['candidate_commit']
+    assert runner.state['execution_evidence']['validation'] == validation
+    assert runner.state['execution_evidence']['usage']['cost_usd_micros'] is None
+    assert runner.state['execution_evidence']['resource_limit_report']['usage']['cpu_time_millis'] == 100
+    network = next(artifact['artifact'] for artifact in runner.state['result']['artifacts']
+                   if artifact['artifact_type'] == 'network_policy_report')
+    assert network['reason'] == 'offline verifier denies all network egress'
+    runner.launch.assert_not_called()
+    runner.complete.assert_called_once()
+
+
 def test_native_quality_gate_rejects_mismatched_expected_head(tmp_path):
     runner, _ = claimed_runner(tmp_path)
     handoff, _ = seed_retained_candidate(tmp_path, candidate='b' * 40)
@@ -1537,6 +1612,50 @@ def test_verify_expected_head_uses_helper_verify_and_server_argv(tmp_path, monke
     payload = json.loads(command[-1])
     assert payload['candidate'] == expected
     assert payload['commands'] == commands
+
+
+def test_eval_verifier_reaps_stopped_children_before_resource_collection(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = load()
+    runner = host(tmp_path, 'executing')
+    runner.name = 'owned'
+    runner.args = SimpleNamespace(image='agent-image', verifier_image='verifier-image')
+    runner.renew = Mock()
+    runner.persist = Mock()
+    runner.start_observer = Mock()
+    runner.collect_resources = Mock()
+    handoff, _ = seed_retained_candidate(tmp_path)
+    runner.state['git_handoff'] = handoff
+    runner.state['enforced_limits'] = {'effective': {
+        'cpu_time_secs': 1, 'memory_bytes': 512 * 1024 * 1024, 'pids': 32,
+        'disk_bytes': 1024 * 1024 * 1024, 'output_bytes': 1024,
+        'wall_time_secs': 30,
+    }}
+    (tmp_path / 'verifier.py').write_text('pass\n')
+    commands = [['python3', '-c', 'pass']]
+    calls = []
+
+    def docker(*args):
+        calls.append(args)
+        if args[0] == 'run':
+            (tmp_path / 'quality-gate-out/validation.json').write_text(json.dumps([{
+                'argv': commands[0], 'exit_code': 0, 'output_sha256': 'a' * 64,
+                'output_bytes': 5, 'duration_ms': 1,
+            }]))
+        return 'ok'
+
+    monkeypatch.setitem(runner.verify_expected_head.__globals__, 'docker', docker)
+    monkeypatch.setitem(runner.verify_expected_head.__globals__, 'stream_agent_output', Mock(return_value=0))
+    result = runner.verify_expected_head(handoff['candidate_commit'], commands)
+    assert result[0]['exit_code'] == 0
+    launch = next(call for call in calls if call[0] == 'run')
+    assert module.CANDIDATE_REAPER_SCRIPT in launch
+    assert launch[-1] == '330'
+    assert runner.state['resource_container'] == 'owned-verify'
+    assert runner.state['network_enforced'] is True
+    assert runner.state['output_bytes'] == 5
+    runner.start_observer.assert_called_once_with(330, 'owned-verify')
+    runner.collect_resources.assert_called_once_with(stop_agents=True)
 
 
 def test_cli_requires_distinct_pinned_verifier_image(monkeypatch, capsys):
