@@ -109,6 +109,15 @@ pub async fn complete_runtime_job_for_runtime_host(
             );
         }
     };
+    // A failed host can measure a quota stop before model usage exists.
+    let failed_resource_report = match evidence::failed_eval_resource_report_without_usage(
+        &job,
+        &result,
+        execution_evidence.is_some(),
+    ) {
+        Ok(report) => report,
+        Err((status, response)) => return (status, completion_json(response)),
+    };
     let result = crate::workflow_runtime_worker::strip_caller_transcript_unavailable_signal(result);
     let cancellation_ack = is_eval_cancellation_ack(&job, &result);
     if !cancellation_ack {
@@ -116,7 +125,7 @@ pub async fn complete_runtime_job_for_runtime_host(
             return (StatusCode::BAD_REQUEST, completion_json(response));
         }
     }
-    let result = match if cancellation_ack {
+    let mut result = match if cancellation_ack {
         attach_eval_cancellation_cleanup_evidence(result, execution_evidence)
     } else {
         attach_eval_checkout_evidence(&job, result, execution_evidence)
@@ -124,6 +133,9 @@ pub async fn complete_runtime_job_for_runtime_host(
         Ok(result) => result,
         Err(response) => return (StatusCode::BAD_REQUEST, completion_json(response)),
     };
+    if let Some(report) = failed_resource_report {
+        result.artifacts.push(report);
+    }
     if !cancellation_ack {
         if let Err((status, response)) = validate_eval_network_policy_report(&job, &result) {
             return (status, completion_json(response));
