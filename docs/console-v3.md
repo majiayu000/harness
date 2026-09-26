@@ -15,7 +15,7 @@ cannot reset shared state while the dashboard is rendering.
 | Approvals | Every pending request is listed. Confirmation uses its submission ID and request ID, then rechecks that request before sending accept/reject. |
 | Bulk actions | Eligibility comes from the operator monitor. A shared reason is required. Each eligible workflow receives one request; partial failures remain visible. |
 | Dependencies / failures | Submission `depends_on` links and `failure_kind`; retry/unblock eligibility is supplied by the server, not a client classification table. |
-| Events / operator activity | `event_query` reads a 24-hour window and incrementally refreshes it; the newest 200 events are shown. Workflow action results use `event_log` with `hook=console_action`. These are client-reported results, not tamper-proof server audit evidence. No localStorage audit or fabricated events are used. |
+| Events / operator activity | `event_query` re-reads the 24-hour window to include late commits and clock skew; the newest 200 events are shown. Workflow action results use `event_log` with `hook=console_action`. These are client-reported results, not tamper-proof server audit evidence. No localStorage audit or fabricated events are used. |
 | Prompts / artifacts / proof | Submission detail endpoints; actual prompt text and artifact content can be inspected. |
 | Context | `context_preview` composes a current preview using the server budget. It is not a reconstruction of a previously executed turn; recorded prompts remain separate. |
 | Memory | Project memory records, using the repository identity recorded in submissions, including outcome/use count; deletion uses the memory endpoint. |
@@ -23,7 +23,7 @@ cannot reset shared state while the dashboard is rendering.
 | Worktree cleanup | Copies a shell-quoted `git worktree remove` command for a server-classified orphan. Does not execute deletion or add `--force`. |
 
 Requests retain session-token Bearer authentication, unauthorized notification,
-timeouts, and stale-state/error reporting. Failed detail requests retry at most
+read timeouts, and stale-state/error reporting. Mutations do not inherit the short polling deadline. Failed detail requests retry at most
 once per 30 seconds. Workflow data is preserved when an essential poll fails.
 An action-log error does not turn an accepted mutation into a failed mutation or
 silently replay it.

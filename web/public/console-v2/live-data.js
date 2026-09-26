@@ -110,7 +110,7 @@
       host: invocation?.lease_owner || '—', turn: task.turn || 0, max: task.max_turns || worktree?.max_turns || '—',
       age: age(task.created_at), obs: invocation?.last_runtime_observation_at ? age(invocation.last_runtime_observation_at) : '—',
       lease: leaseState, tokens: formatInt(tokenUsage?.total_tokens), cost: formatCost(tokenUsage?.cost_usd), file: '', sym: '', crate: repo,
-      inbox: approval ? actionInbox({ kind: 'approval', requestId: approval.id, blocked_reason: 'approval_request', unblock_hint: approval.action, next_action: 'Approve or deny request' }) : actionInbox(action), waiting: task.scheduler?.authority_state || '', activity: invocation?.activity || '', taskKind: task.task_kind || '—',
+      inbox: approval ? actionInbox({ kind: 'approval', requestId: approval.id, blocked_reason: 'approval_request', unblock_hint: approval.action, next_action: 'Approve or deny request' }) : actionInbox(action), waiting: task.scheduler?.authority_state || '', activity: invocation?.activity || '', taskKind: task.task_kind || null,
       branch: worktree?.branch || '—', worktree: worktree?.path_short || '—',
       terminal: terminalStates.has(current), ago: age(task.updated_at || task.created_at), score: '—',
     };
@@ -280,9 +280,9 @@
     refreshView();
     try {
       const dayAgo = Date.now() - 86400_000;
-      const since = H.events[0]?.ts || new Date(dayAgo).toISOString();
-      // event_query orders oldest first; limiting that query would hide new actions.
-      const incoming = await H.rpc('event_query', { filters: { since } });
+      const since = new Date(dayAgo).toISOString();
+      // Query the whole recent window: timestamps can precede commit order.
+      const incoming = await H.rpc('event_query', { filters: { since } }, 15_000);
       H.events = [...new Map([...H.events, ...incoming].map(event => [event.id, event])).values()]
         .filter(event => new Date(event.ts).getTime() >= dayAgo)
         .sort((a, b) => new Date(b.ts) - new Date(a.ts)).slice(0, 200);
@@ -291,9 +291,16 @@
     H.eventsLoading = false;
     refreshView();
   };
+  const eventId = () => {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+    return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
+  };
   H.recordAction = async (action, workflow, reason, endpoint, status) => {
     await H.rpc('event_log', { event: {
-      id: crypto.randomUUID(), ts: new Date().toISOString(), session_id: 'console', hook: 'console_action', tool: action,
+      id: eventId(), ts: new Date().toISOString(), session_id: 'console', hook: 'console_action', tool: action,
       decision: status === 'accepted' ? 'complete' : 'warn', reason: reason || null,
       detail: JSON.stringify({ workflow_id: workflow?.id, ref: workflow?.ref, endpoint, status }),
       metadata: workflow ? { task_id: workflow.submissionId } : null, duration_ms: null,
