@@ -85,6 +85,12 @@ pub enum Method {
         project_root: PathBuf,
         files: Option<Vec<PathBuf>>,
     },
+    RuleFix {
+        project_root: PathBuf,
+    },
+    ExecPolicyCheck {
+        command: String,
+    },
 
     // === ExecPlan ===
     ExecPlanInit {
@@ -298,6 +304,8 @@ impl Method {
             Self::SkillDelete { .. } => "skill/delete",
             Self::RuleLoad { .. } => "rule/load",
             Self::RuleCheck { .. } => "rule/check",
+            Self::RuleFix { .. } => "rule/fix",
+            Self::ExecPolicyCheck { .. } => "exec_policy/check",
             Self::ExecPlanInit { .. } => "exec_plan/init",
             Self::ExecPlanUpdate { .. } => "exec_plan/update",
             Self::ExecPlanStatus { .. } => "exec_plan/status",

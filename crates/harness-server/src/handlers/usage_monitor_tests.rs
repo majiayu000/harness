@@ -87,6 +87,7 @@ async fn usage_monitor_response_includes_postgres_catalog_census() -> anyhow::Re
     assert!(response.postgres_catalog.schema_count.is_some());
     assert!(response.postgres_catalog.catalog_object_count.is_some());
     assert!(response.postgres_catalog.database_size_bytes.is_some());
+    assert_eq!(response.local_quotas.len(), 2);
     Ok(())
 }
 

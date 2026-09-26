@@ -102,6 +102,8 @@ All three transports share the same method set. The following capabilities are
 | `skill/stale` | List stale skills that need review |
 | `rule/load` | Load project rules |
 | `rule/check` | Check files against rules |
+| `rule/fix` | Apply configured fixes to a project and return residual violations |
+| `exec_policy/check` | Evaluate a command against the configured execution policy |
 | `exec_plan/init` | Initialise an execution plan |
 | `exec_plan/update` | Update a plan |
 | `exec_plan/status` | Query plan status |

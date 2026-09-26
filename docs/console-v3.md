@@ -21,6 +21,8 @@ cannot reset shared state while the dashboard is rendering.
 | Memory | Project memory records, using the repository identity recorded in submissions, including outcome/use count; deletion uses the memory endpoint. |
 | Intake / breakers / system | Intake channel driver status and recent dispatches, runtime tree summary, operator snapshot and registered hosts. |
 | Worktree cleanup | Copies a shell-quoted `git worktree remove` command for a server-classified orphan. Does not execute deletion or add `--force`. |
+| Provider quotas | `/api/usage-monitor` reads local `ccstats limits` records offline for Codex and Claude. Official percentage snapshots are shown when present; estimated windows without a percentage remain unquantified. Missing, stale, and unreadable records are labeled. |
+| Rule repair / exec policy | Rule check and auto-fix target the selected project; auto-fix confirms before changing files and reports edits plus residual violations. The command tester checks the server's configured policy on demand and distinguishes no match from allow. |
 
 Requests retain session-token Bearer authentication, unauthorized notification,
 read timeouts, and stale-state/error reporting. Mutations do not inherit the short polling deadline. Failed detail requests retry at most
@@ -33,9 +35,8 @@ silently replay it.
 - Browser WebSocket clients cannot send the Bearer header required by `/ws`.
   Authenticated polling remains active and is labeled in the UI. No credential
   is added to a WebSocket URL and server authentication is not relaxed.
-- Provider quotas, eval execution, rule auto-fix, and exec-policy evaluation do
-  not have dashboard endpoints. The UI reports that limitation. Rule check
-  results are populated after a real check, not seeded with a rule catalog.
+- Eval execution still has no dashboard endpoint. The UI reports that limitation.
+  Rule check results are populated after a real check, not seeded with a rule catalog.
 - The transcript reconstruction endpoint requires a runtime job and supplied
   content; it is not an automatic recovery endpoint. The dashboard retries the
   actual transcript stream after a failure instead of inventing reconstructed

@@ -119,6 +119,17 @@ it("keeps the current invocation, hourly series, and snake-case stream events", 
   expect(context.HC.transcripts.get("retry-wf")).toEqual([{ t: "hello", c: "oklch(0.86 0.005 275)" }]);
 });
 
+it("shows local official quotas without inventing a Claude percentage", async () => {
+  const { context, responses } = await setup();
+  responses["/api/usage-monitor"].local_quotas = [
+    { source: "codex", display_name: "OpenAI Codex", status: "available", observed_at: "2026-09-26T17:06:05Z", windows: [{ window: "weekly", source: "official", used_pct: 70, resets_at: "2026-10-03T16:58:50Z", stale: false }] },
+    { source: "claude", display_name: "Claude Code", status: "available", observed_at: null, windows: [{ window: "estimated_5h", source: "estimated", used_pct: null, resets_at: "53m remaining", stale: false }] },
+  ];
+  await context.HC.refresh();
+  expect(context.HC.X.usage.quotas.map(row => row.used)).toEqual([70, null]);
+  expect(context.HC.X.usage.quotas[1].note).toContain("quota % unavailable");
+});
+
 it("keeps live polling independent of slow history and surfaces history failures", async () => {
   let releaseHistory;
   const pending = new Promise(resolve => { releaseHistory = resolve; });

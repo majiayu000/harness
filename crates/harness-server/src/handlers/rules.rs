@@ -109,15 +109,141 @@ pub async fn rule_check(
     }
 }
 
+pub async fn rule_fix(
+    state: &AppState,
+    id: Option<serde_json::Value>,
+    project_root: PathBuf,
+) -> RpcResponse {
+    let project_root = validate_root!(&project_root, id, &state.core.home_dir);
+    let rules = {
+        let rules = state.engines.rules.read().await;
+        if let Err(error) = rules.validate_scan_request(None) {
+            return rpc_error::validation(id, error.to_string());
+        }
+        rules.clone()
+    };
+    match rules.scan_and_fix(&project_root, true).await {
+        Ok(report) => {
+            state
+                .observability
+                .events
+                .persist_rule_scan(&project_root, &report.residual_violations)
+                .await;
+            match serde_json::to_value(report) {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(error) => rpc_error::internal(id, error.to_string()),
+            }
+        }
+        Err(error) => rpc_error::internal(id, error.to_string()),
+    }
+}
+
+pub async fn exec_policy_check(
+    state: &AppState,
+    id: Option<serde_json::Value>,
+    command: String,
+) -> RpcResponse {
+    if state.core.server.config.rules.exec_policy_paths.is_empty() {
+        return rpc_error::validation(id, "No exec policy rules are configured".to_string());
+    }
+    let Some(argv) = shlex::split(&command) else {
+        return rpc_error::invalid_params(id, "Command has an unmatched quote".to_string());
+    };
+    if argv.is_empty() {
+        return rpc_error::invalid_params(id, "Command is empty".to_string());
+    }
+    let rules = state.engines.rules.read().await;
+    let result =
+        rules.check_command_policy(&argv, &harness_rules::exec_policy::MatchOptions::default());
+    match serde_json::to_value(result) {
+        Ok(value) => RpcResponse::success(id, value),
+        Err(error) => rpc_error::internal(id, error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::rule_check;
-    use harness_core::{types::EventFilters, types::GuardId, types::Language};
+    use super::{exec_policy_check, rule_check, rule_fix};
+    use harness_core::types::{Category, EventFilters, GuardId, Language, RuleId, Severity};
     use harness_protocol::methods::{INVALID_PARAMS, VALIDATION_ERROR};
-    use harness_rules::engine::{Guard, WARN_EMPTY_SCAN_INPUT, WARN_NO_GUARDS_REGISTERED};
+    use harness_rules::engine::{Guard, Rule, WARN_EMPTY_SCAN_INPUT, WARN_NO_GUARDS_REGISTERED};
     use std::path::PathBuf;
 
     use crate::test_helpers::{make_test_state, tempdir_in_home, HOME_LOCK};
+
+    #[tokio::test]
+    async fn rule_fix_requires_registered_guards() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
+        let dir = tempdir_in_home("rule-fix-no-guard-")?;
+        let state = make_test_state(dir.path()).await?;
+        let response = rule_fix(&state, Some(serde_json::json!(1)), dir.path().to_path_buf()).await;
+        assert_eq!(
+            response.error.expect("missing guard error").code,
+            VALIDATION_ERROR
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rule_fix_applies_rule_and_reports_residuals() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
+        let dir = tempdir_in_home("rule-fix-applies-")?;
+        let state = make_test_state(dir.path()).await?;
+        let source = dir.path().join("sample.rs");
+        std::fs::write(&source, "let x = foo();\n")?;
+        let script = dir.path().join("detect-foo.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\nfile=\"$1/sample.rs\"\nif grep -q 'foo()' \"$file\"; then echo \"$file:1:FIX-AUTO:use bar\"; fi\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions)?;
+        }
+        {
+            let mut rules = state.engines.rules.write().await;
+            rules.register_guard(Guard {
+                id: GuardId::from_str("FIX-GUARD"),
+                script_path: script,
+                language: Language::Common,
+                rules: vec![],
+            });
+            rules.add_rule(Rule {
+                id: RuleId::from_str("FIX-AUTO"),
+                title: "Replace foo".to_string(),
+                severity: Severity::Low,
+                category: Category::Style,
+                paths: vec![],
+                description: String::new(),
+                fix_pattern: Some("s/foo/bar/".to_string()),
+            });
+        }
+        let response = rule_fix(&state, Some(serde_json::json!(1)), dir.path().to_path_buf()).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let report: harness_core::types::AutoFixReport =
+            serde_json::from_value(response.result.expect("fix report"))?;
+        assert_eq!(report.fixed_count, 1);
+        assert!(report.residual_violations.is_empty());
+        assert_eq!(std::fs::read_to_string(source)?, "let x = bar();\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exec_policy_check_reports_missing_configuration() -> anyhow::Result<()> {
+        let _lock = HOME_LOCK.lock().await;
+        let dir = tempdir_in_home("exec-policy-no-rules-")?;
+        let state = make_test_state(dir.path()).await?;
+        let response =
+            exec_policy_check(&state, Some(serde_json::json!(1)), "rm -rf .".to_string()).await;
+        assert_eq!(
+            response.error.expect("missing policy error").code,
+            VALIDATION_ERROR
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn rule_check_returns_warning_when_no_guards_registered() -> anyhow::Result<()> {

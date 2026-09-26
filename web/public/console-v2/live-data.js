@@ -161,10 +161,22 @@
     if (!summary) return;
     const { hourly, hourlySource } = H.X.usage;
     const group = (rows) => (rows || []).map(row => [row.name, formatInt(row.total_tokens), formatCost(row.estimated_cost_usd), summary.total_tokens ? Math.round(100 * row.total_tokens / summary.total_tokens) : 0]);
+    const quotas = (usage.local_quotas || []).flatMap(provider => {
+      if (!provider.windows?.length) return [{ name: provider.display_name, used: null, note: provider.error || 'No local quota record', status: provider.status }];
+      return provider.windows.map(window => ({
+        name: provider.display_name + ' · ' + window.window.replaceAll('_', ' '),
+        used: window.used_pct,
+        note: [window.source === 'official' ? 'Local official snapshot' : 'Local estimate; quota % unavailable',
+          provider.observed_at ? 'observed ' + age(provider.observed_at) + ' ago' : null,
+          window.stale ? 'stale' : null,
+          window.resets_at ? 'reset ' + window.resets_at : null].filter(Boolean).join(' · '),
+        status: window.stale ? 'stale' : provider.status,
+      }));
+    });
     H.X.usage = {
       tokens: formatInt(summary.total_tokens), cost: formatCost(summary.estimated_cost_usd), turns: summary.request_count,
       cache: summary.total_tokens ? Math.round(100 * (summary.cache_read_input_tokens || 0) / summary.total_tokens) + '%' : '—',
-      hourly, hourlySource, quotas: [], byProject: group(usage.tokens_by_project), byAgent: group(usage.tokens_by_agent), byModel: group(usage.tokens_by_model),
+      hourly, hourlySource, quotas, byProject: group(usage.tokens_by_project), byAgent: group(usage.tokens_by_agent), byModel: group(usage.tokens_by_model),
     };
   }
 
