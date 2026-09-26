@@ -198,7 +198,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
   <sc-if value="{{ isHistory }}" hint-placeholder-val="{{ false }}">
   <div data-screen-label="History" style="padding:18px 22px 48px;display:flex;flex-direction:column;gap:16px">
     <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap">
-      <div style="display:flex;flex-direction:column;gap:2px"><h1 style="margin:0;font-size:20px;font-weight:600;letter-spacing:-0.015em">History</h1><span style="color:var(--muted)">Terminal workflows · last 24h</span></div>
+      <div style="display:flex;flex-direction:column;gap:2px"><h1 style="margin:0;font-size:20px;font-weight:600;letter-spacing:-0.015em">History</h1><span style="color:var(--muted)">{{ historyStatus }}</span></div>
       <div style="display:flex;gap:4px"><sc-for list="{{ histFilters }}" as="c" hint-placeholder-count="4"><button onClick="{{ c.go }}" style="padding:4px 10px;border-radius:6px;border:1px solid {{ c.bd }};background:{{ c.bg }};color:{{ c.fg }};cursor:pointer;font-size:12px;font-weight:500;display:flex;gap:6px">{{ c.label }}<span style="font-family:'Geist Mono',monospace;color:var(--faint)">{{ c.count }}</span></button></sc-for></div>
     </div>
     <section style="border:1px solid var(--line);border-radius:10px;overflow-x:auto;overflow-y:hidden;background:var(--panel)"><div style="min-width:1040px">
@@ -482,6 +482,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="5"><button onClick="{{ t.go }}" style="padding:6px 0;margin-bottom:-1px;border:none;border-bottom:2px solid {{ t.bd }};background:none;cursor:pointer;font-size:12.5px;font-weight:500;color:{{ t.fg }}">{{ t.label }}</button></sc-for>
       </div>
 
+      <sc-if value="{{ s.detailError }}" hint-placeholder-val="{{ false }}"><p role="status">Details may be incomplete · {{ s.detailError }}. Retrying in 30 seconds.</p></sc-if>
       <sc-if value="{{ tabTimeline }}" hint-placeholder-val="{{ true }}">
         <div style="display:flex;flex-direction:column">
           <sc-for list="{{ s.timeline }}" as="e" hint-placeholder-count="8">
@@ -875,7 +876,7 @@ class Component extends DCLogic {
     ] : [];
     const K = w.inbox ? H.K[w.inbox.kind] : null;
     return {
-      ...d, definition: node?.workflow?.definition_id || w.taskKind || '—', version: node?.workflow?.definition_version ? 'v' + node.workflow.definition_version : '—', life, meta, timeline, transcript: H.transcripts?.get(w.id) || [], streaming: false, commands, artifacts, proof,
+      ...d, detailError: detail.error, definition: node?.workflow?.definition_id || w.taskKind || '—', version: node?.workflow?.definition_version ? 'v' + node.workflow.definition_version : '—', life, meta, timeline, transcript: H.transcripts?.get(w.id) || [], streaming: false, commands, artifacts, proof,
       hasInbox: !!w.inbox, kindLabel: K ? K.label : '', waitingNote: w.state === 'pending',
       canCancel: !w.terminal && w.state !== 'done' && w.state !== 'cancelled',
       cancel: (e) => this.openModal('cancel', w, e),
@@ -957,8 +958,8 @@ class Component extends DCLogic {
     const inboxAll = active.filter(w => w.inbox);
     const inbox = shown.filter(w => w.inbox);
     const inboxGroups = H.KIND_ORDER.map(k => ({ k, ...H.K[k], rows: inbox.filter(w => w.inbox.kind === k).map(w => this.deco(w)) })).filter(g => g.rows.length).map(g => ({ ...g, count: g.rows.length }));
-    const byState = (list) => H.FLEET_ORDER.map(k => ({ key: k, label: H.S[k][0], tone: H.S[k][1], rows: list.filter(w => w.state === k).map(w => this.deco(w)) })).filter(g => g.rows.length).map(g => ({ ...g, count: g.rows.length }));
-    const ffList = shown.filter(w => s.ff === 'all' || (s.ff === 'attn' && w.inbox) || w.repo === s.ff);
+    const byState = (list) => [...H.FLEET_ORDER, ...new Set(list.map(w => w.state).filter(k => !H.FLEET_ORDER.includes(k)))].map(k => ({ key: k, label: (H.S[k] || [k])[0], tone: (H.S[k] || [null, 'var(--queue)'])[1], rows: list.filter(w => w.state === k).map(w => this.deco(w)) })).filter(g => g.rows.length).map(g => ({ ...g, count: g.rows.length }));
+    const ffList = shown.filter(w => s.ff === 'all' || (s.ff === 'attn' && w.inbox) || w.projectId === s.ff);
     const fleetGroups = byState(ffList);
     const fleetGroupsHome = byState(shown.filter(w => !w.inbox));
 
@@ -970,7 +971,7 @@ class Component extends DCLogic {
       ['Blocked', cnt(w => w.state === 'blocked'), 'var(--warn)'], ['Failed', cnt(w => w.state === 'failed'), 'var(--fail)'],
     ].map(([label, v, tone]) => ({ label, v, tone }));
 
-    const hist = [...s.extraHist, ...H.history].map(h => ({ ...this.deco(h), stateLabel: H.S[h.state][0], select: () => { this.setState({ sel: h.id }); H.loadDetails?.(h); } }));
+    const hist = [...s.extraHist, ...H.history].map(h => ({ ...this.deco(h), stateLabel: (H.S[h.state] || [h.state])[0], select: () => { this.setState({ sel: h.id }); H.loadDetails?.(h); } }));
     const histF = hist.filter(h => s.hf === 'all' || h.state === s.hf).filter(h => this.match(h));
 
     let orderList = [];
@@ -1005,7 +1006,7 @@ class Component extends DCLogic {
       return { key: i + 1, label, count, go: set({ screen: key }), bg: on ? 'var(--sel)' : 'transparent', fg: on ? 'var(--ink)' : 'var(--muted)', badgeBg: alert ? (key === 'system' ? 'var(--warn)' : 'var(--accent)') : 'transparent', badgeFg: alert ? 'var(--btnFg)' : 'var(--faint)' };
     });
     const navProjects = H.projects.map(p => {
-      const ws = active.filter(w => w.repo === p.id);
+      const ws = active.filter(w => w.projectId === p.id);
       const bad = ws.some(w => w.state === 'blocked' || w.state === 'failed');
       return { id: p.id, live: ws.length, tone: bad ? 'var(--warn)' : 'var(--ok)', bg: s.screen === 'fleet' && s.ff === p.id ? 'var(--sel)' : 'transparent', go: set({ screen: 'fleet', ff: p.id }) };
     });
@@ -1016,7 +1017,7 @@ class Component extends DCLogic {
 
     const spark = (vals) => { const m = Math.max(...vals, 1), st = 100 / (vals.length - 1); return 'M' + vals.map((v, i) => (i * st).toFixed(1) + ' ' + (26 - (v / m) * 22).toFixed(1)).join(' L'); };
     const projectCards = H.projects.map(p => {
-      const ws = active.filter(w => w.repo === p.id);
+      const ws = active.filter(w => w.projectId === p.id);
       const run = ws.filter(w => w.state !== 'pending' && w.host !== '—').length;
       const q = ws.filter(w => w.state === 'pending').length;
       const attn = ws.filter(w => w.inbox).map(w => ({ n: w.n, title: w.title, label: H.K[w.inbox.kind].label, tone: H.K[w.inbox.kind].tone, select: () => { this.setState({ sel: w.id }); H.loadDetails?.(w); } }));
@@ -1026,7 +1027,7 @@ class Component extends DCLogic {
         metrics: [['Merged', p.merged, 'var(--ink)'], ['Review', p.score, 'var(--ink)'], ['Rule fail', p.ruleFail, parseFloat(p.ruleFail) > 5 ? 'var(--warn)' : 'var(--ink)'], ['Cost', p.cost, 'var(--ink)']].map(([k, v, fg]) => ({ k, v, fg })),
         dispatch: p.dispatch.map(([k, v]) => ({ k, v })),
         memCount: (H.X.memory[p.id] || []).filter(m => !s.memDel[m.id]).length, openMem: set({ memFor: p.id }),
-        remove: () => { if (ws.length) { this.flash('Cannot remove ' + p.id, ws.length + ' active workflows · cancel them first'); return; } this.runAction('Project removed', () => H.request('/projects/' + encodeURIComponent(p.id), { method: 'DELETE' })); },
+        remove: () => { if (ws.length) { this.flash('Cannot remove ' + p.id, ws.length + ' active workflows · cancel them first'); return; } if (window.confirm('Remove project ' + p.id + ' from Harness?')) this.runAction('Project removed', () => H.request('/projects/' + encodeURIComponent(p.id), { method: 'DELETE' })); },
       };
     });
 
@@ -1035,7 +1036,7 @@ class Component extends DCLogic {
       const orphan = w.status === 'orphaned';
       return {
         name: w.path_short || w.workspace_path.split('/').pop(), path: w.workspace_path, branch: w.branch,
-        phase: w.phase || '—', host: linked?.host || '—', age: w.created_at ? new Date(w.created_at).toLocaleDateString() : '—',
+        phase: w.phase || '—', host: linked?.host || '—', age: H.age?.(w.created_at) || '—',
         status: w.status, tone: orphan ? 'var(--warn)' : w.status === 'active' ? 'var(--run)' : 'var(--queue)', orphan,
         bg: linked && s.sel === linked.id ? 'var(--sel)' : 'transparent',
         select: () => { if (linked) { this.setState({ sel: linked.id }); H.loadDetails?.(linked); } },
@@ -1045,7 +1046,7 @@ class Component extends DCLogic {
     const wtUsed = wts.length;
     const wtCells = Array.from({ length: H.maxSlots }, (_, i) => ({ tone: i < wtUsed ? 'var(--run)' : 'var(--line)' }));
 
-    const hosts = H.hosts.map(h => ({ ...h, tone: !h.online ? 'var(--fail)' : parseInt(h.hb) > 30 ? 'var(--warn)' : 'var(--ok)', hb: h.online ? h.hb : 'offline ' + h.hb, leaseCells: Array.from({ length: h.cap }, (_, i) => ({ tone: i < h.leases ? 'var(--run)' : 'var(--line)' })), cpuW: (h.cpu || 0) + '%', ramW: (h.ram || 0) + '%', cpuL: h.cpu == null ? '—' : h.cpu + '%', ramL: h.ram == null ? '—' : h.ram + '%', cpuTone: h.cpu > 75 ? 'var(--warn)' : 'var(--muted)', cached: h.projects + ' projects', dereg: s.hostAct[h.id] === 'dereg', canDereg: s.hostAct[h.id] !== 'dereg',
+    const hosts = H.hosts.map(h => ({ ...h, tone: !h.online ? 'var(--fail)' : parseInt(h.hb) > 30 ? 'var(--warn)' : 'var(--ok)', hb: h.online ? h.hb : 'offline ' + h.hb, leaseCells: Array.from({ length: h.leases || 0 }, () => ({ tone: 'var(--run)' })), cpuW: (h.cpu || 0) + '%', ramW: (h.ram || 0) + '%', cpuL: h.cpu == null ? '—' : h.cpu + '%', ramL: h.ram == null ? '—' : h.ram + '%', cpuTone: h.cpu > 75 ? 'var(--warn)' : 'var(--muted)', cached: h.projects + ' projects', dereg: s.hostAct[h.id] === 'dereg', canDereg: s.hostAct[h.id] !== 'dereg',
       sync: () => this.runAction('Project cache synced', () => H.request('/api/runtime-hosts/' + encodeURIComponent(h.id) + '/projects/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ projects: h.projectRoots.map(project => ({ project })) }) })),
       deregister: () => this.runAction('Host deregistered', () => H.request('/api/runtime-hosts/' + encodeURIComponent(h.id) + '/deregister', { method: 'POST' })) }));
     const breakers = H.breakers.map(b => { const reset = s.breakers[b.profile]; const open = b.open && !reset; return { ...b, open, state: open ? 'open' : reset ? 'closed · reset' : b.state, tone: open ? 'var(--warn)' : 'var(--ok)', next: reset ? 'reset just now' : b.next, opened: reset ? '—' : b.opened, reset: () => this.runAction('Circuit breaker reset', () => H.request('/api/runtime/circuit-breakers/' + encodeURIComponent(b.profile) + '/reset', { method: 'POST' })) }; });
@@ -1087,11 +1088,11 @@ class Component extends DCLogic {
       cols: insp && wide ? '212px minmax(0,1fr) minmax(380px,440px)' : '212px minmax(0,1fr)',
       wide, fleetCols: wide ? 'minmax(220px,1fr) 128px 104px 92px 64px 52px 52px' : 'minmax(200px,1fr) 128px 92px 52px 52px',
       scrim: !!insp && narrow, inspPos: narrow ? 'fixed' : 'relative', inspTop: narrow ? '48px' : '0', inspW: narrow ? 'min(440px, 92vw)' : 'auto', inspShadow: narrow ? 'var(--shadow)' : 'none',
-      now: H.now, liveStatus: H.loading ? 'Connecting' : H.loadError ? 'Stale' : 'Live', q: s.q, onQuery: (e) => this.setState({ q: e.target.value }), chips, nav, navProjects, slotsUsed, maxSlots: H.maxSlots, slotCells,
+      now: H.now, liveStatus: H.loading ? 'Connecting' : H.loadError ? 'Stale' : H.partialError || H.historyError ? 'Partial' : 'Live', q: s.q, onQuery: (e) => this.setState({ q: e.target.value }), chips, nav, navProjects, slotsUsed, maxSlots: H.maxSlots, slotCells,
       isHome: s.screen === 'home', isFleet: s.screen === 'fleet', isProjects: s.screen === 'projects', isHistory: s.screen === 'history', isWorktrees: s.screen === 'worktrees', isSystem: s.screen === 'system',
-      homeTitle: H.loading ? 'Loading workflows' : H.loadError && !H.workflows.length ? 'Data unavailable' : titles[inboxAll.length] || inboxAll.length + ' things need you', homeSub: H.loading ? 'Connecting to Harness' : H.loadError ? 'Data may be stale · ' + H.loadError : running + (running === 1 ? ' agent' : ' agents') + ' running across ' + hostsOnline + (hostsOnline === 1 ? ' host' : ' hosts') + ' · ' + active.length + ' active workflows',
+      homeTitle: H.loading ? 'Loading workflows' : H.loadError && !H.workflows.length ? 'Data unavailable' : titles[inboxAll.length] || inboxAll.length + ' things need you', homeSub: H.loading ? 'Connecting to Harness' : H.loadError ? 'Data may be stale · ' + H.loadError : H.partialError ? 'Some data unavailable · ' + H.partialError : running + (running === 1 ? ' agent' : ' agents') + ' running across ' + hostsOnline + (hostsOnline === 1 ? ' host' : ' hosts') + ' · ' + active.length + ' active workflows',
       stats, inboxCount: inbox.length, inboxEmpty: inbox.length === 0, inboxEmptyLabel: H.loading ? 'Loading…' : H.loadError ? 'Inbox data unavailable.' : 'Nothing needs you right now.', inboxGroups, fleetGroupsHome, fleetGroups, fleetCount: active.length, goFleet: set({ screen: 'fleet', ff: 'all' }), fleetFilters,
-      projectCards, hist: histF, histFilters,
+      projectCards, hist: histF, histFilters, historyStatus: H.historyError ? 'History may be stale · ' + H.historyError : H.historyLoading ? 'Loading terminal workflows…' : 'Terminal workflows',
       worktrees: wts, wtUsed, wtCells, wtOrphanNote: wts.some(w => w.orphan) ? ' · ' + wts.filter(w => w.orphan).length + ' orphaned' : '',
       health: H.health, degraded, healthLabel: H.health.status === 'unknown' ? 'Health unavailable' : healthy ? 'All subsystems healthy' : 'Degraded', healthTone: healthy ? 'var(--ok)' : 'var(--warn)', healthBg: 'var(--panel)',
       hosts, breakers, failures, drafts, sched, rulesLogs,

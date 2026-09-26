@@ -5,17 +5,21 @@ import { expect, it } from "vitest";
 
 const asset = (name) => readFileSync(join(process.cwd(), "public/console-v2", name), "utf8");
 
-it("keeps the current invocation, hourly series, and snake-case stream events", async () => {
-  let readerCancelled = false;
+async function setup(beforeFetch = async () => {}) {
+  const flags = { readerCancelled: false, approvalsFail: false, streamFail: false, monitorFail: false };
+  const calls = [];
+  const rpcMethods = [];
   const task = {
     id: "sub-1", workflow: { id: "wf-1", state: "implementing" }, repo: "owner/repo",
-    external_id: "42", description: "Fix issue 42", status: "implementing", turn: 2,
+    external_id: "42", description: "Fix issue 42", status: "implementing", turn: 2, project: "/tmp/repo",
   };
   const responses = {
-    "/api/workflows/runtime/submissions?limit=200": { data: [task], page: { has_more: false } },
+    "/api/workflows/runtime/submissions?limit=200&active=true": { data: [task], page: { has_more: false } },
+    "/api/workflows/runtime/submissions?limit=200&status=done%2Cfailed%2Ccancelled": { data: [{ id: "old-1", workflow: { id: "old-wf-1", state: "done" }, status: "done", created_at: "2020-01-01T00:00:00Z" }], page: { has_more: true, next_cursor: "next" } },
+    "/api/workflows/runtime/submissions?limit=200&status=done%2Cfailed%2Ccancelled&cursor=next": { data: [{ id: "old-2", workflow: { id: "old-wf-2", state: "done" }, status: "done", created_at: "2020-01-02T00:00:00Z" }], page: { has_more: false } },
     "/api/workflows/runtime/approvals": { data: [{ submission_id: "sub-1", pending_approvals: [{ type: "approval_request", id: "request-1", action: "run tests", approved: null }] }] },
     "/api/operator-monitor": { health: { status: "ok", degraded_subsystems: [], uptime_secs: 30 }, failures: [], operator_actions: [], activity: {} },
-    "/api/overview": { projects: [], runtimes: [] },
+    "/api/overview": { projects: [{ id: "/tmp/repo", root: "/tmp/repo", merged_24h: 0 }], runtimes: [] },
     "/api/usage-monitor": {
       summary: { total_tokens: 100, cache_read_input_tokens: 0, request_count: 1 },
       agent_invocations: [
@@ -28,25 +32,33 @@ it("keeps the current invocation, hourly series, and snake-case stream events", 
     "/api/worktrees": [],
     "/api/intake": { channels: [] },
     "/projects": [],
-    "/api/projects/repo/memory": { records: [] },
+    "/api/projects/%2Ftmp%2Frepo/memory": { records: [] },
     "/api/token-usage": { by_hour: { "2026-09-25T12": { input_tokens: 100 } } },
   };
   const context = {
-    URLSearchParams, TextDecoder, console,
+    URLSearchParams, TextDecoder, AbortController, setTimeout, clearTimeout, console,
     sessionStorage: { getItem: () => null },
     location: { origin: "http://localhost" },
     addEventListener: () => {},
     setInterval: () => 1,
-    fetch: async (path) => {
+    fetch: async (path, init) => {
+      calls.push(path);
+      await beforeFetch(path, init);
       if (path.endsWith("/stream")) {
+        if (flags.streamFail) return { ok: false, status: 503 };
         const data = new TextEncoder().encode('data: {"type":"message_delta","text":"hello"}\n\ndata: {"type":"done"}\n\n');
         let sent = false;
         return { ok: true, body: { getReader: () => ({
           read: async () => sent ? { done: true } : ((sent = true), { done: false, value: data }),
-          cancel: async () => { readerCancelled = true; },
+          cancel: async () => { flags.readerCancelled = true; },
         }) } };
       }
-      if (path === "/rpc") return { ok: true, status: 200, json: async () => ({ result: [] }) };
+      if (path === "/rpc") {
+        rpcMethods.push(JSON.parse(init.body).method);
+        return { ok: true, status: 200, json: async () => ({ result: [] }) };
+      }
+      if (flags.approvalsFail && path === "/api/workflows/runtime/approvals") return { ok: false, status: 503, json: async () => ({ error: "approvals unavailable" }) };
+      if (flags.monitorFail && path === "/api/operator-monitor") return { ok: false, status: 503, json: async () => ({ error: "monitor unavailable" }) };
       const payload = responses[path];
       return payload === undefined
         ? { ok: false, status: 404, json: async () => ({ error: "missing fixture" }) }
@@ -62,17 +74,125 @@ it("keeps the current invocation, hourly series, and snake-case stream events", 
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 
+  return { context, task, responses, flags, calls, rpcMethods };
+}
+
+it("keeps the current invocation, hourly series, and snake-case stream events", async () => {
+  const { context, task, flags, rpcMethods } = await setup();
+  await expect.poll(() => context.HC.historyLoading).toBe(false);
   expect(context.HC.workflows[0].agent).toBe("current-agent");
+  expect(context.HC.workflows[0].projectId).toBe("/tmp/repo");
   expect(context.HC.workflows[0].lease).toBe("active");
   expect(context.HC.workflows[0].inbox.kind).toBe("approval");
+  expect(context.HC.history.map(row => row.id)).toEqual(["old-wf-1", "old-wf-2"]);
   expect(context.HC.X.usage.hourly).toEqual([0.0001]);
+  expect(rpcMethods.slice(0, 2)).toEqual(["initialize", "initialized"]);
 
   await context.HC.refresh();
   expect(context.HC.X.usage.hourly).toEqual([0.0001]);
 
+  flags.approvalsFail = true;
+  await context.HC.refresh();
+  expect(context.HC.loadError).toContain("approvals unavailable");
+  expect(context.HC.workflows[0].inbox.kind).toBe("approval");
+
+  flags.approvalsFail = false;
+  task.workflow.state = "awaiting_dependencies";
+  await context.HC.refresh();
+  expect(context.HC.workflows[0].state).toBe("awaiting_dependencies");
+
   await context.HC.loadTranscript(context.HC.workflows[0]);
   expect(context.HC.transcripts.get("wf-1")).toEqual([{ t: "hello", c: "oklch(0.86 0.005 275)" }]);
-  expect(readerCancelled).toBe(true);
+  expect(flags.readerCancelled).toBe(true);
+
+  const retryWorkflow = { id: "retry-wf", submissionId: "sub-1" };
+  flags.streamFail = true;
+  await context.HC.loadTranscript(retryWorkflow);
+  expect(context.HC.transcriptFailed.has("retry-wf")).toBe(true);
+  flags.streamFail = false;
+  await context.HC.loadTranscript(retryWorkflow);
+  expect(context.HC.transcriptFailed.has("retry-wf")).toBe(false);
+  expect(context.HC.transcripts.get("retry-wf")).toEqual([{ t: "hello", c: "oklch(0.86 0.005 275)" }]);
+});
+
+it("keeps live polling independent of slow history and surfaces history failures", async () => {
+  let releaseHistory;
+  const pending = new Promise(resolve => { releaseHistory = resolve; });
+  const { context, task, responses, flags, calls } = await setup(async path => {
+    if (path.includes("status=done")) await pending;
+  });
+  const H = context.HC;
+  expect(H.loading).toBe(false);
+  expect(H.historyLoading).toBe(true);
+  task.workflow.state = "quality_gate_pending";
+  await H.refresh();
+  expect(H.workflows[0].state).toBe("quality_gate_pending");
+  expect(calls.filter(path => path.includes("active=true"))).toHaveLength(2);
+  expect(calls.filter(path => path.includes("status=done"))).toHaveLength(1);
+
+  flags.monitorFail = true;
+  task.workflow.state = "implementing";
+  await H.refresh();
+  expect(H.loadError).toContain("monitor unavailable");
+  expect(H.workflows[0].state).toBe("quality_gate_pending");
+  expect(H.workflows[0].inbox.kind).toBe("approval");
+
+  releaseHistory();
+  await expect.poll(() => H.historyLoading).toBe(false);
+  expect(H.workflows[0].state).toBe("quality_gate_pending");
+  flags.monitorFail = false;
+  await H.refresh();
+  expect(H.history).toHaveLength(2);
+
+  delete responses["/api/workflows/runtime/submissions?limit=200&status=done%2Cfailed%2Ccancelled&cursor=next"];
+  await H.refresh(true);
+  await expect.poll(() => H.historyLoading).toBe(false);
+  expect(H.historyError).toContain("missing fixture");
+  expect(H.history).toHaveLength(2);
+  await H.refresh();
+  expect(H.historyError).toContain("missing fixture");
+});
+
+it("refreshes history when an active task completes between scheduled history polls", async () => {
+  const { context, task, responses } = await setup();
+  const H = context.HC;
+  await expect.poll(() => H.historyLoading).toBe(false);
+  responses["/api/workflows/runtime/submissions?limit=200&active=true"].data = [];
+  responses["/api/workflows/runtime/submissions?limit=200&status=done%2Cfailed%2Ccancelled"].data.push({ ...task, workflow: { id: "wf-1", state: "done" } });
+  await H.refresh();
+  await expect.poll(() => H.historyLoading).toBe(false);
+  expect(H.workflows).toHaveLength(0);
+  expect(H.history.map(row => row.id)).toContain("wf-1");
+});
+
+it("loads details beyond the first 200 project workflows and throttles failed retries", async () => {
+  const { context, responses, calls } = await setup();
+  const H = context.HC;
+  const workflow = H.workflows[0];
+  const path = "/api/workflows/runtime/submissions/sub-1";
+  responses[path] = { id: "sub-1" };
+  responses[path + "/artifacts"] = [];
+  responses[path + "/prompts"] = [];
+  const tree = offset => "/api/workflows/runtime/tree?detail=full&limit=100&offset=" + offset + "&project_id=%2Ftmp%2Frepo";
+  responses[tree(0)] = { workflows: [{ workflow: { id: "another" } }], pagination: { has_more: true } };
+  responses[tree(100)] = responses[tree(0)];
+  responses[tree(200)] = { workflows: [{ workflow: { id: "wf-1" }, events: [{ event_type: "completed" }] }], pagination: { has_more: false } };
+  await H.loadDetails(workflow);
+  expect(H.details.get("wf-1").node.events[0].event_type).toBe("completed");
+  expect(H.details.get("wf-1").error).toBe("");
+  expect(calls).toContain(tree(200));
+
+  H.details.clear();
+  delete responses[path];
+  await H.loadDetails(workflow);
+  expect(H.details.get("wf-1").error).toContain("missing fixture");
+  const requests = calls.length;
+  await H.loadDetails(workflow);
+  expect(calls).toHaveLength(requests);
+  responses[path] = { id: "sub-1" };
+  H.details.get("wf-1").loadedAt -= 30_001;
+  await H.loadDetails(workflow);
+  expect(H.details.get("wf-1").error).toBe("");
 });
 
 it("closes a pending action when its workflow disappears", () => {
