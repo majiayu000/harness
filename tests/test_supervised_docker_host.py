@@ -348,7 +348,7 @@ def test_stuck_client_cleanup_preserves_primary_failure_and_closes_streams(tmp_p
     process = Mock(stdout=streams[0], stderr=streams[1])
     process.poll.return_value = None
     process.wait.side_effect = subprocess.TimeoutExpired(['docker', 'exec'], 5)
-    monkeypatch.setattr(module.subprocess, 'Popen', Mock(return_value=process))
+    monkeypatch.setattr(module.quality_gate.subprocess, 'Popen', Mock(return_value=process))
     try:
         with pytest.raises(RuntimeError) as raised:
             module.stream_agent_output(['docker', 'exec'], tmp_path, 0 if failure == 'deadline' else 5, Mock())
@@ -367,7 +367,6 @@ def test_stuck_client_cleanup_preserves_primary_failure_and_closes_streams(tmp_p
 
 def resource_runner(tmp_path, monkeypatch, *, running=True, oom=0, pids_max=0, stop_error=False,
                     disk=None, disk_error=None):
-    module = load()
     runner = host(tmp_path, 'executing')
     runner.name = 'owned'
     runner.state['container_started'] = True
@@ -436,14 +435,51 @@ def test_resource_failures_cannot_be_success_or_fake_zero(tmp_path, monkeypatch,
     runner, calls, metrics, disk = resource_runner(
         tmp_path, monkeypatch, running=failure != 'dead', oom=int(failure == 'oom'),
         pids_max=int(failure in {'pids', 'pid-exec'}), stop_error=failure == 'pid-exec')
-    with pytest.raises(RuntimeError, match='resource evidence incomplete'):
+    with pytest.raises(RuntimeError, match='OOM or PID limit' if failure in {'oom', 'pids'}
+                       else 'resource evidence incomplete'):
         runner.collect_resources(stop_agents=True)
     evidence = json.loads((tmp_path / 'candidate-resources.json').read_text())
-    assert evidence['status'] == 'incomplete'
+    assert evidence['status'] == ('limit_exceeded' if failure in {'oom', 'pids'} else 'incomplete')
     assert evidence['metrics'] == metrics
     assert evidence['error']
     assert runner.result('succeeded', 'verifier accepted')['status'] == 'failed'
     assert runner.result('failed', 'original timeout')['error'] == 'original timeout'
+
+
+@pytest.mark.parametrize('resource', ['memory', 'pids'])
+@pytest.mark.parametrize('measurement_failure', [None, 'disk', 'quiescence', 'dead', 'pid-exec'])
+def test_eval_quota_failures_report_only_complete_measurements(
+        tmp_path, monkeypatch, resource, measurement_failure):
+    runner, _, metrics, _ = resource_runner(
+        tmp_path, monkeypatch, oom=int(resource == 'memory'), pids_max=int(resource == 'pids'),
+        running=measurement_failure != 'dead', stop_error=measurement_failure == 'pid-exec',
+        disk_error='disk measurement unavailable' if measurement_failure == 'disk' else None)
+    if measurement_failure == 'quiescence':
+        metrics['current_pids'] = 2
+    runner.state.update(
+        enforced_limits={'requested': {}, 'effective': {
+            'cpu_time_secs': 60, 'memory_bytes': 512 * 1024 * 1024, 'pids': 32,
+            'disk_bytes': 1024 * 1024 * 1024, 'output_bytes': 1024, 'wall_time_secs': 30,
+        }, 'caps': []},
+        output_bytes=100, wall_time_millis=1000,
+    )
+    with pytest.raises(RuntimeError):
+        runner.collect_resources(stop_agents=True)
+    for native_status in ('succeeded', 'succeeded_with_blockers', 'failed'):
+        result = runner.result(native_status, 'original result', native=native_result(native_status))
+        assert result['status'] == 'failed'
+        reports = [item['artifact'] for item in result['artifacts']
+                   if item['artifact_type'] == 'resource_limit_report']
+        if measurement_failure:
+            assert runner.state['resource_evidence']['status'] == 'incomplete'
+            assert reports == []
+        else:
+            assert runner.state['resource_evidence']['status'] == 'limit_exceeded'
+            assert reports[0]['termination']['resource'] == resource
+            assert reports[0]['usage']['peak_memory_bytes'] == metrics['peak_memory_bytes']
+            assert reports[0]['usage']['peak_pids'] == metrics['peak_pids']
+            if native_status != 'failed':
+                assert result['signals'] == []
 
 
 def test_missing_observer_keeps_missing_evidence_instead_of_zero(tmp_path, monkeypatch):
@@ -478,13 +514,14 @@ def test_observer_mount_is_candidate_only_and_has_no_extra_privileges(tmp_path, 
         return '{}'
     monkeypatch.setattr(module, 'docker', invoke)
     monkeypatch.setattr(module.os, 'getuid', lambda: 1001)
-    runner.start_observer()
+    runner.start_observer(900)
     command = next(c for c in calls if c[0] == 'run')
     mount = command[command.index('--mount') + 1]
     assert mount == 'type=bind,src=/sys/fs/cgroup/docker/' + 'a' * 64 + ',dst=/sys/fs/cgroup,readonly'
     assert command[command.index('--network') + 1] == 'none'
     assert command[command.index('--user') + 1].startswith('1001:')
     assert command[command.index('--shm-size') + 1] == '64m'
+    assert command[-2:] == ('sleep', '900')
     assert '--privileged' not in command and '--pid' not in command
     assert not any('docker.sock' in argument for argument in command)
 
@@ -588,8 +625,8 @@ def test_candidate_reaper_collects_exited_children_with_fixed_deadline():
     module = load()
     setup = "import os\npid=os.fork()\nif pid==0: os._exit(0)\n"
     check = "\ntry: os.waitpid(pid,os.WNOHANG)\nexcept ChildProcessError: pass\nelse: raise AssertionError('child was not reaped')\n"
-    script = setup + module.CANDIDATE_REAPER_SCRIPT.replace('+ 900', '+ 0.2') + check
-    subprocess.run([sys.executable, '-I', '-c', script], check=True, timeout=3)
+    script = setup + module.CANDIDATE_REAPER_SCRIPT + check
+    subprocess.run([sys.executable, '-I', '-c', script, '0.2'], check=True, timeout=3)
 
 
 def test_capture_failure_retains_completed_model_usage(tmp_path):
@@ -745,7 +782,7 @@ def test_launch_mounts_only_frozen_input(tmp_path, monkeypatch):
     (tmp_path / 'input.bundle').write_bytes(b'prepared bundle')
     runner.state['input_snapshot'] = {'base_commit': 'a' * 40, 'bundle_sha256': hashlib.sha256(b'prepared bundle').hexdigest()}
     runner.args = SimpleNamespace(workspace=tmp_path / 'mutable', auth_file=tmp_path / 'auth',
-                                  synthetic_dns=False, proxy_image='proxy', image='agent')
+                                  synthetic_dns=False, proxy_image='proxy', image='agent', timeout=180)
     runner.start_observer = Mock()
     calls = []
     monkeypatch.setattr(module, 'docker', lambda *args: calls.append(args))
@@ -754,6 +791,29 @@ def test_launch_mounts_only_frozen_input(tmp_path, monkeypatch):
     assert f'type=bind,src={tmp_path}/input.bundle,dst=/input.bundle,readonly' in candidate
     assert f'type=bind,src={module.GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly' in candidate
     assert not any(str(tmp_path / 'mutable') in arg for arg in candidate)
+
+
+def test_eval_container_lifetime_covers_claimed_wall_limit(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = load()
+    runner = module.Host.__new__(module.Host)
+    runner.root, runner.name = tmp_path, 'owned'
+    runner.state = {
+        'input_snapshot': {'base_commit': 'a' * 40, 'bundle_sha256': 'b' * 64},
+        'enforced_limits': {'effective': {
+            'wall_time_secs': 7200, 'disk_bytes': 512 * 1024 * 1024,
+            'memory_bytes': 2 * 1024 * 1024 * 1024, 'pids': 128,
+        }},
+        'enforced_network_policy': {'inbound': 'deny', 'outbound': 'deny', 'network_allowlist': []},
+    }
+    runner.args = SimpleNamespace(image='agent', timeout=180)
+    runner.start_observer = Mock()
+    calls = []
+    monkeypatch.setattr(module, 'docker', lambda *args: calls.append(args))
+    runner.launch()
+    candidate = next(call for call in calls if call[:4] == ('run', '-d', '--name', 'owned'))
+    assert int(candidate[-1]) > 7200
+    runner.start_observer.assert_called_once_with(int(candidate[-1]))
 
 
 def test_failed_preparation_is_persisted_before_any_claim(tmp_path):
@@ -812,7 +872,7 @@ def test_launch_passes_prepared_digest_to_consumer_before_auth_copy(tmp_path, mo
     (runner.root / 'input.bundle').write_bytes(b'changed bytes')
     runner.name = 'owned'
     runner.args = SimpleNamespace(auth_file=tmp_path / 'auth', image='image',
-                                  proxy_image='proxy', synthetic_dns=False)
+                                  proxy_image='proxy', synthetic_dns=False, timeout=180)
     runner.start_observer = Mock()
     calls = []
     def docker(*args):
@@ -917,13 +977,127 @@ def claimed_runner(tmp_path):
     return runner, claim
 
 
+def test_cumulative_cpu_budget_is_cgroup_usage_not_a_rate_or_wall_timeout():
+    module = load()
+    limits = module.quality_gate.trusted_resource_limits({
+        "resource_limits": {
+            "requested": {"cpu_time_secs": 2},
+            "effective": {
+                "cpu_time_secs": 1, "memory_bytes": 8, "pids": 16,
+                "disk_bytes": 512 * 1024 * 1024, "output_bytes": 1024, "wall_time_secs": 30,
+            },
+        }
+    })
+    assert module.quality_gate.cpu_time_exceeded(1_000_000, 1) is False
+    assert module.quality_gate.cpu_time_exceeded(1_000_001, 1) is True
+    report = module.quality_gate.build_resource_report(
+        limits, cpu_usec=1_000_001, peak_memory_bytes=1, peak_pids=1,
+        disk_bytes=1, output_bytes=1, wall_time_millis=1,
+    )
+    assert report["termination"]["resource"] == "cpu_time"
+    assert report["usage"]["cpu_time_millis"] == 1000
+    assert report["usage"]["wall_time_millis"] == 1
+    variables = module.quality_gate.bind_eval_contract(
+        {
+            "resource_limits": limits,
+            "network_policy": {"inbound": "deny", "outbound": "allowlist", "network_allowlist": ["chatgpt.com"]},
+            "credential_environment_variables": {"MODEL_TOKEN": "secret"},
+        },
+        {"command": {"eval": {}}},
+    )
+    assert variables == {"MODEL_TOKEN": "secret"}
+    assert "secret" not in json.dumps({key: value for key, value in limits.items()})
+
+
+def test_root_eval_contract_is_enforced():
+    module = load()
+    claim = {
+        "resource_limits": {"requested": {}, "effective": {
+            "cpu_time_secs": 1, "memory_bytes": 8, "pids": 16,
+            "disk_bytes": 512 * 1024 * 1024, "output_bytes": 1024,
+            "wall_time_secs": 30,
+        }},
+        "network_policy": {"inbound": "deny", "outbound": "deny", "network_allowlist": []},
+        "credential_environment_variables": {"MODEL_TOKEN": "private-value"},
+    }
+    assert module.quality_gate.bind_eval_contract(claim, {"eval": {}, "command": {}}) == {
+        "MODEL_TOKEN": "private-value"
+    }
+    with pytest.raises(RuntimeError, match="trusted_eval_verifier_v1"):
+        module.quality_gate.bind_eval_contract(
+            claim, {"eval": {"required_runtime_host_capabilities": ["trusted_eval_verifier_v1"]}}
+        )
+
+
+def test_eval_credentials_enter_container_over_stdin_only(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = load()
+    runner = host(tmp_path, 'executing')
+    runner.args = SimpleNamespace(timeout=30, model='model')
+    runner.name = 'candidate'
+    runner.credential_variables = {"MODEL_TOKEN": "private-value"}
+    runner.state.update(
+        enforced_limits={"effective": {
+            "wall_time_secs": 30, "cpu_time_secs": 10, "output_bytes": 1024,
+        }},
+        prepared_prompt={"prompt": "task"},
+    )
+    runner.persist = Mock()
+    runner.renew = Mock()
+    observed = {}
+
+    def stream(command, root, timeout, renew, **kwargs):
+        observed.update(command=command, kwargs=kwargs)
+        return 0
+
+    monkeypatch.setitem(runner.wait.__globals__, 'stream_agent_output', stream)
+    assert runner.wait() == 0
+    assert 'private-value' not in ' '.join(observed['command'])
+    assert observed['command'][:3] == ['docker', 'exec', '-i']
+    assert json.loads(observed['kwargs']['stdin_data']) == runner.credential_variables
+    assert runner.state['wall_time_millis'] >= 0
+
+
+def test_failed_eval_without_measurements_does_not_invent_evidence(tmp_path):
+    runner = host(tmp_path, 'executing')
+    runner.state.update(
+        enforced_limits={"effective": {}},
+        enforced_network_policy={"inbound": "deny", "outbound": "deny", "network_allowlist": []},
+        input_snapshot={"base_commit": "a" * 40},
+    )
+    failed = runner.result('failed', 'container launch failed')
+    assert failed['error_kind'] == 'unknown'
+    assert 'execution_evidence' not in runner.state
+    assert not any(item['artifact_type'] in {'resource_limit_report', 'network_policy_report'}
+                   for item in failed['artifacts'])
+
+
+def test_unenforceable_eval_claim_completes_as_failed_after_lease(tmp_path):
+    runner, claim = claimed_runner(tmp_path)
+    claim['runtime_job']['input']['command']['eval'] = {'timeout_secs': 30}
+    claim['resource_limits'] = {'requested': {'disk_bytes': 100 * 1024 * 1024}, 'effective': {
+        'cpu_time_secs': 30, 'memory_bytes': 2 * 1024 * 1024 * 1024, 'pids': 128,
+        'disk_bytes': 100 * 1024 * 1024, 'output_bytes': 1024 * 1024, 'wall_time_secs': 30,
+    }}
+    claim['network_policy'] = {'inbound': 'deny', 'outbound': 'deny', 'network_allowlist': []}
+    runner.run()
+    assert runner.state['result']['status'] == 'failed'
+    assert 'below the writable mount minimum' in runner.state['result']['error']
+    runner.launch.assert_not_called()
+    runner.cleanup.assert_called_once()
+    runner.complete.assert_called_once()
+    assert runner.state['phase'] == 'completing'
+
+
 def test_rendered_claim_and_native_result_survive_completion_and_restart(tmp_path):
     runner, claim = claimed_runner(tmp_path)
     native = native_result()
     write_result_log(tmp_path / 'agent.jsonl', native)
     runner.run()
     assert runner.api.call_args_list[1].args[1]['execution_workspace'] == '/workspace'
-    assert runner.api.call_args_list[0].args[1]['capabilities'] == ['runtime_job_lease_proof_v1']
+    assert runner.api.call_args_list[0].args[1]['capabilities'] == [
+        'runtime_job_lease_proof_v1', 'eval_resource_limits', 'eval_network_policy',
+    ]
     saved = json.loads((tmp_path / 'state.json').read_text())
     assert saved['prepared_prompt'] == claim['prepared_prompt']
     assert saved['agent_result'] == native
@@ -982,6 +1156,7 @@ def test_verifier_failure_does_not_forward_success_signal(tmp_path):
 @pytest.mark.parametrize('artifact_type', [
     'runtime_host_usage', 'supervised_input_snapshot',
     'supervised_candidate_resources', 'supervised_docker_verification', 'supervised_git_handoff',
+    'resource_limit_report', 'network_policy_report',
 ])
 def test_native_artifacts_cannot_impersonate_host_evidence(tmp_path, artifact_type):
     runner, _ = claimed_runner(tmp_path)

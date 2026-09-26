@@ -90,6 +90,9 @@ pub(super) fn attach_eval_checkout_evidence(
         return Ok(result);
     };
     let Some(execution_evidence) = execution_evidence else {
+        if result.status == harness_workflow::runtime::ActivityStatus::Failed {
+            return Ok(result);
+        }
         return Err(json!({
             "error": "eval completion requires host execution_evidence"
         }));
@@ -264,6 +267,9 @@ pub(in crate::handlers::runtime_hosts) fn validate_eval_resource_limit_report(
         .find(|artifact| artifact.artifact_type == "resource_limit_report")
         .map(|artifact| artifact.artifact.clone())
     else {
+        if result.status == harness_workflow::runtime::ActivityStatus::Failed {
+            return Ok(());
+        }
         return Err((
             StatusCode::BAD_REQUEST,
             json!({
@@ -451,6 +457,22 @@ mod tests {
             err.1["error"],
             "eval runtime job completion requires resource_limit_report artifact"
         );
+    }
+
+    #[test]
+    fn failed_eval_without_measurements_can_complete_as_incomplete_evidence() {
+        let job = eval_implementation_job("abcdef1");
+        let result = ActivityResult::failed("implement_issue", "container failed", "launch failed")
+            .with_error_kind(harness_workflow::runtime::ActivityErrorKind::SpawnFailure);
+        let attached = attach_eval_checkout_evidence(&job, result, None)
+            .expect("failed launch has no checkout or usage measurement");
+        validate_eval_resource_limit_report(&job, &attached)
+            .expect("failed launch has no resource measurement");
+        assert_eq!(
+            attached.status,
+            harness_workflow::runtime::ActivityStatus::Failed
+        );
+        assert!(attached.artifacts.is_empty());
     }
 
     #[test]

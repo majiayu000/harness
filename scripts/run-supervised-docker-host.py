@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Execute one pre-submitted declarative task on an isolated local Harness server.
 
-This supervised client advertises only lease-proof support, not eval capabilities.
+This client advertises lease proof, eval resource limits, and eval network policy.
 A trusted verifier runs in a separate offline container. See the companion guide.
 """
 from __future__ import annotations
@@ -13,7 +13,6 @@ import importlib.util
 import json
 import os
 import re
-import selectors
 from pathlib import Path
 import subprocess
 import sys
@@ -40,6 +39,8 @@ HOST_OWNED_ARTIFACTS = {
     "supervised_candidate_resources",
     "supervised_docker_verification",
     "supervised_git_handoff",
+    "resource_limit_report",
+    "network_policy_report",
 }
 
 def save(path: Path, value: dict) -> None:
@@ -58,94 +59,12 @@ def docker(*args: str, timeout: int = 30) -> str:
         raise RuntimeError(f"docker {args[0]} failed: {result.stderr.strip()}")
     return result.stdout.strip()
 
-def stream_agent_output(command: list[str], root: Path, timeout: int, renew) -> int:
-    """Keep a shared bounded prefix of both attached streams outside the candidate."""
-    deadline = time.monotonic() + timeout
-    observed = 0
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, bufsize=0)
-    try:
-        with selectors.DefaultSelector() as selector, \
-                (root / "agent.jsonl").open("wb") as stdout, \
-                (root / "agent.stderr").open("wb") as stderr:
-            selector.register(process.stdout, selectors.EVENT_READ, stdout)
-            selector.register(process.stderr, selectors.EVENT_READ, stderr)
-            while selector.get_map() or process.poll() is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RuntimeError(f"agent exceeded {timeout}s wall deadline")
-                renew()
-                for key, _ in selector.select(min(0.2, remaining)):
-                    chunk = os.read(key.fd, 64 * 1024)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    retained = chunk[:max(0, OUTPUT_LIMIT - observed)]
-                    key.data.write(retained)
-                    key.data.flush()
-                    observed += len(chunk)
-                    if observed > OUTPUT_LIMIT:
-                        raise RuntimeError(f"agent output exceeded {OUTPUT_LIMIT} bytes")
-            return process.wait(timeout=1)
-    finally:
-        # Disconnecting the CLI does not stop remote exec; the caller must remove
-        # its exact container on failure before completing the job.
-        primary_error = sys.exc_info()[1]
-        cleanup_errors = []
-        try:
-            if process.poll() is None:
-                process.kill()
-        except Exception as error:
-            cleanup_errors.append(f"kill: {error}")
-        try:
-            process.wait(timeout=5)
-        except Exception as error:
-            cleanup_errors.append(f"wait: {error}")
-        for stream in (process.stdout, process.stderr):
-            try:
-                stream.close()
-            except Exception as error:
-                cleanup_errors.append(f"close stream: {error}")
-        if cleanup_errors:
-            reason = "agent output cleanup failed: " + "; ".join(cleanup_errors)
-            if primary_error is not None:
-                reason = f"{type(primary_error).__name__}: {primary_error}; {reason}"
-            raise RuntimeError(reason) from primary_error
+def stream_agent_output(command: list[str], root: Path, timeout: int, renew, **kwargs):
+    kwargs.setdefault("output_limit", OUTPUT_LIMIT)
+    return quality_gate.stream_agent_output(command, root, timeout, renew, **kwargs)
 
-def read_activity_result(log: Path, activity: str) -> dict:
-    # Only host-captured assistant messages carry results; tool output is untrusted.
-    messages = []
-    for line in log.read_text(encoding="utf-8").splitlines():
-        event = json.loads(line)
-        if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message":
-            messages.append(event["item"]["text"])
-    blocks = re.findall(r"^```harness-activity-result\s*\n(.*?)^```[ \t]*$",
-                        "\n".join(messages), re.MULTILINE | re.DOTALL)
-    if len(blocks) != 1:
-        raise RuntimeError("agent must emit exactly one harness-activity-result block")
-    result = json.loads(blocks[0])
-    if not isinstance(result, dict) or result.get("activity") != activity:
-        raise RuntimeError("agent result does not match the claimed activity")
-    if not isinstance(result.get("status"), str) or not isinstance(result.get("summary"), str):
-        raise RuntimeError("agent result requires status and summary strings")
-    for field in ("artifacts", "signals", "validation"):
-        if not isinstance(result.get(field, []), list):
-            raise RuntimeError(f"agent result {field} must be an array")
-    # The completion endpoint owns the full ActivityResult contract validation.
-    return result
-
-def read_usage(log: Path) -> dict:
-    for line in reversed(log.read_text(encoding="utf-8").splitlines()):
-        event = json.loads(line)
-        if event.get("type") == "turn.completed":
-            usage = event["usage"]
-            return {
-                "input_tokens": usage["input_tokens"],
-                "output_tokens": usage["output_tokens"],
-                "cached_input_tokens": usage.get("cached_input_tokens", 0),
-                "total_tokens": usage["input_tokens"] + usage["output_tokens"],
-            }
-    raise RuntimeError("agent produced no completed-turn usage evidence")
+read_activity_result = quality_gate.read_activity_result
+read_usage = quality_gate.read_usage
 
 def archive_members(stream: tarfile.TarFile) -> list[tarfile.TarInfo]:
     members = stream.getmembers()
@@ -158,124 +77,21 @@ def extract_candidate(archive: Path, destination: Path) -> None:
     with tarfile.open(archive) as stream:
         stream.extractall(destination, members=archive_members(stream), filter="data")
 
-CANDIDATE_REAPER_SCRIPT = """import os, time
+CANDIDATE_REAPER_SCRIPT = """import os, sys, time
 # PID 1 adopts agent descendants and must reap them before cgroup quiescence.
-deadline = time.monotonic() + 900
+deadline = time.monotonic() + float(sys.argv[1])
 while time.monotonic() < deadline:
     try:
         while time.monotonic() < deadline and os.waitpid(-1, os.WNOHANG)[0]:
             pass
     except ChildProcessError:
-        pass  # No adopted children are waiting; keep the fixed retention deadline.
+        pass  # No adopted children are waiting; keep the retention deadline.
     time.sleep(0.01)
 """
 
-CGROUP_METRICS_SCRIPT = """import json
-from pathlib import Path
-root = Path('/sys/fs/cgroup')
-def counters(name):
-    return {key: int(value) for key, value in
-            (line.split() for line in (root / name).read_text().splitlines())}
-pids_before = int((root / 'pids.current').read_text())
-cpu = counters('cpu.stat')
-print(json.dumps({'cpu_time_micros': cpu['usage_usec'], 'current_pids_before': pids_before,
-                  'peak_memory_bytes': int((root / 'memory.peak').read_text()),
-                  'peak_pids': int((root / 'pids.peak').read_text()),
-                  'memory_events': counters('memory.events'),
-                  'pids_events': counters('pids.events'),
-                  'current_pids': int((root / 'pids.current').read_text())}))
-"""
-
-# Fixed agent-writable tmpfs roots under the supervised trial policy. Apparent
-# file lengths (du -sb) are not allocated usage; measure via statvfs instead.
-DISK_METRICS_SCRIPT = """import json, os
-from datetime import datetime, timezone
-from pathlib import Path
-ROOTS = ('/workspace', '/home/harness', '/tmp', '/dev/shm')
-mounts = {}
-for line in Path('/proc/self/mountinfo').read_text().splitlines():
-    parts = line.split()
-    sep = parts.index('-')
-    mounts[parts[4]] = {'device': parts[2], 'fstype': parts[sep + 1]}
-samples = []
-for root in ROOTS:
-    if not Path(root).exists():
-        raise SystemExit('missing mount root: ' + root)
-    if not os.access(root, os.W_OK):
-        raise SystemExit('mount root not writable: ' + root)
-    info = mounts.get(root)
-    if info is None:
-        raise SystemExit('mountinfo missing root: ' + root)
-    st = os.statvfs(root)
-    if st.f_frsize <= 0 or st.f_blocks <= 0 or st.f_bfree < 0 or st.f_bfree > st.f_blocks:
-        raise SystemExit('malformed statvfs for ' + root)
-    used = (st.f_blocks - st.f_bfree) * st.f_frsize
-    capacity = st.f_blocks * st.f_frsize
-    samples.append({'root': root, 'device': info['device'], 'fstype': info['fstype'],
-                    'used_bytes': used, 'capacity_bytes': capacity, 'frsize': st.f_frsize})
-by_device = {}
-for sample in samples:
-    prior = by_device.get(sample['device'])
-    if prior is None:
-        by_device[sample['device']] = sample
-    elif (prior['used_bytes'] != sample['used_bytes']
-          or prior['capacity_bytes'] != sample['capacity_bytes']):
-        raise SystemExit('inconsistent statvfs for device ' + sample['device'])
-print(json.dumps({
-    'sample_kind': 'terminal',
-    'observed_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-    'scope': 'candidate agent-writable tmpfs roots under trial policy',
-    'mounts': samples,
-    'aggregate_used_bytes': sum(item['used_bytes'] for item in by_device.values()),
-    'aggregate_capacity_bytes': sum(item['capacity_bytes'] for item in by_device.values()),
-    'distinct_filesystems': len(by_device),
-}))
-"""
-
-def disk_evidence_errors(disk: object) -> list[str]:
-    """Return problems that must block successful completion; never zero-fill."""
-    if not isinstance(disk, dict):
-        return ["disk evidence is not an object"]
-    errors = []
-    if disk.get("sample_kind") != "terminal":
-        errors.append("disk sample_kind must be terminal (not peak)")
-    if not isinstance(disk.get("observed_at"), str) or not disk["observed_at"]:
-        errors.append("disk observed_at is missing")
-    if disk.get("scope") != "candidate agent-writable tmpfs roots under trial policy":
-        errors.append("disk scope is missing or unexpected")
-    mounts = disk.get("mounts")
-    expected = ("/workspace", "/home/harness", "/tmp", "/dev/shm")
-    if not isinstance(mounts, list) or [item.get("root") for item in mounts] != list(expected):
-        errors.append("disk mounts must cover the four agent-writable tmpfs roots")
-        return errors
-    by_device: dict = {}
-    for item, root in zip(mounts, expected):
-        if not isinstance(item, dict):
-            errors.append(f"disk mount {root} is malformed")
-            continue
-        for key in ("device", "fstype"):
-            if not isinstance(item.get(key), str) or not item[key]:
-                errors.append(f"disk mount {root} missing {key}")
-        for key in ("used_bytes", "capacity_bytes", "frsize"):
-            value = item.get(key)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                errors.append(f"disk mount {root} {key} must be a non-negative int")
-        used, capacity = item.get("used_bytes"), item.get("capacity_bytes")
-        if isinstance(used, int) and isinstance(capacity, int) and used > capacity:
-            errors.append(f"disk mount {root} used_bytes exceeds capacity")
-        device = item.get("device")
-        if isinstance(device, str) and device not in by_device:
-            if isinstance(used, int) and isinstance(capacity, int):
-                by_device[device] = (used, capacity)
-    if not isinstance(disk.get("distinct_filesystems"), int) or disk["distinct_filesystems"] != len(by_device):
-        errors.append("disk distinct_filesystems does not match mount devices")
-    expected_used = sum(pair[0] for pair in by_device.values())
-    expected_capacity = sum(pair[1] for pair in by_device.values())
-    if disk.get("aggregate_used_bytes") != expected_used:
-        errors.append("disk aggregate_used_bytes does not match distinct filesystems")
-    if disk.get("aggregate_capacity_bytes") != expected_capacity:
-        errors.append("disk aggregate_capacity_bytes does not match distinct filesystems")
-    return errors
+CGROUP_METRICS_SCRIPT = quality_gate.CGROUP_METRICS_SCRIPT
+DISK_METRICS_SCRIPT = quality_gate.DISK_METRICS_SCRIPT
+disk_evidence_errors = quality_gate.disk_evidence_errors
 
 class Host:
     def __init__(self, args: argparse.Namespace):
@@ -305,6 +121,7 @@ class Host:
         self.endpoint = f"/api/runtime-hosts/{self.name}"
         self.last_renewal = 0.0
         self.token = os.environ["HARNESS_API_TOKEN"]
+        self.credential_variables = {}
 
     def persist(self) -> None:
         save(self.root / "state.json", self.state)
@@ -337,8 +154,6 @@ class Host:
         self.last_renewal = time.monotonic()
 
     def base_args(self) -> list[str]:
-        # Concrete trial caps only: workspace/home/tmp tmpfs plus /dev/shm via
-        # Docker --shm-size. Not operator knobs or a full ResourceLimitReport.
         return [
             "--read-only", "--user", f"{os.getuid()}:{os.getgid()}",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -348,8 +163,17 @@ class Host:
             "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
         ]
 
+    def isolation_args(self) -> list[str]:
+        limits = self.state.get("enforced_limits")
+        if not limits:
+            return self.base_args()
+        effective = limits["effective"]
+        return quality_gate.docker_isolation_args(
+            effective["disk_bytes"], os.getuid(), os.getgid(),
+            memory_bytes=effective["memory_bytes"], pids=effective["pids"],
+        )
+
     def cleanup(self) -> None:
-        # Only exact names persisted by this invocation; never prune Docker globally.
         errors = []
         for name in [self.name + "-observer", self.name, self.name + "-verify", self.name + "-proxy"]:
             try:
@@ -383,37 +207,59 @@ class Host:
     def launch(self) -> None:
         args = self.args
         snapshot = self.state["input_snapshot"]
-        docker("network", "create", "--internal", self.name)
-        proxy_args = [
-            "run", "-d", "--name", self.name + "-proxy", "--network", "bridge",
-            "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-            "--pids-limit", "64", "--memory", "128m", "--cpus", "0.5",
-            "--env", "HARNESS_EGRESS_ALLOWLIST=chatgpt.com,auth.openai.com",
-        ]
-        if args.synthetic_dns:
-            proxy_args += ["--env", "HARNESS_EGRESS_ALLOW_RFC2544_DNS=1"]
-        docker(*proxy_args, args.proxy_image)
-        docker("network", "connect", "--alias", "proxy", self.name, self.name + "-proxy")
+        policy = self.state.get("enforced_network_policy")
+        allowlist = "chatgpt.com,auth.openai.com" if policy is None else (
+            None if policy["outbound"] == "deny" else ",".join(policy["network_allowlist"])
+        )
+        network = "none" if allowlist is None else self.name
+        if allowlist is not None:
+            docker("network", "create", "--internal", self.name)
+            proxy_args = [
+                "run", "-d", "--name", self.name + "-proxy", "--network", "bridge",
+                "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "--pids-limit", "64", "--memory", "128m", "--cpus", "0.5",
+                "--env", f"HARNESS_EGRESS_ALLOWLIST={allowlist}",
+            ]
+            if args.synthetic_dns:
+                proxy_args += ["--env", "HARNESS_EGRESS_ALLOW_RFC2544_DNS=1"]
+            docker(*proxy_args, args.proxy_image)
+            docker("network", "connect", "--alias", "proxy", self.name, self.name + "-proxy")
+        limits = self.state.get("enforced_limits")
+        retention_secs = max(
+            900,
+            (limits["effective"]["wall_time_secs"] if limits else args.timeout) + 300,
+        )
+        workspace = "512m" if limits is None else str(
+            quality_gate.mount_budget(limits["effective"]["disk_bytes"])["workspace"]
+        )
         run_args = [
-            "run", "-d", "--name", self.name, "--network", self.name, *self.base_args(),
-            "--tmpfs", f"/workspace:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
+            "run", "-d", "--name", self.name, "--network", network, *self.isolation_args(),
+            "--tmpfs", f"/workspace:rw,nosuid,nodev,size={workspace},uid={os.getuid()},gid={os.getgid()},mode=700",
             "--mount", f"type=bind,src={self.root / 'input.bundle'},dst=/input.bundle,readonly",
             "--mount", f"type=bind,src={GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly",
-            "--mount", f"type=bind,src={args.auth_file.resolve()},dst=/run/codex-auth.json,readonly",
-            "--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080",
-            args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT,
         ]
+        if limits is None:
+            run_args += [
+                "--mount", f"type=bind,src={args.auth_file.resolve()},dst=/run/codex-auth.json,readonly",
+                "--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080",
+            ]
+        else:
+            if allowlist is not None:
+                run_args += ["--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080"]
+        run_args += [args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT, str(retention_secs)]
         docker(*run_args)
+        self.state["network_enforced"] = policy is not None
         self.state["container_started"] = True
         self.persist()
-        self.start_observer()
+        self.start_observer(retention_secs)
         docker("exec", self.name, "python3", "-I", "/git-handoff.py", "prepare",
                "/input.bundle", snapshot["base_commit"], snapshot["bundle_sha256"], "/workspace")
-        docker("exec", self.name, "sh", "-c",
-               'set -eu; mkdir -p /home/harness/.codex; '
-               'cp /run/codex-auth.json /home/harness/.codex/auth.json')
+        if limits is None:
+            docker("exec", self.name, "sh", "-c",
+                   'set -eu; mkdir -p /home/harness/.codex; '
+                   'cp /run/codex-auth.json /home/harness/.codex/auth.json')
 
-    def start_observer(self) -> None:
+    def start_observer(self, retention_secs: int) -> None:
         engine = json.loads(docker("info", "--format", "{{json .}}"))
         if engine["CgroupVersion"] != "2" or engine["CgroupDriver"] != "cgroupfs":
             raise RuntimeError("resource observer requires Docker cgroup v2 with cgroupfs")
@@ -427,7 +273,7 @@ class Host:
         docker("run", "-d", "--name", self.name + "-observer", "--network", "none",
                *self.base_args(), "--cgroupns", "host", "--mount",
                f"type=bind,src=/sys/fs/cgroup/docker/{candidate_id},dst=/sys/fs/cgroup,readonly",
-               self.args.image, "sleep", "900")
+               self.args.image, "sleep", str(retention_secs))
         # Fail before model execution when this exact kernel/mount lacks the files.
         docker("exec", self.name + "-observer", "python3", "-I", "-c", CGROUP_METRICS_SCRIPT)
 
@@ -438,6 +284,7 @@ class Host:
                     "scope": ("candidate cgroup and agent-writable tmpfs through "
                               "quiesced export; excludes verifier and proxy")}
         errors = []
+        limit_exceeded = False
         try:
             state = json.loads(docker("inspect", self.name, "--format", "{{json .State}}"))
             evidence["container_state"] = state
@@ -458,7 +305,7 @@ class Host:
                 errors.append("candidate cgroup is not quiescent at final resource collection")
             if (metrics["memory_events"]["oom"] or metrics["memory_events"]["oom_kill"]
                     or metrics["pids_events"]["max"]):
-                errors.append("candidate hit an OOM or PID limit")
+                limit_exceeded = True
         except Exception as error:
             errors.append(str(error))
         # Disk accounting needs the live candidate mount namespace; measure after
@@ -472,27 +319,70 @@ class Host:
         try:
             state = json.loads(docker("inspect", self.name, "--format", "{{json .State}}"))
             evidence["container_state"] = state
-            if not state["Running"] or state["OOMKilled"]:
-                errors.append("candidate PID 1 exited or Docker reported OOM")
+            if not state["Running"]:
+                errors.append("candidate PID 1 exited before final resource collection")
+            limit_exceeded = limit_exceeded or state["OOMKilled"]
         except Exception as error:
             errors.append(str(error))
         if errors:
             evidence["error"] = "; ".join(errors)
+        elif limit_exceeded:
+            evidence["status"] = "limit_exceeded"
+            evidence["error"] = "candidate hit an OOM or PID limit"
         else:
             evidence["status"] = "complete"
         self.state["resource_evidence"] = evidence
         save(self.root / "candidate-resources.json", evidence)
         self.persist()
+        if evidence["status"] == "limit_exceeded":
+            raise RuntimeError(evidence["error"])
         if evidence["status"] != "complete":
             raise RuntimeError("candidate resource evidence incomplete: " + evidence["error"])
 
     def wait(self) -> int:
-        return stream_agent_output([
-            "docker", "exec", "--workdir", "/workspace", self.name,
-            "timeout", "--signal=KILL", str(self.args.timeout),
-            "codex", "exec", "--skip-git-repo-check", "--json", "--sandbox", "danger-full-access",
-            "-m", self.args.model, self.state["prepared_prompt"]["prompt"],
-        ], self.root, self.args.timeout, self.renew)
+        limits = (self.state.get("enforced_limits") or {}).get("effective")
+        timeout = self.args.timeout if limits is None else limits["wall_time_secs"]
+        account: dict = {}
+        started = time.monotonic()
+        last_poll = 0.0
+
+        def check() -> None:
+            nonlocal last_poll
+            now = time.monotonic()
+            if now - last_poll < 1:
+                return
+            last_poll = now
+            metrics = json.loads(docker("exec", self.name + "-observer", "python3", "-I", "-c", CGROUP_METRICS_SCRIPT))
+            if quality_gate.cpu_time_exceeded(metrics["cpu_time_micros"], limits["cpu_time_secs"]):
+                raise RuntimeError("candidate exceeded cumulative CPU time limit")
+
+        try:
+            command = ["docker", "exec"]
+            if limits is not None:
+                command.append("-i")
+            command += ["--workdir", "/workspace", self.name]
+            if limits is not None:
+                command += [
+                    "python3", "-I", "-c",
+                    "import json,os,sys\n"
+                    "environment=os.environ.copy()\n"
+                    "environment.update(json.load(sys.stdin))\n"
+                    "os.execvpe(sys.argv[1],sys.argv[1:],environment)",
+                ]
+            command += [
+                "timeout", "--signal=KILL", str(timeout), "codex", "exec",
+                "--skip-git-repo-check", "--json", "--sandbox", "danger-full-access",
+                "-m", self.args.model, self.state["prepared_prompt"]["prompt"],
+            ]
+            return stream_agent_output(command, self.root, timeout, self.renew,
+               output_limit=None if limits is None else limits["output_bytes"],
+               check=None if limits is None else check, account=None if limits is None else account,
+               stdin_data=None if limits is None else json.dumps(self.credential_variables).encode())
+        finally:
+            if limits is not None:
+                self.state["output_bytes"] = account.get("output_bytes", 0)
+                self.state["wall_time_millis"] = max(0, int((time.monotonic() - started) * 1000))
+                self.persist()
 
     def capture(self) -> None:
         archive = self.root / "candidate.tar"
@@ -585,7 +475,9 @@ class Host:
                     + "; copy candidate/ into a fresh --state-dir instead"
                 )
         for key in ("job", "lease", "result", "agent_result", "prepared_prompt",
-                    "cleanup_errors", "resource_evidence", "execution_evidence"):
+                    "cleanup_errors", "resource_evidence", "execution_evidence",
+                    "enforced_limits", "enforced_network_policy", "network_enforced",
+                    "output_bytes", "wall_time_millis"):
             self.state.pop(key, None)
         for name in ("agent.jsonl", "agent.stderr", "verifier.stdout", "candidate-resources.json"):
             path = self.root / name
@@ -667,12 +559,43 @@ class Host:
             evidence = self.state.get("resource_evidence", {"status": "incomplete", "error": "not collected"})
             artifacts.append({"artifact_type": "supervised_candidate_resources", "artifact": evidence})
             if status in {"succeeded", "succeeded_with_blockers"} and evidence["status"] != "complete":
-                status, reason = "failed", reason + "; final resource evidence is incomplete"
+                status, reason = "failed", reason + "; " + evidence.get("error", "final resource evidence is incomplete")
+        limits = self.state.get("enforced_limits")
+        if limits is not None:
+            try:
+                report = quality_gate.report_from_evidence(
+                    limits, self.state.get("resource_evidence") or {},
+                    self.state["output_bytes"], self.state["wall_time_millis"],
+                )
+            except (RuntimeError, KeyError) as error:
+                report = None
+                if status in {"succeeded", "succeeded_with_blockers"}:
+                    status, reason = "failed", f"{reason}; {error}"
+            else:
+                if report.get("termination") and status in {"succeeded", "succeeded_with_blockers"}:
+                    status, reason = "failed", f"{reason}; {report['termination']['reason']}"
+                artifacts.append({"artifact_type": "resource_limit_report", "artifact": report})
+                usage = next((item["artifact"] for item in reversed(artifacts)
+                              if item.get("artifact_type") == "runtime_host_usage"), None)
+                checked = self.state.get("input_snapshot", {}).get("base_commit")
+                if usage is not None and isinstance(checked, str) and "execution_evidence" not in self.state:
+                    self.state["execution_evidence"] = quality_gate.execution_evidence(
+                        checked, [], report, {
+                            "model": usage["model"], "input_tokens": usage["input_tokens"],
+                            "output_tokens": usage["output_tokens"],
+                            "cached_input_tokens": usage.get("cached_input_tokens", 0),
+                            "total_tokens": usage["total_tokens"], "cost_usd_micros": None,
+                        })
+        if self.state.get("network_enforced"):
+            artifacts.append({"artifact_type": "network_policy_report", "artifact": quality_gate.network_report(
+                self.state["job"]["id"], self.state["enforced_network_policy"])})
         return {**(native or {}), "activity": self.state["job"]["input"]["activity"], "status": status,
                 "summary": reason, "artifacts": artifacts or [],
                 "signals": (native or {}).get("signals", []) if native and status == native["status"] else [],
                 "error": (native or {}).get("error") if native and status == native["status"]
-                else reason if status != "succeeded" else None}
+                else reason if status != "succeeded" else None,
+                "error_kind": (native or {}).get("error_kind") if native and status == native["status"]
+                else "unknown" if status == "failed" else None}
 
     def complete(self) -> None:
         payload_path = self.root / "completion.json"
@@ -764,7 +687,8 @@ class Host:
                 self.state["phase"] = "claiming"
                 self.persist()
         self.api("/api/runtime-hosts/register", {
-            "host_id": self.name, "capabilities": ["runtime_job_lease_proof_v1"]})
+            "host_id": self.name, "capabilities": [
+                "runtime_job_lease_proof_v1", "eval_resource_limits", "eval_network_policy"]})
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             claim = self.api(self.endpoint + "/runtime-jobs/claim", {"lease_secs": LEASE_SECONDS, "execution_workspace": "/workspace"})
@@ -776,21 +700,6 @@ class Host:
         job = claim["runtime_job"]
         if job["input"]["workflow_id"] != self.state["submission"]["workflow_id"]:
             raise RuntimeError("claimed unrelated job; use a dedicated disposable server")
-        command = job["input"].get("command")
-        if not isinstance(command, dict):
-            command = {}
-        if "eval" in command or "agent_contract" in command or "exact_replay" in command:
-            raise RuntimeError("this supervised client cannot execute eval or pinned-contract jobs")
-        activity = job["input"].get("activity")
-        if activity != quality_gate.QUALITY_GATE_ACTIVITY:
-            request = self.state["request"]
-            submission = self.state["submission"]
-            digest = hashlib.sha256(b"\0".join(value.encode() for value in [
-                str(Path(request["project"]).resolve()), request.get("subject_key") or request.get("external_id") or "",
-                submission["task_id"], request["prompt"],
-            ])).hexdigest()
-            if command.get("prompt_ref") != "prompt-memory:" + digest:
-                raise RuntimeError("request prompt does not match the claimed submission")
         self.state["job"] = job
         self.state["lease"] = {key: claim[key] for key in
                                ["lease_generation", "lease_expires_at", "lease_proof"]}
@@ -798,6 +707,30 @@ class Host:
         self.persist()
         artifacts = []
         try:
+            command = job["input"].get("command")
+            if not isinstance(command, dict):
+                command = {}
+            if "agent_contract" in command or "exact_replay" in command:
+                raise RuntimeError("this supervised client cannot execute pinned-contract jobs")
+            activity = job["input"].get("activity")
+            bound = quality_gate.bind_eval_contract(claim, job["input"])
+            if bound is not None:
+                self.credential_variables = bound
+                self.state["enforced_limits"] = claim["resource_limits"]
+                self.state["enforced_network_policy"] = claim["network_policy"]
+                if activity == quality_gate.QUALITY_GATE_ACTIVITY:
+                    raise RuntimeError(
+                        "eval quality gate stays offline; this client does not implement trusted_eval_verifier_v1"
+                    )
+            if activity != quality_gate.QUALITY_GATE_ACTIVITY:
+                request = self.state["request"]
+                submission = self.state["submission"]
+                digest = hashlib.sha256(b"\0".join(value.encode() for value in [
+                    str(Path(request["project"]).resolve()), request.get("subject_key") or request.get("external_id") or "",
+                    submission["task_id"], request["prompt"],
+                ])).hexdigest()
+                if command.get("prompt_ref") != "prompt-memory:" + digest:
+                    raise RuntimeError("request prompt does not match the claimed submission")
             if activity == quality_gate.QUALITY_GATE_ACTIVITY:
                 if claim.get("prepared_prompt") is not None:
                     raise RuntimeError("native quality gate must not include a prepared_prompt")
