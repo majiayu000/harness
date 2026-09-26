@@ -94,6 +94,13 @@ mod tests {
     }
 
     #[test]
+    fn console_v2_static_assets_are_auth_exempt() {
+        assert!(is_auth_exempt_path("/console-v2/index.html"));
+        assert!(is_auth_exempt_path("/console-v2/live-data.js"));
+        assert!(!is_auth_exempt_path("/api/workflows/runtime/submissions"));
+    }
+
+    #[test]
     fn resolve_auth_mode_refuses_tokenless_without_opt_in() {
         let err = resolve_api_auth_mode(&ServerConfig::default()).unwrap_err();
         let message = err.to_string();
@@ -204,6 +211,7 @@ pub(crate) fn is_auth_exempt_path(path: &str) -> bool {
             | "/worktrees"
             | "/ws"
     ) || path.starts_with("/assets/")
+        || path.starts_with("/console-v2/")
 }
 
 /// Bearer token authentication middleware.

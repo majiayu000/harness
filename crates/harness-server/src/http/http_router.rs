@@ -37,6 +37,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/assets/{filename}",
             axum::routing::get(crate::assets::serve),
         )
+        .route(
+            "/console-v2/{filename}",
+            axum::routing::get(crate::assets::serve_console),
+        )
         .route("/favicon.ico", get(crate::dashboard::favicon))
         .route("/health", get(health_check))
         .route("/rpc", post(handle_rpc))
@@ -89,6 +93,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/workflows/runtime/submissions",
             get(task_query_routes::list_runtime_submissions)
                 .post(task_routes::create_runtime_submission),
+        )
+        .route(
+            "/api/workflows/runtime/approvals",
+            get(crate::http::approval_list_routes::list_pending_approvals),
         )
         .route(
             "/api/workflows/runtime/submissions/{id}",

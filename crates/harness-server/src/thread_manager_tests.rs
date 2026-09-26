@@ -673,10 +673,22 @@ fn pending_approval_items_for_runtime_handle_returns_only_actionable_running_ite
             approved: None,
         }]
     );
+    assert_eq!(
+        tm.pending_runtime_approvals(),
+        vec![(
+            "submission-1".to_string(),
+            vec![Item::ApprovalRequest {
+                id: Some("request-1".to_string()),
+                action: "run tests".to_string(),
+                approved: None,
+            }]
+        )]
+    );
     tm.complete_turn(&thread_id, &turn_id)?;
     assert!(tm
         .pending_approval_items_for_runtime_handle("submission-1")
         .is_empty());
+    assert!(tm.pending_runtime_approvals().is_empty());
     Ok(())
 }
 
