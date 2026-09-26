@@ -674,7 +674,9 @@ async fn runtime_submission_response_handle(
     )
 }
 
-fn workflow_runtime_loops_enabled(project_root: &Path) -> Result<bool, EnqueueTaskError> {
+pub(crate) fn workflow_runtime_loops_enabled(
+    project_root: &Path,
+) -> Result<bool, EnqueueTaskError> {
     let workflow_config = harness_core::config::workflow::load_workflow_config(project_root)
         .map_err(|error| {
             EnqueueTaskError::Internal(format!(

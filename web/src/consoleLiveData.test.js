@@ -29,6 +29,7 @@ async function setup(beforeFetch = async () => {}) {
       ],
     },
     "/api/local-quotas": { sources: [] },
+    "/api/eval-runs?project_root=%2Ftmp%2Frepo": { runs: [] },
     "/api/workflows/runtime/tree?summary_only=true": { summary: { circuit_breakers: [] } },
     "/api/dashboard": { global: { max_concurrent: 2 }, runtime_hosts: [] },
     "/api/operator-snapshot": {},
@@ -129,6 +130,76 @@ it("shows local official quotas without inventing a Claude percentage", async ()
   await context.HC.refresh(true);
   expect(context.HC.X.usage.quotas.map(row => row.used)).toEqual([70, null]);
   expect(context.HC.X.usage.quotas[1].note).toContain("quota % unavailable");
+});
+
+it("maps saved eval reports without a fabricated diff", async () => {
+  const { context, responses } = await setup();
+  responses["/api/eval-runs?project_root=%2Ftmp%2Frepo"] = { runs: [{ reported_at: "2026-09-26T17:00:00Z", report: { run_id: "run-1", suite: "core", metrics: { total_cases: 3, scored_cases: 2, passed_cases: 1, failed_cases: 1, pending_cases: 1, skipped_cases: 0, infra_failed_cases: 0, pass_at_1: 0.5 } } }], errors: ["run-2/report.json: incomplete JSON"] };
+  await context.HC.loadEvalRuns("/tmp/repo");
+  expect(context.HC.X.evals[0]).toMatchObject({ v: "run-1", suite: "core", pass: 1, fail: 1, partial: 1, score: "50%", delta: "—" });
+  expect(context.HC.evalError).toContain("incomplete JSON");
+});
+
+it("ignores older eval responses for the same project", async () => {
+  let calls = 0;
+  const pending = [];
+  const { context } = await setup(path => {
+    if (path !== "/api/eval-runs?project_root=%2Ftmp%2Frepo") return null;
+    if (++calls === 1) return null;
+    return new Promise(resolve => pending.push(resolve));
+  });
+  const first = context.HC.loadEvalRuns("/tmp/repo");
+  const second = context.HC.loadEvalRuns("/tmp/repo");
+  const response = run_id => ({ ok: true, status: 200, json: async () => ({ runs: [{ reported_at: "2026-09-26T17:00:00Z", report: { run_id, suite: "core", metrics: { scored_cases: 1, passed_cases: 1, pass_at_1: 1 } } }], errors: [] }) });
+  pending[1](response("new"));
+  await second;
+  pending[0](response("old"));
+  await first;
+  expect(context.HC.X.evals[0].v).toBe("new");
+});
+
+it("surfaces an invalid eval response without inventing metrics", async () => {
+  const { context, responses } = await setup();
+  responses["/api/eval-runs?project_root=%2Ftmp%2Frepo"] = { runs: [{ reported_at: "2026-09-26T17:00:00Z", report: { run_id: "broken" } }] };
+  await context.HC.loadEvalRuns("/tmp/repo");
+  expect(context.HC.evalError).toBeTruthy();
+  expect(context.HC.X.evals).toHaveLength(0);
+});
+
+it("drops eval data for a project removed from the live project list", async () => {
+  const { context, responses, calls } = await setup();
+  context.HC.X.evals = [{ v: "old-run" }];
+  responses["/api/overview"].projects = [{ id: "new", root: "/tmp/new", merged_24h: 0 }];
+  responses["/api/eval-runs?project_root=%2Ftmp%2Fnew"] = { runs: [], errors: [] };
+  await context.HC.refresh(true);
+  expect(context.HC.evalProject).toBe("/tmp/new");
+  expect(context.HC.X.evals).toHaveLength(0);
+  expect(calls).toContain("/api/eval-runs?project_root=%2Ftmp%2Fnew");
+});
+
+it("shows an active eval without inventing report metrics", async () => {
+  const { context, responses } = await setup();
+  responses["/api/eval-runs?project_root=%2Ftmp%2Frepo"] = { runs: [{ run_id: "run-active", suite: "core", status: "running", report: null, reported_at: "2026-09-26T17:00:00Z", error: null }], errors: [], active: true, unresolved: true };
+  await context.HC.loadEvalRuns("/tmp/repo");
+  expect(context.HC.X.evals[0]).toMatchObject({ v: "run-active", status: "running", score: "—" });
+  expect(context.HC.evalServerActive).toBe(true);
+  expect(context.HC.evalError).toBeNull();
+});
+
+it("shows persisted eval failure details", async () => {
+  const { context, responses } = await setup();
+  responses["/api/eval-runs?project_root=%2Ftmp%2Frepo"] = { runs: [{ run_id: "run-failed", suite: "core", status: "failed", report: null, reported_at: "2026-09-26T17:00:00Z", error: "dispatch unavailable" }], errors: [], active: false };
+  await context.HC.loadEvalRuns("/tmp/repo");
+  expect(context.HC.X.evals[0].status).toBe("failed");
+  expect(context.HC.evalError).toContain("dispatch unavailable");
+});
+
+it("blocks replacement dispatch for an unreconciled eval", async () => {
+  const { context, responses } = await setup();
+  responses["/api/eval-runs?project_root=%2Ftmp%2Frepo"] = { runs: [{ run_id: "run-old", suite: "core", status: "interrupted", report: null, reported_at: "2026-09-26T17:00:00Z", error: null }], errors: [], active: false, unresolved: true };
+  await context.HC.loadEvalRuns("/tmp/repo");
+  expect(context.HC.evalUnresolved).toBe(true);
+  expect(context.HC.evalError).toContain("cleanup");
 });
 
 it("keeps live polling independent of slow history and surfaces history failures", async () => {

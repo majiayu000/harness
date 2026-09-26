@@ -188,3 +188,64 @@ it("discards policy results for an edited command", async () => {
   await pending;
   expect(component.renderVals().ep.d).toBe("Not evaluated");
 });
+
+it("runs a chosen eval manifest and refreshes saved reports", async () => {
+  const { component, H, context } = setup();
+  context.confirm = vi.fn(() => true);
+  H.loadEvalRuns = vi.fn().mockResolvedValue();
+  H.request.mockResolvedValue({ run: { report: { run_id: "console-run", metrics: { passed_cases: 1, total_cases: 2 } } } });
+  component.state.evalManifest = "evals/benchmarks/core.toml";
+  await component.renderVals().runEval();
+  expect(H.request).toHaveBeenCalledWith("/api/eval-runs", expect.objectContaining({
+    method: "POST",
+    body: JSON.stringify({ project_root: "/tmp/project", manifest_path: "evals/benchmarks/core.toml", dry_run: false }),
+  }));
+  expect(H.loadEvalRuns).toHaveBeenCalledWith("/tmp/project");
+  expect(component.state.evalRunning).toBe(false);
+});
+
+it("does not replace the selected project's eval reports when another run finishes", async () => {
+  const { component, H, context } = setup();
+  context.confirm = vi.fn(() => true);
+  H.projects.push({ id: "other", root: "/tmp/other", trend: [], dispatch: [] });
+  H.loadEvalRuns = vi.fn().mockResolvedValue();
+  let finish;
+  H.request.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  component.state.evalManifest = "evals/benchmarks/core.toml";
+  const pending = component.renderVals().runEval();
+  await component.renderVals().runEval();
+  expect(H.request).toHaveBeenCalledTimes(1);
+  component.renderVals().onRuleProject({ target: { value: "/tmp/other" } });
+  finish({ run: { report: { run_id: "run-a", metrics: { passed_cases: 1, total_cases: 1 } } } });
+  await pending;
+  expect(H.loadEvalRuns).toHaveBeenCalledTimes(1);
+  expect(H.loadEvalRuns).toHaveBeenCalledWith("/tmp/other");
+});
+
+it("keeps the eval selector aligned when the project list is reordered", () => {
+  const { component, H } = setup();
+  H.evalProject = "/tmp/project";
+  H.projects.unshift({ id: "new", root: "/tmp/new", trend: [], dispatch: [] });
+  expect(component.renderVals().ruleProject).toBe("/tmp/project");
+});
+
+it("does not dispatch another benchmark while an eval is active", async () => {
+  const { component, H, context } = setup();
+  context.confirm = vi.fn(() => true);
+  component.state.evalManifest = "evals/benchmarks/core.toml";
+  H.X.evals = [{ v: "run-active", status: "running", pass: 0, partial: 0, fail: 0, delta: "—" }];
+  expect(component.renderVals().evalRunning).toBe(true);
+  await component.renderVals().runEval();
+  expect(context.confirm).not.toHaveBeenCalled();
+  expect(H.request).not.toHaveBeenCalled();
+  H.X.evals = [];
+  H.evalServerActive = true;
+  expect(component.renderVals().evalRunning).toBe(true);
+  await component.renderVals().runEval();
+  expect(H.request).not.toHaveBeenCalled();
+  H.evalServerActive = false;
+  H.evalUnresolved = true;
+  expect(component.renderVals().evalButtonLabel).toBe("Cleanup required");
+  await component.renderVals().runEval();
+  expect(H.request).not.toHaveBeenCalled();
+});

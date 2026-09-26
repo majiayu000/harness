@@ -23,6 +23,7 @@ cannot reset shared state while the dashboard is rendering.
 | Worktree cleanup | Copies a shell-quoted `git worktree remove` command for a server-classified orphan. Does not execute deletion or add `--force`. |
 | Provider quotas | `/api/local-quotas` reads local `ccstats limits` records offline for Codex and Claude. Official percentage snapshots are shown when present; estimated windows without a percentage remain unquantified. Missing, stale, and unreadable records are labeled. |
 | Rule repair / exec policy | Rule check and auto-fix target the selected project; auto-fix confirms before changing files and reports edits plus residual violations. The command tester checks the server's configured policy on demand and distinguishes no match from allow. |
+| Eval runs | The selected registered or default project's `artifacts/eval` directory provides saved reports and active run markers. Unreadable reports are shown as errors beside valid runs. `Run benchmark` accepts a TOML manifest path within that project, dispatches through the existing evaluator, and saves its report there. One Console-started eval per project can run at a time across server instances; CLI runs retain their separate reservation contract. A disconnected browser can reload the running state and later the report; markers from a stopped server are labeled interrupted until reconciled. |
 
 Requests retain session-token Bearer authentication, unauthorized notification,
 read timeouts, and stale-state/error reporting. Mutations do not inherit the short polling deadline. Failed detail requests retry at most
@@ -35,8 +36,15 @@ silently replay it.
 - Browser WebSocket clients cannot send the Bearer header required by `/ws`.
   Authenticated polling remains active and is labeled in the UI. No credential
   is added to a WebSocket URL and server authentication is not relaxed.
-- Eval execution still has no dashboard endpoint. The UI reports that limitation.
-  Rule check results are populated after a real check, not seeded with a rule catalog.
+- The eval panel does not invent report diffs or launch a suite until an operator
+  selects a manifest and confirms execution. Rule check results are populated
+  after a real check, not seeded with a rule catalog.
+- A Console run left without a terminal report blocks replacement dispatch.
+  Inspect or cancel its workflow-runtime work before removing that run's
+  `run-state.json` marker. CLI eval runs keep their separate run-reservation
+  behavior and are not covered by the Console advisory lock.
+- The eval API requires a Unix server for directory-handle-safe manifest reads
+  and report access. Other platforms return an error before dispatch.
 - The transcript reconstruction endpoint requires a runtime job and supplied
   content; it is not an automatic recovery endpoint. The dashboard retries the
   actual transcript stream after a failure instead of inventing reconstructed
