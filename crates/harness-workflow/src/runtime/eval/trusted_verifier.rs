@@ -54,12 +54,6 @@ impl EvalTrustedVerifier {
     }
 }
 
-pub(super) fn is_trusted_eval_verifier_argv(argv: &[String]) -> bool {
-    argv.first().map(String::as_str) == Some("harness")
-        && argv.get(1).map(String::as_str) == Some("eval")
-        && argv.get(2).map(String::as_str) == Some("verify-trusted")
-}
-
 impl FromStr for EvalTrustedVerifier {
     type Err = String;
 

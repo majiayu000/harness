@@ -2,7 +2,7 @@ use super::{
     data::eval_cleanup_data,
     manifest::{EvalBenchmarkCase, EvalIsolationProfile},
     transition_outcome::accepted_transition_record,
-    trusted_verifier::{is_trusted_eval_verifier_argv, TRUSTED_EVAL_VERIFIER_V1_CAPABILITY},
+    trusted_verifier::TRUSTED_EVAL_VERIFIER_V1_CAPABILITY,
 };
 use crate::runtime::{
     build_issue_submission_decision, IssueSubmissionDecisionInput, RuntimeProfile, SubmissionMode,
@@ -496,7 +496,7 @@ fn eval_case_submitted_data(
             "verify_commands_argv": verification_argv,
             "timeout_secs": input.timeout_secs,
             "resource_limits": input.resource_limits,
-            "required_runtime_host_capabilities": eval_required_runtime_host_capabilities(verification_argv),
+            "required_runtime_host_capabilities": eval_required_runtime_host_capabilities(),
             "branch_prefix": EVAL_BRANCH_PREFIX,
             "pull_request_mode": EVAL_PR_DRAFT_MODE,
             "isolation": eval_isolation_metadata(&input.case.isolation),
@@ -525,7 +525,7 @@ fn with_eval_command_metadata(
                 "verify_commands_argv": verification_argv,
                 "timeout_secs": input.timeout_secs,
                 "resource_limits": input.resource_limits,
-                "required_runtime_host_capabilities": eval_required_runtime_host_capabilities(verification_argv),
+                "required_runtime_host_capabilities": eval_required_runtime_host_capabilities(),
                 "branch_prefix": EVAL_BRANCH_PREFIX,
                 "pull_request_mode": EVAL_PR_DRAFT_MODE,
                 "isolation": eval_isolation_metadata(&input.case.isolation),
@@ -560,18 +560,12 @@ fn eval_isolation_metadata(isolation: &EvalIsolationProfile) -> Value {
     })
 }
 
-fn eval_required_runtime_host_capabilities(verification_argv: &[Vec<String>]) -> Vec<&'static str> {
-    let mut capabilities = vec![
+fn eval_required_runtime_host_capabilities() -> Vec<&'static str> {
+    vec![
         harness_sandbox::EVAL_RESOURCE_LIMITS_CAPABILITY,
         harness_sandbox::EVAL_NETWORK_POLICY_CAPABILITY,
-    ];
-    if verification_argv
-        .iter()
-        .any(|argv| is_trusted_eval_verifier_argv(argv))
-    {
-        capabilities.push(TRUSTED_EVAL_VERIFIER_V1_CAPABILITY);
-    }
-    capabilities
+        TRUSTED_EVAL_VERIFIER_V1_CAPABILITY,
+    ]
 }
 
 fn eval_case_workflow_id(eval_run_id: &str, case_id: &str) -> String {

@@ -59,7 +59,11 @@ fn eval_run_plan_marks_issue_submission_for_draft_prs() -> anyhow::Result<()> {
     );
     assert_eq!(
         initial.data["eval"]["required_runtime_host_capabilities"],
-        json!(["eval_resource_limits", "eval_network_policy"])
+        json!([
+            "eval_resource_limits",
+            "eval_network_policy",
+            "trusted_eval_verifier_v1"
+        ])
     );
     assert_eq!(initial.data["eval"]["isolation"]["lifecycle"], "ephemeral");
     assert_eq!(initial.data["eval"]["isolation"]["cleanup_required"], true);
@@ -85,6 +89,15 @@ fn eval_run_plan_marks_issue_submission_for_draft_prs() -> anyhow::Result<()> {
     let command = &decision.commands[0].command;
     assert_eq!(command["activity"], "implement_issue");
     assert_eq!(command["eval"]["eval_run_id"], "run-1");
+    assert_eq!(
+        command["eval"]["required_runtime_host_capabilities"],
+        json!([
+            "eval_resource_limits",
+            "eval_network_policy",
+            "trusted_eval_verifier_v1"
+        ])
+    );
+    assert!(command.get("prompt_ref").is_none());
     assert_eq!(command["eval"]["timeout_secs"], 45);
     assert_eq!(
         command["eval"]["resource_limits"]["effective"]["wall_time_secs"],
