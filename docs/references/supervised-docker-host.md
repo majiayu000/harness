@@ -178,6 +178,8 @@ For eval jobs, credential values pass to the candidate process over Docker
 exec standard input; they are not stored in host state or Docker container
 configuration. A failed container launch can report missing measurements as
 incomplete evidence, while successful eval completion still requires them.
+The local `--auth-file` is not mounted for formal eval claims. Model activities
+need a control-plane credential grant; an empty grant cannot authenticate Codex.
 
 ## Native quality-gate consumption
 

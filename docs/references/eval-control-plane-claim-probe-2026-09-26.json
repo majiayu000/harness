@@ -1,0 +1,72 @@
+{
+  "schema": "harness.eval.control_plane_probe.v1",
+  "scope": "Disposable local control-plane claim of historical GH1454; no model credential grant",
+  "case_id": "gh1454-scoped-ci-jobs",
+  "base_commit": "9c0099ad458e82fd377fd20a8e288a46722762ef",
+  "eval_run_id": "gh1454-control-plane-probe-8-20260927",
+  "workflow_id": "eval:gh1454-control-plane-probe-8-20260927:gh1454-scoped-ci-jobs",
+  "runtime_job_id": "a9555566-06f3-45dc-b70e-79ede5a3f0d3",
+  "host_completion_accepted": true,
+  "host_result_status": "failed",
+  "runtime_job_status": "failed",
+  "server_output_artifact_types": [
+    "supervised_input_snapshot",
+    "supervised_candidate_resources",
+    "network_policy_report",
+    "server_eval_isolation_cleanup",
+    "resource_limit_report"
+  ],
+  "resource_limit_report": {
+    "limits": {
+      "effective": {
+        "cpu_time_secs": 180,
+        "disk_bytes": 21474836480,
+        "memory_bytes": 8589934592,
+        "output_bytes": 67108864,
+        "pids": 512,
+        "wall_time_secs": 180
+      },
+      "requested": {
+        "cpu_time_secs": 180,
+        "disk_bytes": 21474836480,
+        "memory_bytes": 8589934592,
+        "output_bytes": 67108864,
+        "pids": 512,
+        "wall_time_secs": 180
+      }
+    },
+    "usage": {
+      "cpu_time_millis": 4462,
+      "peak_memory_bytes": 467804160,
+      "peak_pids": 44,
+      "disk_bytes": 116506624,
+      "output_bytes": 4261,
+      "wall_time_millis": 25807
+    },
+    "reason": "completed within trusted resource limits"
+  },
+  "network_policy": {
+    "inbound": "deny",
+    "network_allowlist": [
+      "chatgpt.com",
+      "auth.openai.com",
+      "api.openai.com",
+      "github.com",
+      "api.github.com"
+    ],
+    "outbound": "allowlist"
+  },
+  "synthetic_dns": true,
+  "model_endpoint_result": "401 Unauthorized: missing bearer authentication",
+  "eval_report_outcome": "incomplete",
+  "eval_case_status": "infra_failed",
+  "missing_evidence": [
+    "quality_gate",
+    "usage",
+    "base_commit_verification"
+  ],
+  "observed_cost_usd_micros": null,
+  "report_sha256": "3e9fa1669996732e33220c4afbf2d2df50308f98fca6215463912e193bddb341",
+  "completion_response_sha256": "12e9b6f648d822c8524f37df5410f3efec88c8ebdba4592cb52f08b3e45e56a3",
+  "conclusion": "The failed claim completed with measured resources and confirmed cleanup. It is not a completed historical eval case or baseline."
+}

@@ -242,6 +242,20 @@ fn runtime_candidate_accepts_bound_pr_or_issue_only_target() {
     assert_eq!(candidate.pr_number, Some(77));
     assert_eq!(candidate.repo.as_deref(), Some("owner/repo"));
 
+    let eval = WorkflowInstance::new(
+        GITHUB_ISSUE_PR_DEFINITION_ID,
+        1,
+        "implementing",
+        harness_workflow::runtime::WorkflowSubject::new("issue", "issue:42"),
+    )
+    .with_id("eval:run-1:case-1")
+    .with_server_data(json!({
+        "repo": "owner/repo",
+        "issue_number": 42,
+        "eval": {"eval_run_id": "run-1"},
+    }));
+    assert!(runtime_candidate_from_instance(&eval, row_updated_at).is_none());
+
     let issue_only = WorkflowInstance::new(
         GITHUB_ISSUE_PR_DEFINITION_ID,
         1,
