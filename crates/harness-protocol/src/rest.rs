@@ -231,6 +231,14 @@ pub struct RuntimeTaskDetailResponse {
     pub workflow: Option<RuntimeTaskWorkflowResponse>,
 }
 
+/// Response from deleting a registered project. Status codes distinguish errors.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum DeleteProjectResponse {
+    Deleted { deleted: String },
+    Error { error: String },
+}
+
 /// Persisted token usage returned by the workflow submission detail API.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeTaskTokenUsageResponse {
@@ -497,6 +505,9 @@ impl RestDto for TokenUsageResponse {}
 
 impl private::Sealed for HealthCheckResponse {}
 impl RestDto for HealthCheckResponse {}
+
+impl private::Sealed for DeleteProjectResponse {}
+impl RestDto for DeleteProjectResponse {}
 
 impl private::Sealed for ProjectQueueStatsResponse {}
 impl RestDto for ProjectQueueStatsResponse {}

@@ -6,7 +6,7 @@ import { expect, it } from "vitest";
 const asset = (name) => readFileSync(join(process.cwd(), "public/console-v2", name), "utf8");
 
 async function setup(beforeFetch = async () => {}) {
-  const flags = { readerCancelled: false, approvalsFail: false, streamFail: false, monitorFail: false };
+  const flags = { readerCancelled: false, approvalsFail: false, streamFail: false, streamEOF: false, monitorFail: false };
   const calls = [];
   const rpcMethods = [];
   const task = {
@@ -43,10 +43,11 @@ async function setup(beforeFetch = async () => {}) {
     setInterval: () => 1,
     fetch: async (path, init) => {
       calls.push(path);
-      await beforeFetch(path, init);
+      const override = await beforeFetch(path, init);
+      if (override) return override;
       if (path.endsWith("/stream")) {
         if (flags.streamFail) return { ok: false, status: 503 };
-        const data = new TextEncoder().encode('data: {"type":"message_delta","text":"hello"}\n\ndata: {"type":"done"}\n\n');
+        const data = new TextEncoder().encode('data: {"type":"message_delta","text":"hello"}\n\n' + (flags.streamEOF ? '' : 'data: {"type":"done"}\n\n'));
         let sent = false;
         return { ok: true, body: { getReader: () => ({
           read: async () => sent ? { done: true } : ((sent = true), { done: false, value: data }),
@@ -193,6 +194,77 @@ it("loads details beyond the first 200 project workflows and throttles failed re
   H.details.get("wf-1").loadedAt -= 30_001;
   await H.loadDetails(workflow);
   expect(H.details.get("wf-1").error).toBe("");
+});
+
+
+it("queues another history pass when a workflow completes during pagination", async () => {
+  let releasePage;
+  const page = new Promise(resolve => { releasePage = resolve; });
+  const { context, task, responses, calls } = await setup(async path => {
+    if (path.includes("status=done") && path.includes("cursor=next")) await page;
+  });
+  const H = context.HC;
+  const firstPage = "/api/workflows/runtime/submissions?limit=200&status=done%2Cfailed%2Ccancelled";
+  expect(calls.filter(path => path === firstPage)).toHaveLength(1);
+  responses["/api/workflows/runtime/submissions?limit=200&active=true"].data = [];
+  responses[firstPage].data.unshift({ ...task, workflow: { id: "wf-1", state: "done" } });
+  await H.refresh();
+  await H.refresh(true);
+  expect(H.historyLoading).toBe(true);
+  expect(calls.filter(path => path === firstPage)).toHaveLength(1);
+  releasePage();
+  await expect.poll(() => H.historyLoading).toBe(false);
+  expect(calls.filter(path => path === firstPage)).toHaveLength(2);
+  expect(H.history.map(row => row.id)).toContain("wf-1");
+});
+
+it("reconnects after transcript EOF without a terminal event", async () => {
+  const { context, flags } = await setup();
+  const H = context.HC, workflow = H.workflows[0];
+  flags.streamEOF = true;
+  await H.loadTranscript(workflow);
+  expect(H.transcriptFailed.has(workflow.id)).toBe(true);
+  expect(H.transcripts.get(workflow.id)[0].t).toBe("hello");
+  expect(H.transcripts.get(workflow.id)[1].t).toContain("before a terminal event");
+  flags.streamEOF = false;
+  await H.loadTranscript(workflow);
+  expect(H.transcriptFailed.has(workflow.id)).toBe(false);
+  expect(H.transcripts.get(workflow.id)).toHaveLength(1);
+});
+
+it("bounds polling reads without timing out long-running RPC mutations", async () => {
+  let releaseMutation, slowRpc = false;
+  const { context } = await setup(async (path, init) => {
+    const method = path === "/rpc" ? JSON.parse(init.body).method : null;
+    if (path === "/slow-read" || slowRpc && method === "gc_drafts") {
+      return new Promise((resolve, reject) => init.signal.addEventListener("abort", () => reject(new Error("read timeout")), { once: true }));
+    }
+    if (method === "learn_rules") {
+      expect(init.signal).toBeUndefined();
+      return new Promise(resolve => { releaseMutation = () => resolve({ ok: true, status: 200, json: async () => ({ result: { learned: true } }) }); });
+    }
+  });
+  const H = context.HC;
+  await expect.poll(() => H.historyLoading).toBe(false);
+  const alarms = new Set();
+  context.setTimeout = (callback, delay) => { const alarm = { callback, delay }; alarms.add(alarm); return alarm; };
+  context.clearTimeout = alarm => alarms.delete(alarm);
+  const read = H.request("/slow-read");
+  const readFailure = expect(read).rejects.toThrow("read timeout");
+  expect([...alarms].map(alarm => alarm.delay)).toEqual([15_000]);
+  [...alarms].forEach(alarm => alarm.callback());
+  await readFailure;
+  expect(alarms.size).toBe(0);
+  const mutation = H.rpc("learn_rules", { project_root: "/tmp/repo" });
+  expect(alarms.size).toBe(0);
+  releaseMutation();
+  expect(await mutation).toEqual({ learned: true });
+  slowRpc = true;
+  const rpcRead = H.rpc("gc_drafts", { project_id: null }, 15_000);
+  const rpcFailure = expect(rpcRead).rejects.toThrow("read timeout");
+  expect([...alarms].map(alarm => alarm.delay)).toEqual([15_000]);
+  [...alarms].forEach(alarm => alarm.callback());
+  await rpcFailure;
 });
 
 it("closes a pending action when its workflow disappears", () => {

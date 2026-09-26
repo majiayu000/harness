@@ -24,13 +24,13 @@
   const prFrom = (url) => numberFrom(url && url.includes('/pull/') ? url : null);
   const label = (row) => row?.description?.trim() || row?.external_id || row?.task_kind || row?.workflow?.definition_id || row?.id || 'Workflow';
 
-  async function request(path, init) {
+  async function request(path, init, timeoutMs = ['GET', 'HEAD'].includes((init?.method || 'GET').toUpperCase()) ? 15_000 : null) {
     const token = sessionStorage.getItem('harness_token')?.trim();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+    const controller = timeoutMs == null ? null : new AbortController();
+    const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
       const response = await fetch(path, {
-        ...init, signal: controller.signal,
+        ...init, ...(controller ? { signal: controller.signal } : {}),
         headers: { Accept: 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}), ...(init?.headers || {}) },
       });
       if (response.status === 401) {
@@ -47,7 +47,7 @@
       }
       return response.status === 204 ? null : await response.json();
     } finally {
-      clearTimeout(timeout);
+      if (timeout != null) clearTimeout(timeout);
     }
   }
 
@@ -315,7 +315,7 @@
         let buffer = '';
         while (true) {
           const result = await reader.read();
-          if (result.done) break;
+          if (result.done) throw new Error('Transcript ended before a terminal event; retry to reconnect');
           buffer += decoder.decode(result.value, { stream: true });
           const events = buffer.split('\n\n');
           buffer = events.pop() || '';
@@ -352,8 +352,9 @@
     applyPayloads(payloads);
   }
 
+  let historyRefreshPending = false;
   async function refreshHistory() {
-    if (H.historyLoading) return;
+    if (H.historyLoading) { historyRefreshPending = true; return; }
     H.historyLoading = true;
     H.historyError = null;
     refreshView();
@@ -365,6 +366,7 @@
     } finally {
       H.historyLoading = false;
       refreshView();
+      if (historyRefreshPending) { historyRefreshPending = false; void refreshHistory(); }
     }
   }
 
@@ -377,8 +379,8 @@
       const jobs = [
         allTasks(true), request('/api/operator-monitor'), request('/api/overview'), request('/api/usage-monitor'),
         request('/api/dashboard'), request('/api/operator-snapshot'), request('/api/worktrees'), request('/api/intake'),
-        request('/projects'), secondaryDue ? H.rpc('skill_list', { query: null }) : Promise.resolve(null),
-        secondaryDue ? H.rpc('gc_drafts', { project_id: null }) : Promise.resolve(null),
+        request('/projects'), secondaryDue ? H.rpc('skill_list', { query: null }, 15_000) : Promise.resolve(null),
+        secondaryDue ? H.rpc('gc_drafts', { project_id: null }, 15_000) : Promise.resolve(null),
         secondaryDue ? request('/api/token-usage') : Promise.resolve(null),
         request('/api/workflows/runtime/approvals'),
       ];
@@ -423,17 +425,17 @@
 
   H.request = request;
   H.age = age;
-  const rpcRequest = async (method, params = {}) => {
-    const result = await request('/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }) });
+  const rpcRequest = async (method, params = {}, timeoutMs = null) => {
+    const result = await request('/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }) }, timeoutMs);
     if (result.error) throw new Error(result.error.message || 'RPC request failed');
     return result.result;
   };
-  H.rpc = async (method, params = {}) => {
+  H.rpc = async (method, params = {}, timeoutMs = null) => {
     if (!rpcReady) {
       rpcHandshake ||= (async () => {
         try {
-          await rpcRequest('initialize');
-          await rpcRequest('initialized');
+          await rpcRequest('initialize', {}, timeoutMs);
+          await rpcRequest('initialized', {}, timeoutMs);
         } catch (error) {
           if (error.message !== 'Server already initialized.') throw error;
         }
@@ -441,7 +443,7 @@
       })().finally(() => { rpcHandshake = null; });
       await rpcHandshake;
     }
-    return rpcRequest(method, params);
+    return rpcRequest(method, params, timeoutMs);
   };
   H.refresh = refresh;
   window.addEventListener('storage', event => { if (event.key === 'harness_token') { lastSecondaryRefresh = 0; refresh(); } });

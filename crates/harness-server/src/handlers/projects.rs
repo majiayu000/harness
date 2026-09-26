@@ -1,8 +1,9 @@
 use crate::http::builders::intake::effective_issue_project_limits;
-use crate::http::rest_contract::{LegacyJson as Json, PrimitivePath as Path};
+use crate::http::rest_contract::{ContractJson, LegacyJson as Json, PrimitivePath as Path};
 use crate::http::AppState;
 use crate::project_registry::{validate_project_root, Project};
 use axum::{extract::State, http::StatusCode};
+use harness_protocol::rest::DeleteProjectResponse;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -183,7 +184,7 @@ pub async fn get_project(
 pub async fn delete_project(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> (StatusCode, ContractJson<DeleteProjectResponse>) {
     // Resolve the canonical registry ID (which may be an absolute path) from
     // either a direct ID match or a name-based lookup, so callers can use the
     // human-readable name just as well as the full path key.
@@ -194,27 +195,35 @@ pub async fn delete_project(
             Ok(None) => {
                 return (
                     StatusCode::NOT_FOUND,
-                    Json(json!({"error": format!("project '{id}' not found")})),
+                    ContractJson(DeleteProjectResponse::Error {
+                        error: format!("project '{id}' not found"),
+                    }),
                 )
             }
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
+                    ContractJson(DeleteProjectResponse::Error {
+                        error: e.to_string(),
+                    }),
                 )
             }
         },
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
+                ContractJson(DeleteProjectResponse::Error {
+                    error: e.to_string(),
+                }),
             )
         }
     };
     let Some(store) = state.core.workflow_runtime_store.as_ref() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "workflow runtime store unavailable"})),
+            ContractJson(DeleteProjectResponse::Error {
+                error: "workflow runtime store unavailable".to_owned(),
+            }),
         );
     };
     let project_root = project.root.to_string_lossy();
@@ -227,12 +236,16 @@ pub async fn delete_project(
                 );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "failed to check active workflows"})),
+                    ContractJson(DeleteProjectResponse::Error {
+                        error: "failed to check active workflows".to_owned(),
+                    }),
                 );
             }
         };
+    let project_ids = std::iter::once(project.id.as_str())
+        .chain((project.id.as_str() != project_root.as_ref()).then_some(project_root.as_ref()));
     for definition_id in definitions {
-        for project_id in [project.id.as_str(), project_root.as_ref()] {
+        for project_id in project_ids.clone() {
             match store
                 .list_nonterminal_instances_by_definition(&definition_id, Some(project_id), Some(1))
                 .await
@@ -240,7 +253,9 @@ pub async fn delete_project(
                 Ok(workflows) if !workflows.is_empty() => {
                     return (
                         StatusCode::CONFLICT,
-                        Json(json!({"error": "project has active workflows"})),
+                        ContractJson(DeleteProjectResponse::Error {
+                            error: "project has active workflows".to_owned(),
+                        }),
                     )
                 }
                 Ok(_) => {}
@@ -248,21 +263,30 @@ pub async fn delete_project(
                     tracing::error!("project deletion: failed to check active workflows: {error}");
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "failed to check active workflows"})),
+                        ContractJson(DeleteProjectResponse::Error {
+                            error: "failed to check active workflows".to_owned(),
+                        }),
                     );
                 }
             }
         }
     }
     match state.project_svc.remove(&project.id).await {
-        Ok(true) => (StatusCode::OK, Json(json!({"deleted": id}))),
+        Ok(true) => (
+            StatusCode::OK,
+            ContractJson(DeleteProjectResponse::Deleted { deleted: id }),
+        ),
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("project '{id}' not found")})),
+            ContractJson(DeleteProjectResponse::Error {
+                error: format!("project '{id}' not found"),
+            }),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
+            ContractJson(DeleteProjectResponse::Error {
+                error: e.to_string(),
+            }),
         ),
     }
 }
@@ -336,16 +360,23 @@ mod tests {
         let (status, body) =
             delete_project(State(state.clone()), Path("delete-guard".to_owned())).await;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body.0["error"], "project has active workflows");
+        assert_eq!(
+            serde_json::to_value(body.0)?,
+            json!({"error": "project has active workflows"})
+        );
         assert!(state.project_svc.get("delete-guard").await?.is_some());
 
         let mut completed = workflow;
         completed.state = "done".to_owned();
         crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(store, &completed)
             .await?;
-        let (status, _) =
+        let (status, body) =
             delete_project(State(state.clone()), Path("delete-guard".to_owned())).await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::to_value(body.0)?,
+            json!({"deleted": "delete-guard"})
+        );
         assert!(state.project_svc.get("delete-guard").await?.is_none());
         Ok(())
     }
