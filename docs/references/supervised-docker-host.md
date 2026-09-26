@@ -3,8 +3,9 @@
 `scripts/run-supervised-docker-host.py` executes one already-submitted declarative
 prompt task on a **dedicated disposable Harness server**. It is the first bounded
 execution trial for GH-1768, not the complete nightly benchmark executor. It
-advertises `runtime_job_lease_proof_v1`, `eval_resource_limits`, and
-`eval_network_policy`. It does not advertise `trusted_eval_verifier_v1` and must not be used to create a baseline.
+advertises `runtime_job_lease_proof_v1`, `eval_resource_limits`,
+`eval_network_policy`, and `trusted_eval_verifier_v1`. A baseline still requires
+a complete reviewed historical suite report.
 
 ## Scope
 
@@ -19,8 +20,11 @@ remote_host`. Its activity policy must authorize the supplied request prompt;
 the client requests server-rendered instructions for `/workspace` and retains the
 prompt, packet digest and native result schema before model execution. Native
 `run_quality_gate` claims reuse a retained candidate bundle instead of a model
-prompt. It does not implement full multi-activity eval workflows, pinned agent
-contracts, historical eval jobs, or PR lifecycle actions.
+prompt. Formal eval quality gates run in the offline verifier with claimed
+resource limits and host-owned measurements. The client handles one claim per
+process; multi-activity evals need a fresh state directory per claim and a
+candidate handoff between activities. Pinned agent contracts, exact replay, and
+PR lifecycle actions remain unsupported.
 Submit through `POST /api/workflows/runtime/submissions` and retain both the exact
 request JSON and response JSON. The server currently cannot filter host claims
 by project: do not point this client at a shared server with unrelated jobs.
@@ -41,6 +45,9 @@ Python, and GNU `timeout`; it currently does not include the Rust toolchain. The
 offline verifier image is independently pinned and must not be the candidate
 image. Git trees containing symbolic links or submodules are rejected. This
 client is intended for small repositories that fit its tmpfs limits.
+The verifier image used for the native GH1454 contract has no Rust toolchain;
+the other suite cases require a separately prepared offline image with Cargo
+and their dependencies available locally.
 The submitted task must explicitly require committing all changes and supply the
 authorized Git author identity (for example through `git -c user.name=... -c
 user.email=... commit`). The runner does not invent an author or append instructions
@@ -162,9 +169,9 @@ verification retains the pins with `verified: false` and drops success signals.
 This is a single-task Git handoff plus an optional follow-on native quality-gate
 claim that reuses the retained candidate bundle. A local candidate commit is not
 an externally published PR head: quality-gate verification must match
-`command.expected_head_sha`. Historical evaluation contracts and a formal
-baseline remain unsupported. Pinned-contract jobs and eval jobs that require
-`trusted_eval_verifier_v1` are rejected. Other eval jobs enforce the claimed
+`command.expected_head_sha`. The historical trusted verifier can now run as a
+formal offline eval quality gate; a baseline still needs a reviewed full suite
+report. Pinned-contract jobs remain rejected. Eval agent jobs enforce the claimed
 cumulative CPU budget, network policy, and credential environment. There
 is no source-directory-only mode or old-state migration.
 For eval jobs, credential values pass to the candidate process over Docker
@@ -194,10 +201,17 @@ reconstructed tree (`/candidate`), with the operator verifier also mounted at
 `/trusted/verify.py` for argv compatibility and `config/default.toml.example` at
 `/config.toml`. Completion includes host `execution_evidence` whose
 `checked_out_commit` is that expected head, with honest zero model usage.
+Formal eval quality gates measure the verifier container's cgroup CPU, memory,
+and PID peaks plus terminal writable tmpfs use under the claimed resource
+limits. Their completion includes `resource_limit_report` and
+`network_policy_report`; the verifier runs with `--network none` and without
+model credentials. `verifier-resources.json` and `supervised_verifier_resources`
+retain the raw host measurement. The host captures formal eval validation exit
+codes and output digests; the verifier has no writable host result mount.
 Lease-only quality gates still omit eval resource measurements. Prior-job
 `execution_evidence` is cleared before the new claim so stale evidence cannot
-attach to the current lease. Eval quality gates, agent-contract jobs, and
-exact-replay jobs remain rejected. Completed restarts of the original state directory still no-op and do
+attach to the current lease. Agent-contract and exact-replay jobs remain
+rejected. Completed restarts of the original state directory still no-op and do
 not reclaim.
 
 ## Candidate resource evidence
