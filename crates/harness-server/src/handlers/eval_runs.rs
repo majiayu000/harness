@@ -191,7 +191,8 @@ pub(crate) async fn list_eval_runs(
         let result = if is_marker {
             read_marker_entry(
                 &path,
-                active && lock_confirmed,
+                active,
+                lock_confirmed,
                 local_active_run.as_deref(),
                 &mut active_claimed,
             )
@@ -392,12 +393,14 @@ fn read_report_entry(
 fn read_marker_entry(
     path: &Path,
     active: bool,
+    lock_confirmed: bool,
     local_active_run: Option<&str>,
     active_claimed: &mut bool,
 ) -> Result<EvalRunEntry, ApiError> {
     let marker = read_marker(path)?;
     let status = match marker.status.as_str() {
         "failed" => "failed",
+        "running" if !lock_confirmed => "unknown",
         "running"
             if active
                 && !*active_claimed
@@ -924,7 +927,7 @@ mod tests {
             "unknown activity must block another dispatch"
         );
         assert!(!uncertain.0.errors.is_empty());
-        assert!(uncertain.0.runs.iter().all(|run| run.status != "running"));
+        assert!(uncertain.0.runs.iter().any(|run| run.status == "unknown"));
         let execute = EvalRunRequest {
             dry_run: false,
             ..request
