@@ -643,3 +643,41 @@ async fn scan_and_fix_resolves_violation_when_auto_fix_enabled() -> anyhow::Resu
     assert_eq!(content, "let x = bar();\n");
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn auto_fix_rejects_symlink_target_outside_project() -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project)?;
+    let outside = dir.path().join("outside.rs");
+    std::fs::write(&outside, "foo()\n")?;
+    let link = project.join("linked.rs");
+    symlink(&outside, &link)?;
+
+    let mut engine = RuleEngine::new();
+    engine.add_rule(Rule {
+        id: RuleId::from_str("FIX-AUTO"),
+        title: "Replace foo".to_string(),
+        severity: Severity::Low,
+        category: Category::Style,
+        paths: vec![],
+        description: String::new(),
+        fix_pattern: Some("s/foo/bar/".to_string()),
+    });
+    let violation = Violation {
+        rule_id: RuleId::from_str("FIX-AUTO"),
+        file: link,
+        line: Some(1),
+        message: "use bar".to_string(),
+        severity: Severity::Low,
+    };
+    let error = engine
+        .apply_fix(&violation, &project)
+        .expect_err("outside target must be rejected");
+    assert!(error.to_string().contains("outside project root"));
+    assert_eq!(std::fs::read_to_string(outside)?, "foo()\n");
+    Ok(())
+}

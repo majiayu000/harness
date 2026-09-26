@@ -90,6 +90,14 @@ async fn usage_monitor_response_includes_postgres_catalog_census() -> anyhow::Re
     Ok(())
 }
 
+#[tokio::test]
+async fn local_quota_endpoint_reports_each_local_source() {
+    let response = local_quotas().await;
+    assert_eq!(response.0.sources.len(), 2);
+    assert_eq!(response.0.sources[0].source, "codex");
+    assert_eq!(response.0.sources[1].source, "claude");
+}
+
 #[test]
 fn parse_runtime_usage_row_reports_corrupt_json_without_panicking() -> anyhow::Result<()> {
     let workflow = WorkflowInstance::new(

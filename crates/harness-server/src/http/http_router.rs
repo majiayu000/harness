@@ -207,6 +207,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(crate::handlers::usage_monitor::usage_monitor),
         )
         .route(
+            "/api/local-quotas",
+            get(crate::handlers::usage_monitor::local_quotas),
+        )
+        .route(
             "/webhook",
             post(github_webhook).layer(DefaultBodyLimit::max(
                 state.core.server.config.server.max_webhook_body_bytes,

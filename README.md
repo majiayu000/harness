@@ -692,14 +692,14 @@ the scheduling and lifecycle authority.
 
 ## JSON-RPC API
 
-Harness exposes 32 methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
+Harness exposes methods over JSON-RPC 2.0 (stdio, HTTP, or WebSocket):
 
 | Category | Methods |
 |---|---|
 | Lifecycle | `initialize`, `initialized` |
 | GC | `gc/run`, `gc/status`, `gc/drafts`, `gc/adopt`, `gc/reject` |
 | Skills | `skill/create`, `skill/list`, `skill/get`, `skill/delete`, `skill/governance/view`, `skill/governance/history`, `skill/stale` |
-| Rules | `rule/load`, `rule/check` |
+| Rules | `rule/load`, `rule/check`, `rule/fix`, `exec_policy/check` |
 | ExecPlan | `exec_plan/init`, `exec_plan/update`, `exec_plan/status` |
 | Observability | `event/log`, `event/query`, `metrics/collect`, `metrics/query` |
 | Context | `context/preview` |

@@ -829,8 +829,12 @@ fn resolve_fix_path(project_root: &Path, file: &Path) -> anyhow::Result<PathBuf>
     } else {
         project_root.join(file)
     };
-    if joined.starts_with(project_root) {
-        Ok(joined)
+    let root = std::fs::canonicalize(project_root)
+        .with_context(|| format!("failed to resolve project root {}", project_root.display()))?;
+    let target = std::fs::canonicalize(&joined)
+        .with_context(|| format!("failed to resolve violation path {}", joined.display()))?;
+    if target.starts_with(&root) {
+        Ok(target)
     } else {
         anyhow::bail!(
             "violation path '{}' is outside project root '{}'",

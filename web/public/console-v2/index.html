@@ -10,6 +10,10 @@
 @font-face{font-family:Geist;font-style:normal;font-weight:700;font-display:swap;src:url('./geist-700.ttf') format('truetype')}
 @font-face{font-family:'Geist Mono';font-style:normal;font-weight:400;font-display:swap;src:url('./geist-mono-400.ttf') format('truetype')}
 @font-face{font-family:'Geist Mono';font-style:normal;font-weight:500;font-display:swap;src:url('./geist-mono-500.ttf') format('truetype')}
+.console-rule-project{max-width:180px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink);font-size:12px}
+.console-policy-input{display:flex;gap:8px}
+.console-policy-input input{flex:1;min-width:0}
+.console-policy-input button{padding:4px 10px;border-radius:6px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12px}
 </style>
 <script>window.__resources = {
   'https://unpkg.com/react@18.3.1/umd/react.production.min.js': './react.production.min.js',
@@ -393,13 +397,13 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
       </div>
     </div>
     <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
-      <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Provider quotas · {{ quotaNote }}</span><span style="font-size:12px;color:var(--faint)">No provider quota source configured</span></div>
-      <sc-if value="{{ quotasEmpty }}" hint-placeholder-val="{{ false }}"><div style="padding:14px 16px;font-size:12.5px;color:var(--muted)">Provider quotas are not exposed by /api/usage-monitor. {{ costNote }}</div></sc-if>
+      <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Provider quotas · {{ quotaNote }}</span><span style="font-size:12px;color:var(--faint)">Local ccstats records · offline</span></div>
+      <sc-if value="{{ quotasEmpty }}" hint-placeholder-val="{{ false }}"><div style="padding:14px 16px;font-size:12.5px;color:var(--muted)">No local quota records are available.</div></sc-if>
       <sc-for list="{{ quotas }}" as="q" hint-placeholder-count="4">
         <div style="display:grid;grid-template-columns:minmax(160px,220px) minmax(120px,1fr) 44px minmax(0,260px);gap:14px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2)">
           <span style="font-weight:500">{{ q.name }}</span>
           <span style="height:6px;border-radius:3px;background:var(--line);overflow:hidden"><span style="display:block;height:100%;width:{{ q.w }};background:{{ q.tone }}"></span></span>
-          <span style="font-family:'Geist Mono',monospace;font-size:12px;text-align:right;color:{{ q.tone }}">{{ q.w }}</span>
+          <span style="font-family:'Geist Mono',monospace;font-size:12px;text-align:right;color:{{ q.tone }}">{{ q.label }}</span>
           <span style="font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ q.note }}</span>
         </div>
       </sc-for>
@@ -449,7 +453,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:16px">
       <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Rules · last check results</span><div style="display:flex;gap:6px"><button onClick="{{ learnRules }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500">Learn</button><button onClick="{{ autoFix }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500">Auto-fix</button><button onClick="{{ runCheck }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12px;font-weight:500">Run check</button></div></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Rules · last check results</span><div style="display:flex;gap:6px"><select class="console-rule-project" value="{{ ruleProject }}" onChange="{{ onRuleProject }}" aria-label="Project for rule actions"><sc-for list="{{ ruleProjects }}" as="p"><option value="{{ p.root }}">{{ p.id }}</option></sc-for></select><button onClick="{{ learnRules }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500">Learn</button><button onClick="{{ autoFix }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--line);background:transparent;cursor:pointer;font-size:12px;font-weight:500">Auto-fix</button><button onClick="{{ runCheck }}" style="padding:4px 10px;border-radius:6px;border:1px solid var(--btn);background:var(--btn);color:var(--btnFg);cursor:pointer;font-size:12px;font-weight:500">Run check</button></div></div>
         <sc-for list="{{ rules }}" as="r" hint-placeholder-count="6">
           <div style="display:grid;grid-template-columns:minmax(0,1fr) 44px 56px 36px;gap:10px;align-items:center;padding:var(--py) 16px;border-top:1px solid var(--line2)">
             <span style="display:flex;flex-direction:column;min-width:0"><span style="font-family:'Geist Mono',monospace;font-size:12px">{{ r.id }}</span><span style="font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ r.lang }} · {{ r.file }}</span></span>
@@ -463,7 +467,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
         <section style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)">
           <div style="display:flex;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--line)"><span style="font-weight:600">Exec policy tester</span><span style="font-size:12px;color:var(--faint)">harness execpolicy check</span></div>
           <div style="padding:12px 16px;display:flex;flex-direction:column;gap:10px">
-            <input value="{{ epCmd }}" onChange="{{ onEp }}" placeholder="command to evaluate" style="padding:7px 10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);outline:none;font-family:'Geist Mono',monospace;font-size:12.5px">
+            <span class="console-policy-input"><input value="{{ epCmd }}" onChange="{{ onEp }}" placeholder="command to evaluate" style="padding:7px 10px;border-radius:7px;border:1px solid var(--line);background:var(--bg);outline:none;font-family:'Geist Mono',monospace;font-size:12.5px"><button onClick="{{ checkEp }}">Check</button></span>
             <span style="display:flex;align-items:center;gap:10px"><span style="padding:2px 8px;border-radius:5px;border:1px solid {{ ep.tone }};color:{{ ep.tone }};font-family:'Geist Mono',monospace;font-size:12px;font-weight:500">{{ ep.d }}</span><span style="font-size:12px;color:var(--muted)">{{ ep.why }}</span></span>
           </div>
         </section>
@@ -840,7 +844,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 <script type="text/x-dc" data-dc-script>
 
 class Component extends DCLogic {
-  state = { vw: typeof window !== 'undefined' ? window.innerWidth : 1440, screen: new URLSearchParams(location.search).get('screen') || this.props.startScreen || 'home', theme: new URLSearchParams(location.search).get('theme') || this.props.theme || 'dark', density: new URLSearchParams(location.search).get('density') || this.props.density || 'standard', sel: null, tab: 'timeline', q: '', over: {}, modal: null, reason: '', toast: null, tick: 0, hf: 'all', ff: 'all', reclaimed: false, breakers: {}, drafts: {}, extraHist: [], proj: null, newWf: [], form: null, memFor: null, memDel: {}, skillsDel: {}, epCmd: '', reconciled: false, hostAct: {}, picked: {}, fleetView: 'state', fleetLimit: 100, pal: null, palIdx: 0, evf: 'all', promptSel: 0, artOpen: {}, memKind: 'all', submitting: false };
+  state = { vw: typeof window !== 'undefined' ? window.innerWidth : 1440, screen: new URLSearchParams(location.search).get('screen') || this.props.startScreen || 'home', theme: new URLSearchParams(location.search).get('theme') || this.props.theme || 'dark', density: new URLSearchParams(location.search).get('density') || this.props.density || 'standard', sel: null, tab: 'timeline', q: '', over: {}, modal: null, reason: '', toast: null, tick: 0, hf: 'all', ff: 'all', reclaimed: false, breakers: {}, drafts: {}, extraHist: [], proj: null, newWf: [], form: null, memFor: null, memDel: {}, skillsDel: {}, epCmd: '', epResult: null, ruleProject: '', reconciled: false, hostAct: {}, picked: {}, fleetView: 'state', fleetLimit: 100, pal: null, palIdx: 0, evf: 'all', promptSel: 0, artOpen: {}, memKind: 'all', submitting: false };
 
   componentDidMount() {
     if (!(window.HC && window.HC.X)) this.iv0 = setInterval(() => { if (window.HC && window.HC.X) { clearInterval(this.iv0); this.forceUpdate(); } }, 60);
@@ -912,7 +916,7 @@ class Component extends DCLogic {
   openTask() { this.setState({ form: { kind: 'task', tk: 'issue', repo: window.HC.projects[0]?.id || '', num: '', prompt: '', agent: 'auto', effort: 'medium' } }); }
   setF(k) { return (e) => { const v = e && e.target ? e.target.value : e; this.setState(s => ({ form: { ...s.form, [k]: v } })); }; }
   policy() {
-    return { d: 'Not evaluated', why: 'No server policy-preview endpoint. Use harness execpolicy check for the configured policy.', tone: 'var(--faint)' };
+    return this.state.epResult || { d: 'Not evaluated', why: 'Enter a command and press Check.', tone: 'var(--faint)' };
   }
   async submitForm() {
     const f = this.state.form, H = window.HC;
@@ -1078,14 +1082,15 @@ class Component extends DCLogic {
     const pick = (list, cur, key) => list.map(([k, label]) => ({ label, go: () => this.setF(key)(k), bg: cur === k ? 'var(--sel)' : 'transparent', fg: cur === k ? 'var(--ink)' : 'var(--muted)', bd: cur === k ? 'var(--accent)' : 'var(--line)' }));
     const U = X.usage, hmax = Math.max(...U.hourly, 0.001);
     const usageStats = [['Tokens · 24h', U.tokens], ['Est. cost', U.cost], ['Turns', U.turns], ['Cache read', U.cache]].map(([k, v]) => ({ k, v }));
-    const quotas = U.quotas.map(q => ({ ...q, w: q.used + '%', tone: q.used >= 75 ? 'var(--warn)' : 'var(--run)' }));
+    const quotas = U.quotas.map(q => ({ ...q, w: typeof q.used === 'number' ? q.used + '%' : '0%', label: typeof q.used === 'number' ? q.used + '%' : '—', tone: q.status === 'unavailable' || q.status === 'stale' ? 'var(--fail)' : q.used >= 75 ? 'var(--warn)' : 'var(--run)' }));
     const hourly = U.hourly.map(v => ({ h: Math.round(v / hmax * 100) + '%', tip: v.toFixed(1) + 'M' }));
     const usageTables = [['By project', U.byProject], ['By agent', U.byAgent], ['By model', U.byModel]].map(([title, rows]) => ({ title, rows: rows.map(([k, t, c, p]) => ({ k, t, c, w: p + '%' })) }));
 
     const gov = { active: 'var(--ok)', watch: 'var(--warn)', quarantine: 'var(--warn)', retired: 'var(--faint)' };
     const skills = X.skills.map(k => ({ ...k, tone: gov[k.gov] || 'var(--faint)', canDelete: k.src === 'repo' || k.src === 'user', history: () => this.runAction('Governance history', async () => { const rows = await H.rpc('skill_governance_history', { since: null, until: null, limit: null }); return (rows || []).filter(row => row.skill_name === k.name).length + ' transitions for ' + k.name; }), del: () => this.runAction('Skill deleted', () => H.rpc('skill_delete', { skill_id: k.id })) }));
     const rules = X.rules.map(r => ({ ...r, tone: r.sev === 'error' ? 'var(--fail)' : 'var(--warn)', fixLabel: r.fix ? 'auto-fix' : '—', hitTone: r.hits ? 'var(--ink)' : 'var(--faint)' }));
-    const ep = this.policy(s.epCmd);
+    const ep = this.policy();
+    const ruleProject = H.projects.find(p => p.root === s.ruleProject)?.root || H.projects[0]?.root || '';
     const evals = X.evals.map((e, i) => { const t = e.pass + e.partial + e.fail; return { ...e, total: t, pw: (e.pass / t * 100) + '%', aw: (e.partial / t * 100) + '%', fw: (e.fail / t * 100) + '%', deltaTone: e.delta.startsWith('+') ? 'var(--ok)' : 'var(--fail)', hasPrev: !!X.evals[i + 1], diff: () => fl('Diff ' + e.v + ' ↔ ' + (X.evals[i + 1] || {}).v, 'harness eval diff · 2 regressions · 4 fixes') }; });
 
     const memRows = s.memFor ? (X.memory[s.memFor] || []).map(m => ({ ...m, del: () => this.runAction('Memory deleted', () => H.request('/api/memory/' + encodeURIComponent(m.id), { method: 'DELETE' })) })) : [];
@@ -1115,11 +1120,13 @@ class Component extends DCLogic {
     return {
       isUsage: s.screen === 'usage', isLibrary: s.screen === 'library',
       openTask: () => this.openTask(),
-      usageStats, quotas, quotaNote: quotas.length ? 'Provider limits' : 'Not exposed by /api/usage-monitor', hourly, hourlyNote: hourly.length ? U.hourlySource : 'Hourly series unavailable', usageTables,
-      skills, rules, ep, epCmd: s.epCmd, onEp: (e) => this.setState({ epCmd: e.target.value }), evals,
-      runCheck: () => this.runAction('Rule check complete', async () => { const rows = await H.rpc('rule_check', { project_root: H.projects[0]?.root, files: null }); X.rules = (rows || []).map(row => ({ id: row.rule_id, name: row.message, lang: row.file || '—', sev: row.severity, hits: 1, fix: false })); H.rules.failing = X.rules.length; H.rules.lastCheck = new Date().toLocaleTimeString(); return X.rules.length + ' violations'; }),
-      autoFix: () => fl('Auto-fix unavailable', 'The server does not expose an auto-fix endpoint.'),
-      learnRules: () => this.runAction('Rule learning complete', () => H.rpc('learn_rules', { project_root: H.projects[0]?.root })),
+      usageStats, quotas, quotaNote: quotas.length ? 'Local records' : 'Unavailable', hourly, hourlyNote: hourly.length ? U.hourlySource : 'Hourly series unavailable', usageTables,
+      skills, rules, ep, epCmd: s.epCmd, onEp: (e) => { this.epCheckSeq = (this.epCheckSeq || 0) + 1; this.setState({ epCmd: e.target.value, epResult: null }); }, evals,
+      checkEp: async () => { const command = s.epCmd, seq = this.epCheckSeq = (this.epCheckSeq || 0) + 1; try { const result = await H.rpc('exec_policy_check', { command }); if (this.epCheckSeq !== seq || this.state.epCmd !== command) return; const decision = result.decision || 'no match'; this.setState({ epResult: { d: decision, why: result.matchedRules?.length ? result.matchedRules.length + ' matched rule(s)' : 'No configured rule matched this command.', tone: decision === 'forbidden' ? 'var(--fail)' : decision === 'prompt' ? 'var(--warn)' : decision === 'allow' ? 'var(--ok)' : 'var(--faint)' } }); } catch (error) { if (this.epCheckSeq === seq && this.state.epCmd === command) this.setState({ epResult: { d: 'Unavailable', why: error.message || String(error), tone: 'var(--fail)' } }); } },
+      ruleProjects: H.projects, ruleProject, onRuleProject: (e) => this.setState({ ruleProject: e.target.value }),
+      runCheck: () => { if (!ruleProject) return fl('No project selected', 'Register a project to scan its rules.'); return this.runAction('Rule check complete', async () => { const rows = await H.rpc('rule_check', { project_root: ruleProject, files: null }); X.rules = (rows || []).map(row => ({ id: row.rule_id, name: row.message, lang: row.file || '—', sev: row.severity, hits: 1, fix: false })); H.rules.failing = X.rules.length; H.rules.lastCheck = new Date().toLocaleTimeString(); return X.rules.length + ' violations'; }); },
+      autoFix: () => { if (!ruleProject) return fl('No project selected', 'Register a project before running auto-fix.'); if (!window.confirm('Auto-fix may edit files in ' + ruleProject + '. Continue?')) return; return this.runAction('Rule auto-fix complete', async () => { const report = await H.rpc('rule_fix', { project_root: ruleProject }); X.rules = (report.residual_violations || []).map(row => ({ id: row.rule_id, name: row.message, lang: row.file || '—', sev: row.severity, hits: 1, fix: false })); H.rules.failing = X.rules.length; H.rules.lastCheck = new Date().toLocaleTimeString(); return report.fixed_count + ' edits applied; ' + X.rules.length + ' violations remain'; }); },
+      learnRules: () => this.runAction('Rule learning complete', () => H.rpc('learn_rules', { project_root: ruleProject })),
       learnSkills: () => this.runAction('Skill learning complete', () => H.rpc('learn_skills', { project_root: H.projects[0]?.root })),
       runEval: () => fl('Benchmark unavailable', 'The server does not expose an eval run endpoint.'),
       newSkill: () => this.setState({ form: { kind: 'skill', name: '', file: '' } }),
