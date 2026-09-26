@@ -29,6 +29,7 @@ async function setup(beforeFetch = async () => {}) {
       ],
     },
     "/api/local-quotas": { sources: [] },
+    "/api/eval-runs?project_root=%2Ftmp%2Frepo": { runs: [] },
     "/api/workflows/runtime/tree?summary_only=true": { summary: { circuit_breakers: [] } },
     "/api/dashboard": { global: { max_concurrent: 2 }, runtime_hosts: [] },
     "/api/operator-snapshot": {},
@@ -129,6 +130,13 @@ it("shows local official quotas without inventing a Claude percentage", async ()
   await context.HC.refresh(true);
   expect(context.HC.X.usage.quotas.map(row => row.used)).toEqual([70, null]);
   expect(context.HC.X.usage.quotas[1].note).toContain("quota % unavailable");
+});
+
+it("maps saved eval reports without a fabricated diff", async () => {
+  const { context, responses } = await setup();
+  responses["/api/eval-runs?project_root=%2Ftmp%2Frepo"] = { runs: [{ reported_at: "2026-09-26T17:00:00Z", report: { run_id: "run-1", suite: "core", metrics: { total_cases: 3, scored_cases: 2, passed_cases: 1, failed_cases: 1, pending_cases: 1, skipped_cases: 0, infra_failed_cases: 0, pass_at_1: 0.5 } } }] };
+  await context.HC.loadEvalRuns("/tmp/repo");
+  expect(context.HC.X.evals[0]).toMatchObject({ v: "run-1", suite: "core", pass: 1, fail: 1, partial: 1, score: "50%", delta: "—" });
 });
 
 it("keeps live polling independent of slow history and surfaces history failures", async () => {

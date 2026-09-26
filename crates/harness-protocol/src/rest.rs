@@ -31,6 +31,35 @@ pub struct LocalQuotaResponse {
     pub sources: Vec<LocalQuotaSource>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct EvalRunRequest {
+    pub project_root: String,
+    pub manifest_path: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct EvalRunListQuery {
+    pub project_root: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalRunEntry {
+    pub report: serde_json::Value,
+    pub reported_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalRunResponse {
+    pub run: EvalRunEntry,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalRunListResponse {
+    pub runs: Vec<EvalRunEntry>,
+}
+
 /// Runtime-host capability required before the server issues proof-bearing leases.
 pub const RUNTIME_JOB_LEASE_PROOF_V1_CAPABILITY: &str = "runtime_job_lease_proof_v1";
 
@@ -541,3 +570,11 @@ impl RestDto for IntakeStatusResponse {}
 
 impl private::Sealed for LocalQuotaResponse {}
 impl RestDto for LocalQuotaResponse {}
+impl private::Sealed for EvalRunRequest {}
+impl RestDto for EvalRunRequest {}
+impl private::Sealed for EvalRunListQuery {}
+impl RestDto for EvalRunListQuery {}
+impl private::Sealed for EvalRunResponse {}
+impl RestDto for EvalRunResponse {}
+impl private::Sealed for EvalRunListResponse {}
+impl RestDto for EvalRunListResponse {}

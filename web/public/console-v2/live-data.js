@@ -340,6 +340,27 @@
   H.memoryUnavailable = {};
   H.memoryLoading = {};
   H.memoryRepos = {};
+  H.evalError = null;
+  H.evalProject = null;
+  H.loadEvalRuns = async projectRoot => {
+    if (!projectRoot) return;
+    if (H.evalProject !== projectRoot) H.X.evals = [];
+    H.evalProject = projectRoot;
+    try {
+      const payload = await request('/api/eval-runs?' + new URLSearchParams({ project_root: projectRoot }));
+      if (H.evalProject !== projectRoot) return;
+      H.X.evals = (payload.runs || []).map(({ report, reported_at }) => ({
+        v: report.run_id, at: report.outcome ? report.outcome + ' · ' + age(reported_at) : age(reported_at), suite: report.suite,
+        pass: report.metrics.passed_cases || 0,
+        partial: (report.metrics.pending_cases || 0) + (report.metrics.skipped_cases || 0) + (report.metrics.infra_failed_cases || 0),
+        fail: report.metrics.failed_cases || 0,
+        score: report.metrics.scored_cases > 0 && typeof report.metrics.pass_at_1 === 'number' ? Math.round(report.metrics.pass_at_1 * 100) + '%' : '—',
+        delta: '—', outcome: report.outcome || 'completed',
+      }));
+      H.evalError = null;
+    } catch (error) { if (H.evalProject === projectRoot) H.evalError = error.message || String(error); }
+    refreshView();
+  };
   H.loadMemory = async projectId => {
     if (H.memoryLoading[projectId]) return;
     const repos = [...new Set([...H.workflows, ...H.history].filter(w => w.projectId === projectId && w.repository).map(w => w.repository))];
@@ -517,6 +538,7 @@
       if (secondaryDue || finished) void refreshHistory();
       if (secondaryDue) void H.loadEvents();
       if (secondaryDue) await Promise.all(H.projects.map(project => H.loadMemory(project.id)));
+      if (secondaryDue) void H.loadEvalRuns(H.evalProject || H.projects[0]?.root);
       refreshView();
     } catch (error) {
       H.loadError = error.message || String(error);

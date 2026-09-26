@@ -211,6 +211,11 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(crate::handlers::usage_monitor::local_quotas),
         )
         .route(
+            "/api/eval-runs",
+            get(crate::handlers::eval_runs::list_eval_runs)
+                .post(crate::handlers::eval_runs::run_eval),
+        )
+        .route(
             "/webhook",
             post(github_webhook).layer(DefaultBodyLimit::max(
                 state.core.server.config.server.max_webhook_body_bytes,

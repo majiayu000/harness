@@ -24,6 +24,8 @@ observes results. The following capabilities are **only available over HTTP**:
 | `GET  /projects/queue-stats` | stats | Per-project queue statistics |
 | `GET  /api/dashboard` | dashboard | Dashboard data |
 | `GET  /api/intake` | intake | Intake source status |
+| `GET  /api/eval-runs?project_root=...` | eval reports | List saved benchmark reports within a project |
+| `POST /api/eval-runs` | eval run | Validate or execute a project TOML manifest and return its report |
 | `POST /api/workflows/runtime/submissions` | submit | Create a durable workflow-runtime submission |
 | `GET  /api/workflows/runtime/submissions` | list | List runtime submissions |
 | `GET  /api/workflows/runtime/approvals` | approvals | List pending agent approvals for live runtime submission handles |
