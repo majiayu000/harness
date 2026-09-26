@@ -1048,6 +1048,23 @@ def test_failed_eval_without_measurements_does_not_invent_evidence(tmp_path):
                    for item in failed['artifacts'])
 
 
+def test_unenforceable_eval_claim_completes_as_failed_after_lease(tmp_path):
+    runner, claim = claimed_runner(tmp_path)
+    claim['runtime_job']['input']['command']['eval'] = {'timeout_secs': 30}
+    claim['resource_limits'] = {'requested': {'disk_bytes': 100 * 1024 * 1024}, 'effective': {
+        'cpu_time_secs': 30, 'memory_bytes': 2 * 1024 * 1024 * 1024, 'pids': 128,
+        'disk_bytes': 100 * 1024 * 1024, 'output_bytes': 1024 * 1024, 'wall_time_secs': 30,
+    }}
+    claim['network_policy'] = {'inbound': 'deny', 'outbound': 'deny', 'network_allowlist': []}
+    runner.run()
+    assert runner.state['result']['status'] == 'failed'
+    assert 'below the writable mount minimum' in runner.state['result']['error']
+    runner.launch.assert_not_called()
+    runner.cleanup.assert_called_once()
+    runner.complete.assert_called_once()
+    assert runner.state['phase'] == 'completing'
+
+
 def test_rendered_claim_and_native_result_survive_completion_and_restart(tmp_path):
     runner, claim = claimed_runner(tmp_path)
     native = native_result()
@@ -1115,6 +1132,7 @@ def test_verifier_failure_does_not_forward_success_signal(tmp_path):
 @pytest.mark.parametrize('artifact_type', [
     'runtime_host_usage', 'supervised_input_snapshot',
     'supervised_candidate_resources', 'supervised_docker_verification', 'supervised_git_handoff',
+    'resource_limit_report', 'network_policy_report',
 ])
 def test_native_artifacts_cannot_impersonate_host_evidence(tmp_path, artifact_type):
     runner, _ = claimed_runner(tmp_path)

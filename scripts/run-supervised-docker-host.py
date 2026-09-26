@@ -39,6 +39,8 @@ HOST_OWNED_ARTIFACTS = {
     "supervised_candidate_resources",
     "supervised_docker_verification",
     "supervised_git_handoff",
+    "resource_limit_report",
+    "network_policy_report",
 }
 
 def save(path: Path, value: dict) -> None:
@@ -694,30 +696,6 @@ class Host:
         job = claim["runtime_job"]
         if job["input"]["workflow_id"] != self.state["submission"]["workflow_id"]:
             raise RuntimeError("claimed unrelated job; use a dedicated disposable server")
-        command = job["input"].get("command")
-        if not isinstance(command, dict):
-            command = {}
-        if "agent_contract" in command or "exact_replay" in command:
-            raise RuntimeError("this supervised client cannot execute pinned-contract jobs")
-        activity = job["input"].get("activity")
-        bound = quality_gate.bind_eval_contract(claim, job["input"])
-        if bound is not None:
-            self.credential_variables = bound
-            self.state["enforced_limits"] = claim["resource_limits"]
-            self.state["enforced_network_policy"] = claim["network_policy"]
-            if activity == quality_gate.QUALITY_GATE_ACTIVITY:
-                raise RuntimeError(
-                    "eval quality gate stays offline; this client does not implement trusted_eval_verifier_v1"
-                )
-        if activity != quality_gate.QUALITY_GATE_ACTIVITY:
-            request = self.state["request"]
-            submission = self.state["submission"]
-            digest = hashlib.sha256(b"\0".join(value.encode() for value in [
-                str(Path(request["project"]).resolve()), request.get("subject_key") or request.get("external_id") or "",
-                submission["task_id"], request["prompt"],
-            ])).hexdigest()
-            if command.get("prompt_ref") != "prompt-memory:" + digest:
-                raise RuntimeError("request prompt does not match the claimed submission")
         self.state["job"] = job
         self.state["lease"] = {key: claim[key] for key in
                                ["lease_generation", "lease_expires_at", "lease_proof"]}
@@ -725,6 +703,30 @@ class Host:
         self.persist()
         artifacts = []
         try:
+            command = job["input"].get("command")
+            if not isinstance(command, dict):
+                command = {}
+            if "agent_contract" in command or "exact_replay" in command:
+                raise RuntimeError("this supervised client cannot execute pinned-contract jobs")
+            activity = job["input"].get("activity")
+            bound = quality_gate.bind_eval_contract(claim, job["input"])
+            if bound is not None:
+                self.credential_variables = bound
+                self.state["enforced_limits"] = claim["resource_limits"]
+                self.state["enforced_network_policy"] = claim["network_policy"]
+                if activity == quality_gate.QUALITY_GATE_ACTIVITY:
+                    raise RuntimeError(
+                        "eval quality gate stays offline; this client does not implement trusted_eval_verifier_v1"
+                    )
+            if activity != quality_gate.QUALITY_GATE_ACTIVITY:
+                request = self.state["request"]
+                submission = self.state["submission"]
+                digest = hashlib.sha256(b"\0".join(value.encode() for value in [
+                    str(Path(request["project"]).resolve()), request.get("subject_key") or request.get("external_id") or "",
+                    submission["task_id"], request["prompt"],
+                ])).hexdigest()
+                if command.get("prompt_ref") != "prompt-memory:" + digest:
+                    raise RuntimeError("request prompt does not match the claimed submission")
             if activity == quality_gate.QUALITY_GATE_ACTIVITY:
                 if claim.get("prepared_prompt") is not None:
                     raise RuntimeError("native quality gate must not include a prepared_prompt")
