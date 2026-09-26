@@ -7,11 +7,13 @@ use chrono::{DateTime, Utc};
 use harness_protocol::rest::{
     EvalRunEntry, EvalRunListQuery, EvalRunListResponse, EvalRunRequest, EvalRunResponse,
 };
-use harness_workflow::runtime::{
-    eval_report_dry_run, execute_manifest, parse_benchmark_manifest_str, EvalEventPersistenceError,
-    EvalExecuteConfig, EvalRunReport,
-};
-use std::fs::{self, OpenOptions};
+use harness_workflow::runtime::{eval_report_dry_run, parse_benchmark_manifest_str, EvalRunReport};
+#[cfg(unix)]
+use harness_workflow::runtime::{execute_manifest, EvalEventPersistenceError, EvalExecuteConfig};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -105,34 +107,44 @@ pub(crate) async fn run_eval(
         }));
     }
 
-    let store = state.workflow_runtime_store()?.clone();
-    let events = state.observability.events.clone();
-    let directory = create_eval_directory(&root, &run_id)?;
-    let report_path = directory.join("report.json");
-    let project_id = root.to_string_lossy().into_owned();
-    let task = tokio::spawn(async move {
-        let result: Result<ContractJson<EvalRunResponse>, ApiError> = async {
-            let config = EvalExecuteConfig::new(run_id.clone(), project_id.clone(), 3);
-            let report = match execute_manifest(&store, &events, &manifest, config).await {
-                Ok(report) => report,
-                Err(error) => {
-                    if let Some(partial) = error.downcast_ref::<EvalEventPersistenceError>() {
-                        write_report(&report_path, partial.report())?;
+    #[cfg(unix)]
+    {
+        reject_during_maintenance(&state.core.server.config.maintenance_window, Utc::now())?;
+        let store = state.workflow_runtime_store()?.clone();
+        let events = state.observability.events.clone();
+        let directory = create_eval_directory(&root, &run_id)?;
+        let output = EvalReportOutput::open(directory)?;
+        let project_id = root.to_string_lossy().into_owned();
+        let task = tokio::spawn(async move {
+            let result: Result<ContractJson<EvalRunResponse>, ApiError> = async {
+                let config = EvalExecuteConfig::new(run_id.clone(), project_id.clone(), 3);
+                let report = match execute_manifest(&store, &events, &manifest, config).await {
+                    Ok(report) => report,
+                    Err(error) => {
+                        if let Some(partial) = error.downcast_ref::<EvalEventPersistenceError>() {
+                            output.write(partial.report())?;
+                        }
+                        return Err(ApiError::Internal(error.to_string()));
                     }
-                    return Err(ApiError::Internal(error.to_string()));
-                }
-            };
-            write_report(&report_path, &report)?;
-            entry(&report, Utc::now()).map(|run| ContractJson(EvalRunResponse { run }))
-        }
-        .await;
-        if let Err(error) = &result {
-            tracing::error!(run_id = %run_id, project = %project_id, %error, "console eval run failed");
-        }
-        result
-    });
-    task.await
-        .map_err(|error| ApiError::Internal(format!("eval task failed: {error}")))?
+                };
+                output.write(&report)?;
+                entry(&report, Utc::now()).map(|run| ContractJson(EvalRunResponse { run }))
+            }
+            .await;
+            if let Err(error) = &result {
+                tracing::error!(run_id = %run_id, project = %project_id, %error, "console eval run failed");
+            }
+            result
+        });
+        task.await
+            .map_err(|error| ApiError::Internal(format!("eval task failed: {error}")))?
+    }
+    #[cfg(not(unix))]
+    {
+        Err(ApiError::Internal(
+            "secure eval report storage is unavailable on this platform".to_string(),
+        ))
+    }
 }
 
 async fn project_root(state: &AppState, requested: &str) -> Result<PathBuf, ApiError> {
@@ -169,6 +181,20 @@ async fn project_root(state: &AppState, requested: &str) -> Result<PathBuf, ApiE
     ))
 }
 
+#[cfg(unix)]
+fn reject_during_maintenance(
+    maintenance: &harness_core::config::maintenance::MaintenanceWindowConfig,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    if maintenance.in_quiet_window(now) {
+        return Err(ApiError::MaintenanceWindow {
+            retry_after_secs: maintenance.secs_until_window_end(now),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn create_eval_directory(root: &Path, run_id: &str) -> Result<PathBuf, ApiError> {
     let artifacts = root.join("artifacts");
     fs::create_dir_all(&artifacts).map_err(internal)?;
@@ -190,27 +216,75 @@ fn read_report_entry(
     entry(&report, DateTime::<Utc>::from(modified))
 }
 
-fn write_report(path: &Path, report: &EvalRunReport) -> Result<(), ApiError> {
-    let bytes = serde_json::to_vec_pretty(report).map_err(internal)?;
-    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
+#[cfg(unix)]
+struct EvalReportOutput {
+    directory_path: PathBuf,
+    directory: File,
+}
+
+#[cfg(unix)]
+impl EvalReportOutput {
+    fn open(directory_path: PathBuf) -> Result<Self, ApiError> {
+        let directory = File::from(
+            rustix::fs::open(
+                &directory_path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(internal)?,
+        );
+        Ok(Self {
+            directory_path,
+            directory,
+        })
+    }
+
+    fn write(&self, report: &EvalRunReport) -> Result<(), ApiError> {
+        let bytes = serde_json::to_vec_pretty(report).map_err(internal)?;
+        let temporary = format!("report.{}.tmp", uuid::Uuid::new_v4());
+
+        let result = (|| {
+            let file = rustix::fs::openat(
+                &self.directory,
+                temporary.as_str(),
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
             .map_err(internal)?;
-        file.write_all(&bytes).map_err(internal)?;
-        file.sync_all().map_err(internal)?;
-        fs::rename(&temporary, path).map_err(internal)
-    })();
-    if result.is_err() {
-        if let Err(error) = fs::remove_file(&temporary) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::error!(path = %temporary.display(), %error, "failed to remove incomplete eval report");
+            let mut file = File::from(file);
+            file.write_all(&bytes).map_err(internal)?;
+            file.sync_all().map_err(internal)?;
+            rustix::fs::renameat(
+                &self.directory,
+                temporary.as_str(),
+                &self.directory,
+                "report.json",
+            )
+            .map_err(internal)
+        })();
+
+        if result.is_err() {
+            let cleanup = rustix::fs::unlinkat(
+                &self.directory,
+                temporary.as_str(),
+                rustix::fs::AtFlags::empty(),
+            )
+            .map_err(std::io::Error::from);
+            if let Err(error) = cleanup {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(path = %self.directory_path.display(), %error, "failed to remove incomplete eval report");
+                }
             }
         }
+        result
     }
-    result
 }
 
 fn entry(report: &EvalRunReport, reported_at: DateTime<Utc>) -> Result<EvalRunEntry, ApiError> {
@@ -224,10 +298,29 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(error.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_helpers::{db_tests_enabled, make_test_state, tempdir_in_home, HOME_LOCK};
+    use chrono::TimeZone;
+
+    #[test]
+    fn eval_dispatch_respects_maintenance_window() {
+        let mut maintenance = harness_core::config::maintenance::MaintenanceWindowConfig::default();
+        maintenance.enabled = true;
+        maintenance.timezone = "UTC".to_string();
+        maintenance.quiet_window_start = chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+        maintenance.quiet_window_end = chrono::NaiveTime::from_hms_opt(23, 0, 0).unwrap();
+        let now = Utc
+            .with_ymd_and_hms(2026, 9, 27, 12, 0, 0)
+            .single()
+            .unwrap();
+        let error = reject_during_maintenance(&maintenance, now)
+            .expect_err("maintenance must stop eval dispatch");
+        assert_eq!(error.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        maintenance.enabled = false;
+        assert!(reject_during_maintenance(&maintenance, now).is_ok());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -243,6 +336,33 @@ mod tests {
         let error = create_eval_directory(&project, "run-1").expect_err("outside output rejected");
         assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
         assert!(!outside.join("eval").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eval_output_cannot_follow_late_run_directory_symlink() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&project)?;
+        fs::create_dir(&outside)?;
+        let project = project.canonicalize()?;
+        let run_directory = create_eval_directory(&project, "run-1")?;
+        let output = EvalReportOutput::open(run_directory.clone())?;
+        let moved = project.join("artifacts/eval/moved-run");
+        fs::rename(&run_directory, &moved)?;
+        symlink(&outside, &run_directory)?;
+
+        let manifest = parse_benchmark_manifest_str(include_str!(
+            "../../../../evals/benchmarks/eval-isolation-fixture.toml"
+        ))?;
+        let report = eval_report_dry_run(&manifest, "run-1", 3)?;
+        output.write(&report)?;
+        assert!(!outside.join("report.json").exists());
+        assert!(moved.join("report.json").exists());
         Ok(())
     }
 
@@ -278,7 +398,7 @@ mod tests {
             list_eval_runs(State(state.clone()), ContractQuery(query.clone())).await?;
         assert!(before_publish.0.runs.is_empty());
         let report: EvalRunReport = serde_json::from_value(response.0.run.report)?;
-        write_report(&report_directory.join("report.json"), &report)?;
+        EvalReportOutput::open(report_directory.clone())?.write(&report)?;
         let listed = list_eval_runs(State(state.clone()), ContractQuery(query)).await?;
         assert_eq!(listed.0.runs.len(), 1);
         assert_eq!(listed.0.runs[0].report["suite"], "eval-isolation-fixture");

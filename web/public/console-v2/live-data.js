@@ -537,10 +537,12 @@
       applyPayloads(payloads);
       if (results[14].status === 'rejected') H.X.usage.quotas = [{ name: 'Local quota records', used: null, note: results[14].reason?.message || String(results[14].reason), status: 'unavailable' }];
       applyTaskSnapshot();
+      const evalRoot = H.projects.find(project => project.root === H.evalProject)?.root || H.projects[0]?.root;
+      if (H.evalProject && H.evalProject !== evalRoot) { H.evalProject = null; H.evalRequestSeq++; H.X.evals = []; H.evalError = null; }
       if (secondaryDue || finished) void refreshHistory();
       if (secondaryDue) void H.loadEvents();
       if (secondaryDue) await Promise.all(H.projects.map(project => H.loadMemory(project.id)));
-      if (secondaryDue) void H.loadEvalRuns(H.evalProject || H.projects[0]?.root);
+      if (secondaryDue) void H.loadEvalRuns(evalRoot);
       refreshView();
     } catch (error) {
       H.loadError = error.message || String(error);

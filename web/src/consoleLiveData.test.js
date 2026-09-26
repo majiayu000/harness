@@ -166,6 +166,17 @@ it("surfaces an invalid eval response without inventing metrics", async () => {
   expect(context.HC.X.evals).toHaveLength(0);
 });
 
+it("drops eval data for a project removed from the live project list", async () => {
+  const { context, responses, calls } = await setup();
+  context.HC.X.evals = [{ v: "old-run" }];
+  responses["/api/overview"].projects = [{ id: "new", root: "/tmp/new", merged_24h: 0 }];
+  responses["/api/eval-runs?project_root=%2Ftmp%2Fnew"] = { runs: [], errors: [] };
+  await context.HC.refresh(true);
+  expect(context.HC.evalProject).toBe("/tmp/new");
+  expect(context.HC.X.evals).toHaveLength(0);
+  expect(calls).toContain("/api/eval-runs?project_root=%2Ftmp%2Fnew");
+});
+
 it("keeps live polling independent of slow history and surfaces history failures", async () => {
   let releaseHistory;
   const pending = new Promise(resolve => { releaseHistory = resolve; });

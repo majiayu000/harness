@@ -39,6 +39,9 @@ silently replay it.
 - The eval panel does not invent report diffs or launch a suite until an operator
   selects a manifest and confirms execution. Rule check results are populated
   after a real check, not seeded with a rule catalog.
+- Eval execution requires a Unix server for directory-handle-safe report writes;
+  other platforms return an error before dispatch. Report listing and manifest
+  dry runs remain available.
 - The transcript reconstruction endpoint requires a runtime job and supplied
   content; it is not an automatic recovery endpoint. The dashboard retries the
   actual transcript stream after a failure instead of inventing reconstructed
