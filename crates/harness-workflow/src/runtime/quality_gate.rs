@@ -1,3 +1,4 @@
+use super::eval::TRUSTED_EVAL_VERIFIER_V1_CAPABILITY;
 use super::model::{
     WorkflowCommand, WorkflowCommandType, WorkflowDecision, WorkflowEvidence, WorkflowInstance,
 };
@@ -43,7 +44,19 @@ pub fn build_quality_gate_run_decision(
         "validation_commands_argv": input.validation_commands_argv,
     });
     if let Some(eval) = input.eval {
-        command["eval"] = eval.clone();
+        let mut eval = eval.clone();
+        let required = &mut eval["required_runtime_host_capabilities"];
+        if let Some(capabilities) = required.as_array_mut() {
+            if !capabilities
+                .iter()
+                .any(|capability| capability.as_str() == Some(TRUSTED_EVAL_VERIFIER_V1_CAPABILITY))
+            {
+                capabilities.push(json!(TRUSTED_EVAL_VERIFIER_V1_CAPABILITY));
+            }
+        } else {
+            *required = json!([TRUSTED_EVAL_VERIFIER_V1_CAPABILITY]);
+        }
+        command["eval"] = eval;
     }
     if let Some(expected_head_sha) = input.expected_head_sha {
         command["expected_head_sha"] = json!(expected_head_sha);

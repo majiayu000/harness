@@ -320,6 +320,31 @@ pub(in crate::handlers::runtime_hosts) fn validate_eval_resource_limit_report(
     Ok(())
 }
 
+pub(super) fn failed_eval_resource_report_without_usage(
+    job: &RuntimeJob,
+    result: &ActivityResult,
+    has_execution_evidence: bool,
+) -> Result<Option<ActivityArtifact>, (StatusCode, serde_json::Value)> {
+    if has_execution_evidence
+        || result.status != harness_workflow::runtime::ActivityStatus::Failed
+        || eval_metadata(&job.input).is_none()
+    {
+        return Ok(None);
+    }
+    let mut reports = result.artifacts.iter().filter(|artifact| {
+        artifact.artifact_type
+            == harness_workflow::runtime::completion_evidence::ARTIFACT_RESOURCE_LIMIT_REPORT
+    });
+    let report = reports.next().cloned();
+    if reports.next().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "failed eval completion must include at most one resource_limit_report artifact" }),
+        ));
+    }
+    Ok(report)
+}
+
 fn resource_usage_exceeds_limits(report: &ResourceLimitReport) -> bool {
     let limits = report.limits.effective;
     exceeds_millis(report.usage.cpu_time_millis, limits.cpu_time_secs)
@@ -473,6 +498,50 @@ mod tests {
             harness_workflow::runtime::ActivityStatus::Failed
         );
         assert!(attached.artifacts.is_empty());
+    }
+
+    #[test]
+    fn failed_eval_retains_measured_limit_report_without_model_usage() {
+        let limits = ResourceLimits::evaluation_defaults(45)
+            .cap_by(ResourceLimits::operator_default_maxima())
+            .expect("limits should cap");
+        let job = eval_implementation_job("abcdef1");
+        let report = ActivityArtifact::new(
+            harness_workflow::runtime::completion_evidence::ARTIFACT_RESOURCE_LIMIT_REPORT,
+            json!(ResourceLimitReport {
+                limits,
+                usage: complete_resource_usage(),
+                termination: Some(harness_sandbox::ResourceTermination {
+                    resource: harness_sandbox::ResourceLimitKind::Memory,
+                    reason: "memory limit exceeded".to_string(),
+                }),
+                reason: "memory limit exceeded".to_string(),
+            }),
+        );
+        let raw = ActivityResult::failed("implement_issue", "quota stopped", "memory limit")
+            .with_artifact(report.clone());
+        let retained = failed_eval_resource_report_without_usage(&job, &raw, false)
+            .expect("single measured host report should be accepted")
+            .expect("measured report should be retained");
+        let stripped =
+            harness_workflow::runtime::completion_evidence::strip_server_reserved_artifacts(raw);
+        assert!(stripped.artifacts.is_empty());
+        let attached = stripped.with_artifact(retained);
+        validate_eval_resource_limit_report(&job, &attached)
+            .expect("claimed limits and complete measurements should match");
+        assert_eq!(attached.artifacts[0].artifact, report.artifact);
+        assert!(
+            failed_eval_resource_report_without_usage(&job, &attached, true)
+                .expect("execution evidence owns the report")
+                .is_none()
+        );
+        let duplicate = attached.with_artifact(report);
+        assert_eq!(
+            failed_eval_resource_report_without_usage(&job, &duplicate, false)
+                .expect_err("duplicate reports are ambiguous")
+                .0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

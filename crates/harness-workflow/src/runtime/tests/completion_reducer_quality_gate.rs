@@ -4,7 +4,11 @@ fn quality_gate_run_decision_starts_runtime_activity() {
     let instance = quality_gate_instance("pending");
     let commands = vec!["cargo check".to_string(), "cargo test".to_string()];
     let command_argv = vec![vec!["cargo".to_string(), "check".to_string()]];
-    let eval = json!({"eval_run_id": "run-1", "case_id": "case-1"});
+    let eval = json!({
+        "eval_run_id": "run-1",
+        "case_id": "case-1",
+        "required_runtime_host_capabilities": ["eval_resource_limits", "eval_network_policy"]
+    });
     let expected_head_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let output = build_quality_gate_run_decision(
         &instance,
@@ -32,7 +36,14 @@ fn quality_gate_run_decision_starts_runtime_activity() {
         output.decision.commands[0].command["validation_commands_argv"][0],
         serde_json::json!(["cargo", "check"])
     );
-    assert_eq!(output.decision.commands[0].command["eval"], eval);
+    assert_eq!(
+        output.decision.commands[0].command["eval"]["required_runtime_host_capabilities"],
+        json!(["eval_resource_limits", "eval_network_policy", "trusted_eval_verifier_v1"])
+    );
+    assert_eq!(
+        eval["required_runtime_host_capabilities"],
+        json!(["eval_resource_limits", "eval_network_policy"])
+    );
     assert_eq!(
         output.decision.commands[0].command["expected_head_sha"],
         expected_head_sha
@@ -44,6 +55,26 @@ fn quality_gate_run_decision_starts_runtime_activity() {
             &ValidationContext::new("workflow-policy", Utc::now()),
         )
         .expect("quality gate run decision should validate");
+}
+
+#[test]
+fn non_eval_quality_gate_does_not_require_eval_capabilities() {
+    let instance = quality_gate_instance("pending");
+    let output = build_quality_gate_run_decision(
+        &instance,
+        QualityGateDecisionInput {
+            reason: "Run validation before merge.",
+            validation_commands: &["cargo check".to_string()],
+            validation_commands_argv: &[],
+            eval: None,
+            expected_head_sha: None,
+        },
+    );
+
+    let command = &output.decision.commands[0].command;
+    assert_eq!(command["activity"], QUALITY_GATE_ACTIVITY);
+    assert_eq!(command["validation_commands"], json!(["cargo check"]));
+    assert!(command.get("eval").is_none());
 }
 
 #[test]
