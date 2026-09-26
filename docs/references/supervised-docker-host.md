@@ -203,7 +203,8 @@ not reclaim.
 ## Candidate resource evidence
 
 The candidate's trusted non-root Python PID 1 reaps adopted descendants until
-its fixed 900-second retention deadline. A sleeping PID 1 left orphaned Codex
+its retention deadline, which covers the claimed eval wall limit plus cleanup
+time. A sleeping PID 1 left orphaned Codex
 children as zombies, so strict cgroup quiescence could never complete even after
 all live agent processes stopped. Reaping fixes that lifecycle defect without
 relaxing the process-count checks. Completed model usage is parsed into the result

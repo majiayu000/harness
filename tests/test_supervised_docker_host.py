@@ -514,13 +514,14 @@ def test_observer_mount_is_candidate_only_and_has_no_extra_privileges(tmp_path, 
         return '{}'
     monkeypatch.setattr(module, 'docker', invoke)
     monkeypatch.setattr(module.os, 'getuid', lambda: 1001)
-    runner.start_observer()
+    runner.start_observer(900)
     command = next(c for c in calls if c[0] == 'run')
     mount = command[command.index('--mount') + 1]
     assert mount == 'type=bind,src=/sys/fs/cgroup/docker/' + 'a' * 64 + ',dst=/sys/fs/cgroup,readonly'
     assert command[command.index('--network') + 1] == 'none'
     assert command[command.index('--user') + 1].startswith('1001:')
     assert command[command.index('--shm-size') + 1] == '64m'
+    assert command[-2:] == ('sleep', '900')
     assert '--privileged' not in command and '--pid' not in command
     assert not any('docker.sock' in argument for argument in command)
 
@@ -624,8 +625,8 @@ def test_candidate_reaper_collects_exited_children_with_fixed_deadline():
     module = load()
     setup = "import os\npid=os.fork()\nif pid==0: os._exit(0)\n"
     check = "\ntry: os.waitpid(pid,os.WNOHANG)\nexcept ChildProcessError: pass\nelse: raise AssertionError('child was not reaped')\n"
-    script = setup + module.CANDIDATE_REAPER_SCRIPT.replace('+ 900', '+ 0.2') + check
-    subprocess.run([sys.executable, '-I', '-c', script], check=True, timeout=3)
+    script = setup + module.CANDIDATE_REAPER_SCRIPT + check
+    subprocess.run([sys.executable, '-I', '-c', script, '0.2'], check=True, timeout=3)
 
 
 def test_capture_failure_retains_completed_model_usage(tmp_path):
@@ -781,7 +782,7 @@ def test_launch_mounts_only_frozen_input(tmp_path, monkeypatch):
     (tmp_path / 'input.bundle').write_bytes(b'prepared bundle')
     runner.state['input_snapshot'] = {'base_commit': 'a' * 40, 'bundle_sha256': hashlib.sha256(b'prepared bundle').hexdigest()}
     runner.args = SimpleNamespace(workspace=tmp_path / 'mutable', auth_file=tmp_path / 'auth',
-                                  synthetic_dns=False, proxy_image='proxy', image='agent')
+                                  synthetic_dns=False, proxy_image='proxy', image='agent', timeout=180)
     runner.start_observer = Mock()
     calls = []
     monkeypatch.setattr(module, 'docker', lambda *args: calls.append(args))
@@ -790,6 +791,29 @@ def test_launch_mounts_only_frozen_input(tmp_path, monkeypatch):
     assert f'type=bind,src={tmp_path}/input.bundle,dst=/input.bundle,readonly' in candidate
     assert f'type=bind,src={module.GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly' in candidate
     assert not any(str(tmp_path / 'mutable') in arg for arg in candidate)
+
+
+def test_eval_container_lifetime_covers_claimed_wall_limit(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    module = load()
+    runner = module.Host.__new__(module.Host)
+    runner.root, runner.name = tmp_path, 'owned'
+    runner.state = {
+        'input_snapshot': {'base_commit': 'a' * 40, 'bundle_sha256': 'b' * 64},
+        'enforced_limits': {'effective': {
+            'wall_time_secs': 7200, 'disk_bytes': 512 * 1024 * 1024,
+            'memory_bytes': 2 * 1024 * 1024 * 1024, 'pids': 128,
+        }},
+        'enforced_network_policy': {'inbound': 'deny', 'outbound': 'deny', 'network_allowlist': []},
+    }
+    runner.args = SimpleNamespace(image='agent', timeout=180)
+    runner.start_observer = Mock()
+    calls = []
+    monkeypatch.setattr(module, 'docker', lambda *args: calls.append(args))
+    runner.launch()
+    candidate = next(call for call in calls if call[:4] == ('run', '-d', '--name', 'owned'))
+    assert int(candidate[-1]) > 7200
+    runner.start_observer.assert_called_once_with(int(candidate[-1]))
 
 
 def test_failed_preparation_is_persisted_before_any_claim(tmp_path):
@@ -848,7 +872,7 @@ def test_launch_passes_prepared_digest_to_consumer_before_auth_copy(tmp_path, mo
     (runner.root / 'input.bundle').write_bytes(b'changed bytes')
     runner.name = 'owned'
     runner.args = SimpleNamespace(auth_file=tmp_path / 'auth', image='image',
-                                  proxy_image='proxy', synthetic_dns=False)
+                                  proxy_image='proxy', synthetic_dns=False, timeout=180)
     runner.start_observer = Mock()
     calls = []
     def docker(*args):

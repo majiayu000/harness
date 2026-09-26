@@ -77,15 +77,15 @@ def extract_candidate(archive: Path, destination: Path) -> None:
     with tarfile.open(archive) as stream:
         stream.extractall(destination, members=archive_members(stream), filter="data")
 
-CANDIDATE_REAPER_SCRIPT = """import os, time
+CANDIDATE_REAPER_SCRIPT = """import os, sys, time
 # PID 1 adopts agent descendants and must reap them before cgroup quiescence.
-deadline = time.monotonic() + 900
+deadline = time.monotonic() + float(sys.argv[1])
 while time.monotonic() < deadline:
     try:
         while time.monotonic() < deadline and os.waitpid(-1, os.WNOHANG)[0]:
             pass
     except ChildProcessError:
-        pass  # No adopted children are waiting; keep the fixed retention deadline.
+        pass  # No adopted children are waiting; keep the retention deadline.
     time.sleep(0.01)
 """
 
@@ -225,6 +225,10 @@ class Host:
             docker(*proxy_args, args.proxy_image)
             docker("network", "connect", "--alias", "proxy", self.name, self.name + "-proxy")
         limits = self.state.get("enforced_limits")
+        retention_secs = max(
+            900,
+            (limits["effective"]["wall_time_secs"] if limits else args.timeout) + 300,
+        )
         workspace = "512m" if limits is None else str(
             quality_gate.mount_budget(limits["effective"]["disk_bytes"])["workspace"]
         )
@@ -242,12 +246,12 @@ class Host:
         else:
             if allowlist is not None:
                 run_args += ["--env", "HTTPS_PROXY=http://proxy:8080", "--env", "HTTP_PROXY=http://proxy:8080"]
-        run_args += [args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT]
+        run_args += [args.image, "python3", "-I", "-c", CANDIDATE_REAPER_SCRIPT, str(retention_secs)]
         docker(*run_args)
         self.state["network_enforced"] = policy is not None
         self.state["container_started"] = True
         self.persist()
-        self.start_observer()
+        self.start_observer(retention_secs)
         docker("exec", self.name, "python3", "-I", "/git-handoff.py", "prepare",
                "/input.bundle", snapshot["base_commit"], snapshot["bundle_sha256"], "/workspace")
         if limits is None:
@@ -255,7 +259,7 @@ class Host:
                    'set -eu; mkdir -p /home/harness/.codex; '
                    'cp /run/codex-auth.json /home/harness/.codex/auth.json')
 
-    def start_observer(self) -> None:
+    def start_observer(self, retention_secs: int) -> None:
         engine = json.loads(docker("info", "--format", "{{json .}}"))
         if engine["CgroupVersion"] != "2" or engine["CgroupDriver"] != "cgroupfs":
             raise RuntimeError("resource observer requires Docker cgroup v2 with cgroupfs")
@@ -269,7 +273,7 @@ class Host:
         docker("run", "-d", "--name", self.name + "-observer", "--network", "none",
                *self.base_args(), "--cgroupns", "host", "--mount",
                f"type=bind,src=/sys/fs/cgroup/docker/{candidate_id},dst=/sys/fs/cgroup,readonly",
-               self.args.image, "sleep", "900")
+               self.args.image, "sleep", str(retention_secs))
         # Fail before model execution when this exact kernel/mount lacks the files.
         docker("exec", self.name + "-observer", "python3", "-I", "-c", CGROUP_METRICS_SCRIPT)
 
