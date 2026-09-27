@@ -70,6 +70,7 @@ pub(super) fn simplify(packet: &mut Value) {
         .to_owned();
     // A blocked example applies to every activity without inventing successful
     // work. The activity contract describes the evidence needed for success.
+    // plan_issue replaces it: an unmet explicit approval is configuration.
     schema.insert(
         "wire_format_example".into(),
         json!({
@@ -79,6 +80,21 @@ pub(super) fn simplify(packet: &mut Value) {
             "error":"Describe the missing access or input.","error_kind":"external_dependency"
         }),
     );
+    if activity == "plan_issue" {
+        schema.insert(
+            "wire_format_example".into(),
+            json!({
+                "activity": activity,
+                "status": "blocked",
+                "summary": "An explicit approval is unmet. Record the approval, then an operator calls POST /api/workflows/runtime/unblock. Unblock does not grant the approval.",
+                "artifacts": [],
+                "signals": [],
+                "validation": [],
+                "error": "No recorded approval authorizes this step.",
+                "error_kind": "configuration"
+            }),
+        );
+    }
     schema.insert("array_item_fields".into(), json!({
         "artifacts": {"artifact_type":"non-empty artifact name", "artifact":"payload value, encoded only when the transport schema requires it"},
         "signals": {"signal_type":"accepted signal name", "signal":"payload value, encoded only when the transport schema requires it"},
