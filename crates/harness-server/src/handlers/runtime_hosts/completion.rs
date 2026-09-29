@@ -109,12 +109,6 @@ pub async fn complete_runtime_job_for_runtime_host(
             );
         }
     };
-    // A failed host can measure a quota stop before model usage exists.
-    let failed_resource_report =
-        match evidence::failed_eval_resource_report_without_usage(&job, &result) {
-            Ok(report) => report,
-            Err((status, response)) => return (status, completion_json(response)),
-        };
     let result = crate::workflow_runtime_worker::strip_caller_transcript_unavailable_signal(result);
     let cancellation_ack = is_eval_cancellation_ack(&job, &result);
     if !cancellation_ack {
@@ -122,7 +116,7 @@ pub async fn complete_runtime_job_for_runtime_host(
             return (StatusCode::BAD_REQUEST, completion_json(response));
         }
     }
-    let mut result = match if cancellation_ack {
+    let result = match if cancellation_ack {
         attach_eval_cancellation_cleanup_evidence(result, execution_evidence)
     } else {
         attach_eval_checkout_evidence(&job, result, execution_evidence)
@@ -130,23 +124,6 @@ pub async fn complete_runtime_job_for_runtime_host(
         Ok(result) => result,
         Err(response) => return (StatusCode::BAD_REQUEST, completion_json(response)),
     };
-    if let Some(report) = failed_resource_report {
-        if let Some(attached) = result.artifacts.iter().find(|artifact| {
-            artifact.artifact_type
-                == harness_workflow::runtime::completion_evidence::ARTIFACT_RESOURCE_LIMIT_REPORT
-        }) {
-            if attached.artifact != report.artifact {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    completion_json(
-                        json!({"error": "conflicting failed eval resource_limit_report evidence"}),
-                    ),
-                );
-            }
-        } else {
-            result.artifacts.push(report);
-        }
-    }
     if !cancellation_ack {
         if let Err((status, response)) = validate_eval_network_policy_report(&job, &result) {
             return (status, completion_json(response));
