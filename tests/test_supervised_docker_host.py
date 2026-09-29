@@ -99,7 +99,6 @@ def test_unaccepted_completion_remains_pending(tmp_path):
 
 
 def test_failed_eval_completion_attests_successful_cleanup_without_usage(tmp_path, monkeypatch):
-    module = load()
     runner = host(tmp_path, 'cleaning')
     runner.name = 'owned'
     runner.state['enforced_limits'] = {'effective': {}}
@@ -107,10 +106,14 @@ def test_failed_eval_completion_attests_successful_cleanup_without_usage(tmp_pat
                               'artifacts': [], 'signals': [], 'error': 'model failed',
                               'error_kind': 'unknown'}
     runner.api = Mock(return_value={'completed': True})
-    monkeypatch.setattr(module, 'docker', lambda *args: '')
+    # host() loads its own module; patch that module, not a second load().
+    docker_calls = []
+    monkeypatch.setitem(
+        runner.cleanup.__globals__, 'docker', lambda *args: docker_calls.append(args) or '')
 
     runner.run()
 
+    assert docker_calls
     payload = runner.api.call_args.args[1]
     assert payload['result']['status'] == 'failed'
     assert payload['execution_evidence']['checked_out_commit'] == ''
@@ -121,7 +124,6 @@ def test_failed_eval_completion_attests_successful_cleanup_without_usage(tmp_pat
 
 
 def test_failed_eval_completion_sends_quota_report_without_model_usage(tmp_path, monkeypatch):
-    module = load()
     runner = host(tmp_path, 'cleaning')
     runner.name = 'owned'
     report = {
@@ -140,10 +142,14 @@ def test_failed_eval_completion_sends_quota_report_without_model_usage(tmp_path,
         'signals': [], 'error': 'memory limit exceeded', 'error_kind': 'unknown',
     }
     runner.api = Mock(return_value={'completed': True})
-    monkeypatch.setattr(module, 'docker', lambda *args: '')
+    # host() loads its own module; patch that module, not a second load().
+    docker_calls = []
+    monkeypatch.setitem(
+        runner.cleanup.__globals__, 'docker', lambda *args: docker_calls.append(args) or '')
 
     runner.run()
 
+    assert docker_calls
     evidence = runner.api.call_args.args[1]['execution_evidence']
     assert evidence['checked_out_commit'] == ''
     assert evidence['resource_limit_report'] == report
