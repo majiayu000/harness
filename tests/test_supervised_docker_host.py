@@ -99,7 +99,6 @@ def test_unaccepted_completion_remains_pending(tmp_path):
 
 
 def test_failed_eval_completion_attests_successful_cleanup_without_usage(tmp_path, monkeypatch):
-    module = load()
     runner = host(tmp_path, 'cleaning')
     runner.name = 'owned'
     runner.state['enforced_limits'] = {'effective': {}}
@@ -107,15 +106,59 @@ def test_failed_eval_completion_attests_successful_cleanup_without_usage(tmp_pat
                               'artifacts': [], 'signals': [], 'error': 'model failed',
                               'error_kind': 'unknown'}
     runner.api = Mock(return_value={'completed': True})
-    monkeypatch.setattr(module, 'docker', lambda *args: '')
+    # host() loads its own module; patch that module, not a second load().
+    docker_calls = []
+    monkeypatch.setitem(
+        runner.cleanup.__globals__, 'docker', lambda *args: docker_calls.append(args) or '')
 
     runner.run()
 
+    assert docker_calls
     payload = runner.api.call_args.args[1]
     assert payload['result']['status'] == 'failed'
+    assert payload['execution_evidence']['checked_out_commit'] == ''
     assert payload['execution_evidence']['isolation_cleanup_status'] == 'cleaned'
     assert payload['execution_evidence']['resource_limit_report'] == {}
     assert payload['execution_evidence']['usage']['cost_usd_micros'] is None
+    assert payload['execution_evidence']['validation'] == []
+
+
+def test_failed_eval_completion_sends_quota_report_without_model_usage(tmp_path, monkeypatch):
+    runner = host(tmp_path, 'cleaning')
+    runner.name = 'owned'
+    report = {
+        'limits': {'requested': {}, 'effective': {'memory_bytes': 1}, 'caps': []},
+        'usage': {'peak_memory_bytes': 2},
+        'termination': {'resource': 'memory', 'reason': 'memory limit exceeded'},
+        'reason': 'memory limit exceeded',
+    }
+    runner.state['enforced_limits'] = {'effective': {'memory_bytes': 1}}
+    runner.state['result'] = {
+        'activity': 'modify', 'status': 'failed', 'summary': 'quota stopped',
+        'artifacts': [
+            {'artifact_type': 'findings', 'artifact': {'items': []}},
+            {'artifact_type': 'resource_limit_report', 'artifact': report},
+        ],
+        'signals': [], 'error': 'memory limit exceeded', 'error_kind': 'unknown',
+    }
+    runner.api = Mock(return_value={'completed': True})
+    # host() loads its own module; patch that module, not a second load().
+    docker_calls = []
+    monkeypatch.setitem(
+        runner.cleanup.__globals__, 'docker', lambda *args: docker_calls.append(args) or '')
+
+    runner.run()
+
+    assert docker_calls
+    evidence = runner.api.call_args.args[1]['execution_evidence']
+    assert evidence['checked_out_commit'] == ''
+    assert evidence['resource_limit_report'] == report
+    assert evidence['usage'] == {
+        'model': '', 'input_tokens': 0, 'output_tokens': 0,
+        'cached_input_tokens': 0, 'total_tokens': 0, 'cost_usd_micros': None,
+    }
+    assert evidence['isolation_cleanup_status'] == 'cleaned'
+    assert evidence['validation'] == []
 
 
 def test_usage_requires_completed_turn(tmp_path):

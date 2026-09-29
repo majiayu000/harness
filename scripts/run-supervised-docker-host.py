@@ -686,13 +686,13 @@ class Host:
         payload_path = self.root / "completion.json"
         if not payload_path.exists():
             if self.state.get("enforced_limits") is not None and "execution_evidence" not in self.state:
-                # The server uses only this cleanup acknowledgement for a failed
-                # eval result; missing model usage and measurements stay unknown.
-                self.state["execution_evidence"] = quality_gate.execution_evidence("", [], {})
+                items = (self.state.get("result") or {}).get("artifacts") or []
+                reports = [item.get("artifact") for item in items if isinstance(item, dict) and item.get("artifact_type") == "resource_limit_report"]
+                report = reports[0] if len(reports) == 1 and isinstance(reports[0], dict) else {}
+                self.state["execution_evidence"] = quality_gate.execution_evidence("", [], report)
                 self.persist()
             payload = {**self.state["lease"], "result": self.state["result"]}
-            evidence = self.state.get("execution_evidence")
-            if evidence is not None:
+            if (evidence := self.state.get("execution_evidence")) is not None:
                 payload["execution_evidence"] = evidence
             save(payload_path, payload)
         response = self.api(self.endpoint + f"/runtime-jobs/{self.state['job']['id']}/complete",
