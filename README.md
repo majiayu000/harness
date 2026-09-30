@@ -391,7 +391,8 @@ cargo run -p harness-cli -- plan status ./exec-plan-<id>.md
 
 ## Configuration
 
-All settings are declarative TOML. Pass `--config <path>` or use the defaults in [`config/default.toml`](config/default.toml).
+All settings are declarative TOML. Pass `--config <path>` or copy the tracked [`config/default.toml.example`](config/default.toml.example)
+to `config/default.toml` and adjust it for your environment.
 
 ```toml
 [server]
