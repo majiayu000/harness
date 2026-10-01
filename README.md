@@ -30,6 +30,28 @@ AI development is no longer one agent in one terminal — it is fleets of agents
 
 Harness is a Rust-native control plane for that fleet. It wraps AI coding agents (Claude Code, Codex, Anthropic API) with structured lifecycle management, policy enforcement, and continuous feedback loops. Instead of replacing agents, it standardizes how they run, what they're allowed to do, and how their output is reviewed.
 
+## Find the right workflow
+
+This project is [majiayu000/harness](https://github.com/majiayu000/harness), the
+Rust coding-agent control plane. The similarly named [Agent Harness](https://github.com/majiayu000/agent-harness)
+is a Claude Code plugin for GitHub issue delivery; the projects have different
+installation and operation paths.
+
+| Your task | Start here | Prerequisite or boundary |
+|---|---|---|
+| Run one coding-agent task | [Single-agent quickstart](#quickstart-run-one-agent-task) | A local runtime; Linux sandbox helpers as documented. No fleet server is needed. |
+| Operate a fleet and dashboard | [Fleet setup](#level-up-the-fleet-control-plane) | Postgres and API authentication; the server is separate from a one-shot command. |
+| Submit work through the runtime | [Submission API](#workflow-runtime-submissions) and [API contract](docs/api-contract.md) | Submit the registered project/workflow rather than treating legacy tasks as the runtime API. |
+| Recover a stopped workflow | [Workflow runtime operations](docs/workflow-runtime-operations.md) | Inspect the pinned definition, stop reason, and recovery conditions before resuming. |
+| Isolate untrusted issue intake | [Container-tier operator guide](docs/container-tier-operator-guide.md) | Docker, pinned images, and explicit credential/network scope. |
+| Inspect execution evidence | [OpenTelemetry trajectory quickstart](docs/otel-trajectory-quickstart.md) | Configure the documented telemetry path; a submission alone does not prove completion. |
+
+Use [Issues](https://github.com/majiayu000/harness/issues) for reproducible failures
+with the source revision, runtime, selected sandbox, and redacted evidence. This
+repository builds from source; [Releases](https://github.com/majiayu000/harness/releases)
+and [release instructions](RELEASING.md) define publication separately from CI.
+The source is licensed under [MIT](LICENSE).
+
 ## Install
 
 Build from source (no prebuilt binaries or Homebrew formula yet):
