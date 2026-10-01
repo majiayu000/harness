@@ -4,9 +4,28 @@ TypeScript client for Harness workflow-runtime submissions.
 
 ## Install
 
+Install this SDK from a checkout of [majiayu000/harness](https://github.com/majiayu000/harness),
+using Node.js 20+ and npm. The public npm package named `harness-sdk` is a
+different project; `npm install harness-sdk` does not install this client.
+
 ```bash
-npm install harness-sdk
+git clone https://github.com/majiayu000/harness.git
+cd harness/sdk/typescript
+npm install
+npm run build
+npm pack
 ```
+
+The current package version produces `harness-sdk-0.1.0.tgz`, containing the
+built JavaScript and type declarations. From your application's directory,
+install that local archive (replace the path with your checkout):
+
+```bash
+npm install /absolute/path/to/harness/sdk/typescript/harness-sdk-0.1.0.tgz
+```
+
+The usage examples require a running [Harness server](../../README.md#level-up-the-fleet-control-plane).
+Installing the SDK does not build or start the server.
 
 ## Usage
 
@@ -52,10 +71,3 @@ for await (const event of thread.runStream("Diagnose failing tests")) {
 
 Events are SDK-synthesized polling lifecycle events:
 `sdk:turn/started`, `sdk:turn/status`, `sdk:turn/completed`, `sdk:turn/timeout`.
-
-## Publish to npm
-
-```bash
-npm run build
-npm publish --access public
-```
