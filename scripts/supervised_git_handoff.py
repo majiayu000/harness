@@ -149,16 +149,25 @@ def compare(files: dict, source: Path, exclude_git: bool = False) -> None:
         raise RuntimeError('workspace files do not exactly match candidate commit (dirty or extra files)')
 
 
-def prepare(bundle: Path, base: str, expected: str, workspace: Path) -> None:
+def prepare(bundle: Path, base: str, expected: str, workspace: Path,
+            candidate: str | None = None, snapshot: Path | None = None) -> None:
+    if (candidate is None) != (snapshot is None):
+        raise RuntimeError('candidate preparation requires both candidate and snapshot')
+    revision = candidate if candidate is not None else base
     with tempfile.TemporaryDirectory() as directory:
         repo = Path(directory) / 'repo'
-        import_bundle(repo, bundle.resolve(), base, BASE_REF, expected)
-        materialize(tree(repo, base), workspace)
+        import_bundle(repo, bundle.resolve(), revision,
+                      CANDIDATE_REF if candidate is not None else BASE_REF, expected)
+        files = tree(repo, revision)
+        if candidate is not None:
+            ancestry(repo, base, candidate)
+            compare(files, snapshot)
+        materialize(files, workspace)
         shutil.copytree(repo, workspace / '.git')
     repo = workspace / '.git'
     git(repo, 'config', 'core.bare', 'false')
-    git(repo, 'update-ref', '--no-deref', 'HEAD', base)
-    git(repo, 'read-tree', base)
+    git(repo, 'update-ref', '--no-deref', 'HEAD', revision)
+    git(repo, 'read-tree', revision)
 
 
 def regular(path: Path) -> bytes:
@@ -270,6 +279,9 @@ def main() -> None:
         command = commands.add_parser(name)
         for field in fields:
             command.add_argument(field, type=str if field in {'base', 'candidate', 'digest'} else Path)
+        if name == 'prepare':
+            command.add_argument('--candidate')
+            command.add_argument('--snapshot', type=Path)
     args = vars(parser.parse_args())
     command = args.pop('command')
     if 'digest' in args:
