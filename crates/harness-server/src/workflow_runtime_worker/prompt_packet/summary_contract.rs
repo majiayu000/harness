@@ -4,6 +4,7 @@ pub(super) fn agent_summary_contract(workflow_definition: &str, activity: &str) 
     match (workflow_definition, activity) {
         ("github_issue_pr", ISSUE_PLAN_ACTIVITY) => json!({
             "scope": "Anchor the plan to the original requested behavior and observable acceptance criteria. State material non-goals in the existing summary. A plan is a proposal, not authorization to expand the task into general hardening, a new parser or compatibility support.",
+            "blocked_approval": "When an explicit approval is unmet, use status blocked with error_kind configuration. The error_kind external_dependency remains only for a service gap that can clear without a human decision. Resume only after the approval is recorded and an operator calls POST /api/workflows/runtime/unblock. Unblock does not grant the approval.",
             "must_include": ["current and expected behavior", "observable acceptance criteria", "task classification", "minimal implementation slice", "target files or explicit unknown", "validation plan chosen for the change", "current execution blockers, or an empty blockers array"],
             "must_not_include": ["repository code changes", "workflow table mutations", "PR creation", "merge readiness claims"],
             "artifacts": {

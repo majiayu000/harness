@@ -259,6 +259,47 @@ fn activity_result_schema_describes_issue_planning_contract() {
     assert!(schema["agent_summary_contract"]["must_not_include"]
         .as_array()
         .is_some_and(|items| items.contains(&json!("repository code changes"))));
+    let blocked_approval = schema["agent_summary_contract"]["blocked_approval"]
+        .as_str()
+        .expect("plan_issue blocked approval contract");
+    assert!(blocked_approval.contains("status blocked with error_kind configuration"));
+    assert!(blocked_approval.contains(
+        "external_dependency remains only for a service gap that can clear without a human decision"
+    ));
+    assert!(blocked_approval.contains("POST /api/workflows/runtime/unblock"));
+    assert!(blocked_approval.contains("Unblock does not grant the approval"));
+
+    for runtime_kind in ["grok", "codex_jsonrpc"] {
+        let mut packet = json!({
+            "runtime_job": {"runtime_kind": runtime_kind},
+            "workflow": {"definition_id": "github_issue_pr"},
+            "activity_result_schema": schema.clone(),
+        });
+        super::model_input::simplify(&mut packet);
+        let example = &packet["activity_result_schema"]["wire_format_example"];
+        assert_eq!(example["activity"], "plan_issue");
+        assert_eq!(example["status"], "blocked");
+        assert_eq!(example["error_kind"], "configuration");
+        assert_ne!(
+            example["summary"],
+            "Explain the actual external input needed to continue."
+        );
+    }
+
+    let mut shared = json!({
+        "runtime_job": {"runtime_kind": "grok"},
+        "workflow": {"definition_id": "github_issue_pr"},
+        "activity_result_schema": {"activity": "implement_issue"},
+    });
+    super::model_input::simplify(&mut shared);
+    assert_eq!(
+        shared["activity_result_schema"]["wire_format_example"]["error_kind"],
+        "external_dependency"
+    );
+    assert_eq!(
+        shared["activity_result_schema"]["wire_format_example"]["summary"],
+        "Explain the actual external input needed to continue."
+    );
 }
 
 #[test]
