@@ -75,6 +75,10 @@ impl StoreHandle {
 ///
 /// `migrations` must be written in the SQL dialect of the backend the location
 /// routes to (Postgres for schema locations, SQLite for [`StoreLocation::LocalFile`]).
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Open a migrated store handle for `loc`.

@@ -121,6 +121,10 @@ impl fmt::Debug for ScopedGitHubTokenLease {
     }
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait ScopedGitHubTokenIssuer: Send + Sync {
     async fn mint_repo_token(

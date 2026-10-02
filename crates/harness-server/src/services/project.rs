@@ -9,6 +9,10 @@ use std::sync::Arc;
 ///
 /// Implementations may use SQLite persistence ([`DefaultProjectService`]) or
 /// an in-memory store for tests.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait ProjectService: Send + Sync {
     /// Register or update a project in the registry.

@@ -46,6 +46,10 @@ impl std::fmt::Display for EnqueueTaskError {
 
 impl std::error::Error for EnqueueTaskError {}
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait ExecutionService: Send + Sync {
     async fn enqueue(&self, req: CreateTaskRequest) -> Result<TaskId, EnqueueTaskError>;
