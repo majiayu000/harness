@@ -10,6 +10,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use std::time::Duration as StdDuration;
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait RuntimeJobExecutor: Send + Sync {
     fn consumes_runtime_turn(&self, _job: &RuntimeJob) -> bool {

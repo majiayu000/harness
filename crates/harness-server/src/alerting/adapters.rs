@@ -9,6 +9,10 @@ use crate::feishu_client;
 
 /// Mockable HTTP transport. The real implementation posts JSON and returns
 /// the parsed response body; non-2xx statuses are errors.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait AlertTransport: Send + Sync {
     async fn post_json(

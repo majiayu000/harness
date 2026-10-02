@@ -56,6 +56,10 @@ pub struct TaskCompletionResult {
 }
 
 /// Trait for intake channels. Each channel polls or listens and produces `IncomingIssue`s.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait IntakeSource: Send + Sync {
     fn name(&self) -> &str;

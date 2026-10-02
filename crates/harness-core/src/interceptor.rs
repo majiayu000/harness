@@ -107,6 +107,10 @@ impl PostToolUseResult {
 ///
 /// Interceptors run before and after each agent.execute() call.
 /// Multiple interceptors are composed in registration order.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait TurnInterceptor: Send + Sync {
     fn name(&self) -> &str;

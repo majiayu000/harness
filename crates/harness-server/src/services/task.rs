@@ -11,6 +11,10 @@ use tokio::sync::broadcast;
 ///
 /// Implementations may use the SQLite-backed [`DefaultTaskService`] or an
 /// in-memory mock for unit tests.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait TaskService: Send + Sync {
     /// Retrieve a task snapshot by ID.

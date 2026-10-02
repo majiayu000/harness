@@ -80,6 +80,10 @@ impl AgentContractCapabilities {
 /// Backends can be simple one-shot executors, streaming process supervisors, or
 /// stateful protocol adapters. Control operations default to `Unsupported` so
 /// one-shot executors only implement the execution surface they actually own.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait AgentBackend: Send + Sync {
     fn name(&self) -> &str;
