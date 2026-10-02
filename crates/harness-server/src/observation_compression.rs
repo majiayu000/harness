@@ -43,6 +43,10 @@ pub(crate) fn test_task_observation_session(
     Arc::new(TaskObservationCompressionSession { compressor })
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait::async_trait]
 pub(crate) trait RawObservationSink: Send + Sync {
     async fn persist_raw(

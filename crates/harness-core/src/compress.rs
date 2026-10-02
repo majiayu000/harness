@@ -178,6 +178,10 @@ impl ActionSketch {
 
 /// Model access needed by the compressor. Implementations live where the
 /// provider plumbing lives (harness-agents); tests use mocks.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait CompressModel: Send + Sync {
     /// Return a compressed rendition of `raw` for the given task framing.
@@ -217,6 +221,10 @@ fn collect_model_output<T>(
 }
 
 /// Compression entry point used by the seams.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub trait ObservationCompressor: Send + Sync {
     async fn compress(&self, obs: &str, hint: &CompressHint) -> Result<Compressed, CompressError>;

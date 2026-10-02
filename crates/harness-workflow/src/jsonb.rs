@@ -37,6 +37,10 @@ pub(crate) fn nul_characters_removed_total() -> u64 {
     NUL_CHARACTERS_REMOVED.load(Ordering::Relaxed)
 }
 
+#[allow(
+    deprecated,
+    reason = "AtomicU64::try_update requires Rust 1.95; workspace MSRV is 1.88"
+)]
 fn record_nul_characters_removed(count: u64) -> u64 {
     match NUL_CHARACTERS_REMOVED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(count))

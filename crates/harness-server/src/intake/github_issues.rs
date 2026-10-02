@@ -15,6 +15,10 @@ use crate::workflow_runtime_submission::runtime_models::{TaskFailureKind, TaskId
 const GITHUB_ISSUES_MAX_PAGES: usize = 20;
 const DEFAULT_RATE_LIMIT_RETRY_SECS: i64 = 60;
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait]
 pub(crate) trait DispatchedTaskChecker: Send + Sync {
     // Kept for the persisted-dispatch reconciliation compatibility path below.

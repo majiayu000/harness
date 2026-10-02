@@ -14,6 +14,10 @@ use tokio::sync::RwLock;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed Future (rust-clippy#17529)"
+)]
 #[async_trait::async_trait]
 trait PromptExecutor: Send + Sync {
     async fn execute(
