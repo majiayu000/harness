@@ -4,9 +4,24 @@ Python client for Harness workflow-runtime submissions.
 
 ## Install
 
+Install this SDK from a checkout of [majiayu000/harness](https://github.com/majiayu000/harness)
+with Python 3.9+ in a virtual environment. The public PyPI package named
+`harness-sdk` is not a verified distribution of this client; use the local
+source path instead of `pip install harness-sdk`.
+
 ```bash
-pip install harness-sdk
+git clone https://github.com/majiayu000/harness.git
+cd harness
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install ./sdk/python
 ```
+
+This installs the local `harness-sdk` distribution and its `harness_sdk` module
+into that environment. Keep the environment active when running the examples.
+
+The usage examples require a running [Harness server](../../README.md#level-up-the-fleet-control-plane).
+Installing the SDK does not build or start the server.
 
 ## Usage
 
@@ -53,10 +68,3 @@ Events are SDK-synthesized polling lifecycle events:
 `sdk:turn/started`, `sdk:turn/status`, `sdk:turn/completed`, `sdk:turn/timeout`.
 
 This SDK uses synchronous polling; calls block the current thread.
-
-## Publish to PyPI
-
-```bash
-python -m build
-twine upload dist/*
-```

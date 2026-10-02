@@ -12,11 +12,19 @@ pub(super) fn agent_summary_contract(workflow_definition: &str, activity: &str) 
                     "required": true,
                     "fields": ["summary", "task_class", "target_files", "validation_plan", "blockers"],
                     "target_files": "Non-empty array of file paths, or an explanation of what remains unknown as an array entry; do not invent paths.",
-                    "blockers": "Use [] when implementation can proceed. Reserve non-empty blockers for current obstacles that prevent proceeding and require external input or access. Planned work, test prerequisites the implementing agent can provision, risks, and conditional future checks belong in summary or validation_plan. Do not put strings such as none in this array. If access is actually unavailable, report the observed obstacle and a blocked status; do not claim success."
+                    "validation_plan": "Non-empty array of nonblank strings. Each entry is an appropriate validation command or an observable check chosen for the proposed change. Always use an array, even for a single check; a string, object, empty array, or blank entry is invalid. These are planned checks, not claims that validation already ran. Replace example placeholders with actual affected files and checks.",
+                    "blockers": "Use [] when implementation can proceed. Reserve non-empty blockers for current obstacles that prevent proceeding and require external input or access. Planned work, test prerequisites the implementing agent can provision, risks, and conditional future checks belong in summary or validation_plan. Do not put strings such as none in this array. If access is actually unavailable, report the observed obstacle and a blocked status; do not claim success.",
+                    "example": {
+                        "summary": "Fix the reported behavior within the issue's acceptance criteria.",
+                        "task_class": "standard_code",
+                        "target_files": ["<actual affected file>"],
+                        "validation_plan": ["<actual validation command or observable check>"],
+                        "blockers": []
+                    }
                 }
             },
             "signals": {
-                "IssuePlanReady": "Use when the issue has a coherent implementation plan and can proceed. Include summary, task_class, target_files, validation_plan, and blockers: []. Keep signal and artifact consistent; genuinely blocked work is not ready."
+                "IssuePlanReady": "Use when the issue has a coherent implementation plan and can proceed. Include summary, task_class, target_files, validation_plan, and blockers: [] using the issue_plan artifact field types above. Keep signal and artifact consistent; genuinely blocked work is not ready."
             }
         }),
         ("github_issue_pr", "implement_issue") => json!({
@@ -158,7 +166,82 @@ pub(super) fn agent_summary_contract(workflow_definition: &str, activity: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_workflow::runtime::{RuntimeKind, WorkflowSubject};
+    use harness_workflow::runtime::{
+        reduce_runtime_job_completed, ActivityArtifact, ActivityResult, RuntimeKind, WorkflowEvent,
+        WorkflowSubject,
+    };
+
+    #[test]
+    fn issue_plan_prompt_contract_matches_reducer_for_supported_agents() -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        for kind in [
+            RuntimeKind::Cursor,
+            RuntimeKind::CodexExec,
+            RuntimeKind::CodexJsonrpc,
+        ] {
+            let job = RuntimeJob::pending(
+                "plan-contract",
+                kind,
+                "plan-contract",
+                json!({"activity": ISSUE_PLAN_ACTIVITY}),
+            );
+            let workflow = WorkflowInstance::new(
+                "github_issue_pr",
+                1,
+                "planning",
+                WorkflowSubject::new("issue", "issue:123"),
+            );
+            let packet = json!({
+                "runtime_job": {"id": job.id, "runtime_kind": kind, "activity": ISSUE_PLAN_ACTIVITY},
+                "workflow": {"definition_id": "github_issue_pr"},
+                "activity_result_schema": super::super::activity_result_schema(&job, Some(&workflow)),
+            });
+            let prompt = super::super::build_runtime_job_prompt(&packet, None);
+            let contract: Value = serde_json::from_str(
+                prompt
+                    .split_once("\nActivity result contract:\n")
+                    .context("rendered prompt must contain the activity result contract")?
+                    .1,
+            )?;
+            let example = contract
+                .pointer("/agent_summary_contract/artifacts/issue_plan/example")
+                .context("rendered issue plan contract must provide a valid example")?;
+
+            for (validation_plan, expected_state) in [
+                (example["validation_plan"].clone(), "implementing"),
+                (
+                    json!("cargo test -p affected-crate affected_test"),
+                    "blocked",
+                ),
+            ] {
+                let mut plan = example.clone();
+                plan["validation_plan"] = validation_plan;
+                let result = ActivityResult::succeeded(ISSUE_PLAN_ACTIVITY, "Issue plan ready.")
+                    .with_artifact(ActivityArtifact::new(ISSUE_PLAN_ARTIFACT, plan.clone()));
+                let event =
+                    WorkflowEvent::new(&workflow.id, 1, "RuntimeJobCompleted", "plan-contract")
+                        .with_payload(json!({"activity_result": result}));
+                let decision = reduce_runtime_job_completed(&workflow, &event)?
+                    .context("issue plan result must produce a workflow decision")?;
+
+                assert_eq!(
+                    decision.next_state, expected_state,
+                    "runtime kind: {kind:?}"
+                );
+                if expected_state == "implementing" {
+                    assert_eq!(
+                        decision.commands[0].activity_name(),
+                        Some("implement_issue")
+                    );
+                    assert_eq!(decision.commands[0].command["issue_plan"], plan);
+                } else {
+                    assert_eq!(decision.decision, "block_invalid_agent_output");
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn scope_and_feedback_dispositions_reach_rendered_cursor_prompts() {
