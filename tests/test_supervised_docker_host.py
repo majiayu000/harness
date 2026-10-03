@@ -856,6 +856,98 @@ def test_launch_mounts_only_frozen_input(tmp_path, monkeypatch):
     assert not any(str(tmp_path / 'mutable') in arg for arg in candidate)
 
 
+@pytest.mark.parametrize('tamper', [None, 'bundle', 'snapshot'])
+def test_follow_on_model_reconstructs_and_exports_retained_candidate(tmp_path, monkeypatch, tamper):
+    from types import SimpleNamespace
+
+    module = load()
+    prior, source = snapshot_runner(tmp_path)
+    prior.freeze_input()
+    base = prior.args.base_commit
+    implementation = tmp_path / 'implementation'
+    prepare_snapshot(prior, implementation)
+    (implementation / 'implemented').write_text('implementation change\n')
+    candidate = commit_source(implementation)
+    fresh = tmp_path / 'follow-on'
+    fresh.mkdir()
+    archive = fresh / 'prior.tar'
+    with archive.open('wb') as output:
+        subprocess.run([sys.executable, '-I', str(module.GIT_HANDOFF_SCRIPT), 'export',
+                        str(implementation), base], stdout=output, check=True)
+    module.extract_candidate(archive, fresh / 'candidate')
+    retained = {path.relative_to(fresh / 'candidate'): path.read_bytes()
+                for path in (fresh / 'candidate').rglob('*') if path.is_file()}
+    runner = module.Host.__new__(module.Host)
+    runner.root, runner.name, runner.state = fresh, 'follow-on', {'phase': 'new'}
+    runner.args = SimpleNamespace(base_commit=base, auth_file=fresh / 'unused-auth',
+                                  synthetic_dns=False, proxy_image='proxy', image='agent', timeout=180)
+    assert runner.hydrate_retained_candidate()['candidate_commit'] == candidate
+    runner.prepare_follow_on_claim()
+    if tamper == 'bundle':
+        (fresh / 'candidate/candidate.bundle').write_bytes(b'tampered')
+    elif tamper == 'snapshot':
+        (fresh / 'candidate/workspace/implemented').write_text('tampered')
+    model_workspace = tmp_path / 'model-workspace'
+    calls = []
+    real_run = subprocess.run
+
+    def docker(*args):
+        calls.append(args)
+        if args[:5] == ('exec', runner.name, 'python3', '-I', '/git-handoff.py'):
+            mapped = [str(fresh / 'input-candidate') + value[len('/handoff'):]
+                      if value.startswith('/handoff') else
+                      str(model_workspace) if value == '/workspace' else value
+                      for value in args[5:]]
+            real_run([sys.executable, '-I', str(module.GIT_HANDOFF_SCRIPT), *mapped],
+                     capture_output=True, text=True, check=True)
+        return ''
+
+    monkeypatch.setattr(module, 'docker', docker)
+    runner.start_observer = Mock()
+    if tamper:
+        with pytest.raises(subprocess.CalledProcessError):
+            runner.launch()
+        assert not model_workspace.exists()
+        return
+    runner.launch()
+    assert git(model_workspace, 'rev-parse', 'HEAD') == candidate
+    assert (model_workspace / 'implemented').read_text() == 'implementation change\n'
+    snapshot = runner.state['input_snapshot']
+    assert snapshot['base_commit'] == base
+    assert snapshot['candidate_commit'] == candidate
+    assert {path.relative_to(fresh / 'input-candidate'): path.read_bytes()
+            for path in (fresh / 'input-candidate').rglob('*') if path.is_file()} == retained
+    assert not (fresh / 'candidate').exists()
+    (model_workspace / 'reviewed').write_text('follow-on change\n')
+    reviewed = commit_source(model_workspace)
+
+    def export_command(args, **kwargs):
+        if args[:2] == ['docker', 'exec']:
+            assert args[-1] == base
+            return real_run([sys.executable, '-I', str(module.GIT_HANDOFF_SCRIPT),
+                             'export', str(model_workspace), args[-1]], **kwargs)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, 'run', export_command)
+    runner.collect_resources = Mock()
+    runner.capture()
+    assert runner.state['git_handoff']['base_commit'] == base
+    assert runner.state['git_handoff']['candidate_commit'] == reviewed
+    assert runner.state['input_snapshot'] == snapshot
+    assert (fresh / 'candidate/workspace/implemented').read_text() == 'implementation change\n'
+    assert (fresh / 'candidate/workspace/reviewed').read_text() == 'follow-on change\n'
+    assert any('dst=/handoff,readonly' in arg for call in calls for arg in call)
+    runner.state.update(job={'id': 'follow-on', 'input': {'activity': 'modify'}},
+                        enforced_limits={}, output_bytes=1, wall_time_millis=1)
+    monkeypatch.setattr(module.quality_gate, 'report_from_evidence', Mock(return_value={'usage': {}}))
+    runner.result('failed', 'later validation failed', [{
+        'artifact_type': 'runtime_host_usage',
+        'artifact': {'model': 'test', 'input_tokens': 10, 'output_tokens': 1, 'total_tokens': 11},
+    }])
+    assert runner.state['execution_evidence']['checked_out_commit'] == candidate
+    assert runner.state['input_snapshot']['base_commit'] == base
+
+
 def test_eval_container_lifetime_covers_claimed_wall_limit(tmp_path, monkeypatch):
     from types import SimpleNamespace
     module = load()

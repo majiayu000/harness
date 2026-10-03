@@ -207,6 +207,14 @@ class Host:
 
     def launch(self) -> None:
         args = self.args
+        handoff = self.retained_candidate()
+        if handoff is not None:
+            # Keep prior input separate from the next exported candidate.
+            (self.root / "candidate").rename(self.root / "input-candidate")
+            self.state["input_snapshot"] = {
+                key: handoff[key] for key in ("base_commit", "candidate_commit", "bundle_sha256")
+            }
+            self.persist()
         snapshot = self.state["input_snapshot"]
         policy = self.state.get("enforced_network_policy")
         allowlist = "chatgpt.com,auth.openai.com" if policy is None else (
@@ -236,9 +244,12 @@ class Host:
         run_args = [
             "run", "-d", "--name", self.name, "--network", network, *self.isolation_args(),
             "--tmpfs", f"/workspace:rw,nosuid,nodev,size={workspace},uid={os.getuid()},gid={os.getgid()},mode=700",
-            "--mount", f"type=bind,src={self.root / 'input.bundle'},dst=/input.bundle,readonly",
             "--mount", f"type=bind,src={GIT_HANDOFF_SCRIPT},dst=/git-handoff.py,readonly",
         ]
+        if handoff is None:
+            run_args += ["--mount", f"type=bind,src={self.root / 'input.bundle'},dst=/input.bundle,readonly"]
+        else:
+            run_args += ["--mount", f"type=bind,src={self.root / 'input-candidate'},dst=/handoff,readonly"]
         if limits is None:
             run_args += [
                 "--mount", f"type=bind,src={args.auth_file.resolve()},dst=/run/codex-auth.json,readonly",
@@ -253,8 +264,11 @@ class Host:
         self.state["container_started"] = True
         self.persist()
         self.start_observer(retention_secs)
-        docker("exec", self.name, "python3", "-I", "/git-handoff.py", "prepare",
-               "/input.bundle", snapshot["base_commit"], snapshot["bundle_sha256"], "/workspace")
+        prepare_args = ["prepare", "/input.bundle" if handoff is None else "/handoff/candidate.bundle",
+                        snapshot["base_commit"], snapshot["bundle_sha256"], "/workspace"]
+        if handoff is not None:
+            prepare_args += ["--candidate", snapshot["candidate_commit"], "--snapshot", "/handoff/workspace"]
+        docker("exec", self.name, "python3", "-I", "/git-handoff.py", *prepare_args)
         if limits is None:
             docker("exec", self.name, "sh", "-c",
                    'set -eu; mkdir -p /home/harness/.codex; '
@@ -661,7 +675,8 @@ class Host:
                 artifacts.append({"artifact_type": "resource_limit_report", "artifact": report})
                 usage = next((item["artifact"] for item in reversed(artifacts)
                               if item.get("artifact_type") == "runtime_host_usage"), None)
-                checked = self.state.get("input_snapshot", {}).get("base_commit")
+                snapshot = self.state.get("input_snapshot", {})
+                checked = snapshot.get("candidate_commit", snapshot.get("base_commit"))
                 if usage is not None and isinstance(checked, str) and "execution_evidence" not in self.state:
                     self.state["execution_evidence"] = quality_gate.execution_evidence(
                         checked, [], report, {
