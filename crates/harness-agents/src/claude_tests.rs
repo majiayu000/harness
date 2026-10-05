@@ -775,3 +775,49 @@ exit 1
 
 #[path = "claude_tests/lifecycle.rs"]
 mod lifecycle;
+
+#[test]
+fn oneshot_structured_claude_output_requires_a_terminal_result() {
+    for stdout in [
+        r#"{"type":"system","subtype":"init"}"#,
+        r#"{"type":"assistant","message":"partial"}"#,
+        r#"{"type":"error","error":"temporary diagnostic"}"#,
+    ] {
+        let parsed = parse_claude_stream_output(stdout);
+        assert!(parsed
+            .failure
+            .as_deref()
+            .is_some_and(|message| message.contains("terminal result")));
+    }
+    let recovered = parse_claude_stream_output(
+        "{\"type\":\"error\",\"error\":\"temporary diagnostic\"}\n{\"type\":\"result\",\"result\":\"complete\"}\n",
+    );
+    assert!(recovered.failure.is_none());
+    assert_eq!(recovered.output, "complete");
+    assert!(parse_claude_stream_output("plain text\n").failure.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn execute_rejects_incomplete_structured_output_despite_zero_exit() {
+    let (dir, script) = write_executable_script(
+        r#"printf '%s\n' '{"type":"assistant","message":"partial"}'
+exit 0
+"#,
+    );
+    let agent = ClaudeCodeAgent::new(
+        script,
+        "test-model".to_string(),
+        SandboxMode::DangerFullAccess,
+    );
+    let request = AgentRequest {
+        prompt: "ignored".into(),
+        project_root: dir.path().into(),
+        ..AgentRequest::default()
+    };
+    let error = match agent.execute(request).await {
+        Ok(_) => panic!("structured output without a result must fail"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("terminal result"));
+}
