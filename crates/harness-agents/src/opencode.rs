@@ -620,6 +620,10 @@ impl CodeAgent for OpenCodeAgent {
             ));
         }
 
+        if stream_result.is_err() {
+            child.terminate_now();
+        }
+
         let status = child
             .wait_and_cleanup_descendants()
             .await
@@ -699,6 +703,59 @@ printf '%s\n' '{"type":"text","part":{"text":"partial"}}'
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_errors_terminate_the_child_before_waiting() {
+        use std::os::unix::fs::PermissionsExt;
+        for drop_receiver in [false, true] {
+            let dir = tempfile::tempdir().expect("temporary mock CLI directory");
+            let path = dir.path().join("mock-opencode.py");
+            let mut script = String::from("#!/usr/bin/env python3\nimport time\n");
+            if drop_receiver {
+                script.push_str(
+                    "print('{\"type\":\"text\",\"part\":{\"text\":\"partial\"}}', flush=True)\n",
+                );
+            }
+            script.push_str("time.sleep(60)\n");
+            std::fs::write(&path, script).expect("write mock CLI");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make mock CLI executable");
+            let agent = OpenCodeAgent::from_config(
+                OpenCodeAgentConfig {
+                    cli_path: path,
+                    ..OpenCodeAgentConfig::default()
+                },
+                SandboxMode::DangerFullAccess,
+            )
+            .with_stream_timeout(Some(1));
+            let request = AgentRequest {
+                prompt: "ignored".into(),
+                project_root: dir.path().into(),
+                ..AgentRequest::default()
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            let _receiver = if drop_receiver {
+                drop(rx);
+                None
+            } else {
+                Some(rx)
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                agent.execute_stream(request, tx),
+            )
+            .await
+            .expect("stream failure must terminate the sleeping child");
+            let error = result.expect_err("mock stream must fail").to_string();
+            let expected = if drop_receiver {
+                "stream send failed"
+            } else {
+                "idle timeout"
+            };
+            assert!(error.contains(expected), "{error}");
         }
     }
 
