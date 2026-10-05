@@ -140,7 +140,7 @@ fn otel_runtime_profile_from_job(job: &RuntimeJob) -> Option<RuntimeProfile> {
 }
 
 fn retry_attempt(job: &RuntimeJob) -> Option<u64> {
-    (job.lease_generation > 1).then_some(job.lease_generation - 1)
+    job.input.get("command")?.get("retry_attempt")?.as_u64()
 }
 
 fn activity_status_label(status: ActivityStatus) -> &'static str {
@@ -194,5 +194,99 @@ mod tests {
             ));
 
         assert_eq!(runtime_turn_artifact(&result), None);
+    }
+    #[test]
+    fn otel_retry_attempt_uses_the_produced_retry_command() {
+        use harness_workflow::runtime::{
+            reduce_runtime_job_completed, RuntimeKind, WorkflowCommand, WorkflowCommandType,
+            WorkflowEvent, WorkflowSubject, PROMPT_TASK_DEFINITION_ID,
+            PROMPT_TASK_IMPLEMENT_ACTIVITY, RUNTIME_JOB_COMPLETED_EVENT,
+        };
+        let instance = WorkflowInstance::new(
+            PROMPT_TASK_DEFINITION_ID,
+            1,
+            "implementing",
+            WorkflowSubject::new("prompt", "synthetic-task"),
+        )
+        .with_server_data(json!({"runtime_retry_policy": {"max_failed_activity_retries": 2}}));
+        let command = WorkflowCommand::new(
+            WorkflowCommandType::EnqueueActivity,
+            "synthetic-command",
+            json!({"activity": PROMPT_TASK_IMPLEMENT_ACTIVITY, "prompt_ref": "synthetic-prompt"}),
+        );
+        let result = ActivityResult::failed(
+            PROMPT_TASK_IMPLEMENT_ACTIVITY,
+            "Synthetic failure",
+            "first-party egress proxy did not become healthy before dispatch",
+        );
+        let event = WorkflowEvent::new(
+            &instance.id,
+            1,
+            RUNTIME_JOB_COMPLETED_EVENT,
+            "synthetic-runtime",
+        )
+        .with_payload(json!({
+            "command_id": "command-1", "command": command,
+            "runtime_job_id": "job-1", "activity_result": result,
+        }));
+        let decision = reduce_runtime_job_completed(&instance, &event)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.commands[0].command["retry_attempt"], 1);
+        // Match the dispatcher's existing command envelope, then claim the new job.
+        let mut job = RuntimeJob::pending(
+            "retry-command",
+            RuntimeKind::CodexJsonrpc,
+            "synthetic-profile",
+            json!({"command": decision.commands[0].command.clone()}),
+        );
+        job.claim(
+            "synthetic-worker",
+            chrono::Utc::now() + chrono::Duration::minutes(1),
+        );
+        assert_eq!(job.lease_generation, 1);
+        assert_eq!(retry_attempt(&job), Some(1));
+    }
+
+    #[test]
+    fn otel_retry_attempt_is_independent_of_lease_reclaims() {
+        use harness_workflow::runtime::RuntimeKind;
+        let mut job = RuntimeJob::pending(
+            "synthetic-command",
+            RuntimeKind::CodexJsonrpc,
+            "synthetic-profile",
+            json!({"command": {}}),
+        );
+        job.lease_generation = 2;
+        assert_eq!(retry_attempt(&job), None);
+        for attempt in [0, 1, 2, 3] {
+            job.input["command"]["retry_attempt"] = json!(attempt);
+            for generation in [1, 2, 7] {
+                job.lease_generation = generation;
+                assert_eq!(retry_attempt(&job), Some(attempt));
+            }
+        }
+    }
+
+    #[test]
+    fn otel_retry_attempt_does_not_infer_missing_or_invalid_values() {
+        use harness_workflow::runtime::RuntimeKind;
+        for input in [
+            json!({}),
+            json!({"command": {}}),
+            json!({"command": null}),
+            json!({"command": {"retry_attempt": null}}),
+            json!({"command": {"retry_attempt": -1}}),
+            json!({"command": {"retry_attempt": "2"}}),
+        ] {
+            let mut job = RuntimeJob::pending(
+                "synthetic-command",
+                RuntimeKind::CodexJsonrpc,
+                "synthetic-profile",
+                input,
+            );
+            job.lease_generation = 2;
+            assert_eq!(retry_attempt(&job), None);
+        }
     }
 }
