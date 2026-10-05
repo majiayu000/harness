@@ -447,3 +447,24 @@ it("closes a pending action when its workflow disappears", () => {
   expect(component.state.modal).toBeNull();
   expect(component.state.toast.msg).toBe("Workflow changed");
 });
+
+
+it.each([
+  { name: "absent usage", detail: {}, expected: "—" },
+  { name: "unobserved zero", detail: { token_usage: { total_tokens: 100, cost_usd: 0 }, cost_usd_observed: false }, expected: "Unknown" },
+  { name: "partial cost", detail: { token_usage: { total_tokens: 200, cost_usd: 0.125 }, cost_usd_observed: false }, expected: "$0.13 (partial)" },
+  { name: "observed zero", detail: { token_usage: { total_tokens: 100, cost_usd: 0 }, cost_usd_observed: true }, expected: "$0.00" },
+  { name: "observed cost", detail: { token_usage: { total_tokens: 100, cost_usd: 0.125 }, cost_usd_observed: true }, expected: "$0.13" },
+])("preserves workflow cost observation status for $name", async ({ detail, expected }) => {
+  const { context } = await setup(async path => {
+    const payload = path === "/api/workflows/runtime/submissions/sub-1" ? detail
+      : path.endsWith("/artifacts") || path.endsWith("/prompts") ? []
+      : path.startsWith("/api/workflows/runtime/tree?detail=full") ? { workflows: [], pagination: { has_more: false } } : null;
+    return payload === null ? null : { ok: true, status: 200, json: async () => payload };
+  });
+  const H = context.HC;
+  await H.loadDetails(H.workflows[0]);
+  expect(H.workflows[0].cost).toBe(expected);
+  await H.refresh();
+  expect(H.workflows[0].cost).toBe(expected);
+});

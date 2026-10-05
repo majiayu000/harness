@@ -5,6 +5,12 @@
   const refreshView = () => { for (const notify of window.__dcRegistry?.Root?.subs || []) notify(); };
   const formatInt = (value) => typeof value === 'number' ? Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value) : '—';
   const formatCost = (value) => typeof value === 'number' ? '$' + value.toFixed(2) : '—';
+  const formatWorkflowCost = (task) => {
+    const value = task?.token_usage?.cost_usd;
+    if (typeof value !== 'number') return '—';
+    if (task.cost_usd_observed === true) return formatCost(value);
+    return value > 0 ? formatCost(value) + ' (partial)' : 'Unknown';
+  };
   const age = (value) => {
     if (!value) return '—';
     const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000));
@@ -95,7 +101,8 @@
     const worktree = byWorktree.get(id);
     const action = byAction.get(id);
     const approval = task.pending_approvals?.find(item => item.type === 'approval_request' && item.id && item.approved == null);
-    const tokenUsage = H.details?.get(id)?.task?.token_usage;
+    const taskDetail = H.details?.get(id)?.task;
+    const tokenUsage = taskDetail?.token_usage;
     const leaseState = { active_leased: 'active', expired_lease: 'expired', missing_lease: 'missing' }[invocation?.lease_state] || invocation?.lease_state || '—';
     return {
       id, submissionId: task.submission_id || task.id, repo, projectId: project?.id || task.project || null, n: issue || pr || '—', pr,
@@ -109,7 +116,7 @@
       agent: invocation?.agent_runtime || '—', model: invocation?.model || '—', effort: invocation?.reasoning_effort || '—',
       host: invocation?.lease_owner || '—', turn: task.turn || 0, max: task.max_turns || worktree?.max_turns || '—',
       age: age(task.created_at), obs: invocation?.last_runtime_observation_at ? age(invocation.last_runtime_observation_at) : '—',
-      lease: leaseState, tokens: formatInt(tokenUsage?.total_tokens), cost: formatCost(tokenUsage?.cost_usd), file: '', sym: '', crate: repo,
+      lease: leaseState, tokens: formatInt(tokenUsage?.total_tokens), cost: formatWorkflowCost(taskDetail), file: '', sym: '', crate: repo,
       inbox: approval ? actionInbox({ kind: 'approval', requestId: approval.id, blocked_reason: 'approval_request', unblock_hint: approval.action, next_action: 'Approve or deny request' }) : actionInbox(action), waiting: task.scheduler?.authority_state || '', activity: invocation?.activity || '', taskKind: task.task_kind || null,
       branch: worktree?.branch || '—', worktree: worktree?.path_short || '—',
       terminal: terminalStates.has(current), ago: age(task.updated_at || task.created_at), score: '—',
@@ -438,7 +445,7 @@
     const usage = detail.task?.token_usage;
     if (usage) {
       workflow.tokens = formatInt(usage.total_tokens);
-      workflow.cost = formatCost(usage.cost_usd);
+      workflow.cost = formatWorkflowCost(detail.task);
     }
     refreshView();
   };
