@@ -488,3 +488,32 @@ async fn review_submission_preserves_runtime_execution_policy() -> anyhow::Resul
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn omitted_project_uses_configured_server_default() {
+    let configured_root = std::env::temp_dir().join("harness-configured-default-test");
+    let mut config = HarnessConfig::default();
+    config.server.project_root = configured_root.clone();
+    let service = DefaultExecutionService::new_for_tests(Arc::new(config), None, None, vec![]);
+
+    assert_eq!(
+        service.resolve_project(None).await.unwrap(),
+        Some(configured_root)
+    );
+}
+
+#[tokio::test]
+async fn explicit_project_keeps_precedence_over_server_default() {
+    let explicit_root = std::env::temp_dir().join("harness-explicit-project-test");
+    let mut config = HarnessConfig::default();
+    config.server.project_root = std::env::temp_dir().join("harness-other-default-test");
+    let service = DefaultExecutionService::new_for_tests(Arc::new(config), None, None, vec![]);
+
+    assert_eq!(
+        service
+            .resolve_project(Some(explicit_root.clone()))
+            .await
+            .unwrap(),
+        Some(explicit_root)
+    );
+}
