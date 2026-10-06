@@ -239,8 +239,9 @@ server and development setup.
 
 ### Server prerequisites
 
-- Bun 1.1+ for release builds that embed the web dashboard. If `web/dist` is
-  already built, release builds can reuse it.
+- Bun 1.3.14 (the version pinned in `.bun-version` and tested in CI) for release
+  builds that embed the web dashboard. If `web/dist` is already built, release
+  builds can reuse it.
 - Postgres 14+. For local development, `scripts/dev-db.sh` starts the bundled
   Postgres service and requires Docker Engine with the Docker Compose v2.1+
   plugin (`docker compose`, not legacy `docker-compose` v1).
