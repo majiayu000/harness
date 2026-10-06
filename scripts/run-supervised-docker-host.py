@@ -17,6 +17,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -127,28 +128,32 @@ class Host:
     def persist(self) -> None:
         save(self.root / "state.json", self.state)
 
-    def api(self, path: str, body: dict) -> dict:
+    def api(self, path: str, body: dict, *, deadline: float | None = None) -> dict:
+        timeout = 15 if deadline is None else min(15, deadline - time.monotonic())
+        if timeout <= 0:
+            raise RuntimeError("verifier exceeded claimed wall deadline")
         request = urllib.request.Request(
             self.args.server_url.rstrip("/") + path,
             data=json.dumps(body).encode(),
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as error:
             # Preserve server fencing/cancellation facts without recording credentials.
             detail = error.read().decode()
             raise RuntimeError(f"control plane returned {error.code}: {detail}") from error
 
-    def renew(self) -> None:
+    def renew(self, *, deadline: float | None = None) -> None:
         if time.monotonic() - self.last_renewal < 30:
             return
-        self.api(self.endpoint + "/heartbeat", {})
+        self.api(self.endpoint + "/heartbeat", {}, deadline=deadline)
         lease = self.state["lease"]
         response = self.api(
             self.endpoint + f"/runtime-jobs/{self.state['job']['id']}/lease/renew",
             {**lease, "renewal_id": str(uuid.uuid4()), "lease_secs": LEASE_SECONDS},
+            deadline=deadline,
         )
         self.state["lease"] = {key: response[key] for key in lease}
         self.persist()
@@ -602,9 +607,35 @@ class Host:
         ]
         validation = []
         started = time.monotonic()
+        deadline = started + effective["wall_time_secs"]
+        expired = threading.Event()
+        stop_errors = []
+
+        def terminate_verifier() -> None:
+            try:
+                # Private PID namespace: preserve PID 1 and tmpfs for final evidence,
+                # but stop every verifier child even if it detached from its parent.
+                docker("exec", self.name + "-verify", "python3", "-I", "-c",
+                       "import os,signal\ntry: os.kill(-1,signal.SIGKILL)\nexcept ProcessLookupError: pass",
+                       timeout=5)
+            except Exception as error:
+                try:
+                    # PID exhaustion may prevent exec. Stopping our container then
+                    # takes precedence over retaining a complete resource snapshot.
+                    docker("kill", self.name + "-verify", timeout=5)
+                except Exception as stop_error:
+                    stop_errors.append(f"verifier termination failed: {error}; {stop_error}")
+
+        def stop_verifier() -> None:
+            expired.set()
+            terminate_verifier()
+
+        watchdog = threading.Timer(max(0, deadline - time.monotonic()), stop_verifier)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             for index, argv in enumerate([reconstruction, *validation_commands]):
-                remaining_wall = effective["wall_time_secs"] - (time.monotonic() - started)
+                remaining_wall = deadline - time.monotonic()
                 if remaining_wall <= 0:
                     raise RuntimeError("verifier exceeded claimed wall deadline")
                 remaining_output = effective["output_bytes"] - self.state["output_bytes"]
@@ -613,13 +644,15 @@ class Host:
                 try:
                     exit_code = stream_agent_output(
                         ["docker", "exec", "--workdir", "/candidate", self.name + "-verify", *argv],
-                        self.root, remaining_wall, self.renew,
+                        self.root, remaining_wall, lambda: self.renew(deadline=deadline),
                         output_limit=remaining_output, account=account,
-                        check=lambda: self.check_verifier_cpu(effective["cpu_time_secs"]),
+                        check=lambda: self.check_verifier_cpu(effective["cpu_time_secs"], deadline=deadline),
                     )
                 finally:
                     self.state["output_bytes"] += account.get("output_bytes", 0)
                     self.persist()
+                if expired.is_set() or time.monotonic() >= deadline:
+                    raise RuntimeError("verifier exceeded claimed wall deadline")
                 if index == 0:
                     if exit_code:
                         raise RuntimeError(f"independent verifier could not reconstruct candidate: exit {exit_code}")
@@ -631,14 +664,43 @@ class Host:
                     "duration_ms": max(0, int((time.monotonic() - command_started) * 1000)),
                 })
         finally:
+            primary_error = sys.exc_info()[1]
+            collection_error = None
+            try:
+                # Successful commands may leave detached children. Keep their
+                # quiescence and final resource sampling inside the deadline.
+                self.collect_resources(stop_agents=True)
+            except (Exception, KeyboardInterrupt) as error:
+                collection_error = error
+                terminate_verifier()
+            watchdog.cancel()
+            watchdog.join()
+            if time.monotonic() >= deadline and not expired.is_set():
+                # The timer thread may not have run yet when the main thread
+                # finishes. Canceling it must not erase an overdue deadline.
+                stop_verifier()
             self.state["wall_time_millis"] = max(0, int((time.monotonic() - started) * 1000))
             self.persist()
-        self.collect_resources(stop_agents=True)
+            if expired.is_set():
+                reason = "verifier exceeded claimed wall deadline"
+                if stop_errors:
+                    reason += "; " + "; ".join(stop_errors)
+                raise RuntimeError(reason) from (primary_error or collection_error)
+            if collection_error is not None:
+                reason = f"resource collection failed: {collection_error}"
+                if primary_error is not None:
+                    reason = f"{primary_error}; {reason}"
+                if stop_errors:
+                    reason += "; " + "; ".join(stop_errors)
+                raise RuntimeError(reason) from (primary_error or collection_error)
         return validation
 
-    def check_verifier_cpu(self, cpu_time_secs: int) -> None:
+    def check_verifier_cpu(self, cpu_time_secs: int, *, deadline: float) -> None:
+        timeout = min(30, deadline - time.monotonic())
+        if timeout <= 0:
+            raise RuntimeError("verifier exceeded claimed wall deadline")
         metrics = json.loads(docker("exec", self.name + "-observer", "python3", "-I", "-c",
-                                    CGROUP_METRICS_SCRIPT))
+                                    CGROUP_METRICS_SCRIPT, timeout=timeout))
         if quality_gate.cpu_time_exceeded(metrics["cpu_time_micros"], cpu_time_secs):
             raise RuntimeError("verifier exceeded cumulative CPU time limit")
 
