@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 /// families older than the cutoff that are not depended on by any live
 /// workflow. Declarative terminal selectors include the exact version and
 /// content hash so a current definition cannot reclassify historical rows.
+/// Limit eligible families so an older protected family cannot starve cleanup.
 const PRUNE_ELIGIBLE_ROOTS_CTE: &str = r#"WITH RECURSIVE terminal_states(
                  definition_id, definition_version, definition_hash, state
              ) AS (
@@ -33,8 +34,6 @@ const PRUNE_ELIGIBLE_ROOTS_CTE: &str = r#"WITH RECURSIVE terminal_states(
                              )
                          )
                    )
-                 ORDER BY root.updated_at ASC, root.id ASC
-                 LIMIT $6
              ),
              family AS (
                  SELECT root.id AS root_id,
@@ -55,7 +54,7 @@ const PRUNE_ELIGIBLE_ROOTS_CTE: &str = r#"WITH RECURSIVE terminal_states(
                  FROM workflow_instances AS child
                  JOIN family ON child.parent_workflow_id = family.id
              ),
-             eligible_roots AS (
+             eligible_families AS (
                  SELECT family.root_id
                  FROM family
                  GROUP BY family.root_id
@@ -113,6 +112,13 @@ const PRUNE_ELIGIBLE_ROOTS_CTE: &str = r#"WITH RECURSIVE terminal_states(
                               dependent.data->'data'->'last_stop'->>'stop_reason_code')
                               = 'runtime_transcript_lost')
                     ))
+             ),
+             eligible_roots AS (
+                 SELECT eligible_families.root_id
+                 FROM eligible_families
+                 JOIN workflow_instances AS root ON root.id = eligible_families.root_id
+                 ORDER BY root.updated_at ASC, root.id ASC
+                 LIMIT $6
              )"#;
 
 impl WorkflowRuntimeStore {
