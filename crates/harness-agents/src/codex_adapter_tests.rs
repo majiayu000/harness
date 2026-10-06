@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::time::Instant;
 
-fn test_turn_request(project_root: PathBuf) -> AgentRequest {
+pub(super) fn test_turn_request(project_root: PathBuf) -> AgentRequest {
     AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
@@ -29,7 +29,7 @@ fn test_turn_request(project_root: PathBuf) -> AgentRequest {
 }
 
 #[cfg(unix)]
-fn write_app_server_stub(dir: &std::path::Path, body: &str) -> anyhow::Result<PathBuf> {
+pub(super) fn write_app_server_stub(dir: &std::path::Path, body: &str) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let path = dir.join("codex-app-server-stub");
@@ -273,9 +273,10 @@ fn parse_error_response_without_jsonrpc() {
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
-        ParsedCodexMessage::Event(AgentEvent::Error {
-            message: "invalid request".into()
-        })
+        ParsedCodexMessage::RpcError {
+            id: json!(1),
+            error: json!({"message":"invalid request"}),
+        }
     );
 }
 
@@ -1090,6 +1091,7 @@ for raw in sys.stdin:
         print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"method": "thread/started", "params": {"thread": {"id": "thread-1"}}}), flush=True)
+        print(json.dumps({"id": msg["id"], "result": {"thread": {"id": "thread-1"}}}), flush=True)
     elif method == "turn/start":
         open(turn_start_seen, "w").close()
         while not os.path.exists(release_turn_started):
@@ -1348,6 +1350,7 @@ for raw in sys.stdin:
         print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"method": "thread/started", "params": {"thread": {"id": "thread-1"}}}), flush=True)
+        print(json.dumps({"id": msg["id"], "result": {"thread": {"id": "thread-1"}}}), flush=True)
         break
 time.sleep(60)
 "#,
