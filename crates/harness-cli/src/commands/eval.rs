@@ -423,8 +423,11 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
     ));
     output.push_str(&format!(
         "cost_usd_micros: total={} avg/scored={}\n",
-        metrics.total_cost_usd_micros,
-        format_optional_float(metrics.avg_cost_usd_micros_per_scored_case)
+        format_optional_cost(metrics.total_cost_usd_micros),
+        metrics
+            .avg_cost_usd_micros_per_scored_case
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "unknown".to_string())
     ));
     output.push_str("cases:\n");
     for case in &report.cases {
@@ -437,7 +440,7 @@ pub(crate) fn render_run_report(report: &EvalRunReport) -> String {
             attestation_label(case.attestation_trust, case.attestation_decision),
             infrastructure_status_label(case.infrastructure_status),
             case.total_tokens,
-            case.cost_usd_micros,
+            format_optional_cost(case.cost_usd_micros),
             case_source_commit(case),
             case.terminal_state.as_deref().unwrap_or("n/a")
         ));
@@ -495,8 +498,12 @@ pub(crate) fn render_diff_report(diff: &EvalRunReportDiff) -> String {
         diff.delta.pass_at_1_delta, diff.k, diff.delta.pass_to_k_delta
     ));
     output.push_str(&format!(
-        "tokens delta: {:+}  cost_usd_micros delta: {:+}\n",
-        diff.delta.total_tokens_delta, diff.delta.total_cost_usd_micros_delta
+        "tokens delta: {:+}  cost_usd_micros delta: {}\n",
+        diff.delta.total_tokens_delta,
+        diff.delta
+            .total_cost_usd_micros_delta
+            .map(|value| format!("{value:+}"))
+            .unwrap_or_else(|| "unknown".to_string())
     ));
     output.push_str(&format!(
         "regressions: count={} ids={}\n",
@@ -556,6 +563,12 @@ fn format_optional_float(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.2}"))
         .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_optional_cost(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn case_status_label(status: EvalReportCaseStatus) -> &'static str {

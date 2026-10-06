@@ -200,7 +200,9 @@ fn eval_report_evidence_text_includes_pass_cost_and_tokens() {
     assert_eq!(report.metrics.failed_cases, 0);
     assert_eq!(report.metrics.skipped_cases, 1);
     assert_eq!(report.metrics.total_tokens, 120);
-    assert_eq!(report.metrics.total_cost_usd_micros, 50);
+    assert_eq!(report.metrics.total_cost_usd_micros, None);
+    assert!(rendered.contains("cost_usd_micros: total=unknown avg/scored=unknown"));
+    assert!(rendered.contains("tokens=120 cost_usd_micros=50"));
     assert!(rendered.contains("pass@1: 1.0000"));
     assert!(rendered.contains("pass^3: 1.0000"));
     assert!(rendered.contains("status=skipped"));
@@ -284,7 +286,25 @@ fn eval_report_diff_text_includes_status_transitions() {
     assert!(rendered.contains("pass_to_fail"));
     assert!(rendered.contains("regressions: count=1 ids=case-pass"));
     assert!(rendered.contains("tokens delta: -20"));
-    assert!(rendered.contains("cost_usd_micros delta: -10"));
+    assert!(rendered.contains("cost_usd_micros delta: unknown"));
+}
+
+#[test]
+fn eval_cost_rendering_distinguishes_unknown_from_observed_zero() {
+    let mut report = eval_report_dry_run(&sample_eval_manifest(), "run", 1).unwrap();
+    let unknown = render_run_report(&report);
+    assert!(unknown.contains("cost_usd_micros: total=unknown avg/scored=unknown"));
+    assert!(unknown.contains("cost_usd_micros=unknown"));
+    report.metrics.total_cost_usd_micros = Some(0);
+    report.metrics.avg_cost_usd_micros_per_scored_case = Some(0.0);
+    report.cases[0].cost_usd_micros = Some(0);
+    let observed = render_run_report(&report);
+    assert!(observed.contains("cost_usd_micros: total=0 avg/scored=0.00"));
+    assert!(observed.contains("cost_usd_micros=0"));
+    let mut candidate = report.clone();
+    candidate.metrics.total_cost_usd_micros = Some(25);
+    let diff = diff_eval_run_reports(&report, &candidate).unwrap();
+    assert!(render_diff_report(&diff).contains("cost_usd_micros delta: +25"));
 }
 
 #[test]
@@ -761,7 +781,7 @@ fn report_with_pass_count(run_id: &str, total_cases: u64, passed_cases: u64) -> 
                 terminal_state: None,
                 infrastructure_status: EvalCaseInfrastructureStatus::Healthy,
                 total_tokens: 0,
-                cost_usd_micros: 0,
+                cost_usd_micros: Some(0),
                 missing_evidence: Vec::new(),
             }
         })
@@ -786,7 +806,7 @@ fn report_with_pass_count(run_id: &str, total_cases: u64, passed_cases: u64) -> 
             pass_to_k: pass_at_1,
             total_tokens: 0,
             avg_tokens_per_scored_case: Some(0.0),
-            total_cost_usd_micros: 0,
+            total_cost_usd_micros: Some(0),
             avg_cost_usd_micros_per_scored_case: Some(0.0),
         },
         cases,
