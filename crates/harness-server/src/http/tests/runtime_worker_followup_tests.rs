@@ -1,4 +1,6 @@
 use super::*;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 #[tokio::test]
 async fn runtime_job_worker_requeues_pr_feedback_child_inspect_after_stale_dedupe(
@@ -337,7 +339,13 @@ async fn runtime_job_worker_applies_runtime_profile_timeout() -> anyhow::Result<
     )?;
     let mut registry = harness_agents::registry::AgentRegistry::new("codex");
     registry.register("codex", BlockingAgent::new());
-    registry.register_turn_backend_factory("codex", || BlockingAgent::new())?;
+    let created_adapters = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factory_adapters = created_adapters.clone();
+    registry.register_turn_backend_factory("codex", move || {
+        let adapter = BlockingAgent::new();
+        factory_adapters.lock().unwrap().push(adapter.clone());
+        adapter
+    })?;
     let state =
         make_test_state_with_workflow_runtime_and_registry(dir.path(), &project_root, registry)
             .await?;
@@ -383,12 +391,37 @@ async fn runtime_job_worker_applies_runtime_profile_timeout() -> anyhow::Result<
         )
         .await?;
 
-    let tick = crate::workflow_runtime_worker::run_runtime_job_worker_tick(
-        &state,
-        "worker-test",
-        chrono::Duration::minutes(5),
+    let tick = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::workflow_runtime_worker::run_runtime_job_worker_tick(
+            &state,
+            "worker-test",
+            chrono::Duration::minutes(5),
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("runtime profile timeout did not finish cleanup within 5 seconds")
+    })??;
+
+    let adapter = {
+        let adapters = created_adapters.lock().unwrap();
+        let started: Vec<_> = adapters
+            .iter()
+            .filter(|adapter| adapter.turn_starts.load(Ordering::Acquire) != 0)
+            .cloned()
+            .collect();
+        assert_eq!(started.len(), 1, "one per-turn adapter must actually start");
+        started[0].clone()
+    };
+    assert_eq!(adapter.turn_starts.load(Ordering::Acquire), 1);
+    assert_eq!(adapter.active_streams.load(Ordering::Acquire), 0);
+    assert_eq!(adapter.dropped_streams.load(Ordering::Acquire), 1);
+    assert_eq!(
+        adapter.drain_calls.load(Ordering::Acquire),
+        1,
+        "the timed-out adapter must confirm termination after its stream drops"
+    );
 
     assert_eq!(tick.failed, 1);
     assert_eq!(tick.succeeded, 0);
