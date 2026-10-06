@@ -16,3 +16,6 @@ mod terminal_error_tests;
 
 #[cfg(test)]
 mod turn_lifecycle_tests;
+
+#[cfg(test)]
+mod cleanup_tests;

@@ -333,13 +333,18 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                                 budget_usd = stop.budget_usd,
                                 "workflow budget ceiling reached mid-turn; interrupting agent"
                             );
-                            if let Some(adapter) = adapter_opt.as_ref() {
-                                if let Err(error) = adapter.interrupt().await {
-                                    tracing::warn!(
-                                        thread_id = %thread_id,
-                                        turn_id = %turn_id,
-                                        "failed to interrupt agent after the budget ceiling: {error}"
-                                    );
+                            // Drop start_turn before locking its execution adapter:
+                            // initialization may still own that same lock.
+                            terminate_execution_after_drop = executes_via_adapter;
+                            if !control_is_execution_adapter {
+                                if let Some(adapter) = adapter_opt.as_ref() {
+                                    if let Err(error) = adapter.interrupt().await {
+                                        tracing::warn!(
+                                            thread_id = %thread_id,
+                                            turn_id = %turn_id,
+                                            "failed to interrupt agent after the budget ceiling: {error}"
+                                        );
+                                    }
                                 }
                             }
                             execution_result = Some(Err(HarnessError::AgentExecution(format!(
@@ -432,6 +437,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 execution_result = Some(Err(HarnessError::AgentExecution(format!(
                     "Agent turn timed out after {timeout_secs}s"
                 ))));
+                terminate_execution_after_drop = executes_via_adapter;
                 break 'outer;
             }
         }
@@ -443,20 +449,36 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     drop(execution);
     if terminate_execution_after_drop {
         if let Some(adapter) = execution_terminator.as_ref() {
-            if let Err(cleanup_error) = adapter.terminate_and_drain().await {
+            let mut cleanup_failure_recorded = false;
+            while let Err(cleanup_error) = adapter.terminate_and_drain().await {
                 tracing::error!(
                     thread_id = %thread_id,
                     turn_id = %turn_id,
                     "failed to force-stop and drain interrupted agent execution: {cleanup_error}"
                 );
-                // Surface cleanup failure at the turn/resource-release boundary so
-                // unknown process state is never reported as a successful drain.
-                execution_result = Some(match execution_result.take() {
-                    None | Some(Ok(())) => Err(cleanup_error),
-                    Some(Err(primary)) => Err(HarnessError::AgentExecution(format!(
-                        "{primary}; cleanup failed: {cleanup_error}"
-                    ))),
-                });
+                if !cleanup_failure_recorded {
+                    let message = format!(
+                        "Agent cleanup failed; keeping the workspace reserved until termination is confirmed: {cleanup_error}"
+                    );
+                    if let Err(error) = server.thread_manager.add_item(
+                        &thread_id,
+                        &turn_id,
+                        harness_core::types::Item::error(message),
+                    ) {
+                        tracing::warn!("failed to record pending agent cleanup: {error}");
+                    }
+                    execution_result = Some(match execution_result.take() {
+                        None | Some(Ok(())) => Err(cleanup_error),
+                        Some(Err(primary)) => Err(HarnessError::AgentExecution(format!(
+                            "{primary}; cleanup failed: {cleanup_error}"
+                        ))),
+                    });
+                    cleanup_failure_recorded = true;
+                }
+                // Keep the execution scope and its workspace/repository leases
+                // alive. A failed drain is not permission to publish a terminal
+                // turn or to run workspace hooks/removal against a live writer.
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }

@@ -13,6 +13,11 @@ pub mod opencode;
 pub mod opencode_adapter;
 mod output_capture;
 pub mod output_parsing;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod process_group;
 pub mod provider_backpressure;
 pub mod registry;
 pub mod scoped_token;
@@ -120,10 +125,25 @@ pub(crate) fn kill_process_group(child: &tokio::process::Child) {
 
 #[cfg(unix)]
 fn process_group_has_members(pid: u32) -> bool {
-    // kill(-pgid, 0) performs existence/permission checking without sending a
-    // signal. A non-zero result is treated as drained; in this use case Harness
-    // owns the child group, so EPERM should not hide live descendants.
+    // Only ESRCH confirms absence. Permission or inspection failures must not
+    // authorize workspace release while the group's state is unknown.
     (unsafe { nix_kill(-(pid as i32), 0) }) == 0
+        || std::io::Error::last_os_error().raw_os_error() != Some(3)
+}
+
+#[cfg(unix)]
+fn process_group_has_live_members(pid: u32) -> bool {
+    if !process_group_has_members(pid) {
+        return false;
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    if process_group::contains_only_exited_processes(pid) {
+        return false;
+    }
+    true
 }
 
 /// Raw kill(2) syscall without libc dependency.
@@ -381,7 +401,7 @@ impl ManagedChild {
         let Some(process_group_id) = self.process_group_id else {
             return Ok(());
         };
-        if !process_group_has_members(process_group_id) {
+        if !process_group_has_live_members(process_group_id) {
             return Ok(());
         }
 
@@ -393,7 +413,7 @@ impl ManagedChild {
         kill_process_group_id(process_group_id);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if !process_group_has_members(process_group_id) {
+            if !process_group_has_live_members(process_group_id) {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -488,7 +508,9 @@ impl Drop for ManagedChild {
         };
 
         #[cfg(unix)]
-        let group_has_members = self.process_group_id.is_some_and(process_group_has_members);
+        let group_has_members = self
+            .process_group_id
+            .is_some_and(process_group_has_live_members);
         #[cfg(not(unix))]
         let group_has_members = false;
 
@@ -530,7 +552,9 @@ impl Drop for ManagedChild {
     }
 }
 
-/// Reap a killed child and wait until its process group has no remaining members.
+/// Reap the owned child and confirm that no process-group member can still run.
+/// Exited descendants may remain owned by an external reaper; their pidfds are
+/// sufficient exit acknowledgement on supported Linux kernels.
 fn drain_killed_child_blocking(
     mut child: tokio::process::Child,
     mut child_reaped: bool,
@@ -556,7 +580,7 @@ fn drain_killed_child_blocking(
         }
 
         #[cfg(unix)]
-        let group_drained = process_group_id.is_none_or(|pid| !process_group_has_members(pid));
+        let group_drained = process_group_id.is_none_or(|pid| !process_group_has_live_members(pid));
         #[cfg(not(unix))]
         let group_drained = true;
 
@@ -656,7 +680,7 @@ mod managed_child_tests {
 
         drop(managed);
         assert!(
-            !process_group_has_members(pgid),
+            !process_group_has_live_members(pgid),
             "drop returned before the killed process group drained"
         );
     }
@@ -680,12 +704,19 @@ mod managed_child_tests {
         // group before returning (there is no executor to run a reaper task).
         drop(managed);
         assert!(
-            !process_group_has_members(pgid),
+            !process_group_has_live_members(pgid),
             "blocking fallback should drain the killed process group before returning"
         );
         drop(runtime);
     }
 }
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod managed_child_zombie_tests;
 
 #[cfg(test)]
 #[path = "run_id_tests.rs"]
