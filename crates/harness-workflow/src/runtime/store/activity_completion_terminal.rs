@@ -23,15 +23,15 @@ pub(super) fn cancellation_ack_matches(job: &RuntimeJob, result: &ActivityResult
 
 pub(super) async fn lock_workflow_commands_for_terminal_fence_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workflow_id: &str,
+    workflow_ids: &[&str],
 ) -> anyhow::Result<()> {
     sqlx::query(
         "SELECT id FROM workflow_commands
-         WHERE workflow_id = $1
+         WHERE workflow_id = ANY($1::text[])
          ORDER BY id
          FOR UPDATE",
     )
-    .bind(workflow_id)
+    .bind(workflow_ids)
     .fetch_all(&mut **tx)
     .await?;
     Ok(())
@@ -39,16 +39,16 @@ pub(super) async fn lock_workflow_commands_for_terminal_fence_tx(
 
 pub(super) async fn lock_workflow_runtime_jobs_for_terminal_fence_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    workflow_id: &str,
+    workflow_ids: &[&str],
 ) -> anyhow::Result<()> {
     sqlx::query(
         "SELECT job.id FROM runtime_jobs AS job
          JOIN workflow_commands AS command ON command.id = job.command_id
-         WHERE command.workflow_id = $1
+         WHERE command.workflow_id = ANY($1::text[])
          ORDER BY job.id
          FOR UPDATE OF job",
     )
-    .bind(workflow_id)
+    .bind(workflow_ids)
     .fetch_all(&mut **tx)
     .await?;
     Ok(())

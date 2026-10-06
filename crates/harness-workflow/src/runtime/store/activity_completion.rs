@@ -234,22 +234,68 @@ impl WorkflowRuntimeStore {
                 .fetch_optional(&self.pool)
                 .await?;
 
-        let mut tx = self.pool.begin().await?;
-        // Lock order 1/3: the workflow instance. `apply_runtime_completion_decision_tx`
-        // needs this lock at the end of the transaction; taking it here instead
-        // keeps this path from inverting the order used by command dispatch.
-        // A missing instance is fine — the no-workflow path below owns that
-        // case, and locking an absent row is a no-op.
-        let locked_workflow = if let Some((workflow_id,)) = workflow_id_row.as_ref() {
-            transaction_helpers::select_instance_for_update_tx(&mut tx, workflow_id).await?
-        } else {
-            None
+        let workflow_id = workflow_id_row.as_ref().map(|(id,)| id.as_str());
+        // Lock both instances before either workflow's commands or jobs. The
+        // parent reducer may take a terminal fence, so acquiring its locks
+        // after completing the child's job would invert the hierarchy.
+        // Multi-workflow lease revocation also locks instances in ID order.
+        let (mut tx, locked_workflow, locked_parent) = loop {
+            let parent_workflow_id = match workflow_id {
+                Some(id) => self
+                    .get_instance(id)
+                    .await?
+                    .as_ref()
+                    .and_then(child_completion_parent_id)
+                    .map(ToOwned::to_owned),
+                None => None,
+            };
+            let workflow_ids = workflow_id
+                .into_iter()
+                .chain(parent_workflow_id.as_deref())
+                .collect::<Vec<_>>();
+
+            let mut tx = self.pool.begin().await?;
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT data::text FROM workflow_instances
+                 WHERE id = ANY($1::text[])
+                 ORDER BY id
+                 FOR UPDATE",
+            )
+            .bind(&workflow_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            let instances = rows
+                .into_iter()
+                .map(|(data,)| workflow_instance_from_persisted_json(&data))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let locked_workflow = instances
+                .iter()
+                .find(|instance| Some(instance.id.as_str()) == workflow_id)
+                .cloned();
+            if locked_workflow
+                .as_ref()
+                .and_then(child_completion_parent_id)
+                != parent_workflow_id.as_deref()
+            {
+                // A child can acquire its parent once, after creation. If
+                // attachment raced the plain read, restart before any write
+                // rather than lock the newly discovered parent out of order.
+                tx.rollback().await?;
+                continue;
+            }
+            let locked_parent = instances
+                .into_iter()
+                .find(|instance| Some(instance.id.as_str()) == parent_workflow_id.as_deref());
+            break (tx, locked_workflow, locked_parent);
         };
-        if let (Some(_), Some((workflow_id,))) =
-            (locked_workflow.as_ref(), workflow_id_row.as_ref())
-        {
-            lock_workflow_commands_for_terminal_fence_tx(&mut tx, workflow_id).await?;
-            lock_workflow_runtime_jobs_for_terminal_fence_tx(&mut tx, workflow_id).await?;
+        let workflow_ids = locked_workflow
+            .iter()
+            .chain(locked_parent.iter())
+            .map(|instance| instance.id.as_str())
+            .collect::<Vec<_>>();
+        if !workflow_ids.is_empty() {
+            lock_workflow_commands_for_terminal_fence_tx(&mut tx, &workflow_ids).await?;
+            lock_workflow_runtime_jobs_for_terminal_fence_tx(&mut tx, &workflow_ids).await?;
         }
         // Lock order 2/3: the command.
         let command_row: Option<WorkflowCommandRecordRow> = sqlx::query_as(
@@ -521,9 +567,44 @@ impl WorkflowRuntimeStore {
         )
         .await?;
 
+        let parent_completion = if let Some(parent) = locked_parent {
+            let child =
+                transaction_helpers::select_instance_for_update_tx(&mut tx, &locked_workflow.id)
+                    .await?
+                    .context("completed child workflow disappeared within its transaction")?;
+            if should_propagate_child_completion(&child, result) {
+                let parent_event = transaction_helpers::insert_event_tx(
+                    &mut tx,
+                    &parent.id,
+                    "RuntimeJobCompleted",
+                    lease.owner,
+                    merge_child_completion_payload(&event, &child),
+                )
+                .await?;
+                let parent_decision = runtime_completion::apply_runtime_completion_decision_tx(
+                    &mut tx,
+                    &self.definition_registry,
+                    &parent.id,
+                    lease.owner,
+                    &parent_event,
+                    &self.budget_policy,
+                )
+                .await?;
+                Some((parent_event, parent_decision))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         tx.commit().await?;
         if let Some(decision) = decision_record.as_ref() {
             self.record_terminal_repo_memory_for_completion(&event, decision)
+                .await;
+        }
+        if let Some((parent_event, Some(parent_decision))) = parent_completion.as_ref() {
+            self.record_terminal_repo_memory_for_completion(parent_event, parent_decision)
                 .await;
         }
         Ok(Some(RuntimeActivityCompletion {
@@ -533,6 +614,61 @@ impl WorkflowRuntimeStore {
             decision: decision_record,
         }))
     }
+}
+
+fn child_completion_parent_id(child: &WorkflowInstance) -> Option<&str> {
+    match child.definition_id.as_str() {
+        crate::runtime::PR_FEEDBACK_DEFINITION_ID | crate::runtime::QUALITY_GATE_DEFINITION_ID => {
+            child.parent_workflow_id.as_deref()
+        }
+        _ => None,
+    }
+}
+
+fn should_propagate_child_completion(child: &WorkflowInstance, result: &ActivityResult) -> bool {
+    match child.definition_id.as_str() {
+        crate::runtime::PR_FEEDBACK_DEFINITION_ID => {
+            result.status == ActivityStatus::Succeeded
+                && !matches!(child.state.as_str(), "pending" | "inspecting")
+                && !(child.state == "blocked"
+                    && child.data.get("stop_reason_code").and_then(Value::as_str)
+                        == Some(crate::runtime::STOP_REASON_INVALID_AGENT_OUTPUT))
+        }
+        crate::runtime::QUALITY_GATE_DEFINITION_ID => matches!(
+            child.state.as_str(),
+            "passed" | "blocked" | "failed" | "cancelled"
+        ),
+        _ => false,
+    }
+}
+
+fn merge_child_completion_payload(event: &WorkflowEvent, child: &WorkflowInstance) -> Value {
+    let mut payload = event.event.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("child_workflow_id".to_string(), json!(child.id));
+        if let Some(runtime_job_id) = child
+            .data
+            .get("started_by_runtime_job_id")
+            .and_then(Value::as_str)
+        {
+            object.insert(
+                "recovery_activity".to_string(),
+                json!("start_child_workflow"),
+            );
+            object.insert("recovery_runtime_job_id".to_string(), json!(runtime_job_id));
+        }
+        if let Some(artifacts) = object
+            .get_mut("activity_result")
+            .and_then(Value::as_object_mut)
+            .and_then(|activity_result| activity_result.get_mut("artifacts"))
+            .and_then(Value::as_array_mut)
+        {
+            artifacts.retain(|artifact| {
+                artifact.get("artifact_type").and_then(Value::as_str) != Some("workflow_decision")
+            });
+        }
+    }
+    payload
 }
 
 fn cancellation_ack_is_stale_for_workflow(
