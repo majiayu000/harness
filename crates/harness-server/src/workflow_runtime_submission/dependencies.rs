@@ -181,12 +181,9 @@ pub(crate) async fn release_ready_issue_dependencies(
         )
         .await?;
     let mut summary = DependencyReleaseSummary::default();
-    // Waiting instances and the edges between them, for cycle detection
-    // (GH-1885): edge A -> B when A waits on B and B is itself awaiting
-    // dependencies. A cycle in this subgraph can never self-resolve.
+    // Only this page may transition during the sweep. Cycle discovery below
+    // follows their waiting dependencies beyond the page boundary.
     let mut waiting_instances: Vec<WorkflowInstance> = Vec::new();
-    let mut waiting_edges: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
     for instance in instances {
         let depends_on = match task_ids_from_data(&instance.data, "depends_on") {
             Ok(depends_on) => depends_on,
@@ -220,14 +217,6 @@ pub(crate) async fn release_ready_issue_dependencies(
                 }
                 RuntimeDependencyStatus::Waiting => {
                     all_done = false;
-                    if let Some(dep) = dep_instance {
-                        if dep.state == "awaiting_dependencies" {
-                            waiting_edges
-                                .entry(instance.id.clone())
-                                .or_default()
-                                .push(dep.id.clone());
-                        }
-                    }
                 }
             }
         }
@@ -242,6 +231,7 @@ pub(crate) async fn release_ready_issue_dependencies(
             waiting_instances.push(instance);
         }
     }
+    let waiting_edges = collect_waiting_dependency_edges(store, &waiting_instances).await?;
     let deadlocked = find_dependency_cycle_members(&waiting_edges);
     for instance in waiting_instances {
         if deadlocked.contains(&instance.id) {
@@ -255,6 +245,34 @@ pub(crate) async fn release_ready_issue_dependencies(
     Ok(summary)
 }
 
+async fn collect_waiting_dependency_edges(
+    store: &WorkflowRuntimeStore,
+    roots: &[WorkflowInstance],
+) -> anyhow::Result<std::collections::BTreeMap<String, Vec<String>>> {
+    let mut edges = std::collections::BTreeMap::new();
+    let mut pending = roots.to_vec();
+    while let Some(instance) = pending.pop() {
+        if edges.contains_key(&instance.id) {
+            continue;
+        }
+        let mut targets = Vec::new();
+        if let Ok(dependencies) = task_ids_from_data(&instance.data, "depends_on") {
+            for dependency in dependencies {
+                if let Some(target) =
+                    resolve_issue_dependency_instance(store, &instance, &dependency).await?
+                {
+                    if target.state == "awaiting_dependencies" {
+                        targets.push(target.id.clone());
+                        pending.push(target);
+                    }
+                }
+            }
+        }
+        edges.insert(instance.id, targets);
+    }
+    Ok(edges)
+}
+
 /// Workflow ids that sit on a dependency cycle among mutually-waiting
 /// instances. Downstream waiters that merely point *into* a cycle are left
 /// alone: once cycle members fail, the existing terminal-dependency path
@@ -262,54 +280,51 @@ pub(crate) async fn release_ready_issue_dependencies(
 fn find_dependency_cycle_members(
     edges: &std::collections::BTreeMap<String, Vec<String>>,
 ) -> std::collections::BTreeSet<String> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Color {
-        White,
-        Gray,
-        Black,
+    // Discover strongly connected components in two iterative passes. Looking
+    // only for DFS back edges misses members reached through a finished branch.
+    let mut reverse: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for (node, targets) in edges {
+        reverse.entry(node).or_default();
+        for target in targets {
+            reverse.entry(target).or_default().push(node);
+        }
     }
-    let mut color: std::collections::BTreeMap<&str, Color> = edges
-        .iter()
-        .flat_map(|(node, targets)| {
-            std::iter::once(node.as_str()).chain(targets.iter().map(String::as_str))
-        })
-        .map(|node| (node, Color::White))
-        .collect();
-    let mut members = std::collections::BTreeSet::new();
-
-    fn visit<'a>(
-        node: &'a str,
-        edges: &'a std::collections::BTreeMap<String, Vec<String>>,
-        color: &mut std::collections::BTreeMap<&'a str, Color>,
-        stack: &mut Vec<&'a str>,
-        members: &mut std::collections::BTreeSet<String>,
-    ) {
-        color.insert(node, Color::Gray);
-        stack.push(node);
-        for target in edges.get(node).map(Vec::as_slice).unwrap_or_default() {
-            match color.get(target.as_str()).copied().unwrap_or(Color::White) {
-                Color::White => visit(target, edges, color, stack, members),
-                Color::Gray => {
-                    // Back edge: everything on the stack from `target` up is
-                    // on a cycle.
-                    if let Some(start) = stack.iter().position(|frame| *frame == target) {
-                        for frame in &stack[start..] {
-                            members.insert((*frame).to_string());
-                        }
-                    }
+    let mut visited = std::collections::BTreeSet::new();
+    let mut finished = Vec::new();
+    for start in reverse.keys().copied() {
+        let mut stack = vec![(start, false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                finished.push(node);
+            } else if visited.insert(node) {
+                stack.push((node, true));
+                for target in edges.get(node).into_iter().flatten() {
+                    stack.push((target.as_str(), false));
                 }
-                Color::Black => {}
             }
         }
-        stack.pop();
-        color.insert(node, Color::Black);
     }
-
-    let nodes: Vec<&str> = color.keys().copied().collect();
-    for node in nodes {
-        if color.get(node).copied() == Some(Color::White) {
-            let mut stack = Vec::new();
-            visit(node, edges, &mut color, &mut stack, &mut members);
+    visited.clear();
+    let mut members = std::collections::BTreeSet::new();
+    for start in finished.into_iter().rev() {
+        if visited.contains(start) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            if visited.insert(node) {
+                component.push(node);
+                stack.extend(reverse.get(node).into_iter().flatten().copied());
+            }
+        }
+        if component.len() > 1
+            || edges
+                .get(start)
+                .is_some_and(|targets| targets.iter().any(|target| target == start))
+        {
+            members.extend(component.into_iter().map(str::to_owned));
         }
     }
     members
@@ -754,5 +769,38 @@ mod cycle_tests {
         ]));
         assert_eq!(members.len(), 5);
         assert!(!members.contains("lone"));
+    }
+
+    #[test]
+    fn dependency_cycle_includes_members_reached_through_a_finished_branch() {
+        let members = find_dependency_cycle_members(&edges(&[
+            ("a", &["b", "c"]),
+            ("b", &["a"]),
+            ("c", &["b"]),
+        ]));
+        assert_eq!(members.into_iter().collect::<Vec<_>>(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn dependency_cycle_discovery_does_not_include_a_bridge_between_cycles() {
+        let members = find_dependency_cycle_members(&edges(&[
+            ("a", &["b"]),
+            ("b", &["a", "bridge"]),
+            ("bridge", &["x"]),
+            ("x", &["y"]),
+            ("y", &["x"]),
+        ]));
+        assert_eq!(
+            members.into_iter().collect::<Vec<_>>(),
+            vec!["a", "b", "x", "y"]
+        );
+    }
+
+    #[test]
+    fn dependency_cycle_discovery_handles_long_chains_without_recursion() {
+        let graph: BTreeMap<String, Vec<String>> = (0..10_000)
+            .map(|index| (index.to_string(), vec![(index + 1).to_string()]))
+            .collect();
+        assert!(find_dependency_cycle_members(&graph).is_empty());
     }
 }
