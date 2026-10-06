@@ -11,8 +11,8 @@ const TEST_NAME: &str =
 
 #[test]
 fn managed_child_does_not_wait_for_external_reaper() -> anyhow::Result<()> {
-    if let Ok(mode) = std::env::var(FIXTURE_MODE) {
-        let root = std::env::var(FIXTURE_ROOT)?;
+    if let Ok(mode) = harness_core::config::process_env::var(FIXTURE_MODE) {
+        let root = harness_core::config::process_env::var(FIXTURE_ROOT)?;
         let mut runtime = if mode == "drop_multi_thread" {
             tokio::runtime::Builder::new_multi_thread()
         } else {
