@@ -166,6 +166,27 @@ pub(crate) async fn process_stream_item(
                 }
             }
         }
+        StreamItem::CostReported { cost_usd } => {
+            // Cost-only observations must not overwrite the turn's token
+            // counters or emit a TokenUsageUpdated notification.
+            if let Some(context) = runtime_usage {
+                if let Err(error) = context.persist_cost(turn_id, cost_usd).await {
+                    tracing::error!(
+                        runtime_job_id = %context.runtime_job_id,
+                        workflow_id = %context.workflow_id,
+                        "failed to persist workflow runtime cost: {error}"
+                    );
+                }
+                match context.budget_stop().await {
+                    Ok(stop) => budget_stop = stop,
+                    Err(error) => tracing::error!(
+                        runtime_job_id = %context.runtime_job_id,
+                        workflow_id = %context.workflow_id,
+                        "failed to evaluate the mid-turn workflow budget ceiling: {error}"
+                    ),
+                }
+            }
+        }
         StreamItem::Error { message } => {
             if let Err(err) = server.thread_manager.add_item(
                 thread_id,
@@ -345,6 +366,55 @@ mod tests {
             .get_turn(&thread_id, &turn_id)
             .ok_or_else(|| anyhow::anyhow!("turn should exist"))?;
         assert_eq!(turn.status, TurnStatus::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cost_report_does_not_emit_or_replace_token_usage() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let server = HarnessServer::new(
+            HarnessConfig::default(),
+            ThreadManager::new(),
+            AgentRegistry::new("opencode"),
+        );
+        let thread_id = server.thread_manager.start_thread(dir.path().to_path_buf());
+        let turn_id = server.thread_manager.start_turn(
+            &thread_id,
+            "prompt".into(),
+            AgentId::from_str("opencode"),
+        )?;
+        let usage = TokenUsage {
+            input_tokens: 2,
+            output_tokens: 3,
+            total_tokens: 5,
+            cost_usd: 0.0,
+        };
+        server
+            .thread_manager
+            .set_turn_token_usage(&thread_id, &turn_id, usage.clone())?;
+        let (notification_tx, mut notifications) = tokio::sync::broadcast::channel(16);
+        process_stream_item(
+            &server,
+            &None,
+            &notification_tx,
+            None,
+            &thread_id,
+            &turn_id,
+            StreamItem::CostReported { cost_usd: 0.125 },
+        )
+        .await;
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            server
+                .thread_manager
+                .get_turn(&thread_id, &turn_id)
+                .unwrap()
+                .token_usage,
+            usage
+        );
         Ok(())
     }
 
@@ -544,6 +614,57 @@ mod tests {
         assert_eq!(stop.workflow_id, "watchdog-enforce");
         assert_eq!(stop.spent_usd, 0.125);
         assert_eq!(stop.budget_usd, 0.10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cost_report_persists_unknown_tokens_and_enforces_budget() -> anyhow::Result<()> {
+        if resolve_database_url(None).is_err() {
+            return Ok(());
+        }
+        let fixture = watchdog_fixture("cost-only-budget").await?;
+        let context = watchdog_context(
+            fixture.store.clone(),
+            "cost-only-budget",
+            RuntimeBudgetPolicy {
+                default_workflow_budget_usd: 0.10,
+                enforcement: RuntimeBudgetEnforcement::Enforce,
+                ..RuntimeBudgetPolicy::default()
+            },
+        );
+        for cost_usd in [0.0, 0.125] {
+            let stop = process_stream_item(
+                &fixture.server,
+                &None,
+                &fixture.notification_tx,
+                Some(&context),
+                &fixture.thread_id,
+                &fixture.turn_id,
+                StreamItem::CostReported { cost_usd },
+            )
+            .await;
+            assert_eq!(stop.is_some(), cost_usd >= 0.10);
+            let usage = fixture
+                .store
+                .runtime_usage_for_workflow("cost-only-budget")
+                .await?
+                .unwrap();
+            assert_eq!(usage.cost_usd_micros, (cost_usd * 1_000_000.0) as u64);
+            assert!(usage.cost_usd_observed, "explicit zero USD is observed");
+            let records = fixture
+                .store
+                .runtime_usage_between(
+                    chrono::Utc::now() - chrono::Duration::minutes(1),
+                    chrono::Utc::now(),
+                )
+                .await?;
+            assert_eq!(records.len(), 1, "updates replace the same turn snapshot");
+            assert_eq!(
+                records[0].metrics,
+                harness_workflow::runtime::RuntimeUsageMetrics::default()
+            );
+            assert_eq!(records[0].metrics.reported_total_tokens, None);
+        }
         Ok(())
     }
 

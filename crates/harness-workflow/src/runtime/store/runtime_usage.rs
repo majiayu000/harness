@@ -58,6 +58,10 @@ impl RuntimeUsageUpsert {
             .map(|turn_id| format!("turn:{turn_id}"))
             .unwrap_or_else(|| "runtime_job".to_string())
     }
+
+    fn tokens_observed(&self) -> bool {
+        self.metrics.reported_total_tokens.is_some() || !usage_metrics_are_zero(&self.metrics)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +149,7 @@ impl WorkflowRuntimeStore {
         &self,
         usage: &RuntimeUsageUpsert,
     ) -> anyhow::Result<RuntimeUsageUpsertOutcome> {
-        if usage_metrics_are_zero(&usage.metrics) && usage.cost_usd_micros == 0 {
+        if !usage.tokens_observed() && usage.cost_usd_micros == 0 && !usage.cost_usd_observed {
             return Ok(RuntimeUsageUpsertOutcome::SkippedZeroUsage);
         }
         self.upsert_runtime_usage_row(usage).await?;
@@ -187,13 +191,19 @@ impl WorkflowRuntimeStore {
                 candidate_id = EXCLUDED.candidate_id,
                 candidate_index = EXCLUDED.candidate_index,
                 candidate_count = EXCLUDED.candidate_count,
-                input_tokens = EXCLUDED.input_tokens,
-                output_tokens = EXCLUDED.output_tokens,
-                cache_read_input_tokens = EXCLUDED.cache_read_input_tokens,
-                cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
-                reported_total_tokens = EXCLUDED.reported_total_tokens,
-                cost_usd_micros = EXCLUDED.cost_usd_micros,
-                cost_usd_observed = EXCLUDED.cost_usd_observed,
+                input_tokens = CASE WHEN $26 THEN EXCLUDED.input_tokens
+                    ELSE runtime_usage_events.input_tokens END,
+                output_tokens = CASE WHEN $26 THEN EXCLUDED.output_tokens
+                    ELSE runtime_usage_events.output_tokens END,
+                cache_read_input_tokens = CASE WHEN $26 THEN EXCLUDED.cache_read_input_tokens
+                    ELSE runtime_usage_events.cache_read_input_tokens END,
+                cache_creation_input_tokens = CASE WHEN $26 THEN EXCLUDED.cache_creation_input_tokens
+                    ELSE runtime_usage_events.cache_creation_input_tokens END,
+                reported_total_tokens = CASE WHEN $26 THEN EXCLUDED.reported_total_tokens
+                    ELSE runtime_usage_events.reported_total_tokens END,
+                cost_usd_micros = CASE WHEN EXCLUDED.cost_usd_observed THEN EXCLUDED.cost_usd_micros
+                    ELSE runtime_usage_events.cost_usd_micros END,
+                cost_usd_observed = runtime_usage_events.cost_usd_observed OR EXCLUDED.cost_usd_observed,
                 reported_at = EXCLUDED.reported_at,
                 updated_at = CURRENT_TIMESTAMP",
         )
@@ -234,6 +244,7 @@ impl WorkflowRuntimeStore {
         .bind(u64_to_i64(usage.cost_usd_micros, "cost_usd_micros")?)
         .bind(usage.cost_usd_observed)
         .bind(usage.reported_at)
+        .bind(usage.tokens_observed())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -270,18 +281,15 @@ impl WorkflowRuntimeStore {
         &self,
         workflow_id: &str,
     ) -> anyhow::Result<Option<RuntimeWorkflowUsage>> {
-        let row: (i64, i64, i64, i64, i64, i64, i64, bool) = sqlx::query_as(
+        let row: (i64, i64, i64, i64, i64, Option<i64>, i64, bool) = sqlx::query_as(
             "SELECT
                 COUNT(*)::BIGINT,
                 COALESCE(SUM(input_tokens), 0)::BIGINT,
                 COALESCE(SUM(output_tokens), 0)::BIGINT,
                 COALESCE(SUM(cache_read_input_tokens), 0)::BIGINT,
                 COALESCE(SUM(cache_creation_input_tokens), 0)::BIGINT,
-                COALESCE(SUM(COALESCE(
-                    reported_total_tokens,
-                    input_tokens + output_tokens
-                        + cache_read_input_tokens + cache_creation_input_tokens
-                )), 0)::BIGINT,
+                CASE WHEN COUNT(reported_total_tokens) = COUNT(*)
+                    THEN SUM(reported_total_tokens)::BIGINT END,
                 COALESCE(SUM(cost_usd_micros), 0)::BIGINT,
                 COALESCE(BOOL_AND(cost_usd_observed), FALSE)
              FROM runtime_usage_events
@@ -299,7 +307,10 @@ impl WorkflowRuntimeStore {
                 output_tokens: i64_to_u64(row.2, "output_tokens")?,
                 cache_read_input_tokens: i64_to_u64(row.3, "cache_read_input_tokens")?,
                 cache_creation_input_tokens: i64_to_u64(row.4, "cache_creation_input_tokens")?,
-                reported_total_tokens: Some(i64_to_u64(row.5, "reported_total_tokens")?),
+                reported_total_tokens: row
+                    .5
+                    .map(|value| i64_to_u64(value, "reported_total_tokens"))
+                    .transpose()?,
             },
             cost_usd_micros: i64_to_u64(row.6, "cost_usd_micros")?,
             cost_usd_observed: row.7,
@@ -511,7 +522,7 @@ fn aggregate_usage_records(
         return Ok(None);
     }
     let mut metrics = RuntimeUsageMetrics::default();
-    let mut reported_total_tokens = 0_u64;
+    let mut reported_total_tokens = Some(0_u64);
     let mut cost_usd_micros = 0_u64;
     let mut cost_usd_observed = true;
     for record in records {
@@ -535,15 +546,17 @@ fn aggregate_usage_records(
             record.metrics.cache_creation_input_tokens,
             "cache_creation_input_tokens",
         )?;
-        reported_total_tokens = checked_add(
-            reported_total_tokens,
-            record.metrics.total_tokens(),
-            "reported_total_tokens",
-        )?;
+        reported_total_tokens = match (reported_total_tokens, record.metrics.reported_total_tokens)
+        {
+            (Some(total), Some(reported)) => {
+                Some(checked_add(total, reported, "reported_total_tokens")?)
+            }
+            _ => None,
+        };
         cost_usd_micros = checked_add(cost_usd_micros, record.cost_usd_micros, "cost_usd_micros")?;
         cost_usd_observed &= record.cost_usd_observed;
     }
-    metrics.reported_total_tokens = Some(reported_total_tokens);
+    metrics.reported_total_tokens = reported_total_tokens;
     Ok(Some(RuntimeWorkflowUsage {
         metrics,
         cost_usd_micros,
@@ -571,6 +584,61 @@ fn i64_to_u32(value: i64, field: &str) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage_record(metrics: RuntimeUsageMetrics, cost_usd_micros: u64) -> RuntimeUsageRecord {
+        RuntimeUsageRecord {
+            id: "usage-1".into(),
+            runtime_job_id: "job-1".into(),
+            usage_key: "turn:turn-1".into(),
+            command_id: "command-1".into(),
+            workflow_id: "workflow-1".into(),
+            turn_id: Some("turn-1".into()),
+            agent_run_id: None,
+            runtime_kind: "opencode".into(),
+            runtime_profile: "opencode-default".into(),
+            agent: "opencode".into(),
+            model: "model-1".into(),
+            project: "/project".into(),
+            task_id: None,
+            candidate_group_id: None,
+            candidate_id: None,
+            candidate_index: None,
+            candidate_count: None,
+            metrics,
+            cost_usd_micros,
+            cost_usd_observed: true,
+            reported_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn aggregate_usage_requires_every_reported_token_total() -> anyhow::Result<()> {
+        let cost_only = usage_record(RuntimeUsageMetrics::default(), 250_000);
+        let known = usage_record(
+            RuntimeUsageMetrics {
+                input_tokens: 10,
+                output_tokens: 3,
+                cache_read_input_tokens: 2,
+                cache_creation_input_tokens: 1,
+                reported_total_tokens: Some(12),
+            },
+            750_000,
+        );
+        for (records, reported_total, components, cost) in [
+            (vec![cost_only.clone()], None, 0, 250_000),
+            (vec![cost_only, known.clone()], None, 16, 1_000_000),
+            (vec![known.clone(), known], Some(24), 32, 1_500_000),
+        ] {
+            let usage = aggregate_usage_records(&records)?.unwrap();
+            assert_eq!(usage.metrics.reported_total_tokens, reported_total);
+            assert_eq!(usage.metrics.component_total_tokens(), components);
+            assert_eq!(usage.cost_usd_micros, cost);
+            assert!(usage.cost_usd_observed);
+        }
+        assert!(aggregate_usage_records(&[])?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn usage_metrics_are_zero_counts_cache_tokens() {

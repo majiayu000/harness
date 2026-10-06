@@ -4,7 +4,7 @@ use crate::runtime::{
     RuntimeUsageUpsertOutcome,
 };
 use harness_core::run_id::RunId;
-use harness_core::types::{Decision, Event, SessionId};
+use harness_core::types::{Decision, Event, SessionId, TokenUsage};
 use harness_observe::event_store::EventStore;
 use std::str::FromStr;
 
@@ -16,7 +16,8 @@ async fn runtime_usage_upsert_skips_zero_placeholders() -> anyhow::Result<()> {
 
     let dir = tempfile::tempdir()?;
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
-    let usage = runtime_usage_upsert(RuntimeUsageMetrics::default());
+    let mut usage = runtime_usage_upsert(RuntimeUsageMetrics::default());
+    usage.cost_usd_observed = false;
 
     let outcome = store.upsert_runtime_usage(&usage).await?;
     let records = store
@@ -74,6 +75,84 @@ async fn runtime_usage_upsert_replaces_cumulative_turn_usage() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn runtime_usage_upsert_merges_token_and_cost_observations_in_both_orders(
+) -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    for cost_first in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+        let mut tokens = runtime_usage_upsert(RuntimeUsageMetrics::from_token_usage(&TokenUsage {
+            input_tokens: 10,
+            output_tokens: 3,
+            total_tokens: 13,
+            cost_usd: 0.0,
+        }));
+        tokens.cost_usd_observed = false;
+        let mut cost = runtime_usage_upsert(RuntimeUsageMetrics::default());
+        cost.cost_usd_micros = 125_000;
+        if cost_first {
+            store.upsert_runtime_agent_run(&cost).await?;
+            store.upsert_runtime_usage(&tokens).await?;
+        } else {
+            store.upsert_runtime_usage(&tokens).await?;
+            store.upsert_runtime_agent_run(&cost).await?;
+        }
+        // A delayed start marker contains neither observation and must not
+        // clear evidence already persisted for this runtime job and turn.
+        let mut placeholder = runtime_usage_upsert(RuntimeUsageMetrics::default());
+        placeholder.cost_usd_observed = false;
+        store.upsert_runtime_agent_run(&placeholder).await?;
+        let records = store
+            .runtime_usage_between(Utc::now() - Duration::minutes(1), Utc::now())
+            .await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].metrics, tokens.metrics);
+        assert_eq!(records[0].cost_usd_micros, 125_000);
+        assert!(records[0].cost_usd_observed);
+
+        tokens.metrics = RuntimeUsageMetrics::from_token_usage(&TokenUsage::default());
+        assert_eq!(
+            store.upsert_runtime_usage(&tokens).await?,
+            RuntimeUsageUpsertOutcome::Persisted
+        );
+        let usage = store
+            .runtime_usage_for_workflow("workflow-1")
+            .await?
+            .unwrap();
+        assert_eq!(
+            usage.metrics.reported_total_tokens,
+            Some(0),
+            "observed zero tokens replace prior counts"
+        );
+        assert_eq!(
+            usage.cost_usd_micros, 125_000,
+            "token-only zero preserves the observed cost"
+        );
+        assert!(usage.cost_usd_observed);
+
+        cost.cost_usd_micros = 0;
+        assert_eq!(
+            store.upsert_runtime_usage(&cost).await?,
+            RuntimeUsageUpsertOutcome::Persisted
+        );
+        store.upsert_runtime_agent_run(&placeholder).await?;
+        let usage = store
+            .runtime_usage_for_workflow("workflow-1")
+            .await?
+            .unwrap();
+        assert_eq!(usage.metrics.reported_total_tokens, Some(0));
+        assert_eq!(
+            usage.cost_usd_micros, 0,
+            "observed zero USD replaces prior cost"
+        );
+        assert!(usage.cost_usd_observed);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_usage_upsert_persists_cost_only() -> anyhow::Result<()> {
     if resolve_database_url(None).is_err() {
         return Ok(());
@@ -88,6 +167,46 @@ async fn runtime_usage_upsert_persists_cost_only() -> anyhow::Result<()> {
 
     let outcome = store.upsert_runtime_usage(&usage).await?;
     assert_eq!(outcome, RuntimeUsageUpsertOutcome::Persisted);
+    let aggregate = store
+        .runtime_usage_for_workflow(&usage.workflow_id)
+        .await?
+        .unwrap();
+    assert_eq!(aggregate.metrics.reported_total_tokens, None);
+    assert_eq!(aggregate.metrics.component_total_tokens(), 0);
+    assert_eq!(aggregate.cost_usd_micros, 250_000);
+    assert!(aggregate.cost_usd_observed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_usage_for_workflow_keeps_missing_reported_total_unknown() -> anyhow::Result<()> {
+    if resolve_database_url(None).is_err() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
+    let mut cost_only = runtime_usage_upsert(RuntimeUsageMetrics::default());
+    cost_only.cost_usd_micros = 250_000;
+    store.upsert_runtime_usage(&cost_only).await?;
+    let mut known = runtime_usage_upsert(RuntimeUsageMetrics {
+        input_tokens: 10,
+        output_tokens: 3,
+        cache_read_input_tokens: 2,
+        cache_creation_input_tokens: 1,
+        reported_total_tokens: Some(12),
+    });
+    known.turn_id = Some("turn-known".into());
+    known.cost_usd_micros = 750_000;
+    store.upsert_runtime_usage(&known).await?;
+
+    let usage = store
+        .runtime_usage_for_workflow("workflow-1")
+        .await?
+        .unwrap();
+    assert_eq!(usage.metrics.reported_total_tokens, None);
+    assert_eq!(usage.metrics.component_total_tokens(), 16);
+    assert_eq!(usage.cost_usd_micros, 1_000_000);
+    assert!(usage.cost_usd_observed);
     Ok(())
 }
 
@@ -147,6 +266,7 @@ async fn runtime_usage_for_workflow_aggregates_distinct_turns() -> anyhow::Resul
     assert_eq!(usage.metrics.cache_read_input_tokens, 5);
     assert_eq!(usage.metrics.cache_creation_input_tokens, 1);
     assert_eq!(usage.metrics.total_tokens(), 48);
+    assert_eq!(usage.metrics.reported_total_tokens, Some(48));
     assert_eq!(usage.cost_usd_micros, 2_000_000);
     assert!(!usage.cost_usd_observed);
     assert!(store
