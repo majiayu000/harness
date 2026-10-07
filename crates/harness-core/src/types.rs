@@ -204,6 +204,8 @@ pub enum TurnFailureKind {
     Billing,
     LocalProcess,
     Upstream,
+    /// The provider rejected the request; retrying it unchanged will not help.
+    RequestRejected,
     Protocol,
     Unknown,
 }
