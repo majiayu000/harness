@@ -3,10 +3,12 @@ use axum::{http::StatusCode, routing::post, Router};
 use harness_agents::anthropic_api::AnthropicApiAgent;
 use harness_core::agent::{AgentRequest, CodeAgent};
 use harness_core::error::HarnessError;
-use harness_workflow::runtime::reducer::{reduce_runtime_job_completed, RUNTIME_JOB_COMPLETED_EVENT};
+use harness_workflow::runtime::reducer::{
+    reduce_runtime_job_completed, RUNTIME_JOB_COMPLETED_EVENT,
+};
 use harness_workflow::runtime::{
-    ActivityStatus, RuntimeKind, WorkflowCommand, WorkflowCommandType, WorkflowEvent, WorkflowInstance,
-    WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
+    ActivityStatus, RuntimeKind, WorkflowCommand, WorkflowCommandType, WorkflowEvent,
+    WorkflowInstance, WorkflowSubject, GITHUB_ISSUE_PR_DEFINITION_ID,
 };
 use std::time::Duration;
 
@@ -138,8 +140,9 @@ async fn anthropic_http_failures_preserve_retry_semantics_through_runtime_reduce
         // Use the same typed-error handoff as turn_lifecycle, including the
         // transcript serialization boundary before activity-result extraction.
         let item = Item::typed_error(error.to_string(), failure.kind);
-        let item: Item = serde_json::from_value(serde_json::to_value(item).expect("serialize item"))
-            .expect("deserialize item");
+        let item: Item =
+            serde_json::from_value(serde_json::to_value(item).expect("serialize item"))
+                .expect("deserialize item");
         let job = RuntimeJob::pending(
             "command-1",
             RuntimeKind::ClaudeCode,
@@ -183,13 +186,14 @@ async fn anthropic_http_failures_preserve_retry_semantics_through_runtime_reduce
             }
             let mut command = WorkflowCommand::enqueue_activity("implement_issue", "implement-1");
             command.command["retry_attempt"] = json!(retry_attempt);
-            let event = WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-1")
-                .with_payload(json!({
-                    "command_id": "command-1",
-                    "command": command,
-                    "runtime_job_id": "job-1",
-                    "activity_result": result,
-                }));
+            let event =
+                WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-1")
+                    .with_payload(json!({
+                        "command_id": "command-1",
+                        "command": command,
+                        "runtime_job_id": "job-1",
+                        "activity_result": result,
+                    }));
             let decision = reduce_runtime_job_completed(&instance, &event)
                 .expect("HTTP failure completion parses")
                 .expect("HTTP failure produces a decision");
