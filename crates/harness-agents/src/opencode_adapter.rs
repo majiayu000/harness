@@ -4,6 +4,7 @@ use harness_core::agent::{AgentAdapter, AgentEvent, AgentRequest, ApprovalDecisi
 use harness_core::config::agents::{OpenCodeAgentConfig, SandboxMode};
 use harness_sandbox::SandboxSpec;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,10 +15,9 @@ use tokio::sync::{mpsc, Mutex};
 
 type StdoutLines = Lines<BufReader<ChildStdout>>;
 mod protocol;
-#[cfg(test)]
-use self::protocol::request_id_string;
 use self::protocol::{
-    acp_error_message, protocol_line_preview, request_id_from_string, response_id_matches,
+    acp_error_message, cancelled_permission_response, permission_response, protocol_line_preview,
+    request_id_string, response_id_matches, turn_cost,
 };
 pub use self::protocol::{parse_acp_message, ParsedAcpMessage};
 
@@ -68,6 +68,14 @@ struct AdapterState {
     session_id: Option<String>,
     spawn_policy_fingerprint: Option<crate::spawn_contract::AdapterSpawnPolicyFingerprint>,
     egress_verified_at_dispatch: bool,
+    pending_permissions: HashMap<String, PendingPermission>,
+    turn_cancelled: bool,
+    session_cost_usd: Option<f64>,
+}
+
+struct PendingPermission {
+    id: Value,
+    options: Vec<Value>,
 }
 
 impl AdapterState {
@@ -80,6 +88,9 @@ impl AdapterState {
             session_id: None,
             spawn_policy_fingerprint: None,
             egress_verified_at_dispatch: false,
+            pending_permissions: HashMap::new(),
+            turn_cancelled: false,
+            session_cost_usd: Some(0.0),
         }
     }
 
@@ -105,6 +116,9 @@ impl AdapterState {
         self.session_id = None;
         self.spawn_policy_fingerprint = None;
         self.egress_verified_at_dispatch = false;
+        self.pending_permissions.clear();
+        self.turn_cancelled = false;
+        self.session_cost_usd = Some(0.0);
     }
 }
 
@@ -491,6 +505,7 @@ impl AgentAdapter for OpenCodeAcpAdapter {
                 "opencode session/new did not yield a session id".into(),
             )
         })?;
+        state.turn_cancelled = false;
 
         if let Err(error) = Self::send_request(
             &mut state,
@@ -516,12 +531,14 @@ impl AgentAdapter for OpenCodeAcpAdapter {
                 "opencode stdout reader not available".into(),
             )
         })?;
+        let previous_turn_cost_usd = state.session_cost_usd;
         drop(state);
 
         let mut turn_completed = false;
         let mut receiver_closed = false;
         let mut stdout_closed = false;
         let stall_timeout = stall_timeout_for(&req);
+        let mut session_cost_usd = None;
         let read_result = async {
             while let Some(message) =
                 Self::read_next_message_with_timeout(&mut lines, stall_timeout, "turn").await?
@@ -562,6 +579,47 @@ impl AgentAdapter for OpenCodeAcpAdapter {
                         break;
                     }
                     ParsedAcpMessage::Ignore => {}
+                    ParsedAcpMessage::SessionCost { cost_usd } => {
+                        session_cost_usd = Some(cost_usd);
+                        if let Some(cost_usd) = turn_cost(cost_usd, previous_turn_cost_usd)? {
+                            if tx
+                                .send(AgentEvent::CostReported { cost_usd })
+                                .await
+                                .is_err()
+                            {
+                                receiver_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                    ParsedAcpMessage::PermissionRequest {
+                        id,
+                        command,
+                        options,
+                    } => {
+                        let request_id = request_id_string(&id);
+                        let mut state = self.state.lock().await;
+                        if state.turn_cancelled {
+                            Self::send_json_line(&mut state, &cancelled_permission_response(&id))
+                                .await?;
+                            continue;
+                        }
+                        state
+                            .pending_permissions
+                            .insert(request_id.clone(), PendingPermission { id, options });
+                        drop(state);
+                        if tx
+                            .send(AgentEvent::ApprovalRequest {
+                                id: request_id,
+                                command,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            receiver_closed = true;
+                            break;
+                        }
+                    }
                     ParsedAcpMessage::Event(event) => {
                         let is_terminal = matches!(
                             event,
@@ -608,7 +666,10 @@ impl AgentAdapter for OpenCodeAcpAdapter {
                 "opencode event receiver closed before turn/completed".into(),
             ));
         }
-        self.state.lock().await.stdout_lines = Some(lines);
+        let mut state = self.state.lock().await;
+        state.pending_permissions.clear();
+        state.session_cost_usd = session_cost_usd;
+        state.stdout_lines = Some(lines);
         Ok(())
     }
 
@@ -617,12 +678,24 @@ impl AgentAdapter for OpenCodeAcpAdapter {
         let Some(session_id) = state.session_id.clone() else {
             return Ok(());
         };
+        // Requests may already be in stdout when cancellation is dispatched.
+        // The reader checks this flag under the same lock before offering one.
+        state.turn_cancelled = true;
         Self::send_notification(
             &mut state,
             "session/cancel",
             json!({ "sessionId": session_id }),
         )
         .await?;
+        while let Some((key, id)) = state
+            .pending_permissions
+            .iter()
+            .next()
+            .map(|(key, request)| (key.clone(), request.id.clone()))
+        {
+            Self::send_json_line(&mut state, &cancelled_permission_response(&id)).await?;
+            state.pending_permissions.remove(&key);
+        }
         Ok(())
     }
 
@@ -637,19 +710,15 @@ impl AgentAdapter for OpenCodeAcpAdapter {
         decision: ApprovalDecision,
     ) -> harness_core::error::Result<()> {
         let mut state = self.state.lock().await;
-        let request_id = request_id_from_string(&id);
-        let result = match decision {
-            ApprovalDecision::Accept => json!({ "outcome": "approved" }),
-            ApprovalDecision::Reject { reason } => {
-                json!({ "outcome": "rejected", "reason": reason })
-            }
-        };
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": result,
-        });
-        Self::send_json_line(&mut state, &payload).await
+        let request = state.pending_permissions.get(&id).ok_or_else(|| {
+            harness_core::error::HarnessError::AgentExecution(
+                "opencode permission request is no longer pending".into(),
+            )
+        })?;
+        let payload = permission_response(&request.id, &request.options, &decision)?;
+        Self::send_json_line(&mut state, &payload).await?;
+        state.pending_permissions.remove(&id);
+        Ok(())
     }
 }
 

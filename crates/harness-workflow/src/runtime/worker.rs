@@ -240,12 +240,6 @@ impl<'a> RuntimeWorker<'a> {
             );
             return Ok(None);
         };
-        if let Some(event) = completion.workflow_event.as_ref() {
-            self.propagate_pr_feedback_child_completion(&event.workflow_id, event)
-                .await?;
-            self.propagate_quality_gate_child_completion(&event.workflow_id, event)
-                .await?;
-        }
         Ok(Some(completion.runtime_job))
     }
 
@@ -362,72 +356,6 @@ impl<'a> RuntimeWorker<'a> {
         })
     }
 
-    async fn propagate_pr_feedback_child_completion(
-        &self,
-        workflow_id: &str,
-        event: &super::model::WorkflowEvent,
-    ) -> anyhow::Result<()> {
-        let Some(child) = self.store.get_instance(workflow_id).await? else {
-            return Ok(());
-        };
-        if child.definition_id != super::pr_feedback::PR_FEEDBACK_DEFINITION_ID {
-            return Ok(());
-        }
-        if !runtime_event_result_succeeded(event) {
-            return Ok(());
-        }
-        if child.state == "blocked"
-            && child.data.get("stop_reason_code").and_then(Value::as_str)
-                == Some(super::STOP_REASON_INVALID_AGENT_OUTPUT)
-        {
-            return Ok(());
-        }
-        if matches!(child.state.as_str(), "pending" | "inspecting") {
-            return Ok(());
-        }
-        let Some(parent_workflow_id) = child.parent_workflow_id.as_deref() else {
-            return Ok(());
-        };
-        self.store
-            .commit_parent_runtime_completion(
-                parent_workflow_id,
-                &self.owner,
-                merge_child_completion_payload(event, &child),
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn propagate_quality_gate_child_completion(
-        &self,
-        workflow_id: &str,
-        event: &super::model::WorkflowEvent,
-    ) -> anyhow::Result<()> {
-        let Some(child) = self.store.get_instance(workflow_id).await? else {
-            return Ok(());
-        };
-        if child.definition_id != super::quality_gate::QUALITY_GATE_DEFINITION_ID {
-            return Ok(());
-        }
-        if !matches!(
-            child.state.as_str(),
-            "passed" | "blocked" | "failed" | "cancelled"
-        ) {
-            return Ok(());
-        }
-        let Some(parent_workflow_id) = child.parent_workflow_id.as_deref() else {
-            return Ok(());
-        };
-        self.store
-            .commit_parent_runtime_completion(
-                parent_workflow_id,
-                &self.owner,
-                merge_child_completion_payload(event, &child),
-            )
-            .await?;
-        Ok(())
-    }
-
     async fn reserve_runtime_turn_started(
         &self,
         job: &RuntimeJob,
@@ -500,53 +428,6 @@ fn runtime_job_activity_name(job: &RuntimeJob) -> String {
         .and_then(Value::as_str)
         .unwrap_or("runtime_job")
         .to_string()
-}
-
-fn runtime_event_result_succeeded(event: &super::model::WorkflowEvent) -> bool {
-    event
-        .event
-        .get("activity_result")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<ActivityResult>(value).ok())
-        .is_some_and(|result| result.status == ActivityStatus::Succeeded)
-}
-
-fn merge_child_completion_payload(
-    event: &super::model::WorkflowEvent,
-    child: &WorkflowInstance,
-) -> serde_json::Value {
-    let mut payload = event.event.clone();
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("child_workflow_id".to_string(), serde_json::json!(child.id));
-        if let Some(runtime_job_id) = child
-            .data
-            .get("started_by_runtime_job_id")
-            .and_then(Value::as_str)
-        {
-            object.insert(
-                "recovery_activity".to_string(),
-                serde_json::json!("start_child_workflow"),
-            );
-            object.insert(
-                "recovery_runtime_job_id".to_string(),
-                serde_json::json!(runtime_job_id),
-            );
-        }
-        if let Some(artifacts) = object
-            .get_mut("activity_result")
-            .and_then(serde_json::Value::as_object_mut)
-            .and_then(|activity_result| activity_result.get_mut("artifacts"))
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            artifacts.retain(|artifact| {
-                artifact
-                    .get("artifact_type")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("workflow_decision")
-            });
-        }
-    }
-    payload
 }
 
 /// Persist stopped-state metadata into instance data for operator surfaces.

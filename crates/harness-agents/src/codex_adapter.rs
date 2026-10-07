@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::Instant;
 const MAX_PROTOCOL_LINE_PREVIEW: usize = 240;
 mod attempt;
@@ -37,7 +37,7 @@ type StdoutFrames = BoundedStdoutReader<ChildStdout>;
 pub use self::protocol::parse_codex_message;
 use self::protocol::{
     approval_decision_result, notification_payload, protocol_line_preview, response_id_matches,
-    thread_id_from_result, thread_start_params, turn_start_params,
+    rpc_error_message, thread_id_from_result, thread_start_params, turn_start_params,
 };
 #[cfg(test)]
 use self::protocol::{sandbox_mode_value, sandbox_policy_value};
@@ -109,6 +109,8 @@ struct AdapterState {
     /// Set after a cancelled/timed-out write that may have sent partial bytes.
     /// The session must be terminated; never append another JSON frame.
     protocol_poisoned: bool,
+    /// One bounded control request at a time; its failure is not a turn failure.
+    pending_steer: Option<(u64, oneshot::Sender<harness_core::error::Result<()>>)>,
 }
 impl AdapterState {
     fn new() -> Self {
@@ -126,6 +128,7 @@ impl AdapterState {
             next_generation: 1,
             active_attempt: None,
             protocol_poisoned: false,
+            pending_steer: None,
         }
     }
     fn next_request_id(&mut self) -> u64 {
@@ -154,6 +157,7 @@ impl AdapterState {
         self.spawn_policy_fingerprint = None;
         self.egress_verified_at_dispatch = false;
         self.protocol_poisoned = false;
+        self.pending_steer = None;
     }
     fn begin_attempt(&mut self) -> harness_core::error::Result<u64> {
         if self.active_attempt.is_some() {
@@ -177,7 +181,27 @@ impl AdapterState {
         {
             self.active_attempt = None;
             self.active_turn_id = None;
+            self.pending_steer = None;
         }
+    }
+    fn resolve_steer_response(
+        &mut self,
+        id: &Value,
+        result: harness_core::error::Result<()>,
+    ) -> bool {
+        if !self
+            .pending_steer
+            .as_ref()
+            .is_some_and(|(expected, _)| response_id_matches(id, *expected))
+        {
+            return false;
+        }
+        if let Some((_, sender)) = self.pending_steer.take() {
+            if sender.send(result).is_err() {
+                tracing::debug!(request_id = %id, "codex steering caller is no longer waiting");
+            }
+        }
+        true
     }
     fn generation_is_current(&self, generation: u64) -> bool {
         self.active_attempt
@@ -291,6 +315,7 @@ pub enum ParsedCodexMessage {
     ThreadStarted { thread_id: String },
     TurnStarted { turn_id: String },
     Response { id: Value, result: Value },
+    RpcError { id: Value, error: Value },
     Ignore,
 }
 
@@ -832,6 +857,19 @@ impl CodexAdapter {
                     {
                         break;
                     }
+                    Some(ParsedCodexMessage::RpcError { id, error })
+                        if response_id_matches(&id, init_id) =>
+                    {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            rpc_error_message(&id, &error),
+                        ));
+                    }
+                    Some(ParsedCodexMessage::RpcError { id, error }) => {
+                        log_codex_diagnostic(
+                            AgentDiagnosticSeverity::Error,
+                            &rpc_error_message(&id, &error),
+                        );
+                    }
                     Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
                         tracing::warn!(agent = "codex", "{message}");
                     }
@@ -886,7 +924,6 @@ impl CodexAdapter {
                             return Err(stale_generation_error());
                         }
                         state.thread_id = Some(thread_id);
-                        break;
                     }
                     Some(ParsedCodexMessage::Response { id, result })
                         if response_id_matches(&id, thread_id_request) =>
@@ -899,6 +936,19 @@ impl CodexAdapter {
                             state.thread_id = Some(thread_id);
                             break;
                         }
+                    }
+                    Some(ParsedCodexMessage::RpcError { id, error })
+                        if response_id_matches(&id, thread_id_request) =>
+                    {
+                        return Err(harness_core::error::HarnessError::AgentExecution(
+                            rpc_error_message(&id, &error),
+                        ));
+                    }
+                    Some(ParsedCodexMessage::RpcError { id, error }) => {
+                        log_codex_diagnostic(
+                            AgentDiagnosticSeverity::Error,
+                            &rpc_error_message(&id, &error),
+                        );
                     }
                     Some(ParsedCodexMessage::Event(AgentEvent::Warning { message })) => {
                         tracing::warn!(agent = "codex", "{message}");
@@ -957,6 +1007,7 @@ impl CodexAdapter {
     async fn clear_active_turn_id(&self) {
         let mut state = self.state.lock().await;
         state.active_turn_id = None;
+        state.pending_steer = None;
         if let Some(attempt) = state.active_attempt.as_mut() {
             attempt.remote_turn_id = None;
         }
@@ -1112,7 +1163,7 @@ impl AgentAdapter for CodexAdapter {
             }
         };
 
-        if let Err(error) = self
+        let turn_request_id = match self
             .send_request_for_attempt(
                 generation,
                 "turn/start",
@@ -1120,10 +1171,13 @@ impl AgentAdapter for CodexAdapter {
             )
             .await
         {
-            self.state.lock().await.clear_attempt_if_current(generation);
-            attempt_guard.disarm();
-            return Err(error);
-        }
+            Ok(id) => id,
+            Err(error) => {
+                self.state.lock().await.clear_attempt_if_current(generation);
+                attempt_guard.disarm();
+                return Err(error);
+            }
+        };
 
         let mut lines = {
             let mut state = self.state.lock().await;
@@ -1178,7 +1232,33 @@ impl AgentAdapter for CodexAdapter {
                         }
                         guard.thread_id = Some(thread_id);
                     }
-                    ParsedCodexMessage::Response { .. } | ParsedCodexMessage::Ignore => {}
+                    ParsedCodexMessage::Response { id, .. } => {
+                        self.state.lock().await.resolve_steer_response(&id, Ok(()));
+                    }
+                    ParsedCodexMessage::RpcError { id, error } => {
+                        let message = rpc_error_message(&id, &error);
+                        if response_id_matches(&id, turn_request_id) {
+                            return Err(harness_core::error::HarnessError::AgentExecution(message));
+                        }
+                        let handled = self.state.lock().await.resolve_steer_response(
+                            &id,
+                            Err(harness_core::error::HarnessError::AgentExecution(
+                                message.clone(),
+                            )),
+                        );
+                        if !handled {
+                            self.send_event_cancellable(
+                                &tx,
+                                generation,
+                                AgentEvent::Diagnostic {
+                                    severity: AgentDiagnosticSeverity::Error,
+                                    message,
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    ParsedCodexMessage::Ignore => {}
                     ParsedCodexMessage::Event(event) => {
                         let is_terminal = matches!(
                             event,
@@ -1330,9 +1410,10 @@ impl AgentAdapter for CodexAdapter {
     }
 
     async fn steer(&self, text: String) -> harness_core::error::Result<()> {
-        let generation = {
-            let state = self.state.lock().await;
-            state
+        let (sender, response) = oneshot::channel();
+        let (generation, id, thread_id, turn_id) = {
+            let mut state = self.state.lock().await;
+            let generation = state
                 .active_attempt
                 .as_ref()
                 .map(|attempt| attempt.generation)
@@ -1340,10 +1421,7 @@ impl AgentAdapter for CodexAdapter {
                     harness_core::error::HarnessError::AgentExecution(
                         "codex active turn unavailable".into(),
                     )
-                })?
-        };
-        let (thread_id, turn_id) = {
-            let state = self.state.lock().await;
+                })?;
             let thread_id = state.thread_id.clone().ok_or_else(|| {
                 harness_core::error::HarnessError::AgentExecution(
                     "codex thread id unavailable".into(),
@@ -1354,24 +1432,63 @@ impl AgentAdapter for CodexAdapter {
                     "codex active turn unavailable".into(),
                 )
             })?;
-            (thread_id, turn_id)
+            if state
+                .pending_steer
+                .as_ref()
+                .is_some_and(|(_, sender)| !sender.is_closed())
+            {
+                return Err(harness_core::error::HarnessError::AgentExecution(
+                    "codex turn/steer request is already pending".into(),
+                ));
+            }
+            let id = state.next_request_id();
+            state.pending_steer = Some((id, sender));
+            (generation, id, thread_id, turn_id)
         };
-        self.send_request_for_attempt(
-            generation,
-            "turn/steer",
-            json!({
-                "threadId": thread_id,
-                "expectedTurnId": turn_id,
-                "input": [
-                    {
-                        "type": "text",
-                        "text": text,
-                    }
-                ],
-            }),
-        )
-        .await?;
-        Ok(())
+        let result = async {
+            self.send_json_line_for_attempt(
+                generation,
+                &json!({
+                    "id": id,
+                    "method": "turn/steer",
+                    "params": {
+                    "threadId": thread_id,
+                    "expectedTurnId": turn_id,
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": text,
+                        }
+                    ],
+                    },
+                }),
+            )
+            .await?;
+            // Reuse the existing control I/O budget. A lost auxiliary response
+            // cannot wait indefinitely or turn into a successful steering call.
+            tokio::time::timeout(self.deadlines.frame_write, response)
+                .await
+                .map_err(|_| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "codex turn/steer request {id} response deadline elapsed"
+                    ))
+                })?
+                .map_err(|_| {
+                    harness_core::error::HarnessError::AgentExecution(format!(
+                        "codex turn ended before turn/steer request {id} was acknowledged"
+                    ))
+                })?
+        }
+        .await;
+        let mut state = self.state.lock().await;
+        if state
+            .pending_steer
+            .as_ref()
+            .is_some_and(|(pending_id, _)| *pending_id == id)
+        {
+            state.pending_steer = None;
+        }
+        result
     }
 
     async fn respond_approval(
@@ -1390,6 +1507,9 @@ impl AgentAdapter for CodexAdapter {
 #[cfg(test)]
 #[path = "codex_adapter_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod rpc_tests;
 
 #[cfg(all(test, unix))]
 mod spawn_policy_tests {

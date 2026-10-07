@@ -523,6 +523,9 @@ def stream_agent_output(
                 if remaining <= 0:
                     raise RuntimeError(f"agent exceeded {timeout}s wall deadline")
                 renew()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"agent exceeded {timeout}s wall deadline")
                 for key, _ in selector.select(min(0.2, remaining)):
                     chunk = os.read(key.fd, 64 * 1024)
                     if not chunk:

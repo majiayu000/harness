@@ -661,13 +661,11 @@ def test_disk_metrics_reader_rejects_missing_root(tmp_path):
     (tmp_path / 'home').mkdir()
     (tmp_path / 'tmp').mkdir()
     # Intentionally omit /dev/shm directory and mountinfo entry.
-    script = (module.DISK_METRICS_SCRIPT
-              .replace("ROOTS = ('/workspace', '/home/harness', '/tmp', '/dev/shm')",
-                       f"ROOTS = ({str(tmp_path / 'workspace')!r}, {str(tmp_path / 'home')!r}, "
-                       f"{str(tmp_path / 'tmp')!r}, {str(tmp_path / 'shm')!r})")
-              .replace("Path('/proc/self/mountinfo')", f"Path({str(tmp_path / 'mountinfo')!r})"))
+    script = module.DISK_METRICS_SCRIPT.replace(
+        "Path('/proc/self/mountinfo')", f"Path({str(tmp_path / 'mountinfo')!r})")
     (tmp_path / 'mountinfo').write_text(mountinfo)
-    result = subprocess.run([sys.executable, '-I', '-c', script], capture_output=True, text=True)
+    roots = ','.join(str(tmp_path / name) for name in ('workspace', 'home', 'tmp', 'shm'))
+    result = subprocess.run([sys.executable, '-I', '-c', script, roots], capture_output=True, text=True)
     assert result.returncode != 0
     assert 'missing mount root' in result.stderr
     assert result.stdout == ''
@@ -1826,6 +1824,142 @@ def test_eval_verifier_reaps_and_uses_host_captured_validation(tmp_path, monkeyp
     assert runner.state['output_bytes'] == 5
     runner.start_observer.assert_called_once_with(330, 'owned-verify')
     runner.collect_resources.assert_called_once_with(stop_agents=True)
+
+
+@pytest.mark.parametrize('termination', ['exec', 'container', 'failed'])
+def test_eval_verifier_wall_deadline_stops_work_while_renewal_is_blocked(tmp_path, monkeypatch, termination):
+    from threading import Event
+    from types import SimpleNamespace
+
+    runner = host(tmp_path, 'executing')
+    runner.name = 'owned'
+    runner.args = SimpleNamespace(image='agent-image', verifier_image='verifier-image')
+    runner.last_renewal = 0.0
+    runner.persist = Mock()
+    runner.start_observer = Mock()
+    runner.collect_resources = Mock()
+    handoff, _ = seed_retained_candidate(tmp_path)
+    runner.state['git_handoff'] = handoff
+    runner.state['enforced_limits'] = {'effective': {
+        'cpu_time_secs': 1, 'memory_bytes': 512 * 1024 * 1024, 'pids': 32,
+        'disk_bytes': 1024 * 1024 * 1024, 'output_bytes': 1024,
+        'wall_time_secs': 1,
+    }}
+    renewing, stopped = Event(), Event()
+
+    def docker(*args, **kwargs):
+        if args[0] == 'exec' and 'os.kill(-1' in args[-1]:
+            assert renewing.is_set(), 'termination must be independent of the blocked renewal'
+            if termination != 'exec':
+                raise RuntimeError('no PID available for exec')
+            stopped.set()
+        elif args[0] == 'kill':
+            assert args[1] == 'owned-verify'
+            stopped.set()
+            if termination == 'failed':
+                raise RuntimeError('Docker kill failed')
+        return 'ok'
+
+    def api(path, body, **kwargs):
+        renewing.set()
+        assert stopped.wait(2), 'verifier workload survived its deadline during renewal'
+        return dict(runner.state['lease'])
+
+    def stream(command, root, timeout, renew, **kwargs):
+        # Model a slow successful control response while the native workload is live.
+        renew()
+        (root / 'agent.jsonl').write_bytes(b'prefix')
+        (root / 'agent.stderr').write_bytes(b'')
+        kwargs['account']['output_bytes'] = 6
+        return 0
+
+    runner.api = api
+    monkeypatch.setitem(runner.verify_expected_head.__globals__, 'docker', docker)
+    monkeypatch.setitem(runner.verify_expected_head.__globals__, 'stream_agent_output', stream)
+    with pytest.raises(RuntimeError, match='verifier exceeded claimed wall deadline') as error:
+        runner.verify_expected_head(handoff['candidate_commit'], [['python3', '-c', 'pass']])
+    assert stopped.is_set()
+    assert runner.state['wall_time_millis'] >= 1000
+    assert runner.state['output_bytes'] == 6
+    assert ('verifier termination failed' in str(error.value)) == (termination == 'failed')
+
+
+def test_control_request_timeout_uses_remaining_verifier_deadline(monkeypatch):
+    from types import SimpleNamespace
+
+    module = load()
+    runner = module.Host.__new__(module.Host)
+    runner.args = SimpleNamespace(server_url='https://control.example.invalid')
+    runner.token = 'fixture-token'
+    clock = [100.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    response = Mock()
+    response.__enter__ = Mock(return_value=io.BytesIO(b'{}'))
+    response.__exit__ = Mock(return_value=False)
+    open_request = Mock(return_value=response)
+    monkeypatch.setattr(module.urllib.request, 'urlopen', open_request)
+
+    assert runner.api('/heartbeat', {}, deadline=100.25) == {}
+    assert open_request.call_args.kwargs['timeout'] == 0.25
+    clock[0] = 100.25
+    with pytest.raises(RuntimeError, match='wall deadline'):
+        runner.api('/heartbeat', {}, deadline=100.25)
+    assert open_request.call_count == 1
+
+
+@pytest.mark.parametrize('delayed_timer', [False, True])
+def test_eval_verifier_deadline_covers_quiescence_after_command_exit(tmp_path, monkeypatch, delayed_timer):
+    from threading import Event
+    from types import SimpleNamespace
+
+    runner = host(tmp_path, 'executing')
+    runner.name = 'owned'
+    runner.args = SimpleNamespace(image='agent-image', verifier_image='verifier-image')
+    runner.persist = Mock()
+    runner.start_observer = Mock()
+    handoff, _ = seed_retained_candidate(tmp_path)
+    runner.state['git_handoff'] = handoff
+    runner.state['enforced_limits'] = {'effective': {
+        'cpu_time_secs': 1, 'memory_bytes': 512 * 1024 * 1024, 'pids': 32,
+        'disk_bytes': 1024 * 1024 * 1024, 'output_bytes': 1024,
+        'wall_time_secs': 1,
+    }}
+    collecting, stopped = Event(), Event()
+    clock = [100.0]
+    globals_ = runner.verify_expected_head.__globals__
+
+    def docker(*args, **kwargs):
+        if args[0] == 'exec' and 'os.kill(-1' in args[-1]:
+            assert args[1] == 'owned-verify'
+            assert collecting.is_set()
+            stopped.set()
+        return 'ok'
+
+    def stream(command, root, timeout, renew, **kwargs):
+        (root / 'agent.jsonl').write_bytes(b'')
+        (root / 'agent.stderr').write_bytes(b'')
+        kwargs['account']['output_bytes'] = 0
+        return 0
+
+    def collect_resources(stop_agents):
+        assert stop_agents
+        collecting.set()
+        if delayed_timer:
+            clock[0] = 101.5
+        else:
+            assert stopped.wait(4), 'detached verifier work survived during resource collection'
+
+    if delayed_timer:
+        timer = Mock()
+        monkeypatch.setattr(globals_['threading'], 'Timer', Mock(return_value=timer))
+        monkeypatch.setattr(globals_['time'], 'monotonic', lambda: clock[0])
+    runner.collect_resources = collect_resources
+    monkeypatch.setitem(globals_, 'docker', docker)
+    monkeypatch.setitem(globals_, 'stream_agent_output', stream)
+    with pytest.raises(RuntimeError, match='verifier exceeded claimed wall deadline'):
+        runner.verify_expected_head(handoff['candidate_commit'], [['python3', '-c', 'pass']])
+    assert stopped.is_set()
+    assert runner.state['wall_time_millis'] >= 1000
 
 
 def test_cli_requires_distinct_pinned_verifier_image(monkeypatch, capsys):

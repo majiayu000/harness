@@ -476,6 +476,7 @@ pub(crate) async fn stream_codex_exec_output(
                 StreamItem::ItemCompleted { .. } => "item_completed",
                 StreamItem::ItemCompletedKind => "item_completed",
                 StreamItem::TokenUsage { .. } => "token_usage",
+                StreamItem::CostReported { .. } => "cost_reported",
                 StreamItem::ModelReported { .. } => "model_reported",
                 StreamItem::Warning { .. } => "warning",
                 StreamItem::Diagnostic { .. } => "diagnostic",

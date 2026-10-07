@@ -96,6 +96,14 @@ pub(super) fn response_id_matches(actual: &Value, expected: u64) -> bool {
     actual.as_u64() == Some(expected) || actual.as_str() == Some(&expected.to_string())
 }
 
+pub(super) fn rpc_error_message(id: &Value, error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown JSON-RPC error");
+    format!("codex request {id} failed: {message}")
+}
+
 fn request_id_string(id: &Value) -> String {
     match id {
         Value::String(value) => value.clone(),
@@ -280,12 +288,10 @@ pub fn parse_codex_message(line: &str) -> Option<ParsedCodexMessage> {
 
     if let Some(id) = value.get("id") {
         if let Some(error) = value.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-                .to_string();
-            return Some(ParsedCodexMessage::Event(AgentEvent::Error { message }));
+            return Some(ParsedCodexMessage::RpcError {
+                id: id.clone(),
+                error: error.clone(),
+            });
         }
         if let Some(result) = value.get("result") {
             return Some(ParsedCodexMessage::Response {

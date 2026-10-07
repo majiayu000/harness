@@ -146,8 +146,8 @@ fn apply_claude_stream_event(
                 },
             });
         }
-        AgentEvent::ModelReported { model, source } => {
-            emitted_items.push(StreamItem::ModelReported { model, source });
+        event @ (AgentEvent::ModelReported { .. } | AgentEvent::CostReported { .. }) => {
+            emitted_items.push(event);
         }
         AgentEvent::EgressVerifiedAtDispatch
         | AgentEvent::TurnStarted
@@ -184,6 +184,7 @@ fn stream_item_label(item: &StreamItem) -> &'static str {
         StreamItem::ItemCompleted { .. } => "item_completed",
         StreamItem::ItemCompletedKind => "item_completed",
         StreamItem::TokenUsage { .. } => "token_usage",
+        StreamItem::CostReported { .. } => "cost_reported",
         StreamItem::ModelReported { .. } => "model_reported",
         StreamItem::Warning { .. } => "warning",
         StreamItem::Diagnostic { .. } => "diagnostic",

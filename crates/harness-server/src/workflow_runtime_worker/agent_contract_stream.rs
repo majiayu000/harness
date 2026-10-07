@@ -290,14 +290,23 @@ async fn record_event(
         } => Some((usage.clone(), *cost_usd_observed)),
         _ => None,
     };
+    let cost = match &event {
+        AgentEvent::CostReported { cost_usd } => Some(*cost_usd),
+        _ => None,
+    };
     attempt.record_event(event);
-    let (Some((usage, cost_usd_observed)), Some((context, turn_id))) = (usage, runtime_usage)
-    else {
+    let Some((context, turn_id)) = runtime_usage else {
         return Ok(None);
     };
-    context
-        .persist_token_usage(turn_id, &usage, cost_usd_observed)
-        .await?;
+    if let Some((usage, cost_usd_observed)) = usage {
+        context
+            .persist_token_usage(turn_id, &usage, cost_usd_observed)
+            .await?;
+    } else if let Some(cost_usd) = cost {
+        context.persist_cost(turn_id, cost_usd).await?;
+    } else {
+        return Ok(None);
+    }
     context.budget_stop().await
 }
 

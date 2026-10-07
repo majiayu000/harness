@@ -10,6 +10,85 @@ async fn open_runtime_store(dir: &Path) -> anyhow::Result<WorkflowRuntimeStore> 
 }
 
 #[tokio::test]
+async fn issue_dependency_cycle_spanning_a_sweep_page_is_detected() -> anyhow::Result<()> {
+    if !crate::test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let store = open_runtime_store(dir.path()).await?;
+    let project_root = dir.path().join("project");
+    std::fs::create_dir(&project_root)?;
+    let task_ids: Vec<TaskId> = (0..26)
+        .map(|index| TaskId::from_str(&format!("page-cycle-{index}")))
+        .collect();
+    let mut workflow_ids = Vec::new();
+    for (index, task_id) in task_ids.iter().enumerate() {
+        let submission = record_issue_submission(
+            &store,
+            IssueSubmissionRuntimeContext {
+                project_root: &project_root,
+                repo: Some("owner/repo"),
+                issue_number: 1_000 + index as u64,
+                task_id,
+                labels: &[],
+                force_execute: false,
+                additional_prompt: None,
+                depends_on: std::slice::from_ref(&task_ids[(index + 1) % task_ids.len()]),
+                dependencies_blocked: true,
+                source: None,
+                external_id: None,
+                remote_fact_hash: None,
+                author_trust_class: None,
+            },
+        )
+        .await?;
+        workflow_ids.push(submission.workflow_id);
+    }
+
+    let first = release_ready_issue_dependencies(&store, 25).await?;
+    assert_eq!(first.deadlocked, 25);
+    assert_eq!(first.waiting, 0);
+    assert_eq!(first.failed, 0);
+    let mut waiting = 0;
+    for workflow_id in &workflow_ids {
+        let instance = store
+            .get_instance(workflow_id)
+            .await?
+            .expect("workflow exists");
+        if instance.state == "awaiting_dependencies" {
+            waiting += 1;
+        } else {
+            assert_eq!(instance.state, "failed");
+            let event = store
+                .latest_event_for_type(workflow_id, "IssueDependencyCycleDetected")
+                .await?
+                .expect("cycle evidence should exist");
+            assert_eq!(
+                event.event["dependency_cycle_members"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                26
+            );
+        }
+    }
+    assert_eq!(
+        waiting, 1,
+        "graph discovery must not expand the mutation batch"
+    );
+    let second = release_ready_issue_dependencies(&store, 25).await?;
+    assert_eq!(second.failed, 1);
+    assert_eq!(second.deadlocked, 0);
+    for workflow_id in &workflow_ids {
+        assert_eq!(
+            store.get_instance(workflow_id).await?.unwrap().state,
+            "failed"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn issue_submission_releases_dependency_on_completed_runtime_handle() -> anyhow::Result<()> {
     if !crate::test_helpers::db_tests_enabled().await {
         return Ok(());
