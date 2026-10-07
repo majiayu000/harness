@@ -79,6 +79,42 @@ async fn anthropic_http_failures_preserve_retry_semantics_through_runtime_reduce
             ActivityErrorKind::Configuration,
         ),
         (
+            415,
+            "unsupported media type",
+            TurnFailureKind::RequestRejected,
+            ActivityErrorKind::Configuration,
+        ),
+        (
+            422,
+            "invalid message content",
+            TurnFailureKind::RequestRejected,
+            ActivityErrorKind::Configuration,
+        ),
+        (
+            408,
+            "request timeout",
+            TurnFailureKind::Upstream,
+            ActivityErrorKind::ExternalDependency,
+        ),
+        (
+            409,
+            "request conflict",
+            TurnFailureKind::Upstream,
+            ActivityErrorKind::ExternalDependency,
+        ),
+        (
+            421,
+            "misdirected request",
+            TurnFailureKind::Upstream,
+            ActivityErrorKind::ExternalDependency,
+        ),
+        (
+            425,
+            "too early",
+            TurnFailureKind::Upstream,
+            ActivityErrorKind::ExternalDependency,
+        ),
+        (
             500,
             "internal error",
             TurnFailureKind::Upstream,
