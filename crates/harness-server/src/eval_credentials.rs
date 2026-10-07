@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use harness_core::agent::AGENT_SECRETLESS_ENV_ENV;
+use harness_core::config::process_env;
 use harness_workflow::runtime::RuntimeJob;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -362,7 +363,7 @@ pub(crate) fn build_eval_credential_environment(
 pub(crate) fn runtime_host_eval_environment(
     job: &RuntimeJob,
 ) -> Result<Option<EvalCredentialEnvironment>, EvalCredentialEnvironmentError> {
-    let credential_file = std::env::var_os("HARNESS_EVAL_CREDENTIAL_FILE");
+    let credential_file = process_env::var_os("HARNESS_EVAL_CREDENTIAL_FILE");
     runtime_host_eval_environment_with_credential_file(
         job,
         credential_file.as_deref().map(Path::new),

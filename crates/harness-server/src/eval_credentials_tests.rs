@@ -535,3 +535,22 @@ fn eval_credentials_operator_file_unset_keeps_empty_default() {
     assert!(environment.variables().is_empty());
     assert!(environment.audit().credential_grants.is_empty());
 }
+
+#[test]
+fn eval_credentials_operator_file_requires_an_explicit_activity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("credentials.json");
+    std::fs::write(&path, operator_credential_payload().to_string()).unwrap();
+    for input in [
+        json!({"command": {"eval": {"eval_run_id": "run-1"}}}),
+        json!({"activity": 42, "command": {"eval": {"eval_run_id": "run-1"}}}),
+    ] {
+        let mut job = operator_credential_job("implement_issue");
+        job.input = input;
+        let environment = runtime_host_eval_environment_with_credential_file(&job, Some(&path))
+            .unwrap()
+            .unwrap();
+        assert!(environment.variables().is_empty());
+        assert!(environment.audit().credential_grants.is_empty());
+    }
+}
