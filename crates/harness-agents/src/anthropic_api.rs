@@ -129,9 +129,11 @@ impl CodeAgent for AnthropicApiAgent {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(harness_core::error::HarnessError::AgentExecution(format!(
-                "API returned {status}: {text}"
-            )));
+            return Err(harness_core::error::HarnessError::AgentHttpResponse {
+                provider: self.name().to_string(),
+                status: status.as_u16(),
+                message: format!("API returned {status}: {text}"),
+            });
         }
 
         let data: MessagesResponse = resp.json().await.map_err(|e| {

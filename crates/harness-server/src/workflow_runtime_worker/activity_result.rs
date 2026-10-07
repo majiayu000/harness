@@ -651,7 +651,9 @@ fn last_error_item(items: &[Item]) -> Option<(String, Option<TurnFailureKind>)> 
 fn activity_error_kind_from_turn_failure(kind: TurnFailureKind) -> ActivityErrorKind {
     match kind {
         TurnFailureKind::Timeout => ActivityErrorKind::Timeout,
-        TurnFailureKind::Quota | TurnFailureKind::Billing => ActivityErrorKind::Configuration,
+        TurnFailureKind::Quota | TurnFailureKind::Billing | TurnFailureKind::RequestRejected => {
+            ActivityErrorKind::Configuration
+        }
         TurnFailureKind::Upstream => ActivityErrorKind::ExternalDependency,
         TurnFailureKind::LocalProcess => ActivityErrorKind::SpawnFailure,
         TurnFailureKind::Protocol => ActivityErrorKind::Retryable,
@@ -678,3 +680,7 @@ mod tests;
 #[cfg(test)]
 #[path = "activity_result_limit_tests.rs"]
 mod limit_tests;
+
+#[cfg(test)]
+#[path = "activity_result_http_tests.rs"]
+mod http_tests;
