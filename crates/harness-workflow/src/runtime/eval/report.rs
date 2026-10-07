@@ -38,7 +38,8 @@ pub struct EvalReportMetrics {
     pub pass_to_k: f64,
     pub total_tokens: u64,
     pub avg_tokens_per_scored_case: Option<f64>,
-    pub total_cost_usd_micros: u64,
+    /// Present only when every case has complete cost evidence.
+    pub total_cost_usd_micros: Option<u64>,
     pub avg_cost_usd_micros_per_scored_case: Option<f64>,
 }
 
@@ -73,7 +74,8 @@ pub struct EvalReportCase {
     #[serde(default)]
     pub infrastructure_status: EvalCaseInfrastructureStatus,
     pub total_tokens: u64,
-    pub cost_usd_micros: u64,
+    /// Present only when every usage observation reports its cost.
+    pub cost_usd_micros: Option<u64>,
     pub missing_evidence: Vec<String>,
 }
 
@@ -130,7 +132,7 @@ pub struct EvalReportMetricDelta {
     pub pass_at_1_delta: f64,
     pub pass_to_k_delta: f64,
     pub total_tokens_delta: i128,
-    pub total_cost_usd_micros_delta: i128,
+    pub total_cost_usd_micros_delta: Option<i128>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,7 +259,7 @@ pub fn eval_report_dry_run(
             terminal_state: None,
             infrastructure_status: EvalCaseInfrastructureStatus::Unknown,
             total_tokens: 0,
-            cost_usd_micros: 0,
+            cost_usd_micros: None,
             missing_evidence: Vec::new(),
         })
         .collect::<Vec<_>>();
@@ -351,7 +353,7 @@ pub fn eval_report_from_evidence(
                     terminal_state: None,
                     infrastructure_status: EvalCaseInfrastructureStatus::Unknown,
                     total_tokens: 0,
-                    cost_usd_micros: 0,
+                    cost_usd_micros: None,
                     missing_evidence: vec![blocker.to_string()],
                 },
                 (None, None) => EvalReportCase {
@@ -374,7 +376,7 @@ pub fn eval_report_from_evidence(
                     terminal_state: None,
                     infrastructure_status: EvalCaseInfrastructureStatus::MissingEvidence,
                     total_tokens: 0,
-                    cost_usd_micros: 0,
+                    cost_usd_micros: None,
                     missing_evidence: vec!["case_evidence".to_string()],
                 },
             }
@@ -471,8 +473,11 @@ pub fn diff_eval_run_reports(
             pass_to_k_delta: candidate.metrics.pass_to_k - baseline.metrics.pass_to_k,
             total_tokens_delta: i128::from(candidate.metrics.total_tokens)
                 - i128::from(baseline.metrics.total_tokens),
-            total_cost_usd_micros_delta: i128::from(candidate.metrics.total_cost_usd_micros)
-                - i128::from(baseline.metrics.total_cost_usd_micros),
+            total_cost_usd_micros_delta: candidate
+                .metrics
+                .total_cost_usd_micros
+                .zip(baseline.metrics.total_cost_usd_micros)
+                .map(|(candidate, baseline)| i128::from(candidate) - i128::from(baseline)),
         },
         transition_counts,
         regression_count,
@@ -595,14 +600,20 @@ fn evidence_infrastructure_status(
     }
 }
 
-fn evidence_usage_totals(evidence: &EvalCaseEvidence) -> (u64, u64) {
-    evidence.usage.iter().fold((0_u64, 0_u64), |acc, usage| {
-        let tokens = usage.derived_total_tokens().unwrap_or(0);
-        (
-            acc.0.saturating_add(tokens),
-            acc.1.saturating_add(usage.cost_usd_micros.unwrap_or(0)),
-        )
-    })
+fn evidence_usage_totals(evidence: &EvalCaseEvidence) -> (u64, Option<u64>) {
+    let initial_cost = (!evidence.usage.is_empty()).then_some(0_u64);
+    evidence
+        .usage
+        .iter()
+        .fold((0_u64, initial_cost), |acc, usage| {
+            let tokens = usage.derived_total_tokens().unwrap_or(0);
+            (
+                acc.0.saturating_add(tokens),
+                acc.1
+                    .zip(usage.cost_usd_micros)
+                    .map(|(sum, cost)| sum.saturating_add(cost)),
+            )
+        })
 }
 
 fn report_from_cases(
@@ -665,9 +676,9 @@ fn metrics_for_cases(k: u32, cases: &[EvalReportCase]) -> EvalReportMetrics {
     let total_tokens = cases
         .iter()
         .fold(0_u64, |sum, case| sum.saturating_add(case.total_tokens));
-    let total_cost_usd_micros = cases
-        .iter()
-        .fold(0_u64, |sum, case| sum.saturating_add(case.cost_usd_micros));
+    let total_cost_usd_micros = cases.iter().try_fold(0_u64, |sum, case| {
+        case.cost_usd_micros.map(|cost| sum.saturating_add(cost))
+    });
 
     EvalReportMetrics {
         total_cases,
@@ -682,7 +693,8 @@ fn metrics_for_cases(k: u32, cases: &[EvalReportCase]) -> EvalReportMetrics {
         total_tokens,
         avg_tokens_per_scored_case: average_u64(total_tokens, scored_cases),
         total_cost_usd_micros,
-        avg_cost_usd_micros_per_scored_case: average_u64(total_cost_usd_micros, scored_cases),
+        avg_cost_usd_micros_per_scored_case: total_cost_usd_micros
+            .and_then(|cost| average_u64(cost, scored_cases)),
     }
 }
 

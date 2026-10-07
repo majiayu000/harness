@@ -12,8 +12,9 @@ impl WorkflowRuntimeStore {
     /// longer commit because its job lease expired or was reclaimed
     /// (GH-1878). The payload — result plus optional transcript — lands in
     /// `runtime_job_completions_dlq` instead of being dropped, so no finished
-    /// agent work vanishes silently; reconciliation can decide later whether
-    /// the result is still applicable or the job must re-run.
+    /// agent work vanishes silently. Each issued lease generation has its own
+    /// record; replaying that generation must preserve the original payload.
+    /// Reconciliation can decide later whether the result is still applicable.
     pub async fn record_lease_expired_completion(
         &self,
         runtime_job_id: &str,
@@ -317,12 +318,14 @@ async fn insert_lease_expired_completion_tx(
 ) -> anyhow::Result<LeaseExpiredCompletionInsertOutcome> {
     let lease_generation = i64::try_from(lease_generation)
         .map_err(|_| anyhow::anyhow!("runtime job lease generation exceeds BIGINT"))?;
+    let completion_id = format!("{runtime_job_id}:{lease_generation}");
     let inserted = sqlx::query(
         "INSERT INTO runtime_job_completions_dlq
             (id, runtime_job_id, owner, lease_generation, lease_expires_at, result, transcript)
-         VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6::jsonb)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
          ON CONFLICT (id) DO NOTHING",
     )
+    .bind(&completion_id)
     .bind(runtime_job_id)
     .bind(owner)
     .bind(lease_generation)
@@ -345,7 +348,7 @@ async fn insert_lease_expired_completion_tx(
          WHERE id = $1
          FOR UPDATE",
     )
-    .bind(runtime_job_id)
+    .bind(&completion_id)
     .bind(owner)
     .bind(lease_generation)
     .bind(lease_expires_at)

@@ -581,7 +581,7 @@ fn case(case_id: &str, status: EvalReportCaseStatus) -> EvalReportCase {
             _ => EvalCaseInfrastructureStatus::Healthy,
         },
         total_tokens: 0,
-        cost_usd_micros: 0,
+        cost_usd_micros: Some(0),
         missing_evidence: Vec::new(),
     }
 }
@@ -644,4 +644,114 @@ fn imported_evidence_cannot_relabel_old_passing_cases() {
     let mut wrong_version = imported;
     wrong_version.schema_version = 2;
     assert!(eval_report_from_imported_evidence(&original, "report", 1, wrong_version).is_err());
+}
+
+fn cost_usage(cost: Option<u64>, tokens: u64) -> super::super::model::UsageSnapshot {
+    use super::super::model::{Confidence, UsageSnapshot};
+    UsageSnapshot {
+        agent_invocation_id: None,
+        runtime_job_id: None,
+        workflow_id: None,
+        model: Some(if tokens == 0 { "" } else { "fixture-model" }.into()),
+        reasoning_effort: None,
+        input_tokens: Some(tokens),
+        output_tokens: Some(0),
+        cached_input_tokens: Some(0),
+        total_tokens: Some(tokens),
+        cost_usd_micros: cost,
+        token_confidence: Confidence::Observed,
+        cost_confidence: if cost.is_some() {
+            Confidence::Observed
+        } else {
+            Confidence::Unknown
+        },
+    }
+}
+
+#[test]
+fn eval_report_cost_requires_complete_observations_and_preserves_known_zero() {
+    for (usage, expected) in [
+        (vec![], None),
+        (vec![cost_usage(None, 100)], None),
+        (
+            vec![cost_usage(Some(125_000), 100), cost_usage(None, 100)],
+            None,
+        ),
+        (
+            vec![cost_usage(Some(125_000), 100), cost_usage(Some(25_000), 50)],
+            Some(150_000),
+        ),
+        (vec![cost_usage(Some(0), 100)], Some(0)),
+        (vec![cost_usage(Some(0), 0)], Some(0)),
+        (vec![cost_usage(None, 0)], None),
+    ] {
+        let mut item = evidence("case", EvalEvidenceStatus::Passed, vec![], Some("done"));
+        item.usage = usage;
+        let report = eval_report_from_evidence(&manifest(&["case"]), "run", 1, vec![item])
+            .expect("report should retain usage availability");
+        assert_eq!(report.cases[0].cost_usd_micros, expected);
+        assert_eq!(report.metrics.total_cost_usd_micros, expected);
+        assert_eq!(
+            report.metrics.avg_cost_usd_micros_per_scored_case,
+            expected.map(|cost| cost as f64)
+        );
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serialized["cases"][0]["cost_usd_micros"],
+            serde_json::json!(expected)
+        );
+        assert_eq!(
+            serialized["metrics"]["total_cost_usd_micros"],
+            serde_json::json!(expected)
+        );
+        assert_eq!(
+            serde_json::from_value::<EvalRunReport>(serialized).unwrap(),
+            report
+        );
+    }
+}
+
+#[test]
+fn eval_report_mixed_case_costs_do_not_produce_a_total_average_or_delta() {
+    let baseline = report(
+        "baseline",
+        vec![
+            case("known", EvalReportCaseStatus::Passed),
+            case("unknown", EvalReportCaseStatus::Passed),
+        ],
+    );
+    let mut known = case("known", EvalReportCaseStatus::Passed);
+    known.cost_usd_micros = Some(125_000);
+    let mut unknown = case("unknown", EvalReportCaseStatus::Passed);
+    unknown.cost_usd_micros = None;
+    let candidate = report("candidate", vec![known, unknown]);
+    assert_eq!(candidate.cases[0].cost_usd_micros, Some(125_000));
+    assert_eq!(candidate.metrics.total_cost_usd_micros, None);
+    assert_eq!(candidate.metrics.avg_cost_usd_micros_per_scored_case, None);
+    assert_eq!(
+        diff_eval_run_reports(&baseline, &candidate)
+            .unwrap()
+            .delta
+            .total_cost_usd_micros_delta,
+        None
+    );
+    assert_eq!(
+        diff_eval_run_reports(&candidate, &baseline)
+            .unwrap()
+            .delta
+            .total_cost_usd_micros_delta,
+        None
+    );
+
+    let mut cheaper = baseline.clone();
+    cheaper.metrics.total_cost_usd_micros = Some(100);
+    let mut dearer = baseline.clone();
+    dearer.metrics.total_cost_usd_micros = Some(125);
+    assert_eq!(
+        diff_eval_run_reports(&dearer, &cheaper)
+            .unwrap()
+            .delta
+            .total_cost_usd_micros_delta,
+        Some(-25)
+    );
 }

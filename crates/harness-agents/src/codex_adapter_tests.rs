@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::time::Instant;
 
-fn test_turn_request(project_root: PathBuf) -> AgentRequest {
+pub(super) fn test_turn_request(project_root: PathBuf) -> AgentRequest {
     AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
@@ -29,7 +29,7 @@ fn test_turn_request(project_root: PathBuf) -> AgentRequest {
 }
 
 #[cfg(unix)]
-fn write_app_server_stub(dir: &std::path::Path, body: &str) -> anyhow::Result<PathBuf> {
+pub(super) fn write_app_server_stub(dir: &std::path::Path, body: &str) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let path = dir.join("codex-app-server-stub");
@@ -273,9 +273,10 @@ fn parse_error_response_without_jsonrpc() {
     let message = parse_codex_message(line).unwrap();
     assert_eq!(
         message,
-        ParsedCodexMessage::Event(AgentEvent::Error {
-            message: "invalid request".into()
-        })
+        ParsedCodexMessage::RpcError {
+            id: json!(1),
+            error: json!({"message":"invalid request"}),
+        }
     );
 }
 
@@ -776,8 +777,10 @@ async fn clear_active_turn_id_drops_stale_turn_state() {
 
 #[tokio::test]
 async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
+    let workspace = tempfile::tempdir().expect("create workspace");
     let adapter = CodexAdapter::new(PathBuf::from("codex"));
     let mut child = tokio::process::Command::new("sh")
+        .current_dir(workspace.path())
         .arg("-c")
         .arg(
             r#"printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress","items":[]}}}'; read _ || true"#,
@@ -794,13 +797,13 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         state.stdin = Some(stdin);
         state.stdout_lines = Some(adapter.wrap_stdout(stdout));
         state.thread_id = Some("thread-1".into());
-        state.child_workspace = Some(PathBuf::from("/tmp/project"));
+        state.child_workspace = Some(workspace.path().to_path_buf());
     }
 
     let req = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
-        project_root: PathBuf::from("/tmp/project"),
+        project_root: workspace.path().to_path_buf(),
         permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
@@ -1090,6 +1093,7 @@ for raw in sys.stdin:
         print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"method": "thread/started", "params": {"thread": {"id": "thread-1"}}}), flush=True)
+        print(json.dumps({"id": msg["id"], "result": {"thread": {"id": "thread-1"}}}), flush=True)
     elif method == "turn/start":
         open(turn_start_seen, "w").close()
         while not os.path.exists(release_turn_started):
@@ -1348,6 +1352,7 @@ for raw in sys.stdin:
         print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
     elif method == "thread/start":
         print(json.dumps({"method": "thread/started", "params": {"thread": {"id": "thread-1"}}}), flush=True)
+        print(json.dumps({"id": msg["id"], "result": {"thread": {"id": "thread-1"}}}), flush=True)
         break
 time.sleep(60)
 "#,

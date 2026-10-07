@@ -170,6 +170,67 @@ fn execution_ownership_blocks_reuse_and_stale_finalization() {
     );
 }
 
+#[test]
+fn dropped_execution_guard_retains_workspace_until_process_exit_acknowledgement() {
+    use harness_core::process_cleanup::ProcessCleanupAcknowledgement;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace_path = tmp.path().join("workspaces/deferred");
+    std::fs::create_dir_all(workspace_path.join("subdir")).expect("workspace dir");
+    let mgr = Arc::new(
+        WorkspaceManager::new(WorkspaceConfig {
+            root: tmp.path().join("workspaces"),
+            ..Default::default()
+        })
+        .expect("manager"),
+    );
+    let task_id = TaskId("deferred".into());
+    mgr.active.insert(
+        task_id.clone(),
+        ActiveWorkspace {
+            workspace_path: workspace_path.clone(),
+            source_repo: tmp.path().join("repo"),
+            repo: None,
+            runtime_workflow_id: None,
+            workspace_key: "deferred-workspace".into(),
+            project_key: "deferred-project".into(),
+            slot_index: 0,
+            branch: "test".into(),
+            created_at: std::time::SystemTime::now(),
+            owner_session: mgr.owner_session.clone(),
+            run_generation: 1,
+            acquisition_id: "deferred-acquisition".into(),
+            state: ActiveWorkspaceState::Ready,
+            _pool_permit: None,
+            _repository_write_lease: None,
+        },
+    );
+    let execution = mgr
+        .claim_workspace_execution(&task_id, "deferred-acquisition")
+        .expect("execution");
+    // Exercise the actual production ownership fence from a nested child cwd.
+    let cleanup = ProcessCleanupAcknowledgement::pending(
+        workspace_path.join("subdir").canonicalize().unwrap(),
+    );
+    drop(execution);
+    assert!(matches!(
+        mgr.active.get(&task_id).unwrap().state,
+        ActiveWorkspaceState::Running(_)
+    ));
+    assert!(mgr
+        .claim_workspace_execution(&task_id, "deferred-acquisition")
+        .is_err());
+    assert!(workspace_path.exists());
+    cleanup.confirm();
+    assert_eq!(
+        mgr.active.get(&task_id).unwrap().state,
+        ActiveWorkspaceState::CleanupRequired
+    );
+    assert!(
+        workspace_path.exists(),
+        "confirmation permits normal cleanup; it does not itself delete files"
+    );
+}
+
 #[tokio::test]
 async fn active_workspace_outside_reduced_capacity_is_not_reused() {
     let tmp = tempfile::tempdir().expect("tempdir");

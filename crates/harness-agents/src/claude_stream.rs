@@ -17,8 +17,8 @@ pub(crate) struct ParsedClaudeStreamOutput {
     pub(crate) raw_stdout: String,
     pub(crate) output: String,
     pub(crate) token_usage: TokenUsage,
-    /// Terminal `result` failure reported by the CLI (emitted with exit code
-    /// 0), so success cannot be inferred from the process status alone.
+    /// Terminal failure or incomplete structured oneshot output, which can
+    /// accompany exit code 0 and cannot be inferred from process status alone.
     pub(crate) failure: Option<String>,
     completed: bool,
 }
@@ -146,8 +146,8 @@ fn apply_claude_stream_event(
                 },
             });
         }
-        AgentEvent::ModelReported { model, source } => {
-            emitted_items.push(StreamItem::ModelReported { model, source });
+        event @ (AgentEvent::ModelReported { .. } | AgentEvent::CostReported { .. }) => {
+            emitted_items.push(event);
         }
         AgentEvent::EgressVerifiedAtDispatch
         | AgentEvent::TurnStarted
@@ -160,14 +160,19 @@ fn apply_claude_stream_event(
 
 pub(crate) fn parse_claude_stream_output(stdout: &str) -> ParsedClaudeStreamOutput {
     let mut parsed = ParsedClaudeStreamOutput::default();
+    let mut saw_json = false;
     for line in stdout.lines() {
         if line == crate::spawn_contract::egress::CONTAINER_EGRESS_CANARY_VERIFIED {
             continue;
         }
+        saw_json |= is_json_line(line);
         parsed.raw_stdout.push_str(line);
         parsed.raw_stdout.push('\n');
         let mut emitted_items = Vec::new();
         apply_claude_stream_line(line, &mut parsed, &mut emitted_items);
+    }
+    if saw_json && !parsed.completed && parsed.failure.is_none() {
+        parsed.failure = Some("claude structured output ended before a terminal result".into());
     }
     parsed
 }
@@ -184,6 +189,7 @@ fn stream_item_label(item: &StreamItem) -> &'static str {
         StreamItem::ItemCompleted { .. } => "item_completed",
         StreamItem::ItemCompletedKind => "item_completed",
         StreamItem::TokenUsage { .. } => "token_usage",
+        StreamItem::CostReported { .. } => "cost_reported",
         StreamItem::ModelReported { .. } => "model_reported",
         StreamItem::Warning { .. } => "warning",
         StreamItem::Diagnostic { .. } => "diagnostic",

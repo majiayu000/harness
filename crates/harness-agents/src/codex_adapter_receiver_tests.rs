@@ -9,8 +9,10 @@ use tokio::time::Instant;
 #[tokio::test]
 #[cfg(unix)]
 async fn closed_event_receiver_kills_and_reaps_app_server_process_group() -> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
     let mut command = tokio::process::Command::new("sh");
     command
+        .current_dir(workspace.path())
         .arg("-c")
         .arg(
             r#"printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}}'; sleep 60 & wait"#,
@@ -41,12 +43,12 @@ async fn closed_event_receiver_kills_and_reaps_app_server_process_group() -> any
         state.stdin = Some(stdin);
         state.stdout_lines = Some(adapter.wrap_stdout(stdout));
         state.thread_id = Some("thread-1".into());
-        state.child_workspace = Some(PathBuf::from("/tmp/project"));
+        state.child_workspace = Some(workspace.path().to_path_buf());
     }
     let request = AgentRequest {
         prompt: "ping".into(),
         prompt_layers: None,
-        project_root: PathBuf::from("/tmp/project"),
+        project_root: workspace.path().to_path_buf(),
         permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,
@@ -90,9 +92,11 @@ async fn closed_event_receiver_kills_and_reaps_app_server_process_group() -> any
 #[tokio::test]
 #[cfg(unix)]
 async fn full_event_receiver_does_not_block_stop_or_cleanup() -> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
     let mut command = tokio::process::Command::new("sh");
     // Emit turn/started then flood deltas so a capacity-1 live receiver blocks on send.
     command
+        .current_dir(workspace.path())
         .arg("-c")
         .arg(
             r#"
@@ -138,12 +142,12 @@ wait
         state.stdin = Some(stdin);
         state.stdout_lines = Some(adapter.wrap_stdout(stdout));
         state.thread_id = Some("thread-1".into());
-        state.child_workspace = Some(PathBuf::from("/tmp/project"));
+        state.child_workspace = Some(workspace.path().to_path_buf());
     }
     let request = AgentRequest {
         prompt: "ping".into(),
         prompt_layers: None,
-        project_root: PathBuf::from("/tmp/project"),
+        project_root: workspace.path().to_path_buf(),
         permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,

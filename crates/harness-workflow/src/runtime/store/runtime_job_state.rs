@@ -114,6 +114,16 @@ impl WorkflowRuntimeStore {
         next_lease_expires_at: DateTime<Utc>,
     ) -> anyhow::Result<Option<RuntimeJob>> {
         let mut tx = self.pool.begin().await?;
+        // Cancelling the Rust future does not cancel a PostgreSQL statement
+        // already waiting on a row lock. Bound that wait on the server as well.
+        let remaining_ms = (current_lease_expires_at - Utc::now()).num_milliseconds();
+        if remaining_ms <= 0 {
+            return Ok(None);
+        }
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{remaining_ms}ms"))
+            .execute(&mut *tx)
+            .await?;
         if !super::runtime_job_terminal_fence::fence_terminal_runtime_job_workflow_tx(
             &mut tx,
             &self.definition_registry,
@@ -139,7 +149,9 @@ impl WorkflowRuntimeStore {
         }
         let is_current_lease = job.status == RuntimeJobStatus::Running
             && job.lease.as_ref().is_some_and(|lease| {
-                lease.owner == owner && lease.expires_at == current_lease_expires_at
+                lease.owner == owner
+                    && lease.expires_at == current_lease_expires_at
+                    && lease.expires_at > Utc::now()
             });
         if !is_current_lease {
             tx.commit().await?;

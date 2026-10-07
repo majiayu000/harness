@@ -584,7 +584,9 @@ impl AgentAdapter for CleanupFailingAdapter {
     }
 
     async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
-        self.terminate_calls.fetch_add(1, Ordering::AcqRel);
+        if self.terminate_calls.fetch_add(1, Ordering::AcqRel) > 0 {
+            return Ok(());
+        }
         Err(HarnessError::AgentExecution(
             "failed to clean up codex app-server child: injected descendant cleanup failure"
                 .to_string(),
@@ -593,7 +595,7 @@ impl AgentAdapter for CleanupFailingAdapter {
 }
 
 #[tokio::test]
-async fn lease_loss_surfaces_terminate_cleanup_failure_on_turn() -> anyhow::Result<()> {
+async fn lease_loss_preserves_cleanup_failure_after_successful_retry() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let agent_calls = Arc::new(AtomicUsize::new(0));
     let terminate_calls = Arc::new(AtomicUsize::new(0));
@@ -626,7 +628,7 @@ async fn lease_loss_surfaces_terminate_cleanup_failure_on_turn() -> anyhow::Resu
     )
     .await?;
 
-    assert_eq!(terminate_calls.load(Ordering::Acquire), 1);
+    assert_eq!(terminate_calls.load(Ordering::Acquire), 2);
     let thread_id = server
         .thread_manager
         .find_thread_for_turn(&turn_id)

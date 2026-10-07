@@ -38,6 +38,14 @@ pub enum HarnessError {
     #[error("agent execution failed: {0}")]
     AgentExecution(String),
 
+    /// HTTP failure with status retained independently of provider error prose.
+    #[error("agent execution failed: {message}")]
+    AgentHttpResponse {
+        provider: String,
+        status: u16,
+        message: String,
+    },
+
     #[error("agent upstream failure: {0}")]
     Upstream(String),
 
@@ -164,6 +172,29 @@ impl HarnessError {
                 message: Some(message.clone()),
                 body_excerpt: excerpt_after_colon(message),
             }),
+            HarnessError::AgentHttpResponse {
+                provider,
+                status,
+                message,
+            } => {
+                // Keep billing/quota semantics ahead of generic request rejection.
+                let kind = if *status == 402 || is_billing_failure_message(message) {
+                    TurnFailureKind::Billing
+                } else if *status == 429 || is_quota_failure_message(message) {
+                    TurnFailureKind::Quota
+                } else if matches!(*status, 400 | 401 | 403 | 404 | 413 | 415 | 422) {
+                    TurnFailureKind::RequestRejected
+                } else {
+                    TurnFailureKind::Upstream
+                };
+                Some(TurnFailure {
+                    kind,
+                    provider: Some(provider.clone()),
+                    upstream_status: Some(*status),
+                    message: Some(message.clone()),
+                    body_excerpt: excerpt_after_colon(message),
+                })
+            }
             HarnessError::AgentExecution(message) => {
                 Some(classify_agent_execution_failure(message))
             }
@@ -334,6 +365,38 @@ fn excerpt_after_colon(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_status_classification_does_not_depend_on_message_format() {
+        for (status, message, expected) in [
+            (
+                401,
+                "provider rejected credentials",
+                TurnFailureKind::RequestRejected,
+            ),
+            (
+                500,
+                "API returned 401 in an earlier request",
+                TurnFailureKind::Upstream,
+            ),
+            (402, "billing_error", TurnFailureKind::Billing),
+            (429, "monthly spend cap reached", TurnFailureKind::Quota),
+            (400, "insufficient balance", TurnFailureKind::Billing),
+            (400, "quota exhausted", TurnFailureKind::Quota),
+        ] {
+            let failure = HarnessError::AgentHttpResponse {
+                provider: "anthropic-api".to_string(),
+                status,
+                message: message.to_string(),
+            }
+            .turn_failure()
+            .expect("typed HTTP failure");
+            assert_eq!(failure.kind, expected);
+            assert_eq!(failure.upstream_status, Some(status));
+            assert_eq!(failure.provider.as_deref(), Some("anthropic-api"));
+            assert_eq!(failure.message.as_deref(), Some(message));
+        }
+    }
 
     #[test]
     fn classify_streamed_quota_exit_as_quota_failure() {

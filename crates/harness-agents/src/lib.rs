@@ -13,6 +13,12 @@ pub mod opencode;
 pub mod opencode_adapter;
 mod output_capture;
 pub mod output_parsing;
+mod process_cleanup;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod process_group;
 pub mod provider_backpressure;
 pub mod registry;
 pub mod scoped_token;
@@ -120,10 +126,25 @@ pub(crate) fn kill_process_group(child: &tokio::process::Child) {
 
 #[cfg(unix)]
 fn process_group_has_members(pid: u32) -> bool {
-    // kill(-pgid, 0) performs existence/permission checking without sending a
-    // signal. A non-zero result is treated as drained; in this use case Harness
-    // owns the child group, so EPERM should not hide live descendants.
+    // Only ESRCH confirms absence. Permission or inspection failures must not
+    // authorize workspace release while the group's state is unknown.
     (unsafe { nix_kill(-(pid as i32), 0) }) == 0
+        || std::io::Error::last_os_error().raw_os_error() != Some(3)
+}
+
+#[cfg(unix)]
+fn process_group_has_live_members(pid: u32) -> bool {
+    if !process_group_has_members(pid) {
+        return false;
+    }
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    if process_group::contains_only_exited_processes(pid) {
+        return false;
+    }
+    true
 }
 
 /// Raw kill(2) syscall without libc dependency.
@@ -142,12 +163,16 @@ pub(crate) struct ManagedChild {
     process_group_id: Option<u32>,
     label: &'static str,
     cleanup_disarmed: bool,
+    cleanup_workspace: Option<std::path::PathBuf>,
+    cleanup_runtime: Option<tokio::runtime::Handle>,
     egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
     egress_verification: crate::spawn_contract::EgressVerification,
     /// Test-only hook: after the root process exits, return this error instead
     /// of completing descendant cleanup so callers can assert failure propagation.
     #[cfg(test)]
     injected_cleanup_error: Option<std::io::Error>,
+    #[cfg(test)]
+    drop_confirmation_blocked: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ManagedChild {
@@ -158,10 +183,14 @@ impl ManagedChild {
             process_group_id,
             label,
             cleanup_disarmed: false,
+            cleanup_workspace: None,
+            cleanup_runtime: tokio::runtime::Handle::try_current().ok(),
             egress_proxy_lease: None,
             egress_verification: crate::spawn_contract::EgressVerification::NotRequired,
             #[cfg(test)]
             injected_cleanup_error: None,
+            #[cfg(test)]
+            drop_confirmation_blocked: None,
         }
     }
 
@@ -180,6 +209,11 @@ impl ManagedChild {
         lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
     ) -> Self {
         self.egress_proxy_lease = lease;
+        self
+    }
+
+    pub(crate) fn with_cleanup_workspace(mut self, workspace: std::path::PathBuf) -> Self {
+        self.cleanup_workspace = Some(workspace);
         self
     }
 
@@ -381,7 +415,7 @@ impl ManagedChild {
         let Some(process_group_id) = self.process_group_id else {
             return Ok(());
         };
-        if !process_group_has_members(process_group_id) {
+        if !process_group_has_live_members(process_group_id) {
             return Ok(());
         }
 
@@ -393,7 +427,7 @@ impl ManagedChild {
         kill_process_group_id(process_group_id);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if !process_group_has_members(process_group_id) {
+            if !process_group_has_live_members(process_group_id) {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -468,13 +502,21 @@ where
 
 impl Drop for ManagedChild {
     fn drop(&mut self) {
+        // Egress lease Drop schedules external cleanup. Even an already drained
+        // child may be dropped by a synchronous owner outside its Tokio context.
+        let current_runtime = tokio::runtime::Handle::try_current().ok();
+        let may_block_in_place = current_runtime.as_ref().is_some_and(|runtime| {
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        let runtime = current_runtime.or_else(|| self.cleanup_runtime.clone());
+        let _entered = runtime.as_ref().map(|runtime| runtime.enter());
+        let egress_proxy_lease = self.egress_proxy_lease.take();
         if self.cleanup_disarmed {
             return;
         }
         let Some(mut child) = self.child.take() else {
             return;
         };
-        let egress_proxy_lease = self.egress_proxy_lease.take();
         let child_reaped = match child.try_wait() {
             Ok(Some(_)) => true,
             Ok(None) => false,
@@ -483,12 +525,14 @@ impl Drop for ManagedChild {
                     agent_process = self.label,
                     "failed to inspect child process before drop: {error}"
                 );
-                true
+                false
             }
         };
 
         #[cfg(unix)]
-        let group_has_members = self.process_group_id.is_some_and(process_group_has_members);
+        let group_has_members = self
+            .process_group_id
+            .is_some_and(process_group_has_live_members);
         #[cfg(not(unix))]
         let group_has_members = false;
 
@@ -507,22 +551,28 @@ impl Drop for ManagedChild {
         }
         let _ = child.start_kill();
 
-        // A cancelled agent must stop mutating its workspace before the caller
-        // can release the repository lease. Reap synchronously so returning
-        // from Drop is the cancellation acknowledgement; a detached reaper
-        // would allow a replacement writer to overlap the dying process.
+        // Allow a short synchronous acknowledgement for the normal killed-child
+        // path. A slow or unknown group transfers to the shared reaper with its
+        // workspace fence already published before this Drop returns.
+        let workspace = self.cleanup_workspace.take();
+        #[cfg(test)]
+        let confirmation_blocked = self.drop_confirmation_blocked.take();
         let drain = || {
             drain_killed_child_blocking(
-                child,
-                child_reaped,
-                self.label,
-                self.process_group_id,
-                egress_proxy_lease,
+                process_cleanup::DrainingChild {
+                    child,
+                    child_reaped,
+                    label: self.label,
+                    process_group_id: self.process_group_id,
+                    _egress_proxy_lease: egress_proxy_lease,
+                    runtime: runtime.clone(),
+                    #[cfg(test)]
+                    confirmation_blocked,
+                },
+                workspace,
             )
         };
-        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
-            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-        }) {
+        if may_block_in_place {
             tokio::task::block_in_place(drain);
         } else {
             drain();
@@ -530,40 +580,24 @@ impl Drop for ManagedChild {
     }
 }
 
-/// Reap a killed child and wait until its process group has no remaining members.
+/// Reap the owned child and confirm that no process-group member can still run.
+/// Exited descendants may remain owned by an external reaper; their pidfds are
+/// sufficient exit acknowledgement on supported Linux kernels.
 fn drain_killed_child_blocking(
-    mut child: tokio::process::Child,
-    mut child_reaped: bool,
-    label: &'static str,
-    process_group_id: Option<u32>,
-    _egress_proxy_lease: Option<std::sync::Arc<crate::spawn_contract::egress::EgressProxyLease>>,
+    mut child: process_cleanup::DrainingChild,
+    workspace: Option<std::path::PathBuf>,
 ) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
     loop {
-        if !child_reaped {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    child_reaped = true;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        agent_process = label,
-                        "failed waiting for killed agent child to exit: {error}"
-                    );
-                    child_reaped = true;
-                }
-            }
-        }
-
-        #[cfg(unix)]
-        let group_drained = process_group_id.is_none_or(|pid| !process_group_has_members(pid));
-        #[cfg(not(unix))]
-        let group_drained = true;
-
-        if child_reaped && group_drained {
+        if child.try_complete() {
             return;
         }
-
+        if std::time::Instant::now() >= deadline {
+            tracing::error!(agent_process = child.label, pgid = ?child.process_group_id,
+                "process cleanup exceeded Drop deadline; retaining workspace ownership until exit is confirmed");
+            process_cleanup::defer(child, workspace);
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
@@ -646,23 +680,34 @@ mod managed_child_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn drop_of_running_child_reaps_process_group_before_returning() {
+    async fn drop_of_running_child_reaps_or_fences_process_group_before_returning() {
+        let root = tempfile::tempdir().expect("workspace");
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.arg("-c").arg("sleep 30 & wait").kill_on_drop(true);
         set_process_group(&mut cmd);
         let child = cmd.spawn().expect("spawn sleeping child");
         let pgid = child.id().expect("child pid");
-        let managed = ManagedChild::new(child, "drop latency test");
+        let managed = ManagedChild::new(child, "drop latency test")
+            .with_cleanup_workspace(root.path().canonicalize().expect("workspace identity"));
 
         drop(managed);
         assert!(
-            !process_group_has_members(pgid),
-            "drop returned before the killed process group drained"
+            !process_group_has_live_members(pgid)
+                || harness_core::process_cleanup::workspace_cleanup_pending(root.path()),
+            "drop must acknowledge exit or retain the workspace fence"
         );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            harness_core::process_cleanup::wait_for_workspace_cleanup(root.path()),
+        )
+        .await
+        .expect("killed process group drains");
+        assert!(!process_group_has_live_members(pgid));
     }
 
     #[test]
     fn drop_outside_runtime_falls_back_to_blocking_drain() {
+        let root = tempfile::tempdir().expect("workspace");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -673,19 +718,135 @@ mod managed_child_tests {
             set_process_group(&mut cmd);
             let child = cmd.spawn().expect("spawn sleeping child");
             let pgid = child.id().expect("child pid");
-            (ManagedChild::new(child, "blocking drain test"), pgid)
+            (
+                ManagedChild::new(child, "blocking drain test").with_cleanup_workspace(
+                    root.path().canonicalize().expect("workspace identity"),
+                ),
+                pgid,
+            )
         });
 
-        // Dropping outside any runtime context must still fully drain the
-        // group before returning (there is no executor to run a reaper task).
+        // The shared reaper works independently of a Tokio runtime. Until its
+        // acknowledgement arrives, the workspace remains fenced.
         drop(managed);
         assert!(
-            !process_group_has_members(pgid),
-            "blocking fallback should drain the killed process group before returning"
+            !process_group_has_live_members(pgid)
+                || harness_core::process_cleanup::workspace_cleanup_pending(root.path()),
+            "blocking fallback must drain or retain the workspace"
         );
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                harness_core::process_cleanup::wait_for_workspace_cleanup(root.path()),
+            )
+            .await
+            .expect("killed process group drains");
+        });
+        assert!(!process_group_has_live_members(pgid));
         drop(runtime);
     }
+
+    #[tokio::test]
+    async fn child_from_another_runtime_drops_without_block_in_place_on_current_thread() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let managed = {
+            let _entered = other.enter();
+            let mut command = tokio::process::Command::new("/bin/sleep");
+            command.arg("30").kill_on_drop(true);
+            set_process_group(&mut command);
+            ManagedChild::new(command.spawn().unwrap(), "cross-runtime drop test")
+                .with_cleanup_workspace(root.path().canonicalize().unwrap())
+        };
+        drop(managed);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            harness_core::process_cleanup::wait_for_workspace_cleanup(root.path()),
+        )
+        .await
+        .unwrap();
+        other.shutdown_background();
+    }
+
+    #[tokio::test]
+    async fn drop_deadline_keeps_workspace_fenced_without_blocking_runtime() -> anyhow::Result<()> {
+        use harness_core::process_cleanup::{
+            retain_until_workspace_cleanup, wait_for_workspace_cleanup, workspace_cleanup_pending,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct Owner(Arc<AtomicBool>, Arc<AtomicBool>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.1.store(
+                    tokio::runtime::Handle::try_current().is_ok(),
+                    Ordering::Release,
+                );
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let root = tempfile::tempdir()?;
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command.arg("30").kill_on_drop(true);
+        set_process_group(&mut command);
+        let child = command.spawn()?;
+        let pid = child.id().expect("child PID");
+        let mut managed = ManagedChild::new(child, "bounded drop test")
+            .with_cleanup_workspace(root.path().canonicalize()?);
+        let blocked = Arc::new(AtomicBool::new(true));
+        managed.drop_confirmation_blocked = Some(blocked.clone());
+        let began = std::time::Instant::now();
+        drop(managed);
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+        assert!(workspace_cleanup_pending(root.path()));
+        assert!(crate::process_cleanup::workspace_for_spawn(root.path()).is_err());
+        let released = Arc::new(AtomicBool::new(false));
+        let released_in_runtime = Arc::new(AtomicBool::new(false));
+        assert!(retain_until_workspace_cleanup(
+            root.path(),
+            Owner(released.clone(), released_in_runtime.clone())
+        )
+        .is_ok());
+
+        // The current-thread runtime still polls timers while the real reaper
+        // owns the killed child and its confirmation predicate remains blocked.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!released.load(Ordering::Acquire));
+        assert!(workspace_cleanup_pending(root.path()));
+        blocked.store(false, Ordering::Release);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wait_for_workspace_cleanup(root.path()),
+        )
+        .await?;
+        assert!(!process_group_has_live_members(pid));
+        assert!(!workspace_cleanup_pending(root.path()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !released.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            released_in_runtime.load(Ordering::Acquire),
+            "owner destructors must schedule cleanup on their runtime, not block the shared reaper"
+        );
+        assert!(crate::process_cleanup::workspace_for_spawn(root.path()).is_ok());
+        Ok(())
+    }
 }
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod managed_child_zombie_tests;
 
 #[cfg(test)]
 #[path = "run_id_tests.rs"]

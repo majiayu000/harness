@@ -63,11 +63,16 @@ cargo build --release -p harness-cli
 # binary at ./target/release/harness
 ```
 
-Requires Rust 1.88+. A fresh release build also requires Bun 1.1+ because it
-embeds the web dashboard; if `web/dist` is already built, the release build can
+Requires Rust 1.88+. A fresh release build also requires Bun 1.3.14 (the version
+pinned in `.bun-version` and tested in CI) because it embeds the web dashboard; if `web/dist` is already built, the release build can
 reuse it without Bun. Postgres and an API authentication token are only needed
 for the server / fleet features below; a GitHub token is additionally needed
 for GitHub integration.
+
+On Linux, also install a C compiler/linker, `pkg-config`, and OpenSSL development
+headers/libraries for the default native-TLS dependencies. On Debian/Ubuntu,
+these are provided by `build-essential`, `pkg-config`, and `libssl-dev`.
+The OpenSSL command-line program alone does not provide the development headers.
 
 ## Quickstart: run one agent task
 
@@ -234,8 +239,9 @@ server and development setup.
 
 ### Server prerequisites
 
-- Bun 1.1+ for release builds that embed the web dashboard. If `web/dist` is
-  already built, release builds can reuse it.
+- Bun 1.3.14 (the version pinned in `.bun-version` and tested in CI) for release
+  builds that embed the web dashboard. If `web/dist` is already built, release
+  builds can reuse it.
 - Postgres 14+. For local development, `scripts/dev-db.sh` starts the bundled
   Postgres service and requires Docker Engine with the Docker Compose v2.1+
   plugin (`docker compose`, not legacy `docker-compose` v1).

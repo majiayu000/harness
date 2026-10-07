@@ -811,7 +811,9 @@ async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
     let store = WorkflowRuntimeStore::open(&dir.path().join("workflow_runtime.db")).await?;
     let terminal_a = project_issue_instance("/project-a", 501, "done");
     let terminal_b = project_issue_instance("/project-a", 502, "done");
-    let active = project_issue_instance("/project-a", 503, "done");
+    // The protected family sorts before both eligible roots. It must not
+    // consume the only slot in a one-family prune batch.
+    let active = project_issue_instance("/project-a", 500, "done");
     let active_child = quality_gate_instance("checking")
         .with_id("active-family-child-503")
         .with_parent(&active.id);
@@ -847,6 +849,12 @@ async fn retention_dry_run_count_matches_prune_batch() -> anyhow::Result<()> {
     assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 1);
     assert!(store.get_instance(&terminal_a.id).await?.is_none());
     assert!(store.get_instance(&active.id).await?.is_some());
+    let second = store.prune_terminal_runtime_history(cutoff, 1).await?;
+    assert_eq!(second.workflow_instances_deleted, 1);
+    assert!(store.get_instance(&terminal_b.id).await?.is_none());
+    assert!(store.get_instance(&active.id).await?.is_some());
+    assert!(store.get_instance(&active_child.id).await?.is_some());
+    assert_eq!(store.count_terminal_history_candidates(cutoff, 1).await?, 0);
     Ok(())
 }
 
@@ -1003,7 +1011,7 @@ async fn lease_expired_completion_is_recorded_to_dead_letter() -> anyhow::Result
         "job must remain reclaimable"
     );
 
-    // A later re-expiry of the same job must not duplicate the DLQ record.
+    // Replaying the same lease generation must not duplicate the DLQ record.
     store
         .record_lease_expired_completion(
             &first_claim.id,
@@ -1020,7 +1028,113 @@ async fn lease_expired_completion_is_recorded_to_dead_letter() -> anyhow::Result
     .bind(&first_claim.id)
     .fetch_one(store.pool())
     .await?;
-    assert_eq!(dlq_count_after, 1, "DLQ must keep one record per job");
+    assert_eq!(
+        dlq_count_after, 1,
+        "DLQ must deduplicate the same generation"
+    );
+
+    store
+        .extend_runtime_job_lease_if_owned(
+            &job.id,
+            "worker-a",
+            first_lease_expires_at,
+            Utc::now() - Duration::seconds(1),
+        )
+        .await?
+        .expect("first lease should expire");
+    let second_claim = store
+        .claim_next_runtime_job("worker-b", Utc::now() + Duration::minutes(5))
+        .await?
+        .expect("expired job should be reclaimed");
+    assert!(second_claim.lease_generation > first_claim.lease_generation);
+    let second_expiry = second_claim
+        .lease
+        .as_ref()
+        .expect("second lease")
+        .expires_at;
+    store
+        .extend_runtime_job_lease_if_owned(
+            &job.id,
+            "worker-b",
+            second_expiry,
+            Utc::now() - Duration::seconds(1),
+        )
+        .await?
+        .expect("second lease should expire");
+    let current_claim = store
+        .claim_next_runtime_job("worker-c", Utc::now() + Duration::minutes(5))
+        .await?
+        .expect("second expired lease should be reclaimed");
+    let second_result = ActivityResult::succeeded("check", "Completed work from worker b.");
+    store
+        .record_lease_expired_completion(
+            &job.id,
+            "worker-b",
+            second_claim.lease_generation,
+            second_expiry,
+            &second_result,
+            None,
+        )
+        .await?;
+
+    let records: Vec<(i64, String, serde_json::Value, bool)> = sqlx::query_as(
+        "SELECT lease_generation, owner, result, applied
+         FROM runtime_job_completions_dlq WHERE runtime_job_id = $1
+         ORDER BY lease_generation",
+    )
+    .bind(&job.id)
+    .fetch_all(store.pool())
+    .await?;
+    assert_eq!(
+        records.len(),
+        2,
+        "each stale execution must retain its result"
+    );
+    assert_eq!(records[0].0, first_claim.lease_generation as i64);
+    assert_eq!(records[0].1, "worker-a");
+    assert_eq!(records[0].2, serde_json::to_value(&result)?);
+    assert!(!records[0].3);
+    assert_eq!(records[1].0, second_claim.lease_generation as i64);
+    assert_eq!(records[1].1, "worker-b");
+    assert_eq!(records[1].2, serde_json::to_value(&second_result)?);
+    assert!(!records[1].3);
+
+    let conflicting = ActivityResult::succeeded("check", "Conflicting replay.");
+    assert!(store
+        .record_lease_expired_completion(
+            &job.id,
+            "worker-b",
+            second_claim.lease_generation,
+            second_expiry,
+            &conflicting,
+            None,
+        )
+        .await
+        .is_err());
+    let (second_payload,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT result FROM runtime_job_completions_dlq
+         WHERE runtime_job_id = $1 AND lease_generation = $2",
+    )
+    .bind(&job.id)
+    .bind(second_claim.lease_generation as i64)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(second_payload, serde_json::to_value(&second_result)?);
+    let after = store.get_runtime_job(&job.id).await?.expect("job exists");
+    assert_eq!(after.lease_generation, current_claim.lease_generation);
+    assert_eq!(after.status, RuntimeJobStatus::Running);
+    assert_eq!(
+        after.lease.as_ref().expect("current lease").owner,
+        "worker-c"
+    );
+    let (recorded_events,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_events
+         WHERE runtime_job_id = $1 AND event_type = 'LeaseExpiredCompletionRecorded'",
+    )
+    .bind(&job.id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(recorded_events, 2);
     Ok(())
 }
 

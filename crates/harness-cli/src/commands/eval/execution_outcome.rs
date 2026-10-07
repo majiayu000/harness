@@ -70,7 +70,7 @@ mod tests {
                 pass_to_k: 0.0,
                 total_tokens: 0,
                 avg_tokens_per_scored_case: None,
-                total_cost_usd_micros: 0,
+                total_cost_usd_micros: None,
                 avg_cost_usd_micros_per_scored_case: None,
             },
             outcome,

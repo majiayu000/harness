@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) struct CapturingAgent {
     pub(super) prompts: Mutex<Vec<String>>,
@@ -61,12 +62,20 @@ impl FailingStreamAgent {
 
 pub(super) struct BlockingAgent {
     release_permits: Semaphore,
+    pub(super) turn_starts: AtomicUsize,
+    pub(super) active_streams: AtomicUsize,
+    pub(super) dropped_streams: AtomicUsize,
+    pub(super) drain_calls: AtomicUsize,
 }
 
 impl BlockingAgent {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             release_permits: Semaphore::new(0),
+            turn_starts: AtomicUsize::new(0),
+            active_streams: AtomicUsize::new(0),
+            dropped_streams: AtomicUsize::new(0),
+            drain_calls: AtomicUsize::new(0),
         })
     }
 
@@ -77,6 +86,17 @@ impl BlockingAgent {
             .await
             .expect("blocking agent release semaphore should stay open");
         permit.forget();
+    }
+}
+
+struct BlockingStreamGuard<'a> {
+    agent: &'a BlockingAgent,
+}
+
+impl Drop for BlockingStreamGuard<'_> {
+    fn drop(&mut self) {
+        self.agent.active_streams.fetch_sub(1, Ordering::AcqRel);
+        self.agent.dropped_streams.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -248,6 +268,12 @@ impl CodeAgent for FailingStreamAgent {
     ) -> harness_core::error::Result<()> {
         self.execute_stream(req, tx).await
     }
+
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        // This fixture returns its error without spawning a child or detached
+        // work. The failed start_turn has already completed before drain runs.
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -270,6 +296,8 @@ impl CodeAgent for BlockingAgent {
         _req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
+        self.active_streams.fetch_add(1, Ordering::AcqRel);
+        let _stream_guard = BlockingStreamGuard { agent: self };
         self.wait_until_released().await;
         let _ = tx
             .send(StreamItem::MessageDelta {
@@ -284,7 +312,19 @@ impl CodeAgent for BlockingAgent {
         req: AgentRequest,
         tx: tokio::sync::mpsc::Sender<StreamItem>,
     ) -> harness_core::error::Result<()> {
+        self.turn_starts.fetch_add(1, Ordering::AcqRel);
         self.execute_stream(req, tx).await
+    }
+
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        self.drain_calls.fetch_add(1, Ordering::AcqRel);
+        if self.active_streams.load(Ordering::Acquire) != 0 {
+            return Err(harness_core::error::HarnessError::AgentExecution(
+                "blocking mock stream must be dropped before drain".to_string(),
+            ));
+        }
+        // This mock has no detached work: dropping the stream stops all activity.
+        Ok(())
     }
 }
 

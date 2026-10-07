@@ -1,5 +1,5 @@
-use harness_core::agent::AgentEvent;
-use harness_core::types::TokenUsage;
+use harness_core::agent::{AgentEvent, ApprovalDecision};
+use harness_core::error::HarnessError;
 use serde_json::{json, Value};
 
 const MAX_PROTOCOL_LINE_PREVIEW: usize = 240;
@@ -16,8 +16,22 @@ pub(super) fn protocol_line_preview(line: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedAcpMessage {
     Event(AgentEvent),
-    Response { id: Value, result: Value },
-    RpcError { id: Value, error: Value },
+    Response {
+        id: Value,
+        result: Value,
+    },
+    RpcError {
+        id: Value,
+        error: Value,
+    },
+    SessionCost {
+        cost_usd: f64,
+    },
+    PermissionRequest {
+        id: Value,
+        command: String,
+        options: Vec<Value>,
+    },
     Ignore,
 }
 
@@ -93,46 +107,108 @@ fn parse_acp_notification(value: &Value) -> Option<ParsedAcpMessage> {
                     }
                 }
                 "usage_update" => {
-                    let used = update.get("used").and_then(Value::as_u64).unwrap_or(0);
-                    let size = update.get("size").and_then(Value::as_u64).unwrap_or(0);
-                    let cost = update.pointer("/cost/amount").and_then(Value::as_f64);
-                    let cost_usd_observed = cost.is_some()
-                        && update.pointer("/cost/currency").and_then(Value::as_str) == Some("USD");
-                    let usage = TokenUsage {
-                        input_tokens: used,
-                        output_tokens: 0,
-                        total_tokens: size,
-                        cost_usd: cost.filter(|_| cost_usd_observed).unwrap_or(0.0),
-                    };
-                    Some(ParsedAcpMessage::Event(AgentEvent::TokenUsage {
-                        usage,
-                        cost_usd_observed,
-                    }))
+                    // ACP v1 used/size describe context occupancy/capacity, not
+                    // consumed tokens. Cost is an independent session snapshot.
+                    Some(
+                        if update.pointer("/cost/currency").and_then(Value::as_str) == Some("USD") {
+                            match update.pointer("/cost/amount").and_then(Value::as_f64) {
+                                Some(cost_usd) => ParsedAcpMessage::SessionCost { cost_usd },
+                                None => ParsedAcpMessage::Ignore,
+                            }
+                        } else {
+                            ParsedAcpMessage::Ignore
+                        },
+                    )
                 }
                 _ => Some(ParsedAcpMessage::Ignore),
             }
         }
         "session/request_permission" => {
             let id = value.get("id")?.clone();
-            let command = params
-                .get("prompt")
+            let tool_call = params.get("toolCall")?;
+            let options = params.get("options")?.as_array()?.clone();
+            let command = tool_call
+                .pointer("/rawInput/command")
                 .and_then(Value::as_str)
-                .unwrap_or("permission requested")
-                .to_string();
-            Some(ParsedAcpMessage::Event(AgentEvent::ApprovalRequest {
-                id: request_id_string(&id),
+                .or_else(|| tool_call.get("title").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Approve tool call {}",
+                        tool_call
+                            .get("toolCallId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                    )
+                });
+            Some(ParsedAcpMessage::PermissionRequest {
+                id,
                 command,
-            }))
+                options,
+            })
         }
         _ => Some(ParsedAcpMessage::Ignore),
     }
 }
 
 pub(super) fn request_id_string(id: &Value) -> String {
-    match id {
-        Value::String(value) => value.clone(),
-        other => other.to_string(),
+    // JSON encoding keeps numeric 7 and string "7" distinct in the public
+    // opaque approval ID. Replies use the original Value stored with the request.
+    id.to_string()
+}
+
+pub(super) fn cancelled_permission_response(id: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "outcome": { "outcome": "cancelled" } },
+    })
+}
+
+pub(super) fn turn_cost(
+    session_cost_usd: f64,
+    previous_turn_cost_usd: Option<f64>,
+) -> harness_core::error::Result<Option<f64>> {
+    let Some(previous_turn_cost_usd) = previous_turn_cost_usd else {
+        // A reused session with an unobserved previous turn has no reliable
+        // baseline. Do not attribute its entire cumulative cost to this turn.
+        return Ok(None);
+    };
+    let cost_usd = session_cost_usd - previous_turn_cost_usd;
+    if cost_usd < 0.0 {
+        return Err(HarnessError::AgentExecution(
+            "opencode cumulative session cost fell below the previous turn's cost".into(),
+        ));
     }
+    Ok(Some(cost_usd))
+}
+
+pub(super) fn permission_response(
+    id: &Value,
+    options: &[Value],
+    decision: &ApprovalDecision,
+) -> harness_core::error::Result<Value> {
+    // Accept/Reject applies only to this request; it must not silently choose
+    // an allow_always/reject_always option that changes future permissions.
+    let kind = match decision {
+        ApprovalDecision::Accept => "allow_once",
+        ApprovalDecision::Reject { .. } => "reject_once",
+    };
+    let option_id = options
+        .iter()
+        .find(|option| option.get("kind").and_then(Value::as_str) == Some(kind))
+        .and_then(|option| option.get("optionId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            HarnessError::Unsupported(format!(
+                "opencode permission request did not offer a {kind} option"
+            ))
+        })?;
+    Ok(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "outcome": { "outcome": "selected", "optionId": option_id } },
+    }))
 }
 
 pub(super) fn acp_error_message(error: &Value, fallback: &str) -> String {
@@ -147,8 +223,4 @@ pub(super) fn acp_error_message(error: &Value, fallback: &str) -> String {
 
 pub(super) fn response_id_matches(actual: &Value, expected: u64) -> bool {
     actual.as_u64() == Some(expected) || actual.as_str() == Some(&expected.to_string())
-}
-
-pub(super) fn request_id_from_string(id: &str) -> Value {
-    serde_json::from_str(id).unwrap_or_else(|_| Value::String(id.to_string()))
 }

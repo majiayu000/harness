@@ -240,12 +240,6 @@ impl<'a> RuntimeWorker<'a> {
             );
             return Ok(None);
         };
-        if let Some(event) = completion.workflow_event.as_ref() {
-            self.propagate_pr_feedback_child_completion(&event.workflow_id, event)
-                .await?;
-            self.propagate_quality_gate_child_completion(&event.workflow_id, event)
-                .await?;
-        }
         Ok(Some(completion.runtime_job))
     }
 
@@ -283,131 +277,83 @@ impl<'a> RuntimeWorker<'a> {
         executor: &(dyn RuntimeJobExecutor + Send + Sync),
         initial_lease_expires_at: chrono::DateTime<Utc>,
     ) -> anyhow::Result<RuntimeJobExecution> {
+        anyhow::ensure!(
+            initial_lease_expires_at > Utc::now(),
+            "runtime job lease expired before execution started"
+        );
         let mut lease_expires_at = initial_lease_expires_at;
         let renewal_interval = runtime_lease_renewal_interval(self.lease_ttl);
-        let activity = runtime_job_activity_name(job);
         let execution = executor.execute(job.clone());
         tokio::pin!(execution);
 
-        loop {
-            let renewal_sleep = tokio::time::sleep(renewal_interval);
-            tokio::pin!(renewal_sleep);
+        let lease_failure = loop {
+            // The entire renewal (including its database I/O) stays in the
+            // select so execution deadlines and cancellation keep being polled.
+            let current_lease_expires_at = lease_expires_at;
+            let renewal = async move {
+                tokio::time::sleep(renewal_interval).await;
+                let next_lease_expires_at = Utc::now() + self.lease_ttl;
+                self.store
+                    .extend_runtime_job_lease_if_owned(
+                        &job.id,
+                        &self.owner,
+                        current_lease_expires_at,
+                        next_lease_expires_at,
+                    )
+                    .await
+            };
+            tokio::pin!(renewal);
+            let remaining_lease = (lease_expires_at - Utc::now())
+                .to_std()
+                .unwrap_or(StdDuration::ZERO);
 
             tokio::select! {
+                biased;
+                _ = tokio::time::sleep(remaining_lease) => {
+                    break Some(anyhow::anyhow!(
+                        "runtime job lease expired before renewal was confirmed"
+                    ));
+                }
+                renewal_result = &mut renewal => {
+                    match renewal_result {
+                        Ok(Some(updated)) => {
+                            let Some(lease) = updated.lease else {
+                                break Some(anyhow::anyhow!("renewed runtime job is missing its lease"));
+                            };
+                            lease_expires_at = lease.expires_at;
+                        }
+                        Ok(None) => break None,
+                        Err(error) => break Some(error.context("runtime job lease renewal failed")),
+                    }
+                }
                 result = &mut execution => {
                     return Ok(RuntimeJobExecution {
                         result,
                         lease_expires_at,
                     });
                 }
-                _ = &mut renewal_sleep => {
-                    let next_lease_expires_at = Utc::now() + self.lease_ttl;
-                    let Some(updated) = self.store
-                        .extend_runtime_job_lease_if_owned(
-                            &job.id,
-                            &self.owner,
-                            lease_expires_at,
-                            next_lease_expires_at,
-                        )
-                        .await?
-                    else {
-                        // Lease lost mid-turn: cancel the in-flight agent and
-                        // wait for the executor's cleanup (agent termination +
-                        // workspace release) so a reclaimer never sees a
-                        // dirty tree. Bounded by a grace period; if cleanup
-                        // does not finish, the future is dropped and the
-                        // workspace reaper is the backstop (GH-1877).
-                        executor.cancel_execution(job).await;
-                        let cleanup_grace = std::time::Duration::from_secs(30);
-                        let result = match tokio::time::timeout(cleanup_grace, &mut execution)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => ActivityResult::failed(
-                                activity,
-                                "Runtime job lease was lost before the agent completed.",
-                                "Another runtime worker reclaimed the job after this worker's lease expired; agent cleanup exceeded the grace period.",
-                            ),
-                        };
-                        return Ok(RuntimeJobExecution {
-                            result,
-                            lease_expires_at,
-                        });
-                    };
-                    lease_expires_at = updated
-                        .lease
-                        .as_ref()
-                        .map(|lease| lease.expires_at)
-                        .unwrap_or(next_lease_expires_at);
-                }
             }
-        }
-    }
-
-    async fn propagate_pr_feedback_child_completion(
-        &self,
-        workflow_id: &str,
-        event: &super::model::WorkflowEvent,
-    ) -> anyhow::Result<()> {
-        let Some(child) = self.store.get_instance(workflow_id).await? else {
-            return Ok(());
         };
-        if child.definition_id != super::pr_feedback::PR_FEEDBACK_DEFINITION_ID {
-            return Ok(());
+        if let Some(error) = lease_failure.as_ref() {
+            tracing::error!(runtime_job_id = %job.id, "{error:#}; cancelling execution");
         }
-        if !runtime_event_result_succeeded(event) {
-            return Ok(());
+        // Poll cancellation and execution together: the executor may need to
+        // observe the signal before cancel_execution can acknowledge it. Keep
+        // ownership until cleanup actually finishes; dropping this future after
+        // a grace period would let workspace cleanup race an abandoned writer.
+        let (_, mut result) = tokio::join!(executor.cancel_execution(job), &mut execution);
+        if let Some(error) = lease_failure {
+            // Preserve the cancelled execution/transcript through the existing
+            // completion fence and dead-letter path, together with the cause.
+            result = result.with_artifact(super::model::ActivityArtifact::new(
+                "runtime_job_lease_renewal_failure",
+                json!({ "error": format!("{error:#}") }),
+            ));
         }
-        if child.state == "blocked"
-            && child.data.get("stop_reason_code").and_then(Value::as_str)
-                == Some(super::STOP_REASON_INVALID_AGENT_OUTPUT)
-        {
-            return Ok(());
-        }
-        if matches!(child.state.as_str(), "pending" | "inspecting") {
-            return Ok(());
-        }
-        let Some(parent_workflow_id) = child.parent_workflow_id.as_deref() else {
-            return Ok(());
-        };
-        self.store
-            .commit_parent_runtime_completion(
-                parent_workflow_id,
-                &self.owner,
-                merge_child_completion_payload(event, &child),
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn propagate_quality_gate_child_completion(
-        &self,
-        workflow_id: &str,
-        event: &super::model::WorkflowEvent,
-    ) -> anyhow::Result<()> {
-        let Some(child) = self.store.get_instance(workflow_id).await? else {
-            return Ok(());
-        };
-        if child.definition_id != super::quality_gate::QUALITY_GATE_DEFINITION_ID {
-            return Ok(());
-        }
-        if !matches!(
-            child.state.as_str(),
-            "passed" | "blocked" | "failed" | "cancelled"
-        ) {
-            return Ok(());
-        }
-        let Some(parent_workflow_id) = child.parent_workflow_id.as_deref() else {
-            return Ok(());
-        };
-        self.store
-            .commit_parent_runtime_completion(
-                parent_workflow_id,
-                &self.owner,
-                merge_child_completion_payload(event, &child),
-            )
-            .await?;
-        Ok(())
+        Ok(RuntimeJobExecution {
+            result,
+            lease_expires_at,
+        })
     }
 
     async fn reserve_runtime_turn_started(
@@ -482,53 +428,6 @@ fn runtime_job_activity_name(job: &RuntimeJob) -> String {
         .and_then(Value::as_str)
         .unwrap_or("runtime_job")
         .to_string()
-}
-
-fn runtime_event_result_succeeded(event: &super::model::WorkflowEvent) -> bool {
-    event
-        .event
-        .get("activity_result")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<ActivityResult>(value).ok())
-        .is_some_and(|result| result.status == ActivityStatus::Succeeded)
-}
-
-fn merge_child_completion_payload(
-    event: &super::model::WorkflowEvent,
-    child: &WorkflowInstance,
-) -> serde_json::Value {
-    let mut payload = event.event.clone();
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("child_workflow_id".to_string(), serde_json::json!(child.id));
-        if let Some(runtime_job_id) = child
-            .data
-            .get("started_by_runtime_job_id")
-            .and_then(Value::as_str)
-        {
-            object.insert(
-                "recovery_activity".to_string(),
-                serde_json::json!("start_child_workflow"),
-            );
-            object.insert(
-                "recovery_runtime_job_id".to_string(),
-                serde_json::json!(runtime_job_id),
-            );
-        }
-        if let Some(artifacts) = object
-            .get_mut("activity_result")
-            .and_then(serde_json::Value::as_object_mut)
-            .and_then(|activity_result| activity_result.get_mut("artifacts"))
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            artifacts.retain(|artifact| {
-                artifact
-                    .get("artifact_type")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("workflow_decision")
-            });
-        }
-    }
-    payload
 }
 
 /// Persist stopped-state metadata into instance data for operator surfaces.

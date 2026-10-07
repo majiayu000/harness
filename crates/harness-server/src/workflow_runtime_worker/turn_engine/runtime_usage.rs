@@ -90,29 +90,57 @@ impl std::fmt::Debug for RuntimeUsageContext {
 }
 
 impl RuntimeUsageContext {
+    fn usage_record(
+        &self,
+        turn_id: &TurnId,
+        metrics: RuntimeUsageMetrics,
+        cost_usd_micros: u64,
+        cost_usd_observed: bool,
+    ) -> RuntimeUsageUpsert {
+        RuntimeUsageUpsert {
+            runtime_job_id: self.runtime_job_id.clone(),
+            command_id: self.command_id.clone(),
+            workflow_id: self.workflow_id.clone(),
+            turn_id: Some(turn_id.as_str().to_string()),
+            agent_run_id: self.agent_run_id.clone(),
+            runtime_kind: self.runtime_kind,
+            runtime_profile: self.runtime_profile.clone(),
+            agent: self.agent.clone(),
+            model: self.model.clone(),
+            project: self.project.clone(),
+            task_id: self.task_id.clone(),
+            candidate_group_id: self.candidate_group_id.clone(),
+            candidate_id: self.candidate_id.clone(),
+            candidate_index: self.candidate_index,
+            candidate_count: self.candidate_count,
+            metrics,
+            cost_usd_micros,
+            cost_usd_observed,
+            reported_at: chrono::Utc::now(),
+        }
+    }
+
     pub(crate) async fn persist_agent_run_start(&self, turn_id: &TurnId) -> anyhow::Result<()> {
         self.store
-            .upsert_runtime_agent_run(&RuntimeUsageUpsert {
-                runtime_job_id: self.runtime_job_id.clone(),
-                command_id: self.command_id.clone(),
-                workflow_id: self.workflow_id.clone(),
-                turn_id: Some(turn_id.as_str().to_string()),
-                agent_run_id: self.agent_run_id.clone(),
-                runtime_kind: self.runtime_kind,
-                runtime_profile: self.runtime_profile.clone(),
-                agent: self.agent.clone(),
-                model: self.model.clone(),
-                project: self.project.clone(),
-                task_id: self.task_id.clone(),
-                candidate_group_id: self.candidate_group_id.clone(),
-                candidate_id: self.candidate_id.clone(),
-                candidate_index: self.candidate_index,
-                candidate_count: self.candidate_count,
-                metrics: RuntimeUsageMetrics::default(),
-                cost_usd_micros: 0,
-                cost_usd_observed: false,
-                reported_at: chrono::Utc::now(),
-            })
+            .upsert_runtime_agent_run(&self.usage_record(
+                turn_id,
+                RuntimeUsageMetrics::default(),
+                0,
+                false,
+            ))
+            .await
+    }
+
+    pub(crate) async fn persist_cost(&self, turn_id: &TurnId, cost_usd: f64) -> anyhow::Result<()> {
+        // This event reports no token counts. The store preserves independent
+        // token observations and an explicitly observed zero USD cost.
+        self.store
+            .upsert_runtime_agent_run(&self.usage_record(
+                turn_id,
+                RuntimeUsageMetrics::default(),
+                cost_usd_to_micros(cost_usd)?,
+                true,
+            ))
             .await
     }
 
@@ -124,27 +152,12 @@ impl RuntimeUsageContext {
     ) -> anyhow::Result<()> {
         match self
             .store
-            .upsert_runtime_usage(&RuntimeUsageUpsert {
-                runtime_job_id: self.runtime_job_id.clone(),
-                command_id: self.command_id.clone(),
-                workflow_id: self.workflow_id.clone(),
-                turn_id: Some(turn_id.as_str().to_string()),
-                agent_run_id: self.agent_run_id.clone(),
-                runtime_kind: self.runtime_kind,
-                runtime_profile: self.runtime_profile.clone(),
-                agent: self.agent.clone(),
-                model: self.model.clone(),
-                project: self.project.clone(),
-                task_id: self.task_id.clone(),
-                candidate_group_id: self.candidate_group_id.clone(),
-                candidate_id: self.candidate_id.clone(),
-                candidate_index: self.candidate_index,
-                candidate_count: self.candidate_count,
-                metrics: RuntimeUsageMetrics::from_token_usage(usage),
-                cost_usd_micros: cost_usd_to_micros(usage.cost_usd)?,
+            .upsert_runtime_usage(&self.usage_record(
+                turn_id,
+                RuntimeUsageMetrics::from_token_usage(usage),
+                cost_usd_to_micros(usage.cost_usd)?,
                 cost_usd_observed,
-                reported_at: chrono::Utc::now(),
-            })
+            ))
             .await?
         {
             RuntimeUsageUpsertOutcome::SkippedZeroUsage => {}

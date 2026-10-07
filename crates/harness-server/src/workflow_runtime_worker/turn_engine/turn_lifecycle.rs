@@ -217,6 +217,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
 
     // Use a turn backend only when the registry supplies one for the agent.
     // Otherwise the default backend remains the streaming executor.
+    let cleanup_workspace = project_root.clone();
     let execution_terminator = execution_adapter.clone();
     let executes_via_adapter = execution_adapter.is_some();
     let mut execution: std::pin::Pin<
@@ -277,6 +278,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     'outer: while execution_result.is_none() || !stream_closed {
         tokio::select! {
             result = &mut execution, if execution_result.is_none() => {
+                terminate_execution_after_drop |= executes_via_adapter && result.is_err();
                 execution_result = Some(result);
             }
             incoming = stream_rx.recv(), if !stream_closed => {
@@ -333,13 +335,18 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                                 budget_usd = stop.budget_usd,
                                 "workflow budget ceiling reached mid-turn; interrupting agent"
                             );
-                            if let Some(adapter) = adapter_opt.as_ref() {
-                                if let Err(error) = adapter.interrupt().await {
-                                    tracing::warn!(
-                                        thread_id = %thread_id,
-                                        turn_id = %turn_id,
-                                        "failed to interrupt agent after the budget ceiling: {error}"
-                                    );
+                            // Drop start_turn before locking its execution adapter:
+                            // initialization may still own that same lock.
+                            terminate_execution_after_drop = executes_via_adapter;
+                            if !control_is_execution_adapter {
+                                if let Some(adapter) = adapter_opt.as_ref() {
+                                    if let Err(error) = adapter.interrupt().await {
+                                        tracing::warn!(
+                                            thread_id = %thread_id,
+                                            turn_id = %turn_id,
+                                            "failed to interrupt agent after the budget ceiling: {error}"
+                                        );
+                                    }
                                 }
                             }
                             execution_result = Some(Err(HarnessError::AgentExecution(format!(
@@ -412,10 +419,6 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 if executes_via_adapter {
                     terminate_execution_after_drop = true;
                 }
-                if !executes_via_adapter {
-                    // The streaming future is dropped immediately after this loop;
-                    // ManagedChild drains its process group synchronously on that drop.
-                }
                 execution_result = Some(Err(HarnessError::AgentExecution(
                     "Runtime job lease was lost before the agent completed; turn interrupted.".to_string(),
                 )));
@@ -432,33 +435,63 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 execution_result = Some(Err(HarnessError::AgentExecution(format!(
                     "Agent turn timed out after {timeout_secs}s"
                 ))));
+                terminate_execution_after_drop = executes_via_adapter;
                 break 'outer;
             }
         }
     }
 
     // Do not update terminal turn state while an abandoned execution can still
-    // mutate its workspace. Completed futures are harmless to drop here; cancelled
-    // streaming executions synchronously drain their managed process group.
+    // mutate its workspace. Slow process cleanup leaves an explicit fence when
+    // its bounded synchronous Drop transfers ownership to the shared reaper.
     drop(execution);
     if terminate_execution_after_drop {
         if let Some(adapter) = execution_terminator.as_ref() {
-            if let Err(cleanup_error) = adapter.terminate_and_drain().await {
+            let mut cleanup_failure_recorded = false;
+            while let Err(cleanup_error) = adapter.terminate_and_drain().await {
                 tracing::error!(
                     thread_id = %thread_id,
                     turn_id = %turn_id,
                     "failed to force-stop and drain interrupted agent execution: {cleanup_error}"
                 );
-                // Surface cleanup failure at the turn/resource-release boundary so
-                // unknown process state is never reported as a successful drain.
-                execution_result = Some(match execution_result.take() {
-                    None | Some(Ok(())) => Err(cleanup_error),
-                    Some(Err(primary)) => Err(HarnessError::AgentExecution(format!(
-                        "{primary}; cleanup failed: {cleanup_error}"
-                    ))),
-                });
+                if !cleanup_failure_recorded {
+                    let message = format!(
+                        "Agent cleanup failed; keeping the workspace reserved until termination is confirmed: {cleanup_error}"
+                    );
+                    if let Err(error) = server.thread_manager.add_item(
+                        &thread_id,
+                        &turn_id,
+                        harness_core::types::Item::error(message),
+                    ) {
+                        tracing::warn!("failed to record pending agent cleanup: {error}");
+                    }
+                    execution_result = Some(match execution_result.take() {
+                        None | Some(Ok(())) => Err(cleanup_error),
+                        Some(Err(primary)) => Err(HarnessError::AgentExecution(format!(
+                            "{primary}; cleanup failed: {cleanup_error}"
+                        ))),
+                    });
+                    cleanup_failure_recorded = true;
+                }
+                // Keep the execution scope and its workspace/repository leases
+                // alive. A failed drain is not permission to publish a terminal
+                // turn or to run workspace hooks/removal against a live writer.
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
+    }
+
+    if harness_core::process_cleanup::workspace_cleanup_pending(&cleanup_workspace) {
+        if let Err(error) = server.thread_manager.add_item(
+            &thread_id,
+            &turn_id,
+            harness_core::types::Item::error(
+                "Process cleanup is still unconfirmed; keeping the workspace reserved until exit is acknowledged.".to_string(),
+            ),
+        ) {
+            tracing::error!("failed to record deferred process cleanup: {error}");
+        }
+        harness_core::process_cleanup::wait_for_workspace_cleanup(&cleanup_workspace).await;
     }
 
     match execution_result.unwrap_or_else(|| {

@@ -86,3 +86,11 @@ of the manifest used for collection; the importer rejects another manifest's
 identity before building a report. Bare arrays and objects containing only
 `cases` are rejected. This identity check detects accidental stale evidence;
 it does not authenticate a producer or replace attestation verification.
+
+Report costs are nullable. A case cost is available only when every recorded
+usage item includes a cost; a run total and average require available costs for
+every case. Missing cases or partially observed provider costs produce `null`
+in JSON and `unknown` in CLI output. Observed zero remains `0`, including native
+verification when its evidence explicitly reports zero cost. Cost deltas are
+available only when both compared totals are known. This reporting distinction
+does not change the configured budget policy or infer missing provider prices.

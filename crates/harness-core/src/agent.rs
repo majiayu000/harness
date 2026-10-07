@@ -485,6 +485,12 @@ pub enum AgentEvent {
         /// numeric placeholder used when only token counts are available.
         cost_usd_observed: bool,
     },
+    /// Provider-reported cumulative USD cost for this turn. This event carries
+    /// no token counts; they may be reported independently.
+    /// Context occupancy or capacity must never be encoded as TokenUsage.
+    CostReported {
+        cost_usd: f64,
+    },
     /// Model identity observed for this turn, with the observation source so
     /// consumers can distinguish a provider-confirmed identity from one
     /// derived from the launch arguments.
@@ -611,6 +617,7 @@ mod tests {
                 usage: TokenUsage::default(),
                 cost_usd_observed: false,
             },
+            AgentEvent::CostReported { cost_usd: 0.045 },
             AgentEvent::Warning {
                 message: "careful".into(),
             },

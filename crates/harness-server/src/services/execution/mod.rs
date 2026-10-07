@@ -173,6 +173,8 @@ impl DefaultExecutionService {
         &self,
         project: Option<PathBuf>,
     ) -> Result<Option<PathBuf>, EnqueueTaskError> {
+        let project =
+            Some(project.unwrap_or_else(|| self.server_config.server.project_root.clone()));
         resolve_project_from_registry(self.project_registry.as_deref(), project)
             .await
             .map(|(project, _)| project)

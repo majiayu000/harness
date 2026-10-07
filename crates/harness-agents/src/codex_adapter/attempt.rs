@@ -2,6 +2,7 @@
 //!
 //! See #2095 §3.2–3.3 (PR B). Frame-size bounds live in `bounded_frame` (PR C).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +59,7 @@ pub(super) struct TurnAttemptGuard {
     state: Arc<Mutex<AdapterState>>,
     cancel_notify: Arc<Notify>,
     generation: u64,
+    workspace: PathBuf,
     disarmed: Arc<AtomicBool>,
 }
 
@@ -66,11 +68,13 @@ impl TurnAttemptGuard {
         state: Arc<Mutex<AdapterState>>,
         cancel_notify: Arc<Notify>,
         generation: u64,
+        workspace: PathBuf,
     ) -> Self {
         Self {
             state,
             cancel_notify,
             generation,
+            workspace,
             disarmed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -88,26 +92,51 @@ impl Drop for TurnAttemptGuard {
         let state = self.state.clone();
         let cancel_notify = self.cancel_notify.clone();
         let generation = self.generation;
-        // Best-effort cleanup owner when the start_turn future is cancelled.
-        // Concurrent terminate_and_drain remains serialized on the same mutex and
-        // preserves failed-cleanup reuse gating from PR A.
-        tokio::spawn(async move {
-            let mut guard = state.lock().await;
-            let Some(attempt) = guard.active_attempt.as_mut() else {
-                return;
-            };
-            if attempt.generation != generation {
-                return;
-            }
-            attempt.cancel_requested = true;
-            cancel_notify.notify_waiters();
-            let _ = guard.reset_child().await;
-            if guard
-                .active_attempt
-                .as_ref()
-                .is_some_and(|attempt| attempt.generation == generation)
-            {
-                guard.active_attempt = None;
+        // Publish ownership before the async cleanup can wait for the state lock.
+        // The registry retains the adapter even if the runtime stops before the
+        // cleanup task can run. An unacknowledged attempt never authorizes reuse.
+        let cleanup = harness_core::process_cleanup::ProcessCleanupAcknowledgement::pending(
+            self.workspace.clone(),
+        );
+        let _ = harness_core::process_cleanup::retain_until_workspace_cleanup(
+            &self.workspace,
+            state.clone(),
+        );
+        tracing::warn!(workspace = %self.workspace.display(), attempt_generation = generation,
+            "cancelled Codex attempt retains workspace ownership pending process cleanup acknowledgement");
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(workspace = %self.workspace.display(),
+                "cancelled Codex attempt retains workspace ownership because no cleanup runtime is available");
+            return;
+        };
+        runtime.spawn(async move {
+            loop {
+                let mut guard = state.lock().await;
+                if !guard.generation_is_current(generation) && guard.failed_cleanup.is_none() {
+                    // A concurrent terminate already acknowledged the old attempt.
+                    drop(guard);
+                    cleanup.confirm();
+                    return;
+                }
+                if let Some(attempt) = guard.active_attempt.as_mut() {
+                    attempt.cancel_requested = true;
+                    cancel_notify.notify_waiters();
+                }
+                match guard.reset_child().await {
+                    Ok(()) => {
+                        guard.clear_attempt_if_current(generation);
+                        drop(guard);
+                        cleanup.confirm();
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "cancelled Codex attempt cleanup remains unconfirmed: {error}"
+                        );
+                    }
+                }
+                drop(guard);
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }
@@ -183,6 +212,65 @@ pub(super) fn stop_cleanup_deadline_error(budget: Duration) -> harness_core::err
 mod tests {
     use super::*;
     use tokio::time::{timeout, Duration as TokioDuration};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandoned_attempt_fences_workspace_before_waiting_for_adapter_mutex() {
+        struct Owner(Arc<AtomicBool>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command.arg("30").kill_on_drop(true);
+        crate::set_process_group(&mut command);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let state = Arc::new(Mutex::new(AdapterState::new()));
+        let mut locked = state.lock().await;
+        locked.child = Some(
+            crate::ManagedChild::new(child, "cancelled-attempt-test")
+                .with_cleanup_workspace(workspace.clone()),
+        );
+        let generation = locked.begin_attempt().unwrap();
+        let attempt = TurnAttemptGuard::new(
+            state.clone(),
+            Arc::new(Notify::new()),
+            generation,
+            workspace.clone(),
+        );
+        drop(attempt);
+        assert!(harness_core::process_cleanup::workspace_cleanup_pending(
+            &workspace
+        ));
+        let released = Arc::new(AtomicBool::new(false));
+        assert!(
+            harness_core::process_cleanup::retain_until_workspace_cleanup(
+                &workspace,
+                Owner(released.clone()),
+            )
+            .is_ok()
+        );
+        // The detached cleanup cannot acquire the state mutex yet. Cancellation
+        // must already retain its workspace owner while other tasks progress.
+        tokio::time::sleep(TokioDuration::from_millis(20)).await;
+        assert!(!released.load(Ordering::Acquire));
+        assert!(crate::process_group_has_live_members(pid));
+        drop(locked);
+        timeout(
+            TokioDuration::from_secs(3),
+            harness_core::process_cleanup::wait_for_workspace_cleanup(&workspace),
+        )
+        .await
+        .unwrap();
+        assert!(!crate::process_group_has_live_members(pid));
+        assert!(released.load(Ordering::Acquire));
+        assert!(state.lock().await.child.is_none());
+    }
 
     #[tokio::test]
     async fn wait_until_cancelled_observes_notify_after_state_check_window() {

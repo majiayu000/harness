@@ -269,8 +269,9 @@ impl TurnStreamObservations {
                 cost_usd_observed,
             } => {
                 self.token_usage = Some(usage.clone());
-                self.cost_usd_observed = *cost_usd_observed;
+                self.cost_usd_observed |= *cost_usd_observed;
             }
+            AgentEvent::CostReported { .. } => self.cost_usd_observed = true,
             _ => {}
         }
     }
@@ -567,6 +568,44 @@ mod tests {
         assert_eq!(observations.unknown_item_kinds, vec!["novel_side_effect"]);
         assert_eq!(observations.approval_requests, 1);
         assert_eq!(observations.started_item_kinds, vec!["shell_command"]);
+    }
+
+    #[test]
+    fn cost_observation_does_not_invent_token_usage() {
+        let mut observations = TurnStreamObservations::default();
+        observations.record_stream_item(&AgentEvent::CostReported { cost_usd: 0.0 });
+        assert!(observations.cost_usd_observed);
+        assert!(observations.token_usage.is_none());
+        let artifact = turn_observation_artifact(1, &[], &observations);
+        assert_eq!(artifact.artifact["cost_usd_observed"], true);
+    }
+
+    #[test]
+    fn token_and_cost_observations_preserve_both_arrival_orders() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 3,
+            total_tokens: 13,
+            cost_usd: 0.0,
+        };
+        for cost_first in [true, false] {
+            let mut observations = TurnStreamObservations::default();
+            let mut events = vec![
+                AgentEvent::CostReported { cost_usd: 0.125 },
+                AgentEvent::TokenUsage {
+                    usage: usage.clone(),
+                    cost_usd_observed: false,
+                },
+            ];
+            if !cost_first {
+                events.reverse();
+            }
+            for event in events {
+                observations.record_stream_item(&event);
+            }
+            assert!(observations.cost_usd_observed);
+            assert_eq!(observations.token_usage, Some(usage.clone()));
+        }
     }
 
     #[test]
