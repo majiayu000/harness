@@ -376,3 +376,181 @@ fn eval_credentials_spawn_env_is_secretless_for_eval_jobs() {
     assert!(!env_vars.contains_key("OPENAI_API_KEY"));
     assert_eq!(audit.secret_inheritance, "empty_by_default");
 }
+
+fn operator_credential_job(activity: &str) -> RuntimeJob {
+    RuntimeJob::pending(
+        "operator-credential-command",
+        harness_workflow::runtime::RuntimeKind::RemoteHost,
+        "remote-host-default",
+        json!({"activity": activity, "command": {"eval": {"eval_run_id": "run-1"}}}),
+    )
+}
+
+fn operator_credential_payload() -> Value {
+    json!({
+        "credential_requirements": [{
+            "id": "openai-model",
+            "env_var": "OPENAI_API_KEY",
+            "scope": ["model:execute"],
+            "audience": "api.openai.com",
+            "required": true
+        }],
+        "credential_grants": [{
+            "requirement_id": "openai-model",
+            "env_var": "OPENAI_API_KEY",
+            "issuer": "operator",
+            "scope": ["model:execute"],
+            "audience": "api.openai.com",
+            "expires_at": "2999-01-01T00:00:00Z",
+            "value": "operator-secret-sentinel"
+        }]
+    })
+}
+
+#[test]
+fn eval_credentials_operator_file_grants_model_without_persisting_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("credentials.json");
+    std::fs::write(&path, operator_credential_payload().to_string()).unwrap();
+    let mut job = operator_credential_job("implement_issue");
+    job.input["command"]["eval"]["credential_requirements"] = json!([{
+        "id": "github-pr-write", "env_var": "GITHUB_TOKEN",
+        "scope": ["repo:owner/repo:pull_request:write"], "audience": "github.com",
+        "required": true
+    }]);
+    job.input["command"]["eval"]["credential_grants"] = json!([{
+        "requirement_id": "github-pr-write", "env_var": "GITHUB_TOKEN",
+        "issuer": "operator", "scope": ["repo:owner/repo:pull_request:write"],
+        "audience": "github.com", "expires_at": "2999-01-01T00:00:00Z",
+        "value": "existing-job-secret"
+    }]);
+    let before = job.input.clone();
+
+    let environment = runtime_host_eval_environment_with_credential_file(&job, Some(&path))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        environment.variables()["OPENAI_API_KEY"],
+        "operator-secret-sentinel"
+    );
+    assert_eq!(
+        environment.variables()["GITHUB_TOKEN"],
+        "existing-job-secret"
+    );
+    assert_eq!(environment.variables().len(), 2);
+    assert_eq!(job.input, before);
+    attach_eval_policy_to_input(&mut job.input, environment.audit());
+    for output in [
+        serde_json::to_string(environment.audit()).unwrap(),
+        format!("{environment:?}"),
+        job.input.to_string(),
+    ] {
+        assert!(!output.contains("operator-secret-sentinel"));
+    }
+}
+
+#[test]
+fn eval_credentials_operator_file_rejects_expired_and_duplicate_grants() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("credentials.json");
+    let mut payload = operator_credential_payload();
+    payload["credential_grants"][0]["expires_at"] = json!("2000-01-01T00:00:00Z");
+    std::fs::write(&path, payload.to_string()).unwrap();
+    let mut job = operator_credential_job("implement_issue");
+    let error = runtime_host_eval_environment_with_credential_file(&job, Some(&path)).unwrap_err();
+    assert!(matches!(
+        error,
+        EvalCredentialEnvironmentError::ExpiredGrant { .. }
+    ));
+    assert!(!error.to_string().contains("operator-secret-sentinel"));
+
+    let payload = operator_credential_payload();
+    std::fs::write(&path, payload.to_string()).unwrap();
+    job.input["command"]["eval"]["credential_requirements"] =
+        payload["credential_requirements"].clone();
+    let error = runtime_host_eval_environment_with_credential_file(&job, Some(&path)).unwrap_err();
+    assert!(matches!(
+        error,
+        EvalCredentialEnvironmentError::DuplicateRequirement { .. }
+    ));
+}
+
+#[test]
+fn eval_credentials_operator_file_read_and_parse_failures_do_not_leak_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("credentials.json");
+    let job = operator_credential_job("implement_issue");
+    let missing =
+        runtime_host_eval_environment_with_credential_file(&job, Some(&path)).unwrap_err();
+    assert!(matches!(
+        missing,
+        EvalCredentialEnvironmentError::InvalidCredentialFile { .. }
+    ));
+
+    let mut payload = operator_credential_payload();
+    payload["credential_grants"][0]["expires_at"] = json!("operator-secret-sentinel");
+    for content in [
+        payload.to_string(),
+        "{\"credential_grants\":\"operator-secret-sentinel\"}".to_string(),
+    ] {
+        std::fs::write(&path, content).unwrap();
+        let error =
+            runtime_host_eval_environment_with_credential_file(&job, Some(&path)).unwrap_err();
+        assert!(matches!(
+            error,
+            EvalCredentialEnvironmentError::InvalidCredentialFile { .. }
+        ));
+        assert!(!error.to_string().contains("operator-secret-sentinel"));
+        assert!(!format!("{error:?}").contains("operator-secret-sentinel"));
+    }
+}
+
+#[test]
+fn eval_credentials_operator_file_is_ignored_for_native_and_non_eval_jobs() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("missing-credentials.json");
+    let job = operator_credential_job(harness_workflow::runtime::QUALITY_GATE_ACTIVITY);
+    let environment = runtime_host_eval_environment_with_credential_file(&job, Some(&path))
+        .unwrap()
+        .unwrap();
+    assert!(environment.variables().is_empty());
+    assert!(environment.audit().credential_grants.is_empty());
+
+    let mut job = operator_credential_job("implement_issue");
+    job.input = json!({"activity": "implement_issue"});
+    assert!(
+        runtime_host_eval_environment_with_credential_file(&job, Some(&path))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn eval_credentials_operator_file_unset_keeps_empty_default() {
+    let job = operator_credential_job("implement_issue");
+    let environment = runtime_host_eval_environment_with_credential_file(&job, None)
+        .unwrap()
+        .unwrap();
+    assert!(environment.variables().is_empty());
+    assert!(environment.audit().credential_grants.is_empty());
+}
+
+#[test]
+fn eval_credentials_operator_file_requires_an_explicit_activity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("credentials.json");
+    std::fs::write(&path, operator_credential_payload().to_string()).unwrap();
+    for input in [
+        json!({"command": {"eval": {"eval_run_id": "run-1"}}}),
+        json!({"activity": 42, "command": {"eval": {"eval_run_id": "run-1"}}}),
+    ] {
+        let mut job = operator_credential_job("implement_issue");
+        job.input = input;
+        let environment = runtime_host_eval_environment_with_credential_file(&job, Some(&path))
+            .unwrap()
+            .unwrap();
+        assert!(environment.variables().is_empty());
+        assert!(environment.audit().credential_grants.is_empty());
+    }
+}

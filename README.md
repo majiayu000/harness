@@ -76,55 +76,90 @@ The OpenSSL command-line program alone does not provide the development headers.
 
 ## Quickstart: run one agent task
 
-Install one local coding runtime on your `PATH`: either
-[`codex`](https://github.com/openai/codex) or
-[`claude`](https://docs.anthropic.com/en/docs/claude-code). Run Harness as an
-unprivileged OS user: `--drop-sudo` defaults to `true`, so `harness exec`
-rejects root and sudo environments. Only pass `--drop-sudo=false` when elevated
-execution is deliberate.
+Provider connectivity is an explicit prerequisite. The default
+`capability_profile = "standard"` is scoped, and an empty
+`isolation.network_allowlist` denies **all agent networking**, including model
+requests. Installing or authenticating a CLI alone does not enable provider
+access. Keep the scoped profile and list the exact hosts your selected provider
+uses; changing `--sandbox-mode` does not override this network policy.
 
-On Linux, the default `workspace-write` sandbox also requires
-`harness-landlock` or [`bwrap`](https://github.com/containers/bubblewrap) on
-`PATH`; install your distribution's Bubblewrap package if you do not have the
-Landlock helper. A host-tier `danger-full-access` agent with scoped permissions
-and an empty network allowlist requires `bwrap` specifically: Landlock cannot
-provide network-only isolation while leaving filesystem access unrestricted.
-Harness reports that host tier as unavailable during startup health probing and
-refuses matching dispatches. Other Linux sandbox combinations continue to
-accept either helper.
+The following first-task path uses Claude in a container on Linux or macOS.
+It needs Docker Engine and a provisioned Anthropic API credential. It needs
+neither Postgres nor the fleet server.
+Use a Bash terminal and run from this checkout:
 
 ```bash
-# With Codex CLI (Linux or macOS)
-./target/release/harness exec --agent codex \
-  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
+# Verify the bundled coding-runtime image, then build the first-party proxy.
+scripts/verify-agent-container-image.sh
+docker build -f docker/egress-proxy/Dockerfile \
+  -t harness-egress-proxy:quickstart docker/egress-proxy
+export HARNESS_AGENT_CONTAINER_IMAGE="$(docker image inspect harness-agent:fixture --format '{{.Id}}')"
+export HARNESS_AGENT_EGRESS_PROXY_IMAGE="$(docker image inspect harness-egress-proxy:quickstart --format '{{.Id}}')"
 
-# Or with Claude Code CLI on Linux
-./target/release/harness exec --agent claude \
-  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
+# The tracked template explicitly selects standard permissions and container.
+# Harness expects a complete TOML config, not a partial override file.
+sed 's/^network_allowlist = .*/network_allowlist = ["api.anthropic.com"]/' \
+  config/default.toml.example > harness-first-task.toml
 
-# Claude Code on macOS cannot run under the Seatbelt workspace-write sandbox
-./target/release/harness exec --agent claude --sandbox-mode danger-full-access \
+# Read the credential without echoing it or saving it in TOML/history.
+read -r -s -p 'Anthropic API key: ' ANTHROPIC_API_KEY
+printf '\n'
+export ANTHROPIC_API_KEY
+
+./target/release/harness --config harness-first-task.toml exec --agent claude \
+  --output-file first-task.md \
   "Summarize the public API exposed by crates/harness-core/src/lib.rs"
 ```
 
-Harness runs the explicitly selected coding agent against the current directory
-and prints the agent's final response to stdout. The default is
-`workspace-write`. The macOS Claude exception grants the agent unrestricted
-filesystem and process access; use it only in a trusted repository and review
-the resulting changes.
+Harness forwards the explicitly provisioned `ANTHROPIC_API_KEY` to the Claude
+container by environment variable name. An API key, an allowlist, and a usable
+runtime image are separate prerequisites. A successful image fixture proves
+packaging, not provider authentication or task completion. Inspect the command's
+exit status and `first-task.md`; a dispatch or healthy server alone does not
+prove the task completed. Production deployments should use registry digests
+for both images. See the [operator guide](docs/container-tier-operator-guide.md)
+for platform support, provider setup, and refusal diagnostics.
 
-The `anthropic-api` adapter is for text generation: it sends the prompt without
-repository context or tools, so it cannot inspect or modify the project in this
-coding example.
+| Platform and tier | Scoped provider access |
+|---|---|
+| Linux `container` | Supported through the bundled allowlist proxy; use this for online coding tasks. |
+| Linux `host` | Empty allowlist denies networking. A non-empty allowlist is rejected; use `container`. |
+| macOS `container` | Supported through the bundled allowlist proxy, as above. |
+| macOS `host` | Supported through the proxy's loopback port and Seatbelt; Docker is still required for the proxy. |
 
-The `opencode` adapter runs OpenCode (`opencode run` / `opencode acp`), a
-provider-agnostic coding agent. On macOS it must run outside the Seatbelt
-sandbox like Claude Code: `--agent opencode --sandbox-mode danger-full-access`.
+For a locally installed and authenticated Codex CLI on macOS, build the proxy
+as above and use a separate host configuration. This example assumes Codex uses
+an API provider at `api.openai.com`; configure the exact endpoints for your
+actual authentication/provider mode, including any required authentication
+hosts. A ChatGPT login or custom gateway can require a different host list.
+
+```bash
+sed -e 's/^default_tier = .*/default_tier = "host"/' \
+  -e 's/^network_allowlist = .*/network_allowlist = ["api.openai.com"]/' \
+  config/default.toml.example > harness-codex-host.toml
+
+./target/release/harness --config harness-codex-host.toml exec --agent codex \
+  "Summarize the public API exposed by crates/harness-core/src/lib.rs"
+```
+
+Run Harness as an unprivileged OS user: `--drop-sudo` defaults to `true`, so
+`harness exec` rejects root and sudo environments. The default exec sandbox is
+`workspace-write`. Linux host deny-all sandboxes require `harness-landlock` or
+[`bwrap`](https://github.com/containers/bubblewrap); specifically,
+`danger-full-access` with scoped deny-all networking requires Bubblewrap.
+Claude and OpenCode cannot use the macOS host Seatbelt `workspace-write` path;
+use the container path above for Claude instead of broadening permissions.
+
+The `anthropic-api` adapter generates text without repository context or tools,
+so it cannot inspect or modify the project in this coding example. OpenCode is
+provider-agnostic; provision its runtime authentication and provider hosts
+before using it.
 
 Useful flags: `--project <dir>`, `--agent claude|codex|anthropic-api|opencode`,
 `--model <id>`, `--sandbox-mode <mode>`, `--output-file result.md`. Supported
 sandbox modes are `read-only`, `read-only-with-network`, `workspace-write`, and
-`danger-full-access`.
+`danger-full-access`; they do not grant an exception to the configured egress
+policy.
 
 ## Level up: the fleet control plane
 
