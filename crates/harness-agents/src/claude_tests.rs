@@ -782,6 +782,8 @@ fn oneshot_structured_claude_output_requires_a_terminal_result() {
         r#"{"type":"system","subtype":"init"}"#,
         r#"{"type":"assistant","message":"partial"}"#,
         r#"{"type":"error","error":"temporary diagnostic"}"#,
+        r#""unexpected JSON scalar""#,
+        r#"["unexpected JSON array"]"#,
     ] {
         let parsed = parse_claude_stream_output(stdout);
         assert!(parsed
