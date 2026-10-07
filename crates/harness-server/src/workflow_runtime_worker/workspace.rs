@@ -756,12 +756,13 @@ mod tests {
         let root = tempfile::tempdir()?;
         let state = Arc::new(crate::test_helpers::make_test_state(root.path()).await?);
         let project = tempfile::tempdir()?;
+        std::fs::write(project.path().join("hook-marker.txt"), "done")?;
         let workspace = PreparedRuntimeWorkspace {
             run_project: project.path().to_path_buf(),
             task_id: None,
             acquisition_id: None,
             execution_guard: None,
-            after_run_hook: Some("printf done > after-run.txt".into()),
+            after_run_hook: Some("cp hook-marker.txt after-run.txt".into()),
             before_remove_hook: None,
             hook_timeout_secs: 3,
             finish_action: RuntimeWorkspaceFinishAction::Release,
