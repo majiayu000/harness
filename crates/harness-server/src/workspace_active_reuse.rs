@@ -388,6 +388,32 @@ impl Drop for WorkspaceExecutionGuard {
         if !self.armed.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
+        let workspace = self.manager.active.get(&self.task_id).and_then(|active| {
+            (active.acquisition_id == self.acquisition_id).then(|| active.workspace_path.clone())
+        });
+        if let Some(workspace) = workspace {
+            let retained = Self {
+                manager: self.manager.clone(),
+                task_id: self.task_id.clone(),
+                acquisition_id: self.acquisition_id.clone(),
+                execution_id: self.execution_id.clone(),
+                armed: std::sync::atomic::AtomicBool::new(true),
+            };
+            match harness_core::process_cleanup::retain_until_workspace_cleanup(
+                &workspace, retained,
+            ) {
+                Ok(()) => {
+                    self.armed
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    tracing::error!(task_id = %self.task_id.0,
+                        "cancelled execution retains its workspace and repository lease until process cleanup is confirmed");
+                    return;
+                }
+                Err(retained) => retained
+                    .armed
+                    .store(false, std::sync::atomic::Ordering::Release),
+            }
+        }
         let cleanup_required = if let Some(mut active) = self.manager.active.get_mut(&self.task_id)
         {
             if active.acquisition_id == self.acquisition_id

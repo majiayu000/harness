@@ -217,6 +217,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
 
     // Use a turn backend only when the registry supplies one for the agent.
     // Otherwise the default backend remains the streaming executor.
+    let cleanup_workspace = project_root.clone();
     let execution_terminator = execution_adapter.clone();
     let executes_via_adapter = execution_adapter.is_some();
     let mut execution: std::pin::Pin<
@@ -277,6 +278,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     'outer: while execution_result.is_none() || !stream_closed {
         tokio::select! {
             result = &mut execution, if execution_result.is_none() => {
+                terminate_execution_after_drop |= executes_via_adapter && result.is_err();
                 execution_result = Some(result);
             }
             incoming = stream_rx.recv(), if !stream_closed => {
@@ -417,10 +419,6 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 if executes_via_adapter {
                     terminate_execution_after_drop = true;
                 }
-                if !executes_via_adapter {
-                    // The streaming future is dropped immediately after this loop;
-                    // ManagedChild drains its process group synchronously on that drop.
-                }
                 execution_result = Some(Err(HarnessError::AgentExecution(
                     "Runtime job lease was lost before the agent completed; turn interrupted.".to_string(),
                 )));
@@ -444,8 +442,8 @@ pub(crate) async fn run_turn_lifecycle_with_options(
     }
 
     // Do not update terminal turn state while an abandoned execution can still
-    // mutate its workspace. Completed futures are harmless to drop here; cancelled
-    // streaming executions synchronously drain their managed process group.
+    // mutate its workspace. Slow process cleanup leaves an explicit fence when
+    // its bounded synchronous Drop transfers ownership to the shared reaper.
     drop(execution);
     if terminate_execution_after_drop {
         if let Some(adapter) = execution_terminator.as_ref() {
@@ -481,6 +479,19 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
+    }
+
+    if harness_core::process_cleanup::workspace_cleanup_pending(&cleanup_workspace) {
+        if let Err(error) = server.thread_manager.add_item(
+            &thread_id,
+            &turn_id,
+            harness_core::types::Item::error(
+                "Process cleanup is still unconfirmed; keeping the workspace reserved until exit is acknowledged.".to_string(),
+            ),
+        ) {
+            tracing::error!("failed to record deferred process cleanup: {error}");
+        }
+        harness_core::process_cleanup::wait_for_workspace_cleanup(&cleanup_workspace).await;
     }
 
     match execution_result.unwrap_or_else(|| {

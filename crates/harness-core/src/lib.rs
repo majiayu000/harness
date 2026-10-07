@@ -19,6 +19,7 @@ pub mod db_test_safety;
 pub mod error;
 pub mod interceptor;
 pub mod lang_detect;
+pub mod process_cleanup;
 pub mod prompts;
 pub mod proof_of_work;
 pub mod retrieval;

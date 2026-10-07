@@ -35,6 +35,19 @@ pub(super) struct PreparedRuntimeWorkspace {
     pub _repository_write_lease: Option<RepositoryWriteLease>,
 }
 
+impl Drop for PreparedRuntimeWorkspace {
+    fn drop(&mut self) {
+        // Source workspaces own their repository lease directly. Worktree
+        // execution guards retain their own pool slot and attached lease in Drop.
+        if let Some(lease) = self._repository_write_lease.take() {
+            let _ = harness_core::process_cleanup::retain_until_workspace_cleanup(
+                &self.run_project,
+                lease,
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RuntimeWorkspaceFinishAction {
     Remove,
@@ -241,6 +254,10 @@ pub(super) async fn finish_runtime_workspace(
     state: &Arc<AppState>,
     workspace: &PreparedRuntimeWorkspace,
 ) -> anyhow::Result<()> {
+    // An idle adapter can outlive its completed turn and only publish a cleanup
+    // fence when the outer execution owner drops. Observe that fence before
+    // finalization hooks, removal or returning the pool slot.
+    harness_core::process_cleanup::wait_for_workspace_cleanup(&workspace.run_project).await;
     if let (Some(workspace_mgr), Some(task_id), Some(acquisition_id), Some(execution_guard)) = (
         state.concurrency.workspace_mgr.as_ref(),
         workspace.task_id.as_ref(),
@@ -728,5 +745,104 @@ mod tests {
             runtime_workspace_finish_action("on_terminal", false, &issue_job, Some(&issue)),
             RuntimeWorkspaceFinishAction::Remove
         );
+    }
+
+    #[tokio::test]
+    async fn finalization_waits_for_late_process_cleanup_before_running_hooks() -> anyhow::Result<()>
+    {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let root = tempfile::tempdir()?;
+        let state = Arc::new(crate::test_helpers::make_test_state(root.path()).await?);
+        let project = tempfile::tempdir()?;
+        let workspace = PreparedRuntimeWorkspace {
+            run_project: project.path().to_path_buf(),
+            task_id: None,
+            acquisition_id: None,
+            execution_guard: None,
+            after_run_hook: Some("printf done > after-run.txt".into()),
+            before_remove_hook: None,
+            hook_timeout_secs: 3,
+            finish_action: RuntimeWorkspaceFinishAction::Release,
+            repository_lease_lost: None,
+            _repository_write_lease: None,
+        };
+        // The outer execution owner can publish this fence after a successful
+        // turn has returned, when its idle adapter is finally dropped.
+        let cleanup = harness_core::process_cleanup::ProcessCleanupAcknowledgement::pending(
+            project.path().canonicalize()?,
+        );
+        let finish =
+            tokio::spawn(async move { finish_runtime_workspace(&state, &workspace).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!finish.is_finished());
+        assert!(!project.path().join("after-run.txt").exists());
+        cleanup.confirm();
+        tokio::time::timeout(std::time::Duration::from_secs(3), finish).await???;
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("after-run.txt"))?,
+            "done"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_source_workspace_retains_repository_lease_until_process_cleanup(
+    ) -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        let database_url = harness_core::db::resolve_test_database_url(None)?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect(&database_url)
+            .await?;
+        let store =
+            crate::workspace_lease_store::WorkspaceLeaseStore::for_repository_lock_pool_test(pool);
+        let root = tempfile::tempdir()?;
+        let project_key = root.path().to_string_lossy().into_owned();
+        let lease = store
+            .try_acquire_repository_write_lease(&project_key)
+            .await?
+            .expect("initial source lease");
+        let workspace = PreparedRuntimeWorkspace {
+            run_project: root.path().to_path_buf(),
+            task_id: None,
+            acquisition_id: None,
+            execution_guard: None,
+            after_run_hook: None,
+            before_remove_hook: None,
+            hook_timeout_secs: 0,
+            finish_action: RuntimeWorkspaceFinishAction::Release,
+            repository_lease_lost: Some(lease.loss_receiver()),
+            _repository_write_lease: Some(lease),
+        };
+        let cleanup = harness_core::process_cleanup::ProcessCleanupAcknowledgement::pending(
+            root.path().canonicalize()?,
+        );
+        drop(workspace);
+        assert!(
+            store
+                .try_acquire_repository_write_lease_now(&project_key)
+                .await?
+                .is_none(),
+            "cancelling the source execution must not release an unconfirmed writer's lease"
+        );
+        cleanup.confirm();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(replacement) = store
+                    .try_acquire_repository_write_lease_now(&project_key)
+                    .await?
+                {
+                    drop(replacement);
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        Ok(())
     }
 }

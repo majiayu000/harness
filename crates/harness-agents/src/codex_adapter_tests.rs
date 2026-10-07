@@ -776,8 +776,10 @@ async fn clear_active_turn_id_drops_stale_turn_state() {
 
 #[tokio::test]
 async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
+    let workspace = tempfile::tempdir().expect("create workspace");
     let adapter = CodexAdapter::new(PathBuf::from("codex"));
     let mut child = tokio::process::Command::new("sh")
+        .current_dir(workspace.path())
         .arg("-c")
         .arg(
             r#"printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress","items":[]}}}'; read _ || true"#,
@@ -794,13 +796,13 @@ async fn start_turn_fails_when_stdout_eofs_before_terminal_event() {
         state.stdin = Some(stdin);
         state.stdout_lines = Some(adapter.wrap_stdout(stdout));
         state.thread_id = Some("thread-1".into());
-        state.child_workspace = Some(PathBuf::from("/tmp/project"));
+        state.child_workspace = Some(workspace.path().to_path_buf());
     }
 
     let req = AgentRequest {
         prompt: "ping".to_string(),
         prompt_layers: None,
-        project_root: PathBuf::from("/tmp/project"),
+        project_root: workspace.path().to_path_buf(),
         permission_mode: Default::default(),
         model: None,
         reasoning_effort: None,

@@ -39,6 +39,7 @@ mod cleanup_tests {
         allow_drain: Semaphore,
         drain_calls: AtomicUsize,
         fail_first_drain: bool,
+        fail_start: bool,
     }
 
     #[async_trait::async_trait]
@@ -55,6 +56,9 @@ mod cleanup_tests {
             // Initialization holds this lock until start_turn is cancelled. The
             // timeout path must drop it before calling terminate_and_drain.
             let _state = self.state.lock().await;
+            if self.fail_start {
+                return Err(HarnessError::AgentExecution("injected turn failure".into()));
+            }
             std::future::pending().await
         }
 
@@ -76,8 +80,10 @@ mod cleanup_tests {
         }
     }
 
-    async fn assert_wall_timeout_keeps_workspace_until_drained(
+    async fn assert_failure_keeps_workspace_until_drained(
         fail_first_drain: bool,
+        deferred_process_cleanup: bool,
+        fail_start: bool,
     ) -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let manager = Arc::new(WorkspaceManager::new(WorkspaceConfig {
@@ -106,12 +112,18 @@ mod cleanup_tests {
             },
         );
         let execution_guard = manager.claim_workspace_execution(&task_id, "cleanup-acquisition")?;
+        let deferred_cleanup = deferred_process_cleanup.then(|| {
+            harness_core::process_cleanup::ProcessCleanupAcknowledgement::pending(
+                root.path().canonicalize().expect("workspace exists"),
+            )
+        });
         let adapter = Arc::new(GatedCleanupAdapter {
             state: Mutex::new(()),
             drain_started: Notify::new(),
             allow_drain: Semaphore::new(0),
             drain_calls: AtomicUsize::new(0),
             fail_first_drain,
+            fail_start,
         });
         let mut config = HarnessConfig::default();
         config.server.project_root = root.path().to_path_buf();
@@ -187,6 +199,25 @@ mod cleanup_tests {
         }
 
         adapter.allow_drain.add_permits(1);
+        if let Some(cleanup) = deferred_cleanup {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !run.is_finished(),
+                "deferred process cleanup retains execution"
+            );
+            assert!(manager
+                .claim_workspace_execution(&task_id, "cleanup-acquisition")
+                .is_err());
+            assert_eq!(
+                server
+                    .thread_manager
+                    .get_turn(&thread_id, &turn_id)
+                    .unwrap()
+                    .status,
+                TurnStatus::Running
+            );
+            cleanup.confirm();
+        }
         tokio::time::timeout(Duration::from_secs(2), run).await??;
         assert_eq!(
             adapter.drain_calls.load(Ordering::Acquire),
@@ -197,9 +228,14 @@ mod cleanup_tests {
             .get_turn(&thread_id, &turn_id)
             .expect("turn remains available after drain");
         assert_eq!(turn.status, TurnStatus::Failed);
+        let primary_error = if fail_start {
+            "injected turn failure"
+        } else {
+            "Agent turn timed out after 1s"
+        };
         assert!(turn.items.iter().any(|item| matches!(
             item,
-            Item::Error { message, .. } if message.contains("Agent turn timed out after 1s")
+            Item::Error { message, .. } if message.contains(primary_error)
         )));
         if fail_first_drain {
             assert!(turn.items.iter().any(|item| matches!(
@@ -214,12 +250,24 @@ mod cleanup_tests {
     #[tokio::test]
     async fn wall_timeout_drains_initializing_adapter_before_terminal_and_workspace_release(
     ) -> anyhow::Result<()> {
-        assert_wall_timeout_keeps_workspace_until_drained(false).await
+        assert_failure_keeps_workspace_until_drained(false, false, false).await
     }
 
     #[tokio::test]
     async fn wall_timeout_retains_workspace_after_failed_drain_until_retry_succeeds(
     ) -> anyhow::Result<()> {
-        assert_wall_timeout_keeps_workspace_until_drained(true).await
+        assert_failure_keeps_workspace_until_drained(true, false, false).await
+    }
+
+    #[tokio::test]
+    async fn wall_timeout_waits_for_deferred_process_cleanup_before_terminal() -> anyhow::Result<()>
+    {
+        assert_failure_keeps_workspace_until_drained(false, true, false).await
+    }
+
+    #[tokio::test]
+    async fn adapter_error_retains_workspace_until_failed_cleanup_retry_succeeds(
+    ) -> anyhow::Result<()> {
+        assert_failure_keeps_workspace_until_drained(true, false, true).await
     }
 }

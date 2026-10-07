@@ -268,6 +268,12 @@ impl CodeAgent for FailingStreamAgent {
     ) -> harness_core::error::Result<()> {
         self.execute_stream(req, tx).await
     }
+
+    async fn terminate_and_drain(&self) -> harness_core::error::Result<()> {
+        // This fixture returns its error without spawning a child or detached
+        // work. The failed start_turn has already completed before drain runs.
+        Ok(())
+    }
 }
 
 #[async_trait]

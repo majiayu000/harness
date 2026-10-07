@@ -992,12 +992,26 @@ impl AgentAdapter for CodexAdapter {
         let req = self.effective_turn_request(req);
         crate::spawn_supervisor::validate_capability_token(req.capability_token.as_ref())?;
 
+        let cleanup_workspace = req.project_root.canonicalize().map_err(|error| {
+            harness_core::error::HarnessError::AgentExecution(
+                crate::classify_missing_workspace_spawn_failure(
+                    &error,
+                    &req.project_root,
+                    format!("failed to spawn codex app-server: {error}"),
+                ),
+            )
+        })?;
+
         let generation = {
             let mut state = self.state.lock().await;
             state.begin_attempt()?
         };
-        let attempt_guard =
-            TurnAttemptGuard::new(self.state.clone(), self.cancel_notify.clone(), generation);
+        let attempt_guard = TurnAttemptGuard::new(
+            self.state.clone(),
+            self.cancel_notify.clone(),
+            generation,
+            cleanup_workspace,
+        );
 
         let setup = crate::cloud_setup::run_setup_phase(
             &self.cloud,

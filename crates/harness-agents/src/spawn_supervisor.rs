@@ -56,9 +56,13 @@ pub(crate) async fn spawn_agent(
         map_spawn_error,
     } = plan;
 
+    let cleanup_workspace = prepared_spawn
+        .current_dir
+        .canonicalize()
+        .map_err(|error| (map_spawn_error)(&error, &prepared_spawn))?;
     let mut cmd = Command::new(&prepared_spawn.program);
     cmd.args(&prepared_spawn.args)
-        .current_dir(&prepared_spawn.current_dir)
+        .current_dir(&cleanup_workspace)
         .stdin(stdio.stdin)
         .stdout(stdio.stdout)
         .stderr(stdio.stderr)
@@ -71,7 +75,10 @@ pub(crate) async fn spawn_agent(
     }
 
     let child = match spawn_with_etxtbsy_retry(
-        || validate_capability_token(capability_token),
+        || {
+            crate::process_cleanup::workspace_for_spawn(&cleanup_workspace)?;
+            validate_capability_token(capability_token)
+        },
         || cmd.spawn(),
     )
     .await
@@ -100,6 +107,7 @@ pub(crate) async fn spawn_agent(
     }
 
     let managed_child = ManagedChild::new(child, process_label)
+        .with_cleanup_workspace(cleanup_workspace)
         .with_egress_proxy_lease(prepared_spawn.egress_proxy_lease.clone())
         .with_egress_verification(prepared_spawn.egress_verification);
     Ok(SupervisedAgentProcess {

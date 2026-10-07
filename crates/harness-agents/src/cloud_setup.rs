@@ -222,9 +222,10 @@ async fn run_setup_command(
         .await?;
     spawn.clear_inherited_env = true;
 
+    let cleanup_workspace = crate::process_cleanup::workspace_for_spawn(&spawn.current_dir)?;
     let mut cmd = Command::new(&spawn.program);
     cmd.args(&spawn.args)
-        .current_dir(&spawn.current_dir)
+        .current_dir(&cleanup_workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -238,6 +239,7 @@ async fn run_setup_command(
         ))
     })?;
     let mut child = crate::ManagedChild::new(child, "codex cloud setup")
+        .with_cleanup_workspace(cleanup_workspace)
         .with_egress_proxy_lease(spawn.egress_proxy_lease.clone())
         .with_egress_verification(spawn.egress_verification);
     let secret_values: Vec<String> = cloud
