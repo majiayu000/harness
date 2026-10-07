@@ -455,6 +455,12 @@ children. Harness does not silently exempt model-provider traffic because a
 shell child could use the same exemption. Add every required provider endpoint
 (for example, `api.openai.com` or `api.anthropic.com`) to the exact-host list.
 On Linux, any non-empty allowlist requires `default_tier = "container"`.
+On macOS, `host` supports a proxy constrained by Seatbelt, but still needs Docker
+to run that proxy. Start with the [provider-configured first task](../README.md#quickstart-run-one-agent-task),
+which uses Claude's container path on either platform. `--sandbox-mode` does not
+override the network allowlist, and CLI authentication does not grant network
+access. Provision provider credentials separately; the container path forwards
+Claude's explicitly configured `ANTHROPIC_API_KEY`, not arbitrary host login state.
 
 ### `[agents.claude]`
 

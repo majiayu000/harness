@@ -47,12 +47,14 @@ def test_eval_nightly_workflow_is_scheduled_isolated_and_bounded() -> None:
     assert job["timeout-minutes"] == "360"
     assert "HARNESS_DATABASE_URL" not in job["env"]
     assert "HARNESS_API_TOKEN" not in job["env"]
+    assert job["env"]["HARNESS_PROJECT_ROOT"] == "${{ vars.HARNESS_EVAL_PROJECT_ROOT }}"
 
     steps = job["steps"]
     commands = "\n".join(
         str(step.get("run", "")) for step in steps if isinstance(step, dict)
     )
     assert "scripts/preflight-eval-nightly.py" in commands
+    assert "HARNESS_EVAL_PROJECT_ROOT to the server project root" in commands
     assert "harness eval run" in commands
     assert "--execute" in commands
     assert "--max-total-tokens" in commands

@@ -2,6 +2,11 @@ schema_version = 1
 suite = "harness-core"
 default_timeout_secs = 7200
 
+[isolation]
+# Model authentication and the existing draft PR lifecycle need explicit egress.
+# Native verification remains offline on the runtime host.
+network_allowlist = ["api.openai.com", "chatgpt.com", "auth.openai.com", "github.com", "api.github.com"]
+
 # PR #1502 closed GH-1437.
 [[cases]]
 case_id = "gh1437-runtime-stall-detection"

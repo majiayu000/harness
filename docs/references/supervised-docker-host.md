@@ -300,7 +300,10 @@ its original persisted payload. If the server rejects an expired/stale lease,
 the command fails and retains evidence for reconciliation; it never claims a new
 job to conceal that failure. Captured log prefixes survive restart without being
 replaced from candidate files; output not received before interruption is lost.
-The idle task container expires 15 minutes after launch. Before candidate export,
+The idle task container expires after the greater of 15 minutes and the task
+timeout plus five minutes. `--timeout` accepts 1–7200 seconds and defaults to
+180 seconds; formal eval claims use their own effective wall-time limit.
+Before candidate export,
 the client kills residual agent processes inside that container's private PID
 namespace, preserving its idle PID 1 and trusted exporter. It removes the task
 container before independent verification. Stopping a tmpfs container loses its
