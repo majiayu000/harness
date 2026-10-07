@@ -905,7 +905,8 @@ mod http_tests {
                         "runtime_retry_policy": { "max_failed_activity_retries": limit }
                     }));
                 }
-                let mut command = WorkflowCommand::enqueue_activity("implement_issue", "implement-1");
+                let mut command =
+                    WorkflowCommand::enqueue_activity("implement_issue", "implement-1");
                 command.command["retry_attempt"] = json!(retry_attempt);
                 let event =
                     WorkflowEvent::new(&instance.id, 1, RUNTIME_JOB_COMPLETED_EVENT, "runtime-1")
@@ -950,10 +951,9 @@ mod http_tests {
                         .commands
                         .iter()
                         .any(|command| command.command_type == WorkflowCommandType::MarkFailed));
-                    assert!(!decision
-                        .commands
-                        .iter()
-                        .any(|command| command.command_type == WorkflowCommandType::EnqueueActivity));
+                    assert!(!decision.commands.iter().any(
+                        |command| command.command_type == WorkflowCommandType::EnqueueActivity
+                    ));
                 }
             }
 
