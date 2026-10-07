@@ -178,11 +178,11 @@ impl HarnessError {
                 message,
             } => {
                 // Keep billing/quota semantics ahead of generic request rejection.
-                let kind = if is_billing_failure_message(message) {
+                let kind = if *status == 402 || is_billing_failure_message(message) {
                     TurnFailureKind::Billing
                 } else if *status == 429 || is_quota_failure_message(message) {
                     TurnFailureKind::Quota
-                } else if matches!(*status, 400 | 401 | 403 | 404 | 413) {
+                } else if matches!(*status, 400 | 401 | 403 | 404 | 413 | 415 | 422) {
                     TurnFailureKind::RequestRejected
                 } else {
                     TurnFailureKind::Upstream
@@ -379,6 +379,7 @@ mod tests {
                 "API returned 401 in an earlier request",
                 TurnFailureKind::Upstream,
             ),
+            (402, "billing_error", TurnFailureKind::Billing),
             (429, "monthly spend cap reached", TurnFailureKind::Quota),
             (400, "insufficient balance", TurnFailureKind::Billing),
             (400, "quota exhausted", TurnFailureKind::Quota),
