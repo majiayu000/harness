@@ -23,6 +23,35 @@ host has the matching Harness revision. Keeping the workflow disabled before
 those prerequisites exist prevents infrastructure absence from being
 misreported as a benchmark regression.
 
+Set `HARNESS_EVAL_PROJECT_ROOT` to the server's existing project root on the
+isolated runner. The CLI dispatches through PostgreSQL, not through
+`HARNESS_EVAL_SERVER_URL`: that URL is used only by preflight. CLI and server
+must use the same database and that project's `WORKFLOW.md` storage namespace.
+The runner must be able to read the project root. A reachable HTTP server alone
+does not establish that it will dispatch the CLI's workflows.
+
+For model activities, set `HARNESS_EVAL_CREDENTIAL_FILE` in the **server**
+environment to a private operator-owned JSON file. It contains the existing
+`credential_requirements` and `credential_grants` arrays; each grant declares
+its requirement ID, environment variable, issuer, scope, audience, expiration,
+and value. Use a short-lived provider credential such as `OPENAI_API_KEY`, with
+an audience and scope matching its declared requirement. Create this file with
+mode `0600` outside the checkout and remove it after the run. Never commit it,
+upload it as an artifact, or put its contents in shell arguments.
+
+The control plane reads the file at the model-job claim boundary and reuses the
+existing grant validation. Expired, missing-required, conflicting, malformed,
+or unreadable grants fail the claim. Only grant metadata enters the job's audit;
+values travel in the authenticated claim response and host process stdin.
+Native quality gates ignore this operator file and retain offline verification.
+Without the file, the original empty-by-default credential policy remains.
+The fixed manifests explicitly authorize the Codex provider and GitHub hosts;
+other providers require a deliberately edited manifest and a new suite identity.
+An interactive ChatGPT login is not a provider API-key grant for this formal
+host. See the [supervised host limits](../../docs/references/supervised-docker-host.md)
+before enabling nightly; these prerequisites alone do not supply a complete
+multi-activity suite executor or offline Cargo dependencies.
+
 If a report records `event_persistence_failed`, repair the observe stream with
 `harness eval retry-events <report.json>`. The command re-emits deterministic
 event IDs and atomically clears only the event-persistence outcome after the

@@ -36,6 +36,7 @@ jobs:
       baseline-eligible: ${{ steps.eligibility.outputs.eligible }}
     env:
       HARNESS_EVAL_SERVER_URL: ${{ vars.HARNESS_EVAL_SERVER_URL }}
+      HARNESS_PROJECT_ROOT: ${{ vars.HARNESS_EVAL_PROJECT_ROOT }}
       HARNESS_EVAL_GATE_MODE: ${{ github.event.inputs.gate_mode || vars.HARNESS_EVAL_GATE_MODE || 'report-only' }}
       HARNESS_EVAL_MAX_TOTAL_TOKENS: ${{ vars.HARNESS_EVAL_MAX_TOTAL_TOKENS || '1000000' }}
     steps:
@@ -54,11 +55,12 @@ jobs:
         env:
           HARNESS_DATABASE_URL: ${{ secrets.HARNESS_DATABASE_URL }}
           HARNESS_API_TOKEN: ${{ secrets.HARNESS_API_TOKEN }}
-        run: >-
-          python3 scripts/preflight-eval-nightly.py
-          --server-url "${HARNESS_EVAL_SERVER_URL:-http://127.0.0.1:9800}"
-          --gate-mode "$HARNESS_EVAL_GATE_MODE"
-          --manifest evals/benchmarks/harness-core.toml
+        run: |
+          test -n "${HARNESS_PROJECT_ROOT:?Set HARNESS_EVAL_PROJECT_ROOT to the server project root}"
+          python3 scripts/preflight-eval-nightly.py \
+          --server-url "${HARNESS_EVAL_SERVER_URL:-http://127.0.0.1:9800}" \
+          --gate-mode "$HARNESS_EVAL_GATE_MODE" \
+          --manifest evals/benchmarks/harness-core.toml \
           --baseline evals/baselines/harness-core/latest.json
 
       - name: Execute harness-core suite

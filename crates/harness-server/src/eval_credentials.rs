@@ -1,11 +1,13 @@
 use chrono::{DateTime, Utc};
 use harness_core::agent::AGENT_SECRETLESS_ENV_ENV;
+use harness_core::config::process_env;
 use harness_workflow::runtime::RuntimeJob;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fmt;
+use std::path::Path;
 
 pub(crate) const EVAL_CREDENTIAL_ENVIRONMENT_SCHEMA_VERSION: &str =
     "harness.eval.credential_environment.v1";
@@ -64,6 +66,12 @@ pub(crate) struct EvalCredentialGrant {
     pub audience: String,
     pub expires_at: DateTime<Utc>,
     pub value: String,
+}
+
+#[derive(Deserialize)]
+struct OperatorEvalCredentials {
+    credential_requirements: Vec<EvalCredentialRequirement>,
+    credential_grants: Vec<EvalCredentialGrant>,
 }
 
 impl fmt::Debug for EvalCredentialGrant {
@@ -173,6 +181,9 @@ pub(crate) enum EvalCredentialEnvironmentError {
     InvalidCredentialGrants {
         error: String,
     },
+    InvalidCredentialFile {
+        error: String,
+    },
 }
 
 impl fmt::Display for EvalCredentialEnvironmentError {
@@ -225,6 +236,9 @@ impl fmt::Display for EvalCredentialEnvironmentError {
             }
             Self::InvalidCredentialGrants { error } => {
                 write!(f, "invalid credential grants: {error}")
+            }
+            Self::InvalidCredentialFile { error } => {
+                write!(f, "invalid HARNESS_EVAL_CREDENTIAL_FILE: {error}")
             }
         }
     }
@@ -349,10 +363,62 @@ pub(crate) fn build_eval_credential_environment(
 pub(crate) fn runtime_host_eval_environment(
     job: &RuntimeJob,
 ) -> Result<Option<EvalCredentialEnvironment>, EvalCredentialEnvironmentError> {
+    let credential_file = process_env::var_os("HARNESS_EVAL_CREDENTIAL_FILE");
+    runtime_host_eval_environment_with_credential_file(
+        job,
+        credential_file.as_deref().map(Path::new),
+    )
+}
+
+fn runtime_host_eval_environment_with_credential_file(
+    job: &RuntimeJob,
+    credential_file: Option<&Path>,
+) -> Result<Option<EvalCredentialEnvironment>, EvalCredentialEnvironmentError> {
     if !job.is_eval_job() {
         return Ok(None);
     }
-    eval_credential_environment_for_job_with_ambient(job, &HashMap::new()).map(Some)
+    let allowlist =
+        plain_env_allowlist_from_job_input(&job.input).unwrap_or_else(default_plain_env_allowlist);
+    let mut requirements = credential_requirements_from_job_input(&job.input)?;
+    let mut grants = credential_grants_from_job_input(&job.input)?;
+    let activity = job
+        .input
+        .get("activity")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            job.input
+                .pointer("/command/activity")
+                .and_then(Value::as_str)
+        });
+    if activity.is_some_and(|activity| activity != harness_workflow::runtime::QUALITY_GATE_ACTIVITY)
+    {
+        if let Some(path) = credential_file {
+            let bytes = std::fs::read(path).map_err(|error| {
+                EvalCredentialEnvironmentError::InvalidCredentialFile {
+                    error: format!("cannot read operator credential file ({:?})", error.kind()),
+                }
+            })?;
+            // Deserialization errors may quote secret input; never retain their text.
+            let credentials: OperatorEvalCredentials =
+                serde_json::from_slice(&bytes).map_err(|_| {
+                    EvalCredentialEnvironmentError::InvalidCredentialFile {
+                        error:
+                            "expected valid credential_requirements and credential_grants arrays"
+                                .to_string(),
+                    }
+                })?;
+            requirements.extend(credentials.credential_requirements);
+            grants.extend(credentials.credential_grants);
+        }
+    }
+    build_eval_credential_environment(
+        &HashMap::new(),
+        &allowlist,
+        &requirements,
+        &grants,
+        Utc::now(),
+    )
+    .map(Some)
 }
 
 fn eval_credential_environment_for_job_with_ambient(

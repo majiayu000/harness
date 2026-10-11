@@ -990,8 +990,8 @@ def main() -> None:
         parser.error("images must be local sha256 image IDs")
     if args.verifier_image == args.image:
         parser.error("--verifier-image must differ from --image")
-    if not 1 <= args.timeout <= 300:
-        parser.error("timeout must be between 1 and 300 seconds")
+    if not 1 <= args.timeout <= 7200:
+        parser.error("timeout must be between 1 and 7200 seconds")
     if not re.fullmatch(r"[0-9a-f]{40}", args.base_commit):
         parser.error("base-commit must be a full lowercase 40-character SHA")
     host = Host(args)

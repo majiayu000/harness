@@ -4,6 +4,10 @@ Benchmark manifests live in this directory as TOML files. Each manifest lists
 resolved issue cases that the eval driver can replay through the normal
 workflow runtime path.
 
+For a user's repository and common tasks, use the
+[Agent upgrade trial entry point](../../docs/references/agent-upgrade-trial.md)
+to select the actual runtime-host version and compare completed live reports.
+
 ```toml
 schema_version = 1
 suite = "harness-core"

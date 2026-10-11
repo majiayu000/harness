@@ -53,6 +53,36 @@ docker buildx imagetools inspect ghcr.io/OWNER/harness-egress-proxy:2026-08-09
 export HARNESS_AGENT_EGRESS_PROXY_IMAGE=ghcr.io/OWNER/harness-egress-proxy@sha256:...
 ```
 
+## First Provider Request
+
+For a clean environment, use the [single-task quickstart](../README.md#quickstart-run-one-agent-task)
+first. It explicitly selects Claude, provisions its API credential, builds both
+images, sets scoped permissions, and allows `api.anthropic.com`. Do not submit a
+real task with the default empty allowlist: it intentionally denies provider
+requests as well as tool networking.
+
+Choose exact provider hosts from the selected runtime's actual configuration.
+The sample below includes GitHub and two providers; remove unused hosts and add
+any endpoints your authentication mode or custom gateway needs. The first
+allowlisted host is also used for a TLS reachability check before container
+dispatch. It must serve HTTPS on port 443 with a certificate trusted by the
+agent image. Wildcards, URLs, IP literals, and private/local endpoints are not
+accepted by the production proxy. A local synthetic provider fixture with an
+injected DNS resolver is test evidence only, not a supported production endpoint.
+
+Provider reachability and authentication are different checks. A denied target
+returns `403` from the proxy; provider `401`/`403` responses indicate that the
+request reached the provider but authentication/authorization must be checked.
+Missing images, an unhealthy proxy, a failed reachability check, or a failed
+deny canary stop the spawn. Keep the scoped profile; fix the image, endpoint list,
+CA trust, or credential provision that the diagnostic identifies.
+
+The bundled container forwarding currently provisions Claude's
+`ANTHROPIC_API_KEY`. It does not automatically copy host Codex login state or
+all ambient provider secrets into containers. Another runtime needs its own
+image authentication provision before it can complete a real task. Never bake
+real credentials into a published image.
+
 ## Enable Container Routing
 
 Set an isolation rule for untrusted intake. The example uses `container` as the
@@ -79,7 +109,10 @@ Start the server with both pinned images in the environment:
 ```bash
 export HARNESS_AGENT_CONTAINER_IMAGE=ghcr.io/OWNER/harness-agent@sha256:...
 export HARNESS_AGENT_EGRESS_PROXY_IMAGE=ghcr.io/OWNER/harness-egress-proxy@sha256:...
-export ANTHROPIC_API_KEY=sk-ant-...
+# Provision ANTHROPIC_API_KEY through your secret manager or a non-echoing prompt.
+read -r -s -p 'Anthropic API key: ' ANTHROPIC_API_KEY
+printf '\n'
+export ANTHROPIC_API_KEY
 harness --config harness.toml serve
 ```
 
