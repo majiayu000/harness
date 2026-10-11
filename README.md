@@ -39,7 +39,7 @@ installation and operation paths.
 
 | Your task | Start here | Prerequisite or boundary |
 |---|---|---|
-| Run one coding-agent task | [Single-agent quickstart](#quickstart-run-one-agent-task) | A local runtime; Linux sandbox helpers as documented. No fleet server is needed. |
+| Run one coding-agent task | [Single-agent quickstart](#quickstart-run-one-agent-task) | Docker, the runtime/proxy images, and explicit provider credentials and hosts. No fleet server is needed. |
 | Operate a fleet and dashboard | [Fleet setup](#level-up-the-fleet-control-plane) | Postgres and API authentication; the server is separate from a one-shot command. |
 | Submit work through the runtime | [Submission API](#workflow-runtime-submissions) and [API contract](docs/api-contract.md) | Submit the registered project/workflow rather than treating legacy tasks as the runtime API. |
 | Recover a stopped workflow | [Workflow runtime operations](docs/workflow-runtime-operations.md) | Inspect the pinned definition, stop reason, and recovery conditions before resuming. |
@@ -125,10 +125,19 @@ for platform support, provider setup, and refusal diagnostics.
 | Linux `container` | Supported through the bundled allowlist proxy; use this for online coding tasks. |
 | Linux `host` | Empty allowlist denies networking. A non-empty allowlist is rejected; use `container`. |
 | macOS `container` | Supported through the bundled allowlist proxy, as above. |
-| macOS `host` | Supported through the proxy's loopback port and Seatbelt; Docker is still required for the proxy. |
+| macOS `host` | Proxy routing uses a loopback port and Seatbelt; runtime startup compatibility must also be checked. Docker is required for the proxy. |
 
-For a locally installed and authenticated Codex CLI on macOS, build the proxy
-as above and use a separate host configuration. This example assumes Codex uses
+On macOS 26.5.2 (25F84), Codex CLI 0.162.1 aborted under Harness's `read-only`
+host Seatbelt wrapper with `failed to allocate a guard page: Invalid argument
+(os error 22)`. Even `codex --version` failed under that wrapper while the same
+binary succeeded outside it. This startup result covers that specific
+OS/runtime/sandbox combination; it does not establish provider authentication
+or support for other combinations. Use the container quickstart above for
+Claude without broadening permissions.
+
+For a locally installed and authenticated Codex CLI with verified macOS
+host startup compatibility, build the proxy as above and use a separate host
+configuration. This example assumes Codex uses
 an API provider at `api.openai.com`; configure the exact endpoints for your
 actual authentication/provider mode, including any required authentication
 hosts. A ChatGPT login or custom gateway can require a different host list.
