@@ -97,6 +97,52 @@ fn runtime_failure_failed_payload_classifies_from_error_kind() {
 }
 
 #[test]
+fn readiness_gate_local_review_preserves_explicit_stop_signals() {
+    for status in [ActivityStatus::Succeeded, ActivityStatus::Blocked] {
+        for separate_stop_signal in [false, true] {
+            for (code, error_kind, expected_class) in [
+                ("rate_limited", ActivityErrorKind::ExternalDependency, "transient"),
+                ("ci_backend_unavailable", ActivityErrorKind::ExternalDependency, "transient"),
+                ("maintainer_input_required", ActivityErrorKind::ExternalDependency, "terminal"),
+                ("unrecognized_stop", ActivityErrorKind::ExternalDependency, "terminal"),
+                ("rate_limited", ActivityErrorKind::Fatal, "terminal"),
+                ("ci_backend_unavailable", ActivityErrorKind::Configuration, "terminal"),
+            ] {
+                let instance = issue_instance("local_review_gate")
+                    .with_server_data(json!({ "pr_number": 2159 }));
+                let mut result = ActivityResult::succeeded(LOCAL_REVIEW_ACTIVITY, "Review blocked.")
+                    .with_error_kind(error_kind)
+                    .with_signal(ActivitySignal::new(
+                        LOCAL_REVIEW_BLOCKED_SIGNAL,
+                        if separate_stop_signal {
+                            json!({})
+                        } else {
+                            json!({ "stop_reason_code": code })
+                        },
+                    ));
+                if separate_stop_signal {
+                    result = result.with_signal(ActivitySignal::new(
+                        "runtime_stop",
+                        json!({ "stop_reason_code": code }),
+                    ));
+                }
+                result.status = status;
+                let event = runtime_completion_event(&instance, LOCAL_REVIEW_ACTIVITY, result);
+                let decision = reduce_runtime_job_completed(&instance, &event)
+                    .expect("completion should parse")
+                    .expect("review should block");
+                assert_eq!(decision.next_state, "blocked");
+                let payload = &mark_stop_command(&decision, WorkflowCommandType::MarkBlocked).command;
+                for stop in [payload, &payload["last_stop"]] {
+                    assert_eq!(stop["stop_reason_code"], code, "{status:?}, separate={separate_stop_signal}");
+                    assert_eq!(stop["reason_class"], expected_class, "{code}, {error_kind:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn readiness_gate_missing_human_approval_is_not_transient() {
     // Owner-queue completion 30f08dc1-1dec-4841-8b7c-3e0209812493 was
     // automatically unblocked eight seconds later without approval/head change.
@@ -239,7 +285,11 @@ fn runtime_failure_failed_payload_forged_transient_code_with_fatal_is_terminal()
 #[test]
 fn runtime_failure_missing_implementation_block_sets_invalid_agent_output_code() {
     let instance = issue_instance("implementing");
-    let result = ActivityResult::succeeded("implement_issue", "Implementation completed.");
+    let result = ActivityResult::succeeded("implement_issue", "Implementation completed.")
+        .with_signal(ActivitySignal::new(
+            "runtime_stop",
+            json!({ "stop_reason_code": "rate_limited" }),
+        ));
     let event = runtime_completion_event(&instance, "implement_issue", result);
     let decision = reduce_runtime_job_completed(&instance, &event)
         .expect("event should parse")

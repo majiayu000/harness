@@ -208,7 +208,14 @@ pub(super) fn runtime_blocked_payload(
     // A blocked assessment needs external input, not another unchanged attempt.
     // Only an explicit stop reason can make it machine-recheckable; a broad
     // error kind such as external_dependency is not evidence that the gate cleared.
-    let stop_reason_code = stop_reason_code.or(Some(STOP_REASON_MAINTAINER_INPUT_REQUIRED));
+    // Outcome signals can block a succeeded activity too. Preserve their
+    // explicit reason unless the runtime supplied a stronger stop reason.
+    let stop_reason_code = stop_reason_code
+        .map(str::to_owned)
+        .or_else(|| result_stop_reason_code(result));
+    let stop_reason_code = stop_reason_code
+        .as_deref()
+        .or(Some(STOP_REASON_MAINTAINER_INPUT_REQUIRED));
     let mut payload = json!({
         "reason": reason,
         "blocked_reason": reason,

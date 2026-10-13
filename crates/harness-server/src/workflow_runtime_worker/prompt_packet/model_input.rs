@@ -68,6 +68,20 @@ pub(super) fn simplify(packet: &mut Value) {
         .and_then(Value::as_str)
         .unwrap_or("workflow_activity")
         .to_owned();
+    let stop_signal = json!({ "stop_reason_code": "ci_backend_unavailable" });
+    schema.insert("stop_reason_contract".into(), json!({
+        "description": "For a confirmed temporary service gap, include an explicit stop_reason_code in an existing signal payload or in the optional runtime_stop metadata signal shown below. This metadata is accepted in addition to activity_contract.accepted_signals; it does not replace a required activity outcome. A succeeded local review must still emit exactly one review outcome and may put the code directly in LocalReviewBlocked. Both blocked and succeeded + LocalReviewBlocked preserve the code.",
+        "transient_stop_reason_codes": harness_workflow::runtime::reason_class::TRANSIENT_STOP_REASON_CODES,
+        "gate_rule": "A blocked result without a stop code is maintainer_input_required (terminal), even with error_kind external_dependency. Human approval and unchanged acceptance gates require operator input; do not label them transient. Report only a code supported by observed evidence. Runtime-enforced stop reasons take precedence. Fatal, configuration, and unknown error kinds override transient codes; unknown codes are terminal. Failed executions retain the existing bounded retry policy.",
+        "signal_example": {
+            "signal_type": "runtime_stop",
+            "signal": if encoded {
+                json!({"encoding":"harness.runtime.json_payload.v1", "json":stop_signal.to_string()})
+            } else {
+                stop_signal
+            }
+        }
+    }));
     // A blocked example applies to every activity without inventing successful
     // work. The activity contract describes the evidence needed for success.
     // plan_issue replaces it: an unmet explicit approval is configuration.
@@ -97,7 +111,7 @@ pub(super) fn simplify(packet: &mut Value) {
     }
     schema.insert("array_item_fields".into(), json!({
         "artifacts": {"artifact_type":"non-empty artifact name", "artifact":"payload value, encoded only when the transport schema requires it"},
-        "signals": {"signal_type":"accepted signal name", "signal":"payload value, encoded only when the transport schema requires it"},
+        "signals": {"signal_type":"activity outcome signal name or optional runtime_stop metadata", "signal":"payload value, encoded only when the transport schema requires it"},
         "validation": {"command":"actual command run", "status":"actual result such as passed or failed", "reason":"explanation or null"},
         "requirement":"Use these exact field names. Arrays may be empty only when there is no corresponding evidence."
     }));

@@ -303,6 +303,61 @@ fn activity_result_schema_describes_issue_planning_contract() {
 }
 
 #[test]
+fn readiness_gate_model_contract_documents_parseable_transient_stop_signals() {
+    use harness_workflow::runtime::reason_class::{classify_stop, StopReasonClass};
+    use harness_workflow::runtime::{ActivityErrorKind, ActivitySignal};
+
+    for runtime_kind in ["grok", "codex_exec", "codex_jsonrpc"] {
+        for activity in [
+            "implement_issue",
+            "plan_issue",
+            "run_local_review",
+            "implement_prompt",
+        ] {
+            let mut packet = json!({
+                "runtime_job": {"runtime_kind": runtime_kind},
+                "workflow": {"definition_id": "github_issue_pr"},
+                "activity_result_schema": {"activity": activity},
+            });
+            super::model_input::simplify(&mut packet);
+            let contract = &packet["activity_result_schema"]["stop_reason_contract"];
+            let mut example = contract["signal_example"].clone();
+            if runtime_kind != "grok" {
+                assert_eq!(
+                    example["signal"]["encoding"],
+                    "harness.runtime.json_payload.v1"
+                );
+                example["signal"] = serde_json::from_str(
+                    example["signal"]["json"]
+                        .as_str()
+                        .expect("encoded JSON text"),
+                )
+                .expect("stop signal payload should decode");
+            }
+            let signal: ActivitySignal = serde_json::from_value(example)
+                .expect("documented example should be an accepted signal shape");
+            assert_eq!(signal.signal_type, "runtime_stop");
+            assert_eq!(
+                classify_stop(
+                    signal.signal["stop_reason_code"].as_str(),
+                    Some(ActivityErrorKind::ExternalDependency)
+                ),
+                StopReasonClass::Transient,
+            );
+            let codes = contract["transient_stop_reason_codes"]
+                .as_array()
+                .expect("transient reasons");
+            assert!(codes.contains(&json!("rate_limited")));
+            assert!(codes.contains(&signal.signal["stop_reason_code"]));
+            assert!(contract["gate_rule"]
+                .as_str()
+                .unwrap()
+                .contains("maintainer_input_required"));
+        }
+    }
+}
+
+#[test]
 fn activity_result_schema_describes_quality_gate_contract() {
     let job = RuntimeJob::pending(
         "command-1",
