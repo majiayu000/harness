@@ -4,6 +4,7 @@ use crate::runtime::model::{
 };
 use crate::runtime::reason_class::{
     classify_stop, STOP_REASON_BUDGET_EXHAUSTED, STOP_REASON_INVALID_AGENT_OUTPUT,
+    STOP_REASON_MAINTAINER_INPUT_REQUIRED,
 };
 use serde_json::{json, Value};
 
@@ -204,6 +205,10 @@ pub(super) fn runtime_blocked_payload(
     event: &WorkflowEvent,
     result: &ActivityResult,
 ) -> Value {
+    // A blocked assessment needs external input, not another unchanged attempt.
+    // Only an explicit stop reason can make it machine-recheckable; a broad
+    // error kind such as external_dependency is not evidence that the gate cleared.
+    let stop_reason_code = stop_reason_code.or(Some(STOP_REASON_MAINTAINER_INPUT_REQUIRED));
     let mut payload = json!({
         "reason": reason,
         "blocked_reason": reason,

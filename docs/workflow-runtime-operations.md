@@ -73,9 +73,24 @@ curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
 ## Manual Recovery
 
 Use the recovery API after an operator resolves the external condition that
-left a workflow `blocked` or `failed`. Recovery is manual by default. Harness
-does not periodically retry stopped workflows, and these routes do not change
-GitHub labels, comments, or issue state.
+left a workflow `blocked` or `failed`. Recovery is manual by default; opted-in
+auto-recovery only rechecks stops classified as transient. These routes do not
+change GitHub labels, comments, or issue state.
+
+A blocked activity without an explicit `stop_reason_code` records the existing
+`maintainer_input_required` reason and `terminal` classification, even when its
+`error_kind` is `external_dependency`. An unchanged human approval or native
+permission gate therefore does not schedule another attempt. Explicit transient
+stop reasons (for example, `rate_limited`) remain eligible for auto-recovery.
+Failed executions such as upstream model-capacity errors retain the existing
+bounded activity retry policy; they are distinct from blocked assessments.
+
+Record the missing approval for the exact reviewed head, or evidence that the
+external acceptance condition changed, before requesting operator unblock.
+Include the evidence in the recovery request. Unblock schedules a fresh
+assessment; it does not grant approval or complete acceptance. An unchanged
+gate must still block the resumed assessment. Previously persisted stop records
+are not rewritten by this classification change.
 
 ### Authentication
 

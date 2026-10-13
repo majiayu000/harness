@@ -147,6 +147,139 @@ fn event_types(events: &[harness_workflow::runtime::WorkflowEvent]) -> Vec<&str>
         .collect()
 }
 
+#[tokio::test]
+async fn readiness_gate_auto_recovery_waits_for_operator_and_preserves_gate() -> anyhow::Result<()>
+{
+    if !test_helpers::db_tests_enabled().await {
+        return Ok(());
+    }
+    let _lock = test_helpers::HOME_LOCK.lock().await;
+    let (_dir, store) = open_test_store("harness-test-readiness-gate-").await?;
+    let github = test_github_config(3);
+
+    // Replay the material owner-queue facts through the reducer, persistence,
+    // candidate scan and recovery scheduler; no keyword classification is used.
+    for (id, state, activity, head, signals, artifacts) in [
+        (
+            "readiness-human-approval",
+            "local_review_gate",
+            "run_local_review",
+            "943349d526012d4efad78d922f1012c970e74a63",
+            json!([{
+                "signal_type": "LocalReviewBlocked",
+                "signal": {
+                    "reviewed_head_sha": "943349d526012d4efad78d922f1012c970e74a63",
+                    "code_findings": [],
+                    "blocking_findings": [{ "kind": "missing_human_review" }],
+                    "github_evidence": { "reviews": 0, "is_draft": true }
+                }
+            }]),
+            json!([]),
+        ),
+        (
+            "readiness-native-permission",
+            "implementing",
+            "implement_issue",
+            "9d6dbe5f5bc4c4a8771b13dea1c52183ff665547",
+            json!([]),
+            json!([{
+                "artifact_type": "pull_request",
+                "artifact": {
+                    "pr_number": 145,
+                    "pr_url": "https://github.com/majiayu000/keepline/pull/145",
+                    "draft": true,
+                    "head_sha": "9d6dbe5f5bc4c4a8771b13dea1c52183ff665547"
+                }
+            }]),
+        ),
+    ] {
+        let workflow = WorkflowInstance::new(
+            GITHUB_ISSUE_PR_DEFINITION_ID,
+            1,
+            state,
+            WorkflowSubject::new("issue", id),
+        )
+        .with_id(id)
+        .with_server_data(json!({ "repo": TEST_REPO, "pr_head_sha": head }));
+        crate::test_helpers::force_upsert_runtime_lifecycle_state_for_test(&store, &workflow)
+            .await?;
+        let command = WorkflowCommand::enqueue_activity(activity, format!("{id}-source"));
+        let command_id = store.enqueue_command(id, None, &command).await?;
+        let job = store
+            .enqueue_runtime_job(&command_id, RuntimeKind::CodexExec, "codex-test", json!({}))
+            .await?;
+        let payload = json!({
+            "command_id": command_id,
+            "command": command,
+            "runtime_job_id": job.id,
+            "activity_result": {
+                "activity": activity,
+                "status": "blocked",
+                "summary": "Acceptance requires external input; the gate is unchanged.",
+                "error": "Record the missing approval or permission evidence before recovery.",
+                "error_kind": "external_dependency",
+                "signals": signals,
+                "artifacts": artifacts,
+                "validation": []
+            }
+        });
+        store
+            .commit_parent_runtime_completion(id, "test", payload.clone())
+            .await?;
+        let stopped = refreshed(&store, id).await?;
+        assert_eq!(stopped.state, "blocked");
+        let events_before = store.events_for(id).await?;
+        let commands_before = store.commands_for(id).await?;
+
+        for delay in [8, 3600] {
+            let tick = run_auto_recovery_tick(
+                &store,
+                &github,
+                &crate::alerting::AlertHandle::disabled(),
+                Utc::now() + ChronoDuration::seconds(delay),
+            )
+            .await?;
+            assert_eq!(tick, AutoRecoveryTick::default());
+            assert_eq!(refreshed(&store, id).await?, stopped);
+            assert_eq!(store.events_for(id).await?, events_before);
+            assert_eq!(store.commands_for(id).await?, commands_before);
+        }
+
+        // The operator can request a fresh assessment with concrete evidence.
+        // Recovery itself must not synthesize an approval or satisfy the gate.
+        let evidence = [harness_workflow::runtime::WorkflowEvidence::new(
+            "operator_recheck",
+            format!("Reassess the recorded acceptance condition for exact head {head}."),
+        )];
+        let outcome = store
+            .recover_stopped_instance(WorkflowRuntimeRecoveryRequest {
+                workflow_id: id,
+                action: WorkflowRuntimeRecoveryAction::Unblock,
+                reason: "Operator requested reassessment with the recorded evidence.",
+                actor: "operator",
+                target_state: None,
+                evidence: &evidence,
+            })
+            .await?;
+        assert!(matches!(
+            outcome,
+            WorkflowRuntimeRecoveryOutcome::Recovered { .. }
+        ));
+        let resumed = refreshed(&store, id).await?;
+        assert_eq!(resumed.state, state);
+        assert_eq!(resumed.data["pr_head_sha"], head);
+        assert_eq!(resumed.data["last_operator_recovery"]["actor"], "operator");
+
+        store
+            .commit_parent_runtime_completion(id, "test", payload)
+            .await?;
+        let blocked_again = refreshed(&store, id).await?;
+        assert_eq!(blocked_again.state, "blocked");
+        assert_eq!(blocked_again.data["reason_class"], "terminal");
+    }
+    Ok(())
+}
+
 #[test]
 fn auto_recovery_excludes_declarative_instances() {
     let declarative = WorkflowInstance::new(
