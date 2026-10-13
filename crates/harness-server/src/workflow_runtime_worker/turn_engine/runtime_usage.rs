@@ -229,6 +229,7 @@ mod tests {
         event: StreamItem,
         close_pool: bool,
         http_failure: Option<u16>,
+        stream_failure: Option<(&'static str, bool)>,
         notifications: broadcast::Sender<RpcNotification>,
         active: AtomicBool,
         continued: AtomicBool,
@@ -261,6 +262,26 @@ mod tests {
             if self.close_pool {
                 // Fail only after admission and the initial run mapping were persisted.
                 self.store.pool().close().await;
+            }
+            if let Some((message, returns_ok)) = self.stream_failure {
+                // Queue the failure before usage in one poll, then either finish
+                // successfully or stay pending until the lifecycle drops execution.
+                tx.try_send(StreamItem::Error {
+                    message: message.into(),
+                })
+                .unwrap();
+                tx.try_send(self.event.clone()).unwrap();
+                tx.try_send(StreamItem::ItemCompleted {
+                    item: Item::AgentReasoning {
+                        content: "buffered after accounting".into(),
+                    },
+                })
+                .unwrap();
+                return if returns_ok {
+                    Ok(())
+                } else {
+                    std::future::pending().await
+                };
             }
             if let Some(status) = self.http_failure {
                 // Queue both items and return Err in one poll. The lifecycle must
@@ -324,6 +345,7 @@ mod tests {
         force_code_agent: bool,
         policy: RuntimeBudgetPolicy,
         http_failure: Option<u16>,
+        stream_failure: Option<(&'static str, bool)>,
     ) -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let database_url = crate::test_helpers::test_database_url()?;
@@ -399,6 +421,7 @@ mod tests {
             },
             close_pool: fault == Some("persist"),
             http_failure,
+            stream_failure,
             notifications: notification_tx.clone(),
             active: AtomicBool::new(false),
             continued: AtomicBool::new(false),
@@ -470,8 +493,8 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, Item::AgentReasoning { .. })));
         }
-        if let Some(status) = http_failure {
-            let (expected_failure, expected_activity) = match status {
+        let expected_failure = if let Some(status) = http_failure {
+            let (kind, activity) = match status {
                 402 => (TurnFailureKind::Billing, ActivityErrorKind::Configuration),
                 429 => (TurnFailureKind::Quota, ActivityErrorKind::Configuration),
                 503 => (
@@ -480,12 +503,24 @@ mod tests {
                 ),
                 _ => unreachable!("unexpected test status"),
             };
+            Some((
+                "agent execution failed: scripted backend failure",
+                Some(kind),
+                activity,
+            ))
+        } else {
+            stream_failure.map(|(message, _)| match message {
+                "quota exhausted" => (message, None, ActivityErrorKind::Configuration),
+                "request timed out" => (message, None, ActivityErrorKind::Timeout),
+                _ => unreachable!("unexpected test message"),
+            })
+        };
+        if let Some((expected_error, expected_failure, expected_activity)) = expected_failure {
             assert!(
                 matches!(
                     turn.items.last(),
                     Some(Item::Error { message, failure_kind, .. })
-                        if message == "agent execution failed: scripted backend failure"
-                            && *failure_kind == Some(expected_failure)
+                        if message == expected_error && *failure_kind == expected_failure
                 ),
                 "backend failure must remain primary: {:?}",
                 turn.items
@@ -509,10 +544,7 @@ mod tests {
             );
             assert_eq!(result.status, ActivityStatus::Failed);
             assert_eq!(result.error_kind, Some(expected_activity));
-            assert_eq!(
-                result.error.as_deref(),
-                Some("agent execution failed: scripted backend failure")
-            );
+            assert_eq!(result.error.as_deref(), Some(expected_error));
         }
         let inspection_store = if fault == Some("persist") {
             Arc::new(
@@ -562,7 +594,8 @@ mod tests {
             },
         ] {
             for oneshot in [true, false] {
-                accounting_case(cost_only, Some(fault), oneshot, policy.clone(), None).await?;
+                accounting_case(cost_only, Some(fault), oneshot, policy.clone(), None, None)
+                    .await?;
             }
         }
         Ok(())
@@ -606,8 +639,39 @@ mod tests {
                                 ..Default::default()
                             },
                             Some(status),
+                            None,
                         )
                         .await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_stream_accounting_failure_preserves_streamed_failure() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        for message in ["quota exhausted", "request timed out"] {
+            for returns_ok in [false, true] {
+                for cost_only in [true, false] {
+                    for fault in ["persist", "watchdog"] {
+                        for oneshot in [true, false] {
+                            accounting_case(
+                                cost_only,
+                                Some(fault),
+                                oneshot,
+                                RuntimeBudgetPolicy {
+                                    enforcement: RuntimeBudgetEnforcement::Enforce,
+                                    ..Default::default()
+                                },
+                                None,
+                                Some((message, returns_ok)),
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
@@ -643,7 +707,7 @@ mod tests {
                         ..Default::default()
                     },
                 ] {
-                    accounting_case(cost_only, None, oneshot, policy, None).await?;
+                    accounting_case(cost_only, None, oneshot, policy, None, None).await?;
                 }
             }
         }

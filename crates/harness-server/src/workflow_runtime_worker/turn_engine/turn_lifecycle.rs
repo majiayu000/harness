@@ -357,10 +357,16 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                                 }
                             }
                         }
+                        if !matches!(execution_result, Some(Err(_))) {
+                            if let Some(message) = stream_error.take() {
+                                // Preserve the streamed text and its untyped
+                                // classification path in the terminal error item.
+                                execution_result = Some(Err(HarnessError::Other(message)));
+                            }
+                        }
                         if matches!(execution_result, Some(Err(_))) {
-                            // Buffered usage can fail after the backend returned.
-                            // Keep its typed failure primary and retain this
-                            // accounting diagnostic before the terminal error.
+                            // Keep returned or streamed backend failures primary
+                            // and retain accounting diagnostics before them.
                             if let Err(error) = server.thread_manager.add_item(
                                 &thread_id,
                                 &turn_id,
