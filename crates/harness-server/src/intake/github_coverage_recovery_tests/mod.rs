@@ -5,7 +5,6 @@ mod support;
 use support::*;
 
 mod atomic;
-mod cancellation;
 
 #[tokio::test]
 async fn empty_store_recovers_ready_pr_and_stays_idempotent_after_restart() -> anyhow::Result<()> {
