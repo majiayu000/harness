@@ -203,6 +203,10 @@ pub(crate) async fn check_github_issue_coverage(
 
 fn recovered_closed_pr_requires_lookup(workflow: &WorkflowInstance) -> bool {
     workflow.state == "cancelled"
+        // An operator cancellation is not evidence that the recovered PR closed.
+        // Keep the existing hold at both coverage lookup and recovery persistence.
+        && workflow.data.get("last_decision").and_then(serde_json::Value::as_str)
+            != Some("cancel_issue_submission")
         && workflow
             .data
             .get("coverage_recovered_from_github")

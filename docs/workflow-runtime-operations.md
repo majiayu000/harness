@@ -191,6 +191,14 @@ stopped instance with no structured stop metadata resumes at `implement_issue`;
 partial, malformed, or unsupported stop metadata fails closed without mutating
 the workflow.
 
+To stop one native issue workflow during a separately owned repair, use
+`POST /api/workflows/runtime/cancel` with its `workflow_id`. Passive GitHub
+intake preserves this operator cancellation, including for workflows originally
+recovered from a closing PR that has since lost its issue link. Resume that issue
+through an explicit `POST /api/workflows/runtime/submissions` request. This does
+not prevent recovery of a remotely closed PR when GitHub later reports it open
+again: remote closure and an operator cancellation are distinct decisions.
+
 When structured stop metadata is present, Harness replays the original command
 and returns the corresponding active state:
 
