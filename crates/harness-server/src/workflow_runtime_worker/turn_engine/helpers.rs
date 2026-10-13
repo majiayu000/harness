@@ -1,5 +1,7 @@
 pub(crate) use super::runtime_usage::{RuntimeUsageContext, TurnBudgetStop};
+use anyhow::Context;
 use harness_core::agent::StreamItem;
+use harness_core::config::workflow::RuntimeBudgetEnforcement;
 use harness_core::types::{Item, ThreadId, TurnId, TurnStatus};
 use harness_protocol::{notifications::Notification, notifications::RpcNotification};
 
@@ -77,6 +79,8 @@ pub(crate) fn emit_runtime_notification(
 /// Returns a [`TurnBudgetStop`] when the streamed usage just persisted put the
 /// workflow at or over its budget under `enforce`; the caller interrupts the
 /// in-flight turn (GH-1770 §4.3).
+/// Accounting errors also stop an enforced, capped turn: a failed write or
+/// watchdog check cannot establish that execution remains within its budget.
 pub(crate) async fn process_stream_item(
     server: &crate::server::HarnessServer,
     notify_tx: &Option<crate::notify::NotifySender>,
@@ -85,8 +89,8 @@ pub(crate) async fn process_stream_item(
     thread_id: &ThreadId,
     turn_id: &TurnId,
     stream_item: StreamItem,
-) -> Option<TurnBudgetStop> {
-    let mut budget_stop = None;
+) -> anyhow::Result<Option<TurnBudgetStop>> {
+    let mut accounting_result = None;
     match stream_item {
         StreamItem::EgressVerifiedAtDispatch => {}
         StreamItem::ItemStarted { item } => {
@@ -141,50 +145,24 @@ pub(crate) async fn process_stream_item(
                 },
             );
             if let Some(context) = runtime_usage {
-                if let Err(error) = context
-                    .persist_token_usage(turn_id, &usage, cost_usd_observed)
-                    .await
-                {
-                    tracing::error!(
-                        runtime_job_id = %context.runtime_job_id,
-                        command_id = %context.command_id,
-                        workflow_id = %context.workflow_id,
-                        "failed to persist workflow runtime token usage: {error}"
-                    );
-                }
-                // Evaluated after the persist above so the aggregate includes
-                // the usage that may have crossed the ceiling. A failed check
-                // must not silently disable the watchdog: it is logged at
-                // error level and the completion ceiling remains the backstop.
-                match context.budget_stop().await {
-                    Ok(stop) => budget_stop = stop,
-                    Err(error) => tracing::error!(
-                        runtime_job_id = %context.runtime_job_id,
-                        workflow_id = %context.workflow_id,
-                        "failed to evaluate the mid-turn workflow budget ceiling: {error}"
-                    ),
-                }
+                accounting_result = Some(
+                    context
+                        .persist_token_usage(turn_id, &usage, cost_usd_observed)
+                        .await
+                        .context("failed to persist workflow runtime token usage"),
+                );
             }
         }
         StreamItem::CostReported { cost_usd } => {
             // Cost-only observations must not overwrite the turn's token
             // counters or emit a TokenUsageUpdated notification.
             if let Some(context) = runtime_usage {
-                if let Err(error) = context.persist_cost(turn_id, cost_usd).await {
-                    tracing::error!(
-                        runtime_job_id = %context.runtime_job_id,
-                        workflow_id = %context.workflow_id,
-                        "failed to persist workflow runtime cost: {error}"
-                    );
-                }
-                match context.budget_stop().await {
-                    Ok(stop) => budget_stop = stop,
-                    Err(error) => tracing::error!(
-                        runtime_job_id = %context.runtime_job_id,
-                        workflow_id = %context.workflow_id,
-                        "failed to evaluate the mid-turn workflow budget ceiling: {error}"
-                    ),
-                }
+                accounting_result = Some(
+                    context
+                        .persist_cost(turn_id, cost_usd)
+                        .await
+                        .context("failed to persist workflow runtime cost"),
+                );
             }
         }
         StreamItem::Error { message } => {
@@ -268,7 +246,43 @@ pub(crate) async fn process_stream_item(
         }
         _ => {}
     }
-    budget_stop
+    if let (Some(context), Some(persisted)) = (runtime_usage, accounting_result) {
+        let enforced = !context.budget_policy.unlimited
+            && context.budget_policy.enforcement == RuntimeBudgetEnforcement::Enforce;
+        if let Err(error) = persisted {
+            tracing::error!(
+                runtime_job_id = %context.runtime_job_id,
+                command_id = %context.command_id,
+                workflow_id = %context.workflow_id,
+                "{error:#}"
+            );
+            if enforced {
+                return Err(error);
+            }
+        }
+        // Check after persistence so the aggregate includes this observation.
+        // Shadow/unlimited retain best-effort accounting on errors.
+        return match context
+            .budget_stop()
+            .await
+            .context("failed to evaluate the mid-turn workflow budget ceiling")
+        {
+            Ok(stop) => Ok(stop),
+            Err(error) => {
+                tracing::error!(
+                    runtime_job_id = %context.runtime_job_id,
+                    workflow_id = %context.workflow_id,
+                    "{error:#}"
+                );
+                if enforced {
+                    Err(error)
+                } else {
+                    Ok(None)
+                }
+            }
+        };
+    }
+    Ok(None)
 }
 
 pub(crate) async fn mark_turn_failed(
@@ -402,7 +416,7 @@ mod tests {
             &turn_id,
             StreamItem::CostReported { cost_usd: 0.125 },
         )
-        .await;
+        .await?;
         assert!(matches!(
             notifications.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -472,7 +486,7 @@ mod tests {
                 cost_usd_observed: true,
             },
         )
-        .await;
+        .await?;
 
         let records = store
             .runtime_usage_between(
@@ -608,7 +622,7 @@ mod tests {
             &fixture.turn_id,
             watchdog_usage(0.125),
         )
-        .await
+        .await?
         .expect("crossing the ceiling mid-turn must stop the turn");
 
         assert_eq!(stop.workflow_id, "watchdog-enforce");
@@ -642,7 +656,7 @@ mod tests {
                 &fixture.turn_id,
                 StreamItem::CostReported { cost_usd },
             )
-            .await;
+            .await?;
             assert_eq!(stop.is_some(), cost_usd >= 0.10);
             let usage = fixture
                 .store
@@ -694,7 +708,7 @@ mod tests {
             &fixture.turn_id,
             watchdog_usage(0.125),
         )
-        .await;
+        .await?;
 
         assert!(stop.is_none(), "shadow mode must not stop the turn");
         let events = fixture.store.events_for("watchdog-shadow").await?;
@@ -735,7 +749,7 @@ mod tests {
             &fixture.turn_id,
             watchdog_usage(0.125),
         )
-        .await;
+        .await?;
 
         assert!(stop.is_none(), "an under-budget turn keeps running");
         assert!(
@@ -777,7 +791,7 @@ mod tests {
             &fixture.turn_id,
             watchdog_usage(5.0),
         )
-        .await;
+        .await?;
 
         assert!(stop.is_none(), "unlimited opt-out disables the watchdog");
         Ok(())

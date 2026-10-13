@@ -1,6 +1,6 @@
 # Budget Enforcement and Spend Evidence
 
-> Verified: 2026-09-17.
+> Verified: 2026-10-13 (ordinary stream accounting failure paths).
 > Linked issue: [GH-1770](https://github.com/majiayu000/harness/issues/1770).
 > Scope: existing runtime controls, their execution boundaries, and remaining
 > operational acceptance. No production budget is selected here.
@@ -25,7 +25,7 @@ production spend limit.
 | --- | --- | --- |
 | Durable accounting | `runtime/store/runtime_usage.rs` stores attributed token metrics, integer micro-dollar cost, and `cost_usd_observed` | Provider-reported amounts are not automatically reconciled billing data |
 | Before dispatch | `runtime/dispatcher.rs::budget_gate_outcome` checks workflow spend and the configured daily profile cap; shadow records events and enforce defers exhausted work | Comparisons use recorded numerical cost, without rejecting an unobserved aggregate |
-| During execution | `workflow_runtime_worker/turn_engine/runtime_usage.rs::budget_stop` checks recorded workflow cost after streamed usage | Unknown or delayed cost cannot prove remaining spend; ordinary stream accounting failures are logged and do not themselves stop execution |
+| During execution | `workflow_runtime_worker/turn_engine/runtime_usage.rs::budget_stop` checks recorded workflow cost after streamed usage; ordinary turns fail on persistence/check errors under enforced capped policy | Unknown or delayed cost cannot prove remaining spend; shadow and unlimited accounting remains best effort |
 | At completion | `runtime/store/runtime_completion_budget.rs` can replace a decision with a blocked workflow and operator attention under enforce | Ordinary terminal outcomes are preserved; successful agent-contract completions and explicit budget stops have separate handling |
 | Backend admission | Agent-contract execution and ordinary `turn_lifecycle.rs` call `enforced_budget_cost_error` on the selected execution backend before launch under enforce | Checks declared cost-reporting capability; later missing or delayed observations still need execution-period handling |
 | Agent-contract completion | `agent_contract_stream.rs` rejects an attempt that did not emit observed USD cost under enforce | Cost-reporting capability and an observed event do not establish account attribution or invoice reconciliation |
@@ -61,13 +61,28 @@ will emit complete, timely observations. The ordinary watchdog and later
 dispatch gate still inspect numerical recorded cost without rejecting an
 unobserved aggregate. That execution-period coverage remains incomplete.
 
-The ordinary stream path in `turn_engine/helpers.rs` logs usage-persistence or
-watchdog errors and continues. A completion comparison against the same ledger
-cannot reconstruct a usage event that failed to persist. The agent-contract
-stream instead stops on accounting errors. Failure-path verification belongs in
-remaining enforcement acceptance.
+The ordinary stream path in `turn_engine/helpers.rs` propagates token-usage or
+independent-cost persistence errors and watchdog errors under enforced,
+non-unlimited policy. Its `turn_lifecycle.rs` caller interrupts execution, drains
+the per-turn backend after dropping its execution future, and records a failed
+turn with the accounting error. It does not report an observed budget breach for
+an accounting failure. Shadow and explicit unlimited policies retain logging
+and continuation; a successfully observed budget stop retains its existing
+behavior. A completion comparison cannot reconstruct an observation that failed
+to persist, and the failed attempt does not establish a complete cost ledger.
 
 ## Evidence already available
+
+Five `ordinary_stream_` tests cover 40 scripted scenarios across token and
+independent-cost events, oneshot and per-turn execution, and enforced capped,
+shadow, and unlimited policies. Closing the fixture's pool after admission
+reproduces persistence failure; valid individual rows overflowing PostgreSQL's
+aggregate reproduce watchdog failure after a successful write. Before the
+repair, all four error-path tests returned `Completed` instead of `Failed`;
+the successful-accounting control passed. Afterward, all five tests passed
+against disposable PostgreSQL, checking continuation, execution cleanup,
+retained ledger observations, and normal below/over-budget behavior. The USD
+amounts are scripted fixtures, not provider charges or selected production limits.
 
 Three new ordinary-admission tests cover eight backend/policy combinations,
 including opposite capabilities on the selected and unused execution surfaces.

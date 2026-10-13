@@ -314,7 +314,7 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                         let Some(item) = completion_state.normalize(item) else {
                             continue;
                         };
-                        let budget_stop = process_stream_item(
+                        let stop_error = match process_stream_item(
                             &server,
                             &notify_tx,
                             &notification_tx,
@@ -322,39 +322,62 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                             &thread_id,
                             &turn_id,
                             item,
-                        ).await;
-                        // GH-1770 §4.3: an activity that already blew the
-                        // workflow ceiling is precisely the case dispatch-time
-                        // gating cannot catch, so the in-flight turn stops.
-                        if let Some(stop) = budget_stop {
-                            tracing::warn!(
-                                thread_id = %thread_id,
-                                turn_id = %turn_id,
-                                workflow_id = %stop.workflow_id,
-                                spent_usd = stop.spent_usd,
-                                budget_usd = stop.budget_usd,
-                                "workflow budget ceiling reached mid-turn; interrupting agent"
-                            );
-                            // Drop start_turn before locking its execution adapter:
-                            // initialization may still own that same lock.
-                            terminate_execution_after_drop = executes_via_adapter;
-                            if !control_is_execution_adapter {
-                                if let Some(adapter) = adapter_opt.as_ref() {
-                                    if let Err(error) = adapter.interrupt().await {
-                                        tracing::warn!(
-                                            thread_id = %thread_id,
-                                            turn_id = %turn_id,
-                                            "failed to interrupt agent after the budget ceiling: {error}"
-                                        );
-                                    }
+                        ).await {
+                            Ok(None) => continue,
+                            Ok(Some(stop)) => {
+                                tracing::warn!(
+                                    thread_id = %thread_id,
+                                    turn_id = %turn_id,
+                                    workflow_id = %stop.workflow_id,
+                                    spent_usd = stop.spent_usd,
+                                    budget_usd = stop.budget_usd,
+                                    "workflow budget ceiling reached mid-turn; interrupting agent"
+                                );
+                                HarnessError::AgentExecution(format!(
+                                    "Workflow {} spent {:.2} USD, reaching its {:.2} USD budget; turn interrupted.",
+                                    stop.workflow_id, stop.spent_usd, stop.budget_usd
+                                ))
+                            }
+                            Err(error) => HarnessError::AgentExecution(format!(
+                                "{error:#}; turn interrupted under enforced USD budget policy."
+                            )),
+                        };
+                        // A breached ceiling or failed accounting check must
+                        // stop execution. Drop start_turn before locking its
+                        // execution adapter, which may still be initializing.
+                        terminate_execution_after_drop = executes_via_adapter;
+                        if !control_is_execution_adapter {
+                            if let Some(adapter) = adapter_opt.as_ref() {
+                                if let Err(error) = adapter.interrupt().await {
+                                    tracing::warn!(
+                                        thread_id = %thread_id,
+                                        turn_id = %turn_id,
+                                        "failed to interrupt agent after stream accounting stop: {error}"
+                                    );
                                 }
                             }
-                            execution_result = Some(Err(HarnessError::AgentExecution(format!(
-                                "Workflow {} spent {:.2} USD, reaching its {:.2} USD budget; turn interrupted.",
-                                stop.workflow_id, stop.spent_usd, stop.budget_usd
-                            ))));
-                            break 'outer;
                         }
+                        if !matches!(execution_result, Some(Err(_))) {
+                            if let Some(message) = stream_error.take() {
+                                // Preserve the streamed text and its untyped
+                                // classification path in the terminal error item.
+                                execution_result = Some(Err(HarnessError::Other(message)));
+                            }
+                        }
+                        if matches!(execution_result, Some(Err(_))) {
+                            // Keep returned or streamed backend failures primary
+                            // and retain accounting diagnostics before them.
+                            if let Err(error) = server.thread_manager.add_item(
+                                &thread_id,
+                                &turn_id,
+                                harness_core::types::Item::error(stop_error.to_string()),
+                            ) {
+                                tracing::warn!("failed to record stream accounting stop: {error}");
+                            }
+                        } else {
+                            execution_result = Some(Err(stop_error));
+                        }
+                        break 'outer;
                     }
                     None => {
                         stream_closed = true;
