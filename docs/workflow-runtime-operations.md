@@ -73,9 +73,50 @@ curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/submissions \
 ## Manual Recovery
 
 Use the recovery API after an operator resolves the external condition that
-left a workflow `blocked` or `failed`. Recovery is manual by default. Harness
-does not periodically retry stopped workflows, and these routes do not change
-GitHub labels, comments, or issue state.
+left a workflow `blocked` or `failed`. Recovery is manual by default; opted-in
+auto-recovery only rechecks stops classified as transient. These routes do not
+change GitHub labels, comments, or issue state.
+
+A blocked activity without an explicit `stop_reason_code` records the existing
+`maintainer_input_required` reason and `terminal` classification, even when its
+`error_kind` is `external_dependency`. An unchanged human approval or native
+permission gate therefore does not schedule another attempt. Explicit transient
+stop reasons (for example, `rate_limited`) remain eligible for auto-recovery.
+Failed executions such as upstream model-capacity errors retain the existing
+bounded activity retry policy; they are distinct from blocked assessments.
+
+For a confirmed temporary service gap, the activity producer must supply the
+existing optional `runtime_stop` signal, for example:
+
+```json
+{"signal_type":"runtime_stop","signal":{"stop_reason_code":"ci_backend_unavailable"}}
+```
+
+With the encoded output-schema transport, the same signal is:
+
+```json
+{"signal_type":"runtime_stop","signal":{"encoding":"harness.runtime.json_payload.v1","json":"{\"stop_reason_code\":\"ci_backend_unavailable\"}"}}
+```
+
+This is stop metadata, not a substitute for the activity's required outcome
+signal. A local review must still emit exactly one review outcome; its
+`LocalReviewBlocked` payload can carry `stop_reason_code` directly instead of
+using a separate `runtime_stop`. Both `blocked` results and `succeeded` results
+with `LocalReviewBlocked` preserve the explicit reason. Existing transient
+reasons are `rate_limited`, `ci_backend_unavailable`, `merge_base_drift`,
+`circuit_breaker_cooldown`, and `runtime_transcript_store_unavailable`, as defined
+in `crates/harness-workflow/src/runtime/reason_class.rs`. Use only a reason
+supported by observed evidence. Human approval and unchanged acceptance gates
+must not be labeled transient. Runtime-enforced stop reasons take precedence;
+`fatal`, `configuration`, and `unknown` error kinds remain terminal even with a
+transient code. Unknown stop codes remain terminal.
+
+Record the missing approval for the exact reviewed head, or evidence that the
+external acceptance condition changed, before requesting operator unblock.
+Include the evidence in the recovery request. Unblock schedules a fresh
+assessment; it does not grant approval or complete acceptance. An unchanged
+gate must still block the resumed assessment. Previously persisted stop records
+are not rewritten by this classification change.
 
 ### Authentication
 
@@ -88,7 +129,12 @@ development.
 ### Requests
 
 Both routes accept a JSON object with a non-empty workflow id and a non-empty
-operator reason. The reason is written to the workflow audit trail.
+operator reason. The reason is written to the workflow audit trail. Supply
+`evidence` as an array of `WorkflowEvidence` objects with string `kind` and
+`summary` fields; `kind` is a descriptive label, not an enum. Replace the
+example summaries below with the actual head, approval reference, or observed
+condition change. The API accepts omitted evidence, but omission does not
+satisfy the approval/acceptance procedure above.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/unblock \
@@ -96,7 +142,11 @@ curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/unblock \
   -H "Content-Type: application/json" \
   -d '{
     "workflow_id": "github-issue-workflow-id",
-    "reason": "maintainer supplied the requested approval"
+    "reason": "maintainer supplied the requested approval",
+    "evidence": [{
+      "kind": "human_approval",
+      "summary": "Required reviewer approved head <full reviewed SHA> at <approval URL>; the current PR head is still that SHA."
+    }]
   }'
 
 curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/retry \
@@ -104,7 +154,11 @@ curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/retry \
   -H "Content-Type: application/json" \
   -d '{
     "workflow_id": "github-issue-workflow-id",
-    "reason": "the transient backend outage has been repaired"
+    "reason": "the transient backend outage has been repaired",
+    "evidence": [{
+      "kind": "backend_recovery",
+      "summary": "The previously failing CI request succeeded at <UTC time>; result: <run URL>."
+    }]
   }'
 
 # Declarative workflows require an explicit declared recovery target.
@@ -114,7 +168,11 @@ curl -sS -X POST http://127.0.0.1:9800/api/workflows/runtime/unblock \
   -d '{
     "workflow_id": "declarative-workflow-id",
     "reason": "the release was approved",
-    "target_state": "publish"
+    "target_state": "publish",
+    "evidence": [{
+      "kind": "release_approval",
+      "summary": "The required approver authorized release of head <full SHA> at <approval URL>."
+    }]
   }'
 ```
 
