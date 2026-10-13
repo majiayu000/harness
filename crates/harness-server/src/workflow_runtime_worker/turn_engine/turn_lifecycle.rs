@@ -357,7 +357,20 @@ pub(crate) async fn run_turn_lifecycle_with_options(
                                 }
                             }
                         }
-                        execution_result = Some(Err(stop_error));
+                        if matches!(execution_result, Some(Err(_))) {
+                            // Buffered usage can fail after the backend returned.
+                            // Keep its typed failure primary and retain this
+                            // accounting diagnostic before the terminal error.
+                            if let Err(error) = server.thread_manager.add_item(
+                                &thread_id,
+                                &turn_id,
+                                harness_core::types::Item::error(stop_error.to_string()),
+                            ) {
+                                tracing::warn!("failed to record stream accounting stop: {error}");
+                            }
+                        } else {
+                            execution_result = Some(Err(stop_error));
+                        }
                         break 'outer;
                     }
                     None => {

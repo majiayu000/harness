@@ -217,8 +217,10 @@ mod tests {
     use harness_agents::registry::AgentRegistry;
     use harness_core::agent::{AgentRequest, StreamItem};
     use harness_core::config::HarnessConfig;
-    use harness_core::types::{AgentId, Item, TurnStatus};
+    use harness_core::error::HarnessError;
+    use harness_core::types::{AgentId, Item, TurnFailureKind, TurnStatus};
     use harness_protocol::notifications::{Notification, RpcNotification};
+    use harness_workflow::runtime::{ActivityErrorKind, ActivityStatus, RuntimeJob};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::{broadcast, mpsc};
 
@@ -226,6 +228,7 @@ mod tests {
         store: Arc<WorkflowRuntimeStore>,
         event: StreamItem,
         close_pool: bool,
+        http_failure: Option<u16>,
         notifications: broadcast::Sender<RpcNotification>,
         active: AtomicBool,
         continued: AtomicBool,
@@ -258,6 +261,22 @@ mod tests {
             if self.close_pool {
                 // Fail only after admission and the initial run mapping were persisted.
                 self.store.pool().close().await;
+            }
+            if let Some(status) = self.http_failure {
+                // Queue both items and return Err in one poll. The lifecycle must
+                // observe the backend failure before processing the buffered usage.
+                tx.try_send(self.event.clone()).unwrap();
+                tx.try_send(StreamItem::ItemCompleted {
+                    item: Item::AgentReasoning {
+                        content: "buffered after accounting".into(),
+                    },
+                })
+                .unwrap();
+                return Err(HarnessError::AgentHttpResponse {
+                    provider: "scripted".into(),
+                    status,
+                    message: "scripted backend failure".into(),
+                });
             }
             let mut notifications = self.notifications.subscribe();
             tx.send(self.event.clone()).await.unwrap();
@@ -304,6 +323,7 @@ mod tests {
         fault: Option<&str>,
         force_code_agent: bool,
         policy: RuntimeBudgetPolicy,
+        http_failure: Option<u16>,
     ) -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let database_url = crate::test_helpers::test_database_url()?;
@@ -378,6 +398,7 @@ mod tests {
                 }
             },
             close_pool: fault == Some("persist"),
+            http_failure,
             notifications: notification_tx.clone(),
             active: AtomicBool::new(false),
             continued: AtomicBool::new(false),
@@ -449,6 +470,50 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, Item::AgentReasoning { .. })));
         }
+        if let Some(status) = http_failure {
+            let (expected_failure, expected_activity) = match status {
+                402 => (TurnFailureKind::Billing, ActivityErrorKind::Configuration),
+                429 => (TurnFailureKind::Quota, ActivityErrorKind::Configuration),
+                503 => (
+                    TurnFailureKind::Upstream,
+                    ActivityErrorKind::ExternalDependency,
+                ),
+                _ => unreachable!("unexpected test status"),
+            };
+            assert!(
+                matches!(
+                    turn.items.last(),
+                    Some(Item::Error { message, failure_kind, .. })
+                        if message == "agent execution failed: scripted backend failure"
+                            && *failure_kind == Some(expected_failure)
+                ),
+                "backend failure must remain primary: {:?}",
+                turn.items
+            );
+            let job = RuntimeJob::pending(
+                "accounting-command",
+                RuntimeKind::CodexExec,
+                "scripted",
+                json!({ "activity": "implement_issue" }),
+            );
+            let result = crate::workflow_runtime_worker::activity_result::activity_result_from_turn_with_workflow(
+                &job,
+                &turn.status,
+                &turn.items,
+                &thread_id,
+                &turn_id,
+                "accounting-test",
+                root.path(),
+                "test-digest",
+                None,
+            );
+            assert_eq!(result.status, ActivityStatus::Failed);
+            assert_eq!(result.error_kind, Some(expected_activity));
+            assert_eq!(
+                result.error.as_deref(),
+                Some("agent execution failed: scripted backend failure")
+            );
+        }
         let inspection_store = if fault == Some("persist") {
             Arc::new(
                 WorkflowRuntimeStore::open_with_database_url(
@@ -497,7 +562,7 @@ mod tests {
             },
         ] {
             for oneshot in [true, false] {
-                accounting_case(cost_only, Some(fault), oneshot, policy.clone()).await?;
+                accounting_case(cost_only, Some(fault), oneshot, policy.clone(), None).await?;
             }
         }
         Ok(())
@@ -521,6 +586,33 @@ mod tests {
     #[tokio::test]
     async fn ordinary_stream_cost_watchdog_failure() -> anyhow::Result<()> {
         accounting_error_cases(true, "watchdog").await
+    }
+
+    #[tokio::test]
+    async fn ordinary_stream_accounting_failure_preserves_backend_failure() -> anyhow::Result<()> {
+        if !crate::test_helpers::db_tests_enabled().await {
+            return Ok(());
+        }
+        for status in [402, 429, 503] {
+            for cost_only in [true, false] {
+                for fault in ["persist", "watchdog"] {
+                    for oneshot in [true, false] {
+                        accounting_case(
+                            cost_only,
+                            Some(fault),
+                            oneshot,
+                            RuntimeBudgetPolicy {
+                                enforcement: RuntimeBudgetEnforcement::Enforce,
+                                ..Default::default()
+                            },
+                            Some(status),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -551,7 +643,7 @@ mod tests {
                         ..Default::default()
                     },
                 ] {
-                    accounting_case(cost_only, None, oneshot, policy).await?;
+                    accounting_case(cost_only, None, oneshot, policy, None).await?;
                 }
             }
         }
