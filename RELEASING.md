@@ -38,7 +38,9 @@ across parallel PRs.
    cargo fmt --all -- --check
    cargo check --workspace --all-targets
    cargo clippy --workspace --all-targets -- -D warnings
-   # Run only affected package/filtered tests locally; CI owns the full matrix.
+   # For behavior changes, use a focused test, for example:
+   cargo test -p harness-agents execute_response_reports_launch_model
+   # CI owns the full workspace test matrix.
    ```
 6. Commit (`-s` for DCO), open a PR titled `chore(release): vX.Y.Z`, wait for CI
    + review, then squash-merge.
