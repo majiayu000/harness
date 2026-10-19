@@ -32,6 +32,8 @@ review the upgrade notes below before updating a running server.
 
 ### Fixed
 
+- **security:** update rustls to 0.23.46, resolving RUSTSEC-2026-0346 through
+  RUSTSEC-2026-0349 without adding advisory exceptions.
 - **runtime:** detect issue dependency deadlocks, dead-letter expired activity
   completions, and preserve trusted completion evidence (#1887, #1901, #1952).
 - **recovery:** stop retrying unchanged readiness gates and preserve operator
