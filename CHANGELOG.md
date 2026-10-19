@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-20
+
+This release consolidates the workflow-runtime, agent integration, evaluation,
+and operator tooling changes since v0.6.34. It includes breaking API changes;
+review the upgrade notes below before updating a running server.
+
+### Added
+
+- **workflows:** declarative workflow definitions, intake bindings, candidate
+  selection and promotion, and durable replay transcripts (#1523–#1526, #1627,
+  #1629, #1630, #1688, #1710).
+- **agents:** OpenCode execution and per-turn ACP backends, repository-observed
+  agent stack inventory, and pinned agent-contract activities (#1810, #1882,
+  #2020, #2025, #2028).
+- **evaluation:** manifest-driven runs, report/diff commands, case-level
+  regression reports, attestations, and a supervised Docker task host with
+  retained candidates and native quality gates (#1918, #1923, #1930, #2061,
+  #2102, #2115). Live credential-backed runs and agent-upgrade trials have
+  explicit entry points; production baselines still require operator evidence.
+- **operations:** an operator monitor cockpit, agent usage views, runtime
+  trajectory spans, alerting, and budget enforcement controls (#1228, #1328,
+  #1497, #1500, #1592, #1893, #1903–#1906).
+
+### Fixed
+
+- **security:** update rustls to 0.23.46, resolving RUSTSEC-2026-0346 through
+  RUSTSEC-2026-0349 without adding advisory exceptions.
+- **runtime:** detect issue dependency deadlocks, dead-letter expired activity
+  completions, and preserve trusted completion evidence (#1887, #1901, #1952).
+- **recovery:** stop retrying unchanged readiness gates and preserve operator
+  cancellation when recovering issues (#2159, #2161).
+- **accounting:** stop enforced turns when stream usage accounting fails
+  instead of letting them continue without reliable usage evidence (#2160).
+
 ### Changed
 
 - **breaking:** removed the Harness-owned JSON-RPC methods `thread/start`,
@@ -41,6 +75,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `api_token` nor `HARNESS_API_TOKEN` is configured. Operators must set a token
   or explicitly opt in to tokenless local development with
   `allow_unauthenticated = true`.
+
+### Upgrade notes
+
+- Update clients and SDK integrations to the workflow-runtime HTTP endpoints
+  listed above before replacing a v0.6.x server.
+- Review the current configuration example and configure API authentication.
+  Fleet/server operation requires PostgreSQL 14+; one-shot CLI execution does
+  not require the server or PostgreSQL.
+- Distribution remains source-based through GitHub releases. This release
+  does not publish crates, SDK packages, or prebuilt binaries.
+- Open roadmap items, including live evaluation baselines, semantic retrieval,
+  and production spend verification, remain follow-up work rather than release
+  acceptance claims (#1768, #1769, #1770).
 
 ## [0.6.34] - 2026-05-30
 
@@ -77,4 +124,6 @@ workflow runtime (dispatcher / worker / reducer / validator / store / sweepers).
 - Added crate metadata (`description`, `license`, `repository`) and internal
   dependency versions across the workspace so the crates can be published.
 
+[Unreleased]: https://github.com/majiayu000/harness/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/majiayu000/harness/compare/v0.6.34...v0.7.0
 [0.6.34]: https://github.com/majiayu000/harness/releases/tag/v0.6.34

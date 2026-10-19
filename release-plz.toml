@@ -1,6 +1,6 @@
 [workspace]
 # Allow release-plz to open version-bump PRs for all workspace crates.
-# Version numbers are only updated via release-plz; feature/fix PRs must NOT
+# Version numbers are only updated in release PRs; feature/fix PRs must NOT
 # touch Cargo.toml version fields (prevents merge-conflict cascades).
 changelog_update = true
 

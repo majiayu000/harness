@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "harness-agents"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1308,7 +1308,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cli"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1339,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "harness-context"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "harness-core",
  "harness-exec",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "harness-core"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "harness-exec"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "harness-gc"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "harness-observe"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1432,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "harness-protocol"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "harness-rules"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "harness-sandbox"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "harness-core",
  "libc",
@@ -1476,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "harness-server"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1523,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "harness-skills"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "harness-workflow"
-version = "0.6.34"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3193,9 +3193,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",
