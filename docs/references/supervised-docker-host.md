@@ -180,6 +180,10 @@ configuration. A failed container launch can report missing measurements as
 incomplete evidence, while successful eval completion still requires them.
 The local `--auth-file` is not mounted for formal eval claims. Model activities
 need a control-plane credential grant; an empty grant cannot authenticate Codex.
+For `codex exec`, the provider grant must use `env_var: "CODEX_API_KEY"`.
+The runner passes the granted environment variables through unchanged and does
+not translate `OPENAI_API_KEY` or perform an interactive login. See the
+[server credential-file setup](../../evals/baselines/README.md).
 
 ## Native quality-gate consumption
 
