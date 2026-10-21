@@ -44,6 +44,20 @@ pub(super) fn suite_usage_exhaustion_reason(
     evidence: &[EvalCaseEvidence],
 ) -> Option<String> {
     let ceiling = ceiling?;
+    if let Some(limit) = ceiling.max_cost_usd_micros {
+        if let Some(case) = evidence.iter().find(|case| {
+            case.usage.is_empty()
+                || case
+                    .usage
+                    .iter()
+                    .any(|usage| usage.cost_usd_micros.is_none())
+        }) {
+            return Some(format!(
+                "suite usage ceiling cannot be evaluated: USD cost is unknown for case {}; max_cost_usd_micros={limit}",
+                case.case_id
+            ));
+        }
+    }
     let (total_tokens, cost_usd_micros) =
         evidence
             .iter()
@@ -156,5 +170,47 @@ mod tests {
         let evidence = vec![case_evidence(101, 0)];
 
         assert!(suite_usage_exhaustion_reason(Some(&ceiling), &evidence).is_some());
+    }
+
+    #[test]
+    fn unknown_cost_stops_next_dispatch_only_with_an_explicit_usd_ceiling() {
+        let usd_ceiling = EvalUsageCeiling {
+            max_total_tokens: None,
+            max_cost_usd_micros: Some(50),
+        };
+        let token_ceiling = EvalUsageCeiling {
+            max_total_tokens: Some(100),
+            max_cost_usd_micros: None,
+        };
+        let mut unknown = case_evidence(10, 0);
+        unknown.usage[0].cost_usd_micros = None;
+        unknown.usage[0].cost_confidence = Confidence::Unknown;
+        let mut partial = case_evidence(10, 10);
+        partial.usage.push(unknown.usage[0].clone());
+        let mut absent = case_evidence(0, 0);
+        absent.usage.clear();
+
+        for case in [unknown, partial, absent] {
+            let evidence = [case];
+            let reason = suite_usage_exhaustion_reason(Some(&usd_ceiling), &evidence)
+                .expect("unknown spend must stop the next case dispatch");
+            assert!(reason.contains("cost is unknown"), "{reason}");
+            assert!(reason.contains("case-1"), "{reason}");
+            assert!(suite_usage_exhaustion_reason(Some(&token_ceiling), &evidence).is_none());
+            assert!(suite_usage_exhaustion_reason(None, &evidence).is_none());
+        }
+    }
+
+    #[test]
+    fn usd_ceiling_allows_initial_dispatch_and_observed_zero_cost() {
+        let ceiling = EvalUsageCeiling {
+            max_total_tokens: None,
+            max_cost_usd_micros: Some(50),
+        };
+
+        assert!(suite_usage_exhaustion_reason(Some(&ceiling), &[]).is_none());
+        assert!(suite_usage_exhaustion_reason(Some(&ceiling), &[case_evidence(10, 0)]).is_none());
+        assert!(suite_usage_exhaustion_reason(Some(&ceiling), &[case_evidence(10, 49)]).is_none());
+        assert!(suite_usage_exhaustion_reason(Some(&ceiling), &[case_evidence(10, 50)]).is_some());
     }
 }
