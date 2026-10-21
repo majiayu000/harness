@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/majiayu000/harness/releases/tag/harness-skills-v0.7.1) - 2026-10-21
+
+### Added
+
+- *(skills)* add rebase-pr playbook skill
+- *(skills)* add freshness classifier and skill/stale endpoint ([#602](https://github.com/majiayu000/harness/pull/602))
+- add skill usage statistics tracking
+- add skill versioning with change tracking
+- skill persistence, trigger patterns, and auto-injection ([#220](https://github.com/majiayu000/harness/pull/220))
+- embed 10 built-in skills (Phase 3 VibeGuard absorption)
+- persist SkillStore creates/deletes to disk (issue #19) ([#24](https://github.com/majiayu000/harness/pull/24))
+- initial Harness platform — 10 Rust crates implementing OpenAI Harness Engineering
+
+### Fixed
+
+- keep skill, draft, and rule-fix joins inside their roots ([#2091](https://github.com/majiayu000/harness/pull/2091))
+- *(agents)* pipe prompt via stdin instead of positional CLI argument
+- replace TOCTOU get()+insert() with Entry API (RS-02)
+- restore User location for persist_dir skills to preserve shadowing behavior
+- assign System location to skills loaded from persist_dir
+- assign User location to skills loaded from persist_dir
+- address OS sandbox rework feedback ([#156](https://github.com/majiayu000/harness/pull/156))
+- use unreachable! in store.rs create() per Gemini review
+- eliminate unwrap/expect — dispatch() returns Result
+
+### Other
+
+- Refactor retrieval foundation for shadow comparison ([#1937](https://github.com/majiayu000/harness/pull/1937))
+- Improve lexical retrieval ranking ([#1924](https://github.com/majiayu000/harness/pull/1924))
+- Unify build warning policy and dev debug profile ([#1542](https://github.com/majiayu000/harness/pull/1542))
+- release v0.6.34
+- *(skills)* reuse helper in store fixtures ([#1310](https://github.com/majiayu000/harness/pull/1310))
+- *(release)* v0.6.34 ([#1196](https://github.com/majiayu000/harness/pull/1196))
+- use skill helper in store tests
+- *(harness-skills/store)* extract tests via #[path] ([#1093](https://github.com/majiayu000/harness/pull/1093))
+- apply cargo fmt formatting
+- checkpoint current harness workspace state
+- document startup sequence for with_persist_dir in SkillStore
+- add discover_reloads_persisted_skills_across_restart
+- prune dead modules and tighten harness-server test sandboxes
+- add unit tests for 8 crates (56 tests total)
+
 ## [0.6.34](https://github.com/majiayu000/harness/releases/tag/harness-skills-v0.6.34) - 2026-06-29
 
 ### Added
