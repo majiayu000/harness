@@ -34,9 +34,12 @@ For model activities, set `HARNESS_EVAL_CREDENTIAL_FILE` in the **server**
 environment to a private operator-owned JSON file. It contains the existing
 `credential_requirements` and `credential_grants` arrays; each grant declares
 its requirement ID, environment variable, issuer, scope, audience, expiration,
-and value. Use a short-lived provider credential such as `OPENAI_API_KEY`, with
-an audience and scope matching its declared requirement. Create this file with
-mode `0600` outside the checkout and remove it after the run. Never commit it,
+and value. For the supervised host's `codex exec` invocation, set both the
+requirement's and grant's `env_var` to `CODEX_API_KEY`, with matching audience
+and scope. The host passes grant environment variables through unchanged;
+`OPENAI_API_KEY` alone does not authenticate this invocation. See the official
+[Codex automation authentication instructions](https://learn.chatgpt.com/docs/non-interactive-mode#authenticate-in-automation).
+Create this file with mode `0600` outside the checkout and remove it after the run. Never commit it,
 upload it as an artifact, or put its contents in shell arguments.
 
 The control plane reads the file at the model-job claim boundary and reuses the
