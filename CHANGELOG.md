@@ -13,7 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **security:** update rustls-webpki to 0.103.16 and webpki-roots to 1.0.10,
   resolving RUSTSEC-2026-0382 and RUSTSEC-2026-0381 (distrusted emSign
-  intermediates) without adding advisory exceptions.
+  intermediates) without adding advisory exceptions (#2165).
+- **evaluation:** stop USD-capped eval runs at the next case boundary when a
+  prior case has missing or partial cost observations, instead of counting
+  unknown spend as zero; supervised Codex credential docs now use
+  `CODEX_API_KEY` (#2165).
 - **cli:** `harness version` and the version flags report the compiled binary
   version without loading project configuration, so they work outside a
   checkout and no longer report an unrelated Cargo project's version. The
