@@ -23,7 +23,7 @@ mod status;
 mod version;
 
 #[derive(Parser)]
-#[command(name = "harness", about = "Harness — AI Code Agent Platform")]
+#[command(name = "harness", version, about = "Harness — AI Code Agent Platform")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -174,6 +174,10 @@ pub enum Command {
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    if let Command::Version = cli.command {
+        return version::run();
+    }
+
     let (mut config, config_source) = config::load_config(cli.config.as_deref())?;
     // Apply env var overrides for all subcommands so that HARNESS_DATA_DIR,
     // HARNESS_PROJECT_ROOT, etc. are respected by gc, rule check, and skill

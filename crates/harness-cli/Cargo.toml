@@ -11,9 +11,9 @@ workspace = true
 
 [features]
 default = ["server"]
-# Links harness-server so `harness serve` can run in-process.
-# Omit it with `--no-default-features` to keep gc/rule/skill/plan/exec off the
-# HTTP/workflow/Postgres/OTel server stack.
+# Gates `serve` and `reconcile`, and links the optional harness-server dependency.
+# `--no-default-features` omits that dependency only. It does not remove the
+# workflow, Postgres, or OTel build dependencies declared below.
 server = ["dep:harness-server"]
 
 [[bin]]

@@ -54,27 +54,36 @@ The source is licensed under [MIT](LICENSE).
 
 ## Install
 
-Build from source (no prebuilt binaries or Homebrew formula yet):
+Build from source. Harness is distributed as source; [Releases](https://github.com/majiayu000/harness/releases)
+and [release instructions](RELEASING.md) define publication separately from CI.
+This install path does not use a published binary.
 
 ```bash
 git clone https://github.com/majiayu000/harness.git
 cd harness
 cargo build --release -p harness-cli
 # binary at ./target/release/harness
+./target/release/harness --version
+./target/release/harness version
 ```
 
-Requires Rust 1.88+. A fresh release build also requires Bun 1.3.14 (the version
-pinned in `.bun-version` and tested in CI) because it embeds the web dashboard; if `web/dist` is already built, the release build can
-reuse it without Bun. Postgres and an API authentication token are only needed
-for the server / fleet features below; a GitHub token is additionally needed
-for GitHub integration.
+`harness --version`, `harness -V`, and `harness version` print this binary's
+package version. They do not need a server config, database, or provider.
 
-On Linux, also install a C compiler/linker, `pkg-config`, and OpenSSL development
-headers/libraries for the default native-TLS dependencies. On Debian/Ubuntu,
-these are provided by `build-essential`, `pkg-config`, and `libssl-dev`.
-The OpenSSL command-line program alone does not provide the development headers.
+### Preflight
+
+Check these separately before the [one-task quickstart](#quickstart-run-one-agent-task):
+
+- **Source build.** Rust 1.88+. A fresh release build that embeds the web dashboard also needs Bun 1.3.14 (the version pinned in `.bun-version` and tested in CI). If `web/dist` is already built, the release build can reuse it without Bun. On Linux, install a C compiler/linker, `pkg-config`, and OpenSSL development headers for the default native-TLS dependencies (`build-essential`, `pkg-config`, and `libssl-dev` on Debian/Ubuntu). The OpenSSL command-line program alone does not provide those headers.
+- **Docker and images.** A working Docker daemon, then the quickstart's `scripts/verify-agent-container-image.sh` and `docker build -f docker/egress-proxy/Dockerfile -t harness-egress-proxy:quickstart docker/egress-proxy`.
+- **Provider credentials.** A provisioned credential for the selected provider, such as `ANTHROPIC_API_KEY` read into the environment. Do not store it in TOML.
+- **Provider hosts.** Keep `capability_profile = "standard"` and set `isolation.network_allowlist` to that provider's exact hosts. The Claude container example uses `api.anthropic.com`. Use `api.openai.com` for Codex only when that is the real API host. Sandbox mode does not override this list, and these steps do not relax permissions.
+- **Database.** One-shot `harness exec` does not need running PostgreSQL. Postgres 14+, an API token, and a GitHub token belong to the [fleet server](#level-up-the-fleet-control-plane) and GitHub integration.
+- **Cursor.** Use the supported route in [Cursor Agent](docs/cursor-agent.md). This page does not repeat that setup.
 
 ## Quickstart: run one agent task
+
+Complete the [preflight](#preflight) above. The commands below are the supported container path.
 
 Provider connectivity is an explicit prerequisite. The default
 `capability_profile = "standard"` is scoped, and an empty
