@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 license = "MIT"
 rust-version = "1.88"
@@ -28,18 +28,18 @@ warnings = "deny"
 
 [workspace.dependencies]
 # Internal crates (version required so they can be published to crates.io)
-harness-core = { path = "crates/harness-core", version = "0.7.0" }
-harness-protocol = { path = "crates/harness-protocol", version = "0.7.0" }
-harness-server = { path = "crates/harness-server", version = "0.7.0" }
-harness-agents = { path = "crates/harness-agents", version = "0.7.0" }
-harness-sandbox = { path = "crates/harness-sandbox", version = "0.7.0" }
-harness-gc = { path = "crates/harness-gc", version = "0.7.0" }
-harness-rules = { path = "crates/harness-rules", version = "0.7.0" }
-harness-skills = { path = "crates/harness-skills", version = "0.7.0" }
-harness-exec = { path = "crates/harness-exec", version = "0.7.0" }
-harness-context = { path = "crates/harness-context", version = "0.7.0" }
-harness-observe = { path = "crates/harness-observe", version = "0.7.0" }
-harness-workflow = { path = "crates/harness-workflow", version = "0.7.0" }
+harness-core = { path = "crates/harness-core", version = "0.7.1" }
+harness-protocol = { path = "crates/harness-protocol", version = "0.7.1" }
+harness-server = { path = "crates/harness-server", version = "0.7.1" }
+harness-agents = { path = "crates/harness-agents", version = "0.7.1" }
+harness-sandbox = { path = "crates/harness-sandbox", version = "0.7.1" }
+harness-gc = { path = "crates/harness-gc", version = "0.7.1" }
+harness-rules = { path = "crates/harness-rules", version = "0.7.1" }
+harness-skills = { path = "crates/harness-skills", version = "0.7.1" }
+harness-exec = { path = "crates/harness-exec", version = "0.7.1" }
+harness-context = { path = "crates/harness-context", version = "0.7.1" }
+harness-observe = { path = "crates/harness-observe", version = "0.7.1" }
+harness-workflow = { path = "crates/harness-workflow", version = "0.7.1" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

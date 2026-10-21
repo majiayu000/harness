@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-21
+
+### Fixed
+
+- **security:** update rustls-webpki to 0.103.16 and webpki-roots to 1.0.10,
+  resolving RUSTSEC-2026-0382 and RUSTSEC-2026-0381 (distrusted emSign
+  intermediates) without adding advisory exceptions (#2165).
+- **evaluation:** stop USD-capped eval runs at the next case boundary when a
+  prior case has missing or partial cost observations, instead of counting
+  unknown spend as zero; supervised Codex credential docs now use
+  `CODEX_API_KEY` (#2165).
+- **cli:** `harness version` and the version flags report the compiled binary
+  version without loading project configuration, so they work outside a
+  checkout and no longer report an unrelated Cargo project's version. The
+  README now lists first-run prerequisites, and the `--no-default-features`
+  dependency note is corrected (#2164).
+
 ## [0.7.0] - 2026-10-20
 
 This release consolidates the workflow-runtime, agent integration, evaluation,
@@ -124,6 +141,7 @@ workflow runtime (dispatcher / worker / reducer / validator / store / sweepers).
 - Added crate metadata (`description`, `license`, `repository`) and internal
   dependency versions across the workspace so the crates can be published.
 
-[Unreleased]: https://github.com/majiayu000/harness/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/majiayu000/harness/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/majiayu000/harness/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/majiayu000/harness/compare/v0.6.34...v0.7.0
 [0.6.34]: https://github.com/majiayu000/harness/releases/tag/v0.6.34
