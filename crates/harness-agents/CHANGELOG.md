@@ -7,6 +7,183 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/majiayu000/harness/releases/tag/harness-agents-v0.7.1) - 2026-10-21
+
+### Added
+
+- *(runtime)* enforce pinned agent contract attempts ([#2025](https://github.com/majiayu000/harness/pull/2025))
+- *(agents)* add OpenCode runtime over ACP and exec backends ([#1882](https://github.com/majiayu000/harness/pull/1882))
+- *(agents)* fingerprint runtime and mcp stack facts ([#1859](https://github.com/majiayu000/harness/pull/1859))
+- preserve NAP-Lite compressor usage ([#1590](https://github.com/majiayu000/harness/pull/1590))
+- complete workflow runtime recovery operator flow ([#1588](https://github.com/majiayu000/harness/pull/1588))
+- NAP-Lite model client and plan->implement seam (GH1574 T005) ([#1578](https://github.com/majiayu000/harness/pull/1578))
+- *(agents)* add scoped token contract
+- *(agents)* add container spawn contract
+- *(observe)* emit OTel runtime trajectory spans ([#1500](https://github.com/majiayu000/harness/pull/1500))
+- add agent run identity ([#1427](https://github.com/majiayu000/harness/pull/1427))
+- *(workflow)* central WORKFLOW.md config + drive Codex turns through codex exec ([#1222](https://github.com/majiayu000/harness/pull/1222))
+- *(observe)* wire token usage overview KPIs
+- *(security)* CapabilityToken for parallel_dispatch write isolation ([#826](https://github.com/majiayu000/harness/pull/826))
+- *(671)* model tiering, quota circuit-breaker, and release-plz CI ([#778](https://github.com/majiayu000/harness/pull/778))
+- *(observe)* add LLM-specific metrics (cost/turns/linter/latency) ([#738](https://github.com/majiayu000/harness/pull/738))
+- *(agents)* add model and reasoning effort to Codex agent
+- *(agents)* enable per-phase model selection and effort control
+- *(protocol)* add steer/approval routing infrastructure for agent adapters
+- restore hard tool enforcement via --allowedTools at CLI boundary
+- true SSE streaming for task execution via GET /tasks/{id}/stream
+- integrate ReasoningBudget per-phase model selection
+- wire multi-agent dispatch and register anthropic-api adapter ([#168](https://github.com/majiayu000/harness/pull/168))
+- *(agents)* stream execute_stream deltas in realtime
+- add AdapterRegistry + apply Gemini review feedback ([#121](https://github.com/majiayu000/harness/pull/121))
+- add CodexAdapter App Server JSON-RPC protocol ([#120](https://github.com/majiayu000/harness/pull/120))
+- add ClaudeAdapter stream-json parser ([#119](https://github.com/majiayu000/harness/pull/119))
+- PR review loop + agent observability fixes
+- initial Harness platform — 10 Rust crates implementing OpenAI Harness Engineering
+
+### Fixed
+
+- restore Rust 1.99 checks and Rust 1.88 builds ([#2126](https://github.com/majiayu000/harness/pull/2126))
+- *(agents)* bound Codex app-server protocol frame reads ([#2106](https://github.com/majiayu000/harness/pull/2106))
+- *(agents)* scope Codex adapter cancel and stop deadlines ([#2105](https://github.com/majiayu000/harness/pull/2105))
+- *(agents)* propagate Codex adapter cleanup failures ([#2100](https://github.com/majiayu000/harness/pull/2100))
+- *(agents)* report selected model in Codex execute and review responses ([#2094](https://github.com/majiayu000/harness/pull/2094))
+- *(agents)* treat OpenCode JSON-RPC errors as failures ([#2090](https://github.com/majiayu000/harness/pull/2090))
+- *(agents)* terminate Codex prompts with -- ([#2089](https://github.com/majiayu000/harness/pull/2089))
+- *(agents)* point OpenCode ACP at child workspace and honor request sandbox ([#2078](https://github.com/majiayu000/harness/pull/2078))
+- *(agents)* preserve Codex cached token usage ([#2042](https://github.com/majiayu000/harness/pull/2042))
+- *(runtime)* harden real workflow execution ([#2033](https://github.com/majiayu000/harness/pull/2033))
+- *(runtime)* complete agent contract production dogfood ([#2031](https://github.com/majiayu000/harness/pull/2031))
+- *(agents)* honor explicit Codex completion ([#2018](https://github.com/majiayu000/harness/pull/2018))
+- *(agents)* stop waiting after codex exits ([#2021](https://github.com/majiayu000/harness/pull/2021))
+- *(server)* enforce repository single-writer leases ([#2005](https://github.com/majiayu000/harness/pull/2005))
+- *(runtime)* keep agent diagnostics non-terminal ([#1933](https://github.com/majiayu000/harness/pull/1933))
+- *(agents)* consolidate agent spawn supervision (GH-1785) ([#1849](https://github.com/majiayu000/harness/pull/1849))
+- *(agents)* keep scoped GitHub tokens out of Docker argv (GH-1831) ([#1839](https://github.com/majiayu000/harness/pull/1839))
+- *(agents)* route codex review through the agent spawn contract (GH-1785) ([#1814](https://github.com/majiayu000/harness/pull/1814))
+- *(GH1789)* bound non-streaming agent output and enforce an idle timeout ([#1822](https://github.com/majiayu000/harness/pull/1822))
+- *(GH1788)* strip nested-session markers from the effective child env ([#1809](https://github.com/majiayu000/harness/pull/1809))
+- *(GH1783)* honor Claude result is_error and surface tool_use blocks ([#1807](https://github.com/majiayu000/harness/pull/1807))
+- *(GH1787)* make ManagedChild::drop non-blocking on the async runtime ([#1808](https://github.com/majiayu000/harness/pull/1808))
+- *(agents)* apply sandbox spec and align CLI args in ClaudeAdapter ([#1726](https://github.com/majiayu000/harness/pull/1726))
+- *(agents)* anchor cleanup tests after startup ([#1643](https://github.com/majiayu000/harness/pull/1643))
+- *(compression)* seed NAP sampling per task ([#1599](https://github.com/majiayu000/harness/pull/1599))
+- *(agents)* classify missing workspace spawn failures
+- *(runtime)* stop retrying Codex quota failures ([#1285](https://github.com/majiayu000/harness/pull/1285))
+- *(runtime)* pass Codex approval policy via config ([#1230](https://github.com/majiayu000/harness/pull/1230))
+- *(runtime)* honor codex exec transport ([#1172](https://github.com/majiayu000/harness/pull/1172))
+- *(review)* make hosted bots advisory by default
+- *(codex)* consume structured Codex events ([#1038](https://github.com/majiayu000/harness/pull/1038))
+- *(pr-detection)* only match PRs that claim to close the issue ([#799](https://github.com/majiayu000/harness/pull/799)) ([#801](https://github.com/majiayu000/harness/pull/801))
+- *(agents)* increase stream idle timeout from 30min to 60min ([#773](https://github.com/majiayu000/harness/pull/773))
+- *(security)* add prompt injection barrier and field truncation for auto-fix tasks ([#616](https://github.com/majiayu000/harness/pull/616))
+- *(agents)* use process groups to prevent orphaned grandchild processes
+- *(agents)* place prompt immediately after -p flag in Claude CLI invocation
+- *(agents)* pass prompt as positional arg to claude CLI, not via stdin
+- remove --no-session-persistence to restore token usage tracking
+- *(agents)* log warn when child.kill() fails in codex_adapter
+- *(agents)* allow PATH-resolved cli_path in probe_no_session_persistence
+- *(agents)* address PR #610 review: path validation, log level, dead UI warning
+- *(agents)* add 5 s timeout to probe_no_session_persistence; fix token-usage dir error handling
+- *(agents)* strip CLAUDE env vars before probing --no-session-persistence; warn on missing session dir
+- *(agents)* probe CLI for --no-session-persistence support instead of unconditional flag
+- *(agents)* add --no-session-persistence for background agent spawns
+- *(agents)* pipe prompt via stdin instead of positional CLI argument
+- align codex tool semantics and planning-gate exclusions
+- address three reviewer issues in planning gate and capability profiles
+- use bypassPermissions (camelCase) for --permission-mode flag
+- distinguish deny-all from full-access and add bypass-permissions for restricted mode
+- use char-safe truncation for stderr lines
+- detect quota exhaustion and fail fast instead of looping
+- use char-safe slicing for stdout_tail to prevent UTF-8 panic
+- improve agent crash diagnostics with stdout capture and startup logging
+- suppress false WARN for code-content lines in Codex stderr
+- *(streaming)* fix two stream_timeout_secs correctness issues found in PR review
+- *(streaming)* add configurable stream timeout for zombie connections
+- eliminate TOCTOU in HOME-based path validation ([#489](https://github.com/majiayu000/harness/pull/489)) ([#503](https://github.com/majiayu000/harness/pull/503))
+- remove --allowedTools flag that crashes Claude CLI 2.1.70 ([#483](https://github.com/majiayu000/harness/pull/483)) ([#493](https://github.com/majiayu000/harness/pull/493))
+- set CARGO_TARGET_DIR per workspace to prevent build lock contention
+- *(test)* reap child process in channel-closed test to prevent zombie leaks
+- prevent agent process hangs by closing stdin and enabling kill_on_drop
+- log mpsc send errors instead of silently ignoring them
+- codex CLI 0.114.0 sandbox flag migration and config-file project registration
+- make timeout stream test CI-resilient with continuous stdout output
+- make codex stream cancel test CI-resilient
+- add kill_on_drop and centralize strip_claude_env across all agents
+- align test timeouts and sandbox default assertions
+- add env_remove for CLAUDECODE/CLAUDE_CODE_ENTRYPOINT to CodexAgent ([#190](https://github.com/majiayu000/harness/pull/190))
+- remove all Claude nesting detection env vars to prevent SIGTRAP
+- add MessageDelta match arm and apply cargo fmt
+- address OS sandbox rework feedback ([#156](https://github.com/majiayu000/harness/pull/156))
+- codex cloud execution container isolation ([#150](https://github.com/majiayu000/harness/pull/150))
+- log anthropic stream errors + make review bot command configurable ([#123](https://github.com/majiayu000/harness/pull/123))
+- make anthropic max_tokens config-driven ([#116](https://github.com/majiayu000/harness/pull/116))
+- surface mpsc send errors in claude/codex streams (FUT-27) ([#69](https://github.com/majiayu000/harness/pull/69))
+- address Gemini review — registry Arc, input validation, functional style
+- remove library eprintln!, generalize run_review_loop signature
+- eliminate unwrap/expect — dispatch() returns Result
+- enable agentic mode in ClaudeCodeAgent
+
+### Other
+
+- integrate runtime audit fixes for combined acceptance ([#2157](https://github.com/majiayu000/harness/pull/2157))
+- Restore Console v2 dashboard design with live Harness data ([#2111](https://github.com/majiayu000/harness/pull/2111))
+- *(agents)* cover remaining Codex cancel and full-receiver gaps ([#2107](https://github.com/majiayu000/harness/pull/2107))
+- Preserve Cursor runtime and review baseline ([#2057](https://github.com/majiayu000/harness/pull/2057))
+- *(core)* gate database and move parsers ([#1927](https://github.com/majiayu000/harness/pull/1927))
+- Keep eval runtime environments secretless ([#1926](https://github.com/majiayu000/harness/pull/1926))
+- *(agents)* unify agent backend surface ([#1929](https://github.com/majiayu000/harness/pull/1929))
+- *(stack)* defer unused fingerprint pipeline ([#1913](https://github.com/majiayu000/harness/pull/1913))
+- Enforce scoped agent permissions and first-party egress ([#1909](https://github.com/majiayu000/harness/pull/1909))
+- Fix structured ActivityResult handling ([#1858](https://github.com/majiayu000/harness/pull/1858))
+- *(config)* consolidate env config resolution ([#1855](https://github.com/majiayu000/harness/pull/1855))
+- *(agents)* remove the unreachable ClaudeAdapter turn path (GH-1786) ([#1841](https://github.com/majiayu000/harness/pull/1841))
+- *(agents)* one registry builder for every entry point (GH-1791) ([#1833](https://github.com/majiayu000/harness/pull/1833))
+- *(server)* remove legacy thread lifecycle RPCs ([#1703](https://github.com/majiayu000/harness/pull/1703))
+- *(agents)* split Claude lifecycle tests ([#1642](https://github.com/majiayu000/harness/pull/1642))
+- Wire PromptParts layers into Claude caching ([#1561](https://github.com/majiayu000/harness/pull/1561))
+- Unify build warning policy and dev debug profile ([#1542](https://github.com/majiayu000/harness/pull/1542))
+- release v0.6.34
+- Add Claude provider backpressure ([#1336](https://github.com/majiayu000/harness/pull/1336))
+- Fix workspace pool leasing for concurrent tasks ([#1332](https://github.com/majiayu000/harness/pull/1332))
+- Implement local Codex CLI review provider ([#1320](https://github.com/majiayu000/harness/pull/1320))
+- *(release)* v0.6.34 ([#1196](https://github.com/majiayu000/harness/pull/1196))
+- *(agents)* cover codex turn EOF failure ([#1140](https://github.com/majiayu000/harness/pull/1140))
+- Harden Codex app-server turn adapters
+- Harden workflow runtime under Codex defaults
+- *(harness-agents/codex)* extract tests via #[path] ([#1092](https://github.com/majiayu000/harness/pull/1092))
+- Fix workflow runtime workspace and Codex recovery ([#1062](https://github.com/majiayu000/harness/pull/1062))
+- Add workflow runtime activity result contracts ([#1047](https://github.com/majiayu000/harness/pull/1047))
+- Add structured turn telemetry to task and event surfaces ([#915](https://github.com/majiayu000/harness/pull/915))
+- Clean runtime adapter strategy and docs links ([#1019](https://github.com/majiayu000/harness/pull/1019))
+- Stabilize GitHub auth and workspace defaults ([#1010](https://github.com/majiayu000/harness/pull/1010))
+- Improve Codex runtime diagnostics and intake parsing ([#1004](https://github.com/majiayu000/harness/pull/1004))
+- Make issue workflows the orchestration authority ([#913](https://github.com/majiayu000/harness/pull/913))
+- Prevent expired capability tokens from reaching Anthropic agent calls
+- split oversized files into modules (closes #625) ([#823](https://github.com/majiayu000/harness/pull/823))
+- split build_app_state into domain-specific builders ([#685](https://github.com/majiayu000/harness/pull/685)) ([#746](https://github.com/majiayu000/harness/pull/746))
+- unify AgentRegistry and AdapterRegistry into descriptor registry ([#687](https://github.com/majiayu000/harness/pull/687)) ([#743](https://github.com/majiayu000/harness/pull/743))
+- Stabilize Codex stream lifecycle tests under scheduler jitter
+- *(harness-agents)* stabilize stream drop cleanup checks
+- checkpoint current harness workspace state
+- Decouple agent routing and remove silent degradation ([#561](https://github.com/majiayu000/harness/pull/561))
+- Merge pull request #508 from majiayu000/feat/stream-timeout-332
+- replace env_vars loop with cmd.envs() in claude and codex agents
+- Merge pull request #423 from majiayu000/feat/issue-193-db-serializable-trait
+- fix flaky claude timeout test to mirror robust codex pattern
+- Merge pull request #409 from majiayu000/feat/issue-168-dispatch-coverage
+- Merge pull request #407 from majiayu000/feat/issue-166-fix-scoped-env-var-multi-key
+- *(streaming)* strengthen assertions to catch output reordering and extra deltas
+- *(streaming)* add direct unit tests for stream_child_output helper
+- *(codex)* add focused tests for cloud setup cache and secret isolation ([#396](https://github.com/majiayu000/harness/pull/396))
+- Merge pull request #361 from majiayu000/feat/fix-silent-error-discards
+- Merge pull request #350 from majiayu000/feat/log-mpsc-send-errors
+- increase timeout test sleep duration for CI reliability
+- Merge pull request #216 from majiayu000/feat/filter-agent-stderr
+- Merge pull request #189 from majiayu000/feat/codex-remove-claude-env-vars
+- Merge pull request #182 from majiayu000/feat/wire-completion-callback
+- *(agents)* extract shared stream_child_output helper
+- prune dead modules and tighten harness-server test sandboxes
+
 ## [0.6.34](https://github.com/majiayu000/harness/releases/tag/harness-agents-v0.6.34) - 2026-06-29
 
 ### Added
