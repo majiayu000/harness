@@ -11,6 +11,12 @@
 //! Anything that varies per entry point is a parameter here. Everything else
 //! is applied identically by construction.
 
+/// The agent-runtime backend lives next to the builder that registers it; it is
+/// declared here so `lib.rs` stays under the file-size limit.
+#[cfg(feature = "agent-runtime")]
+#[path = "agent_runtime_backend.rs"]
+pub mod agent_runtime_backend;
+
 use crate::claude::{ClaudeCodeAgent, ANTHROPIC_API_KEY_ENV};
 use crate::codex::CodexAgent;
 use crate::codex_adapter::CodexAdapter;
@@ -188,6 +194,8 @@ pub fn registry_from_config(
         ),
     );
 
+    register_runtime_backend(&mut registry, config, sandbox_mode)?;
+
     if let Ok(api_key) = harness_core::config::process_env::var(ANTHROPIC_API_KEY_ENV) {
         registry.register(
             "anthropic-api",
@@ -199,6 +207,50 @@ pub fn registry_from_config(
     }
 
     Ok(registry)
+}
+
+/// Replaces the listed agents with the agent-runtime backend. The native
+/// backend registered above is dropped for those names only, and their turn
+/// backends are cleared so every path (execute, stream, turn) goes through
+/// agent-runtime. An empty list changes nothing.
+#[cfg(feature = "agent-runtime")]
+fn register_runtime_backend(
+    registry: &mut AgentRegistry,
+    config: &AgentsConfig,
+    sandbox_mode: SandboxMode,
+) -> anyhow::Result<()> {
+    let backend_config = &config.runtime_backend;
+    if backend_config.enabled_for.is_empty() {
+        return Ok(());
+    }
+    let runtime = agent_runtime_backend::runtime_from_config(backend_config)?;
+    for name in &backend_config.enabled_for {
+        registry.replace(
+            name,
+            Arc::new(agent_runtime_backend::AgentRuntimeBackend::new(
+                name,
+                backend_config,
+                sandbox_mode,
+                runtime.clone(),
+            )),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "agent-runtime"))]
+fn register_runtime_backend(
+    _registry: &mut AgentRegistry,
+    config: &AgentsConfig,
+    _sandbox_mode: SandboxMode,
+) -> anyhow::Result<()> {
+    if config.runtime_backend.enabled_for.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "[agents.runtime_backend] enabled_for = {:?}, but this harness was built without the `agent-runtime` feature",
+        config.runtime_backend.enabled_for
+    )
 }
 
 #[cfg(test)]

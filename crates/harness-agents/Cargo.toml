@@ -9,7 +9,14 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Opt-in backend through the agent-runtime library. Path dependency on a local
+# checkout during the trial; switch to a git dependency before pushing.
+agent-runtime = ["dep:agent-runtime"]
+
 [dependencies]
+agent-runtime = { path = "../../../runtime/crates/agent-runtime", optional = true }
 harness-core = { workspace = true }
 harness-observe = { workspace = true }
 harness-sandbox = { workspace = true }

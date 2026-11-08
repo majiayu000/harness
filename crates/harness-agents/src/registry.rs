@@ -61,6 +61,23 @@ impl AgentRegistry {
         );
     }
 
+    /// Register `backend` under `name` with no control or turn backend, so it
+    /// owns every execution path for that name. Used to swap a native adapter
+    /// for another backend by configuration.
+    pub fn replace(&mut self, name: &str, backend: Arc<dyn AgentBackend>) {
+        if !self.entries.contains_key(name) {
+            self.registration_order.push(name.to_string());
+        }
+        self.entries.insert(
+            name.to_string(),
+            AgentDescriptor {
+                backend,
+                control_backend: None,
+                turn_backend_factory: None,
+            },
+        );
+    }
+
     /// Attach a control backend to an already-registered agent.
     ///
     /// Returns `Err(HarnessError::AgentNotFound)` if the agent name is unknown,

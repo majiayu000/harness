@@ -43,6 +43,32 @@ pub struct AgentsConfig {
         deserialize_with = "deserialize_stream_timeout_secs"
     )]
     pub stream_timeout_secs: Option<u64>,
+    /// Route selected agents through agent-runtime instead of the native
+    /// adapters. Empty `enabled_for` (the default) keeps every native adapter.
+    #[serde(default)]
+    pub runtime_backend: AgentRuntimeBackendConfig,
+}
+
+/// Opt-in backend that drives agents through the agent-runtime library.
+/// The native adapters stay registered for every agent not listed here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentRuntimeBackendConfig {
+    /// Harness agent names to serve through agent-runtime, e.g. `["claude", "codex", "opencode"]`.
+    pub enabled_for: Vec<String>,
+    /// agent-runtime agent id per harness agent name. Defaults to the same name.
+    pub agent_ids: std::collections::BTreeMap<String, String>,
+    /// agent-runtime channel per harness agent name (`--via`). Defaults to the
+    /// first implemented and installed channel.
+    pub channels: std::collections::BTreeMap<String, String>,
+    /// Native permission mode per harness agent name. Defaults per agent are
+    /// chosen by the backend from the sandbox mode.
+    pub modes: std::collections::BTreeMap<String, String>,
+    /// Extra agent-runtime override files, after its default config directory.
+    pub config_files: Vec<PathBuf>,
+    /// JSONL trial log, one line per call. Defaults to
+    /// `<data dir>/harness/agent-runtime-trial.jsonl`.
+    pub trial_log: Option<PathBuf>,
 }
 
 fn default_stream_timeout_secs() -> Option<u64> {
@@ -96,6 +122,7 @@ impl Default for AgentsConfig {
             capability_profile: CapabilityProfile::default(),
             allowed_tools: None,
             stream_timeout_secs: default_stream_timeout_secs(),
+            runtime_backend: AgentRuntimeBackendConfig::default(),
         }
     }
 }
