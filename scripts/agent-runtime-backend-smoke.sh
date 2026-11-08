@@ -6,6 +6,8 @@
 # the logged-in CLIs with small models; each run is one short task.
 set -u
 : "${HARNESS_BIN:?}" "${WORK:?}"
+[ -x "$HARNESS_BIN" ] || { echo "HARNESS_BIN not executable: $HARNESS_BIN (cargo build -p harness-cli --features agent-runtime)" >&2; exit 2; }
+failed=0
 OC_BIN="${OC_BIN:-$HOME/.opencode/bin/opencode}"
 OC_HOME="${OC_HOME:-$WORK/opencode-home}"
 mkdir -p "$WORK" "$OC_HOME"
@@ -34,11 +36,13 @@ for agent in "$@"; do
   echo "[$agent]"
   model="$(model_for "$agent")"
   start=$(date +%s)
-  perl -e 'alarm 300; exec @ARGV' "$HARNESS_BIN" --config "$WORK/harness.toml" exec --project "$project" --agent "$agent" ${model:+--model "$model"} \
+  perl -e 'alarm 300; exec @ARGV or die "exec: $!\n"' "$HARNESS_BIN" --config "$WORK/harness.toml" exec --project "$project" --agent "$agent" ${model:+--model "$model"} \
     "Create a file named hello.txt in the current directory containing exactly the text OK. Use your file writing tool. Then reply DONE." \
     > "$WORK/$agent.out" 2> "$WORK/$agent.err"
   code=$?
   echo "  exit=$code secs=$(( $(date +%s) - start )) output=$(tr '\n' ' ' < "$WORK/$agent.out" | cut -c1-120)"
   echo "  hello.txt: $(cat "$project/hello.txt" 2>/dev/null || echo MISSING)"
+  { [ "$code" -eq 0 ] && [ "$(cat "$project/hello.txt" 2>/dev/null)" = "OK" ]; } || failed=1
   grep -v 'preserving unmanaged' "$WORK/$agent.err" | grep -iE 'error|agent-runtime' | tail -2 | cut -c1-300 | sed 's/^/  stderr: /'
 done
+exit $failed
