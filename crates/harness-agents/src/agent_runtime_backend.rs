@@ -302,6 +302,9 @@ fn describe(failure: &FailureClass) -> String {
         FailureClass::ProcessExit { code, signal } => {
             format!("process exit code={code:?} signal={signal:?}")
         }
+        FailureClass::Stalled { idle_ms, detail } => {
+            format!("stalled: no event for {}s ({detail})", idle_ms / 1000)
+        }
         FailureClass::Other { detail } => detail.clone(),
     }
 }
