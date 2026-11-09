@@ -11,12 +11,13 @@ workspace = true
 
 [features]
 default = []
-# Opt-in backend through the agent-runtime library. Path dependency on a local
-# checkout during the trial; switch to a git dependency before pushing.
+# Opt-in backend through the agent-runtime library (trial). agent-runtime is a
+# private repository: resolving this workspace needs read access to it, even
+# with the feature off, so this stays on its branch until that changes.
 agent-runtime = ["dep:agent-runtime"]
 
 [dependencies]
-agent-runtime = { path = "../../../runtime/crates/agent-runtime", optional = true }
+agent-runtime = { git = "https://github.com/majiayu000/agent-runtime.git", rev = "3d55a2292d184fff7bb152c238c944168e9a6ea8", optional = true }
 harness-core = { workspace = true }
 harness-observe = { workspace = true }
 harness-sandbox = { workspace = true }

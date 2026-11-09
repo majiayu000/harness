@@ -57,6 +57,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-driver-acp",
@@ -84,6 +85,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-core"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "async-trait",
  "serde",
@@ -95,6 +97,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-driver-acp"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-client-protocol",
  "agent-runtime-core",
@@ -109,6 +112,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-driver-claude"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-transport",
@@ -120,6 +124,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-driver-cloud"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-transport",
@@ -132,6 +137,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-driver-codex"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-transport",
@@ -143,6 +149,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-driver-declared"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-transport",
@@ -154,6 +161,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-driver-oneshot"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-transport",
@@ -165,6 +173,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-driver-opencode"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-supervisor",
@@ -179,6 +188,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-driver-pi"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-transport",
@@ -190,6 +200,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-driver-pty"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-transport",
@@ -202,6 +213,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-installer"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "futures",
  "libc",
@@ -216,6 +228,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-observe"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-driver-oneshot",
@@ -228,6 +241,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-registry"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "serde",
@@ -238,6 +252,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-replay"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-transport",
@@ -251,6 +266,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-supervisor"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "libc",
@@ -261,6 +277,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-transport"
 version = "0.1.0"
+source = "git+https://github.com/majiayu000/agent-runtime.git?rev=3d55a2292d184fff7bb152c238c944168e9a6ea8#3d55a2292d184fff7bb152c238c944168e9a6ea8"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-supervisor",

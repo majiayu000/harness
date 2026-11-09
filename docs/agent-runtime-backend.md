@@ -1,6 +1,6 @@
 # agent-runtime backend (trial)
 
-Branch `agent-runtime-backend`, local only. Trial 2026-11-08 → 2026-11-22.
+Branch `agent-runtime-backend`, pushed but not merged. Trial 2026-11-08 → 2026-11-22.
 
 An opt-in backend that runs Claude, Codex and OpenCode through the
 [agent-runtime](https://github.com/majiayu000/agent-runtime) library instead of
@@ -10,9 +10,11 @@ list.
 
 ## Turn it on
 
-Build with the feature (the dependency is a path to a local agent-runtime
-checkout at `../runtime` during the trial; switch it to a git dependency before
-pushing):
+Build with the feature. The dependency is agent-runtime pinned by git revision.
+agent-runtime is a private repository, so resolving this branch needs read
+access to it even with the feature off; that is why the branch is not merged.
+For local changes to agent-runtime, override it with
+`[patch."https://github.com/majiayu000/agent-runtime.git"]` pointing at a checkout.
 
 ```bash
 cargo build -p harness-cli --features agent-runtime
