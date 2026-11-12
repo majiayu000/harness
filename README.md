@@ -47,16 +47,33 @@ installation and operation paths.
 | Inspect execution evidence | [OpenTelemetry trajectory quickstart](docs/otel-trajectory-quickstart.md) | Configure the documented telemetry path; a submission alone does not prove completion. |
 
 Use [Issues](https://github.com/majiayu000/harness/issues) for reproducible failures
-with the source revision, runtime, selected sandbox, and redacted evidence. This
-repository builds from source; [Releases](https://github.com/majiayu000/harness/releases)
-and [release instructions](RELEASING.md) define publication separately from CI.
+with the source revision, runtime, selected sandbox, and redacted evidence.
+[Releases](https://github.com/majiayu000/harness/releases) carry prebuilt binaries;
+[release instructions](RELEASING.md) define publication separately from CI.
 The source is licensed under [MIT](LICENSE).
 
 ## Install
 
-Build from source. Harness is distributed as source; [Releases](https://github.com/majiayu000/harness/releases)
-and [release instructions](RELEASING.md) define publication separately from CI.
-This install path does not use a published binary.
+### Prebuilt binary
+
+Pick your target: `aarch64-apple-darwin` (Apple silicon), `x86_64-apple-darwin`,
+`x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`. Then download,
+verify, and run:
+
+```bash
+T=aarch64-apple-darwin
+curl -fsSL --remote-name-all https://github.com/majiayu000/harness/releases/latest/download/harness-$T.tar.gz{,.sha256}
+shasum -a 256 -c harness-$T.tar.gz.sha256 && tar xzf harness-$T.tar.gz && ./harness-$T/harness --version
+```
+
+Move `harness-$T/harness` onto your `PATH` to keep it. Each release also has a
+combined `SHA256SUMS`. Linux binaries need glibc 2.35+ and OpenSSL 3
+(Ubuntu 22.04+, Debian 12+). The commands below use `./target/release/harness`;
+substitute your installed path.
+
+### Build from source
+
+Use this path to build a specific revision or an unsupported platform.
 
 ```bash
 git clone https://github.com/majiayu000/harness.git
