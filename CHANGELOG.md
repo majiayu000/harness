@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-11-13
+
+### Added
+
+- **release:** GitHub releases now carry prebuilt `harness` binaries for macOS
+  (arm64, x64) and Linux (x64, arm64) with per-archive `.sha256` files and a
+  combined `SHA256SUMS`, built by `release-binaries.yml` when a release is
+  published. The README gains a three-command prebuilt install path (#2172).
+
+### Fixed
+
+- **security:** update openssl 0.10.82 / openssl-sys 0.9.118, tokio 1.54.1 and
+  rustix 1.1.6, resolving RUSTSEC-2026-0463, RUSTSEC-2026-0473 through
+  RUSTSEC-2026-0479, RUSTSEC-2026-0386 and RUSTSEC-2026-0486.
+  RUSTSEC-2026-0459 (bundled SQLite in libsqlite3-sys) has no upgrade path
+  through sqlx yet and is recorded in `.cargo/audit.toml` with its removal
+  condition (#2173).
+
 ## [0.7.1] - 2026-10-21
 
 ### Fixed
