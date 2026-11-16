@@ -26,6 +26,17 @@ class ReleaseContractTests(unittest.TestCase):
                 self.assertEqual([tag for tag in tags if tag < FIRST_PACKAGEABLE_TAG], [])
                 self.assertIn(FIRST_PACKAGEABLE_TAG, tags)
 
+    def test_changelog_links_cover_every_released_version(self):
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        versions = re.findall(r"^## \[(\d+\.\d+\.\d+)\]", changelog, re.MULTILINE)
+        links = dict(re.findall(r"^\[([^\]]+)\]: (\S+)$", changelog, re.MULTILINE))
+        repo = "https://github.com/majiayu000/harness"
+        self.assertEqual(links.get("Unreleased"), f"{repo}/compare/v{versions[0]}...HEAD")
+        for version, previous in zip(versions, versions[1:]):
+            with self.subTest(version):
+                self.assertEqual(links.get(version), f"{repo}/compare/v{previous}...v{version}")
+        self.assertEqual(links.get(versions[-1]), f"{repo}/releases/tag/v{versions[-1]}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -32,7 +32,9 @@ across parallel PRs.
    `version = "X.Y.Z"` on each internal entry under `[workspace.dependencies]`
    (they must match the workspace version).
 4. Update `CHANGELOG.md`: add a new `## [X.Y.Z] - YYYY-MM-DD` section grouped by
-   `Added` / `Changed` / `Fixed`, and reference the relevant PRs/issues.
+   `Added` / `Changed` / `Fixed`, and reference the relevant PRs/issues. At the
+   end of the file, point `[Unreleased]` at `vX.Y.Z...HEAD` and add the
+   `[X.Y.Z]` compare link.
 5. Verify locally:
    ```bash
    cargo fmt --all -- --check

@@ -159,7 +159,8 @@ workflow runtime (dispatcher / worker / reducer / validator / store / sweepers).
 - Added crate metadata (`description`, `license`, `repository`) and internal
   dependency versions across the workspace so the crates can be published.
 
-[Unreleased]: https://github.com/majiayu000/harness/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/majiayu000/harness/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/majiayu000/harness/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/majiayu000/harness/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/majiayu000/harness/compare/v0.6.34...v0.7.0
 [0.6.34]: https://github.com/majiayu000/harness/releases/tag/v0.6.34
