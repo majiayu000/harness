@@ -59,7 +59,9 @@ Publishing the release triggers `.github/workflows/release-binaries.yml`, which
 builds `harness` for macOS (arm64, x64) and Linux (x64, arm64) and uploads
 `harness-<target>.tar.gz`, `harness-<target>.tar.gz.sha256`, and `SHA256SUMS`
 to it. To backfill an existing release, run that workflow manually with the tag:
-`gh workflow run release-binaries.yml -f tag=vX.Y.Z`.
+`gh workflow run release-binaries.yml -f tag=vX.Y.Z`. Backfill works for v0.7.2
+and later: the workflow packages with the `scripts/package-release.sh` from the
+tag it builds, and earlier tags do not contain that script.
 
 Release tags do not publish to package registries. SDK publication is separate
 work and is not implied by a GitHub release.

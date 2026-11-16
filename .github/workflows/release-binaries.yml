@@ -2,14 +2,16 @@ name: Release Binaries
 
 # Attach prebuilt `harness` binaries and SHA256 checksums to a GitHub release.
 # Runs when a release for a vX.Y.Z tag is published (see RELEASING.md), or
-# manually to backfill an existing release.
+# manually to backfill an existing release. The build jobs check out the tag
+# and package with that tag's scripts/package-release.sh, so a backfill needs
+# v0.7.2 or later.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build and upload (for example v0.7.1)
+        description: Existing release tag to build and upload (v0.7.2 or later)
         required: true
         type: string
 
