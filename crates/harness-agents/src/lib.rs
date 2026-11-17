@@ -134,17 +134,13 @@ fn process_group_has_members(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn process_group_has_live_members(pid: u32) -> bool {
-    if !process_group_has_members(pid) {
-        return false;
-    }
+    let has_live_members = process_group_has_members(pid);
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    if process_group::contains_only_exited_processes(pid) {
-        return false;
-    }
-    true
+    let has_live_members = has_live_members && !process_group::contains_only_exited_processes(pid);
+    has_live_members
 }
 
 /// Raw kill(2) syscall without libc dependency.

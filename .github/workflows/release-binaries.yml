@@ -1,37 +1,60 @@
 name: Release Binaries
 
-# Attach prebuilt `harness` binaries and SHA256 checksums to a GitHub release.
-# Runs when a release for a vX.Y.Z tag is published (see RELEASING.md), or
-# manually to backfill an existing release.
+# Attach verified prebuilt binaries to a release. See RELEASING.md.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build and upload (for example v0.7.1)
+        description: Existing release tag (for example v0.7.3)
         required: true
         type: string
+      backfill_published:
+        description: Replace or fill missing assets on an already published release
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-binaries-${{ github.event.release.tag_name || inputs.tag }}
+  group: release-binaries-${{ inputs.tag }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  TAG: ${{ inputs.tag }}
+  EXPECTED_DRAFT: ${{ !inputs.backfill_published }}
 
 jobs:
+  release-target:
+    name: Verify release target
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "::error::Expected a version tag, got $TAG."
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [[ "$draft" != "$EXPECTED_DRAFT" ]]; then
+            echo "::error::Release $TAG has draft=$draft; this run requires draft=$EXPECTED_DRAFT."
+            exit 1
+          fi
+
   web-build:
     name: Web Build
+    needs: release-target
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
+          ref: refs/tags/${{ env.TAG }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version-file: .bun-version
@@ -57,9 +80,8 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-15
-          # Cross-compiled on Apple silicon; macOS TLS uses Security.framework.
           - target: x86_64-apple-darwin
-            os: macos-15
+            os: macos-15-intel
           # Ubuntu 22.04 keeps the glibc/OpenSSL 3 baseline broad.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
@@ -71,7 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
+          ref: refs/tags/${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
@@ -88,6 +110,26 @@ jobs:
         run: cargo build --release --locked -p harness-cli --target "${{ matrix.target }}"
       - name: Package
         run: scripts/package-release.sh "${{ matrix.target }}" "target/${{ matrix.target }}/release/harness" dist
+      - name: Verify and run the packaged binary
+        working-directory: dist
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="harness-$TARGET.tar.gz"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c "$archive.sha256"
+          else
+            shasum -a 256 -c "$archive.sha256"
+          fi
+          unpacked="$(mktemp -d)"
+          trap 'rm -rf "$unpacked"' EXIT
+          tar -xzf "$archive" -C "$unpacked"
+          actual="$("$unpacked/harness-$TARGET/harness" --version)"
+          if [[ "$actual" != "harness ${TAG#v}" ]]; then
+            echo "::error::Expected harness ${TAG#v} from $archive; got $actual."
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: harness-${{ matrix.target }}
@@ -112,7 +154,14 @@ jobs:
         run: |
           cat ./*.sha256 > SHA256SUMS
           sha256sum -c SHA256SUMS
-      - name: Upload to release
+      - name: Upload verified assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+          if [[ "$draft" != "$EXPECTED_DRAFT" ]]; then
+            echo "::error::Release $TAG has draft=$draft; this run requires draft=$EXPECTED_DRAFT."
+            exit 1
+          fi
+          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"

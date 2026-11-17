@@ -50,16 +50,30 @@ across parallel PRs.
    git tag -a vX.Y.Z <merge-commit-sha> -m "vX.Y.Z"
    git push origin vX.Y.Z
    ```
-8. Create the GitHub release:
+8. Create a draft against the pushed tag and dispatch the binary workflow from
+   `main`:
    ```bash
-   gh release create vX.Y.Z --title "vX.Y.Z" --notes-file <notes.md> --latest
+   gh release create vX.Y.Z --title "vX.Y.Z" --notes-file <notes.md> --verify-tag --draft
+   gh workflow run release-binaries.yml --ref main -f tag=vX.Y.Z
    ```
+9. Wait for the workflow to finish. The four native macOS and Linux jobs verify
+   each archive's SHA-256 checksum, extract it, and compare the installed
+   binary's `--version` with the tag. Confirm the draft has four archives,
+   four per-archive checksums, and `SHA256SUMS`. If a job fails, keep the draft
+   and retry the workflow for the same tag.
+10. Publish the verified draft:
+    ```bash
+    gh release edit vX.Y.Z --draft=false --latest
+    ```
 
-Publishing the release triggers `.github/workflows/release-binaries.yml`, which
-builds `harness` for macOS (arm64, x64) and Linux (x64, arm64) and uploads
-`harness-<target>.tar.gz`, `harness-<target>.tar.gz.sha256`, and `SHA256SUMS`
-to it. To backfill an existing release, run that workflow manually with the tag:
-`gh workflow run release-binaries.yml -f tag=vX.Y.Z`.
+To backfill an already published release, set `backfill_published` explicitly.
+The workflow runs the same native checks before uploading the verified archive
+set and checksums to that release. Existing assets with those filenames are
+replaced.
+
+```bash
+gh workflow run release-binaries.yml --ref main -f tag=vX.Y.Z -f backfill_published=true
+```
 
 Release tags do not publish to package registries. SDK publication is separate
 work and is not implied by a GitHub release.
