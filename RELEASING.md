@@ -54,13 +54,16 @@ across parallel PRs.
    ```
 8. Create the GitHub release:
    ```bash
-   gh release create vX.Y.Z --title "vX.Y.Z" --notes-file <notes.md> --latest
+   gh release create vX.Y.Z --title "vX.Y.Z" --notes-file <notes.md> --latest=false
    ```
 
 Publishing the release triggers `.github/workflows/release-binaries.yml`, which
 builds `harness` for macOS (arm64, x64) and Linux (x64, arm64) and uploads
 `harness-<target>.tar.gz`, `harness-<target>.tar.gz.sha256`, and `SHA256SUMS`
-to it. To backfill an existing release, run that workflow manually with the tag:
+to it. After upload succeeds, the workflow makes the newest stable release
+the latest. The previous complete release stays latest while builds run.
+If a build fails, rerun the failed jobs.
+To backfill an existing release, run that workflow manually with the tag:
 `gh workflow run release-binaries.yml -f tag=vX.Y.Z`. Backfill works for v0.7.2
 and later: the workflow packages with the `scripts/package-release.sh` from the
 tag it builds, and earlier tags do not contain that script.

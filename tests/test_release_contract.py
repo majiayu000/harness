@@ -15,6 +15,16 @@ def release_tags(text):
 
 
 class ReleaseContractTests(unittest.TestCase):
+    def test_latest_moves_after_upload_and_only_on_stable_publication(self):
+        workflow = (ROOT / ".github/workflows/release-binaries.yml").read_text(encoding="utf-8")
+        docs = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+        self.assertIn("--latest=false", docs)
+        upload_job = workflow.split("name: Upload release assets", 1)[1]
+        upload, promote = upload_job.split("name: Promote the complete release to latest", 1)
+        self.assertIn('gh release upload "$TAG"', upload)
+        self.assertIn("github.event_name == 'release' && !github.event.release.prerelease", promote)
+        self.assertIn('gh release edit "$TAG" --latest', promote)
+
     def test_backfill_docs_only_offer_tags_the_workflow_can_package(self):
         workflow = (ROOT / ".github/workflows/release-binaries.yml").read_text(encoding="utf-8")
         releasing = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
