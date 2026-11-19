@@ -57,8 +57,8 @@ The source is licensed under [MIT](LICENSE).
 ### Prebuilt binary
 
 Pick your target: `aarch64-apple-darwin` (Apple silicon), `x86_64-apple-darwin`,
-`x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`. Then download,
-verify, and run:
+`x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`. Then download, verify,
+and run; on Linux without `shasum`, `sha256sum -c` replaces `shasum -a 256 -c`:
 
 ```bash
 T=aarch64-apple-darwin

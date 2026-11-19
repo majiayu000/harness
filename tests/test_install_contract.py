@@ -24,6 +24,14 @@ class InstallContractTests(unittest.TestCase):
         for prerequisite in ("Linux", "OpenSSL", "pkg-config", "libssl-dev"):
             self.assertIn(prerequisite, install)
 
+    def test_prebuilt_install_names_the_linux_checksum_tool(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        prebuilt = readme.split("### Prebuilt binary", 1)[1].split("\n### ", 1)[0]
+        self.assertIn("unknown-linux-gnu", prebuilt)
+        # shasum comes with the full perl package, which minimal Debian/Ubuntu
+        # installs and base container images lack; sha256sum is in coreutils.
+        self.assertIn("sha256sum -c", prebuilt)
+
 
 if __name__ == "__main__":
     unittest.main()
